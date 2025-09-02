@@ -3,7 +3,10 @@
 pub use crate::codecs::{IdCodec, KeyCodec};
 use crate::errors::Error;
 pub use crate::pager::Pager;
+
+#[cfg(feature = "debug")]
 pub mod graphviz_ext;
+#[cfg(feature = "debug")]
 pub use graphviz_ext::*;
 
 /// A generic ordered map interface over a B+Tree.
