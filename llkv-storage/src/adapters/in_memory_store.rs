@@ -1,9 +1,10 @@
-use crate::codec::hash::hash64;
+use crate::codecs::hash64;
 use crate::traits::KeyValueStore;
 use memmap2::{Mmap, MmapMut};
 use rustc_hash::FxHashMap;
 use simd_r_drive::storage_engine::{EntryHandle, EntryMetadata};
 use std::hash::Hash;
+use std::io;
 use std::sync::Arc;
 
 /// In-memory arena store that returns zero-copy EntryHandles.
@@ -31,9 +32,9 @@ impl<StorageKeyType> KeyValueStore<StorageKeyType> for InMemoryStore<StorageKeyT
 where
     StorageKeyType: Send + Sync + 'static + Eq + Hash + Clone + Copy,
 {
-    fn insert_batch(&mut self, items: FxHashMap<StorageKeyType, Vec<u8>>) {
+    fn insert_batch(&mut self, items: FxHashMap<StorageKeyType, Vec<u8>>) -> io::Result<()> {
         if items.is_empty() {
-            return;
+            return Ok(());
         }
 
         // 1) Compute total size for a single contiguous mmap
@@ -81,7 +82,7 @@ where
         }
 
         // 3) Freeze to read-only and wrap in Arc<Mmap>
-        let ro: Mmap = mm.make_read_only().expect("freeze read-only failed");
+        let ro: Mmap = mm.make_read_only()?;
         let arc = Arc::new(ro);
 
         // 4) Build EntryHandles for each staged item and insert
@@ -101,9 +102,14 @@ where
             let handle = EntryHandle::from_arc_mmap(arc.clone(), range, metadata);
             self.inner.insert(storage_key, handle);
         }
+
+        Ok(())
     }
 
-    fn get_batch(&self, keys: &[StorageKeyType]) -> FxHashMap<StorageKeyType, EntryHandle> {
+    fn get_batch(
+        &self,
+        keys: &[StorageKeyType],
+    ) -> io::Result<FxHashMap<StorageKeyType, EntryHandle>> {
         let mut out = FxHashMap::with_capacity_and_hasher(keys.len(), Default::default());
         for &storage_key in keys {
             if let Some(handle) = self.inner.get(&storage_key) {
@@ -111,43 +117,45 @@ where
                 out.insert(storage_key, handle.clone());
             }
         }
-        out
+        Ok(out)
     }
 
-    fn remove_batch(&mut self, keys: &[StorageKeyType]) {
+    fn remove_batch(&mut self, keys: &[StorageKeyType]) -> io::Result<()> {
         for storage_key in keys {
             self.inner.remove(storage_key);
         }
+
+        Ok(())
     }
 
-    fn contains_key(&self, key: &StorageKeyType) -> bool {
-        self.inner.contains_key(key)
+    fn contains_key(&self, key: &StorageKeyType) -> io::Result<bool> {
+        Ok(self.inner.contains_key(key))
     }
 
-    #[cfg(feature = "test-utils")]
-    fn keys(&self) -> Vec<StorageKeyType> {
-        self.inner.keys().copied().collect()
+    #[cfg(feature = "debug")]
+    fn keys(&self) -> io::Result<Vec<StorageKeyType>> {
+        Ok(self.inner.keys().copied().collect())
     }
 
     /// Test-only: enumerate all (key, len) pairs.
-    #[cfg(feature = "test-utils")]
-    fn inspect_all(&self) -> Vec<(StorageKeyType, usize)> {
+    #[cfg(feature = "debug")]
+    fn inspect_all(&self) -> io::Result<Vec<(StorageKeyType, usize)>> {
         let mut out = Vec::with_capacity(self.inner.len());
         for (storage_key, handle) in self.inner.iter() {
             out.push((*storage_key, handle.size()));
         }
-        out
+        Ok(out)
     }
 
     /// Test-only: enumerate (key, len) for a subset.
-    #[cfg(feature = "test-utils")]
-    fn inspect_subset(&self, keys: &[StorageKeyType]) -> Vec<(StorageKeyType, usize)> {
+    #[cfg(feature = "debug")]
+    fn inspect_subset(&self, keys: &[StorageKeyType]) -> io::Result<Vec<(StorageKeyType, usize)>> {
         let mut out = Vec::with_capacity(keys.len());
         for storage_key in keys {
             if let Some(handle) = self.inner.get(storage_key) {
                 out.push((*storage_key, handle.size()));
             }
         }
-        out
+        Ok(out)
     }
 }

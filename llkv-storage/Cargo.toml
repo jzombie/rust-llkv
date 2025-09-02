@@ -7,4 +7,12 @@ publish.workspace = true
 [dependencies]
 memmap2 = "0.9.8"
 rustc-hash.workspace = true
-simd-r-drive = "0.11.0-alpha"
+simd-r-drive = "0.12.0-alpha"
+xxhash-rust.workspace = true
+
+[features]
+debug = []
+
+[dev-dependencies]
+llkv-storage = { workspace = true, features = ["debug"] }
+tempfile = "3.21.0"
