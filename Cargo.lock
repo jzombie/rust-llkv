@@ -1130,3 +1130,7 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[patch.unused]]
+name = "simd-r-drive"
+version = "0.12.0-alpha"
