@@ -1,5 +1,3 @@
-use crossbeam_channel;
-
 use llkv_btree::codecs::{BigEndianIdCodec, BigEndianKeyCodec};
 use llkv_btree::iter::ScanOpts;
 use llkv_btree::pager::{MemPager64, SharedPager};
@@ -59,7 +57,7 @@ fn main() {
             recv(rx_rng_fwd) -> res => {
                 match res {
                     Ok((k, v)) => {
-                        if k < 3 || k > 7 { continue; } // consumer-side range: [3,7]
+                        if !(3..=7).contains(&k) { continue; } // consumer-side range: [3,7]
                         assert_eq!(v.len(), 8, "value length must be 8 for key {k}");
                         let got = u64::from_be_bytes(v.as_slice().try_into().expect("len 8"));
                         assert_eq!(got, k, "decoded value mismatch for key {k}");

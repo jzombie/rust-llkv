@@ -1879,26 +1879,29 @@ mod tests {
             (2u64, b"bb".to_vec()),
             (9u64, b"zzz".to_vec()),
         ];
-        let next = Some(123u64);
+        let expected_next = 123u64;
 
         let bytes = super::LeafBuilder::<BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> {
             entries: &entries,
-            next: &next,
+            next: &Some(expected_next),
             _p: core::marker::PhantomData,
         }
         .encode();
+
         // Header
         assert_eq!(bytes[0], super::NodeTag::Leaf as u8);
         let count = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
         assert_eq!(count, entries.len());
         let aux_len = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
         let hdr = 9usize;
+
         // Aux with next pointer
         let aux = &bytes[hdr..hdr + aux_len];
         let (nxt_len, pos0) = read_u32_at(aux, 0);
         assert_eq!(nxt_len as usize, 8);
         let decoded_next = u64::from_be_bytes(aux[pos0..pos0 + 8].try_into().unwrap());
-        assert_eq!(decoded_next, next.unwrap());
+        assert_eq!(decoded_next, expected_next);
+
         // Compute block boundaries using the trailing index entry.
         let index_start = bytes.len() - count * 16;
         let keys_base = hdr + aux_len;

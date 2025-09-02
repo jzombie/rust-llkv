@@ -75,7 +75,7 @@ fn generate_data(count: usize, unique_values: usize) -> (Vec<(u64, Vec<u8>)>, Ve
 
     let data: Vec<(u64, Vec<u8>)> = keys
         .iter()
-        .map(|&k| (k, values[rng.gen_range(0..unique_values)].clone()))
+        .map(|&k| (k, values[rng.random_range(0..unique_values)].clone()))
         .collect();
 
     (data, keys)
