@@ -111,10 +111,10 @@ where
             next: old_head.clone(),
         };
         self.map.insert(id.clone(), entry);
-        if let Some(h) = old_head {
-            if let Some(e) = self.map.get_mut(&h) {
-                e.prev = Some(id.clone());
-            }
+        if let Some(h) = old_head
+            && let Some(e) = self.map.get_mut(&h)
+        {
+            e.prev = Some(id.clone());
         }
         self.head = Some(id.clone());
         if self.tail.is_none() {
@@ -135,15 +135,15 @@ where
             (e.prev.clone(), e.next.clone())
         };
         // Fix neighbors.
-        if let Some(p) = prev.clone() {
-            if let Some(pe) = self.map.get_mut(&p) {
-                pe.next = next.clone();
-            }
+        if let Some(p) = prev.clone()
+            && let Some(pe) = self.map.get_mut(&p)
+        {
+            pe.next = next.clone();
         }
-        if let Some(n) = next.clone() {
-            if let Some(ne) = self.map.get_mut(&n) {
-                ne.prev = prev.clone();
-            }
+        if let Some(n) = next.clone()
+            && let Some(ne) = self.map.get_mut(&n)
+        {
+            ne.prev = prev.clone();
         }
         // Fix head/tail.
         if self.head.as_ref() == Some(id) {
@@ -172,15 +172,15 @@ where
             (e.prev.clone(), e.next.clone())
         };
         // Detach from current spot.
-        if let Some(p) = prev.clone() {
-            if let Some(pe) = self.map.get_mut(&p) {
-                pe.next = next.clone();
-            }
+        if let Some(p) = prev.clone()
+            && let Some(pe) = self.map.get_mut(&p)
+        {
+            pe.next = next.clone();
         }
-        if let Some(n) = next.clone() {
-            if let Some(ne) = self.map.get_mut(&n) {
-                ne.prev = prev.clone();
-            }
+        if let Some(n) = next.clone()
+            && let Some(ne) = self.map.get_mut(&n)
+        {
+            ne.prev = prev.clone();
         }
         if self.tail.as_ref() == Some(id) {
             self.tail = prev.clone();
@@ -191,10 +191,10 @@ where
             e.prev = None;
             e.next = old_head.clone();
         }
-        if let Some(h) = old_head {
-            if let Some(he) = self.map.get_mut(&h) {
-                he.prev = Some(id.clone());
-            }
+        if let Some(h) = old_head
+            && let Some(he) = self.map.get_mut(&h)
+        {
+            he.prev = Some(id.clone());
         }
         self.head = Some(id.clone());
         if self.tail.is_none() {

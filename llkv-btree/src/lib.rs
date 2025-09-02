@@ -14,6 +14,7 @@ pub use iter::*; // re-export iterator + scan traits
 pub mod pager;
 
 pub mod node_cache;
+pub mod types;
 pub mod views;
 
 pub mod prelude {

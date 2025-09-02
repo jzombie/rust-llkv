@@ -65,12 +65,12 @@ fn calculate_aggregates(
     let mut max = u64::MIN;
 
     // Standard forward iterator over the full snapshot.
-    let mut it = BPlusTreeIter::new(tree).unwrap();
+    let it = BPlusTreeIter::new(tree).unwrap();
 
     // Branchless "take every other row" toggle.
     let mut take = true;
 
-    while let Some((_k_ref, v_ref)) = it.next() {
+    for (_k_ref, v_ref) in it {
         if !take {
             take = true;
             continue;

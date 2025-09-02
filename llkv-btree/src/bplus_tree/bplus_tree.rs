@@ -4,7 +4,7 @@
 //! -----------------
 //!
 //! 1) Columnar leaf format (from prior patch):
-//!    [Header][Aux][Keys block][Values block][Index]
+//!    \[Header\]\[Aux\][Keys block\][Values block\]\[Index\]
 //!    * Keys are contiguous; values are contiguous.
 //!    * Index (per entry): k_off, k_len, v_off, v_len (u32 each).
 //!
@@ -34,6 +34,7 @@ use crate::{
     node_cache::NodeCache,
     pager::{DEFAULT_PAGE_SIZE_HINT, Pager},
     traits::BTree,
+    types::{LeafSplitRes, NodeWithNextRes},
     views::node_view::{NodeTag, NodeView},
     views::value_view::ValueRef,
 };
@@ -287,15 +288,12 @@ where
     where
         KC::Key: Clone,
     {
-        let mut v = self.get_many(&[key.clone()])?;
+        let mut v = self.get_many(std::slice::from_ref(key))?;
         Ok(v.pop().flatten())
     }
 
     #[inline]
-    fn descend_to_leaf_for_key(
-        &self,
-        key: &KC::Key,
-    ) -> Result<(P::Page, NodeView<P>, Option<P::Id>), Error> {
+    fn descend_to_leaf_for_key(&self, key: &KC::Key) -> NodeWithNextRes<P> {
         let mut id = self.root.clone();
         loop {
             let page = self.read_one(&id)?;
@@ -434,7 +432,7 @@ where
         KC::Key: Clone,
     {
         // Use the batched lookup with a single-element slice.
-        let mut res = self.get_many(&[key.clone()])?;
+        let mut res = self.get_many(std::slice::from_ref(key))?;
         Ok(res.pop().flatten().is_some())
     }
 
@@ -568,13 +566,13 @@ where
         let root_id = self.root.clone();
         self._delete(&root_id, key)?;
         let root_node = self.read_node(&self.root)?;
-        if let Node::Internal { entries } = root_node {
-            if entries.len() == 1 {
-                let old_root = self.root.clone();
-                self.root = entries[0].1.clone();
-                self.dealloc_page(old_root.clone());
-                self.pager.on_root_changed(self.root.clone())?;
-            }
+        if let Node::Internal { entries } = root_node
+            && entries.len() == 1
+        {
+            let old_root = self.root.clone();
+            self.root = entries[0].1.clone();
+            self.dealloc_page(old_root.clone());
+            self.pager.on_root_changed(self.root.clone())?;
         }
         Ok(())
     }
@@ -610,18 +608,18 @@ where
                 let child_id = entries[child_pos].1.clone();
 
                 let delete_result = self._delete(&child_id, key);
-                if let Ok(_) = &delete_result {
-                    if let Ok(new_max_key) = self.find_max_key(&child_id) {
-                        entries[child_pos].0 = new_max_key;
-                    }
+                if let Ok(_) = &delete_result
+                    && let Ok(new_max_key) = self.find_max_key(&child_id)
+                {
+                    entries[child_pos].0 = new_max_key;
                 }
                 delete_result
             }
         };
-        if let Ok(DeleteResult::Underflow) = result {
-            if let (Some(child_pos), Node::Internal { entries }) = (child_pos_opt, &mut node) {
-                return self.rebalance_or_merge(node_id.clone(), entries, child_pos);
-            }
+        if let Ok(DeleteResult::Underflow) = result
+            && let (Some(child_pos), Node::Internal { entries }) = (child_pos_opt, &mut node)
+        {
+            return self.rebalance_or_merge(node_id.clone(), entries, child_pos);
         }
 
         if child_pos_opt.is_some() {
@@ -890,7 +888,7 @@ where
         // Miss: fetch from pager.
         let page = self
             .pager
-            .read_batch(&[id.clone()])?
+            .read_batch(std::slice::from_ref(id))?
             .remove(id)
             .ok_or(Error::MissingPage)?;
 
@@ -1055,11 +1053,7 @@ where
         Ok(out)
     }
 
-    fn split_leaf_bytes(
-        &mut self,
-        page_bytes: &[u8],
-        right_id: P::Id,
-    ) -> Result<(Vec<u8>, KC::Key, Vec<u8>), Error> {
+    fn split_leaf_bytes(&mut self, page_bytes: &[u8], right_id: P::Id) -> LeafSplitRes<KC::Key> {
         let view = NodeView::<P>::new(self.pager.materialize_owned(page_bytes)?)?;
         let count = view.count();
         let mid = count / 2;
@@ -1199,91 +1193,92 @@ fn prefetch_value(slice: &[u8]) {
     }
 }
 
-fn simd_find_u64_equal_on_leaf<P: Pager>(view: &NodeView<P>, target_be: u64) -> Option<usize> {
-    let n = view.count();
-    if n == 0 {
-        return None;
-    }
-    if view.leaf_fixed_key_width() != Some(8) {
-        return None;
-    }
-    let keys = view.leaf_keys_block();
-    debug_assert_eq!(keys.len(), n * 8);
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx512f") {
-            unsafe {
-                use core::arch::x86_64::{
-                    _mm512_cmpeq_epi64_mask, _mm512_loadu_si512, _mm512_set1_epi64,
-                };
-                let mut i = 0usize;
-                let lanes = 8usize;
-                let needle = _mm512_set1_epi64(target_be as i64);
-                while i + lanes <= n {
-                    let ptr = keys.as_ptr().add(i * 8) as *const _;
-                    let v = _mm512_loadu_si512(ptr);
-                    let m = _mm512_cmpeq_epi64_mask(v, needle);
-                    if m != 0 {
-                        let offset = m.trailing_zeros() as usize;
-                        return Some(i + offset);
-                    }
-                    i += lanes;
-                }
-                while i < n {
-                    let off = i * 8;
-                    let k = u64::from_be_bytes(keys[off..off + 8].try_into().unwrap());
-                    if k == target_be {
-                        return Some(i);
-                    }
-                    i += 1;
-                }
-                return None;
-            }
-        }
-        if std::is_x86_feature_detected!("avx2") {
-            unsafe {
-                use core::arch::x86_64::{
-                    __m256i, _mm256_castsi256_pd, _mm256_cmpeq_epi64, _mm256_loadu_si256,
-                    _mm256_movemask_pd, _mm256_set1_epi64x,
-                };
-                let mut i = 0usize;
-                let lanes = 4usize;
-                let needle = _mm256_set1_epi64x(target_be as i64);
-                while i + lanes <= n {
-                    let ptr = keys.as_ptr().add(i * 8) as *const __m256i;
-                    let v = _mm256_loadu_si256(ptr);
-                    let eq = _mm256_cmpeq_epi64(v, needle);
-                    let mask = _mm256_movemask_pd(_mm256_castsi256_pd(eq));
-                    if mask != 0 {
-                        let offset = mask.trailing_zeros() as usize;
-                        return Some(i + offset);
-                    }
-                    i += lanes;
-                }
-                while i < n {
-                    let off = i * 8;
-                    let k = u64::from_be_bytes(keys[off..off + 8].try_into().unwrap());
-                    if k == target_be {
-                        return Some(i);
-                    }
-                    i += 1;
-                }
-                return None;
-            }
-        }
-    }
+// TODO: Re-enable?
+// fn simd_find_u64_equal_on_leaf<P: Pager>(view: &NodeView<P>, target_be: u64) -> Option<usize> {
+//     let n = view.count();
+//     if n == 0 {
+//         return None;
+//     }
+//     if view.leaf_fixed_key_width() != Some(8) {
+//         return None;
+//     }
+//     let keys = view.leaf_keys_block();
+//     debug_assert_eq!(keys.len(), n * 8);
+//     #[cfg(target_arch = "x86_64")]
+//     {
+//         if std::is_x86_feature_detected!("avx512f") {
+//             unsafe {
+//                 use core::arch::x86_64::{
+//                     _mm512_cmpeq_epi64_mask, _mm512_loadu_si512, _mm512_set1_epi64,
+//                 };
+//                 let mut i = 0usize;
+//                 let lanes = 8usize;
+//                 let needle = _mm512_set1_epi64(target_be as i64);
+//                 while i + lanes <= n {
+//                     let ptr = keys.as_ptr().add(i * 8) as *const _;
+//                     let v = _mm512_loadu_si512(ptr);
+//                     let m = _mm512_cmpeq_epi64_mask(v, needle);
+//                     if m != 0 {
+//                         let offset = m.trailing_zeros() as usize;
+//                         return Some(i + offset);
+//                     }
+//                     i += lanes;
+//                 }
+//                 while i < n {
+//                     let off = i * 8;
+//                     let k = u64::from_be_bytes(keys[off..off + 8].try_into().unwrap());
+//                     if k == target_be {
+//                         return Some(i);
+//                     }
+//                     i += 1;
+//                 }
+//                 return None;
+//             }
+//         }
+//         if std::is_x86_feature_detected!("avx2") {
+//             unsafe {
+//                 use core::arch::x86_64::{
+//                     __m256i, _mm256_castsi256_pd, _mm256_cmpeq_epi64, _mm256_loadu_si256,
+//                     _mm256_movemask_pd, _mm256_set1_epi64x,
+//                 };
+//                 let mut i = 0usize;
+//                 let lanes = 4usize;
+//                 let needle = _mm256_set1_epi64x(target_be as i64);
+//                 while i + lanes <= n {
+//                     let ptr = keys.as_ptr().add(i * 8) as *const __m256i;
+//                     let v = _mm256_loadu_si256(ptr);
+//                     let eq = _mm256_cmpeq_epi64(v, needle);
+//                     let mask = _mm256_movemask_pd(_mm256_castsi256_pd(eq));
+//                     if mask != 0 {
+//                         let offset = mask.trailing_zeros() as usize;
+//                         return Some(i + offset);
+//                     }
+//                     i += lanes;
+//                 }
+//                 while i < n {
+//                     let off = i * 8;
+//                     let k = u64::from_be_bytes(keys[off..off + 8].try_into().unwrap());
+//                     if k == target_be {
+//                         return Some(i);
+//                     }
+//                     i += 1;
+//                 }
+//                 return None;
+//             }
+//         }
+//     }
 
-    let mut i = 0usize;
-    while i < n {
-        let off = i * 8;
-        let k = u64::from_be_bytes(keys[off..off + 8].try_into().unwrap());
-        if k == target_be {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
+//     let mut i = 0usize;
+//     while i < n {
+//         let off = i * 8;
+//         let k = u64::from_be_bytes(keys[off..off + 8].try_into().unwrap());
+//         if k == target_be {
+//             return Some(i);
+//         }
+//         i += 1;
+//     }
+//     None
+// }
 
 // ------------------------------- BTree trait ---------------------------------
 
@@ -1426,31 +1421,13 @@ mod tests {
         let tree: BPlusTree<TestPager, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> =
             BPlusTree::new(pager, root, None);
 
-        assert_eq!(
-            tree.get(&1).unwrap().as_deref().map(|v| &*v),
-            Some(&b"a"[..])
-        );
-        assert_eq!(
-            tree.get(&2).unwrap().as_deref().map(|v| &*v),
-            Some(&b"bb"[..])
-        );
-        assert_eq!(
-            tree.get(&3).unwrap().as_deref().map(|v| &*v),
-            Some(&b"ccc"[..])
-        );
+        assert_eq!(tree.get(&1).unwrap().as_deref(), Some(&b"a"[..]));
+        assert_eq!(tree.get(&2).unwrap().as_deref(), Some(&b"bb"[..]));
+        assert_eq!(tree.get(&3).unwrap().as_deref(), Some(&b"ccc"[..]));
         assert!(tree.get(&4).unwrap().is_none());
-        assert_eq!(
-            tree.get(&5).unwrap().as_deref().map(|v| &*v),
-            Some(&b"eee"[..])
-        );
-        assert_eq!(
-            tree.get(&6).unwrap().as_deref().map(|v| &*v),
-            Some(&b"ffff"[..])
-        );
-        assert_eq!(
-            tree.get(&7).unwrap().as_deref().map(|v| &*v),
-            Some(&b"gg"[..])
-        );
+        assert_eq!(tree.get(&5).unwrap().as_deref(), Some(&b"eee"[..]));
+        assert_eq!(tree.get(&6).unwrap().as_deref(), Some(&b"ffff"[..]));
+        assert_eq!(tree.get(&7).unwrap().as_deref(), Some(&b"gg"[..]));
     }
 
     #[test]
@@ -1479,7 +1456,7 @@ mod tests {
         }
         .encode();
         let i_bytes = super::InternalBuilder::<BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> {
-            entries: &vec![(11, l1), (12, l2)],
+            entries: &[(11, l1), (12, l2)],
             _p: PhantomData,
         }
         .encode();
@@ -1692,16 +1669,10 @@ mod tests {
         ])
         .unwrap();
 
+        assert_eq!(tree.get(&key1).unwrap().as_deref(), Some(&b"value_one"[..]));
+        assert_eq!(tree.get(&key2).unwrap().as_deref(), Some(&b"value_max"[..]));
         assert_eq!(
-            tree.get(&key1).unwrap().as_deref().map(|v| &*v),
-            Some(&b"value_one"[..])
-        );
-        assert_eq!(
-            tree.get(&key2).unwrap().as_deref().map(|v| &*v),
-            Some(&b"value_max"[..])
-        );
-        assert_eq!(
-            tree.get(&key3).unwrap().as_deref().map(|v| &*v),
+            tree.get(&key3).unwrap().as_deref(),
             Some(&b"value_large"[..])
         );
         assert!(tree.get(&(key1 + 5)).unwrap().is_none());
@@ -1731,16 +1702,10 @@ mod tests {
         ])
         .unwrap();
 
+        assert_eq!(tree.get(&key1).unwrap().as_deref(), Some(&b"value_one"[..]));
+        assert_eq!(tree.get(&key2).unwrap().as_deref(), Some(&b"value_max"[..]));
         assert_eq!(
-            tree.get(&key1).unwrap().as_deref().map(|v| &*v),
-            Some(&b"value_one"[..])
-        );
-        assert_eq!(
-            tree.get(&key2).unwrap().as_deref().map(|v| &*v),
-            Some(&b"value_max"[..])
-        );
-        assert_eq!(
-            tree.get(&key3).unwrap().as_deref().map(|v| &*v),
+            tree.get(&key3).unwrap().as_deref(),
             Some(&b"value_large"[..])
         );
         assert!(tree.contains_key(&key2).unwrap());
@@ -1758,7 +1723,7 @@ mod tests {
         // empty tree OK
         if tree
             .pager
-            .read_batch(&[tree.root.clone()])
+            .read_batch(std::slice::from_ref(&tree.root))
             .unwrap()
             .is_empty()
             && tree.pending_writes.is_empty()
@@ -1810,13 +1775,15 @@ mod tests {
                 view.leaf_entry_slices(i)
             };
             let key = KC::decode_from(k_enc).unwrap();
-            if let Some(prev) = &prev_key {
-                if i > 0 && *prev >= key && view.tag().unwrap() != super::NodeTag::Internal {
-                    return Err(format!(
-                        "Keys in leaf node {:?} not sorted: {:?} >= {:?}",
-                        node_id, prev, key
-                    ));
-                }
+            if let Some(prev) = &prev_key
+                && i > 0
+                && *prev >= key
+                && view.tag().unwrap() != super::NodeTag::Internal
+            {
+                return Err(format!(
+                    "Keys in leaf node {:?} not sorted: {:?} >= {:?}",
+                    node_id, prev, key
+                ));
             }
             prev_key = Some(key.clone());
         }
@@ -1887,18 +1854,9 @@ mod tests {
             BPlusTree::new(pager, root, None);
 
         // Zero-copy assertions via ValueRef -> &[u8]
-        assert_eq!(
-            tree.get(&apple).unwrap().as_deref().map(|v| &*v),
-            Some(&b"red"[..])
-        );
-        assert_eq!(
-            tree.get(&banana).unwrap().as_deref().map(|v| &*v),
-            Some(&b"yellow"[..])
-        );
-        assert_eq!(
-            tree.get(&orange).unwrap().as_deref().map(|v| &*v),
-            Some(&b"orange"[..])
-        );
+        assert_eq!(tree.get(&apple).unwrap().as_deref(), Some(&b"red"[..]));
+        assert_eq!(tree.get(&banana).unwrap().as_deref(), Some(&b"yellow"[..]));
+        assert_eq!(tree.get(&orange).unwrap().as_deref(), Some(&b"orange"[..]));
         assert!(tree.get(&"grape".to_string()).unwrap().is_none());
     }
 
@@ -1921,26 +1879,29 @@ mod tests {
             (2u64, b"bb".to_vec()),
             (9u64, b"zzz".to_vec()),
         ];
-        let next = Some(123u64);
+        let expected_next = 123u64;
 
         let bytes = super::LeafBuilder::<BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> {
             entries: &entries,
-            next: &next,
+            next: &Some(expected_next),
             _p: core::marker::PhantomData,
         }
         .encode();
+
         // Header
         assert_eq!(bytes[0], super::NodeTag::Leaf as u8);
         let count = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
         assert_eq!(count, entries.len());
         let aux_len = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
         let hdr = 9usize;
+
         // Aux with next pointer
         let aux = &bytes[hdr..hdr + aux_len];
         let (nxt_len, pos0) = read_u32_at(aux, 0);
         assert_eq!(nxt_len as usize, 8);
         let decoded_next = u64::from_be_bytes(aux[pos0..pos0 + 8].try_into().unwrap());
-        assert_eq!(decoded_next, next.unwrap());
+        assert_eq!(decoded_next, expected_next);
+
         // Compute block boundaries using the trailing index entry.
         let index_start = bytes.len() - count * 16;
         let keys_base = hdr + aux_len;
@@ -2001,12 +1962,10 @@ mod tests {
         assert_eq!(kb_off, keys_base);
         assert_eq!(kb.len(), keys_len);
         // Entry slices from view must match index-derived ones.
-        for i in 0..entries.len() {
+        for (i, &(k, ref v)) in entries.iter().enumerate() {
             let (k_enc, v_enc) = view.leaf_entry_slices(i);
-            let (k, v) = &entries[i];
-
             let mut k2 = Vec::new();
-            BigEndianKeyCodec::<u64>::encode_into(k, &mut k2);
+            BigEndianKeyCodec::<u64>::encode_into(&k, &mut k2);
             assert_eq!(k_enc, &k2[..]);
             assert_eq!(v_enc, &v[..]);
         }

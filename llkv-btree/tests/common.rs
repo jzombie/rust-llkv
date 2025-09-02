@@ -157,15 +157,16 @@ pub fn populate_tree(tree: &mut TreeU64<TestPager>) -> Result<Vec<(u64, Vec<u8>)
     let mut items = Vec::with_capacity(N);
     let mut expected = Vec::with_capacity(N);
 
-    for i in 0..N {
+    for (i, &k) in keys.iter().enumerate() {
         let value = if i % 5 == 0 {
             shared_value.clone()
         } else {
             format!("unique_value_{i}").into_bytes()
         };
-        items.push((keys[i], value.clone()));
-        expected.push((keys[i], value));
+        items.push((k, value.clone()));
+        expected.push((k, value));
     }
+
     expected.sort_by_key(|e| e.0);
 
     let owned: Vec<_> = items.iter().map(|(k, v)| (*k, v.as_slice())).collect();
@@ -301,11 +302,11 @@ pub fn diff_dump(who: &str, got: &[(u64, Vec<u8>)], want: &[(u64, Vec<u8>)]) {
 
     let mut first_val_mismatch: Option<(u64, Vec<u8>, Vec<u8>)> = None;
     for k in wm.keys() {
-        if let (Some(gv), Some(wv)) = (gm.get(k), wm.get(k)) {
-            if *gv != *wv {
-                first_val_mismatch = Some((*k, (*gv).clone(), (*wv).clone()));
-                break;
-            }
+        if let (Some(gv), Some(wv)) = (gm.get(k), wm.get(k))
+            && *gv != *wv
+        {
+            first_val_mismatch = Some((*k, (*gv).clone(), (*wv).clone()));
+            break;
         }
     }
 
@@ -326,9 +327,9 @@ pub fn diff_dump(who: &str, got: &[(u64, Vec<u8>)], want: &[(u64, Vec<u8>)]) {
 
 /// How to (re)generate golden snapshots:
 ///   1) Set the env var to update snapshots:
-///        UPDATE_SNAPSHOTS=1
+///      UPDATE_SNAPSHOTS=1
 ///   2) Run just these tests (example):
-///        cargo test -p llkv-btree -- graphviz_
+///      cargo test -p llkv-btree -- graphviz_
 ///   3) Commit the files written under tests/snapshots/.
 ///
 /// To debug mismatches, you can also set LLKV_DUMP_DOT to write .dot
