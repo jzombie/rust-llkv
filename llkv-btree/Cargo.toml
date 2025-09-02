@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 crossbeam-channel.workspace = true
+line-ending.workspace = true
 rand.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true

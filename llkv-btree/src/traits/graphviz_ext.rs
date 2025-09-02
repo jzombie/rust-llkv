@@ -2,6 +2,7 @@ use crate::bplus_tree::{BPlusTree, Node, SharedBPlusTree};
 use crate::codecs::{IdCodec, KeyCodec};
 use crate::errors::Error;
 use crate::pager::Pager;
+use line_ending::{self, LineEnding};
 
 pub trait GraphvizExt {
     fn to_dot(&self) -> Result<String, Error>;
@@ -76,6 +77,8 @@ pub trait GraphvizExt {
                 in_hspace = false;
             }
         }
+
+        norm = LineEnding::normalize(&norm);
 
         Ok(norm)
     }
