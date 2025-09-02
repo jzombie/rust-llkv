@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+use line_ending::LineEnding;
 use llkv_btree::bplus_tree::BPlusTree;
 use llkv_btree::codecs::{BigEndianIdCodec, BigEndianKeyCodec, KeyCodec};
 use llkv_btree::errors::Error;
@@ -342,7 +343,9 @@ pub fn assert_matches_golden(actual: &str, golden_path: &str) {
         fs::write(p, actual.as_bytes()).unwrap();
         eprintln!("updated snapshot: {golden_path}");
     } else {
-        let expected = fs::read_to_string(p).expect("missing golden; set UPDATE_SNAPSHOTS=1");
+        let expected = LineEnding::normalize(
+            &fs::read_to_string(p).expect("missing golden; set UPDATE_SNAPSHOTS=1"),
+        );
         assert_eq!(actual, expected, "snapshot mismatch: {golden_path}",);
     }
 }
