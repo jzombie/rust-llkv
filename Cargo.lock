@@ -244,6 +244,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "line-ending",
+ "llkv-btree",
  "rand",
  "rayon",
  "rustc-hash",

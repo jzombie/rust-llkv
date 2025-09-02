@@ -1,9 +1,15 @@
-use crate::bplus_tree::{BPlusTree, Node, SharedBPlusTree};
-use crate::codecs::{IdCodec, KeyCodec};
-use crate::errors::Error;
-use crate::pager::Pager;
-use line_ending::{self, LineEnding};
+#[cfg(feature = "debug")]
+use crate::{
+    bplus_tree::{BPlusTree, Node, SharedBPlusTree},
+    codecs::{IdCodec, KeyCodec},
+    errors::Error,
+    pager::Pager,
+};
 
+#[cfg(feature = "debug")]
+use line_ending::LineEnding;
+
+#[cfg(feature = "debug")]
 pub trait GraphvizExt {
     fn to_dot(&self) -> Result<String, Error>;
 
@@ -11,26 +17,13 @@ pub trait GraphvizExt {
     fn to_canonicalized_dot(&self) -> Result<String, Error> {
         use std::collections::BTreeMap;
 
-        // Own the String; do NOT take &self.to_dot()? as &str.
-        let dot = self.to_dot()?;
+        // Own the String and normalize line endings via the crate.
+        let dot_raw = self.to_dot()?;
+        let dot = LineEnding::normalize(&dot_raw);
 
-        // 1) Normalize line endings to LF.
-        let mut lf = String::with_capacity(dot.len());
-        let mut it = dot.chars().peekable();
-        while let Some(ch) = it.next() {
-            if ch == '\r' {
-                if matches!(it.peek(), Some('\n')) {
-                    it.next(); // swallow the '\n' of CRLF
-                }
-                lf.push('\n');
-            } else {
-                lf.push(ch);
-            }
-        }
-
-        // 2) Canonicalize 'node_<...>' to N0, N1, ...
-        let b = lf.as_bytes();
-        let mut out = String::with_capacity(lf.len());
+        // Canonicalize 'node_<...>' to N0, N1, ...
+        let b = dot.as_bytes();
+        let mut out = String::with_capacity(dot.len());
         let mut map: BTreeMap<String, String> = BTreeMap::new();
         let mut next = 0usize;
         let mut i = 0usize;
@@ -46,7 +39,7 @@ pub trait GraphvizExt {
                     }
                     j += 1;
                 }
-                let tag = &lf[i..j];
+                let tag = &dot[i..j];
                 let name = map.entry(tag.to_string()).or_insert_with(|| {
                     let s = format!("N{}", next);
                     next += 1;
@@ -60,7 +53,7 @@ pub trait GraphvizExt {
             }
         }
 
-        // 3) Collapse horizontal whitespace, preserve newlines.
+        // Collapse horizontal whitespace, preserve '\n'.
         let mut norm = String::with_capacity(out.len());
         let mut in_hspace = false;
         for ch in out.chars() {
@@ -78,12 +71,11 @@ pub trait GraphvizExt {
             }
         }
 
-        norm = LineEnding::normalize(&norm);
-
         Ok(norm)
     }
 }
 
+#[cfg(feature = "debug")]
 impl<P, KC, IC> GraphvizExt for BPlusTree<P, KC, IC>
 where
     P: Pager,
@@ -171,6 +163,7 @@ where
     }
 }
 
+#[cfg(feature = "debug")]
 impl<P, KC, IC> GraphvizExt for SharedBPlusTree<P, KC, IC>
 where
     P: Pager + Clone,

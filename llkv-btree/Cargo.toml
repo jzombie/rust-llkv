@@ -6,14 +6,18 @@ publish.workspace = true
 
 [dependencies]
 crossbeam-channel.workspace = true
-line-ending.workspace = true
+line-ending = { workspace = true, optional = true }
 rand.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
 xxhash-rust.workspace = true
 
+[features]
+debug = ["line-ending"]
+
 [dev-dependencies]
 criterion.workspace = true
+llkv-btree = { workspace = true, features = ["debug"] }
 
 [[bench]]
 name = "large_scale_benchmark"
