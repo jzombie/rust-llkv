@@ -10,10 +10,26 @@ pub trait GraphvizExt {
     fn to_canonicalized_dot(&self) -> Result<String, Error> {
         use std::collections::BTreeMap;
 
-        let dot: &str = &self.to_dot()?;
+        // Own the String; do NOT take &self.to_dot()? as &str.
+        let dot = self.to_dot()?;
 
-        let b = dot.as_bytes();
-        let mut out = String::with_capacity(dot.len());
+        // 1) Normalize line endings to LF.
+        let mut lf = String::with_capacity(dot.len());
+        let mut it = dot.chars().peekable();
+        while let Some(ch) = it.next() {
+            if ch == '\r' {
+                if matches!(it.peek(), Some('\n')) {
+                    it.next(); // swallow the '\n' of CRLF
+                }
+                lf.push('\n');
+            } else {
+                lf.push(ch);
+            }
+        }
+
+        // 2) Canonicalize 'node_<...>' to N0, N1, ...
+        let b = lf.as_bytes();
+        let mut out = String::with_capacity(lf.len());
         let mut map: BTreeMap<String, String> = BTreeMap::new();
         let mut next = 0usize;
         let mut i = 0usize;
@@ -29,13 +45,13 @@ pub trait GraphvizExt {
                     }
                     j += 1;
                 }
-                let tag = &dot[i..j];
-                let entry = map.entry(tag.to_string()).or_insert_with(|| {
+                let tag = &lf[i..j];
+                let name = map.entry(tag.to_string()).or_insert_with(|| {
                     let s = format!("N{}", next);
                     next += 1;
                     s
                 });
-                out.push_str(entry);
+                out.push_str(name);
                 i = j;
             } else {
                 out.push(b[i] as char);
@@ -43,22 +59,21 @@ pub trait GraphvizExt {
             }
         }
 
+        // 3) Collapse horizontal whitespace, preserve newlines.
         let mut norm = String::with_capacity(out.len());
-        let mut in_horizontal_whitespace = false;
+        let mut in_hspace = false;
         for ch in out.chars() {
-            if ch == '\n' || ch == '\r' {
-                // Push newline characters as-is
-                norm.push(ch);
-                in_horizontal_whitespace = false; // Reset the state for horizontal whitespace
+            if ch == '\n' {
+                norm.push('\n');
+                in_hspace = false;
             } else if ch.is_ascii_whitespace() {
-                // For other whitespace (spaces, tabs), collapse them
-                if !in_horizontal_whitespace {
+                if !in_hspace {
                     norm.push(' ');
-                    in_horizontal_whitespace = true;
+                    in_hspace = true;
                 }
             } else {
                 norm.push(ch);
-                in_horizontal_whitespace = false;
+                in_hspace = false;
             }
         }
 
