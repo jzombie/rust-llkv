@@ -1,5 +1,5 @@
 use rustc_hash::FxHashMap;
-use simd_r_drive::EntryHandle;
+use simd_r_drive_entry_handle::EntryHandle;
 use std::io;
 
 pub trait KeyValueStore<StorageKeyType>: Send + Sync

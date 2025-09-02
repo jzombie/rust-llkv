@@ -2,7 +2,7 @@ use crate::codecs::hash64;
 use crate::traits::KeyValueStore;
 use memmap2::{Mmap, MmapMut};
 use rustc_hash::FxHashMap;
-use simd_r_drive::storage_engine::{EntryHandle, EntryMetadata};
+use simd_r_drive_entry_handle::{EntryHandle, EntryMetadata};
 use std::hash::Hash;
 use std::io;
 use std::sync::Arc;

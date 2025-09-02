@@ -416,6 +416,7 @@ dependencies = [
  "memmap2",
  "rustc-hash",
  "simd-r-drive",
+ "simd-r-drive-entry-handle",
  "tempfile",
  "xxhash-rust",
 ]
@@ -760,9 +761,18 @@ dependencies = [
  "dashmap",
  "indoc",
  "memmap2",
+ "simd-r-drive-entry-handle",
  "tracing",
  "tracing-subscriber",
  "xxhash-rust",
+]
+
+[[package]]
+name = "simd-r-drive-entry-handle"
+version = "0.12.0-alpha"
+dependencies = [
+ "crc32fast",
+ "memmap2",
 ]
 
 [[package]]

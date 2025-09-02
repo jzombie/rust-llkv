@@ -1,6 +1,8 @@
 use crate::traits::KeyValueStore;
 use crate::types::StorageKey;
 use rustc_hash::FxHashMap;
+
+#[cfg(feature = "simd-r-drive-support")]
 use simd_r_drive::{
     DataStore,
     storage_engine::EntryHandle,
@@ -10,10 +12,12 @@ use std::io;
 use std::path::Path;
 
 /// Adapter over `simd_r_drive::DataStore` that implements `KeyValueStore<StorageKey>`.
+#[cfg(feature = "simd-r-drive-support")]
 pub struct SimdRDriveStore {
     inner: DataStore,
 }
 
+#[cfg(feature = "simd-r-drive-support")]
 impl SimdRDriveStore {
     /// Open (or create) a datastore at `path`.
     pub fn new(path: &Path) -> Self {
@@ -31,6 +35,7 @@ impl SimdRDriveStore {
     }
 }
 
+#[cfg(feature = "simd-r-drive-support")]
 impl KeyValueStore<StorageKey> for SimdRDriveStore {
     fn insert_batch(&mut self, items: FxHashMap<StorageKey, Vec<u8>>) -> io::Result<()> {
         let entries: Vec<(StorageKey, &[u8])> =
