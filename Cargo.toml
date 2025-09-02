@@ -6,6 +6,9 @@ publish = false
 
 [workspace.dependencies]
 llkv-btree = { path = "./llkv-btree", version = "0.1.0-alpha" }
+llkv-storage = { path = "./llkv-storage", version = "0.1.0-alpha" }
+simd-r-drive = "0.12.0-alpha"
+simd-r-drive-entry-handle = "0.12.0-alpha"
 
 # Vendor crates
 criterion = "0.7.0"
@@ -13,11 +16,13 @@ crossbeam-channel = "0.5.15"
 line-ending = "1.5.1"
 rand = "0.9.1"
 rayon = "1.10.0"
+tempfile = "3.21.0"
 rustc-hash = "2.1.1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [workspace]
 members = [
     "llkv-btree",
+    "llkv-storage",
 ]
 resolver = "2"

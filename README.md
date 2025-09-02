@@ -1,7 +1,6 @@
-# LLKV: Logical Columnar Storage for Key-Value Systems
+# LLKV: Logical Columnar Storage for Binary Key-Value Storage Systems
 
-A small toolkit for building logical columnar layouts on top of a
-byte-ordered key-value store (B+Tree, pager, codecs).
+A small toolkit for building logical columnar layouts on top of a byte-ordered key-value store (B+Tree, pager, codecs).
 
 Status: Work in progress. Interfaces may change.
 
