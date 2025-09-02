@@ -122,8 +122,8 @@ where
                 shared_node_cache,
                 page_size,
             );
-            if let Ok(mut it) = BPlusTreeIter::with_opts(&tree, opts) {
-                while let Some((kref, vref)) = it.next() {
+            if let Ok(it) = BPlusTreeIter::with_opts(&tree, opts) {
+                for (kref, vref) in it {
                     let key = KC::decode_from(kref.as_ref()).expect("decode key");
                     let val = vref.as_ref().to_vec();
                     if tx.send((key, val)).is_err() {

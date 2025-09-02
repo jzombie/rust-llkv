@@ -34,6 +34,7 @@ use crate::{
     node_cache::NodeCache,
     pager::{DEFAULT_PAGE_SIZE_HINT, Pager},
     traits::BTree,
+    types::{LeafSplitRes, NodeWithNextRes},
     views::node_view::{NodeTag, NodeView},
     views::value_view::ValueRef,
 };
@@ -292,10 +293,7 @@ where
     }
 
     #[inline]
-    fn descend_to_leaf_for_key(
-        &self,
-        key: &KC::Key,
-    ) -> Result<(P::Page, NodeView<P>, Option<P::Id>), Error> {
+    fn descend_to_leaf_for_key(&self, key: &KC::Key) -> NodeWithNextRes<P> {
         let mut id = self.root.clone();
         loop {
             let page = self.read_one(&id)?;
@@ -1055,11 +1053,7 @@ where
         Ok(out)
     }
 
-    fn split_leaf_bytes(
-        &mut self,
-        page_bytes: &[u8],
-        right_id: P::Id,
-    ) -> Result<(Vec<u8>, KC::Key, Vec<u8>), Error> {
+    fn split_leaf_bytes(&mut self, page_bytes: &[u8], right_id: P::Id) -> LeafSplitRes<KC::Key> {
         let view = NodeView::<P>::new(self.pager.materialize_owned(page_bytes)?)?;
         let count = view.count();
         let mid = count / 2;

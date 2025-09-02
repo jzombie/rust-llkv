@@ -12,6 +12,7 @@ use crate::codecs::{IdCodec, KeyCodec};
 use crate::errors::Error;
 use crate::pager::Pager;
 use crate::{
+    types::{CursorStepRes, EntryRefRes, FramePred, NodeWithNextRes},
     views::key_view::KeyRef,
     views::node_view::{NodeTag, NodeView},
     views::value_view::ValueRef,
@@ -21,16 +22,6 @@ use core::marker::PhantomData;
 use core::ops::Bound;
 use core::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::Arc;
-
-type CursorStepRes<P> = Result<
-    (
-        <P as Pager>::Page,
-        NodeView<P>,
-        usize,
-        Option<<P as Pager>::Id>,
-    ),
-    Error,
->;
 
 // ------------------------------------------------------------------
 // Direction and scan options
@@ -188,7 +179,7 @@ where
     /// `pred(head, cur)` is true. When it returns false, the iterator ends.
     /// This is `Arc<dyn ... + Send + Sync>` so you can pass it across threads
     /// from `SharedBPlusTree::start_stream_with_opts`.
-    pub frame_predicate: Option<Arc<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync + 'static>>,
+    pub frame_predicate: Option<FramePred>,
 }
 
 impl<'a, KC> Default for ScanOpts<'a, KC>
@@ -286,12 +277,7 @@ where
     fn root_id(&self) -> P::Id;
 
     /// Produce (KeyRef, ValueRef) for entry `i` without allocation.
-    fn entry_at(
-        &self,
-        page: P::Page,
-        view: &NodeView<P>,
-        i: usize,
-    ) -> Result<(KeyRef<P::Page>, ValueRef<P::Page>), Error>;
+    fn entry_at(&self, page: P::Page, view: &NodeView<P>, i: usize) -> EntryRefRes<P>;
 }
 
 // Resolver for a plain BPlusTree: value bytes live in the leaf entry.
@@ -387,7 +373,7 @@ where
     prefix: Option<&'a [u8]>,
 
     // Frame termination predicate and captured head key bytes.
-    frame_predicate: Option<Arc<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync + 'static>>,
+    frame_predicate: Option<FramePred>,
     first_key_enc: Option<Vec<u8>>,
 
     dir: Direction,
@@ -591,9 +577,7 @@ where
 {
     type Item = (KeyRef<P::Page>, ValueRef<P::Page>);
     fn next(&mut self) -> Option<Self::Item> {
-        if self.cur_page.is_none() {
-            return None;
-        }
+        self.cur_page.as_ref()?;
 
         match self.dir {
             Direction::Forward => {
@@ -750,9 +734,7 @@ where
     }
 }
 
-fn descend_rightmost<'a, R, P, KC, IC>(
-    r: &R,
-) -> Result<(P::Page, NodeView<P>, Option<P::Id>), Error>
+fn descend_rightmost<'a, R, P, KC, IC>(r: &R) -> NodeWithNextRes<P>
 where
     R: ValueResolver<'a, P, KC, IC>,
     P: Pager,
@@ -857,11 +839,7 @@ where
     }
 }
 
-fn descend_upper_pos<'a, R, P, KC, IC>(
-    r: &R,
-    key: &KC::Key,
-    inclusive: bool,
-) -> Result<(P::Page, NodeView<P>, usize, Option<P::Id>), Error>
+fn descend_upper_pos<'a, R, P, KC, IC>(r: &R, key: &KC::Key, inclusive: bool) -> CursorStepRes<P>
 where
     R: ValueResolver<'a, P, KC, IC>,
     P: Pager,
