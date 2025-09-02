@@ -121,7 +121,7 @@ where
                             "  {}:\"<{:?}>\" -> {};\n",
                             node_name, k, child_name
                         ));
-                        walk(&tree, child_id, dot, visited)?;
+                        walk(tree, child_id, dot, visited)?;
                     }
                 }
                 Node::Leaf { entries, next } => {

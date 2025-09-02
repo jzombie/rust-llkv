@@ -38,10 +38,11 @@ impl<P: Pager> NodeView<P> {
         &self.page
     }
 
-    #[inline]
-    pub(crate) fn into_page(self) -> P::Page {
-        self.page
-    }
+    // TODO: Use?
+    // #[inline]
+    // pub(crate) fn into_page(self) -> P::Page {
+    //     self.page
+    // }
 
     #[inline]
     pub(crate) fn tag(&self) -> Result<NodeTag, Error> {
@@ -163,13 +164,14 @@ impl<P: Pager> NodeView<P> {
         (k_off, k_len, v_off, v_len)
     }
 
-    #[inline]
-    pub(crate) fn leaf_entry_key_range(&self, i: usize) -> core::ops::Range<usize> {
-        let (k_off, k_len, _, _) = self.leaf_index_fields(i);
-        let start = self.leaf_keys_base() + k_off;
-        let end = start + k_len;
-        start..end
-    }
+    // TODO: Use?
+    // #[inline]
+    // pub(crate) fn leaf_entry_key_range(&self, i: usize) -> core::ops::Range<usize> {
+    //     let (k_off, k_len, _, _) = self.leaf_index_fields(i);
+    //     let start = self.leaf_keys_base() + k_off;
+    //     let end = start + k_len;
+    //     start..end
+    // }
 
     #[inline]
     pub(crate) fn leaf_entry_slices(&self, i: usize) -> (&[u8], &[u8]) {
@@ -201,10 +203,11 @@ impl<P: Pager> NodeView<P> {
         &aux[pos..pos + n as usize]
     }
 
-    /// Returns Some(width) if all keys are fixed-width and packed;
-    /// else None.
+    // TODO: Use?
+    // Returns Some(width) if all keys are fixed-width and packed;
+    // else None.
     #[inline]
-    pub(crate) fn leaf_fixed_key_width(&self) -> Option<usize> {
+    pub fn leaf_fixed_key_width(&self) -> Option<usize> {
         if !self.is_leaf() {
             return None;
         }

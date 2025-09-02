@@ -22,6 +22,16 @@ use core::ops::Bound;
 use core::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::Arc;
 
+type CursorStepRes<P> = Result<
+    (
+        <P as Pager>::Page,
+        NodeView<P>,
+        usize,
+        Option<<P as Pager>::Id>,
+    ),
+    Error,
+>;
+
 // ------------------------------------------------------------------
 // Direction and scan options
 // ------------------------------------------------------------------
@@ -589,10 +599,8 @@ where
             Direction::Forward => {
                 loop {
                     // Hop to the next non-empty leaf when current is exhausted.
-                    if self.pos >= self.cur_count {
-                        if self.advance_leaf_forward().ok()? == false {
-                            return None;
-                        }
+                    if self.pos >= self.cur_count && !(self.advance_leaf_forward().ok()?) {
+                        return None;
                     }
 
                     let page = self.cur_page.as_ref()?.clone();
@@ -630,10 +638,8 @@ where
             Direction::Reverse => {
                 loop {
                     // Move cursor left; when current leaf exhausted, step to previous.
-                    if self.pos_after == 0 {
-                        if self.step_reverse().ok()? == false {
-                            return None;
-                        }
+                    if self.pos_after == 0 && !(self.step_reverse().ok()?) {
+                        return None;
                     }
 
                     let page = self.cur_page.as_ref()?.clone();
@@ -720,9 +726,7 @@ where
     }
 }
 
-fn descend_leftmost<'a, R, P, KC, IC>(
-    r: &R,
-) -> Result<(P::Page, NodeView<P>, usize, Option<P::Id>), Error>
+fn descend_leftmost<'a, R, P, KC, IC>(r: &R) -> CursorStepRes<P>
 where
     R: ValueResolver<'a, P, KC, IC>,
     P: Pager,
@@ -815,10 +819,7 @@ where
     lo as usize
 }
 
-fn descend_ge<'a, R, P, KC, IC>(
-    r: &R,
-    key: &KC::Key,
-) -> Result<(P::Page, NodeView<P>, usize, Option<P::Id>), Error>
+fn descend_ge<'a, R, P, KC, IC>(r: &R, key: &KC::Key) -> CursorStepRes<P>
 where
     R: ValueResolver<'a, P, KC, IC>,
     P: Pager,
@@ -905,10 +906,7 @@ where
 }
 
 /// Strict less-than for an encoded key slice (reverse hop).
-fn descend_lt_encoded<'a, R, P, KC, IC>(
-    r: &R,
-    enc: &[u8],
-) -> Result<(P::Page, NodeView<P>, usize, Option<P::Id>), Error>
+fn descend_lt_encoded<'a, R, P, KC, IC>(r: &R, enc: &[u8]) -> CursorStepRes<P>
 where
     R: ValueResolver<'a, P, KC, IC>,
     P: Pager,
@@ -1011,10 +1009,7 @@ where
 // New small helpers to start from generic `Bound`s
 // ------------------------------------------------------------------
 
-fn descend_lower_pos<'a, R, P, KC, IC>(
-    r: &R,
-    bound: Bound<&KC::Key>,
-) -> Result<(P::Page, NodeView<P>, usize, Option<P::Id>), Error>
+fn descend_lower_pos<'a, R, P, KC, IC>(r: &R, bound: Bound<&KC::Key>) -> CursorStepRes<P>
 where
     R: ValueResolver<'a, P, KC, IC>,
     P: Pager,
@@ -1040,10 +1035,7 @@ where
     }
 }
 
-fn descend_from_upper<'a, R, P, KC, IC>(
-    r: &R,
-    bound: Bound<&KC::Key>,
-) -> Result<(P::Page, NodeView<P>, usize, Option<P::Id>), Error>
+fn descend_from_upper<'a, R, P, KC, IC>(r: &R, bound: Bound<&KC::Key>) -> CursorStepRes<P>
 where
     R: ValueResolver<'a, P, KC, IC>,
     P: Pager,
