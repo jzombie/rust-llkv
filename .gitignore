@@ -1,0 +1,19 @@
+**/target
+
+out.txt
+
+# Local Cargo overrides
+.cargo/config.toml
+
+# Depending on how the fastembed example is run, this cache could
+# wind up in multiple places
+**/.fastembed_cache/*
+
+# SIMD R Drive data stores (and other binaries)
+**/*.bin
+
+# Profiler info
+**/profile.json.gz
+
+# Temp DB files
+**.db

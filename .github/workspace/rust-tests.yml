@@ -1,0 +1,51 @@
+name: Rust Tests
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (OS=${{ matrix.os }}, Features=${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - name: "All Features"
+            flags: "--all-features"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Added caching step to speed up dependency builds.
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.flags }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
+
+      - name: Build
+        run: cargo build --workspace --all-targets ${{ matrix.flags }}
+
+      - name: Test
+        run: cargo test --workspace --all-targets --verbose ${{ matrix.flags }}
+
+      # Added step to ensure benchmarks compile. `--no-run` is important.
+      - name: Check benchmarks compile
+        run: cargo bench --workspace --no-run ${{ matrix.flags }}
