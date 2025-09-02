@@ -153,7 +153,7 @@ fn ops_range_boundaries_u64() -> Result<(), Box<dyn std::error::Error>> {
             let mut want: Vec<(u64, Vec<u8>)> = mv
                 .iter()
                 .filter(|(k, _)| {
-                    let ok_lo = lo.map_or(true, |l| **k >= l);
+                    let ok_lo = lo.is_none_or(|l| **k >= l);
                     let ok_up = match (up, incl) {
                         (Some(u), true) => **k <= u,
                         (Some(u), false) => **k < u,

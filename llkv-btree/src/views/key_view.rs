@@ -13,14 +13,15 @@ impl<Page> KeyRef<Page>
 where
     Page: Clone + core::ops::Deref<Target = [u8]>,
 {
-    #[inline]
-    pub(crate) fn new(page: Page, range: core::ops::Range<usize>) -> Self {
-        Self { page, range }
-    }
+    // TODO: Use?
+    // #[inline]
+    // pub(crate) fn new(page: Page, range: core::ops::Range<usize>) -> Self {
+    //     Self { page, range }
+    // }
 
     #[inline]
     pub(crate) fn from_subslice(page: Page, sub: &[u8]) -> Self {
-        let pb: &[u8] = &*page;
+        let pb: &[u8] = &page;
         let base = pb.as_ptr() as usize;
         let start = sub.as_ptr() as usize - base;
         let end = start + sub.len();
