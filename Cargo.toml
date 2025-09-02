@@ -5,6 +5,7 @@ publish = false
 
 [workspace.dependencies]
 llkv-btree = { path = "./llkv-btree", version = "0.1.0-alpha" }
+llkv-storage = { path = "./llkv-storage", version = "0.1.0-alpha" }
 
 # Vendor crates
 criterion = "0.7.0"
@@ -18,5 +19,6 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 [workspace]
 members = [
     "llkv-btree",
+    "llkv-storage",
 ]
 resolver = "2"

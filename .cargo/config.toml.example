@@ -1,0 +1,2 @@
+[patch.crates-io]
+simd-r-drive = { path = "../rust-simd-r-drive" }
