@@ -40,16 +40,26 @@
 //!     Open `large_tree.png` or `large_tree.svg` in any image viewer to see
 //!     the visual structure of your B+Tree.
 
-use llkv_btree::BPlusTree;
-use llkv_btree::codecs::{BigEndianIdCodec, BigEndianKeyCodec};
-use llkv_btree::pager::MemPager64;
+#[cfg(feature = "debug")]
+use llkv_btree::{
+    BPlusTree,
+    codecs::{BigEndianIdCodec, BigEndianKeyCodec},
+    pager::MemPager64,
+};
+
+#[cfg(feature = "debug")]
 use llkv_btree::traits::GraphvizExt;
 
-use rand::rngs::StdRng;
-use rand::{SeedableRng, seq::SliceRandom};
-use std::fs::File;
-use std::io::Write;
+#[cfg(feature = "debug")]
+use rand::{
+    rngs::StdRng,
+    {SeedableRng, seq::SliceRandom},
+};
 
+#[cfg(feature = "debug")]
+use std::{fs::File, io::Write};
+
+#[cfg(feature = "debug")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Set up the pager and create an empty tree.
     // We now use the standard `MemPager64` from the library.
@@ -91,4 +101,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Follow the instructions at the top of 'examples/visualize.rs' to view it.");
 
     Ok(())
+}
+
+#[cfg(not(feature = "debug"))]
+fn main() {
+    use std::io::Write as _;
+
+    let msg = "\n\
+============================================================\n\
+  This example requires the `debug` feature.\n\
+------------------------------------------------------------\n\
+  Try one of the following:\n\
+    cargo run --example visualize --features debug\n\
+    cargo build --examples --features debug\n\
+============================================================\n\n";
+
+    let _ = std::io::stderr().write_all(msg.as_bytes());
+    std::process::exit(1);
 }

@@ -232,11 +232,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a82ae493e598baaea5209805c49bbf2ea7de956d50d7da0da1164f9c6d28543"
 
 [[package]]
+name = "line-ending"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "834e592123b39b7b3ba3fdc4b7e4822fad3ced449010f8229f843fe6dd1a33f1"
+
+[[package]]
 name = "llkv-btree"
 version = "0.1.0-alpha"
 dependencies = [
  "criterion",
  "crossbeam-channel",
+ "line-ending",
+ "llkv-btree",
  "rand",
  "rayon",
  "rustc-hash",

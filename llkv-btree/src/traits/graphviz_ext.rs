@@ -1,8 +1,15 @@
-use crate::bplus_tree::{BPlusTree, Node, SharedBPlusTree};
-use crate::codecs::{IdCodec, KeyCodec};
-use crate::errors::Error;
-use crate::pager::Pager;
+#[cfg(feature = "debug")]
+use crate::{
+    bplus_tree::{BPlusTree, Node, SharedBPlusTree},
+    codecs::{IdCodec, KeyCodec},
+    errors::Error,
+    pager::Pager,
+};
 
+#[cfg(feature = "debug")]
+use line_ending::LineEnding;
+
+#[cfg(feature = "debug")]
 pub trait GraphvizExt {
     fn to_dot(&self) -> Result<String, Error>;
 
@@ -10,8 +17,11 @@ pub trait GraphvizExt {
     fn to_canonicalized_dot(&self) -> Result<String, Error> {
         use std::collections::BTreeMap;
 
-        let dot: &str = &self.to_dot()?;
+        // Own the String and normalize line endings via the crate.
+        let dot_raw = self.to_dot()?;
+        let dot = LineEnding::normalize(&dot_raw);
 
+        // Canonicalize 'node_<...>' to N0, N1, ...
         let b = dot.as_bytes();
         let mut out = String::with_capacity(dot.len());
         let mut map: BTreeMap<String, String> = BTreeMap::new();
@@ -30,12 +40,12 @@ pub trait GraphvizExt {
                     j += 1;
                 }
                 let tag = &dot[i..j];
-                let entry = map.entry(tag.to_string()).or_insert_with(|| {
+                let name = map.entry(tag.to_string()).or_insert_with(|| {
                     let s = format!("N{}", next);
                     next += 1;
                     s
                 });
-                out.push_str(entry);
+                out.push_str(name);
                 i = j;
             } else {
                 out.push(b[i] as char);
@@ -43,22 +53,21 @@ pub trait GraphvizExt {
             }
         }
 
+        // Collapse horizontal whitespace, preserve '\n'.
         let mut norm = String::with_capacity(out.len());
-        let mut in_horizontal_whitespace = false;
+        let mut in_hspace = false;
         for ch in out.chars() {
-            if ch == '\n' || ch == '\r' {
-                // Push newline characters as-is
-                norm.push(ch);
-                in_horizontal_whitespace = false; // Reset the state for horizontal whitespace
+            if ch == '\n' {
+                norm.push('\n');
+                in_hspace = false;
             } else if ch.is_ascii_whitespace() {
-                // For other whitespace (spaces, tabs), collapse them
-                if !in_horizontal_whitespace {
+                if !in_hspace {
                     norm.push(' ');
-                    in_horizontal_whitespace = true;
+                    in_hspace = true;
                 }
             } else {
                 norm.push(ch);
-                in_horizontal_whitespace = false;
+                in_hspace = false;
             }
         }
 
@@ -66,6 +75,7 @@ pub trait GraphvizExt {
     }
 }
 
+#[cfg(feature = "debug")]
 impl<P, KC, IC> GraphvizExt for BPlusTree<P, KC, IC>
 where
     P: Pager,
@@ -153,6 +163,7 @@ where
     }
 }
 
+#[cfg(feature = "debug")]
 impl<P, KC, IC> GraphvizExt for SharedBPlusTree<P, KC, IC>
 where
     P: Pager + Clone,
