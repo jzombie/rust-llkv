@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 
+use crate::codecs::decode_root_id;
 use crate::expr::{Expr, Filter, Operator};
-use crate::types::{ColumnTree, FieldId, OnRowOf, PrimaryIndexTree, RowId, RowIdCmp, RowIdSetTree};
+use crate::types::{
+    ColumnTree, ColumnValue, FieldId, IndexKey, IndexKeyCodec, OnRowOf, PrimaryIndexTree, RootId,
+    RootIdBytes, RowId, RowIdCmp, RowIdKeyCodec, RowIdSetTree,
+};
 use crossbeam_channel as xchan;
-use llkv_btree::codecs::{BigEndianKeyCodec, KeyCodec};
+use llkv_btree::codecs::KeyCodec;
 use llkv_btree::errors::Error;
 use llkv_btree::iter::{BPlusTreeIter, ScanOpts};
 use llkv_btree::pager::{MemPager64, Pager as BTreePager, SharedPager};
@@ -21,7 +25,7 @@ pub struct TableCfg {
 /// The Table manages a collection of B-Trees for columns and indexes.
 pub struct Table<P>
 where
-    P: BTreePager<Id = u64> + Clone + Send + Sync + 'static,
+    P: BTreePager<Id = RootId> + Clone + Send + Sync + 'static,
     <P as BTreePager>::Page: Send + Sync + 'static,
 {
     columns: BTreeMap<FieldId, ColumnTree<P>>,
@@ -39,7 +43,7 @@ impl Table<SharedPager<MemPager64>> {
 
 impl<P> Table<P>
 where
-    P: BTreePager<Id = u64> + Clone + Send + Sync + 'static,
+    P: BTreePager<Id = RootId> + Clone + Send + Sync + 'static,
     <P as BTreePager>::Page: Send + Sync + 'static,
 {
     pub fn with_pager(pager: P) -> Self {
@@ -60,15 +64,13 @@ where
         self.indexes.insert(field_id, index_tree);
     }
 
-    // TODO: Remove complex type after figuring out u64, Vec<u8> replacements
-    #[allow(clippy::type_complexity)]
     pub fn insert_many(
         &self,
-        rows: &[(RowId, HashMap<FieldId, (u64, Vec<u8>)>)],
+        rows: &[(RowId, HashMap<FieldId, (IndexKey, ColumnValue)>)],
     ) -> Result<(), Error> {
         // Step 1: Aggregate all writes across all rows (sequentially, this is fast)
         let mut all_column_writes: BTreeMap<FieldId, Vec<(RowId, &[u8])>> = BTreeMap::new();
-        let mut all_index_updates: BTreeMap<FieldId, Vec<(u64, RowId)>> = BTreeMap::new();
+        let mut all_index_updates: BTreeMap<FieldId, Vec<(IndexKey, RowId)>> = BTreeMap::new();
 
         for (row_id, data) in rows {
             for (field_id, (index_key, value)) in data {
@@ -117,30 +119,26 @@ where
     fn update_index_parallel(
         &self,
         primary_index: &PrimaryIndexTree<P>,
-        updates: Vec<(u64, RowId)>,
+        updates: Vec<(IndexKey, RowId)>,
     ) -> Result<(), Error> {
-        let mut updates_by_key: BTreeMap<u64, Vec<RowId>> = BTreeMap::new();
+        let mut updates_by_key: BTreeMap<IndexKey, Vec<RowId>> = BTreeMap::new();
         for (index_key, row_id) in updates {
             updates_by_key.entry(index_key).or_default().push(row_id);
         }
 
-        let unique_keys: Vec<u64> = updates_by_key.keys().cloned().collect();
+        let unique_keys: Vec<IndexKey> = updates_by_key.keys().cloned().collect();
         let primary_snapshot = primary_index.snapshot();
-        let existing_roots_map: HashMap<u64, u64> = primary_snapshot
+        // TODO: Use FxHashMap
+        let existing_roots_map: HashMap<IndexKey, RootId> = primary_snapshot
             .get_many(&unique_keys)?
             .into_iter()
             .enumerate()
             .filter_map(|(i, root_ref_opt)| {
-                root_ref_opt.map(|r| {
-                    (
-                        unique_keys[i],
-                        u64::from_be_bytes(r.as_ref().try_into().unwrap()),
-                    )
-                })
+                root_ref_opt.map(|r| (unique_keys[i], decode_root_id(&r)))
             })
             .collect();
 
-        let new_primary_entries: Vec<(u64, [u8; 8])> = updates_by_key
+        let new_primary_entries: Vec<(IndexKey, RootIdBytes)> = updates_by_key
             .into_par_iter()
             .filter_map(|(index_key, row_ids)| {
                 if let Some(root_id) = existing_roots_map.get(&index_key) {
@@ -160,7 +158,7 @@ where
             .collect();
 
         if !new_primary_entries.is_empty() {
-            let writes_slice: Vec<(u64, &[u8])> = new_primary_entries
+            let writes_slice: Vec<(IndexKey, &[u8])> = new_primary_entries
                 .iter()
                 .map(|(k, v)| (*k, &v[..]))
                 .collect();
@@ -199,7 +197,7 @@ where
     fn get_row_id_stream<'b>(
         &'b self,
         expr: &Expr<'b>,
-    ) -> Result<Option<xchan::Receiver<u64>>, Error> {
+    ) -> Result<Option<xchan::Receiver<RowId>>, Error> {
         match expr {
             Expr::Pred(filter) => self.get_stream_for_predicate(filter),
             Expr::And(sub_expressions) => {
@@ -219,12 +217,12 @@ where
 
                 let (tx, rx) = xchan::unbounded();
                 thread::spawn(move || {
-                    let mut intersection: HashSet<u64> = streams.remove(0).into_iter().collect();
+                    let mut intersection: HashSet<RowId> = streams.remove(0).into_iter().collect();
                     for stream in streams {
                         if intersection.is_empty() {
                             break;
                         }
-                        let next_set: HashSet<u64> = stream.into_iter().collect();
+                        let next_set: HashSet<RowId> = stream.into_iter().collect();
                         intersection.retain(|item| next_set.contains(item));
                     }
 
@@ -270,26 +268,28 @@ where
     fn get_stream_for_predicate<'b>(
         &'b self,
         filter: &Filter<'b>,
-    ) -> Result<Option<xchan::Receiver<u64>>, Error> {
+    ) -> Result<Option<xchan::Receiver<RowId>>, Error> {
         if let Some(primary_index) = self.indexes.get(&filter.field) {
             match filter.op {
                 Operator::Equals(val) => {
-                    let index_key = BigEndianKeyCodec::<u64>::decode_from(val)?;
+                    let index_key = IndexKeyCodec::decode_from(val)?;
                     let primary_snapshot = primary_index.snapshot();
                     if let Some(root_id_ref) = primary_snapshot.get(&index_key)? {
-                        let root_id = u64::from_be_bytes(root_id_ref.as_ref().try_into().unwrap());
+                        let root_id = decode_root_id(&root_id_ref);
                         let (tx, rx) = xchan::unbounded();
                         let pager = self.pager.clone();
-                        thread::spawn(move || {
+
+                        std::thread::spawn(move || {
                             let row_id_set = RowIdSetTree::open(pager, root_id, None);
                             let snapshot = row_id_set.snapshot();
                             if let Ok(iter) = snapshot.iter() {
-                                for (row_id_ref, _value) in iter {
+                                for (row_id_ref, _) in iter {
                                     if let Ok(row_id) =
-                                        BigEndianKeyCodec::<u64>::decode_from(row_id_ref.as_ref())
-                                        && tx.send(row_id).is_err()
+                                        RowIdKeyCodec::decode_from(row_id_ref.as_ref())
                                     {
-                                        break;
+                                        if tx.send(row_id).is_err() {
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -298,15 +298,16 @@ where
                     }
                 }
                 Operator::Range { lower, upper } => {
-                    let lower_key = match lower {
+                    let lower_key: Option<IndexKey> = match lower {
                         Bound::Included(b) | Bound::Excluded(b) => {
-                            Some(BigEndianKeyCodec::<u64>::decode_from(b)?)
+                            Some(IndexKeyCodec::decode_from(b)?)
                         }
                         Bound::Unbounded => None,
                     };
-                    let upper_key = match upper {
+
+                    let upper_key: Option<IndexKey> = match upper {
                         Bound::Included(b) | Bound::Excluded(b) => {
-                            Some(BigEndianKeyCodec::<u64>::decode_from(b)?)
+                            Some(IndexKeyCodec::decode_from(b)?)
                         }
                         Bound::Unbounded => None,
                     };
@@ -322,11 +323,10 @@ where
                     };
                     let opts = ScanOpts::forward().with_bounds(lower_bound, upper_bound);
                     let primary_snapshot = primary_index.snapshot();
-                    let mut root_ids = Vec::new();
+                    let mut root_ids: Vec<RootId> = Vec::new();
                     if let Ok(primary_iter) = BPlusTreeIter::with_opts(&primary_snapshot, opts) {
                         for (_, root_id_ref) in primary_iter {
-                            root_ids
-                                .push(u64::from_be_bytes(root_id_ref.as_ref().try_into().unwrap()));
+                            root_ids.push(decode_root_id(&root_id_ref));
                         }
                     }
                     let (tx, rx) = xchan::unbounded();
@@ -335,13 +335,15 @@ where
                         root_ids.into_par_iter().for_each(|root_id| {
                             let row_id_set = RowIdSetTree::open(pager.clone(), root_id, None);
                             let snapshot = row_id_set.snapshot();
+
                             if let Ok(iter) = snapshot.iter() {
                                 for (row_id_ref, _) in iter {
                                     if let Ok(row_id) =
-                                        BigEndianKeyCodec::<u64>::decode_from(row_id_ref.as_ref())
-                                        && tx.send(row_id).is_err()
+                                        RowIdKeyCodec::decode_from(row_id_ref.as_ref())
                                     {
-                                        break;
+                                        if tx.send(row_id).is_err() {
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -502,7 +504,7 @@ mod tests {
         let num_rows = 5000;
         let mut rows_to_insert = Vec::with_capacity(num_rows);
         for i in 0..num_rows {
-            let row_id = i as u64;
+            let row_id = i as RowId;
             let mut row_data = HashMap::new();
 
             // Indexed columns
@@ -704,7 +706,7 @@ mod tests {
         let num_rows = 15_000;
         let mut rows_to_insert = Vec::with_capacity(num_rows);
         for i in 0..num_rows {
-            let row_id = i as u64;
+            let row_id = i as RowId;
             let mut row_data = HashMap::new();
             row_data.insert(1, (row_id % 10, vec![]));
             row_data.insert(2, (row_id % 5, vec![]));

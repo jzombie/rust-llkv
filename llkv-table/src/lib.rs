@@ -1,7 +1,6 @@
-// llkv-table/src/lib.rs
-
 #![forbid(unsafe_code)]
 
+pub mod codecs;
 pub mod expr;
 pub mod table;
 pub mod types;
