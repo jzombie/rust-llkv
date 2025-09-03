@@ -3,8 +3,8 @@
 use crate::codecs::decode_root_id;
 use crate::expr::{Expr, Filter, Operator};
 use crate::types::{
-    ColumnInput, ColumnTree, FieldId, IndexKey, IndexKeyCodec, OnRowOf, PrimaryIndexTree, RootId,
-    RootIdBytes, RowId, RowIdCmp, RowIdKeyCodec, RowIdSetTree,
+    ColumnTree, FieldId, IndexKey, IndexKeyCodec, OnRowOf, PrimaryIndexTree, RootId, RootIdBytes,
+    RowId, RowIdCmp, RowIdKeyCodec, RowIdSetTree, RowPatch,
 };
 use crossbeam_channel as xchan;
 use llkv_btree::codecs::KeyCodec;
@@ -64,10 +64,7 @@ where
         self.indexes.insert(field_id, index_tree);
     }
 
-    pub fn insert_many<'a>(
-        &self,
-        rows: &[(RowId, HashMap<FieldId, (IndexKey, ColumnInput<'a>)>)],
-    ) -> Result<(), Error> {
+    pub fn insert_many(&self, rows: &[RowPatch]) -> Result<(), Error> {
         // Step 1: Aggregate all writes across all rows (sequentially, this is fast)
         let mut all_column_writes: BTreeMap<FieldId, Vec<(RowId, &[u8])>> = BTreeMap::new();
         let mut all_index_updates: BTreeMap<FieldId, Vec<(IndexKey, RowId)>> = BTreeMap::new();
@@ -77,7 +74,7 @@ where
                 all_column_writes
                     .entry(*field_id)
                     .or_default()
-                    .push((*row_id, &*value));
+                    .push((*row_id, &**value));
 
                 if self.indexes.contains_key(field_id) {
                     all_index_updates
@@ -362,6 +359,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::EMPTY_COL;
     use crate::expr::Filter;
     use std::collections::HashSet;
 
@@ -417,27 +415,27 @@ mod tests {
             .insert_many(&[
                 (
                     1,
-                    HashMap::from([(1, (100u64, b"".into())), (2, (0u64, b"data_100".into()))]),
+                    HashMap::from([(1, (100u64, EMPTY_COL)), (2, (0u64, b"data_100".into()))]),
                 ),
                 (
                     2,
-                    HashMap::from([(1, (101u64, b"".into())), (2, (0u64, b"data_101".into()))]),
+                    HashMap::from([(1, (101u64, EMPTY_COL)), (2, (0u64, b"data_101".into()))]),
                 ),
                 (
                     3,
-                    HashMap::from([(1, (102u64, b"".into())), (2, (0u64, b"data_102".into()))]),
+                    HashMap::from([(1, (102u64, EMPTY_COL)), (2, (0u64, b"data_102".into()))]),
                 ),
                 (
                     4,
-                    HashMap::from([(1, (103u64, b"".into())), (2, (0u64, b"data_103".into()))]),
+                    HashMap::from([(1, (103u64, EMPTY_COL)), (2, (0u64, b"data_103".into()))]),
                 ),
                 (
                     5,
-                    HashMap::from([(1, (104u64, b"".into())), (2, (0u64, b"data_104".into()))]),
+                    HashMap::from([(1, (104u64, EMPTY_COL)), (2, (0u64, b"data_104".into()))]),
                 ),
                 (
                     6,
-                    HashMap::from([(1, (105u64, b"".into())), (2, (0u64, b"data_105".into()))]),
+                    HashMap::from([(1, (105u64, EMPTY_COL)), (2, (0u64, b"data_105".into()))]),
                 ),
             ])
             .unwrap();
@@ -497,9 +495,9 @@ mod tests {
             let mut row_data = HashMap::new();
 
             // Indexed columns
-            row_data.insert(1, (1000 + row_id, b"".into())); // Unique key
-            row_data.insert(2, (row_id % 100, b"".into())); // 100 different keys
-            row_data.insert(3, (row_id % 5, b"".into())); // 5 different keys
+            row_data.insert(1, (1000 + row_id, EMPTY_COL)); // Unique key
+            row_data.insert(2, (row_id % 100, EMPTY_COL)); // 100 different keys
+            row_data.insert(3, (row_id % 5, EMPTY_COL)); // 5 different keys
 
             // Non-indexed data payload columns
             for j in 4..=10 {
@@ -591,40 +589,40 @@ mod tests {
             (
                 10,
                 HashMap::from([
-                    (1, (1, b"".into())),
-                    (2, (10, b"".into())),
+                    (1, (1, EMPTY_COL)),
+                    (2, (10, EMPTY_COL)),
                     (3, (0, b"Restaurant in NYC".into())),
                 ]),
             ),
             (
                 20,
                 HashMap::from([
-                    (1, (1, b"".into())),
-                    (2, (20, b"".into())),
+                    (1, (1, EMPTY_COL)),
+                    (2, (20, EMPTY_COL)),
                     (3, (0, b"Museum in NYC".into())),
                 ]),
             ),
             (
                 30,
                 HashMap::from([
-                    (1, (2, b"".into())),
-                    (2, (10, b"".into())),
+                    (1, (2, EMPTY_COL)),
+                    (2, (10, EMPTY_COL)),
                     (3, (0, b"Restaurant in London".into())),
                 ]),
             ),
             (
                 40,
                 HashMap::from([
-                    (1, (2, b"".into())),
-                    (2, (30, b"".into())),
+                    (1, (2, EMPTY_COL)),
+                    (2, (30, EMPTY_COL)),
                     (3, (0, b"Theatre in London".into())),
                 ]),
             ),
             (
                 50,
                 HashMap::from([
-                    (1, (1, b"".into())),
-                    (2, (10, b"".into())),
+                    (1, (1, EMPTY_COL)),
+                    (2, (10, EMPTY_COL)),
                     (3, (0, b"Another Restaurant in NYC".into())),
                 ]),
             ),
@@ -700,11 +698,11 @@ mod tests {
         for i in 0..num_rows {
             let row_id = i as RowId;
             let mut row_data = HashMap::new();
-            row_data.insert(1, (row_id % 10, b"".into()));
-            row_data.insert(2, (row_id % 5, b"".into()));
-            row_data.insert(3, (row_id % 100, b"".into()));
+            row_data.insert(1, (row_id % 10, EMPTY_COL));
+            row_data.insert(2, (row_id % 5, EMPTY_COL));
+            row_data.insert(3, (row_id % 100, EMPTY_COL));
             for j in 4..=10 {
-                row_data.insert(j, (0, b"".into()));
+                row_data.insert(j, (0, EMPTY_COL));
             }
             rows_to_insert.push((row_id, row_data));
         }

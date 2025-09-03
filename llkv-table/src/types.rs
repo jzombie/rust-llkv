@@ -5,6 +5,7 @@
 use core::cmp::Ordering;
 use llkv_btree::{pager::Pager as BTreePager, views::value_view::ValueRef};
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 /// Field identifier type for addressing columns.
 ///
@@ -48,6 +49,8 @@ pub type ColumnTree<P> = llkv_btree::bplus_tree::SharedBPlusTree<P, RowIdKeyCode
 pub type PrimaryIndexTree<P> =
     llkv_btree::bplus_tree::SharedBPlusTree<P, IndexKeyCodec, RootIdIdCodec>;
 pub type RowIdSetTree<P> = llkv_btree::bplus_tree::SharedBPlusTree<P, RowIdKeyCodec, RootIdIdCodec>;
+
+pub type RowPatch<'a> = (RowId, HashMap<FieldId, (IndexKey, ColumnInput<'a>)>);
 
 #[cfg(test)]
 mod tests {

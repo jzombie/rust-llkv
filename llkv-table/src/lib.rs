@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod codecs;
+pub mod constants;
 pub mod expr;
 pub mod table;
 pub mod types;
