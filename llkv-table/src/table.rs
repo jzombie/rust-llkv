@@ -61,51 +61,50 @@ impl Table {
         self.indexes.insert(field_id, index_tree);
     }
 
-    pub fn insert(
+    pub fn insert_many(
         &mut self,
-        row_id: RowId,
-        data: HashMap<FieldId, (u64, Vec<u8>)>,
+        rows: &[(RowId, HashMap<FieldId, (u64, Vec<u8>)>)],
     ) -> Result<(), Error> {
-        // --- Step 1: Group all writes by FieldId ---
-        let mut column_writes: BTreeMap<FieldId, Vec<(RowId, &[u8])>> = BTreeMap::new();
-        let mut index_updates: BTreeMap<FieldId, Vec<(u64, RowId)>> = BTreeMap::new();
+        // --- Step 1: Aggregate all writes across all rows ---
+        let mut all_column_writes: BTreeMap<FieldId, Vec<(RowId, &[u8])>> = BTreeMap::new();
+        let mut all_index_updates: BTreeMap<FieldId, Vec<(u64, RowId)>> = BTreeMap::new();
 
-        for (field_id, (index_key, value)) in &data {
-            column_writes
-                .entry(*field_id)
-                .or_default()
-                .push((row_id, value.as_slice()));
-            if self.indexes.contains_key(field_id) {
-                index_updates
+        for (row_id, data) in rows {
+            for (field_id, (index_key, value)) in data {
+                all_column_writes
                     .entry(*field_id)
                     .or_default()
-                    .push((*index_key, row_id));
+                    .push((*row_id, value.as_slice()));
+
+                if self.indexes.contains_key(field_id) {
+                    all_index_updates
+                        .entry(*field_id)
+                        .or_default()
+                        .push((*index_key, *row_id));
+                }
             }
         }
 
         // --- Step 2: Perform batched column writes ---
-        for (field_id, writes) in column_writes {
+        for (field_id, writes) in all_column_writes {
             if let Some(column_tree) = self.columns.get_mut(&field_id) {
                 column_tree.insert_many(&writes)?;
             }
         }
 
         // --- Step 3: Perform batched index writes ---
-        for (field_id, updates) in index_updates {
+        for (field_id, updates) in all_index_updates {
             if let Some(primary_index) = self.indexes.get_mut(&field_id) {
-                // --- Step 3a: Partition updates based on whether the index key is new or existing ---
-                let mut existing_roots_to_update: BTreeMap<u64, Vec<RowId>> = BTreeMap::new();
-                let mut new_roots_to_create: BTreeMap<u64, Vec<RowId>> = BTreeMap::new();
+                // Group updates by index_key to handle multiple rows updating the same index value.
+                let mut updates_by_key: BTreeMap<u64, Vec<RowId>> = BTreeMap::new();
+                for (index_key, row_id) in updates {
+                    updates_by_key.entry(index_key).or_default().push(row_id);
+                }
 
-                // Find all unique keys and get their status in one batch
-                let unique_keys: Vec<u64> = updates
-                    .iter()
-                    .map(|(k, _)| *k)
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect();
-
+                let unique_keys: Vec<u64> = updates_by_key.keys().cloned().collect();
                 let snapshot = primary_index.snapshot();
+
+                // Get all existing secondary tree roots in one batch.
                 let existing_roots_map: HashMap<u64, u64> = snapshot
                     .get_many(&unique_keys)?
                     .into_iter()
@@ -120,33 +119,16 @@ impl Table {
                     })
                     .collect();
 
-                // Partition the updates based on whether the key already exists in the primary index
-                for (index_key, row_id) in updates {
-                    if existing_roots_map.contains_key(&index_key) {
-                        existing_roots_to_update
-                            .entry(index_key)
-                            .or_default()
-                            .push(row_id);
+                let mut new_primary_entries = Vec::new();
+
+                for (index_key, row_ids) in updates_by_key {
+                    if let Some(root_id) = existing_roots_map.get(&index_key) {
+                        // UPDATE existing secondary tree with all its new row_ids in one batch.
+                        let mut row_id_set = RowIdSetTree::open(self.pager.clone(), *root_id, None);
+                        let writes: Vec<_> = row_ids.iter().map(|rid| (*rid, &[][..])).collect();
+                        row_id_set.insert_many(&writes)?;
                     } else {
-                        new_roots_to_create
-                            .entry(index_key)
-                            .or_default()
-                            .push(row_id);
-                    }
-                }
-
-                // --- Step 3b: Process updates to existing secondary trees ---
-                for (index_key, row_ids) in existing_roots_to_update {
-                    let root_id = existing_roots_map.get(&index_key).unwrap();
-                    let mut row_id_set = RowIdSetTree::open(self.pager.clone(), *root_id, None);
-                    let writes: Vec<_> = row_ids.iter().map(|rid| (*rid, &[][..])).collect();
-                    row_id_set.insert_many(&writes)?;
-                }
-
-                // --- Step 3c: Process creations of new secondary trees and batch the primary index update ---
-                if !new_roots_to_create.is_empty() {
-                    let mut new_primary_entries = Vec::new();
-                    for (index_key, row_ids) in new_roots_to_create {
+                        // CREATE new secondary tree and add all its row_ids in one batch.
                         let mut new_row_id_set =
                             RowIdSetTree::create_empty(self.pager.clone(), None)?;
                         let writes: Vec<_> = row_ids.iter().map(|rid| (*rid, &[][..])).collect();
@@ -154,6 +136,10 @@ impl Table {
                         let new_root_id = new_row_id_set.snapshot().root_id();
                         new_primary_entries.push((index_key, new_root_id.to_be_bytes()));
                     }
+                }
+
+                // Batch insert all new primary index entries.
+                if !new_primary_entries.is_empty() {
                     let writes_slice: Vec<(u64, &[u8])> = new_primary_entries
                         .iter()
                         .map(|(k, v)| (*k, v.as_slice()))
@@ -306,9 +292,9 @@ mod tests {
             (2, (0u64, b"UK".to_vec())),
         ]);
 
-        table.insert(101, row1).unwrap();
-        table.insert(102, row2).unwrap();
-        table.insert(103, row3).unwrap();
+        table
+            .insert_many(&[(101, row1), (102, row2), (103, row3)])
+            .unwrap();
 
         let filter = Filter {
             field: 1,
@@ -341,42 +327,33 @@ mod tests {
         table.add_index(1);
         table.add_column(2); // Data
 
-        // Insert data with user IDs from 100 to 105
         table
-            .insert(
-                1,
-                HashMap::from([(1, (100u64, vec![])), (2, (0u64, b"data_100".to_vec()))]),
-            )
-            .unwrap();
-        table
-            .insert(
-                2,
-                HashMap::from([(1, (101u64, vec![])), (2, (0u64, b"data_101".to_vec()))]),
-            )
-            .unwrap();
-        table
-            .insert(
-                3,
-                HashMap::from([(1, (102u64, vec![])), (2, (0u64, b"data_102".to_vec()))]),
-            )
-            .unwrap();
-        table
-            .insert(
-                4,
-                HashMap::from([(1, (103u64, vec![])), (2, (0u64, b"data_103".to_vec()))]),
-            )
-            .unwrap();
-        table
-            .insert(
-                5,
-                HashMap::from([(1, (104u64, vec![])), (2, (0u64, b"data_104".to_vec()))]),
-            )
-            .unwrap();
-        table
-            .insert(
-                6,
-                HashMap::from([(1, (105u64, vec![])), (2, (0u64, b"data_105".to_vec()))]),
-            )
+            .insert_many(&[
+                (
+                    1,
+                    HashMap::from([(1, (100u64, vec![])), (2, (0u64, b"data_100".to_vec()))]),
+                ),
+                (
+                    2,
+                    HashMap::from([(1, (101u64, vec![])), (2, (0u64, b"data_101".to_vec()))]),
+                ),
+                (
+                    3,
+                    HashMap::from([(1, (102u64, vec![])), (2, (0u64, b"data_102".to_vec()))]),
+                ),
+                (
+                    4,
+                    HashMap::from([(1, (103u64, vec![])), (2, (0u64, b"data_103".to_vec()))]),
+                ),
+                (
+                    5,
+                    HashMap::from([(1, (104u64, vec![])), (2, (0u64, b"data_104".to_vec()))]),
+                ),
+                (
+                    6,
+                    HashMap::from([(1, (105u64, vec![])), (2, (0u64, b"data_105".to_vec()))]),
+                ),
+            ])
             .unwrap();
 
         // Define bounds for the range scan: keys >= 102 and < 105
