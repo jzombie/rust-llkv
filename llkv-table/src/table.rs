@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use crate::expr::{Expr, Operator};
+use crate::expr::{Expr, Filter, Operator};
 use crossbeam_channel as xchan;
 use llkv_btree::codecs::{BigEndianIdCodec, BigEndianKeyCodec, KeyCodec};
 use llkv_btree::errors::Error;
@@ -11,6 +11,7 @@ use llkv_btree::shared_bplus_tree::SharedBPlusTree;
 use llkv_btree::views::value_view::ValueRef;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
+use std::thread;
 
 // --- Correct, Concrete Tree Types for our Table ---
 type Pager = SharedPager<MemPager64>;
@@ -185,79 +186,155 @@ impl Table {
         &'b self,
         expr: &Expr<'b>,
     ) -> Result<Option<xchan::Receiver<u64>>, Error> {
-        if let Expr::Pred(filter) = expr {
-            if let Some(primary_index) = self.indexes.get(&filter.field) {
-                match filter.op {
-                    Operator::Equals(val) => {
-                        let index_key = BigEndianKeyCodec::<u64>::decode_from(val)?;
-                        let snapshot = primary_index.snapshot();
-                        if let Some(root_id_ref) = snapshot.get(&index_key)? {
-                            let root_id =
-                                u64::from_be_bytes(root_id_ref.as_ref().try_into().unwrap());
-                            let row_id_set = RowIdSetTree::open(self.pager.clone(), root_id, None);
-                            let row_id_stream =
-                                row_id_set.start_stream_with_opts(ScanOpts::forward());
-                            let (tx, rx) = xchan::unbounded();
-                            std::thread::spawn(move || {
-                                for (row_id, _) in row_id_stream {
-                                    if tx.send(row_id).is_err() {
-                                        break;
-                                    }
-                                }
-                            });
-                            return Ok(Some(rx));
+        match expr {
+            Expr::Pred(filter) => self.get_stream_for_predicate(filter),
+            Expr::And(sub_expressions) => {
+                let mut streams: Vec<_> = sub_expressions
+                    .iter()
+                    .map(|sub_expr| self.get_row_id_stream(sub_expr))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+
+                if streams.is_empty() {
+                    let (tx, rx) = xchan::unbounded();
+                    drop(tx); // Immediately close, creating an empty stream
+                    return Ok(Some(rx));
+                }
+
+                let (tx, rx) = xchan::unbounded();
+                thread::spawn(move || {
+                    // Seed the intersection set with results from the first stream.
+                    let mut intersection: HashSet<u64> = streams.remove(0).into_iter().collect();
+
+                    // Filter this set by intersecting it with each subsequent stream.
+                    for stream in streams {
+                        let next_set: HashSet<u64> = stream.into_iter().collect();
+                        intersection.retain(|item| next_set.contains(item));
+                        if intersection.is_empty() {
+                            break;
                         }
                     }
-                    Operator::Range { lower, upper } => {
-                        let lower_key = match lower {
-                            Bound::Included(b) | Bound::Excluded(b) => {
-                                Some(BigEndianKeyCodec::<u64>::decode_from(b)?)
-                            }
-                            Bound::Unbounded => None,
-                        };
-                        let upper_key = match upper {
-                            Bound::Included(b) | Bound::Excluded(b) => {
-                                Some(BigEndianKeyCodec::<u64>::decode_from(b)?)
-                            }
-                            Bound::Unbounded => None,
-                        };
-                        let lower_bound = match (lower, lower_key.as_ref()) {
-                            (Bound::Included(_), Some(k)) => Bound::Included(k),
-                            (Bound::Excluded(_), Some(k)) => Bound::Excluded(k),
-                            _ => Bound::Unbounded,
-                        };
-                        let upper_bound = match (upper, upper_key.as_ref()) {
-                            (Bound::Included(_), Some(k)) => Bound::Included(k),
-                            (Bound::Excluded(_), Some(k)) => Bound::Excluded(k),
-                            _ => Bound::Unbounded,
-                        };
-                        let opts = ScanOpts::forward().with_bounds(lower_bound, upper_bound);
-                        let snapshot = primary_index.snapshot();
-                        let mut root_ids = Vec::new();
-                        if let Ok(primary_iter) = BPlusTreeIter::with_opts(&snapshot, opts) {
-                            for (_, root_id_ref) in primary_iter {
-                                root_ids.push(u64::from_be_bytes(
-                                    root_id_ref.as_ref().try_into().unwrap(),
-                                ));
-                            }
+
+                    for row_id in intersection {
+                        if tx.send(row_id).is_err() {
+                            break;
                         }
+                    }
+                });
+                Ok(Some(rx))
+            }
+            Expr::Or(sub_expressions) => {
+                let streams: Vec<_> = sub_expressions
+                    .iter()
+                    .map(|sub_expr| self.get_row_id_stream(sub_expr))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+
+                let (tx, rx) = xchan::unbounded();
+                thread::spawn(move || {
+                    let mut union_set = HashSet::new();
+                    for stream in streams {
+                        for row_id in stream {
+                            union_set.insert(row_id);
+                        }
+                    }
+
+                    for row_id in union_set {
+                        if tx.send(row_id).is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok(Some(rx))
+            }
+            Expr::Not(_) => {
+                // `Not` is complex and often requires a full table scan, which is not
+                // implemented. Returning an empty stream is a safe default.
+                // let (_tx, rx) = xchan::unbounded();
+                // Ok(Some(rx))
+
+                unimplemented!("`Not` is currently unimplemented");
+            }
+        }
+    }
+
+    fn get_stream_for_predicate<'b>(
+        &'b self,
+        filter: &Filter<'b>,
+    ) -> Result<Option<xchan::Receiver<u64>>, Error> {
+        if let Some(primary_index) = self.indexes.get(&filter.field) {
+            match filter.op {
+                Operator::Equals(val) => {
+                    let index_key = BigEndianKeyCodec::<u64>::decode_from(val)?;
+                    let snapshot = primary_index.snapshot();
+                    if let Some(root_id_ref) = snapshot.get(&index_key)? {
+                        let root_id = u64::from_be_bytes(root_id_ref.as_ref().try_into().unwrap());
+                        let row_id_set = RowIdSetTree::open(self.pager.clone(), root_id, None);
+                        let row_id_stream = row_id_set.start_stream_with_opts(ScanOpts::forward());
                         let (tx, rx) = xchan::unbounded();
-                        let pager = self.pager.clone();
                         std::thread::spawn(move || {
-                            for root_id in root_ids {
-                                let row_id_set = RowIdSetTree::open(pager.clone(), root_id, None);
-                                let row_id_rx =
-                                    row_id_set.start_stream_with_opts(ScanOpts::forward());
-                                for (row_id, _) in row_id_rx {
-                                    if tx.send(row_id).is_err() {
-                                        return;
-                                    }
+                            for (row_id, _) in row_id_stream {
+                                if tx.send(row_id).is_err() {
+                                    break;
                                 }
                             }
                         });
                         return Ok(Some(rx));
                     }
-                    _ => { /* Other operators not implemented yet */ }
+                }
+                Operator::Range { lower, upper } => {
+                    let lower_key = match lower {
+                        Bound::Included(b) | Bound::Excluded(b) => {
+                            Some(BigEndianKeyCodec::<u64>::decode_from(b)?)
+                        }
+                        Bound::Unbounded => None,
+                    };
+                    let upper_key = match upper {
+                        Bound::Included(b) | Bound::Excluded(b) => {
+                            Some(BigEndianKeyCodec::<u64>::decode_from(b)?)
+                        }
+                        Bound::Unbounded => None,
+                    };
+                    let lower_bound = match (lower, lower_key.as_ref()) {
+                        (Bound::Included(_), Some(k)) => Bound::Included(k),
+                        (Bound::Excluded(_), Some(k)) => Bound::Excluded(k),
+                        _ => Bound::Unbounded,
+                    };
+                    let upper_bound = match (upper, upper_key.as_ref()) {
+                        (Bound::Included(_), Some(k)) => Bound::Included(k),
+                        (Bound::Excluded(_), Some(k)) => Bound::Excluded(k),
+                        _ => Bound::Unbounded,
+                    };
+                    let opts = ScanOpts::forward().with_bounds(lower_bound, upper_bound);
+                    let snapshot = primary_index.snapshot();
+                    let mut root_ids = Vec::new();
+                    if let Ok(primary_iter) = BPlusTreeIter::with_opts(&snapshot, opts) {
+                        for (_, root_id_ref) in primary_iter {
+                            root_ids
+                                .push(u64::from_be_bytes(root_id_ref.as_ref().try_into().unwrap()));
+                        }
+                    }
+                    let (tx, rx) = xchan::unbounded();
+                    let pager = self.pager.clone();
+                    std::thread::spawn(move || {
+                        for root_id in root_ids {
+                            let row_id_set = RowIdSetTree::open(pager.clone(), root_id, None);
+                            let row_id_rx = row_id_set.start_stream_with_opts(ScanOpts::forward());
+                            for (row_id, _) in row_id_rx {
+                                if tx.send(row_id).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                    return Ok(Some(rx));
+                }
+                _ => {
+                    unimplemented!()
                 }
             }
         }
@@ -487,5 +564,109 @@ mod tests {
         // Each category has 5000 / 5 = 1000 rows. So 2000 total.
         assert_eq!(results_3.len(), 2000);
         assert!(results_3.iter().all(|&rid| rid % 5 == 2 || rid % 5 == 3));
+    }
+
+    #[test]
+    fn it_works_intersections_and_unions() {
+        let mut table = Table::new(4096);
+        table.add_column(1);
+        table.add_index(1); // City ID
+        table.add_column(2);
+        table.add_index(2); // Category ID
+        table.add_column(3); // Payload
+
+        let rows = vec![
+            (
+                10,
+                HashMap::from([
+                    (1, (1, vec![])),
+                    (2, (10, vec![])),
+                    (3, (0, b"Restaurant in NYC".to_vec())),
+                ]),
+            ),
+            (
+                20,
+                HashMap::from([
+                    (1, (1, vec![])),
+                    (2, (20, vec![])),
+                    (3, (0, b"Museum in NYC".to_vec())),
+                ]),
+            ),
+            (
+                30,
+                HashMap::from([
+                    (1, (2, vec![])),
+                    (2, (10, vec![])),
+                    (3, (0, b"Restaurant in London".to_vec())),
+                ]),
+            ),
+            (
+                40,
+                HashMap::from([
+                    (1, (2, vec![])),
+                    (2, (30, vec![])),
+                    (3, (0, b"Theatre in London".to_vec())),
+                ]),
+            ),
+            (
+                50,
+                HashMap::from([
+                    (1, (1, vec![])),
+                    (2, (10, vec![])),
+                    (3, (0, b"Another Restaurant in NYC".to_vec())),
+                ]),
+            ),
+        ];
+        table.insert_many(&rows).unwrap();
+
+        // --- Test 1: Intersection (AND) ---
+        // Find: Restaurants (category 10) in NYC (city 1)
+        let city_nyc = 1u64.to_be_bytes();
+        let cat_restaurant = 10u64.to_be_bytes();
+        let expr_and = Expr::And(vec![
+            Expr::Pred(Filter {
+                field: 1,
+                op: Operator::Equals(&city_nyc),
+            }),
+            Expr::Pred(Filter {
+                field: 2,
+                op: Operator::Equals(&cat_restaurant),
+            }),
+        ]);
+
+        let mut results_and = Vec::new();
+        table
+            .scan(&expr_and, &[], &mut |row_id, _| {
+                results_and.push(row_id);
+            })
+            .unwrap();
+
+        let expected_and: HashSet<u64> = [10, 50].iter().cloned().collect();
+        let got_and: HashSet<u64> = results_and.into_iter().collect();
+        assert_eq!(got_and, expected_and);
+
+        // --- Test 2: Union (OR) ---
+        // Find: anything in NYC (city 1) OR any Restaurant (category 10)
+        let expr_or = Expr::Or(vec![
+            Expr::Pred(Filter {
+                field: 1,
+                op: Operator::Equals(&city_nyc),
+            }),
+            Expr::Pred(Filter {
+                field: 2,
+                op: Operator::Equals(&cat_restaurant),
+            }),
+        ]);
+
+        let mut results_or = Vec::new();
+        table
+            .scan(&expr_or, &[], &mut |row_id, _| {
+                results_or.push(row_id);
+            })
+            .unwrap();
+
+        let expected_or: HashSet<u64> = [10, 20, 30, 50].iter().cloned().collect();
+        let got_or: HashSet<u64> = results_or.into_iter().collect();
+        assert_eq!(got_or, expected_or);
     }
 }
