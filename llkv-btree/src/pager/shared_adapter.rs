@@ -37,13 +37,13 @@ impl<P: Pager> Pager for SharedPager<P> {
     fn read_batch(&self, ids: &[Self::Id]) -> Result<FxHashMap<Self::Id, Self::Page>, Error> {
         self.inner.read().unwrap().read_batch(ids)
     }
-    fn write_batch(&mut self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error> {
+    fn write_batch(&self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error> {
         self.inner.write().unwrap().write_batch(pages)
     }
-    fn alloc_ids(&mut self, n: usize) -> Result<Vec<Self::Id>, Error> {
+    fn alloc_ids(&self, n: usize) -> Result<Vec<Self::Id>, Error> {
         self.inner.write().unwrap().alloc_ids(n)
     }
-    fn dealloc_ids(&mut self, ids: &[Self::Id]) -> Result<(), Error> {
+    fn dealloc_ids(&self, ids: &[Self::Id]) -> Result<(), Error> {
         self.inner.write().unwrap().dealloc_ids(ids)
     }
     fn page_size_hint(&self) -> Option<usize> {

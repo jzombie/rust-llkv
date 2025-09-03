@@ -21,9 +21,9 @@ fn graphviz_is_identical_between_btree_and_shared() {
     let p2 = SharedPager::new(base2);
 
     // Build separate trees (no shared storage required for this test).
-    let mut t1: BPlusTree<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> =
+    let t1: BPlusTree<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> =
         BPlusTree::create_empty(p1, None).expect("create t1");
-    let mut t2s: SharedBPlusTree<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> =
+    let t2s: SharedBPlusTree<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> =
         SharedBPlusTree::create_empty(p2, None).expect("create t2");
 
     // Seed both with the same dataset to force multiple nodes and splits.

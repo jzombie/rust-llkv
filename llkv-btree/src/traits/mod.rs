@@ -19,10 +19,13 @@ pub trait BTree<'a, K> {
     fn get_many(&'a self, keys: &[K]) -> Result<Vec<Option<Self::Value>>, Error>;
 
     fn contains_key(&'a self, key: &K) -> Result<bool, Error>;
-    fn insert_many(&mut self, items: &[(K, &[u8])]) -> Result<(), Error>
+
+    // Write methods now take &self, allowing for internal mutability.
+    fn insert_many(&self, items: &[(K, &[u8])]) -> Result<(), Error>
     where
         K: Clone;
-    fn delete_many(&mut self, keys: &[K]) -> Result<(), Error>
+
+    fn delete_many(&self, keys: &[K]) -> Result<(), Error>
     where
         K: Clone;
 }

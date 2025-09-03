@@ -48,11 +48,12 @@ fn iter_reverse_scan() -> Result<(), Box<dyn std::error::Error>> {
 fn iter_range_scan_u64() -> Result<(), Box<dyn std::error::Error>> {
     let mut tree: U64Tree =
         BPlusTree::<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>::create_empty(
-            TestPager {
-                pages: FxHashMap::default(),
-                next_id: 1,
-                page_size: 256,
-            },
+            // TestPager {
+            //     pages: FxHashMap::default(),
+            //     next_id: 1,
+            //     page_size: 256,
+            // },
+            TestPager::new(256),
             None,
         )?;
     let expected = common::populate_tree(&mut tree)?;
@@ -124,11 +125,12 @@ fn iter_range_reverse_scan_u64() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn iter_prefix_scan_strings() -> Result<(), Box<dyn std::error::Error>> {
     let mut tree = BPlusTree::<TestPager, StringKeyCodec, BigEndianIdCodec<u64>>::create_empty(
-        TestPager {
-            pages: FxHashMap::default(),
-            next_id: 1,
-            page_size: 256,
-        },
+        // TestPager {
+        //     pages: FxHashMap::default(),
+        //     next_id: 1,
+        //     page_size: 256,
+        // },
+        TestPager::new(256),
         None,
     )?;
 
@@ -187,11 +189,12 @@ fn iter_prefix_scan_strings() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn iter_prefix_reverse_scan_strings() -> Result<(), Box<dyn std::error::Error>> {
     let mut tree = BPlusTree::<TestPager, StringKeyCodec, BigEndianIdCodec<u64>>::create_empty(
-        TestPager {
-            pages: FxHashMap::default(),
-            next_id: 1,
-            page_size: 256,
-        },
+        // TestPager {
+        //     pages: FxHashMap::default(),
+        //     next_id: 1,
+        //     page_size: 256,
+        // },
+        TestPager::new(256),
         None,
     )?;
 

@@ -9,21 +9,28 @@ use rustc_hash::FxHashMap;
 
 use crate::errors::Error;
 use crate::pager::Pager;
+use std::sync::Mutex;
+
+struct MemPager64State {
+    pages: FxHashMap<u64, Arc<[u8]>>,
+    next_id: u64,
+}
 
 /// Simple in-memory pager using u64 page IDs.
 /// Not thread-safe by itself; wrap in `SharedPager` to share across threads.
 pub struct MemPager64 {
-    pages: FxHashMap<u64, Arc<[u8]>>,
-    next_id: u64,
     page_size: usize,
+    state: Mutex<MemPager64State>,
 }
 
 impl Default for MemPager64 {
     fn default() -> Self {
         Self {
-            pages: FxHashMap::default(),
-            next_id: 1,
             page_size: 256,
+            state: Mutex::new(MemPager64State {
+                pages: FxHashMap::default(),
+                next_id: 1,
+            }),
         }
     }
 }
@@ -32,20 +39,26 @@ impl MemPager64 {
     /// Create with a maximum page size (soft-checked on writes).
     pub fn new(page_size: usize) -> Self {
         Self {
-            pages: FxHashMap::default(),
-            next_id: 1,
             page_size,
+            state: Mutex::new(MemPager64State {
+                pages: FxHashMap::default(),
+                next_id: 1,
+            }),
         }
     }
 
     /// Number of pages currently stored (for tests/tools).
     pub fn len(&self) -> usize {
-        self.pages.len()
+        let state = self.state.lock().unwrap();
+
+        state.pages.len()
     }
 
     /// True if no pages (for tests/tools).
     pub fn is_empty(&self) -> bool {
-        self.pages.is_empty()
+        let state = self.state.lock().unwrap();
+
+        state.pages.is_empty()
     }
 }
 
@@ -54,35 +67,43 @@ impl Pager for MemPager64 {
     type Page = Arc<[u8]>;
 
     fn read_batch(&self, ids: &[Self::Id]) -> Result<FxHashMap<Self::Id, Self::Page>, Error> {
+        let state = self.state.lock().unwrap();
+
         Ok(ids
             .iter()
-            .filter_map(|id| self.pages.get(id).map(|p| (*id, p.clone())))
+            .filter_map(|id| state.pages.get(id).map(|p| (*id, p.clone())))
             .collect())
     }
 
-    fn write_batch(&mut self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error> {
+    fn write_batch(&self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+
         for (id, data) in pages {
             if data.len() > self.page_size {
                 return Err(Error::Corrupt("page overflow"));
             }
-            self.pages.insert(*id, Arc::from(*data));
+            state.pages.insert(*id, Arc::from(*data));
         }
         Ok(())
     }
 
-    fn alloc_ids(&mut self, count: usize) -> Result<Vec<Self::Id>, Error> {
-        let start = self.next_id;
+    fn alloc_ids(&self, count: usize) -> Result<Vec<Self::Id>, Error> {
+        let mut state = self.state.lock().unwrap();
+
+        let start = state.next_id;
         // checked add to avoid wrap
-        self.next_id = self
+        state.next_id = state
             .next_id
             .checked_add(count as u64)
             .ok_or(Error::Corrupt("id overflow"))?;
-        Ok((start..self.next_id).collect())
+        Ok((start..state.next_id).collect())
     }
 
-    fn dealloc_ids(&mut self, ids: &[Self::Id]) -> Result<(), Error> {
+    fn dealloc_ids(&self, ids: &[Self::Id]) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+
         for id in ids {
-            self.pages.remove(id);
+            state.pages.remove(id);
         }
         Ok(())
     }

@@ -83,13 +83,20 @@ where
     IC: IdCodec<Id = P::Id>,
 {
     fn to_dot(&self) -> Result<String, Error> {
+        // Snapshot the current root while holding the lock briefly,
+        // then drop the lock before any calls that may re-lock state.
+        let root_id = {
+            let s = self.state.lock().unwrap();
+            s.root.clone()
+        };
+
         let mut dot = String::new();
         dot.push_str("digraph BPlusTree {\n");
         dot.push_str("  rankdir=TB;\n");
         dot.push_str("  node [shape=record, style=filled];\n\n");
 
         let mut visited = rustc_hash::FxHashSet::default();
-        if self.read_node(&self.root)?.entry_count() == 0 {
+        if self.read_node(&root_id)?.entry_count() == 0 {
             dot.push_str("}\n");
             return Ok(dot);
         }
@@ -156,7 +163,7 @@ where
             Ok(())
         }
 
-        walk(self, &self.root, &mut dot, &mut visited)?;
+        walk(self, &root_id, &mut dot, &mut visited)?;
 
         dot.push_str("}\n");
         Ok(dot)

@@ -48,7 +48,7 @@ fn pager_sync_bplustree() {
 
     // B: open from last root
     let root = pager.last_root().unwrap_or_else(|| tree_a.root_id());
-    let mut tree_b: TreeU64<SharedPager> = BPlusTree::new(pager.clone(), root, None);
+    let tree_b: TreeU64<SharedPager> = BPlusTree::new(pager.clone(), root, None);
 
     // spot-check + full count
     for &k in &[0, 1, 2, n - 2, n - 1] {

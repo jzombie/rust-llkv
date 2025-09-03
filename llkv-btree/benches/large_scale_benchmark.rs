@@ -2,7 +2,7 @@ use criterion::{BatchSize, Bencher, Criterion, criterion_group, criterion_main};
 use llkv_btree::{
     bplus_tree::BPlusTree,
     codecs::{BigEndianIdCodec, BigEndianKeyCodec},
-    pager::Pager,
+    pager::MemPager64,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -16,53 +16,53 @@ type U64IdCodec = BigEndianIdCodec<u64>;
 
 // TODO: Swap with `MemPager64`
 // --- In-Memory Pager for Benchmarking ---
-#[derive(Clone)]
-struct BenchPager {
-    pages: FxHashMap<u64, Arc<[u8]>>,
-    next_id: u64,
-    page_size: usize,
-}
+// #[derive(Clone)]
+// struct BenchPager {
+//     pages: FxHashMap<u64, Arc<[u8]>>,
+//     next_id: u64,
+//     page_size: usize,
+// }
 
-impl Pager for BenchPager {
-    type Id = u64;
-    type Page = Arc<[u8]>;
+// impl Pager for BenchPager {
+//     type Id = u64;
+//     type Page = Arc<[u8]>;
 
-    fn read_batch(
-        &self,
-        ids: &[Self::Id],
-    ) -> Result<FxHashMap<Self::Id, Self::Page>, llkv_btree::errors::Error> {
-        Ok(ids
-            .iter()
-            .filter_map(|id| self.pages.get(id).map(|p| (*id, p.clone())))
-            .collect())
-    }
-    fn write_batch(
-        &mut self,
-        pages: &[(Self::Id, &[u8])],
-    ) -> Result<(), llkv_btree::errors::Error> {
-        for (id, data) in pages {
-            self.pages.insert(*id, Arc::from(*data));
-        }
-        Ok(())
-    }
-    fn alloc_ids(&mut self, count: usize) -> Result<Vec<Self::Id>, llkv_btree::errors::Error> {
-        let start = self.next_id;
-        self.next_id += count as u64;
-        Ok((start..self.next_id).collect())
-    }
-    fn dealloc_ids(&mut self, ids: &[Self::Id]) -> Result<(), llkv_btree::errors::Error> {
-        for id in ids {
-            self.pages.remove(id);
-        }
-        Ok(())
-    }
-    fn page_size_hint(&self) -> Option<usize> {
-        Some(self.page_size)
-    }
-    fn materialize_owned(&self, bytes: &[u8]) -> Result<Self::Page, llkv_btree::errors::Error> {
-        Ok(Arc::from(bytes))
-    }
-}
+//     fn read_batch(
+//         &self,
+//         ids: &[Self::Id],
+//     ) -> Result<FxHashMap<Self::Id, Self::Page>, llkv_btree::errors::Error> {
+//         Ok(ids
+//             .iter()
+//             .filter_map(|id| self.pages.get(id).map(|p| (*id, p.clone())))
+//             .collect())
+//     }
+//     fn write_batch(
+//         &mut self,
+//         pages: &[(Self::Id, &[u8])],
+//     ) -> Result<(), llkv_btree::errors::Error> {
+//         for (id, data) in pages {
+//             self.pages.insert(*id, Arc::from(*data));
+//         }
+//         Ok(())
+//     }
+//     fn alloc_ids(&mut self, count: usize) -> Result<Vec<Self::Id>, llkv_btree::errors::Error> {
+//         let start = self.next_id;
+//         self.next_id += count as u64;
+//         Ok((start..self.next_id).collect())
+//     }
+//     fn dealloc_ids(&mut self, ids: &[Self::Id]) -> Result<(), llkv_btree::errors::Error> {
+//         for id in ids {
+//             self.pages.remove(id);
+//         }
+//         Ok(())
+//     }
+//     fn page_size_hint(&self) -> Option<usize> {
+//         Some(self.page_size)
+//     }
+//     fn materialize_owned(&self, bytes: &[u8]) -> Result<Self::Page, llkv_btree::errors::Error> {
+//         Ok(Arc::from(bytes))
+//     }
+// }
 
 /// Generates a dataset of `count` items with `unique_values` distinct values.
 fn generate_data(count: usize, unique_values: usize) -> (Vec<(u64, Vec<u8>)>, Vec<u64>) {
@@ -94,14 +94,15 @@ fn benchmark_upserts(c: &mut Criterion) {
     group.bench_function("BPlusTree", |b: &mut Bencher| {
         b.iter_batched(
             || {
-                let pager = BenchPager {
-                    pages: FxHashMap::default(),
-                    next_id: 1,
-                    page_size: 4096,
-                };
+                // let pager = BenchPager {
+                //     pages: FxHashMap::default(),
+                //     next_id: 1,
+                //     page_size: 4096,
+                // };
+                let pager = MemPager64::new(4096);
                 BPlusTree::<_, U64KeyCodec, U64IdCodec>::create_empty(pager, None).unwrap()
             },
-            |mut tree| {
+            |tree| {
                 tree.insert_many(black_box(&owned_data)).unwrap();
             },
             BatchSize::SmallInput,
@@ -123,12 +124,13 @@ fn benchmark_reads(c: &mut Criterion) {
             || {
                 let (data, keys) = generate_data(ITEM_COUNT, UNIQUE_VALUES);
                 let owned_data: Vec<_> = data.iter().map(|(k, v)| (*k, v.as_slice())).collect();
-                let pager = BenchPager {
-                    pages: FxHashMap::default(),
-                    next_id: 1,
-                    page_size: 4096,
-                };
-                let mut tree =
+                // let pager = BenchPager {
+                //     pages: FxHashMap::default(),
+                //     next_id: 1,
+                //     page_size: 4096,
+                // };
+                let pager = MemPager64::new(4096);
+                let tree =
                     BPlusTree::<_, U64KeyCodec, U64IdCodec>::create_empty(pager, None).unwrap();
                 tree.insert_many(&owned_data).unwrap();
                 (tree, keys)

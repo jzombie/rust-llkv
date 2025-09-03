@@ -41,7 +41,7 @@ use crate::{
 use core::cmp::Ordering;
 use core::marker::PhantomData;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 // ============================ Node representation ============================
 
@@ -179,6 +179,12 @@ enum DeleteResult {
     Underflow,
 }
 
+pub(crate) struct BPlusTreeState<P: Pager> {
+    pub(crate) root: P::Id,
+    pending_writes: FxHashMap<P::Id, Vec<u8>>,
+    pending_deletes: FxHashSet<P::Id>,
+}
+
 pub struct BPlusTree<P, KC, IC>
 where
     P: Pager,
@@ -186,11 +192,9 @@ where
     IC: IdCodec<Id = P::Id>,
 {
     pub(crate) pager: P,
-    pub(crate) root: P::Id,
     page_size: usize,
 
-    pending_writes: FxHashMap<P::Id, Vec<u8>>,
-    pending_deletes: FxHashSet<P::Id>,
+    pub(crate) state: Mutex<BPlusTreeState<P>>,
 
     // Page cache for reads (safe, O(1)).
     node_cache: Arc<RwLock<NodeCache<P>>>,
@@ -208,17 +212,19 @@ where
         let page_size = pager.page_size_hint().unwrap_or(DEFAULT_PAGE_SIZE_HINT);
         Self {
             pager,
-            root,
             page_size,
-            pending_writes: FxHashMap::default(),
-            pending_deletes: FxHashSet::default(),
+            state: Mutex::new(BPlusTreeState {
+                root,
+                pending_writes: FxHashMap::default(),
+                pending_deletes: FxHashSet::default(),
+            }),
             node_cache: Self::init_node_cache(opt_node_cache),
             _p: PhantomData,
         }
     }
 
     pub fn create_empty(
-        mut pager: P,
+        pager: P,
         opt_node_cache: Option<Arc<RwLock<NodeCache<P>>>>,
     ) -> Result<Self, Error> {
         let page_size = pager.page_size_hint().unwrap_or(DEFAULT_PAGE_SIZE_HINT);
@@ -233,10 +239,12 @@ where
 
         Ok(Self {
             pager,
-            root: root_id,
             page_size,
-            pending_writes: FxHashMap::default(),
-            pending_deletes: FxHashSet::default(),
+            state: Mutex::new(BPlusTreeState {
+                root: root_id,
+                pending_writes: FxHashMap::default(),
+                pending_deletes: FxHashSet::default(),
+            }),
             node_cache: Self::init_node_cache(opt_node_cache),
             _p: PhantomData,
         })
@@ -254,10 +262,12 @@ where
     ) -> Self {
         Self {
             pager,
-            root,
             page_size,
-            pending_writes: FxHashMap::default(),
-            pending_deletes: FxHashSet::default(),
+            state: Mutex::new(BPlusTreeState {
+                root,
+                pending_writes: FxHashMap::default(),
+                pending_deletes: FxHashSet::default(),
+            }),
             node_cache,
             _p: PhantomData,
         }
@@ -274,7 +284,8 @@ where
 
     #[inline]
     pub fn root_id(&self) -> P::Id {
-        self.root.clone()
+        let state = self.state.lock().unwrap();
+        state.root.clone()
     }
 
     // ----------------------------- public ops --------------------------------
@@ -294,7 +305,14 @@ where
 
     #[inline]
     fn descend_to_leaf_for_key(&self, key: &KC::Key) -> NodeWithNextRes<P> {
-        let mut id = self.root.clone();
+        // let state = self.state.lock().unwrap();
+        // let mut id = state.root.clone();
+        // Take a snapshot of the root while holding the lock, then release it.
+        let mut id = {
+            let s = self.state.lock().unwrap();
+            s.root.clone()
+        };
+
         loop {
             let page = self.read_one(&id)?;
             let view = NodeView::<P>::new(page.clone())?;
@@ -436,7 +454,7 @@ where
         Ok(res.pop().flatten().is_some())
     }
 
-    pub fn insert_many(&mut self, items: &[(KC::Key, &[u8])]) -> Result<(), Error> {
+    pub fn insert_many(&self, items: &[(KC::Key, &[u8])]) -> Result<(), Error> {
         // Sort by key to improve locality during splits and writes.
         let mut owned: Vec<_> = items.iter().map(|(k, v)| (k.clone(), *v)).collect();
         owned.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -446,7 +464,7 @@ where
         self.flush()
     }
 
-    pub fn delete_many(&mut self, keys: &[KC::Key]) -> Result<(), Error> {
+    pub fn delete_many(&self, keys: &[KC::Key]) -> Result<(), Error> {
         for k in keys {
             match self.delete_internal(k) {
                 Ok(_) | Err(Error::KeyNotFound) => {}
@@ -460,42 +478,105 @@ where
         BPlusTreeIter::with_opts(self, ScanOpts::forward())
     }
 
-    pub fn flush(&mut self) -> Result<(), Error> {
-        if self.pending_writes.is_empty() && self.pending_deletes.is_empty() {
-            return Ok(());
+    // pub fn flush(&self) -> Result<(), Error> {
+    //     let mut state = self.state.lock().unwrap();
+
+    //     if state.pending_writes.is_empty() && state.pending_deletes.is_empty() {
+    //         return Ok(());
+    //     }
+    //     let to_write: Vec<_> = state
+    //         .pending_writes
+    //         .iter()
+    //         .map(|(id, bytes)| (id.clone(), bytes.as_slice()))
+    //         .collect();
+    //     self.pager.write_batch(&to_write)?;
+    //     if !state.pending_deletes.is_empty() {
+    //         let ids: Vec<_> = state.pending_deletes.iter().cloned().collect();
+    //         self.pager.dealloc_ids(&ids)?;
+    //     }
+    //     state.pending_writes.clear();
+    //     state.pending_deletes.clear();
+    //     Ok(())
+    // }
+    pub fn flush(&self) -> Result<(), Error> {
+        let (writes, deletes) = {
+            let mut s = self.state.lock().unwrap();
+            if s.pending_writes.is_empty() && s.pending_deletes.is_empty() {
+                return Ok(());
+            }
+            (
+                std::mem::take(&mut s.pending_writes),
+                std::mem::take(&mut s.pending_deletes),
+            )
+        }; // lock released
+
+        if !writes.is_empty() {
+            let to_write: Vec<_> = writes
+                .iter()
+                .map(|(id, bytes)| (id.clone(), bytes.as_slice()))
+                .collect();
+            self.pager.write_batch(&to_write)?;
         }
-        let to_write: Vec<_> = self
-            .pending_writes
-            .iter()
-            .map(|(id, bytes)| (id.clone(), bytes.as_slice()))
-            .collect();
-        self.pager.write_batch(&to_write)?;
-        if !self.pending_deletes.is_empty() {
-            let ids: Vec<_> = self.pending_deletes.iter().cloned().collect();
+        if !deletes.is_empty() {
+            let ids: Vec<_> = deletes.into_iter().collect();
             self.pager.dealloc_ids(&ids)?;
         }
-        self.pending_writes.clear();
-        self.pending_deletes.clear();
         Ok(())
     }
 
     // --------------------------- internal ops --------------------------------
 
-    fn upsert_internal(&mut self, key: &KC::Key, value: &[u8]) -> Result<(), Error> {
-        let root_id = self.root.clone();
+    // fn upsert_internal(&self, key: &KC::Key, value: &[u8]) -> Result<(), Error> {
+    //     let mut state = self.state.lock().unwrap();
+    //     let root_id = state.root.clone();
+
+    //     match self._insert(&root_id, key, value)? {
+    //         InsertResult::Ok => Ok(()),
+    //         InsertResult::Split {
+    //             separator,
+    //             right_id,
+    //         } => {
+    //             let old_root = state.root.clone();
+    //             let new_root = self.alloc_ids(1)?.remove(0);
+    //             let max_left = self.find_max_key(&old_root)?;
+    //             let entries = vec![(max_left, old_root), (separator, right_id)];
+    //             let node: Node<KC::Key, P::Id> = Node::Internal { entries };
+    //             self.write_page(new_root.clone(), Self::encode_node(&node));
+    //             state.root = new_root.clone();
+    //             self.pager.on_root_changed(new_root)?;
+    //             Ok(())
+    //         }
+    //     }
+    // }
+    fn upsert_internal(&self, key: &KC::Key, value: &[u8]) -> Result<(), Error> {
+        // Snapshot current root under lock, then drop the lock.
+        let root_id = {
+            let s = self.state.lock().unwrap();
+            s.root.clone()
+        };
+
         match self._insert(&root_id, key, value)? {
             InsertResult::Ok => Ok(()),
+
             InsertResult::Split {
                 separator,
                 right_id,
             } => {
-                let old_root = self.root.clone();
+                // Do not hold the lock while doing IO or tree reads.
+                let max_left = self.find_max_key(&root_id)?;
+                let entries = vec![(max_left, root_id), (separator, right_id)];
                 let new_root = self.alloc_ids(1)?.remove(0);
-                let max_left = self.find_max_key(&old_root)?;
-                let entries = vec![(max_left, old_root), (separator, right_id)];
+
                 let node: Node<KC::Key, P::Id> = Node::Internal { entries };
                 self.write_page(new_root.clone(), Self::encode_node(&node));
-                self.root = new_root.clone();
+
+                // Update root with a short critical section.
+                {
+                    let mut s = self.state.lock().unwrap();
+                    s.root = new_root.clone();
+                }
+
+                // Notify pager outside the lock.
                 self.pager.on_root_changed(new_root)?;
                 Ok(())
             }
@@ -503,7 +584,7 @@ where
     }
 
     fn _insert(
-        &mut self,
+        &self,
         node_id: &P::Id,
         key: &KC::Key,
         value: &[u8],
@@ -562,22 +643,60 @@ where
         }
     }
 
-    fn delete_internal(&mut self, key: &KC::Key) -> Result<(), Error> {
-        let root_id = self.root.clone();
+    // fn delete_internal(&self, key: &KC::Key) -> Result<(), Error> {
+    //     let mut state = self.state.lock().unwrap();
+
+    //     let root_id = state.root.clone();
+    //     self._delete(&root_id, key)?;
+    //     let root_node = self.read_node(&state.root)?;
+    //     if let Node::Internal { entries } = root_node
+    //         && entries.len() == 1
+    //     {
+    //         let old_root = state.root.clone();
+    //         state.root = entries[0].1.clone();
+    //         self.dealloc_page(old_root.clone());
+    //         self.pager.on_root_changed(state.root.clone())?;
+    //     }
+    //     Ok(())
+    // }
+    fn delete_internal(&self, key: &KC::Key) -> Result<(), Error> {
+        // Snapshot current root under lock, then drop the lock.
+        let root_id = {
+            let s = self.state.lock().unwrap();
+            s.root.clone()
+        };
+
+        // Perform delete without holding the state lock.
         self._delete(&root_id, key)?;
-        let root_node = self.read_node(&self.root)?;
-        if let Node::Internal { entries } = root_node
-            && entries.len() == 1
-        {
-            let old_root = self.root.clone();
-            self.root = entries[0].1.clone();
-            self.dealloc_page(old_root.clone());
-            self.pager.on_root_changed(self.root.clone())?;
+
+        // Re-read current root id (it may have changed during delete).
+        let cur_root = {
+            let s = self.state.lock().unwrap();
+            s.root.clone()
+        };
+
+        // Do not hold the lock while reading nodes.
+        let root_node = self.read_node(&cur_root)?;
+        if let Node::Internal { entries } = root_node {
+            if entries.len() == 1 {
+                let new_root = entries[0].1.clone();
+
+                // Update root id with a short critical section.
+                {
+                    let mut s = self.state.lock().unwrap();
+                    s.root = new_root.clone();
+                }
+
+                // Dealloc old root and notify pager outside the lock.
+                self.dealloc_page(cur_root);
+                self.pager.on_root_changed(new_root)?;
+            }
         }
+
         Ok(())
     }
 
-    fn _delete(&mut self, node_id: &P::Id, key: &KC::Key) -> Result<DeleteResult, Error> {
+    fn _delete(&self, node_id: &P::Id, key: &KC::Key) -> Result<DeleteResult, Error> {
         let mut node = self.read_node(node_id)?;
         let mut child_pos_opt = None;
 
@@ -630,7 +749,7 @@ where
     }
 
     fn rebalance_or_merge(
-        &mut self,
+        &self,
         parent_id: P::Id,
         parent_entries: &mut Vec<(KC::Key, P::Id)>,
         child_pos: usize,
@@ -675,7 +794,7 @@ where
     }
 
     fn rebalance(
-        &mut self,
+        &self,
         parent_entries: &mut [(KC::Key, P::Id)],
         left_pos: usize,
         right_pos: usize,
@@ -715,7 +834,7 @@ where
     }
 
     fn merge(
-        &mut self,
+        &self,
         parent_entries: &mut Vec<(KC::Key, P::Id)>,
         left_pos: usize,
     ) -> Result<(), Error> {
@@ -769,7 +888,7 @@ where
     }
 
     fn split_if_needed(
-        &mut self,
+        &self,
         id: P::Id,
         mut node: Node<KC::Key, P::Id>,
     ) -> Result<InsertResult<KC::Key, P::Id>, Error> {
@@ -867,39 +986,71 @@ where
     // ------------------- Pager I/O with cache integration --------------------
 
     // TODO: Rename to `read_page`?
-    pub(crate) fn read_one(&self, id: &P::Id) -> Result<P::Page, Error> {
-        // Pending mutations always win.
-        if self.pending_deletes.contains(id) {
-            return Err(Error::MissingPage);
-        }
-        if let Some(bytes) = self.pending_writes.get(id) {
-            return self.pager.materialize_owned(bytes);
-        }
+    // pub(crate) fn read_one(&self, id: &P::Id) -> Result<P::Page, Error> {
+    //     let state = self.state.lock().unwrap();
 
-        // Fast path: shared lock + peek (no LRU mutation).
+    //     // Pending mutations always win.
+    //     if state.pending_deletes.contains(id) {
+    //         return Err(Error::MissingPage);
+    //     }
+    //     if let Some(bytes) = state.pending_writes.get(id) {
+    //         return self.pager.materialize_owned(bytes);
+    //     }
+
+    //     // Fast path: shared lock + peek (no LRU mutation).
+    //     if let Some(p) = self.node_cache.read().unwrap().peek(id) {
+    //         // Opportunistic promotion to MRU. Avoids taking a blocking write lock on hot paths.
+    //         if let Ok(mut c) = self.node_cache.try_write() {
+    //             c.touch(id);
+    //         }
+    //         return Ok(p);
+    //     }
+
+    //     // Miss: fetch from pager.
+    //     let page = self
+    //         .pager
+    //         .read_batch(std::slice::from_ref(id))?
+    //         .remove(id)
+    //         .ok_or(Error::MissingPage)?;
+
+    //     // Opportunistic insert into cache. If contended, skip; correctness is unchanged.
+    //     if let Ok(mut c) = self.node_cache.try_write() {
+    //         c.insert(id.clone(), page.clone());
+    //     } else {
+    //         // If you prefer guaranteed caching (slightly higher tail latency), use:
+    //         // self.node_cache.write().unwrap().insert(id.clone(), page.clone());
+    //     }
+
+    //     Ok(page)
+    // }
+    pub(crate) fn read_one(&self, id: &P::Id) -> Result<P::Page, Error> {
+        // Check pending under lock, return fast-path if found.
+        {
+            let s = self.state.lock().unwrap();
+            if s.pending_deletes.contains(id) {
+                return Err(Error::MissingPage);
+            }
+            if let Some(bytes) = s.pending_writes.get(id) {
+                return self.pager.materialize_owned(bytes);
+            }
+        } // lock released here
+
         if let Some(p) = self.node_cache.read().unwrap().peek(id) {
-            // Opportunistic promotion to MRU. Avoids taking a blocking write lock on hot paths.
             if let Ok(mut c) = self.node_cache.try_write() {
                 c.touch(id);
             }
             return Ok(p);
         }
 
-        // Miss: fetch from pager.
         let page = self
             .pager
             .read_batch(std::slice::from_ref(id))?
             .remove(id)
             .ok_or(Error::MissingPage)?;
 
-        // Opportunistic insert into cache. If contended, skip; correctness is unchanged.
         if let Ok(mut c) = self.node_cache.try_write() {
             c.insert(id.clone(), page.clone());
-        } else {
-            // If you prefer guaranteed caching (slightly higher tail latency), use:
-            // self.node_cache.write().unwrap().insert(id.clone(), page.clone());
         }
-
         Ok(page)
     }
 
@@ -925,20 +1076,24 @@ where
     }
 
     #[inline]
-    fn write_page(&mut self, id: P::Id, data: Vec<u8>) {
+    fn write_page(&self, id: P::Id, data: Vec<u8>) {
+        let mut state = self.state.lock().unwrap();
+
         // Invalidate any cached copy to avoid stale reads.
         self.node_cache.write().unwrap().invalidate(&id);
-        self.pending_writes.insert(id, data);
+        state.pending_writes.insert(id, data);
     }
 
     #[inline]
-    fn dealloc_page(&mut self, id: P::Id) {
+    fn dealloc_page(&self, id: P::Id) {
+        let mut state = self.state.lock().unwrap();
+
         self.node_cache.write().unwrap().invalidate(&id);
-        self.pending_deletes.insert(id);
+        state.pending_deletes.insert(id);
     }
 
     #[inline]
-    fn alloc_ids(&mut self, count: usize) -> Result<Vec<P::Id>, Error> {
+    fn alloc_ids(&self, count: usize) -> Result<Vec<P::Id>, Error> {
         self.pager.alloc_ids(count)
     }
 }
@@ -1053,7 +1208,7 @@ where
         Ok(out)
     }
 
-    fn split_leaf_bytes(&mut self, page_bytes: &[u8], right_id: P::Id) -> LeafSplitRes<KC::Key> {
+    fn split_leaf_bytes(&self, page_bytes: &[u8], right_id: P::Id) -> LeafSplitRes<KC::Key> {
         let view = NodeView::<P>::new(self.pager.materialize_owned(page_bytes)?)?;
         let count = view.count();
         let mid = count / 2;
@@ -1123,7 +1278,7 @@ where
     }
 
     fn split_if_needed_bytes(
-        &mut self,
+        &self,
         id: P::Id,
         page_bytes: Vec<u8>,
     ) -> Result<InsertResult<KC::Key, P::Id>, Error> {
@@ -1297,13 +1452,13 @@ where
     fn contains_key(&'a self, key: &KC::Key) -> Result<bool, Error> {
         BPlusTree::contains_key(self, key)
     }
-    fn insert_many(&mut self, items: &[(KC::Key, &[u8])]) -> Result<(), Error>
+    fn insert_many(&self, items: &[(KC::Key, &[u8])]) -> Result<(), Error>
     where
         KC::Key: Clone,
     {
         BPlusTree::insert_many(self, items)
     }
-    fn delete_many(&mut self, keys: &[KC::Key]) -> Result<(), Error>
+    fn delete_many(&self, keys: &[KC::Key]) -> Result<(), Error>
     where
         KC::Key: Clone,
     {
@@ -1325,23 +1480,43 @@ mod tests {
     use std::sync::Arc;
 
     // --- Pager ---
-    #[derive(Clone)]
-    struct TestPager {
+
+    struct TestPagerState {
         pages: FxHashMap<u64, Arc<[u8]>>,
         next_id: u64,
+    }
+
+    struct TestPager {
         page_size: usize,
+        state: Mutex<TestPagerState>,
+    }
+
+    impl TestPager {
+        fn new(page_size: usize) -> Self {
+            Self {
+                page_size,
+                state: Mutex::new(TestPagerState {
+                    pages: FxHashMap::default(),
+                    next_id: 1,
+                }),
+            }
+        }
     }
 
     impl Pager for TestPager {
         type Id = u64;
         type Page = Arc<[u8]>;
         fn read_batch(&self, ids: &[Self::Id]) -> Result<FxHashMap<Self::Id, Self::Page>, Error> {
+            let state = self.state.lock().unwrap();
+
             Ok(ids
                 .iter()
-                .filter_map(|id| self.pages.get(id).map(|p| (*id, p.clone())))
+                .filter_map(|id| state.pages.get(id).map(|p| (*id, p.clone())))
                 .collect())
         }
-        fn write_batch(&mut self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error> {
+        fn write_batch(&self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error> {
+            let mut state = self.state.lock().unwrap();
+
             for (id, data) in pages {
                 if data.len() > self.page_size {
                     panic!(
@@ -1350,18 +1525,22 @@ mod tests {
                         self.page_size
                     );
                 }
-                self.pages.insert(*id, Arc::from(*data));
+                state.pages.insert(*id, Arc::from(*data));
             }
             Ok(())
         }
-        fn alloc_ids(&mut self, count: usize) -> Result<Vec<Self::Id>, Error> {
-            let start = self.next_id;
-            self.next_id += count as u64;
-            Ok((start..self.next_id).collect())
+        fn alloc_ids(&self, count: usize) -> Result<Vec<Self::Id>, Error> {
+            let mut state = self.state.lock().unwrap();
+
+            let start = state.next_id;
+            state.next_id += count as u64;
+            Ok((start..state.next_id).collect())
         }
-        fn dealloc_ids(&mut self, ids: &[Self::Id]) -> Result<(), Error> {
+        fn dealloc_ids(&self, ids: &[Self::Id]) -> Result<(), Error> {
+            let mut state = self.state.lock().unwrap();
+
             for id in ids {
-                self.pages.remove(id);
+                state.pages.remove(id);
             }
             Ok(())
         }
@@ -1377,11 +1556,7 @@ mod tests {
 
     #[test]
     fn point_lookup_works() {
-        let mut pager = TestPager {
-            pages: FxHashMap::default(),
-            next_id: 1,
-            page_size: 4096,
-        };
+        let pager = TestPager::new(4096);
         let ids = pager.alloc_ids(3).unwrap();
         let root = ids[0];
         let left = ids[1];
@@ -1432,11 +1607,7 @@ mod tests {
 
     #[test]
     fn iterator_walks_leaves() {
-        let mut pager = TestPager {
-            pages: FxHashMap::default(),
-            next_id: 1,
-            page_size: 4096,
-        };
+        let pager = TestPager::new(4096);
         let ids = pager.alloc_ids(3).unwrap();
         let root = ids[0];
         let l1 = ids[1];
@@ -1488,11 +1659,7 @@ mod tests {
 
     #[test]
     fn get_many_batched() {
-        let mut pager = TestPager {
-            pages: FxHashMap::default(),
-            next_id: 1,
-            page_size: 4096,
-        };
+        let pager = TestPager::new(4096);
         let ids = pager.alloc_ids(3).unwrap();
         let root = ids[0];
         let left = ids[1];
@@ -1540,12 +1707,8 @@ mod tests {
     // --- Randomized Insertion/Deletion Test ---
     #[test]
     fn test_random_inserts_and_deletes() {
-        let pager = TestPager {
-            pages: FxHashMap::default(),
-            next_id: 1,
-            page_size: 256,
-        };
-        let mut tree = BPlusTree::<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>::create_empty(
+        let pager = TestPager::new(256);
+        let tree = BPlusTree::<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>::create_empty(
             pager, None,
         )
         .unwrap();
@@ -1604,11 +1767,14 @@ mod tests {
     #[test]
     fn test_32bit_physical_64bit_logical_keys() {
         // 32-bit page IDs, 64-bit logical keys
-        #[derive(Clone)]
-        struct TestPager32 {
+        struct TestPager32State {
             pages: FxHashMap<u32, Arc<[u8]>>,
             next_id: u32,
+        }
+
+        struct TestPager32 {
             page_size: usize,
+            state: Mutex<TestPager32State>,
         }
 
         impl Pager for TestPager32 {
@@ -1618,25 +1784,33 @@ mod tests {
                 &self,
                 ids: &[Self::Id],
             ) -> Result<FxHashMap<Self::Id, Self::Page>, Error> {
+                let state = self.state.lock().unwrap();
+
                 Ok(ids
                     .iter()
-                    .filter_map(|id| self.pages.get(id).map(|p| (*id, p.clone())))
+                    .filter_map(|id| state.pages.get(id).map(|p| (*id, p.clone())))
                     .collect())
             }
-            fn write_batch(&mut self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error> {
+            fn write_batch(&self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error> {
+                let mut state = self.state.lock().unwrap();
+
                 for (id, data) in pages {
-                    self.pages.insert(*id, Arc::from(*data));
+                    state.pages.insert(*id, Arc::from(*data));
                 }
                 Ok(())
             }
-            fn alloc_ids(&mut self, count: usize) -> Result<Vec<Self::Id>, Error> {
-                let start = self.next_id;
-                self.next_id += count as u32;
-                Ok((start..self.next_id).collect())
+            fn alloc_ids(&self, count: usize) -> Result<Vec<Self::Id>, Error> {
+                let mut state = self.state.lock().unwrap();
+
+                let start = state.next_id;
+                state.next_id += count as u32;
+                Ok((start..state.next_id).collect())
             }
-            fn dealloc_ids(&mut self, ids: &[Self::Id]) -> Result<(), Error> {
+            fn dealloc_ids(&self, ids: &[Self::Id]) -> Result<(), Error> {
+                let mut state = self.state.lock().unwrap();
+
                 for id in ids {
-                    self.pages.remove(id);
+                    state.pages.remove(id);
                 }
                 Ok(())
             }
@@ -1649,11 +1823,13 @@ mod tests {
         }
 
         let pager = TestPager32 {
-            pages: FxHashMap::default(),
-            next_id: 1,
             page_size: 256,
+            state: Mutex::new(TestPager32State {
+                pages: FxHashMap::default(),
+                next_id: 1,
+            }),
         };
-        let mut tree = BPlusTree::<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u32>>::create_empty(
+        let tree = BPlusTree::<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u32>>::create_empty(
             pager, None,
         )
         .unwrap();
@@ -1680,16 +1856,11 @@ mod tests {
 
     #[test]
     fn test_u128_logical_keys() {
-        let pager = TestPager {
-            pages: FxHashMap::default(),
-            next_id: 1,
-            page_size: 256,
-        };
-        let mut tree =
-            BPlusTree::<_, BigEndianKeyCodec<u128>, BigEndianIdCodec<u64>>::create_empty(
-                pager, None,
-            )
-            .unwrap();
+        let pager = TestPager::new(256);
+        let tree = BPlusTree::<_, BigEndianKeyCodec<u128>, BigEndianIdCodec<u64>>::create_empty(
+            pager, None,
+        )
+        .unwrap();
 
         let key1: u128 = 1;
         let key2: u128 = u128::MAX;
@@ -1714,28 +1885,70 @@ mod tests {
 
     // --- Structure validation (internal views; no payload copies) ---
 
+    // fn validate_structure<P, KC, IC>(tree: &BPlusTree<P, KC, IC>) -> Result<(), String>
+    // where
+    //     P: Pager,
+    //     KC: KeyCodec,
+    //     IC: IdCodec<Id = P::Id>,
+    // {
+    //     let state = tree.state.lock().unwrap();
+
+    //     // empty tree OK
+    //     if tree
+    //         .pager
+    //         .read_batch(std::slice::from_ref(&state.root))
+    //         .unwrap()
+    //         .is_empty()
+    //         && state.pending_writes.is_empty()
+    //     {
+    //         return Ok(());
+    //     }
+    //     let root_node = tree.read_node(&state.root).unwrap();
+    //     if root_node.entry_count() == 0 {
+    //         return Ok(());
+    //     }
+    //     let mut leaf_depths = FxHashSet::default();
+    //     _validate_node(tree, &tree.root_id(), 0, &mut leaf_depths, true)?;
+    //     if leaf_depths.len() > 1 {
+    //         return Err(format!(
+    //             "Tree is unbalanced! Leaf depths: {:?}",
+    //             leaf_depths
+    //         ));
+    //     }
+    //     Ok(())
+    // }
+
     fn validate_structure<P, KC, IC>(tree: &BPlusTree<P, KC, IC>) -> Result<(), String>
     where
         P: Pager,
         KC: KeyCodec,
         IC: IdCodec<Id = P::Id>,
     {
+        // Snapshot minimal state, then release the lock.
+        let (root_id, has_pending_writes) = {
+            let s = tree.state.lock().unwrap();
+            (s.root.clone(), !s.pending_writes.is_empty())
+        };
+
         // empty tree OK
         if tree
             .pager
-            .read_batch(std::slice::from_ref(&tree.root))
+            .read_batch(std::slice::from_ref(&root_id))
             .unwrap()
             .is_empty()
-            && tree.pending_writes.is_empty()
+            && !has_pending_writes
         {
             return Ok(());
         }
-        let root_node = tree.read_node(&tree.root).unwrap();
+
+        // Do not hold the lock while reading nodes.
+        let root_node = tree.read_node(&root_id).unwrap();
         if root_node.entry_count() == 0 {
             return Ok(());
         }
+
         let mut leaf_depths = FxHashSet::default();
-        _validate_node(tree, &tree.root_id(), 0, &mut leaf_depths, true)?;
+        _validate_node(tree, &root_id, 0, &mut leaf_depths, true)?;
         if leaf_depths.len() > 1 {
             return Err(format!(
                 "Tree is unbalanced! Leaf depths: {:?}",
@@ -1805,11 +2018,7 @@ mod tests {
 
     #[test]
     fn point_lookup_with_string_keys() {
-        let mut pager = TestPager {
-            pages: FxHashMap::default(),
-            next_id: 1,
-            page_size: 4096,
-        };
+        let pager = TestPager::new(4096);
         let ids = pager.alloc_ids(3).unwrap();
         let root = ids[0];
         let left = ids[1];
@@ -1945,11 +2154,7 @@ mod tests {
         }
 
         // Cross-check with NodeView helpers.
-        let pager = TestPager {
-            pages: rustc_hash::FxHashMap::default(),
-            next_id: 1,
-            page_size: 4096,
-        };
+        let pager = TestPager::new(4096);
         let page = pager.materialize_owned(&bytes).unwrap();
         let view = super::NodeView::<TestPager>::new(page).unwrap();
 
@@ -2002,11 +2207,7 @@ mod tests {
         assert_eq!(&bytes[keys_base..keys_base + keys_len], &expect_keys[..]);
 
         // Check detection reports None for variable widths.
-        let pager = TestPager {
-            pages: rustc_hash::FxHashMap::default(),
-            next_id: 1,
-            page_size: 4096,
-        };
+        let pager = TestPager::new(4096);
         let page = pager.materialize_owned(&bytes).unwrap();
         let view = super::NodeView::<TestPager>::new(page).unwrap();
         assert_eq!(view.leaf_fixed_key_width(), None);
@@ -2027,11 +2228,7 @@ mod tests {
             _p: core::marker::PhantomData,
         }
         .encode();
-        let pager = TestPager {
-            pages: rustc_hash::FxHashMap::default(),
-            next_id: 1,
-            page_size: 4096,
-        };
+        let pager = TestPager::new(4096);
         let page = pager.materialize_owned(&bytes).unwrap();
         let view = super::NodeView::<TestPager>::new(page.clone()).unwrap();
 

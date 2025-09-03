@@ -11,7 +11,7 @@ use crate::pager::Pager;
 use crate::traits::BTree;
 use std::sync::Arc;
 
-/// A façade that provides a serialized writer and snapshot readers,
+/// A façade that provides a serialized writer and snapshot readers,
 /// while implementing the same `BTree` trait.
 pub struct SharedBPlusTree<P, KC, IC>
 where
@@ -25,6 +25,8 @@ where
     writer: StdMutex<BPlusTree<P, KC, IC>>, // single-threaded writer
     latest_root: RwLock<P::Id>,             // published root for readers
     shared_node_cache: Arc<RwLock<NodeCache<P>>>,
+    // Cache page size so readers do not lock the writer.
+    page_size: usize,
 }
 
 impl<P, KC, IC> SharedBPlusTree<P, KC, IC>
@@ -47,11 +49,14 @@ where
             Some(Arc::clone(&shared_node_cache)),
         )?;
         let root = writer.root_id();
+        let page_size = writer.page_size();
+
         Ok(Self {
             pager,
             writer: StdMutex::new(writer),
             latest_root: RwLock::new(root),
             shared_node_cache,
+            page_size,
         })
     }
 
@@ -68,11 +73,14 @@ where
             root.clone(),
             Some(Arc::clone(&shared_node_cache)),
         );
+        let page_size = writer.page_size();
+
         Self {
             pager,
             writer: StdMutex::new(writer),
             latest_root: RwLock::new(root),
             shared_node_cache,
+            page_size,
         }
     }
 
@@ -81,24 +89,23 @@ where
     pub fn snapshot(&self) -> BPlusTree<P, KC, IC> {
         let root = { self.latest_root.read().unwrap().clone() };
         let shared_node_cache = Arc::clone(&self.shared_node_cache);
-        let page_size = { self.writer.lock().unwrap().page_size() };
 
         BPlusTree::<P, KC, IC>::with_readonly_pager_state(
             self.pager.clone(),
             root,
             shared_node_cache,
-            page_size,
+            self.page_size,
         )
     }
 
-    // TODO: Consider putting this behind a feature flag and only using it for local
-    // testing purposes. This is good for some integration and benchmark testing,
-    // but callers wil likely benefit from manually snapshotting on the thread they
-    // choose to run it on.
+    // TODO: Consider putting this behind a feature flag and only using it for
+    // local testing purposes. This is good for some integration and benchmark
+    // testing, but callers wil likely benefit from manually snapshotting on the
+    // thread they choose to run it on.
     //
     /// Start a streaming scan at the current root, using any `ScanOpts`.
-    /// Returns a crossbeam MPMC receiver; read it from as many threads as you like.
-    /// Keys/values are owned (no borrows across threads).
+    /// Returns a crossbeam MPMC receiver; read it from as many threads as you
+    /// like. Keys/values are owned (no borrows across threads).
     pub fn start_stream_with_opts(
         &self,
         opts: ScanOpts<'static, KC>,
@@ -118,7 +125,7 @@ where
         let (tx, rx) = xchan::bounded(1);
 
         let shared_node_cache = Arc::clone(&self.shared_node_cache);
-        let page_size = { self.writer.lock().unwrap().page_size() };
+        let page_size = self.page_size;
 
         rayon::spawn(move || {
             let tree = BPlusTree::<P, KC, IC>::with_readonly_pager_state(
@@ -134,7 +141,7 @@ where
                     if tx.send((key, val)).is_err() {
                         break;
                     }
-                    // std::thread::yield_now(); // encourages interleaving in demos
+                    // std::thread::yield_now(); // encourages interleaving
                 }
             }
             // drop(tx) ends the stream
@@ -172,25 +179,33 @@ where
         self.snapshot().contains_key(key)
     }
 
-    fn insert_many(&mut self, items: &[(KC::Key, &[u8])]) -> Result<(), Error>
+    fn insert_many(&self, items: &[(KC::Key, &[u8])]) -> Result<(), Error>
     where
         KC::Key: Clone,
     {
-        let mut w = self.writer.lock().unwrap();
-        w.insert_many(items)?;
-        w.flush()?;
-        *self.latest_root.write().unwrap() = w.root_id();
+        // Perform write work under the writer lock, then release it
+        // before publishing the new root to avoid cross-lock waits.
+        let new_root = {
+            let w = self.writer.lock().unwrap();
+            w.insert_many(items)?;
+            w.flush()?;
+            w.root_id()
+        };
+        *self.latest_root.write().unwrap() = new_root;
         Ok(())
     }
 
-    fn delete_many(&mut self, keys: &[KC::Key]) -> Result<(), Error>
+    fn delete_many(&self, keys: &[KC::Key]) -> Result<(), Error>
     where
         KC::Key: Clone,
     {
-        let mut w = self.writer.lock().unwrap();
-        w.delete_many(keys)?;
-        w.flush()?;
-        *self.latest_root.write().unwrap() = w.root_id();
+        let new_root = {
+            let w = self.writer.lock().unwrap();
+            w.delete_many(keys)?;
+            w.flush()?;
+            w.root_id()
+        };
+        *self.latest_root.write().unwrap() = new_root;
         Ok(())
     }
 }
