@@ -91,6 +91,9 @@ where
         )
     }
 
+    // TODO: Remove this entirely (and Rayon and crossbeam from the b-tree, and use snapshots instead,
+    // so that the caller can manage its own threading).
+    //
     /// Start a streaming scan at the current root, using any `ScanOpts`.
     /// Returns a crossbeam MPMC receiver; read it from as many threads as you like.
     /// Keys/values are owned (no borrows across threads).
