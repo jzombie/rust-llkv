@@ -10,6 +10,7 @@ use std::hint::black_box;
 type U64KeyCodec = BigEndianKeyCodec<u64>;
 type U64IdCodec = BigEndianIdCodec<u64>;
 
+// TODO: Clean up
 // --- In-Memory Pager for Benchmarking ---
 // #[derive(Clone)]
 // struct BenchPager {
@@ -84,11 +85,6 @@ fn benchmark_upserts(c: &mut Criterion) {
     group.bench_function("BPlusTree", |b: &mut Bencher| {
         b.iter_batched(
             || {
-                // let pager = BenchPager {
-                //     pages: FxHashMap::default(),
-                //     next_id: 1,
-                //     page_size: 4096,
-                // };
                 let pager = MemPager64::new(4096);
                 BPlusTree::<_, U64KeyCodec, U64IdCodec>::create_empty(pager, None).unwrap()
             },
@@ -113,11 +109,6 @@ fn benchmark_reads(c: &mut Criterion) {
             || {
                 let (data, keys) = generate_unique_data(ITEM_COUNT);
                 let owned_data: Vec<_> = data.iter().map(|(k, v)| (*k, v.as_slice())).collect();
-                // let pager = BenchPager {
-                //     pages: FxHashMap::default(),
-                //     next_id: 1,
-                //     page_size: 4096,
-                // };
                 let pager = MemPager64::new(4096);
                 let tree =
                     BPlusTree::<_, U64KeyCodec, U64IdCodec>::create_empty(pager, None).unwrap();

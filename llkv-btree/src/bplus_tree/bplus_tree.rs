@@ -479,26 +479,6 @@ where
         BPlusTreeIter::with_opts(self, ScanOpts::forward())
     }
 
-    // pub fn flush(&self) -> Result<(), Error> {
-    //     let mut state = self.state.lock().unwrap();
-
-    //     if state.pending_writes.is_empty() && state.pending_deletes.is_empty() {
-    //         return Ok(());
-    //     }
-    //     let to_write: Vec<_> = state
-    //         .pending_writes
-    //         .iter()
-    //         .map(|(id, bytes)| (id.clone(), bytes.as_slice()))
-    //         .collect();
-    //     self.pager.write_batch(&to_write)?;
-    //     if !state.pending_deletes.is_empty() {
-    //         let ids: Vec<_> = state.pending_deletes.iter().cloned().collect();
-    //         self.pager.dealloc_ids(&ids)?;
-    //     }
-    //     state.pending_writes.clear();
-    //     state.pending_deletes.clear();
-    //     Ok(())
-    // }
     pub fn flush(&self) -> Result<(), Error> {
         let (writes, deletes) = {
             let mut s = self.state.lock().unwrap();
@@ -527,28 +507,6 @@ where
 
     // --------------------------- internal ops --------------------------------
 
-    // fn upsert_internal(&self, key: &KC::Key, value: &[u8]) -> Result<(), Error> {
-    //     let mut state = self.state.lock().unwrap();
-    //     let root_id = state.root.clone();
-
-    //     match self._insert(&root_id, key, value)? {
-    //         InsertResult::Ok => Ok(()),
-    //         InsertResult::Split {
-    //             separator,
-    //             right_id,
-    //         } => {
-    //             let old_root = state.root.clone();
-    //             let new_root = self.alloc_ids(1)?.remove(0);
-    //             let max_left = self.find_max_key(&old_root)?;
-    //             let entries = vec![(max_left, old_root), (separator, right_id)];
-    //             let node: Node<KC::Key, P::Id> = Node::Internal { entries };
-    //             self.write_page(new_root.clone(), Self::encode_node(&node));
-    //             state.root = new_root.clone();
-    //             self.pager.on_root_changed(new_root)?;
-    //             Ok(())
-    //         }
-    //     }
-    // }
     fn upsert_internal(&self, key: &KC::Key, value: &[u8]) -> Result<(), Error> {
         // Snapshot current root under lock, then drop the lock.
         let root_id = {
@@ -644,22 +602,6 @@ where
         }
     }
 
-    // fn delete_internal(&self, key: &KC::Key) -> Result<(), Error> {
-    //     let mut state = self.state.lock().unwrap();
-
-    //     let root_id = state.root.clone();
-    //     self._delete(&root_id, key)?;
-    //     let root_node = self.read_node(&state.root)?;
-    //     if let Node::Internal { entries } = root_node
-    //         && entries.len() == 1
-    //     {
-    //         let old_root = state.root.clone();
-    //         state.root = entries[0].1.clone();
-    //         self.dealloc_page(old_root.clone());
-    //         self.pager.on_root_changed(state.root.clone())?;
-    //     }
-    //     Ok(())
-    // }
     fn delete_internal(&self, key: &KC::Key) -> Result<(), Error> {
         // Snapshot current root under lock, then drop the lock.
         let root_id = {
@@ -1886,39 +1828,6 @@ mod tests {
 
     // --- Structure validation (internal views; no payload copies) ---
 
-    // fn validate_structure<P, KC, IC>(tree: &BPlusTree<P, KC, IC>) -> Result<(), String>
-    // where
-    //     P: Pager,
-    //     KC: KeyCodec,
-    //     IC: IdCodec<Id = P::Id>,
-    // {
-    //     let state = tree.state.lock().unwrap();
-
-    //     // empty tree OK
-    //     if tree
-    //         .pager
-    //         .read_batch(std::slice::from_ref(&state.root))
-    //         .unwrap()
-    //         .is_empty()
-    //         && state.pending_writes.is_empty()
-    //     {
-    //         return Ok(());
-    //     }
-    //     let root_node = tree.read_node(&state.root).unwrap();
-    //     if root_node.entry_count() == 0 {
-    //         return Ok(());
-    //     }
-    //     let mut leaf_depths = FxHashSet::default();
-    //     _validate_node(tree, &tree.root_id(), 0, &mut leaf_depths, true)?;
-    //     if leaf_depths.len() > 1 {
-    //         return Err(format!(
-    //             "Tree is unbalanced! Leaf depths: {:?}",
-    //             leaf_depths
-    //         ));
-    //     }
-    //     Ok(())
-    // }
-
     fn validate_structure<P, KC, IC>(tree: &BPlusTree<P, KC, IC>) -> Result<(), String>
     where
         P: Pager,
@@ -2070,7 +1979,6 @@ mod tests {
         assert!(tree.get(&"grape".to_string()).unwrap().is_none());
     }
 
-    // Add inside the existing `#[cfg(test)] mod tests { ... }` block.
     // Verifies the raw on-disk byte layout for a small u64 leaf.
     // Checks header, aux(next), keys block, values block, and index table.
     //
