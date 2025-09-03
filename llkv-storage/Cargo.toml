@@ -1,12 +1,15 @@
 [package]
 name = "llkv-storage"
+description = "General-purpose storage adapters for the LLKV toolset."
+authors.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-memmap2 = "0.9.8"
+memmap2.workspace = true
 rustc-hash.workspace = true
 simd-r-drive = { workspace = true, optional = true }
 simd-r-drive-entry-handle.workspace = true
@@ -17,5 +20,5 @@ debug = []
 simd-r-drive-support = ["simd-r-drive"]
 
 [dev-dependencies]
-llkv-storage = { workspace = true, features = ["debug", "simd-r-drive-support"] }
+llkv-storage = { path = ".", features = ["debug", "simd-r-drive-support"] }
 tempfile.workspace = true

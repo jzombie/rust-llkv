@@ -1,8 +1,16 @@
 use llkv_btree::bplus_tree::{BPlusTree, SharedBPlusTree};
 use llkv_btree::codecs::KeyCodec;
 use llkv_btree::codecs::{BigEndianIdCodec, BigEndianKeyCodec};
-use llkv_btree::pager::{MemPager64, SharedPager};
+use llkv_btree::define_mem_pager;
+use llkv_btree::pager::SharedPager;
 use llkv_btree::traits::{BTree, GraphvizExt};
+
+define_mem_pager! {
+    /// In-memory pager with u64 page IDs.
+    name: MemPager64,
+    id: u64,
+    default_page_size: 256
+}
 
 fn seed_items(n: u64) -> Vec<(u64, Vec<u8>)> {
     // Deterministic, readable payloads.
@@ -21,9 +29,9 @@ fn graphviz_is_identical_between_btree_and_shared() {
     let p2 = SharedPager::new(base2);
 
     // Build separate trees (no shared storage required for this test).
-    let mut t1: BPlusTree<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> =
+    let t1: BPlusTree<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> =
         BPlusTree::create_empty(p1, None).expect("create t1");
-    let mut t2s: SharedBPlusTree<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> =
+    let t2s: SharedBPlusTree<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> =
         SharedBPlusTree::create_empty(p2, None).expect("create t2");
 
     // Seed both with the same dataset to force multiple nodes and splits.

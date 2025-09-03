@@ -16,35 +16,59 @@ use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex};
 
 // ---------------- In-memory pager (simple; no root tracking) ----------------
-#[derive(Clone)]
-pub struct TestPager {
-    pub pages: FxHashMap<u64, Arc<[u8]>>,
-    pub next_id: u64,
-    pub page_size: usize,
+struct TestPagerState {
+    pages: FxHashMap<u64, Arc<[u8]>>,
+    next_id: u64,
 }
+
+pub struct TestPager {
+    page_size: usize,
+    state: Mutex<TestPagerState>,
+}
+
+impl TestPager {
+    pub fn new(page_size: usize) -> Self {
+        Self {
+            page_size,
+            state: Mutex::new(TestPagerState {
+                pages: FxHashMap::default(),
+                next_id: 1,
+            }),
+        }
+    }
+}
+
 impl Pager for TestPager {
     type Id = u64;
     type Page = Arc<[u8]>;
     fn read_batch(&self, ids: &[Self::Id]) -> Result<FxHashMap<Self::Id, Self::Page>, Error> {
+        let state = self.state.lock().unwrap();
+
         Ok(ids
             .iter()
-            .filter_map(|id| self.pages.get(id).map(|p| (*id, p.clone())))
+            .filter_map(|id| state.pages.get(id).map(|p| (*id, p.clone())))
             .collect())
     }
-    fn write_batch(&mut self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error> {
+    fn write_batch(&self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+
         for (id, data) in pages {
-            self.pages.insert(*id, Arc::from(*data));
+            state.pages.insert(*id, Arc::from(*data));
         }
         Ok(())
     }
-    fn alloc_ids(&mut self, count: usize) -> Result<Vec<Self::Id>, Error> {
-        let start = self.next_id;
-        self.next_id += count as u64;
-        Ok((start..self.next_id).collect())
+    fn alloc_ids(&self, count: usize) -> Result<Vec<Self::Id>, Error> {
+        let mut state = self.state.lock().unwrap();
+
+        let start = state.next_id;
+        state.next_id += count as u64;
+        Ok((start..state.next_id).collect())
     }
-    fn dealloc_ids(&mut self, ids: &[Self::Id]) -> Result<(), Error> {
+    fn dealloc_ids(&self, ids: &[Self::Id]) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+
         for id in ids {
-            self.pages.remove(id);
+            state.pages.remove(id);
         }
         Ok(())
     }
@@ -92,7 +116,7 @@ impl Pager for SharedPager {
             .filter_map(|id| g.pages.get(id).map(|p| (*id, p.clone())))
             .collect())
     }
-    fn write_batch(&mut self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error> {
+    fn write_batch(&self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error> {
         let mut g = self.inner.lock().unwrap();
         for (id, data) in pages {
             if data.len() > g.page_size {
@@ -102,13 +126,13 @@ impl Pager for SharedPager {
         }
         Ok(())
     }
-    fn alloc_ids(&mut self, count: usize) -> Result<Vec<Self::Id>, Error> {
+    fn alloc_ids(&self, count: usize) -> Result<Vec<Self::Id>, Error> {
         let mut g = self.inner.lock().unwrap();
         let start = g.next_id;
         g.next_id += count as u64;
         Ok((start..g.next_id).collect())
     }
-    fn dealloc_ids(&mut self, ids: &[Self::Id]) -> Result<(), Error> {
+    fn dealloc_ids(&self, ids: &[Self::Id]) -> Result<(), Error> {
         let mut g = self.inner.lock().unwrap();
         for id in ids {
             g.pages.remove(id);
@@ -121,7 +145,7 @@ impl Pager for SharedPager {
     fn materialize_owned(&self, bytes: &[u8]) -> Result<Self::Page, Error> {
         Ok(Arc::from(bytes))
     }
-    fn on_root_changed(&mut self, new_root: Self::Id) -> Result<(), Error> {
+    fn on_root_changed(&self, new_root: Self::Id) -> Result<(), Error> {
         self.inner.lock().unwrap().last_root = Some(new_root);
         Ok(())
     }
@@ -136,11 +160,7 @@ pub type U64Tree = TreeU64<TestPager>;
 
 /// Create a `BPlusTree<TestPager, …>` (used by many tests).
 pub fn create_tree() -> Result<TreeU64<TestPager>, Error> {
-    let pager = TestPager {
-        pages: FxHashMap::default(),
-        next_id: 1,
-        page_size: 256,
-    };
+    let pager = TestPager::new(256);
     BPlusTree::<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>::create_empty(pager, None)
 }
 

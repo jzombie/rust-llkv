@@ -5,7 +5,6 @@ use std::hash::Hash;
 pub mod shared_adapter;
 pub use shared_adapter::SharedPager;
 pub mod mem;
-pub use mem::MemPager64;
 
 pub const DEFAULT_PAGE_SIZE_HINT: usize = 4096;
 
@@ -22,13 +21,13 @@ pub trait Pager {
     fn read_batch(&self, ids: &[Self::Id]) -> Result<FxHashMap<Self::Id, Self::Page>, Error>;
 
     /// Batch write. Caller keeps page-size invariant.
-    fn write_batch(&mut self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error>;
+    fn write_batch(&self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error>;
 
     /// Allocate `count` new page IDs.
-    fn alloc_ids(&mut self, count: usize) -> Result<Vec<Self::Id>, Error>;
+    fn alloc_ids(&self, count: usize) -> Result<Vec<Self::Id>, Error>;
 
     /// Batch deallocate page IDs.
-    fn dealloc_ids(&mut self, ids: &[Self::Id]) -> Result<(), Error>;
+    fn dealloc_ids(&self, ids: &[Self::Id]) -> Result<(), Error>;
 
     /// Optional page-size hint (for splitting / underflow checks).
     fn page_size_hint(&self) -> Option<usize>;
@@ -38,7 +37,7 @@ pub trait Pager {
     fn materialize_owned(&self, bytes: &[u8]) -> Result<Self::Page, Error>;
 
     /// Optional notification; e.g. persist new root in a meta page.
-    fn on_root_changed(&mut self, _new_root: Self::Id) -> Result<(), Error> {
+    fn on_root_changed(&self, _new_root: Self::Id) -> Result<(), Error> {
         Ok(())
     }
 }

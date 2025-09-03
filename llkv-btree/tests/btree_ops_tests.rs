@@ -188,12 +188,13 @@ fn ops_range_boundaries_u64() -> Result<(), Box<dyn std::error::Error>> {
 // String-key prefix ops (mutate then verify prefix scan)
 #[test]
 fn ops_prefix_mutations_strings() -> Result<(), Box<dyn std::error::Error>> {
-    let mut tb = BPlusTree::<_, StringKeyCodec, BigEndianIdCodec<u64>>::create_empty(
-        common::TestPager {
-            pages: FxHashMap::default(),
-            next_id: 1,
-            page_size: 512,
-        },
+    let tb = BPlusTree::<_, StringKeyCodec, BigEndianIdCodec<u64>>::create_empty(
+        // common::TestPager {
+        //     pages: FxHashMap::default(),
+        //     next_id: 1,
+        //     page_size: 512,
+        // },
+        common::TestPager::new(512),
         None,
     )?;
 
@@ -265,7 +266,7 @@ fn ops_prefix_mutations_strings() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn ops_randomized_against_truth() -> Result<(), Box<dyn std::error::Error>> {
     use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
-    let mut t = create_tree()?;
+    let t = create_tree()?;
     let mut rng = StdRng::seed_from_u64(12345);
 
     let mut all: FxHashMap<u64, Vec<u8>> = FxHashMap::default();
@@ -352,7 +353,7 @@ fn test_phyiscal_keys_are_less_than_logical_keys_single_insert()
                 .filter_map(|id| g.pages.get(id).map(|p| (*id, p.clone())))
                 .collect())
         }
-        fn write_batch(&mut self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error> {
+        fn write_batch(&self, pages: &[(Self::Id, &[u8])]) -> Result<(), Error> {
             let mut g = self.inner.lock().unwrap();
             for (id, data) in pages {
                 if data.len() > g.page_size {
@@ -362,13 +363,13 @@ fn test_phyiscal_keys_are_less_than_logical_keys_single_insert()
             }
             Ok(())
         }
-        fn alloc_ids(&mut self, count: usize) -> Result<Vec<Self::Id>, Error> {
+        fn alloc_ids(&self, count: usize) -> Result<Vec<Self::Id>, Error> {
             let mut g = self.inner.lock().unwrap();
             let start = g.next_id;
             g.next_id += count as u64;
             Ok((start..g.next_id).collect())
         }
-        fn dealloc_ids(&mut self, ids: &[Self::Id]) -> Result<(), Error> {
+        fn dealloc_ids(&self, ids: &[Self::Id]) -> Result<(), Error> {
             let mut g = self.inner.lock().unwrap();
             for id in ids {
                 g.pages.remove(id);
@@ -385,7 +386,7 @@ fn test_phyiscal_keys_are_less_than_logical_keys_single_insert()
 
     // Use a pager we can inspect.
     let pager = SharedPager::new(256);
-    let mut tree: BPlusTree<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> =
+    let tree: BPlusTree<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> =
         BPlusTree::create_empty(pager.clone(), None)?;
 
     let n: u64 = 15_000;

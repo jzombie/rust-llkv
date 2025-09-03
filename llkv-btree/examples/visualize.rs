@@ -44,8 +44,16 @@
 use llkv_btree::{
     BPlusTree,
     codecs::{BigEndianIdCodec, BigEndianKeyCodec},
-    pager::MemPager64,
+    define_mem_pager,
 };
+
+#[cfg(feature = "debug")]
+define_mem_pager! {
+    /// In-memory pager with u64 page IDs.
+    name: MemPager64,
+    id: u64,
+    default_page_size: 256
+}
 
 #[cfg(feature = "debug")]
 use llkv_btree::traits::GraphvizExt;
@@ -67,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pager = MemPager64::default();
 
     // The BPlusTree is now instantiated with the standard BigEndian codecs.
-    let mut tree =
+    let tree =
         BPlusTree::<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>::create_empty(pager, None)?;
 
     // 2. Insert a large number of random keys to build the tree.

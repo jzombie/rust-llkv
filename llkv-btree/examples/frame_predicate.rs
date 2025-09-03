@@ -11,11 +11,19 @@ use llkv_btree::codecs::{BigEndianIdCodec, BigEndianKeyCodec, KeyCodec};
 use llkv_btree::errors::Error;
 use llkv_btree::iter::{BPlusTreeIter, ScanOpts};
 // Import the pagers used in the other example
-use llkv_btree::pager::{MemPager64, SharedPager};
+use llkv_btree::define_mem_pager;
+use llkv_btree::pager::SharedPager;
 use llkv_btree::prelude::*;
 
 // Added for the shuffle functionality.
 use rand::seq::SliceRandom;
+
+define_mem_pager! {
+    /// In-memory pager with u64 page IDs.
+    name: MemPager64,
+    id: u64,
+    default_page_size: 256
+}
 
 // ----------------------------- seed data --------------------------------
 

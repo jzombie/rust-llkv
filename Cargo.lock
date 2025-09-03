@@ -422,6 +422,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-table"
+version = "0.1.0-alpha"
+dependencies = [
+ "crossbeam-channel",
+ "llkv-btree",
+ "llkv-storage",
+ "rayon",
+ "rustc-hash",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"

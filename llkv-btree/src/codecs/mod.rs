@@ -8,6 +8,7 @@ use std::str;
 
 // --- Traits ---
 
+// TODO: Rename to connotate "physical" & "logical" keys? This would also involve renaming of `KeyCodec` and `IdCodec`
 pub trait KeyCodec {
     type Key: Clone + Ord + Debug;
     fn encoded_len(key: &Self::Key) -> usize;
