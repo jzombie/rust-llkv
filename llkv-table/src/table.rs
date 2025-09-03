@@ -64,10 +64,10 @@ impl Table {
     }
 
     pub fn insert_many(
-        &mut self,
+        &self,
         rows: &[(RowId, HashMap<FieldId, (u64, Vec<u8>)>)],
     ) -> Result<(), Error> {
-        // Step 1: Aggregate all writes across all rows
+        // Step 1: Aggregate all writes across all rows (sequentially, this is fast)
         let mut all_column_writes: BTreeMap<FieldId, Vec<(RowId, &[u8])>> = BTreeMap::new();
         let mut all_index_updates: BTreeMap<FieldId, Vec<(u64, RowId)>> = BTreeMap::new();
 
@@ -87,63 +87,87 @@ impl Table {
             }
         }
 
-        // Step 2: Perform batched column writes
-        for (field_id, writes) in all_column_writes {
-            if let Some(column_tree) = self.columns.get_mut(&field_id) {
-                column_tree.insert_many(&writes)?;
-            }
+        // Step 2 & 3: Perform all database writes in parallel using Rayon
+        rayon::join(
+            || {
+                // --- Parallel Column Writes ---
+                all_column_writes
+                    .into_par_iter()
+                    .for_each(|(field_id, writes)| {
+                        if let Some(column_tree) = self.columns.get(&field_id) {
+                            // Assuming BTree::insert_many now takes &self
+                            column_tree.insert_many(&writes).unwrap();
+                        }
+                    });
+            },
+            || {
+                // --- Parallel Index Writes ---
+                all_index_updates
+                    .into_par_iter()
+                    .for_each(|(field_id, updates)| {
+                        if let Some(primary_index) = self.indexes.get(&field_id) {
+                            self.update_index_parallel(primary_index, updates).unwrap();
+                        }
+                    });
+            },
+        );
+
+        Ok(())
+    }
+
+    fn update_index_parallel(
+        &self,
+        primary_index: &PrimaryIndexTree,
+        updates: Vec<(u64, RowId)>,
+    ) -> Result<(), Error> {
+        let mut updates_by_key: BTreeMap<u64, Vec<RowId>> = BTreeMap::new();
+        for (index_key, row_id) in updates {
+            updates_by_key.entry(index_key).or_default().push(row_id);
         }
 
-        // Step 3: Perform batched index writes
-        for (field_id, updates) in all_index_updates {
-            if let Some(primary_index) = self.indexes.get_mut(&field_id) {
-                let mut updates_by_key: BTreeMap<u64, Vec<RowId>> = BTreeMap::new();
-                for (index_key, row_id) in updates {
-                    updates_by_key.entry(index_key).or_default().push(row_id);
+        let unique_keys: Vec<u64> = updates_by_key.keys().cloned().collect();
+        let primary_snapshot = primary_index.snapshot();
+        let existing_roots_map: HashMap<u64, u64> = primary_snapshot
+            .get_many(&unique_keys)?
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, root_ref_opt)| {
+                root_ref_opt.map(|r| {
+                    (
+                        unique_keys[i],
+                        u64::from_be_bytes(r.as_ref().try_into().unwrap()),
+                    )
+                })
+            })
+            .collect();
+
+        let new_primary_entries: Vec<(u64, [u8; 8])> = updates_by_key
+            .into_par_iter()
+            .filter_map(|(index_key, row_ids)| {
+                if let Some(root_id) = existing_roots_map.get(&index_key) {
+                    let row_id_set = RowIdSetTree::open(self.pager.clone(), *root_id, None);
+                    let writes: Vec<_> = row_ids.iter().map(|rid| (*rid, &[][..])).collect();
+                    row_id_set.insert_many(&writes).ok()?;
+                    None
+                } else {
+                    let new_row_id_set =
+                        RowIdSetTree::create_empty(self.pager.clone(), None).ok()?;
+                    let writes: Vec<_> = row_ids.iter().map(|rid| (*rid, &[][..])).collect();
+                    new_row_id_set.insert_many(&writes).ok()?;
+                    let new_root_id = new_row_id_set.snapshot().root_id();
+                    Some((index_key, new_root_id.to_be_bytes()))
                 }
+            })
+            .collect();
 
-                let unique_keys: Vec<u64> = updates_by_key.keys().cloned().collect();
-                let snapshot = primary_index.snapshot();
-                let existing_roots_map: HashMap<u64, u64> = snapshot
-                    .get_many(&unique_keys)?
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(i, root_ref_opt)| {
-                        root_ref_opt.map(|r| {
-                            (
-                                unique_keys[i],
-                                u64::from_be_bytes(r.as_ref().try_into().unwrap()),
-                            )
-                        })
-                    })
-                    .collect();
-
-                let mut new_primary_entries = Vec::new();
-
-                for (index_key, row_ids) in updates_by_key {
-                    if let Some(root_id) = existing_roots_map.get(&index_key) {
-                        let mut row_id_set = RowIdSetTree::open(self.pager.clone(), *root_id, None);
-                        let writes: Vec<_> = row_ids.iter().map(|rid| (*rid, &[][..])).collect();
-                        row_id_set.insert_many(&writes)?;
-                    } else {
-                        let mut new_row_id_set =
-                            RowIdSetTree::create_empty(self.pager.clone(), None)?;
-                        let writes: Vec<_> = row_ids.iter().map(|rid| (*rid, &[][..])).collect();
-                        new_row_id_set.insert_many(&writes)?;
-                        let new_root_id = new_row_id_set.snapshot().root_id();
-                        new_primary_entries.push((index_key, new_root_id.to_be_bytes()));
-                    }
-                }
-
-                if !new_primary_entries.is_empty() {
-                    let writes_slice: Vec<(u64, &[u8])> = new_primary_entries
-                        .iter()
-                        .map(|(k, v)| (*k, v.as_slice()))
-                        .collect();
-                    primary_index.insert_many(&writes_slice)?;
-                }
-            }
+        if !new_primary_entries.is_empty() {
+            let writes_slice: Vec<(u64, &[u8])> = new_primary_entries
+                .iter()
+                .map(|(k, v)| (*k, &v[..]))
+                .collect();
+            primary_index.insert_many(&writes_slice)?;
         }
+
         Ok(())
     }
 
@@ -266,7 +290,6 @@ impl Table {
                             let snapshot = row_id_set.snapshot();
                             if let Ok(iter) = snapshot.iter() {
                                 for (row_id_ref, _value) in iter {
-                                    // **FIX:** Decode the KeyRef before sending
                                     if let Ok(row_id) =
                                         BigEndianKeyCodec::<u64>::decode_from(row_id_ref.as_ref())
                                     {
@@ -320,13 +343,10 @@ impl Table {
                             let snapshot = row_id_set.snapshot();
                             if let Ok(iter) = snapshot.iter() {
                                 for (row_id_ref, _) in iter {
-                                    // **FIX:** Decode the KeyRef before sending
                                     if let Ok(row_id) =
                                         BigEndianKeyCodec::<u64>::decode_from(row_id_ref.as_ref())
                                     {
                                         if tx.send(row_id).is_err() {
-                                            // This break only exits the inner loop for this task.
-                                            // We rely on the channel being dropped to signal completion.
                                             break;
                                         }
                                     }

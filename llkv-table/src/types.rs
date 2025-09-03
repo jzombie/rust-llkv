@@ -21,12 +21,12 @@ pub type RowId = u64;
 /// baking any row-id semantics into this layer.
 pub type RowIdCmp = fn(&[u8], &[u8]) -> Ordering;
 
-pub type ValSink<'a> = dyn FnMut(&'a [u8]) + 'a;
-// consumes one value
-pub type RowEmit<'a> = dyn FnMut(&mut ValSink<'a>) + 'a;
-// calls sink for each value
-pub type OnRow<'a> = dyn FnMut(&'a [u8], &mut RowEmit<'a>) + 'a;
-// (row_id, emit)
+// pub type ValSink<'a> = dyn FnMut(&'a [u8]) + 'a;
+// // consumes one value
+// pub type RowEmit<'a> = dyn FnMut(&mut ValSink<'a>) + 'a;
+// // calls sink for each value
+// pub type OnRow<'a> = dyn FnMut(&'a [u8], &mut RowEmit<'a>) + 'a;
+// // (row_id, emit)
 
 #[cfg(test)]
 mod tests {
