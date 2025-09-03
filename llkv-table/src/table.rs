@@ -9,7 +9,7 @@ use llkv_btree::pager::{MemPager64, Pager as BTreePager, SharedPager};
 use llkv_btree::prelude::*;
 use llkv_btree::shared_bplus_tree::SharedBPlusTree;
 use llkv_btree::views::value_view::ValueRef;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::thread;
 
@@ -189,7 +189,7 @@ impl Table {
         match expr {
             Expr::Pred(filter) => self.get_stream_for_predicate(filter),
             Expr::And(sub_expressions) => {
-                let mut streams: Vec<_> = sub_expressions
+                let streams: Vec<_> = sub_expressions
                     .iter()
                     .map(|sub_expr| self.get_row_id_stream(sub_expr))
                     .collect::<Result<Vec<_>, _>>()?
@@ -199,27 +199,33 @@ impl Table {
 
                 if streams.is_empty() {
                     let (tx, rx) = xchan::unbounded();
-                    drop(tx); // Immediately close, creating an empty stream
+                    drop(tx);
                     return Ok(Some(rx));
                 }
 
                 let (tx, rx) = xchan::unbounded();
                 thread::spawn(move || {
-                    // Seed the intersection set with results from the first stream.
-                    let mut intersection: HashSet<u64> = streams.remove(0).into_iter().collect();
-
-                    // Filter this set by intersecting it with each subsequent stream.
-                    for stream in streams {
-                        let next_set: HashSet<u64> = stream.into_iter().collect();
-                        intersection.retain(|item| next_set.contains(item));
-                        if intersection.is_empty() {
+                    let mut heads: Vec<Option<u64>> =
+                        streams.iter().map(|s| s.recv().ok()).collect();
+                    loop {
+                        if heads.iter().any(|h| h.is_none()) {
                             break;
                         }
-                    }
-
-                    for row_id in intersection {
-                        if tx.send(row_id).is_err() {
-                            break;
+                        let first = heads[0].unwrap();
+                        if heads.iter().all(|h| h.unwrap() == first) {
+                            if tx.send(first).is_err() {
+                                break;
+                            }
+                            for i in 0..streams.len() {
+                                heads[i] = streams[i].recv().ok();
+                            }
+                        } else {
+                            let min_head = heads.iter().filter_map(|&h| h).min().unwrap();
+                            for i in 0..streams.len() {
+                                if heads[i] == Some(min_head) {
+                                    heads[i] = streams[i].recv().ok();
+                                }
+                            }
                         }
                     }
                 });
@@ -236,16 +242,25 @@ impl Table {
 
                 let (tx, rx) = xchan::unbounded();
                 thread::spawn(move || {
-                    let mut union_set = HashSet::new();
-                    for stream in streams {
-                        for row_id in stream {
-                            union_set.insert(row_id);
-                        }
-                    }
-
-                    for row_id in union_set {
-                        if tx.send(row_id).is_err() {
+                    let mut heads: Vec<Option<u64>> =
+                        streams.iter().map(|s| s.recv().ok()).collect();
+                    let mut last_sent: Option<u64> = None;
+                    loop {
+                        let min_head = heads.iter().filter_map(|&h| h).min();
+                        if min_head.is_none() {
                             break;
+                        }
+                        let min_val = min_head.unwrap();
+                        if last_sent != Some(min_val) {
+                            if tx.send(min_val).is_err() {
+                                break;
+                            }
+                            last_sent = Some(min_val);
+                        }
+                        for i in 0..streams.len() {
+                            if heads[i] == Some(min_val) {
+                                heads[i] = streams[i].recv().ok();
+                            }
                         }
                     }
                 });
