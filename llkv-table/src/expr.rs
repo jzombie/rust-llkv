@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 use crate::types::FieldId;
+use std::ops::Bound; // <-- Add this use statement
 
 /// Logical expression over predicates.
 #[derive(Clone, Debug)]
@@ -48,7 +49,12 @@ pub enum Operator<'a> {
     // Equality
     Equals(&'a [u8]),
 
-    // Range comparisons
+    Range {
+        lower: Bound<&'a [u8]>,
+        upper: Bound<&'a [u8]>,
+    },
+
+    // Simple comparisons (can be implemented as special cases of Range if needed)
     GreaterThan(&'a [u8]),
     GreaterThanOrEquals(&'a [u8]),
     LessThan(&'a [u8]),
