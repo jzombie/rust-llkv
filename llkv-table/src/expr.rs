@@ -2,7 +2,6 @@
 //!
 //! All payloads are borrowed &[u8]. Negation is an expression node,
 //! not a dedicated "Ne" operator.
-
 #![forbid(unsafe_code)]
 
 use crate::types::FieldId;
@@ -79,7 +78,6 @@ mod tests {
         let all = Expr::all_of(vec![f1.clone(), f2.clone()]);
         let any = Expr::any_of(vec![f1.clone(), f2.clone()]);
         let not_all = Expr::not(all);
-
         match any {
             Expr::Or(v) => assert_eq!(v.len(), 2),
             _ => panic!("expected Or"),

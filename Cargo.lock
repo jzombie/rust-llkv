@@ -425,7 +425,10 @@ dependencies = [
 name = "llkv-table"
 version = "0.1.0-alpha"
 dependencies = [
+ "crossbeam-channel",
  "llkv-btree",
+ "llkv-storage",
+ "rustc-hash",
 ]
 
 [[package]]

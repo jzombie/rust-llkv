@@ -1,184 +1,270 @@
-//! Table orchestrator that consumes a streaming Source and delegates
-//! projection to ColumnStorage. No id lists are materialized.
+#![forbid(unsafe_code)]
 
-use crate::expr::Expr;
-use crate::source::Source;
-use crate::storage::ColumnStorage;
-use crate::types::{FieldId, RowIdCmp};
+use crate::expr::{Expr, Operator};
+use crossbeam_channel as xchan;
+use llkv_btree::codecs::{BigEndianIdCodec, BigEndianKeyCodec, KeyCodec};
+use llkv_btree::errors::Error;
+use llkv_btree::iter::{BPlusTreeIter, ScanOpts};
+use llkv_btree::pager::{MemPager64, Pager as BTreePager, SharedPager};
+use llkv_btree::prelude::*;
+use llkv_btree::shared_bplus_tree::SharedBPlusTree;
+use llkv_btree::views::value_view::ValueRef;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 
-/// Table configuration provided by the caller.
+// --- Correct, Concrete Tree Types for our Table ---
+type Pager = SharedPager<MemPager64>;
+
+// Stores column data: maps RowId (u64) -> Value (Vec<u8>)
+type ColumnTree = SharedBPlusTree<Pager, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>;
+
+// A B-Tree that maps an indexed value (e.g., user ID 100) to the root ID of a RowIdSetTree.
+type PrimaryIndexTree = SharedBPlusTree<Pager, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>;
+
+// A B-Tree used as a set to store RowIds for a single indexed value.
+type RowIdSetTree = SharedBPlusTree<Pager, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>;
+
+// --- Type Aliases for Readability ---
+pub type FieldId = u32;
+pub type RowId = u64;
+pub type RowIdCmp = fn(&[u8], &[u8]) -> std::cmp::Ordering;
+
 pub struct TableCfg {
-    /// Comparator for opaque row-ids. This function must match the
-    /// ordering of all Sources used with this Table.
     pub row_id_cmp: RowIdCmp,
 }
 
-/// Minimal table that wires a storage engine and leaves indexing to
-/// the caller. It never buffers sequences of row-ids.
-pub struct Table<S: ColumnStorage> {
-    storage: S,
-    cfg: TableCfg,
+/// The Table manages a collection of B-Trees for columns and indexes.
+pub struct Table {
+    columns: BTreeMap<FieldId, ColumnTree>,
+    indexes: BTreeMap<FieldId, PrimaryIndexTree>,
+    pager: Pager,
 }
 
-impl<S: ColumnStorage> Table<S> {
-    pub fn new(storage: S, cfg: TableCfg) -> Self {
-        Self { storage, cfg }
-    }
-
-    /// Project using a caller-provided Source. No buffering occurs.
-    pub fn scan_with_source<'a>(
-        &'a self,
-        src: &mut dyn Source<'a>,
-        projection: &[FieldId],
-        on_row: &mut dyn FnMut(&'a [u8], &mut dyn FnMut(&'a [u8])),
-    ) -> Result<(), ()> {
-        let _ = self.cfg.row_id_cmp; // reserved for future routing
-        self.storage.project_stream(src, projection, on_row)
-    }
-
-    /// Storage-only plan: use pruning when available, else full scan.
-    pub fn scan_storage_only<'a>(
-        &'a self,
-        expr: &Expr<'a>,
-        projection: &[FieldId],
-        on_row: &mut dyn FnMut(&'a [u8], &mut dyn FnMut(&'a [u8])),
-    ) -> Result<(), ()> {
-        if let Some(mut src) = self.storage.open_pruned(expr) {
-            self.storage.project_stream(&mut src, projection, on_row)
-        } else {
-            let mut src = self.storage.open_full_scan();
-            self.storage.project_stream(&mut src, projection, on_row)
+impl Table {
+    pub fn new(page_size: usize) -> Self {
+        let base_pager = MemPager64::new(page_size);
+        let shared_pager = SharedPager::new(base_pager);
+        Self {
+            columns: BTreeMap::new(),
+            indexes: BTreeMap::new(),
+            pager: shared_pager,
         }
     }
 
-    /// Access the storage for adapter-specific operations.
-    pub fn storage(&self) -> &S {
-        &self.storage
+    pub fn add_column(&mut self, field_id: FieldId) {
+        let column_tree = ColumnTree::create_empty(self.pager.clone(), None).unwrap();
+        self.columns.insert(field_id, column_tree);
+    }
+
+    pub fn add_index(&mut self, field_id: FieldId) {
+        let index_tree = PrimaryIndexTree::create_empty(self.pager.clone(), None).unwrap();
+        self.indexes.insert(field_id, index_tree);
+    }
+
+    pub fn insert(
+        &mut self,
+        row_id: RowId,
+        data: HashMap<FieldId, (u64, Vec<u8>)>,
+    ) -> Result<(), Error> {
+        // --- Step 1: Group all writes by FieldId ---
+        let mut column_writes: BTreeMap<FieldId, Vec<(RowId, &[u8])>> = BTreeMap::new();
+        let mut index_updates: BTreeMap<FieldId, Vec<(u64, RowId)>> = BTreeMap::new();
+
+        for (field_id, (index_key, value)) in &data {
+            // Group column data
+            column_writes
+                .entry(*field_id)
+                .or_default()
+                .push((row_id, value.as_slice()));
+
+            // Group index data
+            if self.indexes.contains_key(field_id) {
+                index_updates
+                    .entry(*field_id)
+                    .or_default()
+                    .push((*index_key, row_id));
+            }
+        }
+
+        // --- Step 2: Perform batched column writes ---
+        for (field_id, writes) in column_writes {
+            if let Some(column_tree) = self.columns.get_mut(&field_id) {
+                column_tree.insert_many(&writes)?;
+            }
+        }
+
+        // --- Step 3: Perform batched index writes ---
+        for (field_id, updates) in index_updates {
+            if let Some(primary_index) = self.indexes.get_mut(&field_id) {
+                let snapshot = primary_index.snapshot();
+
+                // Collect all unique index keys to look them up in one batch
+                let index_keys: Vec<u64> = updates.iter().map(|(k, _v)| *k).collect();
+                let existing_roots = snapshot.get_many(&index_keys)?;
+
+                let mut new_primary_entries = Vec::new();
+
+                for (i, (index_key, new_row_id)) in updates.into_iter().enumerate() {
+                    match &existing_roots[i] {
+                        Some(root_id_ref) => {
+                            // Secondary tree exists: open it and add the new row_id
+                            let root_id_bytes: [u8; 8] = root_id_ref.as_ref().try_into().unwrap();
+                            let root_id = u64::from_be_bytes(root_id_bytes);
+                            let mut row_id_set =
+                                RowIdSetTree::open(self.pager.clone(), root_id, None);
+                            row_id_set.insert_many(&[(new_row_id, &[])])?;
+                        }
+                        None => {
+                            // Secondary tree does not exist: create it
+                            let mut new_row_id_set =
+                                RowIdSetTree::create_empty(self.pager.clone(), None)?;
+                            new_row_id_set.insert_many(&[(new_row_id, &[])])?;
+
+                            // Get its root and stage it for insertion into the primary index
+                            let new_root_id = new_row_id_set.snapshot().root_id();
+                            new_primary_entries.push((index_key, new_root_id.to_be_bytes()));
+                        }
+                    }
+                }
+
+                // Insert all new primary index entries in a single batch
+                if !new_primary_entries.is_empty() {
+                    let writes_slice: Vec<(u64, &[u8])> = new_primary_entries
+                        .iter()
+                        .map(|(k, v)| (*k, v.as_slice()))
+                        .collect();
+                    primary_index.insert_many(&writes_slice)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn scan<'a>(
+        &'a self,
+        expr: &Expr<'a>,
+        projection: &[FieldId],
+        on_row: &mut dyn FnMut(
+            RowId,
+            &mut dyn Iterator<Item = ValueRef<<Pager as BTreePager>::Page>>,
+        ),
+    ) -> Result<(), Error> {
+        let row_id_stream = self.get_row_id_stream(expr)?;
+        let row_id_stream = match row_id_stream {
+            Some(rx) => rx,
+            None => return Ok(()),
+        };
+
+        for row_id in row_id_stream {
+            let mut value_refs: Vec<ValueRef<<Pager as BTreePager>::Page>> =
+                Vec::with_capacity(projection.len());
+
+            for field_id in projection {
+                if let Some(column_tree) = self.columns.get(field_id) {
+                    if let Some(value_ref) = column_tree.snapshot().get(&row_id)? {
+                        value_refs.push(value_ref);
+                    }
+                }
+            }
+
+            let mut values_iter = value_refs.into_iter();
+            on_row(row_id, &mut values_iter);
+        }
+        Ok(())
+    }
+
+    fn get_row_id_stream<'b>(
+        &'b self,
+        expr: &Expr<'b>,
+    ) -> Result<Option<xchan::Receiver<u64>>, Error> {
+        if let Expr::Pred(filter) = expr {
+            if let Some(primary_index) = self.indexes.get(&filter.field) {
+                if let Operator::Equals(val) = filter.op {
+                    let index_key = BigEndianKeyCodec::<u64>::decode_from(val)?;
+
+                    let snapshot = primary_index.snapshot();
+                    if let Some(root_id_ref) = snapshot.get(&index_key)? {
+                        let root_id_bytes: [u8; 8] = root_id_ref.as_ref().try_into().unwrap();
+                        let root_id = u64::from_be_bytes(root_id_bytes);
+
+                        // Open the specific RowIdSetTree for this index value.
+                        let row_id_set = RowIdSetTree::open(self.pager.clone(), root_id, None);
+
+                        // Stream all keys (which are the row IDs) from this tree.
+                        let original_rx = row_id_set.start_stream_with_opts(ScanOpts::forward());
+                        let (tx, transformed_rx) = xchan::unbounded();
+
+                        std::thread::spawn(move || {
+                            for (row_id, _empty_value) in original_rx {
+                                if tx.send(row_id).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+
+                        return Ok(Some(transformed_rx));
+                    }
+                }
+            }
+        }
+
+        // If no matching index entry is found, return an empty stream.
+        let (_tx, rx) = xchan::unbounded();
+        Ok(Some(rx))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expr::{Filter, Operator};
-    use crate::source::{SliceSource, Source};
-    use crate::storage::ColumnStorage;
-    use core::cmp::Ordering;
-    use std::collections::BTreeMap;
-
-    fn cmp(a: &[u8], b: &[u8]) -> Ordering {
-        a.cmp(b)
-    }
-
-    /// Small storage used only in this module to validate integration.
-    struct MiniStore {
-        rows: BTreeMap<Vec<u8>, BTreeMap<FieldId, Vec<u8>>>,
-        ids: Vec<Vec<u8>>,
-    }
-
-    impl MiniStore {
-        fn new() -> Self {
-            Self {
-                rows: BTreeMap::new(),
-                ids: Vec::new(),
-            }
-        }
-        fn insert(&mut self, id: &[u8], f: FieldId, v: &[u8]) {
-            self.rows
-                .entry(id.to_vec())
-                .or_default()
-                .insert(f, v.to_vec());
-        }
-        fn seal(&mut self) {
-            self.ids = self.rows.keys().cloned().collect();
-        }
-    }
-
-    impl ColumnStorage for MiniStore {
-        fn project_stream<'a>(
-            &'a self,
-            src: &mut dyn Source<'a>,
-            projection: &[FieldId],
-            on_row: &mut dyn FnMut(&'a [u8], &mut dyn FnMut(&'a [u8])),
-        ) -> Result<(), ()> {
-            while let Some(id) = src.next() {
-                let vals = self.rows.get(id).unwrap();
-                let mut emit = |v: &mut dyn FnMut(&'a [u8])| {
-                    for f in projection {
-                        let buf = vals.get(f).map(|b| b.as_slice()).unwrap_or(&[]);
-                        v(buf);
-                    }
-                };
-                on_row(id, &mut emit);
-            }
-            Ok(())
-        }
-
-        type Pruned<'a> = SliceSource<'a>;
-        fn open_pruned<'a>(&'a self, _expr: &Expr<'a>) -> Option<Self::Pruned<'a>> {
-            None
-        }
-
-        type Full<'a> = SliceSource<'a>;
-        fn open_full_scan<'a>(&'a self) -> Self::Full<'a> {
-            let mut views: Vec<&[u8]> = Vec::with_capacity(self.ids.len());
-            for id in &self.ids {
-                views.push(id.as_slice());
-            }
-            let leaked = Box::leak(views.into_boxed_slice());
-            SliceSource::new(leaked)
-        }
-    }
+    use crate::expr::Filter;
+    use std::collections::HashSet;
 
     #[test]
-    fn table_scan_with_source_projects_rows() {
-        let mut st = MiniStore::new();
-        st.insert(b"id1", 1, b"v11");
-        st.insert(b"id1", 2, b"v12");
-        st.insert(b"id2", 1, b"v21");
-        st.insert(b"id2", 2, b"v22");
-        st.seal();
+    fn it_works_insert_and_scan_using_index() {
+        let mut table = Table::new(4096);
+        table.add_column(1); // Name
+        table.add_index(1);
+        table.add_column(2); // Country
 
-        let tb = Table::new(st, TableCfg { row_id_cmp: cmp });
+        let row1 = HashMap::from([
+            (1, (100u64, b"Alice".to_vec())),
+            (2, (0u64, b"USA".to_vec())),
+        ]);
+        let row2 = HashMap::from([
+            (1, (200u64, b"Bob".to_vec())),
+            (2, (0u64, b"Canada".to_vec())),
+        ]);
+        let row3 = HashMap::from([
+            (1, (100u64, b"Alice".to_vec())),
+            (2, (0u64, b"UK".to_vec())),
+        ]);
 
-        // Build a custom source over id2 only.
-        let picks = [b"id2".as_slice()];
-        let mut src = SliceSource::new(&picks);
+        table.insert(101, row1).unwrap();
+        table.insert(102, row2).unwrap();
+        table.insert(103, row3).unwrap();
 
-        let mut out: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
-        let mut on_row = |rid: &[u8], on_val: &mut dyn FnMut(&[u8])| {
-            let mut vals = Vec::new();
-            let mut push = |v: &[u8]| vals.push(v.to_vec());
-            on_val(&mut push);
-            out.push((rid.to_vec(), vals));
-        };
-        tb.scan_with_source(&mut src, &[1, 2], &mut on_row).unwrap();
-
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0, b"id2");
-        assert_eq!(out[0].1, vec![b"v21".to_vec(), b"v22".to_vec()]);
-    }
-
-    #[test]
-    fn table_storage_only_uses_full_scan() {
-        let mut st = MiniStore::new();
-        st.insert(b"id1", 1, b"v11");
-        st.insert(b"id2", 1, b"v21");
-        st.seal();
-
-        let tb = Table::new(st, TableCfg { row_id_cmp: cmp });
-
-        // Dummy expr. Storage has no pruning, so full scan is used.
-        let expr = Expr::Pred(Filter {
+        let filter = Filter {
             field: 1,
-            op: Operator::Equals(b"v11"),
-        });
-
-        let mut ids: Vec<Vec<u8>> = Vec::new();
-        let mut on_row = |rid: &[u8], _on_val: &mut dyn FnMut(&[u8])| {
-            ids.push(rid.to_vec());
+            op: Operator::Equals(&100u64.to_be_bytes()),
         };
-        tb.scan_storage_only(&expr, &[], &mut on_row).unwrap();
-        assert_eq!(ids, vec![b"id1".to_vec(), b"id2".to_vec()]);
+        let expr = Expr::Pred(filter);
+        let projection = &[2];
+
+        let mut results = Vec::new();
+        table
+            .scan(&expr, projection, &mut |row_id, values_iter| {
+                let values: Vec<Vec<u8>> = values_iter.map(|v| v.as_slice().to_vec()).collect();
+                results.push((row_id, values));
+            })
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+
+        let results_set: HashSet<(u64, Vec<Vec<u8>>)> = results.into_iter().collect();
+        let expected_set =
+            HashSet::from([(101, vec![b"USA".to_vec()]), (103, vec![b"UK".to_vec()])]);
+
+        assert_eq!(results_set, expected_set);
     }
 }
