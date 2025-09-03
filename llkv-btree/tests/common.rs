@@ -160,11 +160,6 @@ pub type U64Tree = TreeU64<TestPager>;
 
 /// Create a `BPlusTree<TestPager, …>` (used by many tests).
 pub fn create_tree() -> Result<TreeU64<TestPager>, Error> {
-    // let pager = TestPager {
-    //     pages: FxHashMap::default(),
-    //     next_id: 1,
-    //     page_size: 256,
-    // };
     let pager = TestPager::new(256);
     BPlusTree::<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>::create_empty(pager, None)
 }
