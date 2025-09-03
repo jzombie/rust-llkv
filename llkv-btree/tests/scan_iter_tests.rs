@@ -4,7 +4,6 @@ use common::{TestPager, U64Tree, collect_and_validate_iter, create_tree, populat
 use llkv_btree::bplus_tree::BPlusTree;
 use llkv_btree::codecs::{BigEndianIdCodec, BigEndianKeyCodec, KeyCodec, StringKeyCodec};
 use llkv_btree::iter::{BPlusTreeIter, Direction, ScanOpts};
-use rustc_hash::FxHashMap;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
 // Forward full scan
@@ -124,7 +123,7 @@ fn iter_range_reverse_scan_u64() -> Result<(), Box<dyn std::error::Error>> {
 // Prefix scan on String keys (forward)
 #[test]
 fn iter_prefix_scan_strings() -> Result<(), Box<dyn std::error::Error>> {
-    let mut tree = BPlusTree::<TestPager, StringKeyCodec, BigEndianIdCodec<u64>>::create_empty(
+    let tree = BPlusTree::<TestPager, StringKeyCodec, BigEndianIdCodec<u64>>::create_empty(
         // TestPager {
         //     pages: FxHashMap::default(),
         //     next_id: 1,
@@ -188,7 +187,7 @@ fn iter_prefix_scan_strings() -> Result<(), Box<dyn std::error::Error>> {
 // Reverse + prefix (extra safety)
 #[test]
 fn iter_prefix_reverse_scan_strings() -> Result<(), Box<dyn std::error::Error>> {
-    let mut tree = BPlusTree::<TestPager, StringKeyCodec, BigEndianIdCodec<u64>>::create_empty(
+    let tree = BPlusTree::<TestPager, StringKeyCodec, BigEndianIdCodec<u64>>::create_empty(
         // TestPager {
         //     pages: FxHashMap::default(),
         //     next_id: 1,

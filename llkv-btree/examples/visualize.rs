@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pager = MemPager64::default();
 
     // The BPlusTree is now instantiated with the standard BigEndian codecs.
-    let mut tree =
+    let tree =
         BPlusTree::<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>::create_empty(pager, None)?;
 
     // 2. Insert a large number of random keys to build the tree.

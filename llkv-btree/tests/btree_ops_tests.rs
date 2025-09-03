@@ -188,7 +188,7 @@ fn ops_range_boundaries_u64() -> Result<(), Box<dyn std::error::Error>> {
 // String-key prefix ops (mutate then verify prefix scan)
 #[test]
 fn ops_prefix_mutations_strings() -> Result<(), Box<dyn std::error::Error>> {
-    let mut tb = BPlusTree::<_, StringKeyCodec, BigEndianIdCodec<u64>>::create_empty(
+    let tb = BPlusTree::<_, StringKeyCodec, BigEndianIdCodec<u64>>::create_empty(
         // common::TestPager {
         //     pages: FxHashMap::default(),
         //     next_id: 1,
@@ -266,7 +266,7 @@ fn ops_prefix_mutations_strings() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn ops_randomized_against_truth() -> Result<(), Box<dyn std::error::Error>> {
     use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
-    let mut t = create_tree()?;
+    let t = create_tree()?;
     let mut rng = StdRng::seed_from_u64(12345);
 
     let mut all: FxHashMap<u64, Vec<u8>> = FxHashMap::default();
@@ -386,7 +386,7 @@ fn test_phyiscal_keys_are_less_than_logical_keys_single_insert()
 
     // Use a pager we can inspect.
     let pager = SharedPager::new(256);
-    let mut tree: BPlusTree<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> =
+    let tree: BPlusTree<_, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> =
         BPlusTree::create_empty(pager.clone(), None)?;
 
     let n: u64 = 15_000;

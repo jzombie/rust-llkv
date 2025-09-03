@@ -30,6 +30,7 @@ impl<'a> Expr<'a> {
     }
 
     /// Wrap an expression in a logical NOT.
+    #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn not(e: Expr<'a>) -> Expr<'a> {
         Expr::Not(Box::new(e))

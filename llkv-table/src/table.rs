@@ -1,31 +1,20 @@
 #![forbid(unsafe_code)]
 
 use crate::expr::{Expr, Filter, Operator};
+use crate::types::{ColumnTree, PrimaryIndexTree, RowIdSetTree};
 use crossbeam_channel as xchan;
-use llkv_btree::codecs::{BigEndianIdCodec, BigEndianKeyCodec, KeyCodec};
+use llkv_btree::codecs::{BigEndianKeyCodec, KeyCodec};
 use llkv_btree::errors::Error;
 use llkv_btree::iter::{BPlusTreeIter, ScanOpts};
 use llkv_btree::pager::{MemPager64, Pager as BTreePager, SharedPager};
 use llkv_btree::prelude::*;
-use llkv_btree::shared_bplus_tree::SharedBPlusTree;
 use llkv_btree::views::value_view::ValueRef;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::thread;
 
-// --- Correct, Concrete Tree Types for our Table ---
-type Pager = SharedPager<MemPager64>;
-
-// Stores column data: maps RowId (u64) -> Value (Vec<u8>)
-type ColumnTree = SharedBPlusTree<Pager, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>;
-
-// A B-Tree that maps an indexed value (e.g., user ID 100) to the root ID of a RowIdSetTree.
-type PrimaryIndexTree = SharedBPlusTree<Pager, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>;
-
-// A B-Tree used as a set to store RowIds for a single indexed value.
-type RowIdSetTree = SharedBPlusTree<Pager, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>;
-
+// TODO: Move to types
 // --- Type Aliases for Readability ---
 pub type FieldId = u32;
 pub type RowId = u64;
@@ -36,20 +25,34 @@ pub struct TableCfg {
 }
 
 /// The Table manages a collection of B-Trees for columns and indexes.
-pub struct Table {
-    columns: BTreeMap<FieldId, ColumnTree>,
-    indexes: BTreeMap<FieldId, PrimaryIndexTree>,
-    pager: Pager,
+pub struct Table<P>
+where
+    P: BTreePager<Id = u64> + Clone + Send + Sync + 'static,
+    <P as BTreePager>::Page: Send + Sync + 'static,
+{
+    columns: BTreeMap<FieldId, ColumnTree<P>>,
+    indexes: BTreeMap<FieldId, PrimaryIndexTree<P>>,
+    pager: P,
 }
 
-impl Table {
+impl Table<SharedPager<MemPager64>> {
     pub fn new(page_size: usize) -> Self {
-        let base_pager = MemPager64::new(page_size);
-        let shared_pager = SharedPager::new(base_pager);
+        let base = MemPager64::new(page_size);
+        let pager = SharedPager::new(base);
+        Self::with_pager(pager)
+    }
+}
+
+impl<P> Table<P>
+where
+    P: BTreePager<Id = u64> + Clone + Send + Sync + 'static,
+    <P as BTreePager>::Page: Send + Sync + 'static,
+{
+    pub fn with_pager(pager: P) -> Self {
         Self {
             columns: BTreeMap::new(),
             indexes: BTreeMap::new(),
-            pager: shared_pager,
+            pager,
         }
     }
 
@@ -63,6 +66,8 @@ impl Table {
         self.indexes.insert(field_id, index_tree);
     }
 
+    // TODO: Remove complex type after figuring out u64, Vec<u8> replacements
+    #[allow(clippy::type_complexity)]
     pub fn insert_many(
         &self,
         rows: &[(RowId, HashMap<FieldId, (u64, Vec<u8>)>)],
@@ -117,7 +122,7 @@ impl Table {
 
     fn update_index_parallel(
         &self,
-        primary_index: &PrimaryIndexTree,
+        primary_index: &PrimaryIndexTree<P>,
         updates: Vec<(u64, RowId)>,
     ) -> Result<(), Error> {
         let mut updates_by_key: BTreeMap<u64, Vec<RowId>> = BTreeMap::new();
@@ -175,10 +180,7 @@ impl Table {
         &'a self,
         expr: &Expr<'a>,
         projection: &[FieldId],
-        on_row: &mut dyn FnMut(
-            RowId,
-            &mut dyn Iterator<Item = ValueRef<<Pager as BTreePager>::Page>>,
-        ),
+        on_row: &mut dyn FnMut(RowId, &mut dyn Iterator<Item = ValueRef<<P>::Page>>),
     ) -> Result<(), Error> {
         let row_id_stream = self.get_row_id_stream(expr)?;
         let row_id_stream = match row_id_stream {
@@ -186,13 +188,12 @@ impl Table {
             None => return Ok(()),
         };
         for row_id in row_id_stream {
-            let mut value_refs: Vec<ValueRef<<Pager as BTreePager>::Page>> =
-                Vec::with_capacity(projection.len());
+            let mut value_refs: Vec<ValueRef<<P>::Page>> = Vec::with_capacity(projection.len());
             for field_id in projection {
-                if let Some(column_tree) = self.columns.get(field_id) {
-                    if let Some(value_ref) = column_tree.snapshot().get(&row_id)? {
-                        value_refs.push(value_ref);
-                    }
+                if let Some(column_tree) = self.columns.get(field_id)
+                    && let Some(value_ref) = column_tree.snapshot().get(&row_id)?
+                {
+                    value_refs.push(value_ref);
                 }
             }
             let mut values_iter = value_refs.into_iter();
@@ -292,10 +293,9 @@ impl Table {
                                 for (row_id_ref, _value) in iter {
                                     if let Ok(row_id) =
                                         BigEndianKeyCodec::<u64>::decode_from(row_id_ref.as_ref())
+                                        && tx.send(row_id).is_err()
                                     {
-                                        if tx.send(row_id).is_err() {
-                                            break;
-                                        }
+                                        break;
                                     }
                                 }
                             }
@@ -345,10 +345,9 @@ impl Table {
                                 for (row_id_ref, _) in iter {
                                     if let Ok(row_id) =
                                         BigEndianKeyCodec::<u64>::decode_from(row_id_ref.as_ref())
+                                        && tx.send(row_id).is_err()
                                     {
-                                        if tx.send(row_id).is_err() {
-                                            break;
-                                        }
+                                        break;
                                     }
                                 }
                             }
@@ -376,7 +375,7 @@ mod tests {
     // They will pass with this new, correct architecture.
     #[test]
     fn it_works_insert_and_scan_using_index() {
-        let mut table = Table::new(4096);
+        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
         table.add_column(1); // Name
         table.add_index(1);
         table.add_column(2); // Country
@@ -424,7 +423,7 @@ mod tests {
 
     #[test]
     fn it_works_range_scan_using_index() {
-        let mut table = Table::new(4096);
+        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
         table.add_column(1); // User ID
         table.add_index(1);
         table.add_column(2); // Data
@@ -495,7 +494,7 @@ mod tests {
 
     #[test]
     fn it_works_complex_multi_column_scans() {
-        let mut table = Table::new(4096);
+        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
 
         // --- Setup: 10 columns, 3 of which are indexed ---
         for i in 1..=10 {
@@ -593,7 +592,7 @@ mod tests {
 
     #[test]
     fn it_works_intersections_and_unions() {
-        let mut table = Table::new(4096);
+        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
         table.add_column(1);
         table.add_index(1); // City ID
         table.add_column(2);
@@ -697,7 +696,7 @@ mod tests {
 
     #[test]
     fn it_works_large_scale_intersections_and_unions() {
-        let mut table = Table::new(4096);
+        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
 
         // --- Setup: 10 columns, 3 with indexes ---
         for i in 1..=10 {

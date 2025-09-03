@@ -678,20 +678,20 @@ where
 
         // Do not hold the lock while reading nodes.
         let root_node = self.read_node(&cur_root)?;
-        if let Node::Internal { entries } = root_node {
-            if entries.len() == 1 {
-                let new_root = entries[0].1.clone();
+        if let Node::Internal { entries } = root_node
+            && entries.len() == 1
+        {
+            let new_root = entries[0].1.clone();
 
-                // Update root id with a short critical section.
-                {
-                    let mut s = self.state.lock().unwrap();
-                    s.root = new_root.clone();
-                }
-
-                // Dealloc old root and notify pager outside the lock.
-                self.dealloc_page(cur_root);
-                self.pager.on_root_changed(new_root)?;
+            // Update root id with a short critical section.
+            {
+                let mut s = self.state.lock().unwrap();
+                s.root = new_root.clone();
             }
+
+            // Dealloc old root and notify pager outside the lock.
+            self.dealloc_page(cur_root);
+            self.pager.on_root_changed(new_root)?;
         }
 
         Ok(())

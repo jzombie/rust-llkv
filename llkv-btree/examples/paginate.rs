@@ -95,7 +95,7 @@ fn main() {
     let pager = SharedPager::new(base);
 
     // Build a shared B+Tree that can be read from and written to.
-    let mut tree: SharedTree = SharedTree::create_empty(pager, None).expect("create_empty");
+    let tree: SharedTree = SharedTree::create_empty(pager, None).expect("create_empty");
 
     // 2. Seeding: Insert 20 key-value pairs into the tree.
     let items: Vec<(u64, Vec<u8>)> = (1u64..=20u64)

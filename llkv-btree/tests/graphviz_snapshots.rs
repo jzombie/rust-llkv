@@ -9,7 +9,7 @@ const N: u64 = 200;
 
 /// Build a BPlusTree<TestPager> with deterministic items.
 fn build_btree() -> common::TreeU64<common::TestPager> {
-    let mut t = common::create_tree().expect("create btree");
+    let t = common::create_tree().expect("create btree");
     let items: Vec<(u64, Vec<u8>)> = (0..N)
         .map(|k| (k, format!("v{}", k).into_bytes()))
         .collect();
@@ -22,7 +22,7 @@ fn build_btree() -> common::TreeU64<common::TestPager> {
 fn build_shared(
     pager: common::SharedPager,
 ) -> SharedBPlusTree<common::SharedPager, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>> {
-    let mut t = SharedBPlusTree::create_empty(pager, None).expect("create");
+    let t = SharedBPlusTree::create_empty(pager, None).expect("create");
     let items: Vec<(u64, Vec<u8>)> = (0..N)
         .map(|k| (k, format!("v{}", k).into_bytes()))
         .collect();

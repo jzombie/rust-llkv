@@ -4,9 +4,7 @@ use llkv_btree::{
     codecs::{BigEndianIdCodec, BigEndianKeyCodec},
     pager::MemPager64,
 };
-use rustc_hash::FxHashMap;
 use std::hint::black_box;
-use std::sync::Arc;
 
 // --- Type Aliases for the Benchmark ---
 type U64KeyCodec = BigEndianKeyCodec<u64>;
@@ -121,7 +119,7 @@ fn benchmark_reads(c: &mut Criterion) {
                 //     page_size: 4096,
                 // };
                 let pager = MemPager64::new(4096);
-                let mut tree =
+                let tree =
                     BPlusTree::<_, U64KeyCodec, U64IdCodec>::create_empty(pager, None).unwrap();
                 tree.insert_many(&owned_data).unwrap();
                 (tree, keys)

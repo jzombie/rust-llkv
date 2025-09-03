@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-memmap2 = "0.9.8"
+memmap2.workspace = true
 rustc-hash.workspace = true
 simd-r-drive = { workspace = true, optional = true }
 simd-r-drive-entry-handle.workspace = true

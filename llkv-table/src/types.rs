@@ -1,10 +1,14 @@
-// llkv-table/src/types.rs
-
 //! Common types for the zero-alloc table core.
 
 #![forbid(unsafe_code)]
 
 use core::cmp::Ordering;
+use llkv_btree::{
+    bplus_tree::SharedBPlusTree,
+    codecs::{BigEndianIdCodec, BigEndianKeyCodec},
+    pager::Pager as BTreePager,
+    views::value_view::ValueRef,
+};
 
 /// Field identifier type for addressing columns.
 ///
@@ -25,8 +29,21 @@ pub type RowIdCmp = fn(&[u8], &[u8]) -> Ordering;
 // // consumes one value
 // pub type RowEmit<'a> = dyn FnMut(&mut ValSink<'a>) + 'a;
 // // calls sink for each value
-// pub type OnRow<'a> = dyn FnMut(&'a [u8], &mut RowEmit<'a>) + 'a;
-// // (row_id, emit)
+// Small, descriptive aliases
+// type PageT = <dyn Pager as BTreePager>::Page;
+// type VRef = ValueRef<PageT>;
+// type VIter<'a> = dyn Iterator<Item = VRef> + 'a;
+
+// /// Callback: (row_id, iterator over projected value refs)
+pub type PageOf<P> = <P as BTreePager>::Page;
+pub type VRefOf<P> = ValueRef<PageOf<P>>;
+pub type VIterOf<'a, P> = dyn Iterator<Item = VRefOf<P>> + 'a;
+pub type OnRowOf<'a, P> = dyn FnMut(u64, &mut VIterOf<'a, P>) + 'a; // (RowId, values)
+
+// TODO: Don't hardcode u64
+pub type ColumnTree<P> = SharedBPlusTree<P, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>;
+pub type PrimaryIndexTree<P> = SharedBPlusTree<P, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>;
+pub type RowIdSetTree<P> = SharedBPlusTree<P, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>;
 
 #[cfg(test)]
 mod tests {

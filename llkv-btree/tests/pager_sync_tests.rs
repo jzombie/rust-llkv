@@ -26,7 +26,7 @@ fn pager_sync_bplustree() {
     let pager = SharedPager::new(4096);
 
     // A: bulk randomized load
-    let mut tree_a: TreeU64<SharedPager> =
+    let tree_a: TreeU64<SharedPager> =
         BPlusTree::create_empty(pager.clone(), None).expect("create_empty");
 
     // Generate & shuffle keys

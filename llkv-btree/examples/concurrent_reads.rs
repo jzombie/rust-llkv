@@ -14,7 +14,7 @@ fn main() {
     // Wrap base storage with the shared adapter and build a shared B+Tree.
     let base = MemPager64::new(4096);
     let pager = SharedPager::new(base);
-    let mut remote: SharedTree = SharedTree::create_empty(pager, None).expect("create_empty");
+    let remote: SharedTree = SharedTree::create_empty(pager, None).expect("create_empty");
 
     // Seed 1..=10 with k.to_be_bytes()
     let items: Vec<(u64, Vec<u8>)> = (1u64..=10u64)

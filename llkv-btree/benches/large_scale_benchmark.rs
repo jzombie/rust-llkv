@@ -6,9 +6,7 @@ use llkv_btree::{
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use rustc_hash::FxHashMap;
 use std::hint::black_box;
-use std::sync::Arc;
 
 // --- Type Aliases for the Benchmark ---
 type U64KeyCodec = BigEndianKeyCodec<u64>;
