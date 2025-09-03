@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-Columnar table using [LLKV](https://github.com/jzombie/rust-llkv) toolset.
+Columnar table using the [LLKV](https://github.com/jzombie/rust-llkv) toolset.
 
 ## License
 

@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-Generic, paged B+Tree with batch-only pager I/O.
+Generic, paged B+Tree with batch-only pager I/O for the [LLKV](https://github.com/jzombie/rust-llkv) toolset.
 
 ## Features
 

@@ -1,8 +1,11 @@
 [package]
 name = "llkv-btree"
+description = "Generic, paged B+Tree with batch-only pager I/O for the LLKV toolset."
+authors.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 publish.workspace = true
 
 [dependencies]
