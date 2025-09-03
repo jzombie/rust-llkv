@@ -91,8 +91,10 @@ where
         )
     }
 
-    // TODO: Remove this entirely (and Rayon and crossbeam from the b-tree, and use snapshots instead,
-    // so that the caller can manage its own threading).
+    // TODO: Consider putting this behind a feature flag and only using it for local
+    // testing purposes. This is good for some integration and benchmark testing,
+    // but callers wil likely benefit from manually snapshotting on the thread they
+    // choose to run it on.
     //
     /// Start a streaming scan at the current root, using any `ScanOpts`.
     /// Returns a crossbeam MPMC receiver; read it from as many threads as you like.
