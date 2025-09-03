@@ -44,8 +44,16 @@
 use llkv_btree::{
     BPlusTree,
     codecs::{BigEndianIdCodec, BigEndianKeyCodec},
-    pager::MemPager64,
+    define_mem_pager,
 };
+
+#[cfg(feature = "debug")]
+define_mem_pager! {
+    /// In-memory pager with u64 page IDs.
+    name: MemPager64,
+    id: u64,
+    default_page_size: 256
+}
 
 #[cfg(feature = "debug")]
 use llkv_btree::traits::GraphvizExt;

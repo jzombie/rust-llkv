@@ -8,13 +8,21 @@
 
 use llkv_btree::bplus_tree::{BPlusTree, SharedBPlusTree};
 use llkv_btree::codecs::{BigEndianIdCodec, BigEndianKeyCodec};
+use llkv_btree::define_mem_pager;
 use llkv_btree::iter::BPlusTreeIter;
-use llkv_btree::pager::{MemPager64, SharedPager};
+use llkv_btree::pager::SharedPager;
 use llkv_btree::prelude::*;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::time::Instant;
+
+define_mem_pager! {
+    /// In-memory pager with u64 page IDs.
+    name: MemPager64,
+    id: u64,
+    default_page_size: 256
+}
 
 // ----------------------------- Seed Data --------------------------------
 

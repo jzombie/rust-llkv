@@ -2,7 +2,7 @@ use criterion::{BatchSize, Bencher, Criterion, criterion_group, criterion_main};
 use llkv_btree::{
     bplus_tree::BPlusTree,
     codecs::{BigEndianIdCodec, BigEndianKeyCodec},
-    pager::MemPager64,
+    define_mem_pager,
 };
 use std::hint::black_box;
 
@@ -10,55 +10,12 @@ use std::hint::black_box;
 type U64KeyCodec = BigEndianKeyCodec<u64>;
 type U64IdCodec = BigEndianIdCodec<u64>;
 
-// TODO: Clean up
-// --- In-Memory Pager for Benchmarking ---
-// #[derive(Clone)]
-// struct BenchPager {
-//     pages: FxHashMap<u64, Arc<[u8]>>,
-//     next_id: u64,
-//     page_size: usize,
-// }
-
-// impl Pager for BenchPager {
-//     type Id = u64;
-//     type Page = Arc<[u8]>;
-
-//     fn read_batch(
-//         &self,
-//         ids: &[Self::Id],
-//     ) -> Result<FxHashMap<Self::Id, Self::Page>, llkv_btree::errors::Error> {
-//         Ok(ids
-//             .iter()
-//             .filter_map(|id| self.pages.get(id).map(|p| (*id, p.clone())))
-//             .collect())
-//     }
-//     fn write_batch(
-//         &mut self,
-//         pages: &[(Self::Id, &[u8])],
-//     ) -> Result<(), llkv_btree::errors::Error> {
-//         for (id, data) in pages {
-//             self.pages.insert(*id, Arc::from(*data));
-//         }
-//         Ok(())
-//     }
-//     fn alloc_ids(&mut self, count: usize) -> Result<Vec<Self::Id>, llkv_btree::errors::Error> {
-//         let start = self.next_id;
-//         self.next_id += count as u64;
-//         Ok((start..self.next_id).collect())
-//     }
-//     fn dealloc_ids(&mut self, ids: &[Self::Id]) -> Result<(), llkv_btree::errors::Error> {
-//         for id in ids {
-//             self.pages.remove(id);
-//         }
-//         Ok(())
-//     }
-//     fn page_size_hint(&self) -> Option<usize> {
-//         Some(self.page_size)
-//     }
-//     fn materialize_owned(&self, bytes: &[u8]) -> Result<Self::Page, llkv_btree::errors::Error> {
-//         Ok(Arc::from(bytes))
-//     }
-// }
+define_mem_pager! {
+    /// In-memory pager with u64 page IDs.
+    name: MemPager64,
+    id: u64,
+    default_page_size: 256
+}
 
 /// Generates a dataset of `count` items where every value is unique.
 fn generate_unique_data(count: usize) -> (Vec<(u64, Vec<u8>)>, Vec<u64>) {

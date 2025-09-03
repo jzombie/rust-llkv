@@ -2,10 +2,18 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 
 use llkv_btree::codecs::KeyCodec;
 use llkv_btree::codecs::{BigEndianIdCodec, BigEndianKeyCodec};
+use llkv_btree::define_mem_pager;
 use llkv_btree::iter::{BPlusTreeIter, ScanOpts};
-use llkv_btree::pager::{MemPager64, SharedPager};
+use llkv_btree::pager::SharedPager;
 use llkv_btree::prelude::*;
 use llkv_btree::shared_bplus_tree::SharedBPlusTree;
+
+define_mem_pager! {
+    /// In-memory pager with u64 page IDs.
+    name: MemPager64,
+    id: u64,
+    default_page_size: 256
+}
 
 // ---------- types ----------
 // Type aliases to make the code more readable.

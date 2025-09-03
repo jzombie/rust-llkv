@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+// TODO: Change all HashMap/HashSet to FxHashMap/FxHashSet
+
 use crate::codecs::decode_root_id;
 use crate::expr::{Expr, Filter, Operator};
 use crate::types::{
@@ -8,9 +10,10 @@ use crate::types::{
 };
 use crossbeam_channel as xchan;
 use llkv_btree::codecs::KeyCodec;
+use llkv_btree::define_mem_pager;
 use llkv_btree::errors::Error;
 use llkv_btree::iter::{BPlusTreeIter, ScanOpts};
-use llkv_btree::pager::{MemPager64, Pager as BTreePager, SharedPager};
+use llkv_btree::pager::{Pager as BTreePager, SharedPager};
 use llkv_btree::prelude::*;
 use llkv_btree::views::value_view::ValueRef;
 use rayon::prelude::*;
@@ -31,6 +34,13 @@ where
     columns: BTreeMap<FieldId, ColumnTree<P>>,
     indexes: BTreeMap<FieldId, PrimaryIndexTree<P>>,
     pager: P,
+}
+
+define_mem_pager! {
+    /// In-memory pager with u64 page IDs.
+    name: MemPager64,
+    id: u64,
+    default_page_size: 256
 }
 
 impl Table<SharedPager<MemPager64>> {

@@ -1,8 +1,16 @@
 use llkv_btree::bplus_tree::{BPlusTree, SharedBPlusTree};
 use llkv_btree::codecs::KeyCodec;
 use llkv_btree::codecs::{BigEndianIdCodec, BigEndianKeyCodec};
-use llkv_btree::pager::{MemPager64, SharedPager};
+use llkv_btree::define_mem_pager;
+use llkv_btree::pager::SharedPager;
 use llkv_btree::traits::{BTree, GraphvizExt};
+
+define_mem_pager! {
+    /// In-memory pager with u64 page IDs.
+    name: MemPager64,
+    id: u64,
+    default_page_size: 256
+}
 
 fn seed_items(n: u64) -> Vec<(u64, Vec<u8>)> {
     // Deterministic, readable payloads.

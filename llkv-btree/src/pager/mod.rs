@@ -5,7 +5,6 @@ use std::hash::Hash;
 pub mod shared_adapter;
 pub use shared_adapter::SharedPager;
 pub mod mem;
-pub use mem::MemPager64;
 
 pub const DEFAULT_PAGE_SIZE_HINT: usize = 4096;
 
