@@ -21,7 +21,7 @@ debug = ["line-ending"]
 
 [dev-dependencies]
 criterion.workspace = true
-llkv-btree = { workspace = true, features = ["debug"] }
+llkv-btree = { path = ".", features = ["debug"] }
 
 [[bench]]
 name = "large_scale_benchmark"

@@ -20,5 +20,5 @@ debug = []
 simd-r-drive-support = ["simd-r-drive"]
 
 [dev-dependencies]
-llkv-storage = { workspace = true, features = ["debug", "simd-r-drive-support"] }
+llkv-storage = { path = ".", features = ["debug", "simd-r-drive-support"] }
 tempfile.workspace = true

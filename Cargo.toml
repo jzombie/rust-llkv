@@ -4,7 +4,7 @@ version = "0.1.0-alpha"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/jzombie/rust-llkv"
-publish = false
+publish = true
 
 [workspace.dependencies]
 llkv-btree = { path = "./llkv-btree", version = "0.1.0-alpha" }
