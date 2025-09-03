@@ -181,6 +181,7 @@ enum DeleteResult {
 
 pub(crate) struct BPlusTreeState<P: Pager> {
     pub(crate) root: P::Id,
+    // pending_writes: FxHashMap<P::Id, P::Page>, TODO: Change to this model, instead of allocating with Vec<u8> here
     pending_writes: FxHashMap<P::Id, Vec<u8>>,
     pending_deletes: FxHashSet<P::Id>,
 }
