@@ -1,3 +1,7 @@
+# LLKV B+Tree
+
+**Work in Progress**
+
 Generic, paged B+Tree with batch-only pager I/O.
 
 ## Features
@@ -7,3 +11,7 @@ Generic, paged B+Tree with batch-only pager I/O.
 - Streaming-capable. Entire tree may be much larger than RAM.
 - Physical/Logical key separation
 - `Graphviz` (`.dot`) visualization generation (see [examples/visualize.rs](examples/visualize.rs)). Integration tests also use this functionality for snapshot testing.
+
+## License
+
+Licensed under the [Apache-2.0 License](../LICENSE).
