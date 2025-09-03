@@ -390,4 +390,102 @@ mod tests {
 
         assert_eq!(results_set, expected_set);
     }
+
+    #[test]
+    fn it_works_complex_multi_column_scans() {
+        let mut table = Table::new(4096);
+
+        // --- Setup: 10 columns, 3 of which are indexed ---
+        for i in 1..=10 {
+            table.add_column(i);
+        }
+        table.add_index(1); // High cardinality (unique)
+        table.add_index(2); // Medium cardinality (100 unique values)
+        table.add_index(3); // Low cardinality (5 unique values)
+
+        // --- Insert 5000 rows ---
+        let num_rows = 5000;
+        let mut rows_to_insert = Vec::with_capacity(num_rows);
+        for i in 0..num_rows {
+            let row_id = i as u64;
+            let mut row_data = HashMap::new();
+
+            // Indexed columns
+            row_data.insert(1, (1000 + row_id, vec![])); // Unique key
+            row_data.insert(2, (row_id % 100, vec![])); // 100 different keys
+            row_data.insert(3, (row_id % 5, vec![])); // 5 different keys
+
+            // Non-indexed data payload columns
+            for j in 4..=10 {
+                row_data.insert(j, (0, format!("col{}_row{}", j, row_id).into_bytes()));
+            }
+            rows_to_insert.push((row_id, row_data));
+        }
+        table.insert_many(&rows_to_insert).unwrap();
+
+        // --- Test 1: Forward Range Scan on high-cardinality index (Field 1) ---
+        let lower_1 = 3000u64.to_be_bytes();
+        let upper_1 = 4000u64.to_be_bytes();
+        let filter_1 = Filter {
+            field: 1,
+            op: Operator::Range {
+                lower: Bound::Included(&lower_1),
+                upper: Bound::Excluded(&upper_1),
+            },
+        };
+        let expr_1 = Expr::Pred(filter_1);
+        let mut results_1 = Vec::new();
+        table
+            .scan(&expr_1, &[4], &mut |row_id, values_iter| {
+                results_1.push((row_id, values_iter.last().unwrap().as_slice().to_vec()));
+            })
+            .unwrap();
+
+        assert_eq!(results_1.len(), 1000); // Should find 1000 rows
+        results_1.sort_by_key(|(k, _)| *k);
+        assert_eq!(results_1[0].0, 2000); // 1000 + 2000 = 3000
+        assert_eq!(results_1[0].1, b"col4_row2000".to_vec());
+        assert_eq!(results_1[999].0, 2999); // 1000 + 2999 = 3999
+        assert_eq!(results_1[999].1, b"col4_row2999".to_vec());
+
+        // --- Test 2: Equality Scan on medium-cardinality index (Field 2) ---
+        let key_2 = 42u64.to_be_bytes();
+        let filter_2 = Filter {
+            field: 2,
+            op: Operator::Equals(&key_2),
+        };
+        let expr_2 = Expr::Pred(filter_2);
+        let mut results_2 = Vec::new();
+        table
+            .scan(&expr_2, &[], &mut |row_id, _| {
+                results_2.push(row_id);
+            })
+            .unwrap();
+
+        assert_eq!(results_2.len(), 50); // 5000 / 100 = 50
+        assert!(results_2.iter().all(|&rid| rid % 100 == 42));
+
+        // --- Test 3: Range Scan on low-cardinality index (Field 3) ---
+        let lower_3 = 2u64.to_be_bytes();
+        let upper_3 = 4u64.to_be_bytes();
+        let filter_3 = Filter {
+            field: 3,
+            op: Operator::Range {
+                lower: Bound::Included(&lower_3),
+                upper: Bound::Excluded(&upper_3),
+            },
+        };
+        let expr_3 = Expr::Pred(filter_3);
+        let mut results_3 = Vec::new();
+        table
+            .scan(&expr_3, &[], &mut |row_id, _| {
+                results_3.push(row_id);
+            })
+            .unwrap();
+
+        // Should find rows where row_id % 5 is 2 or 3.
+        // Each category has 5000 / 5 = 1000 rows. So 2000 total.
+        assert_eq!(results_3.len(), 2000);
+        assert!(results_3.iter().all(|&rid| rid % 5 == 2 || rid % 5 == 3));
+    }
 }
