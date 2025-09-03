@@ -26,6 +26,7 @@ pub trait IdCodec {
 
 // --- Generic Integer Codec ---
 
+// TODO: Rename to connotate "physical" & "logical" keys?
 /// A generic codec for any integer type that can be represented as big-endian bytes.
 #[derive(Debug)]
 pub struct BigEndianKeyCodec<T>(std::marker::PhantomData<T>);
