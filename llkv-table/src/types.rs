@@ -1,9 +1,10 @@
-//! Common types for the zero-alloc table core.
+//! Common types for the table core.
 
 #![forbid(unsafe_code)]
 
 use core::cmp::Ordering;
 use llkv_btree::{pager::Pager as BTreePager, views::value_view::ValueRef};
+use std::borrow::Cow;
 
 /// Field identifier type for addressing columns.
 ///
@@ -23,8 +24,13 @@ pub type RootIdBytes = [u8; 8];
 /// baking any row-id semantics into this layer.
 pub type RowIdCmp = fn(&[u8], &[u8]) -> Ordering;
 
-// TODO: swap when you move off Vec<u8>
-pub type ColumnValue = Vec<u8>;
+pub type ColumnValue<'a> = &'a [u8];
+
+/// A column value provided as input for an insert or update operation.
+///
+/// This uses a Cow (Copy-on-Write) to allow for either borrowed (zero-copy)
+/// or owned data to be passed to the table.
+pub type ColumnInput<'a> = Cow<'a, [u8]>;
 
 // /// Callback: (row_id, iterator over projected value refs)
 pub type PageOf<P> = <P as BTreePager>::Page;

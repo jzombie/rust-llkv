@@ -3,7 +3,7 @@
 use crate::codecs::decode_root_id;
 use crate::expr::{Expr, Filter, Operator};
 use crate::types::{
-    ColumnTree, ColumnValue, FieldId, IndexKey, IndexKeyCodec, OnRowOf, PrimaryIndexTree, RootId,
+    ColumnInput, ColumnTree, FieldId, IndexKey, IndexKeyCodec, OnRowOf, PrimaryIndexTree, RootId,
     RootIdBytes, RowId, RowIdCmp, RowIdKeyCodec, RowIdSetTree,
 };
 use crossbeam_channel as xchan;
@@ -64,9 +64,9 @@ where
         self.indexes.insert(field_id, index_tree);
     }
 
-    pub fn insert_many(
+    pub fn insert_many<'a>(
         &self,
-        rows: &[(RowId, HashMap<FieldId, (IndexKey, ColumnValue)>)],
+        rows: &[(RowId, HashMap<FieldId, (IndexKey, ColumnInput<'a>)>)],
     ) -> Result<(), Error> {
         // Step 1: Aggregate all writes across all rows (sequentially, this is fast)
         let mut all_column_writes: BTreeMap<FieldId, Vec<(RowId, &[u8])>> = BTreeMap::new();
@@ -77,7 +77,7 @@ where
                 all_column_writes
                     .entry(*field_id)
                     .or_default()
-                    .push((*row_id, value.as_slice()));
+                    .push((*row_id, &*value));
 
                 if self.indexes.contains_key(field_id) {
                     all_index_updates
@@ -286,10 +286,9 @@ where
                                 for (row_id_ref, _) in iter {
                                     if let Ok(row_id) =
                                         RowIdKeyCodec::decode_from(row_id_ref.as_ref())
+                                        && tx.send(row_id).is_err()
                                     {
-                                        if tx.send(row_id).is_err() {
-                                            break;
-                                        }
+                                        break;
                                     }
                                 }
                             }
@@ -340,10 +339,9 @@ where
                                 for (row_id_ref, _) in iter {
                                     if let Ok(row_id) =
                                         RowIdKeyCodec::decode_from(row_id_ref.as_ref())
+                                        && tx.send(row_id).is_err()
                                     {
-                                        if tx.send(row_id).is_err() {
-                                            break;
-                                        }
+                                        break;
                                     }
                                 }
                             }
@@ -376,18 +374,9 @@ mod tests {
         table.add_index(1);
         table.add_column(2); // Country
 
-        let row1 = HashMap::from([
-            (1, (100u64, b"Alice".to_vec())),
-            (2, (0u64, b"USA".to_vec())),
-        ]);
-        let row2 = HashMap::from([
-            (1, (200u64, b"Bob".to_vec())),
-            (2, (0u64, b"Canada".to_vec())),
-        ]);
-        let row3 = HashMap::from([
-            (1, (100u64, b"Alice".to_vec())),
-            (2, (0u64, b"UK".to_vec())),
-        ]);
+        let row1 = HashMap::from([(1, (100u64, b"Alice".into())), (2, (0u64, b"USA".into()))]);
+        let row2 = HashMap::from([(1, (200u64, b"Bob".into())), (2, (0u64, b"Canada".into()))]);
+        let row3 = HashMap::from([(1, (100u64, b"Alice".into())), (2, (0u64, b"UK".into()))]);
 
         table
             .insert_many(&[(101, row1), (102, row2), (103, row3)])
@@ -428,27 +417,27 @@ mod tests {
             .insert_many(&[
                 (
                     1,
-                    HashMap::from([(1, (100u64, vec![])), (2, (0u64, b"data_100".to_vec()))]),
+                    HashMap::from([(1, (100u64, b"".into())), (2, (0u64, b"data_100".into()))]),
                 ),
                 (
                     2,
-                    HashMap::from([(1, (101u64, vec![])), (2, (0u64, b"data_101".to_vec()))]),
+                    HashMap::from([(1, (101u64, b"".into())), (2, (0u64, b"data_101".into()))]),
                 ),
                 (
                     3,
-                    HashMap::from([(1, (102u64, vec![])), (2, (0u64, b"data_102".to_vec()))]),
+                    HashMap::from([(1, (102u64, b"".into())), (2, (0u64, b"data_102".into()))]),
                 ),
                 (
                     4,
-                    HashMap::from([(1, (103u64, vec![])), (2, (0u64, b"data_103".to_vec()))]),
+                    HashMap::from([(1, (103u64, b"".into())), (2, (0u64, b"data_103".into()))]),
                 ),
                 (
                     5,
-                    HashMap::from([(1, (104u64, vec![])), (2, (0u64, b"data_104".to_vec()))]),
+                    HashMap::from([(1, (104u64, b"".into())), (2, (0u64, b"data_104".into()))]),
                 ),
                 (
                     6,
-                    HashMap::from([(1, (105u64, vec![])), (2, (0u64, b"data_105".to_vec()))]),
+                    HashMap::from([(1, (105u64, b"".into())), (2, (0u64, b"data_105".into()))]),
                 ),
             ])
             .unwrap();
@@ -508,13 +497,16 @@ mod tests {
             let mut row_data = HashMap::new();
 
             // Indexed columns
-            row_data.insert(1, (1000 + row_id, vec![])); // Unique key
-            row_data.insert(2, (row_id % 100, vec![])); // 100 different keys
-            row_data.insert(3, (row_id % 5, vec![])); // 5 different keys
+            row_data.insert(1, (1000 + row_id, b"".into())); // Unique key
+            row_data.insert(2, (row_id % 100, b"".into())); // 100 different keys
+            row_data.insert(3, (row_id % 5, b"".into())); // 5 different keys
 
             // Non-indexed data payload columns
             for j in 4..=10 {
-                row_data.insert(j, (0, format!("col{}_row{}", j, row_id).into_bytes()));
+                row_data.insert(
+                    j,
+                    (0, format!("col{}_row{}", j, row_id).into_bytes().into()),
+                );
             }
             rows_to_insert.push((row_id, row_data));
         }
@@ -599,41 +591,41 @@ mod tests {
             (
                 10,
                 HashMap::from([
-                    (1, (1, vec![])),
-                    (2, (10, vec![])),
-                    (3, (0, b"Restaurant in NYC".to_vec())),
+                    (1, (1, b"".into())),
+                    (2, (10, b"".into())),
+                    (3, (0, b"Restaurant in NYC".into())),
                 ]),
             ),
             (
                 20,
                 HashMap::from([
-                    (1, (1, vec![])),
-                    (2, (20, vec![])),
-                    (3, (0, b"Museum in NYC".to_vec())),
+                    (1, (1, b"".into())),
+                    (2, (20, b"".into())),
+                    (3, (0, b"Museum in NYC".into())),
                 ]),
             ),
             (
                 30,
                 HashMap::from([
-                    (1, (2, vec![])),
-                    (2, (10, vec![])),
-                    (3, (0, b"Restaurant in London".to_vec())),
+                    (1, (2, b"".into())),
+                    (2, (10, b"".into())),
+                    (3, (0, b"Restaurant in London".into())),
                 ]),
             ),
             (
                 40,
                 HashMap::from([
-                    (1, (2, vec![])),
-                    (2, (30, vec![])),
-                    (3, (0, b"Theatre in London".to_vec())),
+                    (1, (2, b"".into())),
+                    (2, (30, b"".into())),
+                    (3, (0, b"Theatre in London".into())),
                 ]),
             ),
             (
                 50,
                 HashMap::from([
-                    (1, (1, vec![])),
-                    (2, (10, vec![])),
-                    (3, (0, b"Another Restaurant in NYC".to_vec())),
+                    (1, (1, b"".into())),
+                    (2, (10, b"".into())),
+                    (3, (0, b"Another Restaurant in NYC".into())),
                 ]),
             ),
         ];
@@ -708,11 +700,11 @@ mod tests {
         for i in 0..num_rows {
             let row_id = i as RowId;
             let mut row_data = HashMap::new();
-            row_data.insert(1, (row_id % 10, vec![]));
-            row_data.insert(2, (row_id % 5, vec![]));
-            row_data.insert(3, (row_id % 100, vec![]));
+            row_data.insert(1, (row_id % 10, b"".into()));
+            row_data.insert(2, (row_id % 5, b"".into()));
+            row_data.insert(3, (row_id % 100, b"".into()));
             for j in 4..=10 {
-                row_data.insert(j, (0, vec![]));
+                row_data.insert(j, (0, b"".into()));
             }
             rows_to_insert.push((row_id, row_data));
         }
