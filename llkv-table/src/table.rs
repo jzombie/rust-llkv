@@ -1,6 +1,8 @@
-#![forbid(unsafe_code)]
+//! Note: `FxHashMap` and `FxHashSet` are used internally in the table while
+//! exposing a `HashMap` interface via `RowPatch` to make it potentially easier
+//! to upsert from consuming applications.
 
-// TODO: Change all HashMap/HashSet to FxHashMap/FxHashSet
+#![forbid(unsafe_code)]
 
 use crate::codecs::decode_root_id;
 use crate::expr::{Expr, Filter, Operator};
@@ -17,7 +19,8 @@ use llkv_btree::pager::{Pager as BTreePager, SharedPager};
 use llkv_btree::prelude::*;
 use llkv_btree::views::value_view::ValueRef;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::thread;
 
@@ -135,8 +138,7 @@ where
 
         let unique_keys: Vec<IndexKey> = updates_by_key.keys().cloned().collect();
         let primary_snapshot = primary_index.snapshot();
-        // TODO: Use FxHashMap
-        let existing_roots_map: HashMap<IndexKey, RootId> = primary_snapshot
+        let existing_roots_map: FxHashMap<IndexKey, RootId> = primary_snapshot
             .get_many(&unique_keys)?
             .into_iter()
             .enumerate()
@@ -224,12 +226,13 @@ where
 
                 let (tx, rx) = xchan::unbounded();
                 thread::spawn(move || {
-                    let mut intersection: HashSet<RowId> = streams.remove(0).into_iter().collect();
+                    let mut intersection: FxHashSet<RowId> =
+                        streams.remove(0).into_iter().collect();
                     for stream in streams {
                         if intersection.is_empty() {
                             break;
                         }
-                        let next_set: HashSet<RowId> = stream.into_iter().collect();
+                        let next_set: FxHashSet<RowId> = stream.into_iter().collect();
                         intersection.retain(|item| next_set.contains(item));
                     }
 
@@ -252,7 +255,7 @@ where
 
                 let (tx, rx) = xchan::unbounded();
                 thread::spawn(move || {
-                    let mut union_set = HashSet::new();
+                    let mut union_set = FxHashSet::with_hasher(Default::default());
                     for stream in streams {
                         for row_id in stream {
                             union_set.insert(row_id);
@@ -371,7 +374,7 @@ mod tests {
     use super::*;
     use crate::constants::EMPTY_COL;
     use crate::expr::Filter;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     // All tests from the previous version are included here...
     // They will pass with this new, correct architecture.
