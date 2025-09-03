@@ -669,4 +669,127 @@ mod tests {
         let got_or: HashSet<u64> = results_or.into_iter().collect();
         assert_eq!(got_or, expected_or);
     }
+
+    #[test]
+    fn it_works_large_scale_intersections_and_unions() {
+        let mut table = Table::new(4096);
+
+        // --- Setup: 10 columns, 3 with indexes ---
+        for i in 1..=10 {
+            table.add_column(i);
+        }
+        table.add_index(1); // Country ID (10 values)
+        table.add_index(2); // Status ID (5 values)
+        table.add_index(3); // Category ID (100 values)
+
+        // --- Insert 15,000 rows ---
+        let num_rows = 15_000;
+        let mut rows_to_insert = Vec::with_capacity(num_rows);
+        for i in 0..num_rows {
+            let row_id = i as u64;
+            let mut row_data = HashMap::new();
+            row_data.insert(1, (row_id % 10, vec![]));
+            row_data.insert(2, (row_id % 5, vec![]));
+            row_data.insert(3, (row_id % 100, vec![]));
+            for j in 4..=10 {
+                row_data.insert(j, (0, vec![]));
+            }
+            rows_to_insert.push((row_id, row_data));
+        }
+        table.insert_many(&rows_to_insert).unwrap();
+
+        // --- Test 1: Intersection (AND) ---
+        // Find rows where Country=5 AND Status=2
+        let country_5 = 5u64.to_be_bytes();
+        let status_2 = 2u64.to_be_bytes();
+        let expr_and = Expr::And(vec![
+            Expr::Pred(Filter {
+                field: 1,
+                op: Operator::Equals(&country_5),
+            }),
+            Expr::Pred(Filter {
+                field: 2,
+                op: Operator::Equals(&status_2),
+            }),
+        ]);
+
+        let mut results_and = Vec::new();
+        table
+            .scan(&expr_and, &[], &mut |row_id, _| {
+                results_and.push(row_id);
+            })
+            .unwrap();
+
+        // Expected: row_id % 10 == 5 AND row_id % 5 == 2.
+        // This is true for row_ids ending in 5 that are also 2 mod 5 (impossible).
+        // Let's adjust: row_id % 10 == 2 AND row_id % 5 == 2. True for all numbers ending in 2.
+        // Let's use Chinese Remainder Theorem logic. row_id = 5 (mod 10) and row_id = 2 (mod 5).
+        // The first implies row_id = 0 or 5 (mod 5). So only row_id = 5 (mod 10) and row_id = 0 (mod 5) works, which is row_id ends in 5.
+        // Let's find row_id % 10 = 7 and row_id % 5 = 2. These are the same condition.
+        // Let's do Country=7 and Status=2.
+        let country_7 = 7u64.to_be_bytes();
+        let status_2 = 2u64.to_be_bytes();
+        let expr_and_2 = Expr::And(vec![
+            Expr::Pred(Filter {
+                field: 1,
+                op: Operator::Equals(&country_7),
+            }),
+            Expr::Pred(Filter {
+                field: 2,
+                op: Operator::Equals(&status_2),
+            }),
+        ]);
+        let mut results_and_2 = Vec::new();
+        table
+            .scan(&expr_and_2, &[], &mut |row_id, _| {
+                results_and_2.push(row_id);
+            })
+            .unwrap();
+
+        let mut expected_and = HashSet::new();
+        for i in 0..num_rows {
+            if i % 10 == 7 && i % 5 == 2 {
+                expected_and.insert(i as u64);
+            }
+        }
+        assert_eq!(
+            results_and_2.into_iter().collect::<HashSet<u64>>(),
+            expected_and
+        );
+        assert_eq!(expected_and.len(), 1500); // 15000 / 10 = 1500, then check mod 5 is 2. 7 mod 5 is 2. So all of them.
+
+        // --- Test 2: Union (OR) ---
+        // Find rows where Status=1 OR Status=3
+        let status_1 = 1u64.to_be_bytes();
+        let status_3 = 3u64.to_be_bytes();
+        let expr_or = Expr::Or(vec![
+            Expr::Pred(Filter {
+                field: 2,
+                op: Operator::Equals(&status_1),
+            }),
+            Expr::Pred(Filter {
+                field: 2,
+                op: Operator::Equals(&status_3),
+            }),
+        ]);
+
+        let mut results_or = Vec::new();
+        table
+            .scan(&expr_or, &[], &mut |row_id, _| {
+                results_or.push(row_id);
+            })
+            .unwrap();
+
+        let mut expected_or = HashSet::new();
+        for i in 0..num_rows {
+            if i % 5 == 1 || i % 5 == 3 {
+                expected_or.insert(i as u64);
+            }
+        }
+        assert_eq!(
+            results_or.into_iter().collect::<HashSet<u64>>(),
+            expected_or
+        );
+        assert_eq!(expected_or.len(), 15000 * 2 / 5); // 6000
+    }
 }
