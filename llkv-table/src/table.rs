@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use crate::expr::{Expr, Filter, Operator};
-use crate::types::{ColumnTree, PrimaryIndexTree, RowIdSetTree};
+use crate::types::{ColumnTree, FieldId, OnRowOf, PrimaryIndexTree, RowId, RowIdCmp, RowIdSetTree};
 use crossbeam_channel as xchan;
 use llkv_btree::codecs::{BigEndianKeyCodec, KeyCodec};
 use llkv_btree::errors::Error;
@@ -13,12 +13,6 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::thread;
-
-// TODO: Move to types
-// --- Type Aliases for Readability ---
-pub type FieldId = u32;
-pub type RowId = u64;
-pub type RowIdCmp = fn(&[u8], &[u8]) -> std::cmp::Ordering;
 
 pub struct TableCfg {
     pub row_id_cmp: RowIdCmp,
@@ -180,7 +174,7 @@ where
         &'a self,
         expr: &Expr<'a>,
         projection: &[FieldId],
-        on_row: &mut dyn FnMut(RowId, &mut dyn Iterator<Item = ValueRef<<P>::Page>>),
+        on_row: &mut OnRowOf<P>,
     ) -> Result<(), Error> {
         let row_id_stream = self.get_row_id_stream(expr)?;
         let row_id_stream = match row_id_stream {

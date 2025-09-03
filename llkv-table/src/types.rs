@@ -38,7 +38,7 @@ pub type RowIdCmp = fn(&[u8], &[u8]) -> Ordering;
 pub type PageOf<P> = <P as BTreePager>::Page;
 pub type VRefOf<P> = ValueRef<PageOf<P>>;
 pub type VIterOf<'a, P> = dyn Iterator<Item = VRefOf<P>> + 'a;
-pub type OnRowOf<'a, P> = dyn FnMut(u64, &mut VIterOf<'a, P>) + 'a; // (RowId, values)
+pub type OnRowOf<'a, P> = dyn FnMut(RowId, &mut VIterOf<'a, P>) + 'a;
 
 // TODO: Don't hardcode u64
 pub type ColumnTree<P> = SharedBPlusTree<P, BigEndianKeyCodec<u64>, BigEndianIdCodec<u64>>;
