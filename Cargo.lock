@@ -428,6 +428,7 @@ dependencies = [
  "crossbeam-channel",
  "llkv-btree",
  "llkv-storage",
+ "rayon",
  "rustc-hash",
 ]
 

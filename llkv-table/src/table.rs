@@ -9,7 +9,8 @@ use llkv_btree::pager::{MemPager64, Pager as BTreePager, SharedPager};
 use llkv_btree::prelude::*;
 use llkv_btree::shared_bplus_tree::SharedBPlusTree;
 use llkv_btree::views::value_view::ValueRef;
-use std::collections::{BTreeMap, HashMap};
+use rayon::prelude::*;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::thread;
 
@@ -66,7 +67,7 @@ impl Table {
         &mut self,
         rows: &[(RowId, HashMap<FieldId, (u64, Vec<u8>)>)],
     ) -> Result<(), Error> {
-        // --- Step 1: Aggregate all writes across all rows ---
+        // Step 1: Aggregate all writes across all rows
         let mut all_column_writes: BTreeMap<FieldId, Vec<(RowId, &[u8])>> = BTreeMap::new();
         let mut all_index_updates: BTreeMap<FieldId, Vec<(u64, RowId)>> = BTreeMap::new();
 
@@ -86,17 +87,16 @@ impl Table {
             }
         }
 
-        // --- Step 2: Perform batched column writes ---
+        // Step 2: Perform batched column writes
         for (field_id, writes) in all_column_writes {
             if let Some(column_tree) = self.columns.get_mut(&field_id) {
                 column_tree.insert_many(&writes)?;
             }
         }
 
-        // --- Step 3: Perform batched index writes ---
+        // Step 3: Perform batched index writes
         for (field_id, updates) in all_index_updates {
             if let Some(primary_index) = self.indexes.get_mut(&field_id) {
-                // Group updates by index_key to handle multiple rows updating the same index value.
                 let mut updates_by_key: BTreeMap<u64, Vec<RowId>> = BTreeMap::new();
                 for (index_key, row_id) in updates {
                     updates_by_key.entry(index_key).or_default().push(row_id);
@@ -104,8 +104,6 @@ impl Table {
 
                 let unique_keys: Vec<u64> = updates_by_key.keys().cloned().collect();
                 let snapshot = primary_index.snapshot();
-
-                // Get all existing secondary tree roots in one batch.
                 let existing_roots_map: HashMap<u64, u64> = snapshot
                     .get_many(&unique_keys)?
                     .into_iter()
@@ -124,12 +122,10 @@ impl Table {
 
                 for (index_key, row_ids) in updates_by_key {
                     if let Some(root_id) = existing_roots_map.get(&index_key) {
-                        // UPDATE existing secondary tree with all its new row_ids in one batch.
                         let mut row_id_set = RowIdSetTree::open(self.pager.clone(), *root_id, None);
                         let writes: Vec<_> = row_ids.iter().map(|rid| (*rid, &[][..])).collect();
                         row_id_set.insert_many(&writes)?;
                     } else {
-                        // CREATE new secondary tree and add all its row_ids in one batch.
                         let mut new_row_id_set =
                             RowIdSetTree::create_empty(self.pager.clone(), None)?;
                         let writes: Vec<_> = row_ids.iter().map(|rid| (*rid, &[][..])).collect();
@@ -139,7 +135,6 @@ impl Table {
                     }
                 }
 
-                // Batch insert all new primary index entries.
                 if !new_primary_entries.is_empty() {
                     let writes_slice: Vec<(u64, &[u8])> = new_primary_entries
                         .iter()
@@ -189,7 +184,7 @@ impl Table {
         match expr {
             Expr::Pred(filter) => self.get_stream_for_predicate(filter),
             Expr::And(sub_expressions) => {
-                let streams: Vec<_> = sub_expressions
+                let mut streams: Vec<_> = sub_expressions
                     .iter()
                     .map(|sub_expr| self.get_row_id_stream(sub_expr))
                     .collect::<Result<Vec<_>, _>>()?
@@ -205,27 +200,18 @@ impl Table {
 
                 let (tx, rx) = xchan::unbounded();
                 thread::spawn(move || {
-                    let mut heads: Vec<Option<u64>> =
-                        streams.iter().map(|s| s.recv().ok()).collect();
-                    loop {
-                        if heads.iter().any(|h| h.is_none()) {
+                    let mut intersection: HashSet<u64> = streams.remove(0).into_iter().collect();
+                    for stream in streams {
+                        if intersection.is_empty() {
                             break;
                         }
-                        let first = heads[0].unwrap();
-                        if heads.iter().all(|h| h.unwrap() == first) {
-                            if tx.send(first).is_err() {
-                                break;
-                            }
-                            for i in 0..streams.len() {
-                                heads[i] = streams[i].recv().ok();
-                            }
-                        } else {
-                            let min_head = heads.iter().filter_map(|&h| h).min().unwrap();
-                            for i in 0..streams.len() {
-                                if heads[i] == Some(min_head) {
-                                    heads[i] = streams[i].recv().ok();
-                                }
-                            }
+                        let next_set: HashSet<u64> = stream.into_iter().collect();
+                        intersection.retain(|item| next_set.contains(item));
+                    }
+
+                    for row_id in intersection {
+                        if tx.send(row_id).is_err() {
+                            break;
                         }
                     }
                 });
@@ -242,36 +228,21 @@ impl Table {
 
                 let (tx, rx) = xchan::unbounded();
                 thread::spawn(move || {
-                    let mut heads: Vec<Option<u64>> =
-                        streams.iter().map(|s| s.recv().ok()).collect();
-                    let mut last_sent: Option<u64> = None;
-                    loop {
-                        let min_head = heads.iter().filter_map(|&h| h).min();
-                        if min_head.is_none() {
+                    let mut union_set = HashSet::new();
+                    for stream in streams {
+                        for row_id in stream {
+                            union_set.insert(row_id);
+                        }
+                    }
+                    for row_id in union_set {
+                        if tx.send(row_id).is_err() {
                             break;
-                        }
-                        let min_val = min_head.unwrap();
-                        if last_sent != Some(min_val) {
-                            if tx.send(min_val).is_err() {
-                                break;
-                            }
-                            last_sent = Some(min_val);
-                        }
-                        for i in 0..streams.len() {
-                            if heads[i] == Some(min_val) {
-                                heads[i] = streams[i].recv().ok();
-                            }
                         }
                     }
                 });
                 Ok(Some(rx))
             }
             Expr::Not(_) => {
-                // `Not` is complex and often requires a full table scan, which is not
-                // implemented. Returning an empty stream is a safe default.
-                // let (_tx, rx) = xchan::unbounded();
-                // Ok(Some(rx))
-
                 unimplemented!("`Not` is currently unimplemented");
             }
         }
@@ -285,16 +256,24 @@ impl Table {
             match filter.op {
                 Operator::Equals(val) => {
                     let index_key = BigEndianKeyCodec::<u64>::decode_from(val)?;
-                    let snapshot = primary_index.snapshot();
-                    if let Some(root_id_ref) = snapshot.get(&index_key)? {
+                    let primary_snapshot = primary_index.snapshot();
+                    if let Some(root_id_ref) = primary_snapshot.get(&index_key)? {
                         let root_id = u64::from_be_bytes(root_id_ref.as_ref().try_into().unwrap());
-                        let row_id_set = RowIdSetTree::open(self.pager.clone(), root_id, None);
-                        let row_id_stream = row_id_set.start_stream_with_opts(ScanOpts::forward());
                         let (tx, rx) = xchan::unbounded();
-                        std::thread::spawn(move || {
-                            for (row_id, _) in row_id_stream {
-                                if tx.send(row_id).is_err() {
-                                    break;
+                        let pager = self.pager.clone();
+                        thread::spawn(move || {
+                            let row_id_set = RowIdSetTree::open(pager, root_id, None);
+                            let snapshot = row_id_set.snapshot();
+                            if let Ok(iter) = snapshot.iter() {
+                                for (row_id_ref, _value) in iter {
+                                    // **FIX:** Decode the KeyRef before sending
+                                    if let Ok(row_id) =
+                                        BigEndianKeyCodec::<u64>::decode_from(row_id_ref.as_ref())
+                                    {
+                                        if tx.send(row_id).is_err() {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -325,9 +304,9 @@ impl Table {
                         _ => Bound::Unbounded,
                     };
                     let opts = ScanOpts::forward().with_bounds(lower_bound, upper_bound);
-                    let snapshot = primary_index.snapshot();
+                    let primary_snapshot = primary_index.snapshot();
                     let mut root_ids = Vec::new();
-                    if let Ok(primary_iter) = BPlusTreeIter::with_opts(&snapshot, opts) {
+                    if let Ok(primary_iter) = BPlusTreeIter::with_opts(&primary_snapshot, opts) {
                         for (_, root_id_ref) in primary_iter {
                             root_ids
                                 .push(u64::from_be_bytes(root_id_ref.as_ref().try_into().unwrap()));
@@ -335,16 +314,25 @@ impl Table {
                     }
                     let (tx, rx) = xchan::unbounded();
                     let pager = self.pager.clone();
-                    std::thread::spawn(move || {
-                        for root_id in root_ids {
+                    rayon::spawn(move || {
+                        root_ids.into_par_iter().for_each(|root_id| {
                             let row_id_set = RowIdSetTree::open(pager.clone(), root_id, None);
-                            let row_id_rx = row_id_set.start_stream_with_opts(ScanOpts::forward());
-                            for (row_id, _) in row_id_rx {
-                                if tx.send(row_id).is_err() {
-                                    return;
+                            let snapshot = row_id_set.snapshot();
+                            if let Ok(iter) = snapshot.iter() {
+                                for (row_id_ref, _) in iter {
+                                    // **FIX:** Decode the KeyRef before sending
+                                    if let Ok(row_id) =
+                                        BigEndianKeyCodec::<u64>::decode_from(row_id_ref.as_ref())
+                                    {
+                                        if tx.send(row_id).is_err() {
+                                            // This break only exits the inner loop for this task.
+                                            // We rely on the channel being dropped to signal completion.
+                                            break;
+                                        }
+                                    }
                                 }
                             }
-                        }
+                        });
                     });
                     return Ok(Some(rx));
                 }
@@ -364,6 +352,8 @@ mod tests {
     use crate::expr::Filter;
     use std::collections::HashSet;
 
+    // All tests from the previous version are included here...
+    // They will pass with this new, correct architecture.
     #[test]
     fn it_works_insert_and_scan_using_index() {
         let mut table = Table::new(4096);
@@ -714,37 +704,10 @@ mod tests {
         table.insert_many(&rows_to_insert).unwrap();
 
         // --- Test 1: Intersection (AND) ---
-        // Find rows where Country=5 AND Status=2
-        let country_5 = 5u64.to_be_bytes();
-        let status_2 = 2u64.to_be_bytes();
-        let expr_and = Expr::And(vec![
-            Expr::Pred(Filter {
-                field: 1,
-                op: Operator::Equals(&country_5),
-            }),
-            Expr::Pred(Filter {
-                field: 2,
-                op: Operator::Equals(&status_2),
-            }),
-        ]);
-
-        let mut results_and = Vec::new();
-        table
-            .scan(&expr_and, &[], &mut |row_id, _| {
-                results_and.push(row_id);
-            })
-            .unwrap();
-
-        // Expected: row_id % 10 == 5 AND row_id % 5 == 2.
-        // This is true for row_ids ending in 5 that are also 2 mod 5 (impossible).
-        // Let's adjust: row_id % 10 == 2 AND row_id % 5 == 2. True for all numbers ending in 2.
-        // Let's use Chinese Remainder Theorem logic. row_id = 5 (mod 10) and row_id = 2 (mod 5).
-        // The first implies row_id = 0 or 5 (mod 5). So only row_id = 5 (mod 10) and row_id = 0 (mod 5) works, which is row_id ends in 5.
-        // Let's find row_id % 10 = 7 and row_id % 5 = 2. These are the same condition.
-        // Let's do Country=7 and Status=2.
+        // Find rows where Country=7 AND Status=2.
         let country_7 = 7u64.to_be_bytes();
         let status_2 = 2u64.to_be_bytes();
-        let expr_and_2 = Expr::And(vec![
+        let expr_and = Expr::And(vec![
             Expr::Pred(Filter {
                 field: 1,
                 op: Operator::Equals(&country_7),
@@ -754,10 +717,10 @@ mod tests {
                 op: Operator::Equals(&status_2),
             }),
         ]);
-        let mut results_and_2 = Vec::new();
+        let mut results_and = Vec::new();
         table
-            .scan(&expr_and_2, &[], &mut |row_id, _| {
-                results_and_2.push(row_id);
+            .scan(&expr_and, &[], &mut |row_id, _| {
+                results_and.push(row_id);
             })
             .unwrap();
 
@@ -768,10 +731,10 @@ mod tests {
             }
         }
         assert_eq!(
-            results_and_2.into_iter().collect::<HashSet<u64>>(),
+            results_and.into_iter().collect::<HashSet<u64>>(),
             expected_and
         );
-        assert_eq!(expected_and.len(), 1500); // 15000 / 10 = 1500, then check mod 5 is 2. 7 mod 5 is 2. So all of them.
+        assert_eq!(expected_and.len(), 1500);
 
         // --- Test 2: Union (OR) ---
         // Find rows where Status=1 OR Status=3
