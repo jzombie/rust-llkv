@@ -8,6 +8,7 @@ use std::str;
 
 // --- Traits ---
 
+// TODO: Rename to connotate "physical" & "logical" keys? This would also involve renaming of `KeyCodec` and `IdCodec`
 pub trait KeyCodec {
     type Key: Clone + Ord + Debug;
     fn encoded_len(key: &Self::Key) -> usize;
@@ -26,7 +27,6 @@ pub trait IdCodec {
 
 // --- Generic Integer Codec ---
 
-// TODO: Rename to connotate "physical" & "logical" keys?
 /// A generic codec for any integer type that can be represented as big-endian bytes.
 #[derive(Debug)]
 pub struct BigEndianKeyCodec<T>(std::marker::PhantomData<T>);
