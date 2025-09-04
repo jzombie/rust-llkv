@@ -15,6 +15,7 @@ use llkv_btree::codecs::KeyCodec;
 use llkv_btree::define_mem_pager;
 use llkv_btree::errors::Error;
 use llkv_btree::iter::{BPlusTreeIter, ScanOpts};
+use llkv_btree::node_cache::NodeCache;
 use llkv_btree::pager::{Pager as BTreePager, SharedPager};
 use llkv_btree::prelude::*;
 use llkv_btree::views::value_view::ValueRef;
@@ -22,6 +23,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::sync::{Arc, RwLock};
 use std::thread;
 
 pub struct TableCfg {
@@ -37,6 +39,7 @@ where
     columns: BTreeMap<FieldId, ColumnTree<P>>,
     indexes: BTreeMap<FieldId, PrimaryIndexTree<P>>,
     pager: P,
+    shared_node_cache: Arc<RwLock<NodeCache<P>>>,
 }
 
 define_mem_pager! {
@@ -60,20 +63,30 @@ where
     <P as BTreePager>::Page: Send + Sync + 'static,
 {
     pub fn with_pager(pager: P) -> Self {
+        let shared_node_cache = Arc::new(RwLock::new(NodeCache::default()));
         Self {
             columns: BTreeMap::new(),
             indexes: BTreeMap::new(),
             pager,
+            shared_node_cache,
         }
     }
 
     pub fn add_column(&mut self, field_id: FieldId) {
-        let column_tree = ColumnTree::create_empty(self.pager.clone(), None).unwrap();
+        let column_tree = ColumnTree::create_empty(
+            self.pager.clone(),
+            Some(Arc::clone(&self.shared_node_cache)),
+        )
+        .unwrap();
         self.columns.insert(field_id, column_tree);
     }
 
     pub fn add_index(&mut self, field_id: FieldId) {
-        let index_tree = PrimaryIndexTree::create_empty(self.pager.clone(), None).unwrap();
+        let index_tree = PrimaryIndexTree::create_empty(
+            self.pager.clone(),
+            Some(Arc::clone(&self.shared_node_cache)),
+        )
+        .unwrap();
         self.indexes.insert(field_id, index_tree);
     }
 
