@@ -409,6 +409,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-expr"
+version = "0.1.0-alpha"
+
+[[package]]
 name = "llkv-storage"
 version = "0.1.0-alpha"
 dependencies = [
@@ -427,6 +431,7 @@ version = "0.1.0-alpha"
 dependencies = [
  "crossbeam-channel",
  "llkv-btree",
+ "llkv-expr",
  "llkv-storage",
  "rayon",
  "rustc-hash",
