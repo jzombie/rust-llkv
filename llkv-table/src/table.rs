@@ -179,7 +179,7 @@ where
 
     pub fn scan<'a>(
         &'a self,
-        expr: &Expr<'a>,
+        expr: &Expr<'a, FieldId>,
         projection: &[FieldId],
         on_row: &mut OnRowOf<P>,
     ) -> Result<(), Error> {
@@ -205,7 +205,7 @@ where
 
     fn get_row_id_stream<'b>(
         &'b self,
-        expr: &Expr<'b>,
+        expr: &Expr<'b, FieldId>,
     ) -> Result<Option<xchan::Receiver<RowId>>, Error> {
         match expr {
             Expr::Pred(filter) => self.get_stream_for_predicate(filter),
@@ -277,9 +277,9 @@ where
 
     fn get_stream_for_predicate<'b>(
         &'b self,
-        filter: &Filter<'b>,
+        filter: &Filter<'b, FieldId>,
     ) -> Result<Option<xchan::Receiver<RowId>>, Error> {
-        if let Some(primary_index) = self.indexes.get(&filter.field) {
+        if let Some(primary_index) = self.indexes.get(&filter.field_id) {
             match filter.op {
                 Operator::Equals(val) => {
                     let index_key = IndexKeyCodec::decode_from(val)?;
@@ -394,7 +394,7 @@ mod tests {
             .unwrap();
 
         let filter = Filter {
-            field: 1,
+            field_id: 1,
             op: Operator::Equals(&100u64.to_be_bytes()),
         };
         let expr = Expr::Pred(filter);
@@ -458,7 +458,7 @@ mod tests {
         let upper_bound_bytes = 105u64.to_be_bytes();
 
         let filter = Filter {
-            field: 1,
+            field_id: 1,
             op: Operator::Range {
                 lower: Bound::Included(&lower_bound_bytes),
                 upper: Bound::Excluded(&upper_bound_bytes),
@@ -527,7 +527,7 @@ mod tests {
         let lower_1 = 3000u64.to_be_bytes();
         let upper_1 = 4000u64.to_be_bytes();
         let filter_1 = Filter {
-            field: 1,
+            field_id: 1,
             op: Operator::Range {
                 lower: Bound::Included(&lower_1),
                 upper: Bound::Excluded(&upper_1),
@@ -551,7 +551,7 @@ mod tests {
         // --- Test 2: Equality Scan on medium-cardinality index (Field 2) ---
         let key_2 = 42u64.to_be_bytes();
         let filter_2 = Filter {
-            field: 2,
+            field_id: 2,
             op: Operator::Equals(&key_2),
         };
         let expr_2 = Expr::Pred(filter_2);
@@ -569,7 +569,7 @@ mod tests {
         let lower_3 = 2u64.to_be_bytes();
         let upper_3 = 4u64.to_be_bytes();
         let filter_3 = Filter {
-            field: 3,
+            field_id: 3,
             op: Operator::Range {
                 lower: Bound::Included(&lower_3),
                 upper: Bound::Excluded(&upper_3),
@@ -648,11 +648,11 @@ mod tests {
         let cat_restaurant = 10u64.to_be_bytes();
         let expr_and = Expr::And(vec![
             Expr::Pred(Filter {
-                field: 1,
+                field_id: 1,
                 op: Operator::Equals(&city_nyc),
             }),
             Expr::Pred(Filter {
-                field: 2,
+                field_id: 2,
                 op: Operator::Equals(&cat_restaurant),
             }),
         ]);
@@ -672,11 +672,11 @@ mod tests {
         // Find: anything in NYC (city 1) OR any Restaurant (category 10)
         let expr_or = Expr::Or(vec![
             Expr::Pred(Filter {
-                field: 1,
+                field_id: 1,
                 op: Operator::Equals(&city_nyc),
             }),
             Expr::Pred(Filter {
-                field: 2,
+                field_id: 2,
                 op: Operator::Equals(&cat_restaurant),
             }),
         ]);
@@ -727,11 +727,11 @@ mod tests {
         let status_2 = 2u64.to_be_bytes();
         let expr_and = Expr::And(vec![
             Expr::Pred(Filter {
-                field: 1,
+                field_id: 1,
                 op: Operator::Equals(&country_7),
             }),
             Expr::Pred(Filter {
-                field: 2,
+                field_id: 2,
                 op: Operator::Equals(&status_2),
             }),
         ]);
@@ -760,11 +760,11 @@ mod tests {
         let status_3 = 3u64.to_be_bytes();
         let expr_or = Expr::Or(vec![
             Expr::Pred(Filter {
-                field: 2,
+                field_id: 2,
                 op: Operator::Equals(&status_1),
             }),
             Expr::Pred(Filter {
-                field: 2,
+                field_id: 2,
                 op: Operator::Equals(&status_3),
             }),
         ]);
