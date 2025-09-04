@@ -17,6 +17,7 @@ simd-r-drive-entry-handle = "0.12.0-alpha"
 # Vendor crates
 criterion = "0.7.0"
 crossbeam-channel = "0.5.15"
+csv = "1.3.1"
 line-ending = "1.5.1"
 memmap2 = "0.9.8"
 rand = "0.9.1"
@@ -28,6 +29,7 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 [workspace]
 members = [
     "llkv-btree",
+    "llkv-csv",
     "llkv-expr",
     "llkv-storage",
     "llkv-table"

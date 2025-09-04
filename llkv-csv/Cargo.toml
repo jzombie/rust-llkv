@@ -1,0 +1,13 @@
+[package]
+name = "llkv-csv"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+csv.workspace = true
+llkv-table.workspace = true
+rustc-hash.workspace = true
