@@ -549,24 +549,236 @@ where
         Ok(res.pop().flatten().is_some())
     }
 
-    pub fn insert_many(&self, items: &[(KC::Key, &[u8])]) -> Result<(), Error> {
-        // Sort by key to improve locality during splits and writes.
-        let mut owned: Vec<_> = items.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    pub fn insert_many(&self, items: &[(KC::Key, &[u8])]) -> Result<(), Error>
+    where
+        KC::Key: Ord + Clone,
+    {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        // 1) Sort by key (as before).
+        let mut owned: Vec<(KC::Key, &[u8])> = items.iter().map(|(k, v)| (k.clone(), *v)).collect();
         owned.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        // New: leaf cursor to avoid repeated root descents.
-        let mut cur: LeafCursor<P> = LeafCursor::default();
+        // 2) Coalesce duplicates (keep last value per key).
+        let mut coalesced: Vec<(KC::Key, &[u8])> = Vec::with_capacity(owned.len());
+        for (k, v) in owned.into_iter() {
+            if let Some(last) = coalesced.last_mut() {
+                if last.0 == k {
+                    last.1 = v; // overwrite last
+                    continue;
+                }
+            }
+            coalesced.push((k, v));
+        }
 
-        for (k, v) in owned {
-            // Try to stay on the same or adjacent leaf before falling
-            // back to a partial/new descent.
-            let (leaf_id, view) = self.find_leaf_with_hint(&mut cur, &k)?;
-            // Insert/update directly in this leaf, handling split and
-            // parent propagation using the recorded path.
-            self.upsert_into_leaf_with_path(&mut cur, &leaf_id, &view, &k, v)?;
+        // 3) Batch by leaf using the cursor hint.
+        let mut cur = LeafCursor::<P>::default();
+        let mut i = 0;
+
+        while i < coalesced.len() {
+            let (leaf_id, view) = self.find_leaf_with_hint(&mut cur, &coalesced[i].0)?;
+
+            // Compute the end of this run.
+            let mut j = i + 1;
+            if !cur.max_key.is_empty() {
+                // Non-empty leaf: take keys <= leaf's current max.
+                while j < coalesced.len()
+                    && KC::compare_encoded(cur.max_key.as_slice(), &coalesced[j].0)
+                        != Ordering::Less
+                {
+                    j += 1;
+                }
+            } else {
+                // Empty leaf: greedily pack up to page_size to avoid one-write-per-key.
+                j = self.choose_run_end_for_empty_leaf(&view, &coalesced, i);
+            }
+
+            // Build the new leaf once for the whole run.
+            let new_bytes = Self::encode_leaf_with_bulk(&view, &coalesced[i..j])?;
+
+            match self.split_if_needed_bytes(leaf_id.clone(), new_bytes)? {
+                InsertResult::Ok => {
+                    // Refresh cursor to updated leaf.
+                    let page = self.read_one(&leaf_id)?;
+                    let v2 = NodeView::<P>::new(page)?;
+                    self.update_cursor_from_view(&mut cur, leaf_id.clone(), &v2);
+                }
+                InsertResult::Split {
+                    separator,
+                    right_id,
+                } => {
+                    // Update parents; next loop will naturally walk into right leaf.
+                    self.update_parent_chain_after_split(
+                        &mut cur.path,
+                        leaf_id.clone(),
+                        separator,
+                        right_id.clone(),
+                    )?;
+                    cur.right_sibling = Some(right_id);
+                    let page = self.read_one(&leaf_id)?;
+                    let v2 = NodeView::<P>::new(page)?;
+                    self.update_cursor_from_view(&mut cur, leaf_id, &v2);
+                }
+            }
+
+            i = j;
         }
 
         self.flush()
+    }
+
+    /// When a leaf is empty, greedily choose a run end `j` so the resulting
+    /// single rebuilt leaf fits in `page_size` (avoids one write per key).
+    fn choose_run_end_for_empty_leaf(
+        &self,
+        view: &NodeView<P>,
+        items: &[(KC::Key, &[u8])],
+        start: usize,
+    ) -> usize {
+        debug_assert_eq!(view.count(), 0);
+
+        // Leaf layout size = header(9) + aux + Σkeys + Σvals + 16 * count
+        let header = 9usize;
+        let aux = view.aux_len();
+        let mut k_bytes = 0usize;
+        let mut v_bytes = 0usize;
+        let mut added = 0usize;
+
+        let mut j = start;
+        while j < items.len() {
+            let (k, v) = &items[j];
+            let kl = KC::encoded_len(k);
+            let vl = v.len();
+            let new_added = added + 1;
+            let new_k = k_bytes + kl;
+            let new_v = v_bytes + vl;
+
+            let total = header + aux + new_k + new_v + 16 * new_added;
+            if total > self.page_size {
+                break;
+            }
+
+            added = new_added;
+            k_bytes = new_k;
+            v_bytes = new_v;
+            j += 1;
+        }
+
+        // Ensure forward progress even if a single (k,v) would overflow
+        // (the pager will enforce its own constraints).
+        if j == start { start + 1 } else { j }
+    }
+
+    fn encode_leaf_with_bulk(
+        view: &NodeView<P>,
+        inserts: &[(KC::Key, &[u8])],
+    ) -> Result<Vec<u8>, Error> {
+        let n_old = view.count();
+        let n_new = inserts.len();
+
+        // Merge old entries with new (sorted) inserts.
+        let mut i = 0usize; // old index
+        let mut j = 0usize; // new index
+
+        let mut keys_out = Vec::new();
+        let mut vals_out = Vec::new();
+        let mut idx_out = Vec::with_capacity((n_old + n_new) * 16);
+
+        let mut k_off: u32 = 0;
+        let mut v_off: u32 = 0;
+
+        while i < n_old || j < n_new {
+            if j == n_new {
+                // copy remaining old
+                let (k_bytes, v_bytes) = view.leaf_entry_slices(i);
+                push_u32(&mut idx_out, k_off);
+                push_u32(&mut idx_out, k_bytes.len() as u32);
+                push_u32(&mut idx_out, v_off);
+                push_u32(&mut idx_out, v_bytes.len() as u32);
+                keys_out.extend_from_slice(k_bytes);
+                vals_out.extend_from_slice(v_bytes);
+                k_off += k_bytes.len() as u32;
+                v_off += v_bytes.len() as u32;
+                i += 1;
+                continue;
+            }
+            if i == n_old {
+                // copy remaining new
+                let (k, v) = &inserts[j];
+                let mut k_tmp = Vec::with_capacity(KC::encoded_len(k));
+                KC::encode_into(k, &mut k_tmp);
+                push_u32(&mut idx_out, k_off);
+                push_u32(&mut idx_out, k_tmp.len() as u32);
+                push_u32(&mut idx_out, v_off);
+                push_u32(&mut idx_out, v.len() as u32);
+                keys_out.extend_from_slice(&k_tmp);
+                vals_out.extend_from_slice(v);
+                k_off += k_tmp.len() as u32;
+                v_off += v.len() as u32;
+                j += 1;
+                continue;
+            }
+
+            let (k_bytes_old, v_bytes_old) = view.leaf_entry_slices(i);
+            match KC::compare_encoded(k_bytes_old, &inserts[j].0) {
+                Ordering::Less => {
+                    // keep old
+                    push_u32(&mut idx_out, k_off);
+                    push_u32(&mut idx_out, k_bytes_old.len() as u32);
+                    push_u32(&mut idx_out, v_off);
+                    push_u32(&mut idx_out, v_bytes_old.len() as u32);
+                    keys_out.extend_from_slice(k_bytes_old);
+                    vals_out.extend_from_slice(v_bytes_old);
+                    k_off += k_bytes_old.len() as u32;
+                    v_off += v_bytes_old.len() as u32;
+                    i += 1;
+                }
+                Ordering::Equal => {
+                    // update value (reuse old key bytes)
+                    let (_k_new, v_new) = &inserts[j];
+                    push_u32(&mut idx_out, k_off);
+                    push_u32(&mut idx_out, k_bytes_old.len() as u32);
+                    push_u32(&mut idx_out, v_off);
+                    push_u32(&mut idx_out, v_new.len() as u32);
+                    keys_out.extend_from_slice(k_bytes_old);
+                    vals_out.extend_from_slice(v_new);
+                    k_off += k_bytes_old.len() as u32;
+                    v_off += v_new.len() as u32;
+                    i += 1;
+                    j += 1;
+                }
+                Ordering::Greater => {
+                    // insert new key/value
+                    let (k_new, v_new) = &inserts[j];
+                    let mut k_tmp = Vec::with_capacity(KC::encoded_len(k_new));
+                    KC::encode_into(k_new, &mut k_tmp);
+                    push_u32(&mut idx_out, k_off);
+                    push_u32(&mut idx_out, k_tmp.len() as u32);
+                    push_u32(&mut idx_out, v_off);
+                    push_u32(&mut idx_out, v_new.len() as u32);
+                    keys_out.extend_from_slice(&k_tmp);
+                    vals_out.extend_from_slice(v_new);
+                    k_off += k_tmp.len() as u32;
+                    v_off += v_new.len() as u32;
+                    j += 1;
+                }
+            }
+        }
+
+        // Assemble full page: [tag][count][aux_len][aux][keys][vals][index]
+        let mut out = Vec::with_capacity(
+            9 + view.aux_len() + keys_out.len() + vals_out.len() + idx_out.len(),
+        );
+        out.push(NodeTag::Leaf as u8);
+        push_u32(&mut out, (idx_out.len() / 16) as u32);
+        push_u32(&mut out, view.aux_len() as u32);
+        out.extend_from_slice(&view.as_slice()[view.aux_range()]);
+        out.extend_from_slice(&keys_out);
+        out.extend_from_slice(&vals_out);
+        out.extend_from_slice(&idx_out);
+        Ok(out)
     }
 
     pub fn delete_many(&self, keys: &[KC::Key]) -> Result<(), Error> {
