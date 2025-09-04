@@ -1,7 +1,7 @@
 use bitcode::{Decode, Encode};
 
-pub type PhysicalKey = u64; // KV/pager address
-pub type LogicalKeyBytes = Vec<u8>; // app/logical key, already encoded
+pub mod types;
+use types::{IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey};
 
 // ── Bootstrapping ────────────────────────────────────────────────────────────
 // Physical key 0 holds this tiny record so you can find the manifest.
@@ -18,7 +18,7 @@ pub struct Manifest {
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct ColumnEntry {
-    pub field_id: u32,
+    pub field_id: LogicalFieldId,
     /// Physical key of the current ColumnIndex blob for this column.
     pub column_index_physical_key: PhysicalKey,
 }
@@ -27,7 +27,7 @@ pub struct ColumnEntry {
 // One per column. Newest-first so later segments shadow older ones.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct ColumnIndex {
-    pub field_id: u32,
+    pub field_id: LogicalFieldId,
     pub segments: Vec<IndexSegmentRef>, // newest-first
 }
 
@@ -42,7 +42,7 @@ pub struct IndexSegmentRef {
     pub logical_key_max: LogicalKeyBytes,
 
     /// Number of entries in that segment (helps pre-alloc).
-    pub n_entries: u32,
+    pub n_entries: IndexEntryCount,
 }
 
 // ── Your locked index segment & value layout ─────────────────────────────────
@@ -59,12 +59,12 @@ pub struct IndexSegment {
     pub data_physical_key: PhysicalKey,
 
     /// Number of entries (also equal to logical_key_offsets.len()-1).
-    pub n_entries: u32,
+    pub n_entries: IndexEntryCount,
 
     /// Sorted *logical* keys, stored compactly:
     /// `logical_key_bytes[logical_key_offsets[i]..logical_key_offsets[i+1])`
     pub logical_key_bytes: Vec<u8>,
-    pub logical_key_offsets: Vec<u32>, // len = n_entries + 1
+    pub logical_key_offsets: Vec<IndexEntryCount>, // len = n_entries + 1
 
     /// How to slice the *data* blob for the i-th value.
     pub value_layout: ValueLayout,
@@ -95,12 +95,12 @@ mod tests {
 
     /// Tiny in-memory KV used by the tests to simulate a pager/kv store.
     /// Values are **opaque blobs**; only indexes carry structure.
-    struct MemKv {
+    struct MemPager {
         map: HashMap<PhysicalKey, Vec<u8>>,
         next: PhysicalKey, // simple monotonically increasing allocator
     }
 
-    impl Default for MemKv {
+    impl Default for MemPager {
         fn default() -> Self {
             Self {
                 map: HashMap::new(),
@@ -109,7 +109,7 @@ mod tests {
         }
     }
 
-    impl MemKv {
+    impl MemPager {
         // -------- allocation (batched only) --------
         fn alloc_many(&mut self, n: usize) -> Vec<PhysicalKey> {
             let start = self.next;
@@ -237,7 +237,7 @@ mod tests {
     ///   3) open an index segment and inspect min/max/key layout.
     #[test]
     fn bootstrap_manifest_column_index_roundtrip() {
-        let mut kv = MemKv::default();
+        let mut kv = MemPager::default();
 
         // ----- allocate physical ids (batched) -----
         // data_100, idx_100, data_200, idx_200, col_100_idx_pkey, col_200_idx_pkey, manifest_pkey
@@ -393,7 +393,7 @@ mod tests {
     /// then a simple binary search inside an `IndexSegment` without any B-Tree.
     #[test]
     fn prune_and_binary_search_in_segment() {
-        let mut kv = MemKv::default();
+        let mut kv = MemPager::default();
 
         // allocate 3 data keys + 3 index keys (batched)
         let ids = kv.alloc_many(6);
