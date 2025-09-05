@@ -1015,35 +1015,37 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     }
 
     /// Renders a compact ASCII table of the current storage layout.
+    /// (bytes column moved before details to keep the table aligned)
     pub fn render_storage_ascii(&mut self) -> String {
         let nodes = self.describe_storage();
         let mut s = String::new();
-        let _ = writeln!(
-            &mut s,
-            "{:<10} {:<12} {:<9} {:<40} {:>8}",
-            "phys_key", "kind", "field", "details", "bytes"
+
+        // Header: phys_key | kind | field | bytes | details
+
+        let header = format!(
+            "{:<10} {:<12} {:<9} {:>10}  {}",
+            "phys_key", "kind", "field", "bytes", "details"
         );
-        let _ = writeln!(
-            &mut s,
-            "{}",
-            "-".repeat(10 + 1 + 12 + 1 + 9 + 1 + 40 + 1 + 8)
-        );
+        let _ = writeln!(&mut s, "{header}");
+
+        // Divider length covers the fixed-width columns (details is free-width at the end)
+        let _ = writeln!(&mut s, "{}", "-".repeat(header.len()));
 
         for n in nodes {
             match n.kind {
                 StorageKind::Bootstrap => {
                     let _ = writeln!(
                         &mut s,
-                        "{:<10} {:<12} {:<9} {:<40} {:>8}",
-                        n.pk, "bootstrap", "-", "-", n.stored_len
+                        "{:<10} {:<12} {:<9} {:>10}  {}",
+                        n.pk, "bootstrap", "-", n.stored_len, "-"
                     );
                 }
                 StorageKind::Manifest { column_count } => {
                     let det = format!("columns={}", column_count);
                     let _ = writeln!(
                         &mut s,
-                        "{:<10} {:<12} {:<9} {:<40} {:>8}",
-                        n.pk, "manifest", "-", det, n.stored_len
+                        "{:<10} {:<12} {:<9} {:>10}  {}",
+                        n.pk, "manifest", "-", n.stored_len, det
                     );
                 }
                 StorageKind::ColumnIndex {
@@ -1053,8 +1055,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     let det = format!("segments={}", n_segments);
                     let _ = writeln!(
                         &mut s,
-                        "{:<10} {:<12} {:<9} {:<40} {:>8}",
-                        n.pk, "col_index", field_id, det, n.stored_len
+                        "{:<10} {:<12} {:<9} {:>10}  {}",
+                        n.pk, "col_index", field_id, n.stored_len, det
                     );
                 }
                 StorageKind::IndexSegment {
@@ -1087,16 +1089,16 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     };
                     let _ = writeln!(
                         &mut s,
-                        "{:<10} {:<12} {:<9} {:<40} {:>8}",
-                        n.pk, "idx_segment", field_id, det, n.stored_len
+                        "{:<10} {:<12} {:<9} {:>10}  {}",
+                        n.pk, "idx_segment", field_id, n.stored_len, det
                     );
                 }
                 StorageKind::DataBlob { owner_index_pk } => {
                     let det = format!("owner_idx_pk={}", owner_index_pk);
                     let _ = writeln!(
                         &mut s,
-                        "{:<10} {:<12} {:<9} {:<40} {:>8}",
-                        n.pk, "data_blob", "-", det, n.stored_len
+                        "{:<10} {:<12} {:<9} {:>10}  {}",
+                        n.pk, "data_blob", "-", n.stored_len, det
                     );
                 }
             }
