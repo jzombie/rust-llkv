@@ -18,6 +18,46 @@ use crate::index::{
 use crate::pager::Pager;
 use crate::types::{IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey};
 
+use std::fmt::Write as _;
+
+#[derive(Clone, Debug)]
+pub struct IndexLayoutInfo {
+    pub kind: &'static str,       // "fixed" or "variable"
+    pub fixed_width: Option<u32>, // when fixed
+    pub key_bytes: usize,         // logical_key_bytes.len()
+    pub key_offs_bytes: usize,    // logical_key_offsets.len() * 4
+    pub value_meta_bytes: usize,  // Variable: value_offsets.len()*4, Fixed: 4 (width)
+}
+
+#[derive(Clone, Debug)]
+pub struct StorageNode {
+    pub pk: PhysicalKey,
+    pub stored_len: usize,
+    pub kind: StorageKind,
+}
+
+#[derive(Clone, Debug)]
+pub enum StorageKind {
+    Bootstrap,
+    Manifest {
+        column_count: usize,
+    },
+    ColumnIndex {
+        field_id: LogicalFieldId,
+        n_segments: usize,
+    },
+    IndexSegment {
+        field_id: LogicalFieldId,
+        n_entries: IndexEntryCount,
+        layout: IndexLayoutInfo,
+        data_pkey: PhysicalKey,
+        owner_colindex_pk: PhysicalKey,
+    },
+    DataBlob {
+        owner_index_pk: PhysicalKey,
+    },
+}
+
 // ----------------------------- helpers -----------------------------
 
 fn concat_keys_and_offsets_sorted(
@@ -561,6 +601,335 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         }
 
         out
+    }
+}
+
+impl<'p, P: Pager> ColumnStore<'p, P> {
+    /// Scans the manifest -> ColumnIndex -> IndexSegments -> Data blobs,
+    /// returns one entry per physical key with sizes and relationships.
+    /// Batch-only I/O.
+    pub fn describe_storage(&mut self) -> Vec<StorageNode> {
+        let mut out: Vec<StorageNode> = Vec::new();
+
+        // --- bootstrap + manifest (raw sizes)
+        let bootstrap_key: PhysicalKey = self.bootstrap_key;
+        let mut header_keys = vec![bootstrap_key, self.manifest_key];
+        let header_raw = self.pager.batch_get_raw(&header_keys);
+        // bootstrap
+        out.push(StorageNode {
+            pk: bootstrap_key,
+            stored_len: header_raw[0].len(),
+            kind: StorageKind::Bootstrap,
+        });
+        // manifest
+        out.push(StorageNode {
+            pk: self.manifest_key,
+            stored_len: header_raw[1].len(),
+            kind: StorageKind::Manifest {
+                column_count: self.manifest.columns.len(),
+            },
+        });
+
+        // --- column indexes (typed + raw in a single pass)
+        let col_index_pks: Vec<PhysicalKey> = self
+            .manifest
+            .columns
+            .iter()
+            .map(|c| c.column_index_physical_key)
+            .collect();
+
+        let mut colindex_nodes: Vec<StorageNode> = Vec::new();
+        let mut field_for_colindex: HashMap<PhysicalKey, LogicalFieldId> = HashMap::new();
+        let mut all_seg_index_pks: Vec<PhysicalKey> = Vec::new();
+        let mut seg_owner_colindex: HashMap<PhysicalKey, (LogicalFieldId, PhysicalKey)> =
+            HashMap::new();
+
+        if !col_index_pks.is_empty() {
+            let colindex_raw = self.pager.batch_get_raw(&col_index_pks);
+            let colindices: Vec<ColumnIndex> =
+                self.pager.batch_get_typed::<ColumnIndex>(&col_index_pks);
+
+            for (i, ci) in colindices.into_iter().enumerate() {
+                let pk = col_index_pks[i];
+                field_for_colindex.insert(pk, ci.field_id);
+                colindex_nodes.push(StorageNode {
+                    pk,
+                    stored_len: colindex_raw[i].len(),
+                    kind: StorageKind::ColumnIndex {
+                        field_id: ci.field_id,
+                        n_segments: ci.segments.len() as usize,
+                    },
+                });
+
+                // collect segment index pkeys and owners
+                for sref in ci.segments {
+                    all_seg_index_pks.push(sref.index_physical_key);
+                    seg_owner_colindex.insert(sref.index_physical_key, (ci.field_id, pk));
+                }
+            }
+        }
+
+        out.extend(colindex_nodes);
+
+        // --- index segments (typed + raw) and discover data pkeys
+        let mut data_pkeys: Vec<PhysicalKey> = Vec::new();
+        let mut owner_for_data: HashMap<PhysicalKey, PhysicalKey> = HashMap::new(); // data_pkey -> index_segment_pk
+        let mut seg_nodes: Vec<StorageNode> = Vec::new();
+
+        if !all_seg_index_pks.is_empty() {
+            let seg_raw = self.pager.batch_get_raw(&all_seg_index_pks);
+            let segs: Vec<IndexSegment> = self
+                .pager
+                .batch_get_typed::<IndexSegment>(&all_seg_index_pks);
+
+            for (i, seg) in segs.into_iter().enumerate() {
+                let seg_pk = all_seg_index_pks[i];
+                let (field_id, owner_colindex_pk) =
+                    seg_owner_colindex.get(&seg_pk).cloned().unwrap();
+
+                // book-keep data blob for later
+                data_pkeys.push(seg.data_physical_key);
+                owner_for_data.insert(seg.data_physical_key, seg_pk);
+
+                // compute layout info
+                let key_bytes = seg.logical_key_bytes.len();
+                let key_offs_bytes =
+                    seg.logical_key_offsets.len() * std::mem::size_of::<IndexEntryCount>();
+                let (kind, fixed_width, value_meta_bytes) = match &seg.value_layout {
+                    ValueLayout::FixedWidth { width } => {
+                        ("fixed", Some(*width), std::mem::size_of::<u32>())
+                    }
+                    ValueLayout::Variable { value_offsets } => (
+                        "variable",
+                        None,
+                        value_offsets.len() * std::mem::size_of::<u32>(),
+                    ),
+                };
+
+                let layout = IndexLayoutInfo {
+                    kind,
+                    fixed_width,
+                    key_bytes,
+                    key_offs_bytes,
+                    value_meta_bytes,
+                };
+
+                seg_nodes.push(StorageNode {
+                    pk: seg_pk,
+                    stored_len: seg_raw[i].len(),
+                    kind: StorageKind::IndexSegment {
+                        field_id,
+                        n_entries: seg.n_entries,
+                        layout,
+                        data_pkey: seg.data_physical_key,
+                        owner_colindex_pk,
+                    },
+                });
+            }
+        }
+
+        out.extend(seg_nodes);
+
+        // --- data blobs (raw only)
+        if !data_pkeys.is_empty() {
+            let data_raw = self.pager.batch_get_raw(&data_pkeys);
+            for (i, dpk) in data_pkeys.iter().enumerate() {
+                let owner = *owner_for_data.get(dpk).unwrap();
+                out.push(StorageNode {
+                    pk: *dpk,
+                    stored_len: data_raw[i].len(),
+                    kind: StorageKind::DataBlob {
+                        owner_index_pk: owner,
+                    },
+                });
+            }
+        }
+
+        // deterministic order
+        out.sort_by_key(|n| n.pk);
+        out
+    }
+
+    /// Renders a compact ASCII table of the current storage layout.
+    pub fn render_storage_ascii(&mut self) -> String {
+        let nodes = self.describe_storage();
+        let mut s = String::new();
+        let _ = writeln!(
+            &mut s,
+            "{:<10} {:<12} {:<9} {:<40} {:>8}",
+            "phys_key", "kind", "field", "details", "bytes"
+        );
+        let _ = writeln!(
+            &mut s,
+            "{}",
+            "-".repeat(10 + 1 + 12 + 1 + 9 + 1 + 40 + 1 + 8)
+        );
+
+        for n in nodes {
+            match n.kind {
+                StorageKind::Bootstrap => {
+                    let _ = writeln!(
+                        &mut s,
+                        "{:<10} {:<12} {:<9} {:<40} {:>8}",
+                        n.pk, "bootstrap", "-", "-", n.stored_len
+                    );
+                }
+                StorageKind::Manifest { column_count } => {
+                    let det = format!("columns={}", column_count);
+                    let _ = writeln!(
+                        &mut s,
+                        "{:<10} {:<12} {:<9} {:<40} {:>8}",
+                        n.pk, "manifest", "-", det, n.stored_len
+                    );
+                }
+                StorageKind::ColumnIndex {
+                    field_id,
+                    n_segments,
+                } => {
+                    let det = format!("segments={}", n_segments);
+                    let _ = writeln!(
+                        &mut s,
+                        "{:<10} {:<12} {:<9} {:<40} {:>8}",
+                        n.pk, "col_index", field_id, det, n.stored_len
+                    );
+                }
+                StorageKind::IndexSegment {
+                    field_id,
+                    n_entries,
+                    layout,
+                    data_pkey,
+                    owner_colindex_pk,
+                } => {
+                    let det = match layout.fixed_width {
+                        Some(w) => format!(
+                            "entries={} layout=fixed({}) key_bytes={} key_offs={} val_meta={} data_pk={} colidx_pk={}",
+                            n_entries,
+                            w,
+                            layout.key_bytes,
+                            layout.key_offs_bytes,
+                            layout.value_meta_bytes,
+                            data_pkey,
+                            owner_colindex_pk
+                        ),
+                        None => format!(
+                            "entries={} layout=variable key_bytes={} key_offs={} val_meta={} data_pk={} colidx_pk={}",
+                            n_entries,
+                            layout.key_bytes,
+                            layout.key_offs_bytes,
+                            layout.value_meta_bytes,
+                            data_pkey,
+                            owner_colindex_pk
+                        ),
+                    };
+                    let _ = writeln!(
+                        &mut s,
+                        "{:<10} {:<12} {:<9} {:<40} {:>8}",
+                        n.pk, "idx_segment", field_id, det, n.stored_len
+                    );
+                }
+                StorageKind::DataBlob { owner_index_pk } => {
+                    let det = format!("owner_idx_pk={}", owner_index_pk);
+                    let _ = writeln!(
+                        &mut s,
+                        "{:<10} {:<12} {:<9} {:<40} {:>8}",
+                        n.pk, "data_blob", "-", det, n.stored_len
+                    );
+                }
+            }
+        }
+        s
+    }
+
+    /// Renders a Graphviz DOT graph showing edges:
+    /// bootstrap -> manifest -> ColumnIndex -> IndexSegment -> DataBlob
+    pub fn render_storage_dot(&mut self) -> String {
+        let nodes = self.describe_storage();
+
+        // index nodes by pk for quick lookup
+        let mut map: HashMap<PhysicalKey, &StorageNode> = HashMap::new();
+        for n in &nodes {
+            map.insert(n.pk, n);
+        }
+
+        let mut s = String::new();
+        let _ = writeln!(&mut s, "digraph storage {{");
+        let _ = writeln!(&mut s, "  node [shape=box, fontname=\"monospace\"];");
+
+        // emit nodes
+        for n in &nodes {
+            match &n.kind {
+                StorageKind::Bootstrap => {
+                    let _ = writeln!(
+                        &mut s,
+                        "  n{} [label=\"Bootstrap pk={} bytes={}\"];",
+                        n.pk, n.pk, n.stored_len
+                    );
+                    // edge to manifest
+                    let _ = writeln!(&mut s, "  n{} -> n{};", n.pk, self.manifest_key);
+                }
+                StorageKind::Manifest { column_count } => {
+                    let _ = writeln!(
+                        &mut s,
+                        "  n{} [label=\"Manifest pk={} columns={} bytes={}\"];",
+                        n.pk, n.pk, column_count, n.stored_len
+                    );
+                    // edges to column indexes
+                    for e in &self.manifest.columns {
+                        let _ =
+                            writeln!(&mut s, "  n{} -> n{};", n.pk, e.column_index_physical_key);
+                    }
+                }
+                StorageKind::ColumnIndex {
+                    field_id,
+                    n_segments,
+                } => {
+                    let _ = writeln!(
+                        &mut s,
+                        "  n{} [label=\"ColumnIndex pk={} field={} segs={} bytes={}\"];",
+                        n.pk, n.pk, field_id, n_segments, n.stored_len
+                    );
+                }
+                StorageKind::IndexSegment {
+                    field_id,
+                    n_entries,
+                    layout,
+                    data_pkey,
+                    owner_colindex_pk,
+                } => {
+                    let lay = match layout.fixed_width {
+                        Some(w) => format!("fixed({})", w),
+                        None => "variable".to_string(),
+                    };
+                    let _ = writeln!(
+                        &mut s,
+                        "  n{} [label=\"IndexSegment pk={} field={} entries={} layout={} idx_bytes={} (key_bytes={}, key_offs={}, val_meta={})\"];",
+                        n.pk,
+                        n.pk,
+                        field_id,
+                        n_entries,
+                        lay,
+                        n.stored_len,
+                        layout.key_bytes,
+                        layout.key_offs_bytes,
+                        layout.value_meta_bytes
+                    );
+                    // owner colindex and data edge
+                    let _ = writeln!(&mut s, "  n{} -> n{};", owner_colindex_pk, n.pk);
+                    let _ = writeln!(&mut s, "  n{} -> n{};", n.pk, data_pkey);
+                }
+                StorageKind::DataBlob { owner_index_pk } => {
+                    let _ = writeln!(
+                        &mut s,
+                        "  n{} [label=\"DataBlob pk={} bytes={}\"];",
+                        n.pk, n.pk, n.stored_len
+                    );
+                    let _ = writeln!(&mut s, "  n{} -> n{};", owner_index_pk, n.pk);
+                }
+            }
+        }
+
+        let _ = writeln!(&mut s, "}}");
+        s
     }
 }
 
