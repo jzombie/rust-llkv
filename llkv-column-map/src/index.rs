@@ -1,9 +1,11 @@
 use bitcode::{Decode, Encode};
 
-use crate::types::{IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey};
+use crate::types::{
+    ByteLen, ByteOffset, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey,
+};
 
 // TODO: Refactor
-pub fn concat_keys_and_offsets(mut keys: Vec<Vec<u8>>) -> (Vec<u8>, Vec<u32>) {
+pub fn concat_keys_and_offsets(mut keys: Vec<Vec<u8>>) -> (Vec<u8>, Vec<ByteOffset>) {
     // Ensure sorted by logical key bytes
     keys.sort_unstable();
     let mut bytes = Vec::new();
@@ -12,7 +14,7 @@ pub fn concat_keys_and_offsets(mut keys: Vec<Vec<u8>>) -> (Vec<u8>, Vec<u32>) {
     offs.push(acc);
     for k in keys {
         bytes.extend_from_slice(&k);
-        acc += k.len() as u32;
+        acc += k.len() as ByteOffset;
         offs.push(acc);
     }
     (bytes, offs)
@@ -48,7 +50,14 @@ fn pack_keys_with_layout(
             }
             let min = keys.first().cloned().unwrap_or_default();
             let max = keys.last().cloned().unwrap_or_default();
-            (bytes, KeyLayout::FixedWidth { width: w as u32 }, min, max)
+            (
+                bytes,
+                KeyLayout::FixedWidth {
+                    width: w as ByteWidth,
+                },
+                min,
+                max,
+            )
         }
         None => {
             // Use the legacy "bytes + offsets" representation.
@@ -113,7 +122,7 @@ pub struct IndexSegmentRef {
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum KeyLayout {
     /// Every *logical key* is exactly `width` bytes → slice i is [i*w .. (i+1)*w).
-    FixedWidth { width: u32 },
+    FixedWidth { width: ByteWidth },
 
     /// Variable width logical keys. Prefix sum of key byte offsets:
     /// key_i is [key_offsets[i], key_offsets[i+1]).
@@ -152,7 +161,7 @@ impl IndexSegment {
     pub fn build_fixed(
         data_pkey: PhysicalKey,
         logical_keys: Vec<Vec<u8>>,
-        width: u32,
+        width: ByteWidth,
     ) -> IndexSegment {
         let n = logical_keys.len() as IndexEntryCount;
         let (logical_key_bytes, key_layout, logical_key_min, logical_key_max) =
@@ -171,7 +180,7 @@ impl IndexSegment {
     pub fn build_var(
         data_pkey: PhysicalKey,
         logical_keys: Vec<Vec<u8>>,
-        value_sizes: &[u32], // one per entry
+        value_sizes: &[ByteLen], // one per entry
     ) -> IndexSegment {
         assert_eq!(logical_keys.len(), value_sizes.len());
         let n = logical_keys.len() as IndexEntryCount;
@@ -207,7 +216,7 @@ impl IndexSegment {
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum ValueLayout {
     /// Every value is exactly `width` bytes.
-    FixedWidth { width: u32 },
+    FixedWidth { width: ByteWidth },
 
     /// Variable width values. Prefix sum of byte offsets into data blob.
     /// Slice i is [value_offsets[i], value_offsets[i+1]).

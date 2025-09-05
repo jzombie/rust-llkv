@@ -4,7 +4,9 @@ use crate::index::{
     ValueLayout,
 };
 use crate::pager::{BatchGet, BatchPut, GetResult, Pager, TypedKind, TypedValue};
-use crate::types::{IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey};
+use crate::types::{
+    ByteLen, ByteOffset, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::min;
 use std::collections::hash_map::Entry;
@@ -16,12 +18,12 @@ use std::sync::{
 
 #[derive(Clone, Debug)]
 pub struct IndexLayoutInfo {
-    pub kind: &'static str,       // "fixed" or "variable" (value layout)
-    pub fixed_width: Option<u32>, // when value layout is fixed
+    pub kind: &'static str,             // "fixed" or "variable" (value layout)
+    pub fixed_width: Option<ByteWidth>, // when value layout is fixed
     // TODO: Rename to indicate *logical* and *len*?
     pub key_bytes: usize,        // logical_key_bytes.len()
-    pub key_offs_bytes: usize, // if KeyLayout::Variable: key_offsets.len() * sizeof(IndexEntryCount); else 0
-    pub value_meta_bytes: usize, // Variable: value_offsets.len()*sizeof(IndexEntryCount), Fixed: 4 (width)
+    pub key_offs_bytes: usize, // if KeyLayout::Variable: key_offsets.len() * sizeof(ByteOffset); else 0
+    pub value_meta_bytes: usize, // Variable: value_offsets.len()*sizeof(ByteOffset), Fixed: 4 (ByteWidth)
 }
 
 #[derive(Clone, Debug)]
@@ -101,7 +103,7 @@ pub struct Put {
 #[derive(Clone, Copy, Debug)]
 pub enum ValueMode {
     Auto,
-    ForceFixed(u32),
+    ForceFixed(ByteWidth),
     ForceVariable,
 }
 
@@ -316,7 +318,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         // Also decide value layout for this batch (fixed width or variable).
         #[derive(Clone)]
         enum PlannedLayout {
-            Fixed { width: u32 },
+            Fixed { width: ByteWidth },
             Variable, // offsets will be computed per segment
         }
         struct PlannedChunk {
@@ -365,7 +367,9 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 ValueMode::Auto => {
                     let w = items[0].1.len();
                     if w > 0 && items.iter().all(|(_, v)| v.len() == w) {
-                        PlannedLayout::Fixed { width: w as u32 }
+                        PlannedLayout::Fixed {
+                            width: w as ByteWidth,
+                        }
                     } else {
                         PlannedLayout::Variable
                     }
@@ -551,10 +555,10 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 PlannedLayout::Variable => {
                     // values blob
                     let mut blob = Vec::new();
-                    let mut sizes: Vec<u32> = Vec::with_capacity(chunk.values.len());
+                    let mut sizes: Vec<ByteLen> = Vec::with_capacity(chunk.values.len());
                     for v in &chunk.values {
                         blob.extend_from_slice(v);
-                        sizes.push(v.len() as u32);
+                        sizes.push(v.len() as ByteLen);
                     }
                     // index segment
                     let seg = IndexSegment::build_var(data_pkey, chunk.keys_sorted.clone(), &sizes);
@@ -1009,17 +1013,17 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     let key_offs_bytes = match &seg.key_layout {
                         KeyLayout::FixedWidth { .. } => 0,
                         KeyLayout::Variable { key_offsets } => {
-                            key_offsets.len() * std::mem::size_of::<IndexEntryCount>()
+                            key_offsets.len() * std::mem::size_of::<ByteOffset>()
                         }
                     };
                     let (kind, fixed_width, value_meta_bytes) = match &seg.value_layout {
                         ValueLayout::FixedWidth { width } => {
-                            ("fixed", Some(*width), std::mem::size_of::<u32>())
+                            ("fixed", Some(*width), std::mem::size_of::<ByteWidth>())
                         }
                         ValueLayout::Variable { value_offsets } => (
                             "variable",
                             None,
-                            value_offsets.len() * std::mem::size_of::<IndexEntryCount>(),
+                            value_offsets.len() * std::mem::size_of::<ByteOffset>(),
                         ),
                     };
 
@@ -1354,7 +1358,7 @@ mod tests {
 
         // recompute expected lengths
         let expect_len = |s: &str| -> usize {
-            let i: u32 = s[3..].parse().unwrap();
+            let i: ByteWidth = s[3..].parse().unwrap();
             (i % 17 + 1) as usize
         };
 
