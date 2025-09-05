@@ -51,6 +51,7 @@ pub struct ColumnIndex {
 pub struct IndexSegmentRef {
     /// Physical key of the *index segment* blob.
     pub index_physical_key: PhysicalKey,
+    pub data_physical_key: PhysicalKey,
 
     /// Quick span prune (LOGICAL key bytes).
     pub logical_key_min: LogicalKeyBytes,
@@ -274,6 +275,7 @@ mod tests {
             field_id: 100,
             segments: vec![IndexSegmentRef {
                 index_physical_key: idx_100,
+                data_physical_key: data_100,
                 logical_key_min: seg_100.logical_key_min.clone(),
                 logical_key_max: seg_100.logical_key_max.clone(),
                 n_entries: seg_100.n_entries,
@@ -283,6 +285,7 @@ mod tests {
             field_id: 200,
             segments: vec![IndexSegmentRef {
                 index_physical_key: idx_200,
+                data_physical_key: data_200,
                 logical_key_min: seg_200.logical_key_min.clone(),
                 logical_key_max: seg_200.logical_key_max.clone(),
                 n_entries: seg_200.n_entries,
@@ -430,18 +433,21 @@ mod tests {
             segments: vec![
                 IndexSegmentRef {
                     index_physical_key: p_c,
+                    data_physical_key: data_c,
                     logical_key_min: seg_c.logical_key_min.clone(),
                     logical_key_max: seg_c.logical_key_max.clone(),
                     n_entries: seg_c.n_entries,
                 },
                 IndexSegmentRef {
                     index_physical_key: p_b,
+                    data_physical_key: data_b,
                     logical_key_min: seg_b.logical_key_min.clone(),
                     logical_key_max: seg_b.logical_key_max.clone(),
                     n_entries: seg_b.n_entries,
                 },
                 IndexSegmentRef {
                     index_physical_key: p_a,
+                    data_physical_key: data_a,
                     logical_key_min: seg_a.logical_key_min.clone(),
                     logical_key_max: seg_a.logical_key_max.clone(),
                     n_entries: seg_a.n_entries,

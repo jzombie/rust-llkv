@@ -1,12 +1,7 @@
-// lib.rs
-//
 // High-level append/query API on top of pager + index modules.
-// ASCII-only; ready to paste.
 
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
-
-use bitcode::{Decode, Encode};
 
 pub mod index;
 pub mod pager;
@@ -446,6 +441,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 0,
                 IndexSegmentRef {
                     index_physical_key: index_pkey,
+                    data_physical_key: seg.data_physical_key,
                     logical_key_min: seg.logical_key_min.clone(),
                     logical_key_max: seg.logical_key_max.clone(),
                     n_entries: seg.n_entries,
@@ -483,6 +479,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     // ----------------------------- read API -----------------------------
 
     // TODO: Make zero-copy
+    // TODO: Split into two parts? One which builds physical keys to fetch; the other to act upon it
     // Batched point lookup: values for a single column and a list of logical keys.
     // Returns values in the same order as requested (None if missing).
     pub fn get_in_column(
@@ -522,31 +519,52 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         };
         let _ = col_index_pkey;
 
-        // Map key index -> chosen segment_physical_key (newest-first shadowing)
-        let mut seg_for_key: Vec<Option<PhysicalKey>> = vec![None; keys.len()];
-        // Also collect per segment the list of query indices
+        // Decide candidate segments directly from ColumnIndex (newest-first),
+        // and record both index_pk and data_pk so we can prefetch data blobs
+        // WITHOUT decoding segments first.
         let mut per_seg: HashMap<PhysicalKey, Vec<usize>> = HashMap::new();
+        let mut seg_to_data: HashMap<PhysicalKey, PhysicalKey> = HashMap::new();
 
         for (qi, k) in keys.iter().enumerate() {
             for segref in &col_index.segments {
                 if segref.logical_key_min.as_slice() <= k.as_slice()
                     && k.as_slice() <= segref.logical_key_max.as_slice()
                 {
-                    seg_for_key[qi] = Some(segref.index_physical_key);
                     per_seg
                         .entry(segref.index_physical_key)
                         .or_default()
                         .push(qi);
+                    // map index -> data for the selected segment
+                    seg_to_data.insert(segref.index_physical_key, segref.data_physical_key);
                     break; // newest-first: stop at first covering segment
                 }
             }
         }
 
-        // Load all needed index segments in one batch
+        // If nothing matched, return all None quickly.
         let needed_seg_keys: Vec<PhysicalKey> = per_seg.keys().copied().collect();
         if needed_seg_keys.is_empty() {
             return vec![None; keys.len()];
         }
+
+        // Prefetch data blobs in one batch directly from the column index refs.
+        // Build data key list from the exact segments we will open.
+        let mut data_keys: Vec<PhysicalKey> = needed_seg_keys
+            .iter()
+            .filter_map(|idx_pk| seg_to_data.get(idx_pk).copied())
+            .collect();
+        // de-dup in case multiple queries hit the same segment
+        {
+            let mut seen = HashSet::with_capacity(data_keys.len());
+            data_keys.retain(|k| seen.insert(*k));
+        }
+        let data_blobs_slices: Vec<&[u8]> = self.pager.batch_get_raw(&data_keys);
+        let mut data_map: HashMap<PhysicalKey, &[u8]> = HashMap::with_capacity(data_keys.len());
+        for (i, pk) in data_keys.iter().enumerate() {
+            data_map.insert(*pk, data_blobs_slices[i]);
+        }
+
+        // Load all needed index segments in a single batched typed read.
         let segments: Vec<IndexSegment> =
             self.pager.batch_get_typed::<IndexSegment>(&needed_seg_keys);
 
@@ -557,27 +575,14 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             seg_map.insert(*pk, segments[i].clone());
         }
 
-        // Gather all needed data blob pkeys to batch-load
-        let mut data_need: HashSet<PhysicalKey> = HashSet::new();
-        for pk in per_seg.keys() {
-            let seg = seg_map.get(pk).unwrap();
-            data_need.insert(seg.data_physical_key);
-        }
-        let data_keys: Vec<PhysicalKey> = data_need.iter().copied().collect();
-        let data_blobs_slices: Vec<&[u8]> = self.pager.batch_get_raw(&data_keys);
-
-        let mut data_map: HashMap<PhysicalKey, &[u8]> = HashMap::with_capacity(data_keys.len());
-        for (i, pk) in data_keys.iter().enumerate() {
-            data_map.insert(*pk, data_blobs_slices[i]);
-        }
-
         // answer vector
         let mut out: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
 
         // For each segment: binary search the keys it owns; then slice from data blob
         for (seg_pk, qidxs) in per_seg {
             let seg = seg_map.get(&seg_pk).unwrap();
-            let data_blob = data_map.get(&seg.data_physical_key).unwrap();
+            let data_pk = *seg_to_data.get(&seg_pk).unwrap();
+            let data_blob = data_map.get(&data_pk).unwrap();
 
             for qi in qidxs {
                 let target = keys[qi].as_slice();
@@ -939,6 +944,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcode::{Decode, Encode};
     use std::collections::HashMap;
 
     // in-memory pager for tests

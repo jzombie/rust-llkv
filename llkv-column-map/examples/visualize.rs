@@ -29,11 +29,11 @@
 //!      - SVG:  `dot -Tsvg storage_layout.dot -o storage_layout.svg`
 
 use bitcode::{Decode, Encode};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use llkv_column_map::pager::Pager;
-use llkv_column_map::types::{LogicalFieldId, PhysicalKey};
+use llkv_column_map::types::PhysicalKey;
 use llkv_column_map::{AppendOptions, ColumnStore, Put, StorageKind, ValueMode};
 
 // ---------------- Tiny in-memory pager for the example ----------------
@@ -136,6 +136,7 @@ fn build_put_for_col3(start: usize, end: usize) -> Option<Put> {
 
 // ---------------- DOT rendering with batch coloring -------------------------
 
+// TODO: Migrate to lib?
 fn color_for_batch(b: usize) -> &'static str {
     match b {
         0 => "white", // bootstrap/manifest
@@ -147,6 +148,7 @@ fn color_for_batch(b: usize) -> &'static str {
     }
 }
 
+// TODO: Migrate to lib?
 fn render_one_colored_dot(
     store: &mut ColumnStore<'_, MemPager>,
     created_in_batch: &HashMap<PhysicalKey, usize>,
