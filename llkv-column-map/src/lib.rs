@@ -4,6 +4,22 @@ pub mod types;
 use types::{IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey};
 pub mod pager;
 
+// TODO: Refactor
+pub fn concat_keys_and_offsets(mut keys: Vec<Vec<u8>>) -> (Vec<u8>, Vec<u32>) {
+    // Ensure sorted by logical key bytes
+    keys.sort_unstable();
+    let mut bytes = Vec::new();
+    let mut offs = Vec::with_capacity(keys.len() + 1);
+    let mut acc = 0u32;
+    offs.push(acc);
+    for k in keys {
+        bytes.extend_from_slice(&k);
+        acc += k.len() as u32;
+        offs.push(acc);
+    }
+    (bytes, offs)
+}
+
 // ── Bootstrapping ────────────────────────────────────────────────────────────
 // Physical key 0 holds this tiny record so you can find the manifest.
 #[derive(Debug, Clone, Encode, Decode)]
@@ -73,6 +89,56 @@ pub struct IndexSegment {
     /// Redundant cached bounds for fast reject/prune.
     pub logical_key_min: LogicalKeyBytes,
     pub logical_key_max: LogicalKeyBytes,
+}
+
+impl IndexSegment {
+    pub fn build_fixed(
+        data_pkey: PhysicalKey,
+        logical_keys: Vec<LogicalKeyBytes>,
+        width: u32,
+    ) -> IndexSegment {
+        let n = logical_keys.len() as u32;
+        let (logical_key_bytes, logical_key_offsets) =
+            concat_keys_and_offsets(logical_keys.clone());
+        IndexSegment {
+            data_physical_key: data_pkey,
+            n_entries: n,
+            logical_key_bytes,
+            logical_key_offsets,
+            value_layout: ValueLayout::FixedWidth { width },
+            logical_key_min: logical_keys.first().cloned().unwrap_or_default(),
+            logical_key_max: logical_keys.last().cloned().unwrap_or_default(),
+        }
+    }
+
+    pub fn build_var(
+        data_pkey: PhysicalKey,
+        logical_keys: Vec<LogicalKeyBytes>,
+        value_sizes: &[u32], // one per entry
+    ) -> IndexSegment {
+        assert_eq!(logical_keys.len(), value_sizes.len());
+        let n = logical_keys.len() as u32;
+        let (logical_key_bytes, logical_key_offsets) =
+            concat_keys_and_offsets(logical_keys.clone());
+
+        let mut value_offsets = Vec::with_capacity(value_sizes.len() + 1);
+        let mut acc = 0u32;
+        value_offsets.push(acc);
+        for &sz in value_sizes {
+            acc += sz;
+            value_offsets.push(acc);
+        }
+
+        IndexSegment {
+            data_physical_key: data_pkey,
+            n_entries: n,
+            logical_key_bytes,
+            logical_key_offsets,
+            value_layout: ValueLayout::Variable { value_offsets },
+            logical_key_min: logical_keys.first().cloned().unwrap_or_default(),
+            logical_key_max: logical_keys.last().cloned().unwrap_or_default(),
+        }
+    }
 }
 
 /// Slicing recipe for values inside the *data* blob.
@@ -152,69 +218,6 @@ mod tests {
 
     // ---------------- helpers to build index segments ----------------
 
-    fn concat_keys_and_offsets(mut keys: Vec<Vec<u8>>) -> (Vec<u8>, Vec<u32>) {
-        // Ensure sorted by logical key bytes
-        keys.sort_unstable();
-        let mut bytes = Vec::new();
-        let mut offs = Vec::with_capacity(keys.len() + 1);
-        let mut acc = 0u32;
-        offs.push(acc);
-        for k in keys {
-            bytes.extend_from_slice(&k);
-            acc += k.len() as u32;
-            offs.push(acc);
-        }
-        (bytes, offs)
-    }
-
-    fn build_segment_fixed(
-        data_pkey: PhysicalKey,
-        logical_keys: Vec<Vec<u8>>,
-        width: u32,
-    ) -> IndexSegment {
-        let n = logical_keys.len() as u32;
-        let (logical_key_bytes, logical_key_offsets) =
-            concat_keys_and_offsets(logical_keys.clone());
-        IndexSegment {
-            data_physical_key: data_pkey,
-            n_entries: n,
-            logical_key_bytes,
-            logical_key_offsets,
-            value_layout: ValueLayout::FixedWidth { width },
-            logical_key_min: logical_keys.first().cloned().unwrap_or_default(),
-            logical_key_max: logical_keys.last().cloned().unwrap_or_default(),
-        }
-    }
-
-    fn build_segment_var(
-        data_pkey: PhysicalKey,
-        logical_keys: Vec<Vec<u8>>,
-        value_sizes: &[u32], // one per entry
-    ) -> IndexSegment {
-        assert_eq!(logical_keys.len(), value_sizes.len());
-        let n = logical_keys.len() as u32;
-        let (logical_key_bytes, logical_key_offsets) =
-            concat_keys_and_offsets(logical_keys.clone());
-
-        let mut value_offsets = Vec::with_capacity(value_sizes.len() + 1);
-        let mut acc = 0u32;
-        value_offsets.push(acc);
-        for &sz in value_sizes {
-            acc += sz;
-            value_offsets.push(acc);
-        }
-
-        IndexSegment {
-            data_physical_key: data_pkey,
-            n_entries: n,
-            logical_key_bytes,
-            logical_key_offsets,
-            value_layout: ValueLayout::Variable { value_offsets },
-            logical_key_min: logical_keys.first().cloned().unwrap_or_default(),
-            logical_key_max: logical_keys.last().cloned().unwrap_or_default(),
-        }
-    }
-
     fn slice_key<'a>(bytes: &'a [u8], offs: &'a [u32], i: usize) -> &'a [u8] {
         let a = offs[i] as usize;
         let b = offs[i + 1] as usize;
@@ -253,14 +256,14 @@ mod tests {
         let manifest_pkey = ids[6];
 
         // ----- build two segments for columns 100 and 200 -----
-        let seg_100 = build_segment_fixed(
+        let seg_100 = IndexSegment::build_fixed(
             data_100,
             vec![b"a".to_vec(), b"b".to_vec(), b"d".to_vec()],
             1,
         );
         let animals = vec![b"ant".to_vec(), b"wolf".to_vec(), b"zebra".to_vec()];
         let sizes: Vec<u32> = vec![5, 2, 8]; // arbitrary payload lengths
-        let seg_200 = build_segment_var(data_200, animals.clone(), &sizes);
+        let seg_200 = IndexSegment::build_var(data_200, animals.clone(), &sizes);
 
         // store index segments (batched)
         kv.batch_put_typed::<IndexSegment>(&[
@@ -404,13 +407,13 @@ mod tests {
 
         // One column with three sealed segments, newest-first.
         // Ranges: ["aa".."am"], ["b".."c"], ["wolf".."zebra"]
-        let seg_a = build_segment_fixed(
+        let seg_a = IndexSegment::build_fixed(
             data_a,
             vec![b"aa".to_vec(), b"al".to_vec(), b"am".to_vec()],
             4,
         );
-        let seg_b = build_segment_fixed(data_b, vec![b"b".to_vec(), b"c".to_vec()], 2);
-        let seg_c = build_segment_var(
+        let seg_b = IndexSegment::build_fixed(data_b, vec![b"b".to_vec(), b"c".to_vec()], 2);
+        let seg_c = IndexSegment::build_var(
             data_c,
             vec![b"wolf".to_vec(), b"yak".to_vec(), b"zebra".to_vec()],
             &[7, 3, 9],
@@ -488,7 +491,7 @@ mod tests {
         let data_key = 42;
 
         // Fixed width = 8 → ranges are [i*8 .. (i+1)*8)
-        let seg_fixed = build_segment_fixed(
+        let seg_fixed = IndexSegment::build_fixed(
             data_key,
             vec![
                 b"k1".to_vec(),
@@ -511,7 +514,7 @@ mod tests {
         }
 
         // Variable layout: explicit prefix sums
-        let seg_var = build_segment_var(
+        let seg_var = IndexSegment::build_var(
             data_key,
             vec![b"a".to_vec(), b"aa".to_vec(), b"aaa".to_vec()],
             &[3, 1, 9],
