@@ -1,7 +1,8 @@
 // High-level append/query API on top of pager + index modules.
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::min;
-use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::Entry;
 
 pub mod index;
 pub mod pager;
@@ -157,7 +158,7 @@ pub struct ColumnStore<'p, P: Pager> {
     manifest_key: PhysicalKey,
     manifest: Manifest,
     // field_id -> (column_index_pkey, decoded)
-    colindex_cache: HashMap<LogicalFieldId, (PhysicalKey, ColumnIndex)>,
+    colindex_cache: FxHashMap<LogicalFieldId, (PhysicalKey, ColumnIndex)>,
     // pager-hit metrics (counts only)
     io_stats: IoStats,
 }
@@ -223,7 +224,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             bootstrap_key,
             manifest_key,
             manifest,
-            colindex_cache: HashMap::new(),
+            colindex_cache: FxHashMap::with_hasher(Default::default()),
             io_stats: IoStats::default(),
         }
     }
@@ -270,7 +271,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             bootstrap_key,
             manifest_key,
             manifest,
-            colindex_cache: HashMap::new(),
+            colindex_cache: FxHashMap::with_hasher(Default::default()),
             io_stats: IoStats::default(),
         }
     }
@@ -306,8 +307,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
             if opts.last_write_wins_in_batch {
                 // last wins: overwrite by key
-                let mut last: HashMap<LogicalKeyBytes, Vec<u8>> =
-                    HashMap::with_capacity(items.len());
+                let mut last: FxHashMap<LogicalKeyBytes, Vec<u8>> =
+                    FxHashMap::with_capacity_and_hasher(items.len(), Default::default());
                 for (k, v) in items {
                     last.insert(k, v);
                 }
@@ -415,9 +416,11 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
         // Prepare map: field_id -> (col_index_pkey, ColumnIndex)
         let mut need_manifest_update = false;
-        let mut ensure_column_loaded: HashSet<LogicalFieldId> = HashSet::new();
+        let mut ensure_column_loaded: FxHashSet<LogicalFieldId> =
+            FxHashSet::with_hasher(Default::default());
         // NEW: track which ColumnIndex pkeys were actually modified this call.
-        let mut touched_colindex_pkeys: HashSet<PhysicalKey> = HashSet::new();
+        let mut touched_colindex_pkeys: FxHashSet<PhysicalKey> =
+            FxHashSet::with_hasher(Default::default());
 
         // Bring column indexes we will touch into cache (batch-read where possible)
         for chunk in &planned_chunks {
@@ -582,8 +585,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             // Assert we're using storage efficiently
             #[cfg(debug_assertions)]
             {
-                use std::collections::HashSet;
-                let mut seen = HashSet::new();
+                let mut seen = FxHashSet::with_hasher(Default::default());
                 for p in &puts_batch {
                     let k = match p {
                         BatchPut::Raw { key, .. } => *key,
@@ -618,8 +620,6 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         &'s mut self,
         items: Vec<(LogicalFieldId, Vec<LogicalKeyBytes>)>,
     ) -> Vec<Vec<Option<&'s [u8]>>> {
-        use std::collections::hash_map::Entry;
-
         if items.is_empty() {
             return Vec::new();
         }
@@ -629,7 +629,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             items.iter().map(|(_, ks)| vec![None; ks.len()]).collect();
 
         // -------- ensure ColumnIndex in cache for all referenced fields --------
-        let mut need_fids: HashSet<LogicalFieldId> = HashSet::new();
+        let mut need_fids: FxHashSet<LogicalFieldId> = FxHashSet::with_hasher(Default::default());
         for (fid, _) in &items {
             need_fids.insert(*fid);
         }
@@ -671,7 +671,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         }
 
         // -------- routing: segment -> (data_pk, [(item_i, key_j), ...]) --------
-        let mut per_seg: HashMap<PhysicalKey, (PhysicalKey, Vec<(usize, usize)>)> = HashMap::new();
+        let mut per_seg: FxHashMap<PhysicalKey, (PhysicalKey, Vec<(usize, usize)>)> =
+            FxHashMap::with_hasher(Default::default());
 
         for (qi, (fid, keys)) in items.iter().enumerate() {
             let col_index = match self.colindex_cache.get(fid) {
@@ -717,7 +718,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
         // 2) raw load of all needed data blobs (dedup)
         let mut data_keys: Vec<PhysicalKey> = Vec::with_capacity(per_seg.len());
-        let mut seen_data: HashSet<PhysicalKey> = HashSet::new();
+        let mut seen_data: FxHashSet<PhysicalKey> = FxHashSet::with_hasher(Default::default());
         for v in per_seg.values() {
             let data_pk = v.0;
             if seen_data.insert(data_pk) {
@@ -731,9 +732,10 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         let resp = self.do_batch(BatchRequest { puts: vec![], gets });
 
         // Partition response into typed segments and raw data slices.
-        let mut seg_map: HashMap<PhysicalKey, IndexSegment> =
-            HashMap::with_capacity(seg_keys.len());
-        let mut data_map: HashMap<PhysicalKey, &'s [u8]> = HashMap::with_capacity(data_keys.len());
+        let mut seg_map: FxHashMap<PhysicalKey, IndexSegment> =
+            FxHashMap::with_capacity_and_hasher(seg_keys.len(), Default::default());
+        let mut data_map: FxHashMap<PhysicalKey, &'s [u8]> =
+            FxHashMap::with_capacity_and_hasher(data_keys.len(), Default::default());
 
         for gr in resp.get_results {
             match gr {
@@ -806,7 +808,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             .collect::<Vec<_>>();
         let resp = self.do_batch(BatchRequest { puts: vec![], gets });
 
-        let mut raw_len_map: HashMap<PhysicalKey, usize> = HashMap::new();
+        let mut raw_len_map: FxHashMap<PhysicalKey, usize> =
+            FxHashMap::with_hasher(Default::default());
         for gr in resp.get_results {
             if let GetResult::Raw { key, bytes } = gr {
                 raw_len_map.insert(key, bytes.len());
@@ -837,10 +840,11 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             .collect();
 
         let mut colindex_nodes: Vec<StorageNode> = Vec::new();
-        let mut field_for_colindex: HashMap<PhysicalKey, LogicalFieldId> = HashMap::new();
+        let mut field_for_colindex: FxHashMap<PhysicalKey, LogicalFieldId> =
+            FxHashMap::with_hasher(Default::default());
         let mut all_seg_index_pks: Vec<PhysicalKey> = Vec::new();
-        let mut seg_owner_colindex: HashMap<PhysicalKey, (LogicalFieldId, PhysicalKey)> =
-            HashMap::new();
+        let mut seg_owner_colindex: FxHashMap<PhysicalKey, (LogicalFieldId, PhysicalKey)> =
+            FxHashMap::with_hasher(Default::default());
 
         if !col_index_pks.is_empty() {
             // Combined batch: raw + typed for each ColumnIndex key
@@ -854,8 +858,10 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             }
             let resp = self.do_batch(BatchRequest { puts: vec![], gets });
 
-            let mut colindex_raw_len: HashMap<PhysicalKey, usize> = HashMap::new();
-            let mut colindices_by_pk: HashMap<PhysicalKey, ColumnIndex> = HashMap::new();
+            let mut colindex_raw_len: FxHashMap<PhysicalKey, usize> =
+                FxHashMap::with_hasher(Default::default());
+            let mut colindices_by_pk: FxHashMap<PhysicalKey, ColumnIndex> =
+                FxHashMap::with_hasher(Default::default());
 
             for gr in resp.get_results {
                 match gr {
@@ -897,7 +903,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
         // --- index segments (typed + raw) and discover data pkeys
         let mut data_pkeys: Vec<PhysicalKey> = Vec::new();
-        let mut owner_for_data: HashMap<PhysicalKey, PhysicalKey> = HashMap::new(); // data_pkey -> index_segment_pk
+        let mut owner_for_data: FxHashMap<PhysicalKey, PhysicalKey> =
+            FxHashMap::with_hasher(Default::default()); // data_pkey -> index_segment_pk
         let mut seg_nodes: Vec<StorageNode> = Vec::new();
 
         if !all_seg_index_pks.is_empty() {
@@ -912,8 +919,10 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             }
             let resp = self.do_batch(BatchRequest { puts: vec![], gets });
 
-            let mut seg_raw_len: HashMap<PhysicalKey, usize> = HashMap::new();
-            let mut segs_by_pk: HashMap<PhysicalKey, IndexSegment> = HashMap::new();
+            let mut seg_raw_len: FxHashMap<PhysicalKey, usize> =
+                FxHashMap::with_hasher(Default::default());
+            let mut segs_by_pk: FxHashMap<PhysicalKey, IndexSegment> =
+                FxHashMap::with_hasher(Default::default());
 
             for gr in resp.get_results {
                 match gr {
@@ -991,7 +1000,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 .collect::<Vec<_>>();
             let resp = self.do_batch(BatchRequest { puts: vec![], gets });
 
-            let mut data_len: HashMap<PhysicalKey, usize> = HashMap::new();
+            let mut data_len: FxHashMap<PhysicalKey, usize> =
+                FxHashMap::with_hasher(Default::default());
             for gr in resp.get_results {
                 if let GetResult::Raw { key, bytes } = gr {
                     data_len.insert(key, bytes.len());
@@ -1112,7 +1122,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         let nodes = self.describe_storage();
 
         // index nodes by pk for quick lookup
-        let mut map: HashMap<PhysicalKey, &StorageNode> = HashMap::new();
+        let mut map: FxHashMap<PhysicalKey, &StorageNode> =
+            FxHashMap::with_hasher(Default::default());
         for n in &nodes {
             map.insert(n.pk, n);
         }

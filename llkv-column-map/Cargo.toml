@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 bitcode = "0.6.7"
+rustc-hash.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
