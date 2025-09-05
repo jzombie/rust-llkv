@@ -4,4 +4,4 @@
 - Logical keys namespaced per field.
 - Supports variable and fixed width keys.
 - Supports variable and fixed width values.
-
+- Logical key and value segment pruning.
