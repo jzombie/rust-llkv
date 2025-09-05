@@ -482,6 +482,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
     // ----------------------------- read API -----------------------------
 
+    // TODO: Make zero-copy
     // Batched point lookup: values for a single column and a list of logical keys.
     // Returns values in the same order as requested (None if missing).
     pub fn get_in_column(
