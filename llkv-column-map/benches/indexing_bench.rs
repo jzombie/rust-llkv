@@ -23,9 +23,9 @@
 //!
 //! **What it measures**  
 //! - Overhead of creating large numbers of small typed objects (`IndexSegment`, `ColumnIndex`,
-//!   `Manifest`, `Bootstrap`) and shuttling them through the **unified pager batch**.
+//!   `Manifest`, `Bootstrap`) and shuttling them through the **batched puts** path.
 //! - Effectiveness of batching: we minimize round-trips by staging puts into a single
-//!   `BatchRequest` per chunk (and once more at the end for `Manifest` + `Bootstrap`).
+//!   batch call per chunk (and once more at the end for `Manifest` + `Bootstrap`).
 //!
 //! **Why fixed-width + one segment per column?**  
 //! - Keeps the test simple and deterministic (no variable-width offset building).
@@ -34,7 +34,7 @@
 //! **Knobs to tweak**  
 //! - `columns`: increase to stress the manifest and the volume of typed puts.
 //! - `entries_per_col`: increases `logical_key_bytes` and offsets size per segment.
-//! - `chunk_cols`: trade off peak memory vs. number of unified batches.
+//! - `chunk_cols`: trade off peak memory vs. number of batched calls.
 //! - `value_width`: impacts how large each data blob *would* be (opaque here).
 //!
 //! **Interpreting results**  
@@ -51,7 +51,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use llkv_column_map::index::{
     Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, Manifest,
 };
-use llkv_column_map::pager::{BatchPut, BatchRequest, MemPager, Pager, TypedValue};
+use llkv_column_map::pager::{BatchPut, MemPager, Pager, TypedValue};
 use llkv_column_map::types::{LogicalFieldId, LogicalKeyBytes, PhysicalKey};
 use std::hint::black_box;
 
@@ -77,7 +77,7 @@ fn build_many_columns_fixed_width(
     let mut pager = MemPager::default();
 
     // Manifest gets its own physical key up front.
-    let manifest_pkey = pager.alloc_many(1)[0];
+    let manifest_pkey = pager.alloc_many(1).unwrap()[0];
 
     // We collect the manifest entries as we go; writing it once at the end.
     let mut manifest_entries: Vec<ColumnEntry> = Vec::with_capacity(columns);
@@ -91,7 +91,7 @@ fn build_many_columns_fixed_width(
 
         // For each column in this batch we need:
         //   data_pkey, index_segment_pkey, column_index_pkey  → 3 keys/column
-        let ids = pager.alloc_many(batch * 3);
+        let ids = pager.alloc_many(batch * 3).unwrap();
 
         // Stage typed writes in two homogenous batches:
         //   1) IndexSegment
@@ -135,7 +135,7 @@ fn build_many_columns_fixed_width(
             next_field_id = next_field_id.wrapping_add(1);
         }
 
-        // Persist the two homogenous batches in ONE unified batch call.
+        // Persist the two homogenous groups in ONE batched put call.
         let mut puts: Vec<BatchPut> = Vec::with_capacity(seg_puts.len() + colidx_puts.len());
         for (k, seg) in seg_puts {
             puts.push(BatchPut::Typed {
@@ -149,29 +149,27 @@ fn build_many_columns_fixed_width(
                 value: TypedValue::ColumnIndex(colidx),
             });
         }
-        let _ = pager.batch(&BatchRequest { puts, gets: vec![] });
+        pager.batch_put(&puts).unwrap();
 
         remaining -= batch;
     }
 
-    // Write Manifest and Bootstrap (key 0) in a single batch.
-    let _ = pager.batch(&BatchRequest {
-        puts: vec![
-            BatchPut::Typed {
-                key: manifest_pkey,
-                value: TypedValue::Manifest(Manifest {
-                    columns: manifest_entries,
-                }),
-            },
-            BatchPut::Typed {
-                key: BOOTSTRAP_PKEY,
-                value: TypedValue::Bootstrap(Bootstrap {
-                    manifest_physical_key: manifest_pkey,
-                }),
-            },
-        ],
-        gets: vec![],
-    });
+    // Write Manifest and Bootstrap (key 0) in a single batched put.
+    let final_puts = vec![
+        BatchPut::Typed {
+            key: manifest_pkey,
+            value: TypedValue::Manifest(Manifest {
+                columns: manifest_entries,
+            }),
+        },
+        BatchPut::Typed {
+            key: BOOTSTRAP_PKEY,
+            value: TypedValue::Bootstrap(Bootstrap {
+                manifest_physical_key: manifest_pkey,
+            }),
+        },
+    ];
+    pager.batch_put(&final_puts).unwrap();
 
     // Keep side-effects alive for the optimizer.
     black_box(manifest_pkey);

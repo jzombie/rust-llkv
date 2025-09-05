@@ -1,4 +1,8 @@
+use std::io;
+use std::sync::Arc;
+
 use crate::types::PhysicalKey;
+
 pub mod mem_pager;
 pub use mem_pager::*;
 
@@ -48,37 +52,29 @@ pub enum BatchGet {
     Typed { key: PhysicalKey, kind: TypedKind },
 }
 
-/// Request for one unified batch. Semantics: all `puts` are applied
-/// before any `gets` in the same batch.
-#[derive(Clone, Debug, Default)]
-pub struct BatchRequest {
-    pub puts: Vec<BatchPut>,
-    pub gets: Vec<BatchGet>,
-}
-
-/// Result for a single get.
+/// Result for a single get. Raw returns an owned buffer (Arc slice) so callers
+/// can use `&self` and share across threads without tying lifetimes to the pager.
 #[derive(Debug)]
-pub enum GetResult<'a> {
-    Raw { key: PhysicalKey, bytes: &'a [u8] },
+pub enum GetResult {
+    Raw { key: PhysicalKey, bytes: Arc<[u8]> },
     Typed { key: PhysicalKey, value: TypedValue },
     Missing { key: PhysicalKey },
 }
 
-/// Response for a batch. `get_results` aligns with `req.gets` order.
-#[derive(Debug)]
-pub struct BatchResponse<'a> {
-    pub get_results: Vec<GetResult<'a>>,
-}
-
-/// Unified pager. `batch` performs raw+typed puts/gets in one roundtrip.
-/// Lifetimes of `Raw` get slices are tied to `&'a self`.
+/// Unified pager interface with separate put/get passes.
+/// - `batch_put` applies all writes atomically w.r.t. this pager.
+/// - `batch_get` serves a mixed list of typed/raw reads in one round-trip.
+/// Returning owned buffers allows `&self` for reads (good for RwLock read guards).
 pub trait Pager {
     /// Key allocation can remain separate; typically needed ahead of
     /// a write batch.
-    fn alloc_many(&mut self, n: usize) -> Vec<PhysicalKey>;
+    fn alloc_many(&self, n: usize) -> io::Result<Vec<PhysicalKey>>;
 
-    /// Apply all puts, then serve all gets, in one batch.
-    fn batch<'a>(&'a mut self, req: &BatchRequest) -> BatchResponse<'a>;
+    /// Apply all puts in one batch.
+    fn batch_put(&self, puts: &[BatchPut]) -> io::Result<()>;
+
+    /// Serve all gets (raw + typed) in one batch.
+    fn batch_get(&self, gets: &[BatchGet]) -> io::Result<Vec<GetResult>>;
 }
 
 // =================== Encoding helpers (typed) ======================
@@ -92,22 +88,28 @@ pub fn encode_typed(v: &TypedValue) -> Vec<u8> {
     }
 }
 
-pub fn decode_typed(kind: TypedKind, bytes: &[u8]) -> Result<TypedValue, ()> {
+pub fn decode_typed(kind: TypedKind, bytes: &[u8]) -> io::Result<TypedValue> {
+    use std::io::{Error, ErrorKind};
+
     match kind {
         TypedKind::Bootstrap => {
-            let v: crate::index::Bootstrap = bitcode::decode(bytes).map_err(|_| ())?;
+            let v: crate::index::Bootstrap =
+                bitcode::decode(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
             Ok(TypedValue::Bootstrap(v))
         }
         TypedKind::Manifest => {
-            let v: crate::index::Manifest = bitcode::decode(bytes).map_err(|_| ())?;
+            let v: crate::index::Manifest =
+                bitcode::decode(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
             Ok(TypedValue::Manifest(v))
         }
         TypedKind::ColumnIndex => {
-            let v: crate::index::ColumnIndex = bitcode::decode(bytes).map_err(|_| ())?;
+            let v: crate::index::ColumnIndex =
+                bitcode::decode(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
             Ok(TypedValue::ColumnIndex(v))
         }
         TypedKind::IndexSegment => {
-            let v: crate::index::IndexSegment = bitcode::decode(bytes).map_err(|_| ())?;
+            let v: crate::index::IndexSegment =
+                bitcode::decode(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
             Ok(TypedValue::IndexSegment(v))
         }
     }

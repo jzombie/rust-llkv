@@ -1,75 +1,111 @@
-use super::{
-    BatchGet, BatchPut, BatchRequest, BatchResponse, GetResult, Pager, decode_typed, encode_typed,
-};
-use crate::types::PhysicalKey;
+use super::*;
 use rustc_hash::FxHashMap;
+use std::io::{self, Error, ErrorKind};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 
-/// Minimal in-memory pager showing how to implement the unified API.
+/// In-memory pager used for tests/benchmarks.
+/// Thread-safe:
+/// - key allocation uses an AtomicU64
+/// - blob storage is protected by an RwLock
+#[allow(clippy::module_name_repetitions)]
 pub struct MemPager {
-    map: FxHashMap<PhysicalKey, Vec<u8>>,
-    next: PhysicalKey,
+    /// Next physical key to hand out. We reserve 0 for bootstrap.
+    next_key: AtomicU64,
+    // PhysicalKey -> Arc<[u8]>
+    blobs: RwLock<FxHashMap<PhysicalKey, Arc<[u8]>>>,
 }
 
 impl Default for MemPager {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MemPager {
+    pub fn new() -> Self {
         Self {
-            map: FxHashMap::with_hasher(Default::default()),
-            next: 1, // reserve 0 for bootstrap
+            next_key: AtomicU64::new(1), // reserve 0 for bootstrap
+            blobs: RwLock::new(FxHashMap::default()),
         }
     }
 }
 
 impl Pager for MemPager {
-    fn alloc_many(&mut self, n: usize) -> Vec<PhysicalKey> {
-        let start = self.next;
-        self.next += n as u64;
-        (0..n).map(|i| start + i as u64).collect()
+    fn alloc_many(&self, n: usize) -> io::Result<Vec<PhysicalKey>> {
+        // Simple monotonic allocator (thread-safe).
+        // We use fetch_update to check overflow and advance atomically.
+        let n_u64 = n as u64;
+        let start = self
+            .next_key
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                cur.checked_add(n_u64)
+            })
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::Other,
+                    "physical key space overflow in MemPager::alloc_many",
+                )
+            })?;
+        let end = start + n_u64;
+        Ok((start..end).collect())
     }
 
-    fn batch<'a>(&'a mut self, req: &BatchRequest) -> BatchResponse<'a> {
-        // 1) Apply puts
-        for p in &req.puts {
+    fn batch_put(&self, puts: &[BatchPut]) -> io::Result<()> {
+        // Single write lock for the whole batch so it’s atomic w.r.t. readers.
+        let mut map = self
+            .blobs
+            .write()
+            .expect("MemPager blobs write lock poisoned");
+        for p in puts {
             match p {
                 BatchPut::Raw { key, bytes } => {
-                    self.map.insert(*key, bytes.clone());
+                    // Store as Arc<[u8]> so readers can share without copying.
+                    // We must clone here because `puts` only gives us &Vec<u8>.
+                    map.insert(*key, Arc::from(bytes.clone()));
                 }
                 BatchPut::Typed { key, value } => {
-                    let enc = encode_typed(value);
-                    self.map.insert(*key, enc);
+                    let enc = encode_typed(value); // Vec<u8>
+                    map.insert(*key, Arc::from(enc.into_boxed_slice()));
                 }
             }
         }
+        Ok(())
+    }
 
-        // 2) Serve gets
-        let mut out: Vec<GetResult<'a>> = Vec::with_capacity(req.gets.len());
-        for g in &req.gets {
-            match g {
+    fn batch_get(&self, gets: &[BatchGet]) -> io::Result<Vec<GetResult>> {
+        // Single read lock for the entire batch; multiple readers can proceed concurrently.
+        let map = self
+            .blobs
+            .read()
+            .expect("MemPager blobs read lock poisoned");
+
+        let mut out = Vec::with_capacity(gets.len());
+        for g in gets {
+            match *g {
                 BatchGet::Raw { key } => {
-                    if let Some(v) = self.map.get(key) {
+                    if let Some(b) = map.get(&key) {
                         out.push(GetResult::Raw {
-                            key: *key,
-                            bytes: v.as_slice(),
+                            key,
+                            bytes: Arc::clone(b),
                         });
                     } else {
-                        out.push(GetResult::Missing { key: *key });
+                        out.push(GetResult::Missing { key });
                     }
                 }
                 BatchGet::Typed { key, kind } => {
-                    if let Some(v) = self.map.get(key) {
-                        match decode_typed(*kind, v.as_slice()) {
-                            Ok(tv) => out.push(GetResult::Typed {
-                                key: *key,
-                                value: tv,
-                            }),
-                            Err(_) => out.push(GetResult::Missing { key: *key }),
-                        }
+                    if let Some(b) = map.get(&key) {
+                        // Arc<[u8]> derefs to [u8], so &b[..] is a &[u8]
+                        let tv = decode_typed(kind, &b[..])?;
+                        out.push(GetResult::Typed { key, value: tv });
                     } else {
-                        out.push(GetResult::Missing { key: *key });
+                        out.push(GetResult::Missing { key });
                     }
                 }
             }
         }
-
-        BatchResponse { get_results: out }
+        Ok(out)
     }
 }

@@ -107,7 +107,7 @@ fn color_for_batch(b: usize) -> &'static str {
 
 // TODO: Migrate to lib?
 fn render_one_colored_dot(
-    store: &mut ColumnStore<'_, MemPager>,
+    store: &ColumnStore<'_, MemPager>,
     created_in_batch: &HashMap<PhysicalKey, usize>,
 ) -> String {
     use std::fmt::Write;
@@ -234,8 +234,8 @@ fn render_one_colored_dot(
 // ---------------- Main: multi-batch ingest then ONE colored DOT -------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut pager = MemPager::default();
-    let mut store = ColumnStore::init_empty(&mut pager);
+    let pager = MemPager::default();
+    let store = ColumnStore::init_empty(&pager);
 
     // record creation batch for each physical key we ever see
     // batch 0 = pre-existing (bootstrap, manifest)
@@ -289,7 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("Total ingest time: {:?}", t_total.elapsed());
 
-    // simple probes (now using zero-copy get_many)
+    // simple probes (get_many returns Arc<[u8]> values)
     let got1 = store.get_many(vec![(
         1,
         vec![b"id:000010".to_vec(), b"id:009999".to_vec()],
@@ -301,19 +301,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         2,
         vec![b"id:000000".to_vec(), b"id:000100".to_vec()],
     )]);
-    println!("col=2 id:000000 len={:?}", got2[0][0].map(|v| v.len()));
-    println!("col=2 id:000100 len={:?}", got2[0][1].map(|v| v.len()));
+    println!(
+        "col=2 id:000000 len={:?}",
+        got2[0][0].as_deref().map(|v| v.len())
+    );
+    println!(
+        "col=2 id:000100 len={:?}",
+        got2[0][1].as_deref().map(|v| v.len())
+    );
 
     let got3 = store.get_many(vec![(3, vec![b"k000100".to_vec(), b"k004999".to_vec()])]);
-    println!("col=3 k000100 -> len={:?}", got3[0][0].map(|v| v.len()));
-    println!("col=3 k004999 -> len={:?}", got3[0][1].map(|v| v.len()));
+    println!(
+        "col=3 k000100 -> len={:?}",
+        got3[0][0].as_deref().map(|v| v.len())
+    );
+    println!(
+        "col=3 k004999 -> len={:?}",
+        got3[0][1].as_deref().map(|v| v.len())
+    );
 
     // ASCII summary of final layout
     let ascii = store.render_storage_ascii();
     println!("\n==== STORAGE ASCII ====\n{}", ascii);
 
     // ONE final DOT with batch-colored nodes
-    let dot = render_one_colored_dot(&mut store, &created_in_batch);
+    let dot = render_one_colored_dot(&store, &created_in_batch);
     std::fs::write("storage_layout.dot", dot)?;
     println!("Wrote storage_layout.dot (single graph, nodes colored by batch)");
 
