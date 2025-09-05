@@ -1430,4 +1430,97 @@ mod tests {
         assert_eq!(got[0][1].as_deref().unwrap(), &[2u8; 4]);
         assert!(got[0][2].is_none());
     }
+    #[test]
+    fn last_write_wins_true_dedups_within_batch() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+
+        // Three items, with a duplicate for key "k": last is "ZZ".
+        let fid = 42;
+        let put = Put {
+            field_id: fid,
+            items: vec![
+                (b"k".to_vec(), b"AA".to_vec()),
+                (b"x".to_vec(), b"BB".to_vec()),
+                (b"k".to_vec(), b"ZZ".to_vec()),
+            ],
+        };
+
+        let mut opts = AppendOptions::default();
+        opts.mode = ValueMode::ForceFixed(2); // keep sizes simple
+        opts.segment_max_entries = 1024; // ensure a single segment
+        opts.last_write_wins_in_batch = true; // <- dedup ON
+
+        store.append_many(vec![put], opts);
+
+        // Read back the two keys we wrote; "k" should be the LAST value ("ZZ").
+        let got = store.get_many(vec![(fid, vec![b"k".to_vec(), b"x".to_vec()])]);
+        assert_eq!(got[0][0].as_deref().unwrap(), b"ZZ");
+        assert_eq!(got[0][1].as_deref().unwrap(), b"BB");
+
+        // Verify the segment entry count reflects deduplication (2 items).
+        let total_entries_for_fid: usize = store
+            .describe_storage()
+            .into_iter()
+            .map(|n| match n.kind {
+                StorageKind::IndexSegment {
+                    field_id,
+                    n_entries,
+                    ..
+                } if field_id == fid => n_entries as usize,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(total_entries_for_fid, 2);
+    }
+
+    #[test]
+    fn last_write_wins_false_keeps_dups_within_batch() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+
+        // Same three items; duplicates for "k" are KEPT.
+        let fid = 43;
+        let put = Put {
+            field_id: fid,
+            items: vec![
+                (b"k".to_vec(), b"AA".to_vec()),
+                (b"x".to_vec(), b"BB".to_vec()),
+                (b"k".to_vec(), b"ZZ".to_vec()),
+            ],
+        };
+
+        let mut opts = AppendOptions::default();
+        opts.mode = ValueMode::ForceFixed(2);
+        opts.segment_max_entries = 1024; // keep to a single segment
+        opts.last_write_wins_in_batch = false; // <- dedup OFF
+
+        store.append_many(vec![put], opts);
+
+        // Reads for "k" will return one of the duplicate values.
+        // (Order among equal keys after sort is not guaranteed.)
+        let got = store.get_many(vec![(fid, vec![b"k".to_vec(), b"x".to_vec()])]);
+        let v_k = got[0][0].as_deref().unwrap();
+        assert!(
+            v_k == b"AA" || v_k == b"ZZ",
+            "expected one of the duplicate values, got {:?}",
+            v_k
+        );
+        assert_eq!(got[0][1].as_deref().unwrap(), b"BB");
+
+        // Verify the segment entry count reflects the duplicates (3 items).
+        let total_entries_for_fid: usize = store
+            .describe_storage()
+            .into_iter()
+            .map(|n| match n.kind {
+                StorageKind::IndexSegment {
+                    field_id,
+                    n_entries,
+                    ..
+                } if field_id == fid => n_entries as usize,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(total_entries_for_fid, 3);
+    }
 }
