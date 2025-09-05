@@ -18,6 +18,55 @@ pub fn concat_keys_and_offsets(mut keys: Vec<Vec<u8>>) -> (Vec<u8>, Vec<u32>) {
     (bytes, offs)
 }
 
+// Helper: pack keys choosing the most space-efficient representation.
+// - If all keys have the same non-zero length -> FixedWidth { width }
+// - Otherwise -> Variable { key_offsets } (like the old format)
+fn pack_keys_with_layout(
+    mut keys: Vec<Vec<u8>>,
+) -> (Vec<u8>, KeyLayout, LogicalKeyBytes, LogicalKeyBytes) {
+    keys.sort_unstable();
+    let n = keys.len();
+
+    // Compute fixed width if possible
+    let fixed_w_opt = if n == 0 {
+        Some(0usize)
+    } else {
+        let w = keys[0].len();
+        if w > 0 && keys.iter().all(|k| k.len() == w) {
+            Some(w)
+        } else {
+            None
+        }
+    };
+
+    match fixed_w_opt {
+        Some(w) => {
+            // Concatenate in order; no per-key offsets needed.
+            let mut bytes = Vec::with_capacity(n * w);
+            for k in &keys {
+                bytes.extend_from_slice(k);
+            }
+            let min = keys.first().cloned().unwrap_or_default();
+            let max = keys.last().cloned().unwrap_or_default();
+            (bytes, KeyLayout::FixedWidth { width: w as u32 }, min, max)
+        }
+        None => {
+            // Use the legacy "bytes + offsets" representation.
+            let (bytes, offs) = concat_keys_and_offsets(keys.clone());
+            let min = keys.first().cloned().unwrap_or_default();
+            let max = keys.last().cloned().unwrap_or_default();
+            (
+                bytes,
+                KeyLayout::Variable {
+                    key_offsets: offs.into_iter().map(|v| v as IndexEntryCount).collect(),
+                },
+                min,
+                max,
+            )
+        }
+    }
+}
+
 // ── Bootstrapping ────────────────────────────────────────────────────────────
 // Physical key 0 holds this tiny record so you can find the manifest.
 #[derive(Debug, Clone, Encode, Decode)]
@@ -61,26 +110,36 @@ pub struct IndexSegmentRef {
     pub n_entries: IndexEntryCount,
 }
 
+// ── Logical key layout (how to slice logical_key_bytes) ──────────────────────
+#[derive(Debug, Clone, Encode, Decode)]
+pub enum KeyLayout {
+    /// Every *logical key* is exactly `width` bytes → slice i is [i*w .. (i+1)*w).
+    FixedWidth { width: u32 },
+
+    /// Variable width logical keys. Prefix sum of key byte offsets:
+    /// key_i is [key_offsets[i], key_offsets[i+1]).
+    Variable { key_offsets: Vec<IndexEntryCount> }, // len = n_entries + 1
+}
+
 // ── Your locked index segment & value layout ─────────────────────────────────
 /// One sealed batch. Describes how to fetch values from the *data* blob.
 /// The *data* blob contains only raw value bytes — no headers/markers.
 ///
 /// This index stores:
 ///   - the *physical* key of the data blob,
-///   - the *logical* keys (sorted, contiguous+offsets),
+///   - the *logical* keys (sorted, compact; either fixed-width or with offsets),
 ///   - the value layout (fixed width or var-width offsets).
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct IndexSegment {
     /// Where the values live (physical KV key).
     pub data_physical_key: PhysicalKey,
 
-    /// Number of entries (also equal to logical_key_offsets.len()-1).
+    /// Number of entries.
     pub n_entries: IndexEntryCount,
 
-    /// Sorted *logical* keys, stored compactly:
-    /// `logical_key_bytes[logical_key_offsets[i]..logical_key_offsets[i+1])`
+    /// Sorted *logical* keys, stored compactly (see `key_layout`).
     pub logical_key_bytes: Vec<u8>,
-    pub logical_key_offsets: Vec<IndexEntryCount>, // len = n_entries + 1
+    pub key_layout: KeyLayout,
 
     /// How to slice the *data* blob for the i-th value.
     pub value_layout: ValueLayout,
@@ -97,16 +156,16 @@ impl IndexSegment {
         width: u32,
     ) -> IndexSegment {
         let n = logical_keys.len() as IndexEntryCount;
-        let (logical_key_bytes, logical_key_offsets) =
-            concat_keys_and_offsets(logical_keys.clone());
+        let (logical_key_bytes, key_layout, logical_key_min, logical_key_max) =
+            pack_keys_with_layout(logical_keys);
         IndexSegment {
             data_physical_key: data_pkey,
             n_entries: n,
             logical_key_bytes,
-            logical_key_offsets,
+            key_layout,
             value_layout: ValueLayout::FixedWidth { width },
-            logical_key_min: logical_keys.first().cloned().unwrap_or_default(),
-            logical_key_max: logical_keys.last().cloned().unwrap_or_default(),
+            logical_key_min,
+            logical_key_max,
         }
     }
 
@@ -117,8 +176,8 @@ impl IndexSegment {
     ) -> IndexSegment {
         assert_eq!(logical_keys.len(), value_sizes.len());
         let n = logical_keys.len() as IndexEntryCount;
-        let (logical_key_bytes, logical_key_offsets) =
-            concat_keys_and_offsets(logical_keys.clone());
+        let (logical_key_bytes, key_layout, logical_key_min, logical_key_max) =
+            pack_keys_with_layout(logical_keys);
 
         let mut value_offsets = Vec::with_capacity(value_sizes.len() + 1);
         let mut acc = 0u32;
@@ -132,10 +191,15 @@ impl IndexSegment {
             data_physical_key: data_pkey,
             n_entries: n,
             logical_key_bytes,
-            logical_key_offsets,
-            value_layout: ValueLayout::Variable { value_offsets },
-            logical_key_min: logical_keys.first().cloned().unwrap_or_default(),
-            logical_key_max: logical_keys.last().cloned().unwrap_or_default(),
+            key_layout,
+            value_layout: ValueLayout::Variable {
+                value_offsets: value_offsets
+                    .into_iter()
+                    .map(|v| v as IndexEntryCount)
+                    .collect(),
+            },
+            logical_key_min,
+            logical_key_max,
         }
     }
 }
@@ -148,7 +212,7 @@ pub enum ValueLayout {
 
     /// Variable width values. Prefix sum of byte offsets into data blob.
     /// Slice i is [value_offsets[i], value_offsets[i+1]).
-    Variable { value_offsets: Vec<u32> }, // len = n_entries + 1
+    Variable { value_offsets: Vec<IndexEntryCount> }, // len = n_entries + 1
 }
 
 #[cfg(test)]
@@ -156,19 +220,26 @@ mod tests {
     use super::*;
     use crate::pager::{
         BatchGet, BatchPut, BatchRequest, GetResult, MemPager, Pager, TypedKind, TypedValue,
-        decode_typed, encode_typed,
     };
-    use bitcode::{Decode, Encode};
-    use std::collections::HashMap;
 
     const BOOTSTRAP_PKEY: PhysicalKey = 0;
 
-    // ---------------- helpers to build index segments ----------------
+    // ---------------- helpers to build/slice logical keys ----------------
 
-    fn slice_key<'a>(bytes: &'a [u8], offs: &'a [u32], i: usize) -> &'a [u8] {
-        let a = offs[i] as usize;
-        let b = offs[i + 1] as usize;
-        &bytes[a..b]
+    fn slice_key<'a>(bytes: &'a [u8], layout: &'a KeyLayout, i: usize) -> &'a [u8] {
+        match layout {
+            KeyLayout::FixedWidth { width } => {
+                let w = *width as usize;
+                let a = i * w;
+                let b = a + w;
+                &bytes[a..b]
+            }
+            KeyLayout::Variable { key_offsets } => {
+                let a = key_offsets[i] as usize;
+                let b = key_offsets[i + 1] as usize;
+                &bytes[a..b]
+            }
+        }
     }
 
     // Generic function (not a closure) to avoid HRTB/lifetime clash.
@@ -408,10 +479,10 @@ mod tests {
             _ => panic!("expected fixed width"),
         }
 
-        // Inspect keys via offsets
-        let k0 = slice_key(&seg100.logical_key_bytes, &seg100.logical_key_offsets, 0);
-        let k1 = slice_key(&seg100.logical_key_bytes, &seg100.logical_key_offsets, 1);
-        let k2 = slice_key(&seg100.logical_key_bytes, &seg100.logical_key_offsets, 2);
+        // Inspect keys via KeyLayout
+        let k0 = slice_key(&seg100.logical_key_bytes, &seg100.key_layout, 0);
+        let k1 = slice_key(&seg100.logical_key_bytes, &seg100.key_layout, 1);
+        let k2 = slice_key(&seg100.logical_key_bytes, &seg100.key_layout, 2);
         assert_eq!(k0, &b"a"[..]);
         assert_eq!(k1, &b"b"[..]);
         assert_eq!(k2, &b"d"[..]);
@@ -526,8 +597,7 @@ mod tests {
             _ => panic!("IndexSegment missing"),
         };
 
-        // Binary search inside that segment
-        let (keys, offs) = (&seg.logical_key_bytes, &seg.logical_key_offsets);
+        // Binary search inside that segment using KeyLayout
         let target = &b"wolf"[..];
 
         let mut lo = 0usize;
@@ -535,7 +605,7 @@ mod tests {
         let mut hit = None;
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let k = slice_key(keys, offs, mid);
+            let k = slice_key(&seg.logical_key_bytes, &seg.key_layout, mid);
             match k.cmp(target) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
@@ -546,7 +616,10 @@ mod tests {
             }
         }
         let pos = hit.expect("should find wolf");
-        assert_eq!(slice_key(keys, offs, pos), &b"wolf"[..]);
+        assert_eq!(
+            slice_key(&seg.logical_key_bytes, &seg.key_layout, pos),
+            &b"wolf"[..]
+        );
     }
 
     /// Confirms `ValueLayout` slicing rules for both FixedWidth and Variable.
@@ -592,6 +665,20 @@ mod tests {
                 }
             }
             _ => unreachable!(),
+        }
+
+        // And for the key layout in both cases:
+        // seg_fixed keys are all 2 bytes ("k1","k2","k3","k4")? No, the inputs are len=2 each,
+        // so FixedWidth is selected; seg_var keys ("a","aa","aaa") invoke Variable (with offsets).
+        match &seg_fixed.key_layout {
+            KeyLayout::FixedWidth { width } => assert_eq!(*width, 2),
+            _ => panic!("expected fixed-width key layout"),
+        }
+        match &seg_var.key_layout {
+            KeyLayout::Variable { key_offsets } => {
+                assert_eq!(key_offsets, &vec![0, 1, 3, 6]); // 1 + 2 + 3 = 6
+            }
+            _ => panic!("expected variable key layout"),
         }
     }
 }

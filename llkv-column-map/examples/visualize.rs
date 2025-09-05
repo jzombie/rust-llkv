@@ -28,7 +28,6 @@
 //!      - PNG:  `dot -Tpng storage_layout.dot -o storage_layout.png`
 //!      - SVG:  `dot -Tsvg storage_layout.dot -o storage_layout.svg`
 
-use bitcode::{Decode, Encode};
 use std::collections::HashMap;
 use std::time::Instant;
 

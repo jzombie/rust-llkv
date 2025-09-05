@@ -8,7 +8,8 @@ pub mod pager;
 pub mod types;
 
 use crate::index::{
-    Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, Manifest, ValueLayout,
+    Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, KeyLayout, Manifest,
+    ValueLayout,
 };
 use crate::pager::{
     BatchGet, BatchPut, BatchRequest, BatchResponse, GetResult, Pager, TypedKind, TypedValue,
@@ -19,12 +20,12 @@ use std::fmt::Write as _;
 
 #[derive(Clone, Debug)]
 pub struct IndexLayoutInfo {
-    pub kind: &'static str,       // "fixed" or "variable"
-    pub fixed_width: Option<u32>, // when fixed
+    pub kind: &'static str,       // "fixed" or "variable" (value layout)
+    pub fixed_width: Option<u32>, // when value layout is fixed
     // TODO: Rename to indicate *logical* and *len*?
     pub key_bytes: usize,        // logical_key_bytes.len()
-    pub key_offs_bytes: usize,   // logical_key_offsets.len() * 4
-    pub value_meta_bytes: usize, // Variable: value_offsets.len()*4, Fixed: 4 (width)
+    pub key_offs_bytes: usize, // if KeyLayout::Variable: key_offsets.len() * sizeof(IndexEntryCount); else 0
+    pub value_meta_bytes: usize, // Variable: value_offsets.len()*sizeof(IndexEntryCount), Fixed: 4 (width)
 }
 
 #[derive(Clone, Debug)]
@@ -58,45 +59,40 @@ pub enum StorageKind {
 
 // ----------------------------- helpers -----------------------------
 
-fn concat_keys_and_offsets_sorted(
-    keys_sorted: &[LogicalKeyBytes],
-) -> (Vec<u8>, Vec<IndexEntryCount>) {
-    let mut bytes = Vec::new();
-    let mut offs = Vec::with_capacity(keys_sorted.len() + 1);
-    let mut acc: IndexEntryCount = 0;
-    offs.push(acc);
-    for k in keys_sorted {
-        bytes.extend_from_slice(k);
-        acc += k.len() as IndexEntryCount;
-        offs.push(acc);
+fn slice_key_by_layout<'a>(bytes: &'a [u8], layout: &'a KeyLayout, i: usize) -> &'a [u8] {
+    match layout {
+        KeyLayout::FixedWidth { width } => {
+            let w = *width as usize;
+            let a = i * w;
+            let b = a + w;
+            &bytes[a..b]
+        }
+        KeyLayout::Variable { key_offsets } => {
+            let a = key_offsets[i] as usize;
+            let b = key_offsets[i + 1] as usize;
+            &bytes[a..b]
+        }
     }
-    (bytes, offs)
 }
 
-fn slice_key<'a>(bytes: &'a [u8], offs: &'a [IndexEntryCount], i: usize) -> &'a [u8] {
-    let a = offs[i] as usize;
-    let b = offs[i + 1] as usize;
-    &bytes[a..b]
-}
-
-fn binary_search_key(bytes: &[u8], offs: &[IndexEntryCount], target: &[u8]) -> Option<usize> {
+fn binary_search_key_with_layout(
+    bytes: &[u8],
+    layout: &KeyLayout,
+    n_entries: usize,
+    target: &[u8],
+) -> Option<usize> {
     let mut lo = 0usize;
-    let mut hi = offs.len() - 1;
+    let mut hi = n_entries; // exclusive
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let k = slice_key(bytes, offs, mid);
+        let k = slice_key_by_layout(bytes, layout, mid);
         match k.cmp(target) {
             std::cmp::Ordering::Less => lo = mid + 1,
             std::cmp::Ordering::Greater => hi = mid,
             std::cmp::Ordering::Equal => return Some(mid),
         }
     }
-    // final check
-    if lo < offs.len() - 1 && slice_key(bytes, offs, lo) == target {
-        Some(lo)
-    } else {
-        None
-    }
+    None
 }
 
 // ----------------------------- write API -----------------------------
@@ -420,6 +416,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         // Prepare map: field_id -> (col_index_pkey, ColumnIndex)
         let mut need_manifest_update = false;
         let mut ensure_column_loaded: HashSet<LogicalFieldId> = HashSet::new();
+        // NEW: track which ColumnIndex pkeys were actually modified this call.
+        let mut touched_colindex_pkeys: HashSet<PhysicalKey> = HashSet::new();
 
         // Bring column indexes we will touch into cache (batch-read where possible)
         for chunk in &planned_chunks {
@@ -490,57 +488,32 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             let data_pkey = data_keys[i];
             let index_pkey = index_keys[i];
 
-            // build data blob (+ offsets if variable)
-            let (data_blob, layout_enum, n_entries) = match chunk.layout {
+            // build data blob (+ value offsets for variable)
+            let (data_blob, seg, n_entries) = match chunk.layout {
                 PlannedLayout::Fixed { width } => {
+                    // values blob
                     let mut blob = Vec::with_capacity(chunk.values.len() * (width as usize));
                     for v in &chunk.values {
                         debug_assert_eq!(v.len(), width as usize);
                         blob.extend_from_slice(v);
                     }
-                    (
-                        blob,
-                        ValueLayout::FixedWidth { width },
-                        chunk.values.len() as IndexEntryCount,
-                    )
+                    // index segment (lets the index module compute key layout & min/max)
+                    let seg =
+                        IndexSegment::build_fixed(data_pkey, chunk.keys_sorted.clone(), width);
+                    (blob, seg, chunk.values.len() as IndexEntryCount)
                 }
                 PlannedLayout::Variable => {
+                    // values blob
                     let mut blob = Vec::new();
-                    let mut off: Vec<IndexEntryCount> = Vec::with_capacity(chunk.values.len() + 1);
-                    let mut acc: IndexEntryCount = 0;
-                    off.push(0);
+                    let mut sizes: Vec<u32> = Vec::with_capacity(chunk.values.len());
                     for v in &chunk.values {
                         blob.extend_from_slice(v);
-                        acc += v.len() as IndexEntryCount;
-                        off.push(acc);
+                        sizes.push(v.len() as u32);
                     }
-                    (
-                        blob,
-                        ValueLayout::Variable { value_offsets: off },
-                        chunk.values.len() as IndexEntryCount,
-                    )
+                    // index segment
+                    let seg = IndexSegment::build_var(data_pkey, chunk.keys_sorted.clone(), &sizes);
+                    (blob, seg, chunk.values.len() as IndexEntryCount)
                 }
-            };
-
-            // Build key storage
-            let (key_bytes, key_offs) = concat_keys_and_offsets_sorted(&chunk.keys_sorted);
-            let logical_key_min = chunk.keys_sorted.first().cloned().unwrap().to_vec();
-            let logical_key_max = chunk.keys_sorted.last().cloned().unwrap().to_vec();
-
-            // Assemble IndexSegment
-            let seg = IndexSegment {
-                data_physical_key: data_pkey,
-                n_entries,
-                logical_key_bytes: key_bytes,
-                logical_key_offsets: key_offs,
-                value_layout: match layout_enum {
-                    ValueLayout::FixedWidth { width } => ValueLayout::FixedWidth { width },
-                    ValueLayout::Variable { value_offsets } => {
-                        ValueLayout::Variable { value_offsets }
-                    }
-                },
-                logical_key_min,
-                logical_key_max,
             };
 
             // queue writes
@@ -548,7 +521,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             index_puts.push((index_pkey, seg.clone()));
 
             // update ColumnIndex (newest-first: push_front semantics)
-            let (_col_pkey, col_index) = self
+            let (col_pkey, col_index) = self
                 .colindex_cache
                 .get_mut(&chunk.field_id)
                 .expect("column index present");
@@ -560,9 +533,12 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     data_physical_key: seg.data_physical_key,
                     logical_key_min: seg.logical_key_min.clone(),
                     logical_key_max: seg.logical_key_max.clone(),
-                    n_entries: seg.n_entries,
+                    n_entries,
                 },
             );
+
+            // mark this ColumnIndex as touched so we persist only these (ingest perf fix)
+            touched_colindex_pkeys.insert(*col_pkey);
         }
 
         // Persist: data blobs, index segments, column indexes, manifest (if needed).
@@ -582,15 +558,19 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 });
             }
         }
-        if !self.colindex_cache.is_empty() {
-            // batch write all updated column indexes
+
+        // Only write ColumnIndex blobs that were actually touched this call.
+        if !touched_colindex_pkeys.is_empty() {
             for (_fid, (pk, ci)) in self.colindex_cache.iter() {
-                puts_batch.push(BatchPut::Typed {
-                    key: *pk,
-                    value: TypedValue::ColumnIndex(ci.clone()),
-                });
+                if touched_colindex_pkeys.contains(pk) {
+                    puts_batch.push(BatchPut::Typed {
+                        key: *pk,
+                        value: TypedValue::ColumnIndex(ci.clone()),
+                    });
+                }
             }
         }
+
         if need_manifest_update {
             puts_batch.push(BatchPut::Typed {
                 key: self.manifest_key,
@@ -767,9 +747,12 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
             for (qi, kj) in pairs {
                 let target = items[qi].1[kj].as_slice();
-                if let Some(pos) =
-                    binary_search_key(&seg.logical_key_bytes, &seg.logical_key_offsets, target)
-                {
+                if let Some(pos) = binary_search_key_with_layout(
+                    &seg.logical_key_bytes,
+                    &seg.key_layout,
+                    seg.n_entries as usize,
+                    target,
+                ) {
                     match &seg.value_layout {
                         ValueLayout::FixedWidth { width } => {
                             let w = *width as usize;
@@ -944,8 +927,12 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
                     // compute layout info
                     let key_bytes = seg.logical_key_bytes.len();
-                    let key_offs_bytes =
-                        seg.logical_key_offsets.len() * std::mem::size_of::<IndexEntryCount>();
+                    let key_offs_bytes = match &seg.key_layout {
+                        KeyLayout::FixedWidth { .. } => 0,
+                        KeyLayout::Variable { key_offsets } => {
+                            key_offsets.len() * std::mem::size_of::<IndexEntryCount>()
+                        }
+                    };
                     let (kind, fixed_width, value_meta_bytes) = match &seg.value_layout {
                         ValueLayout::FixedWidth { width } => {
                             ("fixed", Some(*width), std::mem::size_of::<u32>())
@@ -953,7 +940,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         ValueLayout::Variable { value_offsets } => (
                             "variable",
                             None,
-                            value_offsets.len() * std::mem::size_of::<u32>(),
+                            value_offsets.len() * std::mem::size_of::<IndexEntryCount>(),
                         ),
                     };
 
@@ -1021,7 +1008,6 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         let mut s = String::new();
 
         // Header: phys_key | kind | field | bytes | details
-
         let header = format!(
             "{:<10} {:<12} {:<9} {:>10}  {}",
             "phys_key", "kind", "field", "bytes", "details"
@@ -1204,7 +1190,6 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcode::{Decode, Encode};
 
     // Use the unified in-memory pager from the pager module.
     use crate::pager::MemPager;
