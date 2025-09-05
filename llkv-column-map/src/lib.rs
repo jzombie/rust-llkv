@@ -579,6 +579,20 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         }
 
         if !puts_batch.is_empty() {
+            // Assert we're using storage efficiently
+            #[cfg(debug_assertions)]
+            {
+                use std::collections::HashSet;
+                let mut seen = HashSet::new();
+                for p in &puts_batch {
+                    let k = match p {
+                        BatchPut::Raw { key, .. } => *key,
+                        BatchPut::Typed { key, .. } => *key,
+                    };
+                    assert!(seen.insert(k), "duplicate PUT for key {}", k);
+                }
+            }
+
             let _ = self.do_batch(BatchRequest {
                 puts: puts_batch,
                 gets: vec![],
