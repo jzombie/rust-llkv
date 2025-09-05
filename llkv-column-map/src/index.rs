@@ -155,6 +155,9 @@ pub struct IndexSegment {
     /// Redundant cached bounds for fast reject/prune.
     pub logical_key_min: LogicalKeyBytes,
     pub logical_key_max: LogicalKeyBytes,
+
+    pub value_bytes_min: Vec<u8>,
+    pub value_bytes_max: Vec<u8>,
 }
 
 impl IndexSegment {
@@ -174,6 +177,8 @@ impl IndexSegment {
             value_layout: ValueLayout::FixedWidth { width },
             logical_key_min,
             logical_key_max,
+            value_bytes_min: Vec::new(),
+            value_bytes_max: Vec::new(),
         }
     }
 
@@ -208,6 +213,8 @@ impl IndexSegment {
             },
             logical_key_min,
             logical_key_max,
+            value_bytes_min: Vec::new(),
+            value_bytes_max: Vec::new(),
         }
     }
 }

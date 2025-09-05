@@ -16,6 +16,23 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+// TODO: Move to utils?
+#[inline]
+fn min_max_bytes(values: &[Vec<u8>]) -> (Vec<u8>, Vec<u8>) {
+    debug_assert!(!values.is_empty());
+    let mut min = &values[0];
+    let mut max = &values[0];
+    for v in &values[1..] {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+    (min.clone(), max.clone())
+}
+
 /// Zero-copy view into a subrange of an Arc-backed data blob.
 /// Holds the Arc and byte offsets; derefs to `[u8]` without copying.
 #[derive(Clone, Debug)]
@@ -575,6 +592,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             let data_pkey = data_keys[i];
             let index_pkey = index_keys[i];
 
+            let (vmin, vmax) = min_max_bytes(&chunk.values);
+
             // build data blob (+ value offsets for variable)
             let (data_blob, seg, n_entries) = match chunk.layout {
                 PlannedLayout::Fixed { width } => {
@@ -585,8 +604,11 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         blob.extend_from_slice(v);
                     }
                     // index segment (lets the index module compute key layout & min/max)
-                    let seg =
+                    let mut seg =
                         IndexSegment::build_fixed(data_pkey, chunk.keys_sorted.clone(), width);
+                    seg.value_bytes_min = vmin;
+                    seg.value_bytes_max = vmax;
+
                     (blob, seg, chunk.values.len() as IndexEntryCount)
                 }
                 PlannedLayout::Variable => {
@@ -598,7 +620,11 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         sizes.push(v.len() as ByteLen);
                     }
                     // index segment
-                    let seg = IndexSegment::build_var(data_pkey, chunk.keys_sorted.clone(), &sizes);
+                    let mut seg =
+                        IndexSegment::build_var(data_pkey, chunk.keys_sorted.clone(), &sizes);
+                    seg.value_bytes_min = vmin;
+                    seg.value_bytes_max = vmax;
+
                     (blob, seg, chunk.values.len() as IndexEntryCount)
                 }
             };
@@ -1602,5 +1628,103 @@ mod tests {
         let s = store.io_stats();
         assert_eq!(s.get_typed_ops, 1);
         assert_eq!(s.get_raw_ops, 1);
+    }
+
+    #[test]
+    fn value_min_max_recorded_fixed() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 5050;
+
+        // fixed 4B values with easy min/max
+        let items = vec![
+            (b"k1".to_vec(), vec![9, 9, 9, 9]),
+            (b"k2".to_vec(), vec![0, 0, 0, 0]),       // min
+            (b"k3".to_vec(), vec![255, 255, 255, 1]), // max (lexicographic)
+        ];
+
+        store.append_many(
+            vec![Put {
+                field_id: fid,
+                items,
+            }],
+            AppendOptions {
+                mode: ValueMode::ForceFixed(4),
+                ..Default::default()
+            },
+        );
+
+        // find the segment pk we just wrote
+        let (seg_pk, _) = {
+            let ci = store.colindex_cache.read().unwrap();
+            let (_pk, colidx) = ci.get(&fid).expect("colindex");
+            let sref = &colidx.segments[0]; // newest-first
+            (sref.index_physical_key, sref.data_physical_key)
+        };
+
+        // load that IndexSegment and check value min/max
+        let got = store.do_gets(vec![BatchGet::Typed {
+            key: seg_pk,
+            kind: TypedKind::IndexSegment,
+        }]);
+
+        match &got[0] {
+            GetResult::Typed {
+                value: TypedValue::IndexSegment(seg),
+                ..
+            } => {
+                assert_eq!(seg.value_bytes_min, vec![0, 0, 0, 0]);
+                assert_eq!(seg.value_bytes_max, vec![255, 255, 255, 1]);
+            }
+            _ => panic!("expected IndexSegment"),
+        }
+    }
+
+    #[test]
+    fn value_min_max_recorded_variable() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 6060;
+
+        // variable-length values; lexicographic min/max over raw bytes
+        let items = vec![
+            (b"a".to_vec(), b"wolf".to_vec()),
+            (b"b".to_vec(), b"ant".to_vec()), // min ("ant" < "wolf" < "zebra")
+            (b"c".to_vec(), b"zebra".to_vec()), // max
+        ];
+
+        store.append_many(
+            vec![Put {
+                field_id: fid,
+                items,
+            }],
+            AppendOptions {
+                mode: ValueMode::ForceVariable,
+                ..Default::default()
+            },
+        );
+
+        let (seg_pk, _) = {
+            let ci = store.colindex_cache.read().unwrap();
+            let (_pk, colidx) = ci.get(&fid).expect("colindex");
+            let sref = &colidx.segments[0];
+            (sref.index_physical_key, sref.data_physical_key)
+        };
+
+        let got = store.do_gets(vec![BatchGet::Typed {
+            key: seg_pk,
+            kind: TypedKind::IndexSegment,
+        }]);
+
+        match &got[0] {
+            GetResult::Typed {
+                value: TypedValue::IndexSegment(seg),
+                ..
+            } => {
+                assert_eq!(seg.value_bytes_min, b"ant".to_vec());
+                assert_eq!(seg.value_bytes_max, b"zebra".to_vec());
+            }
+            _ => panic!("expected IndexSegment"),
+        }
     }
 }
