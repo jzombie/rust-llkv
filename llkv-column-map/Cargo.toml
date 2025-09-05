@@ -18,5 +18,5 @@ name = "indexing_bench"
 harness = false
 
 [[bench]]
-name = "injest_bench"
+name = "ingest_bench"
 harness = false

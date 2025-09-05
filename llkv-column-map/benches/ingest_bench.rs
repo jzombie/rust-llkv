@@ -1,56 +1,59 @@
-use std::collections::HashMap;
+//! # Benchmark: Ingest 21 Columns × 150,000 Rows (batching strategies)
+//!
+//! **Purpose**  
+//! Measure end-to-end ingest throughput of the high-level `ColumnStore::append_many` API
+//! while varying how much data we pack into each append call. This highlights the cost of
+//! segmentation, index construction, and pager round-trips as a function of batch size.
+//!
+//! **What it does**  
+//! - Synthesizes a dataset of **21 columns** per row:
+//!   - 8 columns with fixed width 8 bytes
+//!   - 4 columns with fixed width 4 bytes
+//!   - 5 columns with variable length (5..=25 bytes)
+//!   - 4 columns with variable length (50..=200 bytes)
+//! - Generates **150,000 rows** and ingests them through `ColumnStore::append_many`,
+//!   using two batching patterns, each as a separate Criterion benchmark group:
+//!   1. **`bench_ingest_by_batches`**: sweep the **number of batches** (e.g., 1, 2, 5, 10, …).
+//!      More batches ⇒ smaller per-append chunk size.
+//!   2. **`bench_ingest_by_rows_per_batch`**: sweep the **rows per batch** directly
+//!      (e.g., 150k, 75k, 50k, …).
+//!
+//! **Why two patterns?**  
+//! They provide the same control from two angles: *“how many appends?”* vs
+//! *“how big is each append?”*. Both reveal how your segment thresholds and pager usage
+//! respond to different batching choices.
+//!
+//! **How it measures**  
+//! - Each benchmark creates a fresh in-memory `MemPager` and `ColumnStore`.
+//! - It runs one or more `append_many` calls until all 150k rows × 21 columns are ingested.
+//! - We call `store.describe_storage()` at the end of each iteration to prevent the optimizer
+//!   from eliding the work and to force at least one read pass over the storage state.
+//! - Criterion reports time per iteration; we also set `Throughput::Elements(total_rows * 21)`
+//!   so you can interpret results as *logical cells per second* if you want.
+//!
+//! **Knobs to tweak**  
+//! - `segment_max_entries`, `segment_max_bytes`: affect how often segments roll over.
+//! - `last_write_wins_in_batch`: whether duplicate keys in the same batch are deduped.
+//! - The set and shape of columns in `col_spec_21()`.
+//!
+//! **How to read the output**  
+//! - **Fewer, larger batches** generally reduce overhead (fewer pager calls, fewer index objects),
+//!   but increase memory pressure and produce larger segments.
+//! - **More, smaller batches** give you smaller segments and lower peaks in memory usage,
+//!   but higher fixed overhead per batch.
+//!
+//! **Caveats**  
+//! - Uses an in-memory pager; absolute timings won’t match a real backend, but **relative trends**
+//!   are very telling.
+//! - Values are synthetic. If your real payloads compress/branch differently, expect shifts.
+//! ```
+
 use std::hint::black_box;
 use std::time::Duration;
 
-use bitcode::{Decode, Encode};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use llkv_column_map::{
-    AppendOptions, ColumnStore, Put, ValueMode, pager::Pager, types::PhysicalKey,
-};
-
-// ----------------- minimal in-memory Pager for the bench -----------------
-#[derive(Default)]
-struct MemPager {
-    map: HashMap<PhysicalKey, Vec<u8>>,
-    next: PhysicalKey,
-}
-impl Pager for MemPager {
-    fn alloc_many(&mut self, n: usize) -> Vec<PhysicalKey> {
-        if self.next == 0 {
-            self.next = 1;
-        } // reserve 0 for bootstrap
-        let start = self.next;
-        self.next += n as u64;
-        (0..n).map(|i| start + i as u64).collect()
-    }
-    fn batch_put_raw(&mut self, items: &[(PhysicalKey, Vec<u8>)]) {
-        for (k, v) in items {
-            self.map.insert(*k, v.clone());
-        }
-    }
-    fn batch_get_raw<'a>(&'a self, keys: &[PhysicalKey]) -> Vec<&'a [u8]> {
-        keys.iter()
-            .map(|k| self.map.get(k).expect("missing key").as_slice())
-            .collect()
-    }
-    fn batch_put_typed<T: Encode>(&mut self, items: &[(PhysicalKey, T)]) {
-        let enc: Vec<(PhysicalKey, Vec<u8>)> = items
-            .iter()
-            .map(|(k, v)| (*k, bitcode::encode(v)))
-            .collect();
-        self.batch_put_raw(&enc);
-    }
-    fn batch_get_typed<T>(&self, keys: &[PhysicalKey]) -> Vec<T>
-    where
-        for<'a> T: Decode<'a>,
-    {
-        self.batch_get_raw(keys)
-            .into_iter()
-            .map(|b| bitcode::decode(b).expect("bitcode decode failed"))
-            .collect()
-    }
-}
+use llkv_column_map::{AppendOptions, ColumnStore, Put, ValueMode, pager::MemPager};
 
 // ----------------- dataset shape: 21 columns x 150_000 rows ---------------
 #[derive(Clone, Copy)]
@@ -169,7 +172,9 @@ fn bench_ingest_by_batches(c: &mut Criterion) {
                     start = end;
                 }
 
-                black_box(pager.map.len());
+                // Prevent optimizer from discarding all work; also touches the storage via batch gets.
+                let n_nodes = store.describe_storage().len();
+                black_box(n_nodes);
             });
         });
     }
@@ -211,7 +216,9 @@ fn bench_ingest_by_rows_per_batch(c: &mut Criterion) {
                     start = end;
                 }
 
-                black_box(pager.map.len());
+                // Prevent optimizer from discarding all work; also touches the storage via batch gets.
+                let n_nodes = store.describe_storage().len();
+                black_box(n_nodes);
             });
         });
     }

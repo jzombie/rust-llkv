@@ -32,51 +32,9 @@ use bitcode::{Decode, Encode};
 use std::collections::HashMap;
 use std::time::Instant;
 
-use llkv_column_map::pager::Pager;
+use llkv_column_map::pager::MemPager;
 use llkv_column_map::types::PhysicalKey;
 use llkv_column_map::{AppendOptions, ColumnStore, Put, StorageKind, ValueMode};
-
-// ---------------- Tiny in-memory pager for the example ----------------
-
-#[derive(Default)]
-struct MemPager {
-    map: HashMap<PhysicalKey, Vec<u8>>,
-    next: PhysicalKey,
-}
-
-impl Pager for MemPager {
-    fn alloc_many(&mut self, n: usize) -> Vec<PhysicalKey> {
-        let start = if self.next == 0 { 1 } else { self.next }; // keep 0 for bootstrap
-        self.next = start + n as u64;
-        (0..n).map(|i| start + i as u64).collect()
-    }
-    fn batch_put_raw(&mut self, items: &[(PhysicalKey, Vec<u8>)]) {
-        for (k, v) in items {
-            self.map.insert(*k, v.clone());
-        }
-    }
-    fn batch_get_raw<'a>(&'a self, keys: &[PhysicalKey]) -> Vec<&'a [u8]> {
-        keys.iter()
-            .map(|k| self.map.get(k).expect("missing key").as_slice())
-            .collect()
-    }
-    fn batch_put_typed<T: Encode>(&mut self, items: &[(PhysicalKey, T)]) {
-        let enc: Vec<(PhysicalKey, Vec<u8>)> = items
-            .iter()
-            .map(|(k, v)| (*k, bitcode::encode(v)))
-            .collect();
-        self.batch_put_raw(&enc);
-    }
-    fn batch_get_typed<T>(&self, keys: &[PhysicalKey]) -> Vec<T>
-    where
-        for<'a> T: Decode<'a>,
-    {
-        self.batch_get_raw(keys)
-            .into_iter()
-            .map(|b| bitcode::decode(b).expect("bitcode decode failed"))
-            .collect()
-    }
-}
 
 // ---------------- Workload config (small, but shows batching clearly) --------
 

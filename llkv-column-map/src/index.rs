@@ -154,66 +154,14 @@ pub enum ValueLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pager::Pager;
+    use crate::pager::{
+        BatchGet, BatchPut, BatchRequest, GetResult, MemPager, Pager, TypedKind, TypedValue,
+        decode_typed, encode_typed,
+    };
     use bitcode::{Decode, Encode};
     use std::collections::HashMap;
 
     const BOOTSTRAP_PKEY: PhysicalKey = 0;
-
-    /// Tiny in-memory KV used by the tests to simulate a pager/kv store.
-    /// Values are **opaque blobs**; only indexes carry structure.
-    struct MemPager {
-        map: HashMap<PhysicalKey, Vec<u8>>,
-        next: PhysicalKey, // simple monotonically increasing allocator
-    }
-
-    impl Default for MemPager {
-        fn default() -> Self {
-            Self {
-                map: HashMap::new(),
-                next: 1,
-            } // reserve 0 for Bootstrap
-        }
-    }
-
-    impl Pager for MemPager {
-        // -------- allocation (batched only) --------
-        fn alloc_many(&mut self, n: usize) -> Vec<PhysicalKey> {
-            let start = self.next;
-            self.next += n as u64;
-            (0..n).map(|i| start + i as u64).collect()
-        }
-
-        // -------- raw bytes (batched only) --------
-        fn batch_put_raw(&mut self, items: &[(PhysicalKey, Vec<u8>)]) {
-            for (k, v) in items {
-                self.map.insert(*k, v.clone());
-            }
-        }
-        fn batch_get_raw<'a>(&'a self, keys: &[PhysicalKey]) -> Vec<&'a [u8]> {
-            keys.iter()
-                .map(|k| self.map.get(k).expect("missing key").as_slice())
-                .collect()
-        }
-
-        // -------- typed (batched only) --------
-        fn batch_put_typed<T: Encode>(&mut self, items: &[(PhysicalKey, T)]) {
-            let mut enc: Vec<(PhysicalKey, Vec<u8>)> = Vec::with_capacity(items.len());
-            for (k, v) in items {
-                enc.push((*k, bitcode::encode(v)));
-            }
-            self.batch_put_raw(&enc);
-        }
-        fn batch_get_typed<T>(&self, keys: &[PhysicalKey]) -> Vec<T>
-        where
-            for<'a> T: Decode<'a>,
-        {
-            self.batch_get_raw(keys)
-                .into_iter()
-                .map(|b| bitcode::decode(b).expect("bitcode decode failed"))
-                .collect()
-        }
-    }
 
     // ---------------- helpers to build index segments ----------------
 
@@ -244,7 +192,8 @@ mod tests {
         let mut kv = MemPager::default();
 
         // ----- allocate physical ids (batched) -----
-        // data_100, idx_100, data_200, idx_200, col_100_idx_pkey, col_200_idx_pkey, manifest_pkey
+        // data_100, idx_100, data_200, idx_200, col_100_idx_pkey,
+        // col_200_idx_pkey, manifest_pkey
         let ids = kv.alloc_many(7);
         let data_100 = ids[0];
         let idx_100 = ids[1];
@@ -264,11 +213,20 @@ mod tests {
         let sizes: Vec<u32> = vec![5, 2, 8]; // arbitrary payload lengths
         let seg_200 = IndexSegment::build_var(data_200, animals.clone(), &sizes);
 
-        // store index segments (batched)
-        kv.batch_put_typed::<IndexSegment>(&[
-            (idx_100, seg_100.clone()),
-            (idx_200, seg_200.clone()),
-        ]);
+        // store index segments (one batch)
+        let _ = kv.batch(&BatchRequest {
+            puts: vec![
+                BatchPut::Typed {
+                    key: idx_100,
+                    value: TypedValue::IndexSegment(seg_100.clone()),
+                },
+                BatchPut::Typed {
+                    key: idx_200,
+                    value: TypedValue::IndexSegment(seg_200.clone()),
+                },
+            ],
+            gets: vec![],
+        });
 
         // ----- ColumnIndex blobs (newest-first segments) -----
         let col_100_index = ColumnIndex {
@@ -292,10 +250,19 @@ mod tests {
             }],
         };
 
-        kv.batch_put_typed::<ColumnIndex>(&[
-            (col_100_idx_pkey, col_100_index),
-            (col_200_idx_pkey, col_200_index),
-        ]);
+        let _ = kv.batch(&BatchRequest {
+            puts: vec![
+                BatchPut::Typed {
+                    key: col_100_idx_pkey,
+                    value: TypedValue::ColumnIndex(col_100_index),
+                },
+                BatchPut::Typed {
+                    key: col_200_idx_pkey,
+                    value: TypedValue::ColumnIndex(col_200_index),
+                },
+            ],
+            gets: vec![],
+        });
 
         // ----- Manifest maps columns → current ColumnIndex physical keys -----
         let manifest = Manifest {
@@ -310,27 +277,56 @@ mod tests {
                 },
             ],
         };
-        kv.batch_put_typed::<Manifest>(&[(manifest_pkey, manifest)]);
 
         // ----- Bootstrap at physical key 0 points to the manifest -----
-        kv.batch_put_typed::<Bootstrap>(&[(
-            BOOTSTRAP_PKEY,
-            Bootstrap {
-                manifest_physical_key: manifest_pkey,
-            },
-        )]);
+        let _ = kv.batch(&BatchRequest {
+            puts: vec![
+                BatchPut::Typed {
+                    key: manifest_pkey,
+                    value: TypedValue::Manifest(manifest),
+                },
+                BatchPut::Typed {
+                    key: BOOTSTRAP_PKEY,
+                    value: TypedValue::Bootstrap(Bootstrap {
+                        manifest_physical_key: manifest_pkey,
+                    }),
+                },
+            ],
+            gets: vec![],
+        });
 
         // ======== Walk it back as a user would (batched reads only) =========
 
         // 0) Find the manifest
-        let boot: Bootstrap = kv
-            .batch_get_typed::<Bootstrap>(&[BOOTSTRAP_PKEY])
-            .pop()
-            .unwrap();
-        let got_manifest: Manifest = kv
-            .batch_get_typed::<Manifest>(&[boot.manifest_physical_key])
-            .pop()
-            .unwrap();
+        let resp = kv.batch(&BatchRequest {
+            puts: vec![],
+            gets: vec![BatchGet::Typed {
+                key: BOOTSTRAP_PKEY,
+                kind: TypedKind::Bootstrap,
+            }],
+        });
+        let boot = match &resp.get_results[0] {
+            GetResult::Typed {
+                value: TypedValue::Bootstrap(b),
+                ..
+            } => b.clone(),
+            _ => panic!("bootstrap missing"),
+        };
+
+        let resp = kv.batch(&BatchRequest {
+            puts: vec![],
+            gets: vec![BatchGet::Typed {
+                key: boot.manifest_physical_key,
+                kind: TypedKind::Manifest,
+            }],
+        });
+        let got_manifest = match &resp.get_results[0] {
+            GetResult::Typed {
+                value: TypedValue::Manifest(m),
+                ..
+            } => m.clone(),
+            _ => panic!("manifest missing"),
+        };
 
         // 1) Read ColumnIndex blobs in one batch
         let idx_keys: Vec<PhysicalKey> = got_manifest
@@ -338,7 +334,27 @@ mod tests {
             .iter()
             .map(|c| c.column_index_physical_key)
             .collect();
-        let mut col_indexes: Vec<ColumnIndex> = kv.batch_get_typed::<ColumnIndex>(&idx_keys);
+
+        let gets = idx_keys
+            .iter()
+            .map(|k| BatchGet::Typed {
+                key: *k,
+                kind: TypedKind::ColumnIndex,
+            })
+            .collect::<Vec<_>>();
+
+        let resp = kv.batch(&BatchRequest { puts: vec![], gets });
+
+        let mut col_indexes: Vec<ColumnIndex> = Vec::with_capacity(idx_keys.len());
+        for gr in resp.get_results {
+            match gr {
+                GetResult::Typed {
+                    value: TypedValue::ColumnIndex(ci),
+                    ..
+                } => col_indexes.push(ci),
+                _ => panic!("ColumnIndex missing"),
+            }
+        }
 
         // map by field_id for assertions
         col_indexes.sort_by_key(|ci| ci.field_id);
@@ -358,10 +374,31 @@ mod tests {
         assert!(&b"zebra"[..] >= segref_200.logical_key_max.as_slice());
 
         // 3) Open both IndexSegments in a single batch read
-        let segs: Vec<IndexSegment> = kv.batch_get_typed::<IndexSegment>(&[
-            segref_100.index_physical_key,
-            segref_200.index_physical_key,
-        ]);
+        let resp = kv.batch(&BatchRequest {
+            puts: vec![],
+            gets: vec![
+                BatchGet::Typed {
+                    key: segref_100.index_physical_key,
+                    kind: TypedKind::IndexSegment,
+                },
+                BatchGet::Typed {
+                    key: segref_200.index_physical_key,
+                    kind: TypedKind::IndexSegment,
+                },
+            ],
+        });
+
+        let mut segs: Vec<IndexSegment> = Vec::new();
+        for gr in resp.get_results {
+            match gr {
+                GetResult::Typed {
+                    value: TypedValue::IndexSegment(s),
+                    ..
+                } => segs.push(s),
+                _ => panic!("IndexSegment missing"),
+            }
+        }
+
         let seg100 = &segs[0];
         let seg200 = &segs[1];
 
@@ -421,11 +458,23 @@ mod tests {
         );
 
         // store all three segments in one batch
-        kv.batch_put_typed::<IndexSegment>(&[
-            (p_a, seg_a.clone()),
-            (p_b, seg_b.clone()),
-            (p_c, seg_c.clone()),
-        ]);
+        let _ = kv.batch(&BatchRequest {
+            puts: vec![
+                BatchPut::Typed {
+                    key: p_a,
+                    value: TypedValue::IndexSegment(seg_a.clone()),
+                },
+                BatchPut::Typed {
+                    key: p_b,
+                    value: TypedValue::IndexSegment(seg_b.clone()),
+                },
+                BatchPut::Typed {
+                    key: p_c,
+                    value: TypedValue::IndexSegment(seg_c.clone()),
+                },
+            ],
+            gets: vec![],
+        });
 
         // ColumnIndex in-memory (no IO needed)
         let col = ColumnIndex {
@@ -462,9 +511,20 @@ mod tests {
         assert!(cand[0].logical_key_max.as_slice() >= &b"wolf"[..]);
 
         // Fetch the one candidate segment via a single *batch* get
-        let segs: Vec<IndexSegment> =
-            kv.batch_get_typed::<IndexSegment>(&[cand[0].index_physical_key]);
-        let seg = &segs[0];
+        let resp = kv.batch(&BatchRequest {
+            puts: vec![],
+            gets: vec![BatchGet::Typed {
+                key: cand[0].index_physical_key,
+                kind: TypedKind::IndexSegment,
+            }],
+        });
+        let seg = match &resp.get_results[0] {
+            GetResult::Typed {
+                value: TypedValue::IndexSegment(s),
+                ..
+            } => s.clone(),
+            _ => panic!("IndexSegment missing"),
+        };
 
         // Binary search inside that segment
         let (keys, offs) = (&seg.logical_key_bytes, &seg.logical_key_offsets);

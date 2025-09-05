@@ -10,7 +10,7 @@ pub mod types;
 use crate::index::{
     Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, Manifest, ValueLayout,
 };
-use crate::pager::Pager;
+use crate::pager::{BatchGet, BatchPut, BatchRequest, GetResult, Pager, TypedKind, TypedValue};
 use crate::types::{IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey};
 
 use std::fmt::Write as _;
@@ -149,13 +149,24 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         let manifest = Manifest {
             columns: Vec::new(),
         };
-        pager.batch_put_typed::<Manifest>(&[(manifest_key, manifest.clone())]);
-        pager.batch_put_typed::<Bootstrap>(&[(
-            bootstrap_key,
-            Bootstrap {
-                manifest_physical_key: manifest_key,
-            },
-        )]);
+
+        // Write Manifest and Bootstrap in a single batch.
+        let _ = pager.batch(&BatchRequest {
+            puts: vec![
+                BatchPut::Typed {
+                    key: manifest_key,
+                    value: TypedValue::Manifest(manifest.clone()),
+                },
+                BatchPut::Typed {
+                    key: bootstrap_key,
+                    value: TypedValue::Bootstrap(Bootstrap {
+                        manifest_physical_key: manifest_key,
+                    }),
+                },
+            ],
+            gets: vec![],
+        });
+
         ColumnStore {
             pager,
             bootstrap_key,
@@ -168,11 +179,40 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     // Open existing store (bootstrap(0) -> manifest).
     pub fn open(pager: &'p mut P) -> Self {
         let bootstrap_key: PhysicalKey = 0;
-        let b: Vec<Bootstrap> = pager.batch_get_typed::<Bootstrap>(&[bootstrap_key]);
-        let boot = b.into_iter().next().expect("missing bootstrap at key 0");
+
+        // Get Bootstrap
+        let resp = pager.batch(&BatchRequest {
+            puts: vec![],
+            gets: vec![BatchGet::Typed {
+                key: bootstrap_key,
+                kind: TypedKind::Bootstrap,
+            }],
+        });
+        let boot = match &resp.get_results[0] {
+            GetResult::Typed {
+                value: TypedValue::Bootstrap(b),
+                ..
+            } => b.clone(),
+            _ => panic!("missing bootstrap at key 0"),
+        };
         let manifest_key = boot.manifest_physical_key;
-        let m: Vec<Manifest> = pager.batch_get_typed::<Manifest>(&[manifest_key]);
-        let manifest = m.into_iter().next().expect("missing manifest");
+
+        // Get Manifest
+        let resp = pager.batch(&BatchRequest {
+            puts: vec![],
+            gets: vec![BatchGet::Typed {
+                key: manifest_key,
+                kind: TypedKind::Manifest,
+            }],
+        });
+        let manifest = match &resp.get_results[0] {
+            GetResult::Typed {
+                value: TypedValue::Manifest(m),
+                ..
+            } => m.clone(),
+            _ => panic!("missing manifest"),
+        };
+
         ColumnStore {
             pager,
             bootstrap_key,
@@ -343,10 +383,28 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 }
             }
             if !lookups.is_empty() {
-                let keys: Vec<PhysicalKey> = lookups.iter().map(|(_, k)| *k).collect();
-                let got: Vec<ColumnIndex> = self.pager.batch_get_typed::<ColumnIndex>(&keys);
+                let gets: Vec<BatchGet> = lookups
+                    .iter()
+                    .map(|(_, pk)| BatchGet::Typed {
+                        key: *pk,
+                        kind: TypedKind::ColumnIndex,
+                    })
+                    .collect();
+                let resp = self.pager.batch(&BatchRequest { puts: vec![], gets });
+
+                let mut got_vec: Vec<ColumnIndex> = Vec::with_capacity(lookups.len());
+                for gr in resp.get_results {
+                    match gr {
+                        GetResult::Typed {
+                            value: TypedValue::ColumnIndex(ci),
+                            ..
+                        } => got_vec.push(ci),
+                        _ => panic!("ColumnIndex missing"),
+                    }
+                }
+
                 for (i, (fid, k)) in lookups.into_iter().enumerate() {
-                    self.colindex_cache.insert(fid, (k, got[i].clone()));
+                    self.colindex_cache.insert(fid, (k, got_vec[i].clone()));
                 }
             }
         }
@@ -433,7 +491,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             index_puts.push((index_pkey, seg.clone()));
 
             // update ColumnIndex (newest-first: push_front semantics)
-            let (col_pkey, col_index) = self
+            let (_col_pkey, col_index) = self
                 .colindex_cache
                 .get_mut(&chunk.field_id)
                 .expect("column index present");
@@ -448,32 +506,46 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     n_entries: seg.n_entries,
                 },
             );
-
-            // write updated ColumnIndex after loop (batched)
-            let _ = col_pkey; // kept for later batch write
         }
 
         // Persist: data blobs, index segments, column indexes, manifest (if needed).
+        // Combine everything into a SINGLE batch.
+        let mut puts_batch: Vec<BatchPut> = Vec::new();
+
         if !data_puts.is_empty() {
-            self.pager.batch_put_raw(&data_puts);
+            for (k, v) in data_puts {
+                puts_batch.push(BatchPut::Raw { key: k, bytes: v });
+            }
         }
         if !index_puts.is_empty() {
-            self.pager.batch_put_typed::<IndexSegment>(&index_puts);
+            for (k, seg) in index_puts {
+                puts_batch.push(BatchPut::Typed {
+                    key: k,
+                    value: TypedValue::IndexSegment(seg),
+                });
+            }
         }
-
         if !self.colindex_cache.is_empty() {
             // batch write all updated column indexes
-            let mut colindex_puts: Vec<(PhysicalKey, ColumnIndex)> =
-                Vec::with_capacity(self.colindex_cache.len());
             for (_fid, (pk, ci)) in self.colindex_cache.iter() {
-                colindex_puts.push((*pk, ci.clone()));
+                puts_batch.push(BatchPut::Typed {
+                    key: *pk,
+                    value: TypedValue::ColumnIndex(ci.clone()),
+                });
             }
-            self.pager.batch_put_typed::<ColumnIndex>(&colindex_puts);
+        }
+        if need_manifest_update {
+            puts_batch.push(BatchPut::Typed {
+                key: self.manifest_key,
+                value: TypedValue::Manifest(self.manifest.clone()),
+            });
         }
 
-        if need_manifest_update {
-            self.pager
-                .batch_put_typed::<Manifest>(&[(self.manifest_key, self.manifest.clone())]);
+        if !puts_batch.is_empty() {
+            let _ = self.pager.batch(&BatchRequest {
+                puts: puts_batch,
+                gets: vec![],
+            });
         }
     }
 
@@ -484,9 +556,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     /// each value is an `Option<&[u8]>` slice into prefetched data blobs.
     ///
     /// I/O pattern (whole batch):
-    ///   1) batch_get_typed<ColumnIndex> for any missing columns (once)
-    ///   2) batch_get_typed<IndexSegment> for all needed segments (once)
-    ///   3) batch_get_raw for all needed data blobs (once)
+    ///   1) batch(ColumnIndex gets) for any missing columns (once)
+    ///   2) batch(IndexSegment typed + DataBlob raw gets) (once)
     ///
     /// Newest-first shadowing: for each key we pick the first segment whose
     /// [min,max] covers it.
@@ -523,10 +594,28 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         }
 
         if !to_load.is_empty() {
-            let idx_pks: Vec<PhysicalKey> = to_load.iter().map(|(_, pk)| *pk).collect();
-            let got: Vec<ColumnIndex> = self.pager.batch_get_typed::<ColumnIndex>(&idx_pks);
+            let gets: Vec<BatchGet> = to_load
+                .iter()
+                .map(|(_, pk)| BatchGet::Typed {
+                    key: *pk,
+                    kind: TypedKind::ColumnIndex,
+                })
+                .collect();
+            let resp = self.pager.batch(&BatchRequest { puts: vec![], gets });
+
+            let mut got_vec: Vec<ColumnIndex> = Vec::with_capacity(to_load.len());
+            for gr in resp.get_results {
+                match gr {
+                    GetResult::Typed {
+                        value: TypedValue::ColumnIndex(ci),
+                        ..
+                    } => got_vec.push(ci),
+                    _ => panic!("ColumnIndex missing"),
+                }
+            }
+
             for (i, (fid, pk)) in to_load.into_iter().enumerate() {
-                self.colindex_cache.insert(fid, (pk, got[i].clone()));
+                self.colindex_cache.insert(fid, (pk, got_vec[i].clone()));
             }
         }
 
@@ -562,30 +651,52 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             return results;
         }
 
-        // -------- single batched loads for segments and data blobs -------------
-        // 1) typed load of all needed index segments (owned, no borrowing)
-        let seg_keys: Vec<PhysicalKey> = per_seg.keys().copied().collect();
-        let segs: Vec<IndexSegment> = self.pager.batch_get_typed::<IndexSegment>(&seg_keys);
+        // -------- single batched load for segments AND data blobs -------------
+        // Build one get list containing typed IndexSegments and raw Data blobs.
+        let mut gets: Vec<BatchGet> = Vec::with_capacity(per_seg.len() * 2);
 
-        let mut seg_map: HashMap<PhysicalKey, IndexSegment> = HashMap::with_capacity(segs.len());
-        for (i, pk) in seg_keys.iter().enumerate() {
-            seg_map.insert(*pk, segs[i].clone());
+        // 1) typed load of all needed index segments
+        let seg_keys: Vec<PhysicalKey> = per_seg.keys().copied().collect();
+        for pk in &seg_keys {
+            gets.push(BatchGet::Typed {
+                key: *pk,
+                kind: TypedKind::IndexSegment,
+            });
         }
 
-        // 2) raw load of all needed data blobs (borrowed slices, zero-copy)
+        // 2) raw load of all needed data blobs (dedup)
         let mut data_keys: Vec<PhysicalKey> = Vec::with_capacity(per_seg.len());
         let mut seen_data: HashSet<PhysicalKey> = HashSet::new();
         for v in per_seg.values() {
-            let data_pk = v.0; // Copy (PhysicalKey is u64)
+            let data_pk = v.0;
             if seen_data.insert(data_pk) {
                 data_keys.push(data_pk);
             }
         }
+        for pk in &data_keys {
+            gets.push(BatchGet::Raw { key: *pk });
+        }
 
-        let data_slices: Vec<&'s [u8]> = self.pager.batch_get_raw(&data_keys);
+        let resp = self.pager.batch(&BatchRequest { puts: vec![], gets });
+
+        // Partition response into typed segments and raw data slices.
+        let mut seg_map: HashMap<PhysicalKey, IndexSegment> =
+            HashMap::with_capacity(seg_keys.len());
         let mut data_map: HashMap<PhysicalKey, &'s [u8]> = HashMap::with_capacity(data_keys.len());
-        for (i, pk) in data_keys.iter().enumerate() {
-            data_map.insert(*pk, data_slices[i]);
+
+        for gr in resp.get_results {
+            match gr {
+                GetResult::Typed {
+                    key,
+                    value: TypedValue::IndexSegment(seg),
+                } => {
+                    seg_map.insert(key, seg);
+                }
+                GetResult::Raw { key, bytes } => {
+                    data_map.insert(key, bytes);
+                }
+                _ => {}
+            }
         }
 
         // -------- execution: binary search inside segments and slice values ----
@@ -633,17 +744,31 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         // --- bootstrap + manifest (raw sizes)
         let bootstrap_key: PhysicalKey = self.bootstrap_key;
         let mut header_keys = vec![bootstrap_key, self.manifest_key];
-        let header_raw = self.pager.batch_get_raw(&header_keys);
+
+        // Fetch raw bytes for bootstrap + manifest in one batch.
+        let gets = header_keys
+            .iter()
+            .map(|k| BatchGet::Raw { key: *k })
+            .collect::<Vec<_>>();
+        let resp = self.pager.batch(&BatchRequest { puts: vec![], gets });
+
+        let mut raw_len_map: HashMap<PhysicalKey, usize> = HashMap::new();
+        for gr in resp.get_results {
+            if let GetResult::Raw { key, bytes } = gr {
+                raw_len_map.insert(key, bytes.len());
+            }
+        }
+
         // bootstrap
         out.push(StorageNode {
             pk: bootstrap_key,
-            stored_len: header_raw[0].len(),
+            stored_len: *raw_len_map.get(&bootstrap_key).unwrap_or(&0),
             kind: StorageKind::Bootstrap,
         });
         // manifest
         out.push(StorageNode {
             pk: self.manifest_key,
-            stored_len: header_raw[1].len(),
+            stored_len: *raw_len_map.get(&self.manifest_key).unwrap_or(&0),
             kind: StorageKind::Manifest {
                 column_count: self.manifest.columns.len(),
             },
@@ -664,26 +789,52 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             HashMap::new();
 
         if !col_index_pks.is_empty() {
-            let colindex_raw = self.pager.batch_get_raw(&col_index_pks);
-            let colindices: Vec<ColumnIndex> =
-                self.pager.batch_get_typed::<ColumnIndex>(&col_index_pks);
-
-            for (i, ci) in colindices.into_iter().enumerate() {
-                let pk = col_index_pks[i];
-                field_for_colindex.insert(pk, ci.field_id);
-                colindex_nodes.push(StorageNode {
-                    pk,
-                    stored_len: colindex_raw[i].len(),
-                    kind: StorageKind::ColumnIndex {
-                        field_id: ci.field_id,
-                        n_segments: ci.segments.len() as usize,
-                    },
+            // Combined batch: raw + typed for each ColumnIndex key
+            let mut gets: Vec<BatchGet> = Vec::with_capacity(col_index_pks.len() * 2);
+            for pk in &col_index_pks {
+                gets.push(BatchGet::Raw { key: *pk });
+                gets.push(BatchGet::Typed {
+                    key: *pk,
+                    kind: TypedKind::ColumnIndex,
                 });
+            }
+            let resp = self.pager.batch(&BatchRequest { puts: vec![], gets });
 
-                // collect segment index pkeys and owners
-                for sref in ci.segments {
-                    all_seg_index_pks.push(sref.index_physical_key);
-                    seg_owner_colindex.insert(sref.index_physical_key, (ci.field_id, pk));
+            let mut colindex_raw_len: HashMap<PhysicalKey, usize> = HashMap::new();
+            let mut colindices_by_pk: HashMap<PhysicalKey, ColumnIndex> = HashMap::new();
+
+            for gr in resp.get_results {
+                match gr {
+                    GetResult::Raw { key, bytes } => {
+                        colindex_raw_len.insert(key, bytes.len());
+                    }
+                    GetResult::Typed {
+                        key,
+                        value: TypedValue::ColumnIndex(ci),
+                    } => {
+                        colindices_by_pk.insert(key, ci);
+                    }
+                    _ => {}
+                }
+            }
+
+            for pk in &col_index_pks {
+                if let Some(ci) = colindices_by_pk.get(pk) {
+                    field_for_colindex.insert(*pk, ci.field_id);
+                    colindex_nodes.push(StorageNode {
+                        pk: *pk,
+                        stored_len: *colindex_raw_len.get(pk).unwrap_or(&0),
+                        kind: StorageKind::ColumnIndex {
+                            field_id: ci.field_id,
+                            n_segments: ci.segments.len() as usize,
+                        },
+                    });
+
+                    // collect segment index pkeys and owners
+                    for sref in &ci.segments {
+                        all_seg_index_pks.push(sref.index_physical_key);
+                        seg_owner_colindex.insert(sref.index_physical_key, (ci.field_id, *pk));
+                    }
                 }
             }
         }
@@ -696,54 +847,79 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         let mut seg_nodes: Vec<StorageNode> = Vec::new();
 
         if !all_seg_index_pks.is_empty() {
-            let seg_raw = self.pager.batch_get_raw(&all_seg_index_pks);
-            let segs: Vec<IndexSegment> = self
-                .pager
-                .batch_get_typed::<IndexSegment>(&all_seg_index_pks);
-
-            for (i, seg) in segs.into_iter().enumerate() {
-                let seg_pk = all_seg_index_pks[i];
-                let (field_id, owner_colindex_pk) =
-                    seg_owner_colindex.get(&seg_pk).cloned().unwrap();
-
-                // book-keep data blob for later
-                data_pkeys.push(seg.data_physical_key);
-                owner_for_data.insert(seg.data_physical_key, seg_pk);
-
-                // compute layout info
-                let key_bytes = seg.logical_key_bytes.len();
-                let key_offs_bytes =
-                    seg.logical_key_offsets.len() * std::mem::size_of::<IndexEntryCount>();
-                let (kind, fixed_width, value_meta_bytes) = match &seg.value_layout {
-                    ValueLayout::FixedWidth { width } => {
-                        ("fixed", Some(*width), std::mem::size_of::<u32>())
-                    }
-                    ValueLayout::Variable { value_offsets } => (
-                        "variable",
-                        None,
-                        value_offsets.len() * std::mem::size_of::<u32>(),
-                    ),
-                };
-
-                let layout = IndexLayoutInfo {
-                    kind,
-                    fixed_width,
-                    key_bytes,
-                    key_offs_bytes,
-                    value_meta_bytes,
-                };
-
-                seg_nodes.push(StorageNode {
-                    pk: seg_pk,
-                    stored_len: seg_raw[i].len(),
-                    kind: StorageKind::IndexSegment {
-                        field_id,
-                        n_entries: seg.n_entries,
-                        layout,
-                        data_pkey: seg.data_physical_key,
-                        owner_colindex_pk,
-                    },
+            // Combined batch: raw + typed for each IndexSegment key
+            let mut gets: Vec<BatchGet> = Vec::with_capacity(all_seg_index_pks.len() * 2);
+            for pk in &all_seg_index_pks {
+                gets.push(BatchGet::Raw { key: *pk });
+                gets.push(BatchGet::Typed {
+                    key: *pk,
+                    kind: TypedKind::IndexSegment,
                 });
+            }
+            let resp = self.pager.batch(&BatchRequest { puts: vec![], gets });
+
+            let mut seg_raw_len: HashMap<PhysicalKey, usize> = HashMap::new();
+            let mut segs_by_pk: HashMap<PhysicalKey, IndexSegment> = HashMap::new();
+
+            for gr in resp.get_results {
+                match gr {
+                    GetResult::Raw { key, bytes } => {
+                        seg_raw_len.insert(key, bytes.len());
+                    }
+                    GetResult::Typed {
+                        key,
+                        value: TypedValue::IndexSegment(seg),
+                    } => {
+                        segs_by_pk.insert(key, seg);
+                    }
+                    _ => {}
+                }
+            }
+
+            for pk in &all_seg_index_pks {
+                if let Some(seg) = segs_by_pk.get(pk) {
+                    let (field_id, owner_colindex_pk) =
+                        seg_owner_colindex.get(pk).cloned().unwrap();
+
+                    // book-keep data blob for later
+                    data_pkeys.push(seg.data_physical_key);
+                    owner_for_data.insert(seg.data_physical_key, *pk);
+
+                    // compute layout info
+                    let key_bytes = seg.logical_key_bytes.len();
+                    let key_offs_bytes =
+                        seg.logical_key_offsets.len() * std::mem::size_of::<IndexEntryCount>();
+                    let (kind, fixed_width, value_meta_bytes) = match &seg.value_layout {
+                        ValueLayout::FixedWidth { width } => {
+                            ("fixed", Some(*width), std::mem::size_of::<u32>())
+                        }
+                        ValueLayout::Variable { value_offsets } => (
+                            "variable",
+                            None,
+                            value_offsets.len() * std::mem::size_of::<u32>(),
+                        ),
+                    };
+
+                    let layout = IndexLayoutInfo {
+                        kind,
+                        fixed_width,
+                        key_bytes,
+                        key_offs_bytes,
+                        value_meta_bytes,
+                    };
+
+                    seg_nodes.push(StorageNode {
+                        pk: *pk,
+                        stored_len: *seg_raw_len.get(pk).unwrap_or(&0),
+                        kind: StorageKind::IndexSegment {
+                            field_id,
+                            n_entries: seg.n_entries,
+                            layout,
+                            data_pkey: seg.data_physical_key,
+                            owner_colindex_pk,
+                        },
+                    });
+                }
             }
         }
 
@@ -751,12 +927,24 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
         // --- data blobs (raw only)
         if !data_pkeys.is_empty() {
-            let data_raw = self.pager.batch_get_raw(&data_pkeys);
-            for (i, dpk) in data_pkeys.iter().enumerate() {
-                let owner = *owner_for_data.get(dpk).unwrap();
+            let gets = data_pkeys
+                .iter()
+                .map(|k| BatchGet::Raw { key: *k })
+                .collect::<Vec<_>>();
+            let resp = self.pager.batch(&BatchRequest { puts: vec![], gets });
+
+            let mut data_len: HashMap<PhysicalKey, usize> = HashMap::new();
+            for gr in resp.get_results {
+                if let GetResult::Raw { key, bytes } = gr {
+                    data_len.insert(key, bytes.len());
+                }
+            }
+
+            for dpk in data_pkeys {
+                let owner = *owner_for_data.get(&dpk).unwrap();
                 out.push(StorageNode {
-                    pk: *dpk,
-                    stored_len: data_raw[i].len(),
+                    pk: dpk,
+                    stored_len: *data_len.get(&dpk).unwrap_or(&0),
                     kind: StorageKind::DataBlob {
                         owner_index_pk: owner,
                     },
@@ -958,56 +1146,9 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 mod tests {
     use super::*;
     use bitcode::{Decode, Encode};
-    use std::collections::HashMap;
 
-    // in-memory pager for tests
-    struct MemPager {
-        map: HashMap<PhysicalKey, Vec<u8>>,
-        next: PhysicalKey,
-    }
-
-    impl Default for MemPager {
-        fn default() -> Self {
-            Self {
-                map: HashMap::new(),
-                next: 1, // reserve 0 for bootstrap
-            }
-        }
-    }
-
-    impl Pager for MemPager {
-        fn alloc_many(&mut self, n: usize) -> Vec<PhysicalKey> {
-            let start = self.next;
-            self.next += n as u64;
-            (0..n).map(|i| start + i as u64).collect()
-        }
-        fn batch_put_raw(&mut self, items: &[(PhysicalKey, Vec<u8>)]) {
-            for (k, v) in items {
-                self.map.insert(*k, v.clone());
-            }
-        }
-        fn batch_get_raw<'a>(&'a self, keys: &[PhysicalKey]) -> Vec<&'a [u8]> {
-            keys.iter()
-                .map(|k| self.map.get(k).expect("missing key").as_slice())
-                .collect()
-        }
-        fn batch_put_typed<T: Encode>(&mut self, items: &[(PhysicalKey, T)]) {
-            let enc: Vec<(PhysicalKey, Vec<u8>)> = items
-                .iter()
-                .map(|(k, v)| (*k, bitcode::encode(v)))
-                .collect();
-            self.batch_put_raw(&enc);
-        }
-        fn batch_get_typed<T>(&self, keys: &[PhysicalKey]) -> Vec<T>
-        where
-            for<'a> T: Decode<'a>,
-        {
-            self.batch_get_raw(keys)
-                .into_iter()
-                .map(|b| bitcode::decode(b).expect("decode fail"))
-                .collect()
-        }
-    }
+    // Use the unified in-memory pager from the pager module.
+    use crate::pager::MemPager;
 
     #[test]
     fn put_get_fixed_auto() {

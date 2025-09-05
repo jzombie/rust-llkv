@@ -1,68 +1,62 @@
-use bitcode::{Decode, Encode};
+//! # Benchmark: Build Many Columns (fixed-width, one segment per column)
+//!
+//! **Purpose**  
+//! Stress the *metadata construction path* by creating lots of columns quickly.
+//! Each column receives exactly one sealed `IndexSegment` (fixed-width values) and a
+//! `ColumnIndex` pointing to it, then we write a single `Manifest` and `Bootstrap`.
+//! This isolates the cost of **allocating keys**, **encoding/decoding typed blobs**,
+//! and **batched puts** without mixing in high-volume value writes.
+//!
+//! **What it does**  
+//! - Parameterized by:
+//!   - `columns` (e.g., 5k, 50k), i.e., how many columns to create.
+//!   - `entries_per_col` (e.g., 8, 64, 128), i.e., logical rows per column.
+//!   - `value_width` (e.g., 8), i.e., fixed width for every value in that column.
+//!   - `chunk_cols` (e.g., 2,048): columns processed per loop to cap peak allocations.
+//! - For each chunk of columns:
+//!   1. Allocate **3 keys per column**: data blob key, index segment key, column index key.
+//!   2. Build an `IndexSegment::build_fixed` for that column (one per column).
+//!   3. Build a `ColumnIndex` that contains a single `IndexSegmentRef` (newest-first list).
+//!   4. Persist all segments and column indexes in **one unified batch** (mixed typed puts).
+//! - After all chunks: write **one `Manifest`** containing all column entries and **`Bootstrap`**
+//!   (physical key 0) in a **single batch**.
+//!
+//! **What it measures**  
+//! - Overhead of creating large numbers of small typed objects (`IndexSegment`, `ColumnIndex`,
+//!   `Manifest`, `Bootstrap`) and shuttling them through the **unified pager batch**.
+//! - Effectiveness of batching: we minimize round-trips by staging puts into a single
+//!   `BatchRequest` per chunk (and once more at the end for `Manifest` + `Bootstrap`).
+//!
+//! **Why fixed-width + one segment per column?**  
+//! - Keeps the test simple and deterministic (no variable-width offset building).
+//! - Focuses on index+manifest object counts and encoding costs rather than data slicing.
+//!
+//! **Knobs to tweak**  
+//! - `columns`: increase to stress the manifest and the volume of typed puts.
+//! - `entries_per_col`: increases `logical_key_bytes` and offsets size per segment.
+//! - `chunk_cols`: trade off peak memory vs. number of unified batches.
+//! - `value_width`: impacts how large each data blob *would* be (opaque here).
+//!
+//! **Interpreting results**  
+//! - Larger `chunk_cols` ⇒ fewer batch calls, larger per-batch payloads.
+//! - More `columns` or more `entries_per_col` ⇒ more/larger typed blobs;
+//!   timings should scale roughly with total bytes encoded + map insertions.
+//!
+//! **Caveats**  
+//! - Uses an in-memory pager; it exercises encode/decode and batching but not I/O latency.
+//! - Data blobs are treated as opaque; this benchmark targets **metadata path**, not reads.
+//! ```
+
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use llkv_column_map::index::{
     Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, Manifest,
 };
-use llkv_column_map::pager::Pager;
+use llkv_column_map::pager::{BatchPut, BatchRequest, MemPager, Pager, TypedValue};
 use llkv_column_map::types::{LogicalFieldId, LogicalKeyBytes, PhysicalKey};
-use std::collections::HashMap;
 use std::hint::black_box;
 
 /// Physical key reserved for the tiny bootstrap record.
 const BOOTSTRAP_PKEY: PhysicalKey = 0;
-
-/// A tiny in-memory pager used for the benchmark (batch-only API).
-struct MemPager {
-    map: HashMap<PhysicalKey, Vec<u8>>,
-    next: PhysicalKey,
-}
-
-impl Default for MemPager {
-    fn default() -> Self {
-        Self {
-            map: HashMap::new(),
-            next: 1,
-        } // reserve 0 for Bootstrap
-    }
-}
-
-impl Pager for MemPager {
-    fn alloc_many(&mut self, n: usize) -> Vec<PhysicalKey> {
-        let start = self.next;
-        self.next += n as u64;
-        (0..n).map(|i| start + i as u64).collect()
-    }
-
-    fn batch_put_raw(&mut self, items: &[(PhysicalKey, Vec<u8>)]) {
-        for (k, v) in items {
-            self.map.insert(*k, v.clone());
-        }
-    }
-
-    fn batch_get_raw<'a>(&'a self, keys: &[PhysicalKey]) -> Vec<&'a [u8]> {
-        keys.iter()
-            .map(|k| self.map.get(k).expect("missing key").as_slice())
-            .collect()
-    }
-
-    fn batch_put_typed<T: Encode>(&mut self, items: &[(PhysicalKey, T)]) {
-        let mut enc: Vec<(PhysicalKey, Vec<u8>)> = Vec::with_capacity(items.len());
-        for (k, v) in items {
-            enc.push((*k, bitcode::encode(v)));
-        }
-        self.batch_put_raw(&enc);
-    }
-
-    fn batch_get_typed<T>(&self, keys: &[PhysicalKey]) -> Vec<T>
-    where
-        for<'a> T: Decode<'a>,
-    {
-        self.batch_get_raw(keys)
-            .into_iter()
-            .map(|b| bitcode::decode(b).expect("bitcode decode failed"))
-            .collect()
-    }
-}
 
 /// Make monotonically increasing numeric logical keys (already sorted).
 #[inline]
@@ -141,29 +135,46 @@ fn build_many_columns_fixed_width(
             next_field_id = next_field_id.wrapping_add(1);
         }
 
-        // Persist the two homogenous batches.
-        pager.batch_put_typed::<IndexSegment>(&seg_puts);
-        pager.batch_put_typed::<ColumnIndex>(&colidx_puts);
+        // Persist the two homogenous batches in ONE unified batch call.
+        let mut puts: Vec<BatchPut> = Vec::with_capacity(seg_puts.len() + colidx_puts.len());
+        for (k, seg) in seg_puts {
+            puts.push(BatchPut::Typed {
+                key: k,
+                value: TypedValue::IndexSegment(seg),
+            });
+        }
+        for (k, colidx) in colidx_puts {
+            puts.push(BatchPut::Typed {
+                key: k,
+                value: TypedValue::ColumnIndex(colidx),
+            });
+        }
+        let _ = pager.batch(&BatchRequest { puts, gets: vec![] });
 
         remaining -= batch;
     }
 
-    // Write Manifest and Bootstrap (key 0).
-    pager.batch_put_typed::<Manifest>(&[(
-        manifest_pkey,
-        Manifest {
-            columns: manifest_entries,
-        },
-    )]);
-    pager.batch_put_typed::<Bootstrap>(&[(
-        BOOTSTRAP_PKEY,
-        Bootstrap {
-            manifest_physical_key: manifest_pkey,
-        },
-    )]);
+    // Write Manifest and Bootstrap (key 0) in a single batch.
+    let _ = pager.batch(&BatchRequest {
+        puts: vec![
+            BatchPut::Typed {
+                key: manifest_pkey,
+                value: TypedValue::Manifest(Manifest {
+                    columns: manifest_entries,
+                }),
+            },
+            BatchPut::Typed {
+                key: BOOTSTRAP_PKEY,
+                value: TypedValue::Bootstrap(Bootstrap {
+                    manifest_physical_key: manifest_pkey,
+                }),
+            },
+        ],
+        gets: vec![],
+    });
 
     // Keep side-effects alive for the optimizer.
-    black_box(pager);
+    black_box(manifest_pkey);
 }
 
 fn criterion_build_columns(c: &mut Criterion) {
