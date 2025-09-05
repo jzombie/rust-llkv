@@ -94,7 +94,7 @@ pub struct IndexSegment {
 impl IndexSegment {
     pub fn build_fixed(
         data_pkey: PhysicalKey,
-        logical_keys: Vec<LogicalKeyBytes>,
+        logical_keys: Vec<Vec<u8>>,
         width: u32,
     ) -> IndexSegment {
         let n = logical_keys.len() as u32;
@@ -113,7 +113,7 @@ impl IndexSegment {
 
     pub fn build_var(
         data_pkey: PhysicalKey,
-        logical_keys: Vec<LogicalKeyBytes>,
+        logical_keys: Vec<Vec<u8>>,
         value_sizes: &[u32], // one per entry
     ) -> IndexSegment {
         assert_eq!(logical_keys.len(), value_sizes.len());

@@ -476,6 +476,7 @@ name = "llkv-column-map"
 version = "0.1.0-alpha"
 dependencies = [
  "bitcode",
+ "criterion",
 ]
 
 [[package]]

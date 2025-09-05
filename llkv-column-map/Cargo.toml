@@ -9,3 +9,10 @@ publish.workspace = true
 
 [dependencies]
 bitcode = "0.6.7"
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "column_map_bench"
+harness = false
