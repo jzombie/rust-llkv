@@ -16,6 +16,45 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+/// Zero-copy view into a subrange of an Arc-backed data blob.
+/// Holds the Arc and byte offsets; derefs to `[u8]` without copying.
+#[derive(Clone, Debug)]
+pub struct ValueSlice {
+    data: Arc<[u8]>,
+    start: crate::types::ByteOffset,
+    end: crate::types::ByteOffset, // exclusive
+}
+
+impl ValueSlice {
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[self.start as usize..self.end as usize]
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        (self.end - self.start) as usize
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl std::ops::Deref for ValueSlice {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for ValueSlice {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct IndexLayoutInfo {
     pub kind: &'static str,             // "fixed" or "variable" (value layout)
@@ -667,14 +706,16 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     pub fn get_many(
         &self,
         items: Vec<(LogicalFieldId, Vec<LogicalKeyBytes>)>,
-    ) -> Vec<Vec<Option<Arc<[u8]>>>> {
+    ) -> Vec<Vec<Option<ValueSlice>>> {
         if items.is_empty() {
             return Vec::new();
         }
 
         // Pre-size outputs: one vector per input, one slot per key.
-        let mut results: Vec<Vec<Option<Arc<[u8]>>>> =
-            items.iter().map(|(_, ks)| vec![None; ks.len()]).collect();
+        let mut results: Vec<Vec<Option<ValueSlice>>> = items
+            .iter()
+            .map(|(_, ks)| vec![Option::<ValueSlice>::None; ks.len()])
+            .collect();
 
         // -------- ensure ColumnIndex in cache for all referenced fields --------
         let mut need_fids: FxHashSet<LogicalFieldId> = FxHashSet::with_hasher(Default::default());
@@ -827,21 +868,28 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     seg.n_entries as usize,
                     target,
                 ) {
-                    let arc_slice: Arc<[u8]> = match &seg.value_layout {
+                    let view = match &seg.value_layout {
                         ValueLayout::FixedWidth { width } => {
                             let w = *width as usize;
                             let a = pos * w;
                             let b = a + w;
-                            // Owned Arc for the value bytes (safe for &self).
-                            Arc::from(&data_blob[a..b])
+                            ValueSlice {
+                                data: Arc::clone(data_blob),
+                                start: a as crate::types::ByteOffset,
+                                end: b as crate::types::ByteOffset,
+                            }
                         }
                         ValueLayout::Variable { value_offsets } => {
-                            let a = value_offsets[pos] as usize;
-                            let b = value_offsets[pos + 1] as usize;
-                            Arc::from(&data_blob[a..b])
+                            let a = value_offsets[pos] as crate::types::ByteOffset;
+                            let b = value_offsets[pos + 1] as crate::types::ByteOffset;
+                            ValueSlice {
+                                data: Arc::clone(data_blob),
+                                start: a,
+                                end: b,
+                            }
                         }
                     };
-                    results[qi][kj] = Some(arc_slice);
+                    results[qi][kj] = Some(view);
                 }
             }
         }

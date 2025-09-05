@@ -11,10 +11,8 @@
 //!
 //! “cells” = number of (key,value) entries written, i.e., len(items) per column.
 
-use std::sync::Arc;
-
 use llkv_column_map::{
-    AppendOptions, ColumnStore, Put, ValueMode, pager::MemPager, types::LogicalFieldId,
+    AppendOptions, ColumnStore, Put, ValueMode, ValueSlice, pager::MemPager, types::LogicalFieldId,
 };
 
 // -------- simple key/value generators ---------------------------------------
@@ -206,8 +204,7 @@ fn fmt_key(k: &[u8]) -> String {
 fn print_read_report(
     heading: &str,
     queries: &[(Fid, Vec<Vec<u8>>)],
-    // NOTE: get_many now returns Arc<[u8]> for lock-free reads without tying lifetimes.
-    results: &[Vec<Option<Arc<[u8]>>>],
+    results: &[Vec<Option<ValueSlice>>],
 ) {
     println!("-- {} --", heading);
     for (i, (fid, ks)) in queries.iter().enumerate() {
