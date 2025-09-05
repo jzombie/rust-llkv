@@ -2,6 +2,7 @@ use bitcode::{Decode, Encode};
 
 pub mod types;
 use types::{IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey};
+pub mod pager;
 
 // ── Bootstrapping ────────────────────────────────────────────────────────────
 // Physical key 0 holds this tiny record so you can find the manifest.
@@ -88,6 +89,7 @@ pub enum ValueLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pager::Pager;
     use bitcode::{Decode, Encode};
     use std::collections::HashMap;
 
@@ -109,7 +111,7 @@ mod tests {
         }
     }
 
-    impl MemPager {
+    impl Pager for MemPager {
         // -------- allocation (batched only) --------
         fn alloc_many(&mut self, n: usize) -> Vec<PhysicalKey> {
             let start = self.next;
