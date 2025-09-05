@@ -1523,4 +1523,84 @@ mod tests {
             .sum();
         assert_eq!(total_entries_for_fid, 3);
     }
+
+    fn be_key(v: u64) -> Vec<u8> {
+        v.to_be_bytes().to_vec()
+    }
+
+    #[test]
+    fn key_based_segment_pruning_uses_min_max_and_is_inclusive() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 1234;
+
+        // Two disjoint segments for same column:
+        //   seg A covers [0..100)      (keys 0..99)
+        //   seg B covers [200..300)    (keys 200..299)
+        // Make values fixed 4B to keep things simple.
+
+        // Build segment A
+        let items_a: Vec<(Vec<u8>, Vec<u8>)> = (0u64..100u64)
+            .map(|k| (be_key(k), vec![0xAA, 0, 0, 0]))
+            .collect();
+        store.append_many(
+            vec![Put {
+                field_id: fid,
+                items: items_a,
+            }],
+            AppendOptions {
+                mode: ValueMode::ForceFixed(4),
+                segment_max_entries: 10_000,
+                segment_max_bytes: 1_000_000,
+                last_write_wins_in_batch: true,
+            },
+        );
+
+        // Build segment B (newest)
+        let items_b: Vec<(Vec<u8>, Vec<u8>)> = (200u64..300u64)
+            .map(|k| (be_key(k), vec![0xBB, 0, 0, 0]))
+            .collect();
+        store.append_many(
+            vec![Put {
+                field_id: fid,
+                items: items_b,
+            }],
+            AppendOptions {
+                mode: ValueMode::ForceFixed(4),
+                segment_max_entries: 10_000,
+                segment_max_bytes: 1_000_000,
+                last_write_wins_in_batch: true,
+            },
+        );
+
+        // ------------- Query hits ONLY seg B ----------------
+        store.reset_io_stats();
+        let got = store.get_many(vec![(fid, vec![be_key(250)])]);
+        assert_eq!(got[0][0].as_deref().unwrap(), &[0xBB, 0, 0, 0]);
+
+        // Because of pruning, we should fetch exactly 1 IndexSegment (typed) and 1 data blob (raw)
+        let s = store.io_stats();
+        assert_eq!(
+            s.get_typed_ops, 1,
+            "should load only the matching index segment"
+        );
+        assert_eq!(s.get_raw_ops, 1, "should load only one data blob");
+
+        // ------------- Inclusivity: min & max are hits -------
+        store.reset_io_stats();
+        let got = store.get_many(vec![(fid, vec![be_key(200), be_key(299)])]);
+        assert_eq!(got[0][0].as_deref().unwrap(), &[0xBB, 0, 0, 0]); // min
+        assert_eq!(got[0][1].as_deref().unwrap(), &[0xBB, 0, 0, 0]); // max
+        let s = store.io_stats();
+        assert_eq!(s.get_typed_ops, 1);
+        assert_eq!(s.get_raw_ops, 1);
+
+        // ------------- Query hits ONLY seg A ----------------
+        store.reset_io_stats();
+        let got = store.get_many(vec![(fid, vec![be_key(5)])]);
+        assert_eq!(got[0][0].as_deref().unwrap(), &[0xAA, 0, 0, 0]);
+        let s = store.io_stats();
+        assert_eq!(s.get_typed_ops, 1);
+        assert_eq!(s.get_raw_ops, 1);
+    }
 }

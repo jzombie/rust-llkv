@@ -675,4 +675,49 @@ mod tests {
             _ => panic!("expected variable key layout"),
         }
     }
+
+    #[test]
+    fn min_max_fixed_width_keys() {
+        // three 8-byte big-endian u64 keys: 1, 5, 9
+        let keys = vec![
+            1u64.to_be_bytes().to_vec(),
+            9u64.to_be_bytes().to_vec(),
+            5u64.to_be_bytes().to_vec(),
+        ];
+        let seg = IndexSegment::build_fixed(123, keys, 4 /* any width for values */);
+        // bounds must be inclusive and lexicographic
+        assert_eq!(seg.logical_key_min, 1u64.to_be_bytes().to_vec());
+        assert_eq!(seg.logical_key_max, 9u64.to_be_bytes().to_vec());
+        // layout must be FixedWidth for keys too (since all keys same length)
+        match seg.key_layout {
+            KeyLayout::FixedWidth { width } => {
+                // 8 bytes per logical key
+                assert_eq!(width, 8);
+            }
+            _ => panic!("expected fixed-width key layout"),
+        }
+    }
+
+    #[test]
+    fn min_max_variable_width_keys() {
+        // mixed-length keys -> variable layout for keys
+        let keys = vec![
+            b"a".to_vec(),
+            b"wolf".to_vec(),
+            b"zebra".to_vec(),
+            b"ant".to_vec(),
+        ];
+        let sizes = vec![1u32; keys.len()]; // dummy value sizes
+        let seg = IndexSegment::build_var(777, keys, &sizes);
+        // "a" .. "zebra", lexicographic order
+        assert_eq!(seg.logical_key_min, b"a".to_vec());
+        assert_eq!(seg.logical_key_max, b"zebra".to_vec());
+        match seg.key_layout {
+            KeyLayout::Variable { ref key_offsets } => {
+                // one extra offset than entries
+                assert_eq!(key_offsets.len(), seg.n_entries as usize + 1);
+            }
+            _ => panic!("expected variable key layout"),
+        }
+    }
 }
