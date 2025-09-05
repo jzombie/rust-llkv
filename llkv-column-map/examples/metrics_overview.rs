@@ -1,98 +1,237 @@
-//! Example: observing pager-hit metrics collected by ColumnStore (IoStats).
+//! Example: phase-by-phase I/O stats + clear “how much data we wrote” lines.
 //!
-//! What this does:
-//! 1) Initializes an empty store (Bootstrap->Manifest).
-//! 2) Appends fixed-width columns in one batch.
-//! 3) Appends variable-width columns (chunked) in one batch.
-//! 4) Adds new columns later (forces a Manifest update).
-//! 5) Performs a mixed append across existing + new columns at once.
-//! 6) Runs a multi-column read with `get_many`.
-//! 7) Calls `render_storage_ascii` to show current on-disk layout
-//!    (note: this also issues pager gets, and you’ll see the extra metrics).
+//! For each phase we print ONLY the I/O done in that phase by snapshotting
+//! cumulative stats before/after and printing the difference. No delta API
+//! is required.
 //!
-//! After each phase we print the IoStats counters and reset them so you can
-//! see the cost of just that phase.
+//! Output per phase now includes a data summary like:
+//!   data: 2 columns × 10,000 rows/col = 20,000 cells
+//! or, when counts differ across columns:
+//!   data: 2 columns; cells per column = {100:3, 999:10} (total=13)
+//!
+//! “cells” = number of (key,value) entries written, i.e., len(items) per column.
 
-use llkv_column_map::{AppendOptions, ColumnStore, Put, ValueMode, pager::MemPager};
+use llkv_column_map::{
+    AppendOptions, ColumnStore, Put, ValueMode, pager::MemPager, types::LogicalFieldId,
+};
 
-type Field = u32;
+// -------- simple key/value generators ---------------------------------------
 
-// ---------- tiny helpers to build synthetic data ----------
-
-#[inline]
-fn be_key(row: u64) -> Vec<u8> {
-    row.to_be_bytes().to_vec()
+fn be_key(v: u64) -> Vec<u8> {
+    v.to_be_bytes().to_vec()
 }
 
-/// Fixed-width value of exactly `w` bytes, deterministically derived from (row, field).
-fn fixed_value(row: u64, field: Field, w: usize) -> Vec<u8> {
+fn fixed_value(row: u64, field: u32, width: usize) -> Vec<u8> {
+    // Stable 8-byte seed then repeat/truncate to requested width
     let seed = (row ^ field as u64).to_le_bytes();
-    if w <= 8 {
-        seed[..w].to_vec()
+    if width <= 8 {
+        seed[..width].to_vec()
     } else {
-        let mut buf = Vec::with_capacity(w);
-        while buf.len() < w {
-            let take = std::cmp::min(8, w - buf.len());
-            buf.extend_from_slice(&seed[..take]);
+        let mut out = Vec::with_capacity(width);
+        while out.len() < width {
+            let take = core::cmp::min(8, width - out.len());
+            out.extend_from_slice(&seed[..take]);
         }
-        buf
+        out
     }
 }
 
-/// Variable-length value in [min, max], filled with a repeating byte from (row, field).
-fn var_value(row: u64, field: Field, min: usize, max: usize) -> Vec<u8> {
-    let span = (max - min + 1) as u64;
-    let mix = row
-        .wrapping_mul(1103515245)
-        .wrapping_add(field as u64)
-        .rotate_left(13);
-    let len = (min as u64 + (mix % span)) as usize;
-    let b = (((row as u32).wrapping_add(field)) & 0xFF) as u8;
-    vec![b; len]
-}
-
-/// Build a `Put { field_id, items }` for rows [start, end) with fixed width `w`.
-fn build_put_fixed(field: Field, start: u64, end: u64, w: usize) -> Put {
+fn build_put_fixed(field_id: LogicalFieldId, start: u64, end: u64, width: usize) -> Put {
     let mut items = Vec::with_capacity((end - start) as usize);
     for r in start..end {
-        items.push((be_key(r), fixed_value(r, field, w)));
+        items.push((be_key(r), fixed_value(r, field_id, width)));
     }
-    Put {
-        field_id: field,
-        items,
-    }
+    Put { field_id, items }
 }
 
-/// Build a `Put` for rows [start, end) with variable length values in [min, max].
-fn build_put_var(field: Field, start: u64, end: u64, min: usize, max: usize) -> Put {
+fn build_put_var(field_id: LogicalFieldId, start: u64, end: u64, min: usize, max: usize) -> Put {
     let mut items = Vec::with_capacity((end - start) as usize);
     for r in start..end {
-        items.push((be_key(r), var_value(r, field, min, max)));
+        // pseudo-var length that depends on (row, field)
+        let span = (max - min + 1) as u64;
+        let mix = r
+            .wrapping_mul(1103515245)
+            .wrapping_add(field_id as u64)
+            .rotate_left(13);
+        let len = (min as u64 + (mix % span)) as usize;
+        let byte = (((r as u32).wrapping_add(field_id)) & 0xFF) as u8;
+        items.push((be_key(r), vec![byte; len]));
     }
-    Put {
-        field_id: field,
-        items,
+    Put { field_id, items }
+}
+
+// -------- I/O metric helpers (compute per-phase delta locally) ---------------
+
+#[derive(Clone, Copy, Default)]
+struct Counts {
+    batches: u64,
+    put_raw: u64,
+    put_typed: u64,
+    get_raw: u64,
+    get_typed: u64,
+}
+
+impl core::ops::Sub for Counts {
+    type Output = Counts;
+    fn sub(self, rhs: Counts) -> Counts {
+        Counts {
+            batches: self.batches.saturating_sub(rhs.batches),
+            put_raw: self.put_raw.saturating_sub(rhs.put_raw),
+            put_typed: self.put_typed.saturating_sub(rhs.put_typed),
+            get_raw: self.get_raw.saturating_sub(rhs.get_raw),
+            get_typed: self.get_typed.saturating_sub(rhs.get_typed),
+        }
     }
 }
 
-/// Pretty-print the IoStats and then (optionally) reset them.
-fn show_stats(label: &str, store: &mut ColumnStore<'_, MemPager>, reset_after: bool) {
-    let s = store.io_stats().clone();
-    println!(
-        "\n== {} ==\n  batches: {}\n  puts:   raw={} typed={}\n  gets:   raw={} typed={}",
-        label, s.batches, s.put_raw_ops, s.put_typed_ops, s.get_raw_ops, s.get_typed_ops
-    );
-    if reset_after {
-        store.reset_io_stats();
+// Uses your actual IoStats field names.
+fn read_counts<P: llkv_column_map::pager::Pager>(store: &ColumnStore<'_, P>) -> Counts {
+    let s = store.io_stats(); // cumulative since process start
+    Counts {
+        batches: s.batches as u64,
+        put_raw: s.put_raw_ops as u64,
+        put_typed: s.put_typed_ops as u64,
+        get_raw: s.get_raw_ops as u64,
+        get_typed: s.get_typed_ops as u64,
     }
 }
+
+// -------- “how much data did we write” summary -------------------------------
+
+struct AppendSummary {
+    num_cols: usize,
+    total_cells: usize,
+    // If every column wrote the same number of rows, we fill this.
+    uniform_rows_per_col: Option<usize>,
+    // Always available for the per-column fallback line.
+    per_col: Vec<(LogicalFieldId, usize)>,
+}
+
+fn summarize_puts(puts: &[Put]) -> AppendSummary {
+    let per_col: Vec<(LogicalFieldId, usize)> =
+        puts.iter().map(|p| (p.field_id, p.items.len())).collect();
+    let num_cols = per_col.len();
+    let total_cells: usize = per_col.iter().map(|(_, n)| *n).sum();
+    let uniform_rows_per_col = if num_cols > 0 && per_col.iter().all(|(_, n)| *n == per_col[0].1) {
+        Some(per_col[0].1)
+    } else {
+        None
+    };
+    AppendSummary {
+        num_cols,
+        total_cells,
+        uniform_rows_per_col,
+        per_col,
+    }
+}
+
+fn print_data_summary(label: &str, a: &AppendSummary) {
+    println!("== {} ==", label);
+    match a.uniform_rows_per_col {
+        Some(rows) => {
+            println!(
+                "  data: {} columns × {} rows/col = {} cells",
+                a.num_cols, rows, a.total_cells
+            );
+        }
+        None => {
+            // Compact per-column list
+            print!("  data: {} columns; cells per column = {{", a.num_cols);
+            for (i, (fid, n)) in a.per_col.iter().enumerate() {
+                if i > 0 {
+                    print!(", ");
+                }
+                print!("{}:{}", fid, n);
+            }
+            println!("}} (total={})", a.total_cells);
+        }
+    }
+}
+
+// Prints the phase’s data summary and then the per-phase I/O deltas.
+fn show_phase_with_data<P: llkv_column_map::pager::Pager>(
+    label: &str,
+    store: &ColumnStore<'_, P>,
+    prev: &mut Counts,
+    summary: &AppendSummary,
+) {
+    print_data_summary(label, summary);
+    let now = read_counts(store);
+    let d = now - *prev;
+    println!("  batches: {}", d.batches);
+    println!("  puts:   raw={} typed={}", d.put_raw, d.put_typed);
+    println!("  gets:   raw={} typed={}", d.get_raw, d.get_typed);
+    println!();
+    *prev = now;
+}
+
+// Simple version (no data line), used for phases that don’t write (e.g. init, describe)
+fn show_phase<P: llkv_column_map::pager::Pager>(
+    label: &str,
+    store: &ColumnStore<'_, P>,
+    prev: &mut Counts,
+) {
+    println!("== {} ==", label);
+    let now = read_counts(store);
+    let d = now - *prev;
+    println!("  batches: {}", d.batches);
+    println!("  puts:   raw={} typed={}", d.put_raw, d.put_typed);
+    println!("  gets:   raw={} typed={}", d.get_raw, d.get_typed);
+    println!();
+    *prev = now;
+}
+
+// -------- pretty read report -------------------------------------------------
+
+use llkv_column_map::types::LogicalFieldId as Fid;
+
+fn fmt_key(k: &[u8]) -> String {
+    if k.len() == 8 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(k);
+        format!("u64({})", u64::from_be_bytes(buf))
+    } else {
+        // short hex
+        let mut s = String::with_capacity(k.len() * 2);
+        for b in k {
+            use core::fmt::Write;
+            let _ = write!(s, "{:02x}", b);
+        }
+        format!("hex({})", s)
+    }
+}
+
+fn print_read_report(
+    heading: &str,
+    queries: &[(Fid, Vec<Vec<u8>>)],
+    results: &[Vec<Option<&[u8]>>],
+) {
+    println!("-- {} --", heading);
+    for (i, (fid, ks)) in queries.iter().enumerate() {
+        print!("col {}: ", fid);
+        for (j, k) in ks.iter().enumerate() {
+            match results[i][j] {
+                Some(bytes) => print!("{} → HIT {}B;  ", fmt_key(k), bytes.len()),
+                None => print!("{} → MISSING;  ", fmt_key(k)),
+            }
+        }
+        println!();
+    }
+    println!();
+}
+
+// -------- main walkthrough ---------------------------------------------------
 
 fn main() {
-    // Use the in-memory pager from the crate.
     let mut pager = MemPager::default();
     let mut store = ColumnStore::init_empty(&mut pager);
 
-    // A common append configuration; we’ll tweak the mode per phase.
+    // We'll accumulate a previous snapshot here and compute deltas per phase.
+    let mut prev = read_counts(&store);
+
+    // Phase 0: init (writes manifest+bootstrap before ColumnStore is counting).
+    show_phase("Phase 0: init (bootstrap + manifest)", &store, &mut prev);
+
     let mut opts = AppendOptions {
         mode: ValueMode::Auto,
         segment_max_entries: 16_384,
@@ -100,151 +239,91 @@ fn main() {
         last_write_wins_in_batch: true,
     };
 
-    // ---------------- Phase 1: fixed-width append ----------------
-    // Two columns, each 10_000 rows of width-8 payloads, in one append_many.
+    // ---------------- Phase 1: fixed-width cols 100 & 101 -------------------
     {
-        let puts = vec![
-            build_put_fixed(100, 0, 10_000, 8),
-            build_put_fixed(101, 0, 10_000, 8),
-        ];
-        opts.mode = ValueMode::ForceFixed(8);
+        let put_100 = build_put_fixed(100, 0, 10_000, 8);
+        let put_101 = build_put_fixed(101, 0, 10_000, 8);
+        let puts = vec![put_100, put_101];
+        let summary = summarize_puts(&puts);
         store.append_many(puts, opts.clone());
-        show_stats(
+        show_phase_with_data(
             "Phase 1: append fixed-width cols 100 & 101",
-            &mut store,
-            true,
+            &store,
+            &mut prev,
+            &summary,
         );
     }
 
-    // ---------------- Phase 2: variable-width append (chunked) ----------------
-    // Two columns with variable-length values in [5, 25], still in one append_many.
-    // Chunking will likely split into multiple segments depending on thresholds.
+    // ------------- Phase 2: variable-width cols 200 & 201 (chunked) ---------
     {
-        let puts = vec![
-            build_put_var(200, 0, 12_345, 5, 25),
-            build_put_var(201, 0, 12_345, 5, 25),
-        ];
-        opts.mode = ValueMode::Auto; // let it detect variable width
-        opts.segment_max_entries = 4_000; // encourage multiple segments
-        opts.segment_max_bytes = 128 * 1024;
+        let put_200 = build_put_var(200, 0, 12_345, 6, 18);
+        let put_201 = build_put_var(201, 0, 12_345, 6, 18);
+        let puts = vec![put_200, put_201];
+        let summary = summarize_puts(&puts);
         store.append_many(puts, opts.clone());
-        show_stats(
-            "Phase 2: append variable-width cols 200 & 201 (chunked)",
-            &mut store,
-            true,
+        show_phase_with_data(
+            "Phase 2: append variable-width cols 200 & 201",
+            &store,
+            &mut prev,
+            &summary,
         );
     }
 
-    // ---------------- Phase 3: add new columns later ----------------
-    // This will cause a Manifest update and new ColumnIndex blobs to be created.
+    // ------- Phase 3: add new columns later (forces Manifest update) --------
     {
-        let puts = vec![
-            build_put_fixed(300, 0, 2_000, 4),
-            build_put_var(301, 0, 2_000, 50, 200),
-        ];
-        opts.mode = ValueMode::Auto;
+        let put_300 = build_put_fixed(300, 0, 2_000, 8);
+        let put_301 = build_put_var(301, 0, 2_000, 10, 30);
+        let puts = vec![put_300, put_301];
+        let summary = summarize_puts(&puts);
         store.append_many(puts, opts.clone());
-        show_stats(
-            "Phase 3: append new cols 300 (fixed) & 301 (var) — forces Manifest update",
-            &mut store,
-            true,
+        show_phase_with_data(
+            "Phase 3: append new cols 300 (fixed) & 301 (var) — updates Manifest",
+            &store,
+            &mut prev,
+            &summary,
         );
     }
 
-    // ---------------- Phase 4: mixed append into existing + new ----------------
+    // ---- Phase 4: mixed append: existing (100) + brand-new (999) -----------
     {
-        // We intentionally write ONLY three keys for column 100 (5, 7, 9).
-        // Later, if the probe asks for any other key in col 100, it will (correctly) be MISSING.
-        //
-        // Also demonstrate "last-write-wins" inside a single Put: we first stage a different
-        // value for key=7, then overwrite it before the append. Only the LAST value for the
-        // same logical key is kept within the batch (dedup happens before layout is chosen).
-        let mut items_100 = vec![
-            (be_key(5), fixed_value(5, 100, 8)),
-            (be_key(7), b"OVERWRITE7!".to_vec()), // temp; will be replaced to keep width=8
-            (be_key(9), fixed_value(9, 100, 8)),
-        ];
-        // Keep column 100 fixed-width (8 bytes). If we left "OVERWRITE7!" (11 bytes),
-        // AUTO layout would flip this chunk to variable width or (with ForceFixed) panic.
-        // By replacing it with an 8-byte value, all three entries are uniform → fixed(8).
-        items_100[1].1 = fixed_value(7, 100, 8);
+        // Existing fixed-width col 100: write 3 specific keys (5,7,9).
         let put_100 = Put {
             field_id: 100,
-            items: items_100,
+            items: vec![
+                (be_key(5), fixed_value(5, 100, 8)),
+                (be_key(7), fixed_value(7, 100, 8)),
+                (be_key(9), fixed_value(9, 100, 8)),
+            ],
         };
+        // Brand-new variable-width col 999: write 10 keys [1000..1010).
+        let put_999 = build_put_var(999, 1_000, 1_010, 12, 40);
 
-        // New variable-width column 999:
-        // We insert keys in the inclusive range [0, 1233] (i.e., 1_234 keys total).
-        // Any probe against col 999 that asks for a key OUTSIDE that range will be MISSING.
-        //
-        // NOTE on "min/max vs existence":
-        // Segment min/max bounds are a coarse prune. A key can fall within a segment's
-        // logical_key_min..=logical_key_max and STILL be MISSING if that exact logical key
-        // isn't present in the segment (binary search returns None). That's expected.
-        let put_999 = build_put_var(999, 0, 1_234, 10, 30);
-
-        // IMPORTANT: use Auto so each put chooses its own layout independently:
-        // - col 100 chunk stays fixed(8)
-        // - col 999 chunk becomes variable (10..30 bytes per value)
-        opts.mode = ValueMode::Auto;
-        store.append_many(vec![put_100, put_999], opts.clone());
-
-        // After this append:
-        // - IoStats "puts typed" includes:
-        //     * 1 IndexSegment for col 100
-        //     * 1 IndexSegment for col 999
-        //     * ColumnIndex rewrites for any columns in cache that changed
-        //     * (and if col 999 was new, a Manifest rewrite)
-        // - Reads that show `MISSING` are usually:
-        //     * a key never written in col 100 (we only wrote 5,7,9 here), or
-        //     * a key outside [0,1233] for col 999, or
-        //     * a key within a segment’s min/max that simply doesn’t exist there
-        //       (min/max is prune-only; exact membership is decided by binary search).
-        show_stats(
+        opts.mode = ValueMode::Auto; // allow mixed fixed/var in one append_many
+        let puts = vec![put_100, put_999];
+        let summary = summarize_puts(&puts);
+        store.append_many(puts, opts.clone());
+        show_phase_with_data(
             "Phase 4: mixed append (existing col 100 + new col 999)",
-            &mut store,
-            true,
+            &store,
+            &mut prev,
+            &summary,
         );
     }
 
-    // ---------------- Phase 5: multi-column read ----------------
-    // Query across multiple fields; internally this batches segment + data loads.
+    // ---------------- Phase 5: multi-column read + describe ------------------
     {
-        let query_items = vec![
-            (
-                100u32,
-                vec![be_key(0), be_key(7), be_key(9), be_key(123456)],
-            ),
-            (200u32, vec![be_key(123), be_key(9999), be_key(12_344)]),
-            (301u32, vec![be_key(100), be_key(1_999), be_key(2_000)]), // last is missing
-            (999u32, vec![be_key(0), be_key(777), be_key(1_233)]),
+        let queries = vec![
+            (100, vec![be_key(5), be_key(7), be_key(9), be_key(255)]), // col 100 has 10k rows → all HIT 8B
+            (200, vec![be_key(1), be_key(2), be_key(3)]),              // var
+            (201, vec![be_key(123), be_key(456), be_key(9_999)]),      // var
+            (999, vec![be_key(1_003), be_key(1_005), be_key(1_007)]), // var; all HIT (we wrote [1000..1010))
         ];
+        let results = store.get_many(queries.iter().map(|(fid, ks)| (*fid, ks.clone())).collect());
+        print_read_report("Read report (get_many)", &queries, &results);
 
-        let results = store.get_many(query_items);
-        // Quick sanity print (don’t spam; just show presence/lengths).
-        println!("\nSome read results (len or MISSING):");
-        for (rowset_i, rowset) in results.iter().enumerate() {
-            print!("  field[{}]:", rowset_i);
-            for v in rowset {
-                match v {
-                    Some(bytes) => print!(" {}", bytes.len()),
-                    None => print!(" MISSING"),
-                }
-            }
-            println!();
-        }
+        let ascii = store.render_storage_ascii(); // triggers raw gets to size nodes
+        println!("\n==== STORAGE ASCII ====\n{}", ascii);
 
-        show_stats("Phase 5: get_many over multiple fields", &mut store, true);
+        show_phase("Phase 5: describe_storage + read report", &store, &mut prev);
     }
-
-    // ---------------- Phase 6: introspection (storage ASCII) ----------------
-    // The `describe_storage`/`render_storage_ascii` are read-only but do issue
-    // batched raw/typed gets internally. We isolate their cost with fresh stats.
-    {
-        let ascii = store.render_storage_ascii();
-        println!("\n--- Storage Layout (ASCII) ---\n{}\n", ascii);
-        show_stats("Phase 6: render_storage_ascii()", &mut store, true);
-    }
-
-    println!("\nDone.");
 }

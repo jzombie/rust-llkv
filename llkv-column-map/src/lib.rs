@@ -800,7 +800,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
         // --- bootstrap + manifest (raw sizes)
         let bootstrap_key: PhysicalKey = self.bootstrap_key;
-        let mut header_keys = vec![bootstrap_key, self.manifest_key];
+        let header_keys = vec![bootstrap_key, self.manifest_key];
 
         // Fetch raw bytes for bootstrap + manifest in one batch.
         let gets = header_keys
