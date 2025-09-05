@@ -10,7 +10,9 @@ pub mod types;
 use crate::index::{
     Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, Manifest, ValueLayout,
 };
-use crate::pager::{BatchGet, BatchPut, BatchRequest, GetResult, Pager, TypedKind, TypedValue};
+use crate::pager::{
+    BatchGet, BatchPut, BatchRequest, BatchResponse, GetResult, Pager, TypedKind, TypedValue,
+};
 use crate::types::{IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey};
 
 use std::fmt::Write as _;
@@ -130,6 +132,27 @@ impl Default for AppendOptions {
     }
 }
 
+// ----------------------------- metrics -----------------------------
+
+/// Minimal pager-hit metrics collected inside ColumnStore. This counts how
+/// many *requests* we send to the pager (not bytes). If you need byte totals,
+/// you can extend this to compute sizes for Raw puts/gets and (optionally)
+/// encoded sizes for Typed values.
+#[derive(Clone, Debug, Default)]
+pub struct IoStats {
+    pub batches: usize,       // number of times we called Pager::batch
+    pub get_raw_ops: usize,   // number of Raw gets requested
+    pub get_typed_ops: usize, // number of Typed gets requested
+    pub put_raw_ops: usize,   // number of Raw puts requested
+    pub put_typed_ops: usize, // number of Typed puts requested
+}
+
+impl IoStats {
+    pub fn reset(&mut self) {
+        *self = IoStats::default();
+    }
+}
+
 // ----------------------------- ColumnStore -----------------------------
 
 pub struct ColumnStore<'p, P: Pager> {
@@ -139,9 +162,40 @@ pub struct ColumnStore<'p, P: Pager> {
     manifest: Manifest,
     // field_id -> (column_index_pkey, decoded)
     colindex_cache: HashMap<LogicalFieldId, (PhysicalKey, ColumnIndex)>,
+    // pager-hit metrics (counts only)
+    io_stats: IoStats,
 }
 
 impl<'p, P: Pager> ColumnStore<'p, P> {
+    // Helper to route all batch calls through here so we bump metrics in one place.
+    fn do_batch<'a>(&'a mut self, req: BatchRequest) -> BatchResponse<'a> {
+        // update counters before the call
+        self.io_stats.batches += 1;
+        for p in &req.puts {
+            match p {
+                BatchPut::Raw { .. } => self.io_stats.put_raw_ops += 1,
+                BatchPut::Typed { .. } => self.io_stats.put_typed_ops += 1,
+            }
+        }
+        for g in &req.gets {
+            match g {
+                BatchGet::Raw { .. } => self.io_stats.get_raw_ops += 1,
+                BatchGet::Typed { .. } => self.io_stats.get_typed_ops += 1,
+            }
+        }
+        self.pager.batch(&req)
+    }
+
+    /// Access current metrics (counts of batch/ops).
+    pub fn io_stats(&self) -> &IoStats {
+        &self.io_stats
+    }
+
+    /// Reset metrics to zero.
+    pub fn reset_io_stats(&mut self) {
+        self.io_stats.reset();
+    }
+
     // Create fresh store (bootstrap->manifest, empty manifest).
     pub fn init_empty(pager: &'p mut P) -> Self {
         let bootstrap_key: PhysicalKey = 0;
@@ -151,6 +205,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         };
 
         // Write Manifest and Bootstrap in a single batch.
+        // (Not counted in ColumnStore metrics since the store isn't constructed yet.)
         let _ = pager.batch(&BatchRequest {
             puts: vec![
                 BatchPut::Typed {
@@ -173,6 +228,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             manifest_key,
             manifest,
             colindex_cache: HashMap::new(),
+            io_stats: IoStats::default(),
         }
     }
 
@@ -180,7 +236,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     pub fn open(pager: &'p mut P) -> Self {
         let bootstrap_key: PhysicalKey = 0;
 
-        // Get Bootstrap
+        // Get Bootstrap (not counted; ColumnStore not constructed yet)
         let resp = pager.batch(&BatchRequest {
             puts: vec![],
             gets: vec![BatchGet::Typed {
@@ -197,7 +253,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         };
         let manifest_key = boot.manifest_physical_key;
 
-        // Get Manifest
+        // Get Manifest (not counted; ColumnStore not constructed yet)
         let resp = pager.batch(&BatchRequest {
             puts: vec![],
             gets: vec![BatchGet::Typed {
@@ -219,6 +275,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             manifest_key,
             manifest,
             colindex_cache: HashMap::new(),
+            io_stats: IoStats::default(),
         }
     }
 
@@ -390,7 +447,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         kind: TypedKind::ColumnIndex,
                     })
                     .collect();
-                let resp = self.pager.batch(&BatchRequest { puts: vec![], gets });
+                let resp = self.do_batch(BatchRequest { puts: vec![], gets });
 
                 let mut got_vec: Vec<ColumnIndex> = Vec::with_capacity(lookups.len());
                 for gr in resp.get_results {
@@ -542,7 +599,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         }
 
         if !puts_batch.is_empty() {
-            let _ = self.pager.batch(&BatchRequest {
+            let _ = self.do_batch(BatchRequest {
                 puts: puts_batch,
                 gets: vec![],
             });
@@ -601,7 +658,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     kind: TypedKind::ColumnIndex,
                 })
                 .collect();
-            let resp = self.pager.batch(&BatchRequest { puts: vec![], gets });
+            let resp = self.do_batch(BatchRequest { puts: vec![], gets });
 
             let mut got_vec: Vec<ColumnIndex> = Vec::with_capacity(to_load.len());
             for gr in resp.get_results {
@@ -677,7 +734,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             gets.push(BatchGet::Raw { key: *pk });
         }
 
-        let resp = self.pager.batch(&BatchRequest { puts: vec![], gets });
+        let resp = self.do_batch(BatchRequest { puts: vec![], gets });
 
         // Partition response into typed segments and raw data slices.
         let mut seg_map: HashMap<PhysicalKey, IndexSegment> =
@@ -750,7 +807,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             .iter()
             .map(|k| BatchGet::Raw { key: *k })
             .collect::<Vec<_>>();
-        let resp = self.pager.batch(&BatchRequest { puts: vec![], gets });
+        let resp = self.do_batch(BatchRequest { puts: vec![], gets });
 
         let mut raw_len_map: HashMap<PhysicalKey, usize> = HashMap::new();
         for gr in resp.get_results {
@@ -798,7 +855,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     kind: TypedKind::ColumnIndex,
                 });
             }
-            let resp = self.pager.batch(&BatchRequest { puts: vec![], gets });
+            let resp = self.do_batch(BatchRequest { puts: vec![], gets });
 
             let mut colindex_raw_len: HashMap<PhysicalKey, usize> = HashMap::new();
             let mut colindices_by_pk: HashMap<PhysicalKey, ColumnIndex> = HashMap::new();
@@ -856,7 +913,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     kind: TypedKind::IndexSegment,
                 });
             }
-            let resp = self.pager.batch(&BatchRequest { puts: vec![], gets });
+            let resp = self.do_batch(BatchRequest { puts: vec![], gets });
 
             let mut seg_raw_len: HashMap<PhysicalKey, usize> = HashMap::new();
             let mut segs_by_pk: HashMap<PhysicalKey, IndexSegment> = HashMap::new();
@@ -931,7 +988,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 .iter()
                 .map(|k| BatchGet::Raw { key: *k })
                 .collect::<Vec<_>>();
-            let resp = self.pager.batch(&BatchRequest { puts: vec![], gets });
+            let resp = self.do_batch(BatchRequest { puts: vec![], gets });
 
             let mut data_len: HashMap<PhysicalKey, usize> = HashMap::new();
             for gr in resp.get_results {
@@ -1178,6 +1235,12 @@ mod tests {
         assert_eq!(got[0][0].unwrap(), b"NEWVVVV1");
         assert_eq!(got[0][1].unwrap(), b"VVVVVVV2");
         assert!(got[0][2].is_none());
+
+        // sanity: we should have issued at least one batch (append + get)
+        let stats = store.io_stats().clone();
+        assert!(stats.batches >= 2);
+        assert!(stats.put_raw_ops > 0 || stats.put_typed_ops > 0);
+        assert!(stats.get_raw_ops > 0 || stats.get_typed_ops > 0);
     }
 
     #[test]
@@ -1218,6 +1281,7 @@ mod tests {
             b"nope".to_vec(),
         ];
 
+        store.reset_io_stats(); // isolate the get path
         let got = store.get_many(vec![(77, q.clone())]);
 
         // recompute expected lengths
@@ -1232,6 +1296,12 @@ mod tests {
         assert_eq!(got[0][3].unwrap().len(), expect_len("key0200"));
         assert_eq!(got[0][4].unwrap().len(), expect_len("key0999"));
         assert!(got[0][5].is_none());
+
+        // sanity: get_many should have exactly 1 batch for segments+data,
+        // plus 0 or 1 for initial ColumnIndex fills (depending on cache)
+        let s = store.io_stats();
+        assert!(s.batches >= 1);
+        assert!(s.get_raw_ops > 0 || s.get_typed_ops > 0);
     }
 
     #[test]
