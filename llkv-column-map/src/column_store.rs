@@ -697,10 +697,6 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     ///
     /// Newest-first shadowing: for each key we pick the first segment whose
     /// [min,max] covers it.
-    ///
-    /// NOTE: With `&self` we return **owned** `Arc<[u8]>` slices for values
-    /// (safe for concurrent readers). If you need strict zero-copy borrowed
-    /// slices, keep `&mut self` and store the Arc-backed blobs inside `self`.
     pub fn get_many(
         &self,
         items: Vec<(LogicalFieldId, Vec<LogicalKeyBytes>)>,
