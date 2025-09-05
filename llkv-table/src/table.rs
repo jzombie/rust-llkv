@@ -268,7 +268,7 @@ where
 
                 let (tx, rx) = xchan::unbounded();
                 thread::spawn(move || {
-                    let mut union_set = FxHashSet::with_hasher(Default::default());
+                    let mut union_set = FxHashSet::default();
                     for stream in streams {
                         for row_id in stream {
                             union_set.insert(row_id);
