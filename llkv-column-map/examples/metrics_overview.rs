@@ -11,6 +11,7 @@
 //!
 //! “cells” = number of (key,value) entries written, i.e., len(items) per column.
 
+use llkv_column_map::pager::BlobLike;
 use llkv_column_map::{
     AppendOptions, ColumnStore, Put, ValueMode, ValueSlice, pager::MemPager, types::LogicalFieldId,
 };
@@ -201,17 +202,19 @@ fn fmt_key(k: &[u8]) -> String {
     }
 }
 
-fn print_read_report(
+fn print_read_report<B>(
     heading: &str,
     queries: &[(Fid, Vec<Vec<u8>>)],
-    results: &[Vec<Option<ValueSlice>>],
-) {
+    results: &[Vec<Option<ValueSlice<B>>>],
+) where
+    B: BlobLike,
+{
     println!("-- {} --", heading);
     for (i, (fid, ks)) in queries.iter().enumerate() {
         print!("col {}: ", fid);
         for (j, k) in ks.iter().enumerate() {
             match &results[i][j] {
-                Some(bytes) => print!("{} → HIT {}B;  ", fmt_key(k), bytes.len()),
+                Some(bytes) => print!("{} → HIT {}B;  ", fmt_key(k), bytes.as_ref().len()),
                 None => print!("{} → MISSING;  ", fmt_key(k)),
             }
         }

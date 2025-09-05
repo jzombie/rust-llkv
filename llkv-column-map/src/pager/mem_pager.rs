@@ -34,6 +34,9 @@ impl MemPager {
 }
 
 impl Pager for MemPager {
+    /// For the in-memory backend, a blob is just an Arc to an immutable byte slice.
+    type Blob = Arc<[u8]>;
+
     fn alloc_many(&self, n: usize) -> io::Result<Vec<PhysicalKey>> {
         // Simple monotonic allocator (thread-safe).
         // We use fetch_update to check overflow and advance atomically.
@@ -75,7 +78,7 @@ impl Pager for MemPager {
         Ok(())
     }
 
-    fn batch_get(&self, gets: &[BatchGet]) -> io::Result<Vec<GetResult>> {
+    fn batch_get(&self, gets: &[BatchGet]) -> io::Result<Vec<GetResult<Self::Blob>>> {
         // Single read lock for the entire batch; multiple readers can proceed concurrently.
         let map = self
             .blobs

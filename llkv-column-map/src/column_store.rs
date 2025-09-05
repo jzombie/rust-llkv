@@ -12,23 +12,23 @@ use std::cmp::min;
 use std::collections::hash_map::Entry;
 use std::fmt::Write;
 use std::sync::{
-    Arc, RwLock,
+    RwLock,
     atomic::{AtomicUsize, Ordering},
 };
 
 /// Zero-copy view into a subrange of an Arc-backed data blob.
 /// Holds the Arc and byte offsets; derefs to `[u8]` without copying.
 #[derive(Clone, Debug)]
-pub struct ValueSlice {
-    data: Arc<[u8]>,
+pub struct ValueSlice<B> {
+    data: B,
     start: crate::types::ByteOffset,
     end: crate::types::ByteOffset, // exclusive
 }
 
-impl ValueSlice {
+impl<B: AsRef<[u8]> + Clone> ValueSlice<B> {
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        &self.data[self.start as usize..self.end as usize]
+        &self.data.as_ref()[self.start as usize..self.end as usize]
     }
     #[inline]
     pub fn len(&self) -> usize {
@@ -40,7 +40,7 @@ impl ValueSlice {
     }
 }
 
-impl std::ops::Deref for ValueSlice {
+impl<B: AsRef<[u8]> + Clone> std::ops::Deref for ValueSlice<B> {
     type Target = [u8];
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -48,7 +48,7 @@ impl std::ops::Deref for ValueSlice {
     }
 }
 
-impl AsRef<[u8]> for ValueSlice {
+impl<B: AsRef<[u8]> + Clone> AsRef<[u8]> for ValueSlice<B> {
     #[inline]
     fn as_ref(&self) -> &[u8] {
         self.as_slice()
@@ -221,7 +221,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     }
 
     // Helper to route batch GETs through here to bump metrics in one place.
-    fn do_gets(&self, gets: Vec<BatchGet>) -> Vec<GetResult> {
+    fn do_gets(&self, gets: Vec<BatchGet>) -> Vec<GetResult<P::Blob>> {
         if gets.is_empty() {
             return Vec::new();
         }
@@ -706,15 +706,15 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     pub fn get_many(
         &self,
         items: Vec<(LogicalFieldId, Vec<LogicalKeyBytes>)>,
-    ) -> Vec<Vec<Option<ValueSlice>>> {
+    ) -> Vec<Vec<Option<ValueSlice<P::Blob>>>> {
         if items.is_empty() {
             return Vec::new();
         }
 
         // Pre-size outputs: one vector per input, one slot per key.
-        let mut results: Vec<Vec<Option<ValueSlice>>> = items
+        let mut results: Vec<Vec<Option<ValueSlice<P::Blob>>>> = items
             .iter()
-            .map(|(_, ks)| vec![Option::<ValueSlice>::None; ks.len()])
+            .map(|(_, ks)| vec![Option::<ValueSlice<P::Blob>>::None; ks.len()])
             .collect();
 
         // -------- ensure ColumnIndex in cache for all referenced fields --------
@@ -833,7 +833,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         // Partition response into typed segments and raw data slices.
         let mut seg_map: FxHashMap<PhysicalKey, IndexSegment> =
             FxHashMap::with_capacity_and_hasher(seg_keys.len(), Default::default());
-        let mut data_map: FxHashMap<PhysicalKey, Arc<[u8]>> =
+        let mut data_map: FxHashMap<PhysicalKey, P::Blob> =
             FxHashMap::with_capacity_and_hasher(data_keys.len(), Default::default());
 
         for gr in resp {
@@ -874,7 +874,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                             let a = pos * w;
                             let b = a + w;
                             ValueSlice {
-                                data: Arc::clone(data_blob),
+                                data: data_blob.clone(),
                                 start: a as crate::types::ByteOffset,
                                 end: b as crate::types::ByteOffset,
                             }
@@ -883,7 +883,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                             let a = value_offsets[pos] as crate::types::ByteOffset;
                             let b = value_offsets[pos + 1] as crate::types::ByteOffset;
                             ValueSlice {
-                                data: Arc::clone(data_blob),
+                                data: data_blob.clone(),
                                 start: a,
                                 end: b,
                             }
@@ -920,7 +920,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             FxHashMap::with_hasher(Default::default());
         for gr in resp {
             if let GetResult::Raw { key, bytes } = gr {
-                raw_len_map.insert(key, bytes.len());
+                raw_len_map.insert(key, bytes.as_ref().len());
             }
         }
 
@@ -974,7 +974,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             for gr in resp {
                 match gr {
                     GetResult::Raw { key, bytes } => {
-                        colindex_raw_len.insert(key, bytes.len());
+                        colindex_raw_len.insert(key, bytes.as_ref().len());
                     }
                     GetResult::Typed {
                         key,
@@ -1035,7 +1035,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             for gr in resp {
                 match gr {
                     GetResult::Raw { key, bytes } => {
-                        seg_raw_len.insert(key, bytes.len());
+                        seg_raw_len.insert(key, bytes.as_ref().len());
                     }
                     GetResult::Typed {
                         key,
@@ -1112,7 +1112,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 FxHashMap::with_hasher(Default::default());
             for gr in resp {
                 if let GetResult::Raw { key, bytes } = gr {
-                    data_len.insert(key, bytes.len());
+                    data_len.insert(key, bytes.as_ref().len());
                 }
             }
 

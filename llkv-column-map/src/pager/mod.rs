@@ -1,10 +1,13 @@
 use std::io;
-use std::sync::Arc;
 
 use crate::types::PhysicalKey;
 
 pub mod mem_pager;
 pub use mem_pager::*;
+
+/// Any clonable, thread-safe buffer that can be viewed as `&[u8]`.
+pub trait BlobLike: AsRef<[u8]> + Clone + Send + Sync + 'static {}
+impl<T> BlobLike for T where T: AsRef<[u8]> + Clone + Send + Sync + 'static {}
 
 /// Typed kinds the pager knows how to decode/encode. Keep this set
 /// scoped to storage types you persist via `bitcode`.
@@ -52,11 +55,16 @@ pub enum BatchGet {
     Typed { key: PhysicalKey, kind: TypedKind },
 }
 
-/// Result for a single get. Raw returns an owned buffer (Arc slice) so callers
-/// can use `&self` and share across threads without tying lifetimes to the pager.
+/// Result for a single get. For raw reads, the pager returns a **blob handle**
+/// chosen by the pager implementation (see `Pager::Blob`). This blob must be
+/// cheap to clone and must expose its bytes via `AsRef<[u8]>`.
+///
+/// Examples:
+/// - In-memory pager: `Blob = Arc<[u8]>`
+/// - File-backed pager: `Blob = EntryHandle` (which wraps `Arc<Mmap> + Range`)
 #[derive(Debug)]
-pub enum GetResult {
-    Raw { key: PhysicalKey, bytes: Arc<[u8]> },
+pub enum GetResult<B> {
+    Raw { key: PhysicalKey, bytes: B },
     Typed { key: PhysicalKey, value: TypedValue },
     Missing { key: PhysicalKey },
 }
@@ -64,8 +72,20 @@ pub enum GetResult {
 /// Unified pager interface with separate put/get passes.
 /// - `batch_put` applies all writes atomically w.r.t. this pager.
 /// - `batch_get` serves a mixed list of typed/raw reads in one round-trip.
-/// Returning owned buffers allows `&self` for reads (good for RwLock read guards).
+/// Returning **owned blob handles** allows `&self` for reads (good for
+/// RwLock read guards) while remaining zero-copy when the blob is mmap-backed.
+///
+/// ## Zero-copy blobs
+/// Implementations choose `type Blob`:
+/// - In-memory: `type Blob = Arc<[u8]>`
+/// - mmap-backed: `type Blob = EntryHandle` (your type that wraps `Arc<Mmap>`)
 pub trait Pager {
+    /// The blob handle type returned for raw reads. Must be:
+    /// - `AsRef<[u8]>` so callers can view bytes without copying,
+    /// - `Clone` so the handle can be duplicated cheaply (refcount bump),
+    /// - `Send + Sync + 'static` for cross-thread safety.
+    type Blob: BlobLike;
+
     /// Key allocation can remain separate; typically needed ahead of
     /// a write batch.
     fn alloc_many(&self, n: usize) -> io::Result<Vec<PhysicalKey>>;
@@ -74,7 +94,7 @@ pub trait Pager {
     fn batch_put(&self, puts: &[BatchPut]) -> io::Result<()>;
 
     /// Serve all gets (raw + typed) in one batch.
-    fn batch_get(&self, gets: &[BatchGet]) -> io::Result<Vec<GetResult>>;
+    fn batch_get(&self, gets: &[BatchGet]) -> io::Result<Vec<GetResult<Self::Blob>>>;
 }
 
 // =================== Encoding helpers (typed) ======================
