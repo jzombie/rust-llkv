@@ -1,4 +1,1 @@
-# Graphviz files
-*.dot
-
 !tests/snapshots/*.dot
