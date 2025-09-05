@@ -119,6 +119,7 @@ fn build_many_columns_fixed_width(
             // Reference to that segment (newest-first list with 1 element).
             let segref = IndexSegmentRef {
                 index_physical_key: seg_pkey,
+                data_physical_key: seg.data_physical_key,
                 logical_key_min: seg.logical_key_min.clone(),
                 logical_key_max: seg.logical_key_max.clone(),
                 n_entries: seg.n_entries,

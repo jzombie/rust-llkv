@@ -479,113 +479,126 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
     // ----------------------------- read API -----------------------------
 
-    // TODO: Make zero-copy
-    // Batched point lookup: values for a single column and a list of logical keys.
-    // Returns values in the same order as requested (None if missing).
-    pub fn get_in_column(
-        &mut self,
-        field_id: LogicalFieldId,
-        keys: Vec<LogicalKeyBytes>,
-    ) -> Vec<Option<Vec<u8>>> {
-        if keys.is_empty() {
+    /// Batched point lookups across many columns, zero-copy.
+    /// Each item is (field_id, keys). Output is aligned per input, where
+    /// each value is an `Option<&[u8]>` slice into prefetched data blobs.
+    ///
+    /// I/O pattern (whole batch):
+    ///   1) batch_get_typed<ColumnIndex> for any missing columns (once)
+    ///   2) batch_get_typed<IndexSegment> for all needed segments (once)
+    ///   3) batch_get_raw for all needed data blobs (once)
+    ///
+    /// Newest-first shadowing: for each key we pick the first segment whose
+    /// [min,max] covers it.
+    ///
+    /// Lifetimes tie returned slices to `&'s mut self`.
+    pub fn get_many<'s>(
+        &'s mut self,
+        items: Vec<(LogicalFieldId, Vec<LogicalKeyBytes>)>,
+    ) -> Vec<Vec<Option<&'s [u8]>>> {
+        use std::collections::hash_map::Entry;
+
+        if items.is_empty() {
             return Vec::new();
         }
 
-        // resolve column index (cache or load)
-        let (col_index_pkey, col_index) = match self.colindex_cache.get(&field_id) {
-            Some((pk, ci)) => (*pk, ci.clone()),
-            None => {
-                // look up in manifest
-                let entry = match self
-                    .manifest
-                    .columns
-                    .iter()
-                    .find(|e| e.field_id == field_id)
-                {
-                    Some(e) => e.clone(),
-                    None => {
-                        // column is unknown
-                        return vec![None; keys.len()];
-                    }
-                };
-                let got: Vec<ColumnIndex> = self
-                    .pager
-                    .batch_get_typed::<ColumnIndex>(&[entry.column_index_physical_key]);
-                let ci = got.into_iter().next().expect("ColumnIndex missing");
-                self.colindex_cache
-                    .insert(field_id, (entry.column_index_physical_key, ci.clone()));
-                (entry.column_index_physical_key, ci)
+        // Pre-size outputs: one vector per input, one slot per key.
+        let mut results: Vec<Vec<Option<&'s [u8]>>> =
+            items.iter().map(|(_, ks)| vec![None; ks.len()]).collect();
+
+        // -------- ensure ColumnIndex in cache for all referenced fields --------
+        let mut need_fids: HashSet<LogicalFieldId> = HashSet::new();
+        for (fid, _) in &items {
+            need_fids.insert(*fid);
+        }
+
+        let mut to_load: Vec<(LogicalFieldId, PhysicalKey)> = Vec::new();
+        for fid in need_fids {
+            if self.colindex_cache.contains_key(&fid) {
+                continue;
             }
-        };
-        let _ = col_index_pkey;
+            if let Some(entry) = self.manifest.columns.iter().find(|e| e.field_id == fid) {
+                to_load.push((fid, entry.column_index_physical_key));
+            }
+        }
 
-        // Decide candidate segments directly from ColumnIndex (newest-first),
-        // and record both index_pk and data_pk so we can prefetch data blobs
-        // WITHOUT decoding segments first.
-        let mut per_seg: HashMap<PhysicalKey, Vec<usize>> = HashMap::new();
-        let mut seg_to_data: HashMap<PhysicalKey, PhysicalKey> = HashMap::new();
+        if !to_load.is_empty() {
+            let idx_pks: Vec<PhysicalKey> = to_load.iter().map(|(_, pk)| *pk).collect();
+            let got: Vec<ColumnIndex> = self.pager.batch_get_typed::<ColumnIndex>(&idx_pks);
+            for (i, (fid, pk)) in to_load.into_iter().enumerate() {
+                self.colindex_cache.insert(fid, (pk, got[i].clone()));
+            }
+        }
 
-        for (qi, k) in keys.iter().enumerate() {
-            for segref in &col_index.segments {
-                if segref.logical_key_min.as_slice() <= k.as_slice()
-                    && k.as_slice() <= segref.logical_key_max.as_slice()
-                {
-                    per_seg
-                        .entry(segref.index_physical_key)
-                        .or_default()
-                        .push(qi);
-                    // map index -> data for the selected segment
-                    seg_to_data.insert(segref.index_physical_key, segref.data_physical_key);
-                    break; // newest-first: stop at first covering segment
+        // -------- routing: segment -> (data_pk, [(item_i, key_j), ...]) --------
+        let mut per_seg: HashMap<PhysicalKey, (PhysicalKey, Vec<(usize, usize)>)> = HashMap::new();
+
+        for (qi, (fid, keys)) in items.iter().enumerate() {
+            let col_index = match self.colindex_cache.get(fid) {
+                Some((_, ci)) => ci,
+                None => continue, // unknown field => all None for that entry
+            };
+
+            for (kj, k) in keys.iter().enumerate() {
+                for segref in &col_index.segments {
+                    if segref.logical_key_min.as_slice() <= k.as_slice()
+                        && k.as_slice() <= segref.logical_key_max.as_slice()
+                    {
+                        match per_seg.entry(segref.index_physical_key) {
+                            Entry::Occupied(mut e) => {
+                                e.get_mut().1.push((qi, kj));
+                            }
+                            Entry::Vacant(e) => {
+                                e.insert((segref.data_physical_key, vec![(qi, kj)]));
+                            }
+                        }
+                        break;
+                    }
                 }
             }
         }
 
-        // If nothing matched, return all None quickly.
-        let needed_seg_keys: Vec<PhysicalKey> = per_seg.keys().copied().collect();
-        if needed_seg_keys.is_empty() {
-            return vec![None; keys.len()];
+        if per_seg.is_empty() {
+            return results;
         }
 
-        // Prefetch data blobs in one batch directly from the column index refs.
-        // Build data key list from the exact segments we will open.
-        let mut data_keys: Vec<PhysicalKey> = needed_seg_keys
-            .iter()
-            .filter_map(|idx_pk| seg_to_data.get(idx_pk).copied())
-            .collect();
-        // de-dup in case multiple queries hit the same segment
-        {
-            let mut seen = HashSet::with_capacity(data_keys.len());
-            data_keys.retain(|k| seen.insert(*k));
+        // -------- single batched loads for segments and data blobs -------------
+        // 1) typed load of all needed index segments (owned, no borrowing)
+        let seg_keys: Vec<PhysicalKey> = per_seg.keys().copied().collect();
+        let segs: Vec<IndexSegment> = self.pager.batch_get_typed::<IndexSegment>(&seg_keys);
+
+        let mut seg_map: HashMap<PhysicalKey, IndexSegment> = HashMap::with_capacity(segs.len());
+        for (i, pk) in seg_keys.iter().enumerate() {
+            seg_map.insert(*pk, segs[i].clone());
         }
-        let data_blobs_slices: Vec<&[u8]> = self.pager.batch_get_raw(&data_keys);
-        let mut data_map: HashMap<PhysicalKey, &[u8]> = HashMap::with_capacity(data_keys.len());
+
+        // 2) raw load of all needed data blobs (borrowed slices, zero-copy)
+        let mut data_keys: Vec<PhysicalKey> = Vec::with_capacity(per_seg.len());
+        let mut seen_data: HashSet<PhysicalKey> = HashSet::new();
+        for v in per_seg.values() {
+            let data_pk = v.0; // Copy (PhysicalKey is u64)
+            if seen_data.insert(data_pk) {
+                data_keys.push(data_pk);
+            }
+        }
+
+        let data_slices: Vec<&'s [u8]> = self.pager.batch_get_raw(&data_keys);
+        let mut data_map: HashMap<PhysicalKey, &'s [u8]> = HashMap::with_capacity(data_keys.len());
         for (i, pk) in data_keys.iter().enumerate() {
-            data_map.insert(*pk, data_blobs_slices[i]);
+            data_map.insert(*pk, data_slices[i]);
         }
 
-        // Load all needed index segments in a single batched typed read.
-        let segments: Vec<IndexSegment> =
-            self.pager.batch_get_typed::<IndexSegment>(&needed_seg_keys);
+        // -------- execution: binary search inside segments and slice values ----
+        for (seg_pk, (data_pk, pairs)) in per_seg {
+            let seg = seg_map
+                .get(&seg_pk)
+                .expect("loaded segment missing from seg_map");
+            let data_blob = data_map
+                .get(&data_pk)
+                .expect("loaded data blob missing from data_map");
 
-        // Map index_physical_key -> loaded segment
-        let mut seg_map: HashMap<PhysicalKey, IndexSegment> =
-            HashMap::with_capacity(segments.len());
-        for (i, pk) in needed_seg_keys.iter().enumerate() {
-            seg_map.insert(*pk, segments[i].clone());
-        }
-
-        // answer vector
-        let mut out: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
-
-        // For each segment: binary search the keys it owns; then slice from data blob
-        for (seg_pk, qidxs) in per_seg {
-            let seg = seg_map.get(&seg_pk).unwrap();
-            let data_pk = *seg_to_data.get(&seg_pk).unwrap();
-            let data_blob = data_map.get(&data_pk).unwrap();
-
-            for qi in qidxs {
-                let target = keys[qi].as_slice();
+            for (qi, kj) in pairs {
+                let target = items[qi].1[kj].as_slice();
                 if let Some(pos) =
                     binary_search_key(&seg.logical_key_bytes, &seg.logical_key_offsets, target)
                 {
@@ -594,19 +607,19 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                             let w = *width as usize;
                             let a = pos * w;
                             let b = a + w;
-                            out[qi] = Some(data_blob[a..b].to_vec());
+                            results[qi][kj] = Some(&data_blob[a..b]);
                         }
                         ValueLayout::Variable { value_offsets } => {
                             let a = value_offsets[pos] as usize;
                             let b = value_offsets[pos + 1] as usize;
-                            out[qi] = Some(data_blob[a..b].to_vec());
+                            results[qi][kj] = Some(&data_blob[a..b]);
                         }
                     }
-                } // else None (not found inside)
+                }
             }
         }
 
-        out
+        results
     }
 }
 
@@ -1014,10 +1027,16 @@ mod tests {
 
         store.append_many(vec![put], AppendOptions::default());
 
-        let got = store.get_in_column(10, vec![b"k1".to_vec(), b"k2".to_vec(), b"kX".to_vec()]);
-        assert_eq!(got[0].as_ref().unwrap(), b"NEWVVVV1");
-        assert_eq!(got[1].as_ref().unwrap(), b"VVVVVVV2");
-        assert!(got[2].is_none());
+        // zero-copy batch get across columns (here only field 10)
+        let got = store.get_many(vec![(
+            10,
+            vec![b"k1".to_vec(), b"k2".to_vec(), b"kX".to_vec()],
+        )]);
+
+        // got[0] corresponds to field 10's query vector
+        assert_eq!(got[0][0].unwrap(), b"NEWVVVV1");
+        assert_eq!(got[0][1].unwrap(), b"VVVVVVV2");
+        assert!(got[0][2].is_none());
     }
 
     #[test]
@@ -1029,7 +1048,7 @@ mod tests {
         let mut items = Vec::new();
         for i in 0..1000u32 {
             let k = format!("key{:04}", i).into_bytes();
-            let v = vec![b'A' + (i % 26) as u8; (i % 17 + 1) as usize]; // variable 1..17
+            let v = vec![b'A' + (i % 26) as u8; (i % 17 + 1) as usize]; // 1..17
             items.push((k, v));
         }
 
@@ -1057,7 +1076,8 @@ mod tests {
             b"key0999".to_vec(),
             b"nope".to_vec(),
         ];
-        let got = store.get_in_column(77, q.clone());
+
+        let got = store.get_many(vec![(77, q.clone())]);
 
         // recompute expected lengths
         let expect_len = |s: &str| -> usize {
@@ -1065,12 +1085,12 @@ mod tests {
             (i % 17 + 1) as usize
         };
 
-        assert_eq!(got[0].as_ref().unwrap().len(), expect_len("key0000"));
-        assert_eq!(got[1].as_ref().unwrap().len(), expect_len("key0001"));
-        assert_eq!(got[2].as_ref().unwrap().len(), expect_len("key0199"));
-        assert_eq!(got[3].as_ref().unwrap().len(), expect_len("key0200"));
-        assert_eq!(got[4].as_ref().unwrap().len(), expect_len("key0999"));
-        assert!(got[5].is_none());
+        assert_eq!(got[0][0].unwrap().len(), expect_len("key0000"));
+        assert_eq!(got[0][1].unwrap().len(), expect_len("key0001"));
+        assert_eq!(got[0][2].unwrap().len(), expect_len("key0199"));
+        assert_eq!(got[0][3].unwrap().len(), expect_len("key0200"));
+        assert_eq!(got[0][4].unwrap().len(), expect_len("key0999"));
+        assert!(got[0][5].is_none());
     }
 
     #[test]
@@ -1088,9 +1108,10 @@ mod tests {
         };
         store.append_many(vec![Put { field_id: 5, items }], opts);
 
-        let got = store.get_in_column(5, vec![b"a".to_vec(), b"b".to_vec(), b"z".to_vec()]);
-        assert_eq!(got[0].as_ref().unwrap(), &[1u8; 4]);
-        assert_eq!(got[1].as_ref().unwrap(), &[2u8; 4]);
-        assert!(got[2].is_none());
+        let got = store.get_many(vec![(5, vec![b"a".to_vec(), b"b".to_vec(), b"z".to_vec()])]);
+
+        assert_eq!(got[0][0].unwrap(), &[1u8; 4]);
+        assert_eq!(got[0][1].unwrap(), &[2u8; 4]);
+        assert!(got[0][2].is_none());
     }
 }

@@ -332,30 +332,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("Total ingest time: {:?}", t_total.elapsed());
 
-    // simple probes
-    let got1 = store.get_in_column(1, vec![b"id:000010".to_vec(), b"id:009999".to_vec()]);
-    println!("col=1 id:000010 -> {:?}", got1[0].as_deref());
-    println!("col=1 id:009999 -> {:?}", got1[1].as_deref());
+    // simple probes (now using zero-copy get_many)
+    let got1 = store.get_many(vec![(
+        1,
+        vec![b"id:000010".to_vec(), b"id:009999".to_vec()],
+    )]);
+    println!("col=1 id:000010 -> {:?}", got1[0][0]);
+    println!("col=1 id:009999 -> {:?}", got1[0][1]);
 
-    let got2 = store.get_in_column(2, vec![b"id:000000".to_vec(), b"id:000100".to_vec()]);
-    println!(
-        "col=2 id:000000 len={:?}",
-        got2[0].as_ref().map(|v| v.len())
-    );
-    println!(
-        "col=2 id:000100 len={:?}",
-        got2[1].as_ref().map(|v| v.len())
-    );
+    let got2 = store.get_many(vec![(
+        2,
+        vec![b"id:000000".to_vec(), b"id:000100".to_vec()],
+    )]);
+    println!("col=2 id:000000 len={:?}", got2[0][0].map(|v| v.len()));
+    println!("col=2 id:000100 len={:?}", got2[0][1].map(|v| v.len()));
 
-    let got3 = store.get_in_column(3, vec![b"k000100".to_vec(), b"k004999".to_vec()]);
-    println!(
-        "col=3 k000100 -> len={:?}",
-        got3[0].as_ref().map(|v| v.len())
-    );
-    println!(
-        "col=3 k004999 -> len={:?}",
-        got3[1].as_ref().map(|v| v.len())
-    );
+    let got3 = store.get_many(vec![(3, vec![b"k000100".to_vec(), b"k004999".to_vec()])]);
+    println!("col=3 k000100 -> len={:?}", got3[0][0].map(|v| v.len()));
+    println!("col=3 k004999 -> len={:?}", got3[0][1].map(|v| v.len()));
 
     // ASCII summary of final layout
     let ascii = store.render_storage_ascii();
