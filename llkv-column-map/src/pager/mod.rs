@@ -1,5 +1,5 @@
 use crate::types::PhysicalKey;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// Typed kinds the pager knows how to decode/encode. Keep this set
 /// scoped to storage types you persist via `bitcode`.
@@ -84,14 +84,14 @@ pub trait Pager {
 
 /// Minimal in-memory pager showing how to implement the unified API.
 pub struct MemPager {
-    map: HashMap<PhysicalKey, Vec<u8>>,
+    map: FxHashMap<PhysicalKey, Vec<u8>>,
     next: PhysicalKey,
 }
 
 impl Default for MemPager {
     fn default() -> Self {
         Self {
-            map: HashMap::new(),
+            map: FxHashMap::with_hasher(Default::default()),
             next: 1, // reserve 0 for bootstrap
         }
     }
