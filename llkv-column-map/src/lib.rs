@@ -19,9 +19,10 @@ use std::fmt::Write as _;
 pub struct IndexLayoutInfo {
     pub kind: &'static str,       // "fixed" or "variable"
     pub fixed_width: Option<u32>, // when fixed
-    pub key_bytes: usize,         // logical_key_bytes.len()
-    pub key_offs_bytes: usize,    // logical_key_offsets.len() * 4
-    pub value_meta_bytes: usize,  // Variable: value_offsets.len()*4, Fixed: 4 (width)
+    // TODO: Rename to indicate *logical* and *len*?
+    pub key_bytes: usize,        // logical_key_bytes.len()
+    pub key_offs_bytes: usize,   // logical_key_offsets.len() * 4
+    pub value_meta_bytes: usize, // Variable: value_offsets.len()*4, Fixed: 4 (width)
 }
 
 #[derive(Clone, Debug)]
@@ -479,7 +480,6 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     // ----------------------------- read API -----------------------------
 
     // TODO: Make zero-copy
-    // TODO: Split into two parts? One which builds physical keys to fetch; the other to act upon it
     // Batched point lookup: values for a single column and a list of logical keys.
     // Returns values in the same order as requested (None if missing).
     pub fn get_in_column(
