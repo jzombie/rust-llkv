@@ -1,7 +1,7 @@
 // High-level append/query API on top of pager + index modules.
 use crate::index::{
     Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, KeyLayout, Manifest,
-    ValueLayout,
+    ValueBound, ValueLayout,
 };
 use crate::pager::{BatchGet, BatchPut, GetResult, Pager, TypedKind, TypedValue};
 use crate::types::{
@@ -18,7 +18,7 @@ use std::sync::{
 
 // TODO: Move to utils?
 #[inline]
-fn min_max_bytes(values: &[Vec<u8>]) -> (Vec<u8>, Vec<u8>) {
+fn min_max_bounds(values: &[Vec<u8>]) -> (ValueBound, ValueBound) {
     debug_assert!(!values.is_empty());
     let mut min = &values[0];
     let mut max = &values[0];
@@ -30,7 +30,7 @@ fn min_max_bytes(values: &[Vec<u8>]) -> (Vec<u8>, Vec<u8>) {
             max = v;
         }
     }
-    (min.clone(), max.clone())
+    (ValueBound::from_bytes(min), ValueBound::from_bytes(max))
 }
 
 /// Zero-copy view into a subrange of an Arc-backed data blob.
@@ -592,7 +592,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             let data_pkey = data_keys[i];
             let index_pkey = index_keys[i];
 
-            let (vmin, vmax) = min_max_bytes(&chunk.values);
+            let (vmin, vmax) = min_max_bounds(&chunk.values);
 
             // build data blob (+ value offsets for variable)
             let (data_blob, seg, n_entries) = match chunk.layout {
@@ -606,8 +606,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     // index segment (lets the index module compute key layout & min/max)
                     let mut seg =
                         IndexSegment::build_fixed(data_pkey, chunk.keys_sorted.clone(), width);
-                    seg.value_bytes_min = vmin;
-                    seg.value_bytes_max = vmax;
+                    seg.value_min = Some(vmin);
+                    seg.value_max = Some(vmax);
 
                     (blob, seg, chunk.values.len() as IndexEntryCount)
                 }
@@ -622,8 +622,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     // index segment
                     let mut seg =
                         IndexSegment::build_var(data_pkey, chunk.keys_sorted.clone(), &sizes);
-                    seg.value_bytes_min = vmin;
-                    seg.value_bytes_max = vmax;
+                    seg.value_min = Some(vmin);
+                    seg.value_max = Some(vmax);
 
                     (blob, seg, chunk.values.len() as IndexEntryCount)
                 }
@@ -1550,12 +1550,12 @@ mod tests {
         assert_eq!(total_entries_for_fid, 3);
     }
 
-    fn be_key(v: u64) -> Vec<u8> {
-        v.to_be_bytes().to_vec()
-    }
-
     #[test]
     fn key_based_segment_pruning_uses_min_max_and_is_inclusive() {
+        fn be_key(v: u64) -> Vec<u8> {
+            v.to_be_bytes().to_vec()
+        }
+
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
         let fid = 1234;
@@ -1673,8 +1673,11 @@ mod tests {
                 value: TypedValue::IndexSegment(seg),
                 ..
             } => {
-                assert_eq!(seg.value_bytes_min, vec![0, 0, 0, 0]);
-                assert_eq!(seg.value_bytes_max, vec![255, 255, 255, 1]);
+                assert_eq!(seg.value_min, Some(ValueBound::from_bytes(&[0, 0, 0, 0])));
+                assert_eq!(
+                    seg.value_max,
+                    Some(ValueBound::from_bytes(&[255, 255, 255, 1]))
+                );
             }
             _ => panic!("expected IndexSegment"),
         }
@@ -1721,10 +1724,82 @@ mod tests {
                 value: TypedValue::IndexSegment(seg),
                 ..
             } => {
-                assert_eq!(seg.value_bytes_min, b"ant".to_vec());
-                assert_eq!(seg.value_bytes_max, b"zebra".to_vec());
+                assert_eq!(seg.value_min, Some(ValueBound::from_bytes(b"ant")));
+                assert_eq!(seg.value_max, Some(ValueBound::from_bytes(b"zebra")));
             }
             _ => panic!("expected IndexSegment"),
         }
+    }
+
+    #[test]
+    fn value_bounds_do_not_duplicate_huge_value() {
+        use crate::index::VALUE_BOUND_MAX;
+
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 7070;
+
+        // Single huge value (1 MiB)
+        let huge = vec![42u8; 1_048_576];
+        store.append_many(
+            vec![Put {
+                field_id: fid,
+                items: vec![(b"k".to_vec(), huge.clone())],
+            }],
+            AppendOptions {
+                mode: ValueMode::ForceVariable,
+                segment_max_entries: 1_000_000, // don't force extra chunking
+                segment_max_bytes: usize::MAX,  // allow the one huge value in one segment
+                last_write_wins_in_batch: true,
+            },
+        );
+
+        // find the freshly-written segment
+        let (seg_pk, _data_pk) = {
+            let ci = store.colindex_cache.read().unwrap();
+            let (_pk, colidx) = ci.get(&fid).expect("colindex");
+            let sref = &colidx.segments[0];
+            (sref.index_physical_key, sref.data_physical_key)
+        };
+
+        // read typed segment to inspect the bounds
+        let got = store.do_gets(vec![BatchGet::Typed {
+            key: seg_pk,
+            kind: TypedKind::IndexSegment,
+        }]);
+
+        let seg = match &got[0] {
+            GetResult::Typed {
+                value: TypedValue::IndexSegment(seg),
+                ..
+            } => seg,
+            _ => panic!("expected IndexSegment"),
+        };
+
+        // both min and max are the same single huge value
+        let vmin = seg.value_min.as_ref().expect("value_min");
+        let vmax = seg.value_max.as_ref().expect("value_max");
+
+        assert_eq!(vmin.total_len, 1_048_576);
+        assert_eq!(vmax.total_len, 1_048_576);
+        assert!(vmin.is_truncated());
+        assert!(vmax.is_truncated());
+        assert_eq!(vmin.prefix.len(), VALUE_BOUND_MAX);
+        assert_eq!(vmax.prefix.len(), VALUE_BOUND_MAX);
+        assert_eq!(vmin.prefix, vmax.prefix);
+
+        // prove the index-segment blob on disk is tiny vs the 1 MiB data blob
+        let nodes = store.describe_storage();
+        let seg_node_size = nodes
+            .into_iter()
+            .find(|n| n.pk == seg_pk)
+            .expect("segment node")
+            .stored_len;
+
+        assert!(
+            seg_node_size < 32 * 1024,
+            "segment blob unexpectedly large: {}",
+            seg_node_size
+        );
     }
 }

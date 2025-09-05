@@ -4,6 +4,33 @@ use crate::types::{
     ByteLen, ByteOffset, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey,
 };
 
+// pick a small, cache-friendly cap
+pub const VALUE_BOUND_MAX: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct ValueBound {
+    /// Full byte length of the value this bound represents.
+    pub total_len: ByteLen,
+    /// First min(VALUE_BOUND_MAX, total_len) bytes of that value.
+    pub prefix: Vec<u8>,
+}
+
+impl ValueBound {
+    #[inline]
+    pub fn from_bytes(b: &[u8]) -> Self {
+        let take = core::cmp::min(b.len(), VALUE_BOUND_MAX);
+        Self {
+            total_len: b.len() as u32,
+            prefix: b[..take].to_vec(),
+        }
+    }
+
+    #[inline]
+    pub fn is_truncated(&self) -> bool {
+        (self.prefix.len() as u32) < self.total_len
+    }
+}
+
 // TODO: Refactor
 pub fn concat_keys_and_offsets(mut keys: Vec<Vec<u8>>) -> (Vec<u8>, Vec<ByteOffset>) {
     // Ensure sorted by logical key bytes
@@ -156,8 +183,8 @@ pub struct IndexSegment {
     pub logical_key_min: LogicalKeyBytes,
     pub logical_key_max: LogicalKeyBytes,
 
-    pub value_bytes_min: Vec<u8>,
-    pub value_bytes_max: Vec<u8>,
+    pub value_min: Option<ValueBound>,
+    pub value_max: Option<ValueBound>,
 }
 
 impl IndexSegment {
@@ -177,8 +204,8 @@ impl IndexSegment {
             value_layout: ValueLayout::FixedWidth { width },
             logical_key_min,
             logical_key_max,
-            value_bytes_min: Vec::new(),
-            value_bytes_max: Vec::new(),
+            value_min: None,
+            value_max: None,
         }
     }
 
@@ -213,8 +240,8 @@ impl IndexSegment {
             },
             logical_key_min,
             logical_key_max,
-            value_bytes_min: Vec::new(),
-            value_bytes_max: Vec::new(),
+            value_min: None,
+            value_max: None,
         }
     }
 }
