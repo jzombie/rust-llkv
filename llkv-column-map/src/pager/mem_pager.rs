@@ -111,4 +111,18 @@ impl Pager for MemPager {
         }
         Ok(out)
     }
+
+    fn free_many(&self, keys: &[PhysicalKey]) -> io::Result<()> {
+        let mut map = self
+            .blobs
+            .write()
+            .expect("MemPager blobs write lock poisoned");
+
+        for key in keys {
+            // The correct method to remove a key-value pair from a HashMap is `remove`.
+            map.remove(key);
+        }
+
+        Ok(())
+    }
 }

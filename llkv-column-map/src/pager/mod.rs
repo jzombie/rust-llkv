@@ -95,6 +95,10 @@ pub trait Pager {
 
     /// Serve all gets (raw + typed) in one batch.
     fn batch_get(&self, gets: &[BatchGet]) -> io::Result<Vec<GetResult<Self::Blob>>>;
+
+    /// Used for deletions (typically after GC, since each physical node may
+    /// represent multiple entries)
+    fn free_many(&self, keys: &[PhysicalKey]) -> io::Result<()>;
 }
 
 // =================== Encoding helpers (typed) ======================

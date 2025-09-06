@@ -38,8 +38,8 @@ fn min_max_bounds(values: &[Vec<u8>]) -> (ValueBound, ValueBound) {
 #[derive(Clone, Debug)]
 pub struct ValueSlice<B> {
     data: B,
-    start: crate::types::ByteOffset,
-    end: crate::types::ByteOffset, // exclusive
+    start: ByteOffset,
+    end: ByteOffset, // exclusive
 }
 
 impl<B: AsRef<[u8]> + Clone> ValueSlice<B> {
@@ -195,6 +195,7 @@ pub struct IoStats {
     pub get_typed_ops: usize, // number of Typed gets requested
     pub put_raw_ops: usize,   // number of Raw puts requested
     pub put_typed_ops: usize, // number of Typed puts requested
+    pub free_ops: usize,      // number of physical keys freed
 }
 
 // ----------------------------- ColumnStore -----------------------------
@@ -213,6 +214,7 @@ pub struct ColumnStore<'p, P: Pager> {
     io_get_typed_ops: AtomicUsize,
     io_put_raw_ops: AtomicUsize,
     io_put_typed_ops: AtomicUsize,
+    io_free_ops: AtomicUsize,
 }
 
 impl<'p, P: Pager> ColumnStore<'p, P> {
@@ -257,6 +259,16 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         self.pager.batch_get(&gets).unwrap_or_default()
     }
 
+    // Helper to route batch Frees through here to bump metrics in one place.
+    fn do_frees(&self, keys: &[PhysicalKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        self.io_batches.fetch_add(1, Ordering::Relaxed);
+        self.io_free_ops.fetch_add(keys.len(), Ordering::Relaxed);
+        let _ = self.pager.free_many(keys);
+    }
+
     /// Access current metrics (counts of batch/ops).
     pub fn io_stats(&self) -> IoStats {
         IoStats {
@@ -265,6 +277,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             get_typed_ops: self.io_get_typed_ops.load(Ordering::Relaxed),
             put_raw_ops: self.io_put_raw_ops.load(Ordering::Relaxed),
             put_typed_ops: self.io_put_typed_ops.load(Ordering::Relaxed),
+            free_ops: self.io_free_ops.load(Ordering::Relaxed),
         }
     }
 
@@ -275,6 +288,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         self.io_get_typed_ops.store(0, Ordering::Relaxed);
         self.io_put_raw_ops.store(0, Ordering::Relaxed);
         self.io_put_typed_ops.store(0, Ordering::Relaxed);
+        self.io_free_ops.store(0, Ordering::Relaxed);
     }
 
     // Create fresh store (bootstrap->manifest, empty manifest).
@@ -311,6 +325,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             io_get_typed_ops: AtomicUsize::new(0),
             io_put_raw_ops: AtomicUsize::new(0),
             io_put_typed_ops: AtomicUsize::new(0),
+            io_free_ops: AtomicUsize::new(0),
         }
     }
 
@@ -360,6 +375,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             io_get_typed_ops: AtomicUsize::new(0),
             io_put_raw_ops: AtomicUsize::new(0),
             io_put_typed_ops: AtomicUsize::new(0),
+            io_free_ops: AtomicUsize::new(0),
         }
     }
 
@@ -712,6 +728,30 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         }
     }
 
+    /// Logically delete keys by appending tombstones (zero-length values).
+    /// We force variable layout so size=0 entries are valid.
+    pub fn delete_many(&self, items: Vec<(LogicalFieldId, Vec<LogicalKeyBytes>)>) {
+        if items.is_empty() {
+            return;
+        }
+
+        // Convert to Put batches with empty value bytes.
+        let puts: Vec<Put> = items
+            .into_iter()
+            .map(|(fid, keys)| Put {
+                field_id: fid,
+                items: keys.into_iter().map(|k| (k, Vec::<u8>::new())).collect(),
+            })
+            .collect();
+
+        // Force variable so 0-byte values are allowed; keep LWW in-batch.
+        let mut opts = AppendOptions::default();
+        opts.mode = ValueMode::ForceVariable;
+        opts.last_write_wins_in_batch = true;
+
+        self.append_many(puts, opts);
+    }
+
     // ----------------------------- read API -----------------------------
 
     /// Batched point lookups across many columns.
@@ -732,10 +772,12 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         }
 
         // Pre-size outputs: one vector per input, one slot per key.
-        let mut results: Vec<Vec<Option<ValueSlice<P::Blob>>>> = items
-            .iter()
-            .map(|(_, ks)| vec![Option::<ValueSlice<P::Blob>>::None; ks.len()])
-            .collect();
+        let mut results: Vec<Vec<Option<ValueSlice<P::Blob>>>> =
+            items.iter().map(|(_, ks)| vec![None; ks.len()]).collect();
+
+        // Track which queries have been resolved (found value or tombstone).
+        // Key: (query_index, key_index)
+        let mut resolved_queries: FxHashSet<(usize, usize)> = FxHashSet::default();
 
         // -------- ensure ColumnIndex in cache for all referenced fields --------
         let mut need_fids: FxHashSet<LogicalFieldId> = FxHashSet::default();
@@ -786,8 +828,10 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         }
 
         // -------- routing: segment -> (data_pk, [(item_i, key_j), ...]) --------
+        // We also compute a "recency rank" per segment pk so we can process newest-first globally.
         let mut per_seg: FxHashMap<PhysicalKey, (PhysicalKey, Vec<(usize, usize)>)> =
             FxHashMap::default();
+        let mut seg_rank: FxHashMap<PhysicalKey, usize> = FxHashMap::default();
 
         {
             let cache = self.colindex_cache.read().unwrap();
@@ -798,7 +842,17 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     None => continue, // unknown field => all None for that entry
                 };
 
+                // Record recency ranks for this column's segments (0 == newest).
+                for (rank, segref) in col_index.segments.iter().enumerate() {
+                    seg_rank
+                        .entry(segref.index_physical_key)
+                        .and_modify(|r| *r = (*r).min(rank))
+                        .or_insert(rank);
+                }
+
                 for (kj, k) in keys.iter().enumerate() {
+                    // Route this key to all segments whose min/max covers it.
+                    // We'll decide which one wins later by processing order (newest-first).
                     for segref in &col_index.segments {
                         if segref.logical_key_min.as_slice() <= k.as_slice()
                             && k.as_slice() <= segref.logical_key_max.as_slice()
@@ -811,7 +865,6 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                                     e.insert((segref.data_physical_key, vec![(qi, kj)]));
                                 }
                             }
-                            break;
                         }
                     }
                 }
@@ -822,40 +875,30 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             return results;
         }
 
-        // -------- single batched load for segments AND data blobs -------------
-        // Build one get list containing typed IndexSegments and raw Data blobs.
-        let mut gets: Vec<BatchGet> = Vec::with_capacity(per_seg.len() * 2);
+        // Build a processing order of segments: strictly newest-first using the recorded ranks.
+        let mut seg_order: Vec<PhysicalKey> = per_seg.keys().copied().collect();
+        seg_order.sort_by_key(|pk| *seg_rank.get(pk).unwrap_or(&usize::MAX));
 
-        // 1) typed load of all needed index segments
-        let seg_keys: Vec<PhysicalKey> = per_seg.keys().copied().collect();
-        for pk in &seg_keys {
+        // -------- single batched load for segments AND data blobs -------------
+        let mut gets: Vec<BatchGet> = Vec::with_capacity(seg_order.len() * 2);
+        for pk in &seg_order {
             gets.push(BatchGet::Typed {
                 key: *pk,
                 kind: TypedKind::IndexSegment,
             });
         }
-
-        // 2) raw load of all needed data blobs (dedup)
-        let mut data_keys: Vec<PhysicalKey> = Vec::with_capacity(per_seg.len());
         let mut seen_data: FxHashSet<PhysicalKey> = FxHashSet::default();
-        for v in per_seg.values() {
-            let data_pk = v.0;
-            if seen_data.insert(data_pk) {
-                data_keys.push(data_pk);
+        for pk in &seg_order {
+            let (data_pk, _) = per_seg.get(pk).unwrap();
+            // Defensive: skip impossible/sentinel data keys.
+            if *data_pk != u64::MAX && seen_data.insert(*data_pk) {
+                gets.push(BatchGet::Raw { key: *data_pk });
             }
         }
-        for pk in &data_keys {
-            gets.push(BatchGet::Raw { key: *pk });
-        }
-
         let resp = self.do_gets(gets);
 
-        // Partition response into typed segments and raw data slices.
-        let mut seg_map: FxHashMap<PhysicalKey, IndexSegment> =
-            FxHashMap::with_capacity_and_hasher(seg_keys.len(), Default::default());
-        let mut data_map: FxHashMap<PhysicalKey, P::Blob> =
-            FxHashMap::with_capacity_and_hasher(data_keys.len(), Default::default());
-
+        let mut seg_map: FxHashMap<PhysicalKey, IndexSegment> = FxHashMap::default();
+        let mut data_map: FxHashMap<PhysicalKey, P::Blob> = FxHashMap::default();
         for gr in resp {
             match gr {
                 GetResult::Typed {
@@ -871,16 +914,19 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             }
         }
 
-        // -------- execution: binary search inside segments and slice values ----
-        for (seg_pk, (data_pk, pairs)) in per_seg {
+        // -------- execution: search segments newest-first and slice values ----
+        for seg_pk in seg_order {
+            let (data_pk, pairs) = per_seg.remove(&seg_pk).expect("segment present in per_seg");
             let seg = seg_map
                 .get(&seg_pk)
                 .expect("loaded segment missing from seg_map");
-            let data_blob = data_map
-                .get(&data_pk)
-                .expect("loaded data blob missing from data_map");
 
             for (qi, kj) in pairs {
+                // Skip if already satisfied by a newer segment (value or tombstone).
+                if resolved_queries.contains(&(qi, kj)) {
+                    continue;
+                }
+
                 let target = items[qi].1[kj].as_slice();
                 if let Some(pos) = binary_search_key_with_layout(
                     &seg.logical_key_bytes,
@@ -888,32 +934,49 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     seg.n_entries as usize,
                     target,
                 ) {
-                    let view = match &seg.value_layout {
+                    match &seg.value_layout {
                         ValueLayout::FixedWidth { width } => {
-                            let w = *width as usize;
-                            let a = pos * w;
-                            let b = a + w;
-                            ValueSlice {
-                                data: data_blob.clone(),
-                                start: a as crate::types::ByteOffset,
-                                end: b as crate::types::ByteOffset,
+                            // Fixed-width tombstone is only defensive (ForceFixed(0) is rejected).
+                            if *width == 0 {
+                                resolved_queries.insert((qi, kj));
+                                continue;
                             }
+                            if let Some(data_blob) = data_map.get(&data_pk) {
+                                let w = *width as usize;
+                                let a = pos * w;
+                                let b = a + w;
+                                results[qi][kj] = Some(ValueSlice {
+                                    data: data_blob.clone(),
+                                    start: a as ByteOffset,
+                                    end: b as ByteOffset,
+                                });
+                            }
+                            resolved_queries.insert((qi, kj));
                         }
                         ValueLayout::Variable { value_offsets } => {
-                            let a = value_offsets[pos] as crate::types::ByteOffset;
-                            let b = value_offsets[pos + 1] as crate::types::ByteOffset;
-                            ValueSlice {
-                                data: data_blob.clone(),
-                                start: a,
-                                end: b,
+                            let a = value_offsets[pos] as ByteOffset;
+                            let b = value_offsets[pos + 1] as ByteOffset;
+
+                            if a == b {
+                                // zero-length value => tombstone
+                                resolved_queries.insert((qi, kj));
+                                continue;
                             }
+
+                            if let Some(data_blob) = data_map.get(&data_pk) {
+                                results[qi][kj] = Some(ValueSlice {
+                                    data: data_blob.clone(),
+                                    start: a,
+                                    end: b,
+                                });
+                            }
+                            resolved_queries.insert((qi, kj));
                         }
-                    };
-                    results[qi][kj] = Some(view);
+                    }
                 }
+                // else: not in this (newer) segment, keep looking in older ones
             }
         }
-
         results
     }
 }
@@ -1800,6 +1863,71 @@ mod tests {
             seg_node_size < 32 * 1024,
             "segment blob unexpectedly large: {}",
             seg_node_size
+        );
+    }
+
+    #[test]
+    fn delete_many_and_get() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 101;
+
+        // 1. Write some initial data
+        let put = Put {
+            field_id: fid,
+            items: vec![
+                (b"k1".to_vec(), b"val1".to_vec()),
+                (b"k2".to_vec(), b"val2".to_vec()),
+                (b"k3".to_vec(), b"val3".to_vec()),
+            ],
+        };
+        store.append_many(vec![put], AppendOptions::default());
+
+        // 2. Verify initial data
+        let got1 = store.get_many(vec![(
+            fid,
+            vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()],
+        )]);
+        assert_eq!(got1[0][0].as_deref().unwrap(), b"val1");
+        assert_eq!(got1[0][1].as_deref().unwrap(), b"val2");
+        assert_eq!(got1[0][2].as_deref().unwrap(), b"val3");
+
+        // 3. Delete k2 and a non-existent key k4
+        store.delete_many(vec![(fid, vec![b"k2".to_vec(), b"k4".to_vec()])]);
+
+        // 4. Verify deletion
+        // NOTE: This test will FAIL until get_many is updated to handle tombstones.
+        // The current implementation of get_many does not check for tombstone segments
+        // (segments with value width 0) and will still find the old data.
+        let got2 = store.get_many(vec![(
+            fid,
+            vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()],
+        )]);
+        assert_eq!(
+            got2[0][0].as_deref().unwrap(),
+            b"val1",
+            "k1 should still exist"
+        );
+        assert!(got2[0][1].is_none(), "k2 should be deleted");
+        assert_eq!(
+            got2[0][2].as_deref().unwrap(),
+            b"val3",
+            "k3 should still exist"
+        );
+
+        // 5. Appending a new value for k2 should bring it back
+        let put2 = Put {
+            field_id: fid,
+            items: vec![(b"k2".to_vec(), b"new_val2".to_vec())],
+        };
+        store.append_many(vec![put2], AppendOptions::default());
+
+        let got3 = store.get_many(vec![(fid, vec![b"k1".to_vec(), b"k2".to_vec()])]);
+        assert_eq!(got3[0][0].as_deref().unwrap(), b"val1");
+        assert_eq!(
+            got3[0][1].as_deref().unwrap(),
+            b"new_val2",
+            "k2 should have new value"
         );
     }
 }

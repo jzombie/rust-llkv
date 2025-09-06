@@ -70,6 +70,7 @@ struct Counts {
     put_typed: u64,
     get_raw: u64,
     get_typed: u64,
+    frees: u64, // number of physical keys freed
 }
 
 impl core::ops::Sub for Counts {
@@ -81,6 +82,7 @@ impl core::ops::Sub for Counts {
             put_typed: self.put_typed.saturating_sub(rhs.put_typed),
             get_raw: self.get_raw.saturating_sub(rhs.get_raw),
             get_typed: self.get_typed.saturating_sub(rhs.get_typed),
+            frees: self.frees.saturating_sub(rhs.frees),
         }
     }
 }
@@ -94,6 +96,7 @@ fn read_counts<P: llkv_column_map::pager::Pager>(store: &ColumnStore<'_, P>) -> 
         put_typed: s.put_typed_ops as u64,
         get_raw: s.get_raw_ops as u64,
         get_typed: s.get_typed_ops as u64,
+        frees: s.free_ops as u64,
     }
 }
 
@@ -162,6 +165,7 @@ fn show_phase_with_data<P: llkv_column_map::pager::Pager>(
     println!("  batches: {}", d.batches);
     println!("  puts:   raw={} typed={}", d.put_raw, d.put_typed);
     println!("  gets:   raw={} typed={}", d.get_raw, d.get_typed);
+    println!("  frees:  {}", d.frees);
     println!();
     *prev = now;
 }
@@ -178,6 +182,7 @@ fn show_phase<P: llkv_column_map::pager::Pager>(
     println!("  batches: {}", d.batches);
     println!("  puts:   raw={} typed={}", d.put_raw, d.put_typed);
     println!("  gets:   raw={} typed={}", d.get_raw, d.get_typed);
+    println!("  frees:  {}", d.frees);
     println!();
     *prev = now;
 }
