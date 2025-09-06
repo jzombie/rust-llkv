@@ -13,6 +13,7 @@ rustc-hash.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+rand.workspace = true
 
 [[bench]]
 name = "indexing_bench"
@@ -20,4 +21,8 @@ harness = false
 
 [[bench]]
 name = "ingest_bench"
+harness = false
+
+[[bench]]
+name = "read_bench"
 harness = false
