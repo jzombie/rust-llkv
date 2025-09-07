@@ -106,6 +106,7 @@ pub struct ColumnIndex {
     pub segments: Vec<IndexSegmentRef>, // newest-first
 }
 
+// TODO: [perf] Ensure bounds are updated as keys are dereferenced.
 /// Pointer to a sealed segment + fast-prune info (all LOGICAL).
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct IndexSegmentRef {
