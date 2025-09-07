@@ -36,6 +36,7 @@ pub enum GetResult<B> {
 /// Unified pager interface with separate put/get passes.
 /// - `batch_put` applies all writes atomically w.r.t. this pager.
 /// - `batch_get` serves a mixed list of typed/raw reads in one round-trip.
+///
 /// Returning **owned blob handles** allows `&self` for reads (good for
 /// RwLock read guards) while remaining zero-copy when the blob is mmap-backed.
 ///

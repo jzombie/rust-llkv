@@ -68,7 +68,7 @@ impl Pager for MemPagerU64 {
         s.next_id = s
             .next_id
             .checked_add(count as u64)
-            .ok_or_else(|| Error::Corrupt("id space exhausted"))?;
+            .ok_or(Error::Corrupt("id space exhausted"))?;
         Ok((start..s.next_id).collect())
     }
 

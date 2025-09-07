@@ -105,7 +105,7 @@ fn build_many_columns_fixed_width(
         let key_max = logical_keys.last().cloned().unwrap_or_default();
 
         for i in 0..batch {
-            let data_pkey = ids[i * 3 + 0];
+            let data_pkey = ids[i * 3];
             let seg_pkey = ids[i * 3 + 1];
             let colidx_pkey = ids[i * 3 + 2];
 

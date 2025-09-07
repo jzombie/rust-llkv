@@ -26,6 +26,8 @@
 //!    * Writes/dealloc invalidate affected pages immediately.
 //!    * Pending writes bypass the cache (serve from in-memory bytes).
 
+#![allow(dead_code)] // Allowed because crate is being replaced
+
 use crate::{
     codecs::push_u32,
     codecs::{IdCodec, KeyCodec},
@@ -564,11 +566,11 @@ where
         // 2) Coalesce duplicates (keep last value per key).
         let mut coalesced: Vec<(KC::Key, &[u8])> = Vec::with_capacity(owned.len());
         for (k, v) in owned.into_iter() {
-            if let Some(last) = coalesced.last_mut() {
-                if last.0 == k {
-                    last.1 = v; // overwrite last
-                    continue;
-                }
+            if let Some(last) = coalesced.last_mut()
+                && last.0 == k
+            {
+                last.1 = v; // overwrite last
+                continue;
             }
             coalesced.push((k, v));
         }
@@ -1381,6 +1383,7 @@ where
     }
 
     /// Descend using an existing path hint where possible.
+    #[allow(clippy::type_complexity)] // Note: Allowed because crate is being replaced.
     fn descend_with_path_hint(
         &self,
         path_hint: &[(P::Id, usize)],
@@ -1388,7 +1391,7 @@ where
     ) -> Result<(P::Id, NodeView<P>, Option<P::Id>, Vec<(P::Id, usize)>), Error> {
         // Start from the highest node in the hint that is still valid
         // for this key; otherwise restart from root.
-        let mut root_id = {
+        let root_id = {
             let s = self.state.lock().unwrap();
             s.root.clone()
         };
@@ -1562,6 +1565,7 @@ where
 
     /// Update internal parents following a child split, possibly
     /// creating a new root if the old root overflows.
+    #[allow(clippy::ptr_arg)] // Note: Allowed because crate is being replaced.
     fn update_parent_chain_after_split(
         &self,
         path: &mut Vec<(P::Id, usize)>,

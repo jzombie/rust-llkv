@@ -156,15 +156,16 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         self.pager.batch_get(&gets).unwrap_or_default()
     }
 
+    // TODO: Implement with GC
     // Helper to route batch Frees through here to bump metrics in one place.
-    fn do_frees(&self, keys: &[PhysicalKey]) {
-        if keys.is_empty() {
-            return;
-        }
-        self.io_batches.fetch_add(1, Ordering::Relaxed);
-        self.io_free_ops.fetch_add(keys.len(), Ordering::Relaxed);
-        let _ = self.pager.free_many(keys);
-    }
+    // fn do_frees(&self, keys: &[PhysicalKey]) {
+    //     if keys.is_empty() {
+    //         return;
+    //     }
+    //     self.io_batches.fetch_add(1, Ordering::Relaxed);
+    //     self.io_free_ops.fetch_add(keys.len(), Ordering::Relaxed);
+    //     let _ = self.pager.free_many(keys);
+    // }
 
     /// Access current metrics (counts of batch/ops).
     pub fn io_stats(&self) -> IoStats {
@@ -646,9 +647,11 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             .collect();
 
         // Force variable so 0-byte values are allowed; keep LWW in-batch.
-        let mut opts = AppendOptions::default();
-        opts.mode = ValueMode::ForceVariable;
-        opts.last_write_wins_in_batch = true;
+        let opts = AppendOptions {
+            mode: ValueMode::ForceVariable,
+            last_write_wins_in_batch: true,
+            ..Default::default()
+        };
 
         self.append_many(puts, opts);
     }
@@ -895,7 +898,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
         // --- bootstrap + manifest (raw sizes)
         let bootstrap_key: PhysicalKey = self.bootstrap_key;
-        let header_keys = vec![bootstrap_key, self.manifest_key];
+        let header_keys = [bootstrap_key, self.manifest_key];
 
         // Fetch raw bytes for bootstrap + manifest in one batch.
         let gets = header_keys
@@ -978,7 +981,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         stored_len: *colindex_raw_len.get(pk).unwrap_or(&0),
                         kind: StorageKind::ColumnIndex {
                             field_id: ci.field_id,
-                            n_segments: ci.segments.len() as usize,
+                            n_segments: ci.segments.len(),
                         },
                     });
 
@@ -1134,8 +1137,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 StorageKind::Bootstrap => {
                     let _ = writeln!(
                         &mut s,
-                        "{:<10} {:<12} {:<9} {:>10}  {}",
-                        n.pk, "bootstrap", "-", n.stored_len, "-"
+                        "{:<10} {:<12} {:<9} {:>10}  -",
+                        n.pk, "bootstrap", "-", n.stored_len,
                     );
                 }
                 StorageKind::Manifest { column_count } => {
@@ -1440,10 +1443,12 @@ mod tests {
             ],
         };
 
-        let mut opts = AppendOptions::default();
-        opts.mode = ValueMode::ForceFixed(2); // keep sizes simple
-        opts.segment_max_entries = 1024; // ensure a single segment
-        opts.last_write_wins_in_batch = true; // <- dedup ON
+        let opts = AppendOptions {
+            mode: ValueMode::ForceFixed(2), // keep sizes simple
+            segment_max_entries: 1024,      // ensure a single segment
+            last_write_wins_in_batch: true, // <- dedup ON
+            ..Default::default()
+        };
 
         store.append_many(vec![put], opts);
 
@@ -1484,10 +1489,12 @@ mod tests {
             ],
         };
 
-        let mut opts = AppendOptions::default();
-        opts.mode = ValueMode::ForceFixed(2);
-        opts.segment_max_entries = 1024; // keep to a single segment
-        opts.last_write_wins_in_batch = false; // <- dedup OFF
+        let opts = AppendOptions {
+            mode: ValueMode::ForceFixed(2),
+            segment_max_entries: 1024,
+            last_write_wins_in_batch: false, // <- dedup OFF
+            ..Default::default()
+        };
 
         store.append_many(vec![put], opts);
 

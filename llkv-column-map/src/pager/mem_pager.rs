@@ -2,7 +2,7 @@ use super::*;
 use crate::codecs::{decode_typed, encode_typed};
 use crate::constants::BOOTSTRAP_PKEY;
 use rustc_hash::FxHashMap;
-use std::io::{self, Error, ErrorKind};
+use std::io::{self, Error};
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicU64, Ordering},
@@ -48,12 +48,7 @@ impl Pager for MemPager {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 cur.checked_add(n_u64)
             })
-            .map_err(|_| {
-                Error::new(
-                    ErrorKind::Other,
-                    "physical key space overflow in MemPager::alloc_many",
-                )
-            })?;
+            .map_err(|_| Error::other("physical key space overflow in MemPager::alloc_many"))?;
         let end = start + n_u64;
         Ok((start..end).collect())
     }

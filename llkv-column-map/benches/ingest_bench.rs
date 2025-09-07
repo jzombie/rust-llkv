@@ -151,7 +151,8 @@ fn bench_ingest_by_batches(c: &mut Criterion) {
     group.throughput(Throughput::Elements(total_rows * 21));
 
     for &batches in &num_batches_options {
-        let rows_per_batch = (total_rows as usize + batches - 1) / batches;
+        let rows_per_batch = (total_rows as usize).div_ceil(batches);
+
         let label = format!(
             "num_batches={} (rows_per_batch≈{})",
             batches, rows_per_batch

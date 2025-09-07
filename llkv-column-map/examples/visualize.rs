@@ -18,11 +18,11 @@
 //!
 //!      This creates one `storage_layout.dot` in the project root and prints
 //!      an ASCII summary to stdout. Nodes are colored by batch of creation:
-//!        batch 0 (bootstrap/manifest): white
-//!        batch 1: lightskyblue
-//!        batch 2: palegreen
-//!        batch 3: khaki
-//!        batch 4: lightpink
+//!      - batch 0 (bootstrap/manifest): white
+//!      - batch 1: lightskyblue
+//!      - batch 2: palegreen
+//!      - batch 3: khaki
+//!      - batch 4: lightpink
 //!
 //!   3) Generate an image
 //!      - PNG:  `dot -Tpng storage_layout.dot -o storage_layout.png`
@@ -70,7 +70,7 @@ fn build_put_for_col2(start: usize, end: usize) -> Option<Put> {
     let mut items = Vec::with_capacity(e - s);
     for i in s..e {
         let key = format!("id:{:06}", i).into_bytes();
-        let len = (i % 21 + 1) as usize; // 1..21
+        let len = i % 21 + 1; // 1..21
         items.push((key, vec![b'A' + (i % 26) as u8; len]));
     }
     Some(Put { field_id: 2, items })
@@ -244,7 +244,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         created_in_batch.insert(n.pk, 0);
     }
 
-    let rows_per_batch = (C3_ROWS + BATCHES - 1) / BATCHES;
+    let rows_per_batch = C3_ROWS.div_ceil(BATCHES);
+
     println!(
         "Ingesting col1={} rows, col2={} rows, col3={} rows in {} batches ({} rows/batch on col3)...",
         C1_ROWS, C2_ROWS, C3_ROWS, BATCHES, rows_per_batch

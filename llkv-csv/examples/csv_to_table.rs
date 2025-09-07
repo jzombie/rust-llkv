@@ -155,7 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("--- table dump start ---");
     table
-        .scan(&expr, &projection, &mut |row_id, mut values_iter| {
+        .scan(&expr, &projection, &mut |row_id, values_iter| {
             print!("row_id={}:", row_id);
             for i in 0..projection.len() {
                 if let Some(v) = values_iter.next() {
@@ -173,7 +173,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!();
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+        .map_err(|e| std::io::Error::other(format!("{:?}", e)))?;
     println!("--- table dump end ---");
 
     Ok(())
