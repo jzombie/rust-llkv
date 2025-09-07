@@ -1,3 +1,6 @@
+pub mod index_layout;
+pub use index_layout::*;
+
 pub mod key_layout;
 pub use key_layout::*;
 

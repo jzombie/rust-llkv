@@ -2,7 +2,7 @@
 use crate::index::{
     Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, Manifest, ValueBound,
 };
-use crate::layout::{KeyLayout, ValueLayout};
+use crate::layout::{IndexLayoutInfo, KeyLayout, ValueLayout};
 use crate::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::types::{
     ByteLen, ByteOffset, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey,
@@ -16,16 +16,6 @@ use std::sync::{
     RwLock,
     atomic::{AtomicUsize, Ordering},
 };
-
-#[derive(Clone, Debug)]
-pub struct IndexLayoutInfo {
-    pub kind: &'static str,             // "fixed" or "variable" (value layout)
-    pub fixed_width: Option<ByteWidth>, // when value layout is fixed
-    // TODO: Rename to indicate *logical* and *len*?
-    pub key_bytes: usize,        // logical_key_bytes.len()
-    pub key_offs_bytes: usize, // if KeyLayout::Variable: key_offsets.len() * sizeof(ByteOffset); else 0
-    pub value_meta_bytes: usize, // Variable: value_offsets.len()*sizeof(ByteOffset), Fixed: 4 (ByteWidth)
-}
 
 #[derive(Clone, Debug)]
 pub struct StorageNode {
@@ -1682,7 +1672,7 @@ mod tests {
 
     #[test]
     fn value_bounds_do_not_duplicate_huge_value() {
-        use crate::index::VALUE_BOUND_MAX;
+        use crate::constants::VALUE_BOUND_MAX;
 
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);

@@ -1,12 +1,10 @@
 use bitcode::{Decode, Encode};
 
+use crate::constants::VALUE_BOUND_MAX;
 use crate::layout::{KeyLayout, ValueLayout};
 use crate::types::{
     ByteLen, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey,
 };
-
-// pick a small, cache-friendly cap
-pub const VALUE_BOUND_MAX: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
 pub struct ValueBound {
