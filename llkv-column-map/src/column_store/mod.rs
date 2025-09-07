@@ -205,7 +205,8 @@ mod tests {
     use super::*;
 
     // Use the unified in-memory pager from the pager module.
-    use crate::index::{IndexSegmentRef, ValueBound};
+    use crate::bounds::ValueBound;
+    use crate::index::IndexSegmentRef;
     use crate::storage::pager::MemPager;
 
     #[test]

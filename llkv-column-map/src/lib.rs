@@ -1,3 +1,4 @@
+pub mod bounds;
 pub mod codecs;
 pub mod column_store;
 pub mod constants;
