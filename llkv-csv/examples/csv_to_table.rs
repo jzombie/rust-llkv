@@ -144,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---- Stream the table contents back out (in sorted order) ----
     let projection: Vec<FieldId> = (1..=width as FieldId).collect();
 
-    // CORRECTED SCAN: Use a full range scan on the index to get all rows in sorted order.
+    // Use a full range scan on the index to get all rows in sorted order.
     let expr = Expr::Pred(Filter {
         field_id: 1,
         op: Operator::Range {

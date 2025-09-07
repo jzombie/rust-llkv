@@ -3,8 +3,6 @@
 //! Parses CSV rows from any `Read` and batches `Table::insert_many`.
 //! The mapping closure returns an optional `RowPatch`. Returning `None`
 //! skips that row. Only the example binary should touch the filesystem.
-//!
-//! All lines <= 80 chars.
 
 #![forbid(unsafe_code)]
 
