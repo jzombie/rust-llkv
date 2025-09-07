@@ -11,10 +11,9 @@
 //!
 //! “cells” = number of (key,value) entries written, i.e., len(items) per column.
 
-use llkv_column_map::pager::BlobLike;
 use llkv_column_map::{
-    AppendOptions, ColumnStore, Put, ValueMode, pager::MemPager, types::LogicalFieldId,
-    views::ValueSlice,
+    AppendOptions, ColumnStore, Put, ValueMode, pager::MemPager, types::BlobLike,
+    types::LogicalFieldId, views::ValueSlice,
 };
 
 // -------- simple key/value generators ---------------------------------------

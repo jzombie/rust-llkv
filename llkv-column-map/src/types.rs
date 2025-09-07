@@ -57,3 +57,39 @@ pub type ByteOffset = u32;
 /// - Stored as `u32` for compactness; thus each individual value must be
 ///   `< 4 GiB` and any single blob must also remain `< 4 GiB`.
 pub type ByteLen = u32;
+
+/// Any clonable, thread-safe buffer that can be viewed as `&[u8]`.
+pub trait BlobLike: AsRef<[u8]> + Clone + Send + Sync + 'static {}
+impl<T> BlobLike for T where T: AsRef<[u8]> + Clone + Send + Sync + 'static {}
+
+/// Typed kinds the pager knows how to decode/encode. Keep this set
+/// scoped to storage types you persist via `bitcode`.
+#[derive(Clone, Copy, Debug)]
+pub enum TypedKind {
+    Bootstrap,
+    Manifest,
+    ColumnIndex,
+    IndexSegment,
+}
+
+/// Type-erased typed value. Concrete structs live in your crate's
+/// `index` module. This avoids `Any`/downcasts at callers.
+#[derive(Clone, Debug)]
+pub enum TypedValue {
+    Bootstrap(crate::index::Bootstrap),
+    Manifest(crate::index::Manifest),
+    ColumnIndex(crate::index::ColumnIndex),
+    IndexSegment(crate::index::IndexSegment),
+}
+
+impl TypedValue {
+    /// Helper to get the kind tag for a value.
+    pub fn kind(&self) -> TypedKind {
+        match self {
+            TypedValue::Bootstrap(_) => TypedKind::Bootstrap,
+            TypedValue::Manifest(_) => TypedKind::Manifest,
+            TypedValue::ColumnIndex(_) => TypedKind::ColumnIndex,
+            TypedValue::IndexSegment(_) => TypedKind::IndexSegment,
+        }
+    }
+}

@@ -3,9 +3,10 @@ use crate::index::{
     Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, Manifest, ValueBound,
 };
 use crate::layout::{KeyLayout, ValueLayout};
-use crate::pager::{BatchGet, BatchPut, GetResult, Pager, TypedKind, TypedValue};
+use crate::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::types::{
     ByteLen, ByteOffset, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey,
+    TypedKind, TypedValue,
 };
 use crate::views::ValueSlice;
 use rustc_hash::{FxHashMap, FxHashSet};
