@@ -156,26 +156,11 @@ impl IndexSegment {
 mod tests {
     use super::*;
     use crate::pager::{BatchGet, BatchPut, GetResult, MemPager, Pager, TypedKind, TypedValue};
+    use crate::utils::slice::slice_key_by_layout;
 
     const BOOTSTRAP_PKEY: PhysicalKey = 0;
 
     // ---------------- helpers to build/slice logical keys ----------------
-
-    fn slice_key<'a>(bytes: &'a [u8], layout: &'a KeyLayout, i: usize) -> &'a [u8] {
-        match layout {
-            KeyLayout::FixedWidth { width } => {
-                let w = *width as usize;
-                let a = i * w;
-                let b = a + w;
-                &bytes[a..b]
-            }
-            KeyLayout::Variable { key_offsets } => {
-                let a = key_offsets[i] as usize;
-                let b = key_offsets[i + 1] as usize;
-                &bytes[a..b]
-            }
-        }
-    }
 
     // Generic function (not a closure) to avoid HRTB/lifetime clash.
     fn prune<'a>(refs: &'a [IndexSegmentRef], probe: &[u8]) -> Vec<&'a IndexSegmentRef> {
@@ -405,9 +390,9 @@ mod tests {
         }
 
         // Inspect keys via KeyLayout
-        let k0 = slice_key(&seg100.logical_key_bytes, &seg100.key_layout, 0);
-        let k1 = slice_key(&seg100.logical_key_bytes, &seg100.key_layout, 1);
-        let k2 = slice_key(&seg100.logical_key_bytes, &seg100.key_layout, 2);
+        let k0 = slice_key_by_layout(&seg100.logical_key_bytes, &seg100.key_layout, 0);
+        let k1 = slice_key_by_layout(&seg100.logical_key_bytes, &seg100.key_layout, 1);
+        let k2 = slice_key_by_layout(&seg100.logical_key_bytes, &seg100.key_layout, 2);
         assert_eq!(k0, &b"a"[..]);
         assert_eq!(k1, &b"b"[..]);
         assert_eq!(k2, &b"d"[..]);
@@ -533,7 +518,7 @@ mod tests {
         let mut hit = None;
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let k = slice_key(&seg.logical_key_bytes, &seg.key_layout, mid);
+            let k = slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, mid);
             match k.cmp(target) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
@@ -545,7 +530,7 @@ mod tests {
         }
         let pos = hit.expect("should find wolf");
         assert_eq!(
-            slice_key(&seg.logical_key_bytes, &seg.key_layout, pos),
+            slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, pos),
             &b"wolf"[..]
         );
     }
@@ -621,8 +606,8 @@ mod tests {
         let seg = IndexSegment::build_fixed(123, keys, 4 /* any width for values */);
 
         // bounds must be inclusive and lexicographic — derive by slicing first/last
-        let first = slice_key(&seg.logical_key_bytes, &seg.key_layout, 0);
-        let last = slice_key(
+        let first = slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);
+        let last = slice_key_by_layout(
             &seg.logical_key_bytes,
             &seg.key_layout,
             seg.n_entries as usize - 1,
@@ -653,8 +638,8 @@ mod tests {
         let seg = IndexSegment::build_var(777, keys, &sizes);
 
         // derive lexicographic min/max by slicing packed keys
-        let first = slice_key(&seg.logical_key_bytes, &seg.key_layout, 0);
-        let last = slice_key(
+        let first = slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);
+        let last = slice_key_by_layout(
             &seg.logical_key_bytes,
             &seg.key_layout,
             seg.n_entries as usize - 1,
