@@ -1,4 +1,5 @@
 use super::*;
+use crate::constants::BOOTSTRAP_PKEY;
 use rustc_hash::FxHashMap;
 use std::io::{self, Error, ErrorKind};
 use std::sync::{
@@ -27,7 +28,7 @@ impl Default for MemPager {
 impl MemPager {
     pub fn new() -> Self {
         Self {
-            next_key: AtomicU64::new(1), // reserve 0 for bootstrap
+            next_key: AtomicU64::new(BOOTSTRAP_PKEY + 1), // reserve initial for bootstrap
             blobs: RwLock::new(FxHashMap::default()),
         }
     }

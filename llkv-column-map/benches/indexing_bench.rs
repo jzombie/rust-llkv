@@ -48,15 +48,13 @@
 //! ```
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use llkv_column_map::constants::BOOTSTRAP_PKEY;
 use llkv_column_map::index::{
     Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, Manifest,
 };
 use llkv_column_map::pager::{BatchPut, MemPager, Pager, TypedValue};
 use llkv_column_map::types::{LogicalFieldId, LogicalKeyBytes, PhysicalKey};
 use std::hint::black_box;
-
-/// Physical key reserved for the tiny bootstrap record.
-const BOOTSTRAP_PKEY: PhysicalKey = 0;
 
 /// Make monotonically increasing numeric logical keys (already sorted).
 #[inline]
