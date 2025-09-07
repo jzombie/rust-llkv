@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-Prototype B+Tree replacement with batch-only pager I/O for the [LLKV](https://github.com/jzombie/rust-llkv) toolset.
+Prototype B+Tree replacement with batch-only pager I/O for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
 
 ## Features
 

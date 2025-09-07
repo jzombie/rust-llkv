@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-Simple CSV ingestion for the [LLKV](https://github.com/jzombie/rust-llkv) toolset.
+Simple CSV ingestion for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
 
 ## License
 
