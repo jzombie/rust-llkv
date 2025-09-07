@@ -16,23 +16,8 @@ use std::sync::{
 };
 pub mod ingest;
 pub mod introspect;
+pub mod metrics;
 pub mod query;
-
-// ----------------------------- metrics -----------------------------
-
-/// Minimal pager-hit metrics collected inside ColumnStore. This counts how
-/// many *requests* we send to the pager (not bytes). If you need byte totals,
-/// you can extend this to compute sizes for Raw puts/gets and (optionally)
-/// encoded sizes for Typed values.
-#[derive(Clone, Debug, Default)]
-pub struct IoStats {
-    pub batches: usize,       // number of times we called Pager::batch_* (get/put)
-    pub get_raw_ops: usize,   // number of Raw gets requested
-    pub get_typed_ops: usize, // number of Typed gets requested
-    pub put_raw_ops: usize,   // number of Raw puts requested
-    pub put_typed_ops: usize, // number of Typed puts requested
-    pub free_ops: usize,      // number of physical keys freed
-}
 
 // ----------------------------- ColumnStore -----------------------------
 
@@ -107,8 +92,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     // }
 
     /// Access current metrics (counts of batch/ops).
-    pub fn io_stats(&self) -> IoStats {
-        IoStats {
+    pub fn io_stats(&self) -> metrics::IoStats {
+        metrics::IoStats {
             batches: self.io_batches.load(Ordering::Relaxed),
             get_raw_ops: self.io_get_raw_ops.load(Ordering::Relaxed),
             get_typed_ops: self.io_get_typed_ops.load(Ordering::Relaxed),
