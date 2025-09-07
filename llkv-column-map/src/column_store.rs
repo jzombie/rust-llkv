@@ -1,8 +1,8 @@
 // High-level append/query API on top of pager + index modules.
 use crate::index::{
-    Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, KeyLayout, Manifest,
-    ValueBound, ValueLayout,
+    Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, Manifest, ValueBound,
 };
+use crate::layout::{KeyLayout, ValueLayout};
 use crate::pager::{BatchGet, BatchPut, GetResult, Pager, TypedKind, TypedValue};
 use crate::types::{
     ByteLen, ByteOffset, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey,

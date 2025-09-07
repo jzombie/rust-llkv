@@ -1,5 +1,6 @@
 use bitcode::{Decode, Encode};
 
+use crate::layout::{KeyLayout, ValueLayout};
 use crate::types::{
     ByteLen, ByteOffset, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey,
 };
@@ -125,17 +126,6 @@ pub struct IndexSegmentRef {
     pub n_entries: IndexEntryCount,
 }
 
-// ── Logical key layout (how to slice logical_key_bytes) ──────────────────────
-#[derive(Debug, Clone, Encode, Decode)]
-pub enum KeyLayout {
-    /// Every *logical key* is exactly `width` bytes → slice i is [i*w .. (i+1)*w).
-    FixedWidth { width: ByteWidth },
-
-    /// Variable width logical keys. Prefix sum of key byte offsets:
-    /// key_i is [key_offsets[i], key_offsets[i+1]).
-    Variable { key_offsets: Vec<IndexEntryCount> }, // len = n_entries + 1
-}
-
 // ── Your locked index segment & value layout ─────────────────────────────────
 /// One sealed batch. Describes how to fetch values from the *data* blob.
 /// The *data* blob contains only raw value bytes — no headers/markers.
@@ -207,17 +197,6 @@ impl IndexSegment {
             },
         }
     }
-}
-
-/// Slicing recipe for values inside the *data* blob.
-#[derive(Debug, Clone, Encode, Decode)]
-pub enum ValueLayout {
-    /// Every value is exactly `width` bytes.
-    FixedWidth { width: ByteWidth },
-
-    /// Variable width values. Prefix sum of byte offsets into data blob.
-    /// Slice i is [value_offsets[i], value_offsets[i+1]).
-    Variable { value_offsets: Vec<IndexEntryCount> }, // len = n_entries + 1
 }
 
 #[cfg(test)]
