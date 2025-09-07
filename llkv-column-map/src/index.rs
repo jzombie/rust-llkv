@@ -159,6 +159,7 @@ mod tests {
 
     // ---------------- helpers to build/slice logical keys ----------------
 
+    // TODO: Extract
     // Generic function (not a closure) to avoid HRTB/lifetime clash.
     fn prune<'a>(refs: &'a [IndexSegmentRef], probe: &[u8]) -> Vec<&'a IndexSegmentRef> {
         refs.iter()
