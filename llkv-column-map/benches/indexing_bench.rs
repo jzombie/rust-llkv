@@ -72,7 +72,7 @@ fn build_many_columns_fixed_width(
     chunk_cols: usize,
     value_width: u32,
 ) {
-    let mut pager = MemPager::default();
+    let pager = MemPager::default();
 
     // Manifest gets its own physical key up front.
     let manifest_pkey = pager.alloc_many(1).unwrap()[0];

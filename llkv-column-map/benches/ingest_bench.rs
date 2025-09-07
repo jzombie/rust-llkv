@@ -158,8 +158,8 @@ fn bench_ingest_by_batches(c: &mut Criterion) {
         );
         group.bench_function(BenchmarkId::from_parameter(label), |b| {
             b.iter(|| {
-                let mut pager = MemPager::default();
-                let mut store = ColumnStore::init_empty(&mut pager);
+                let pager = MemPager::default();
+                let store = ColumnStore::init_empty(&pager);
 
                 let mut start = 0u64;
                 for _ in 0..batches {
@@ -205,8 +205,8 @@ fn bench_ingest_by_rows_per_batch(c: &mut Criterion) {
         let label = format!("rows_per_batch={}", rows_per_batch);
         group.bench_function(BenchmarkId::from_parameter(label), |b| {
             b.iter(|| {
-                let mut pager = MemPager::default();
-                let mut store = ColumnStore::init_empty(&mut pager);
+                let pager = MemPager::default();
+                let store = ColumnStore::init_empty(&pager);
 
                 let mut start = 0u64;
                 while start < total_rows {
