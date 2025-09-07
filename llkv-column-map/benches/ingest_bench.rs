@@ -55,7 +55,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 
 use llkv_column_map::{
     ColumnStore,
-    column_store::ingest::{AppendOptions, Put, ValueMode},
+    column_store::write::{AppendOptions, Put, ValueMode},
     storage::pager::MemPager,
 };
 

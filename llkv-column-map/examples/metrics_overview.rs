@@ -13,7 +13,7 @@
 
 use llkv_column_map::{
     ColumnStore,
-    column_store::ingest::{AppendOptions, Put, ValueMode},
+    column_store::write::{AppendOptions, Put, ValueMode},
     storage::pager::MemPager,
     types::BlobLike,
     types::LogicalFieldId,

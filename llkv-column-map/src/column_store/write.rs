@@ -1,11 +1,10 @@
-use super::{ColumnStore, ingest};
+use super::ColumnStore;
 use crate::index::{ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, ValueBound};
 use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::types::{
     ByteLen, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey, TypedKind,
     TypedValue,
 };
-
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub struct Put {
@@ -42,7 +41,7 @@ impl Default for AppendOptions {
 impl<'p, P: Pager> ColumnStore<'p, P> {
     // Single entrypoint for writing. Many columns, each with unordered items.
     // Auto-chooses fixed vs variable, chunks to segments, writes everything in batches.
-    pub fn append_many(&self, puts: Vec<ingest::Put>, opts: ingest::AppendOptions) {
+    pub fn append_many(&self, puts: Vec<Put>, opts: AppendOptions) {
         if puts.is_empty() {
             return;
         }
@@ -83,7 +82,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
             // decide layout
             let layout = match opts.mode {
-                ingest::ValueMode::ForceFixed(w) => {
+                ValueMode::ForceFixed(w) => {
                     assert!(w > 0, "fixed width must be > 0");
                     for (_, v) in &put.items {
                         assert!(
@@ -95,8 +94,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     }
                     PlannedLayout::Fixed { width: w }
                 }
-                ingest::ValueMode::ForceVariable => PlannedLayout::Variable,
-                ingest::ValueMode::Auto => {
+                ValueMode::ForceVariable => PlannedLayout::Variable,
+                ValueMode::Auto => {
                     let w = put.items[0].1.len();
                     if w > 0 && put.items.iter().all(|(_, v)| v.len() == w) {
                         PlannedLayout::Fixed {
@@ -391,5 +390,31 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             }
             self.do_puts(puts_batch);
         }
+    }
+
+    /// Logically delete keys by appending tombstones (zero-length values).
+    /// We force variable layout so size=0 entries are valid.
+    pub fn delete_many(&self, items: Vec<(LogicalFieldId, Vec<LogicalKeyBytes>)>) {
+        if items.is_empty() {
+            return;
+        }
+
+        // Convert to Put batches with empty value bytes.
+        let puts: Vec<Put> = items
+            .into_iter()
+            .map(|(fid, keys)| Put {
+                field_id: fid,
+                items: keys.into_iter().map(|k| (k, Vec::<u8>::new())).collect(),
+            })
+            .collect();
+
+        // Force variable so 0-byte values are allowed; keep LWW in-batch.
+        let opts = AppendOptions {
+            mode: ValueMode::ForceVariable,
+            last_write_wins_in_batch: true,
+            ..Default::default()
+        };
+
+        self.append_many(puts, opts);
     }
 }
