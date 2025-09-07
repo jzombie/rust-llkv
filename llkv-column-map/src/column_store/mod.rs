@@ -1,5 +1,5 @@
 // High-level append/query API on top of pager + index modules.
-use crate::index::{Bootstrap, ColumnIndex, IndexSegment, Manifest};
+use crate::column_index::{Bootstrap, ColumnIndex, IndexSegment, Manifest};
 use crate::layout::{IndexLayoutInfo, KeyLayout, ValueLayout};
 use crate::storage::{
     StorageKind, StorageNode,
@@ -206,7 +206,7 @@ mod tests {
 
     // Use the unified in-memory pager from the pager module.
     use crate::bounds::ValueBound;
-    use crate::index::IndexSegmentRef;
+    use crate::column_index::IndexSegmentRef;
     use crate::storage::pager::MemPager;
 
     #[test]

@@ -76,10 +76,10 @@ pub enum TypedKind {
 /// `index` module. This avoids `Any`/downcasts at callers.
 #[derive(Clone, Debug)]
 pub enum TypedValue {
-    Bootstrap(crate::index::Bootstrap),
-    Manifest(crate::index::Manifest),
-    ColumnIndex(crate::index::ColumnIndex),
-    IndexSegment(crate::index::IndexSegment),
+    Bootstrap(crate::column_index::Bootstrap),
+    Manifest(crate::column_index::Manifest),
+    ColumnIndex(crate::column_index::ColumnIndex),
+    IndexSegment(crate::column_index::IndexSegment),
 }
 
 impl TypedValue {

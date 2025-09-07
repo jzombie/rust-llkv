@@ -1,5 +1,5 @@
 use super::ColumnStore;
-use crate::index::{ColumnIndex, IndexSegment};
+use crate::column_index::{ColumnIndex, IndexSegment};
 use crate::layout::{KeyLayout, ValueLayout};
 use crate::storage::pager::{BatchGet, GetResult, Pager};
 use crate::types::{

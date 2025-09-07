@@ -1,6 +1,6 @@
 use super::ColumnStore;
 use crate::bounds::ValueBound;
-use crate::index::{ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef};
+use crate::column_index::{ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef};
 use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::types::{
     ByteLen, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey, TypedKind,

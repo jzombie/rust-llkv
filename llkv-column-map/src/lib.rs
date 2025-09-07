@@ -1,8 +1,8 @@
 pub mod bounds;
 pub mod codecs;
+pub mod column_index;
 pub mod column_store;
 pub mod constants;
-pub mod index;
 pub mod layout;
 pub mod storage;
 pub mod types;
