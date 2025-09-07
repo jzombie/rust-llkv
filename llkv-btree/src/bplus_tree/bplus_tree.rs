@@ -4,7 +4,7 @@
 //! -----------------
 //!
 //! 1) Columnar leaf format (from prior patch):
-//!    [Header][Aux][Keys block][Values block][Index]
+//!    \[Header\]\[Aux\]\[Keys block\]/[Values block\]\[Index\]
 //!    * Keys are contiguous; values are contiguous.
 //!    * Index (per entry): k_off, k_len, v_off, v_len (u32 each).
 //!

@@ -8,6 +8,6 @@ pub enum ValueLayout {
     FixedWidth { width: ByteWidth },
 
     /// Variable width values. Prefix sum of byte offsets into data blob.
-    /// Slice i is [value_offsets[i], value_offsets[i+1]).
+    /// Slice i is [value_offsets\[i\], value_offsets\[i+1\]).
     Variable { value_offsets: Vec<IndexEntryCount> }, // len = n_entries + 1
 }

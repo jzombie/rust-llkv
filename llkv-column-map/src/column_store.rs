@@ -666,7 +666,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     ///   2) batch(IndexSegment typed + DataBlob raw gets) (once)
     ///
     /// Newest-first shadowing: for each key we pick the first segment whose
-    /// [min,max] covers it.
+    /// \[min,max\] covers it.
     pub fn get_many(
         &self,
         items: Vec<(LogicalFieldId, Vec<LogicalKeyBytes>)>,

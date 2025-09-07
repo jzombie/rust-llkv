@@ -8,7 +8,7 @@ pub enum KeyLayout {
     FixedWidth { width: ByteWidth },
 
     /// Variable width logical keys. Prefix sum of key byte offsets:
-    /// key_i is [key_offsets[i], key_offsets[i+1]).
+    /// key_i is [key_offsets\[i\], key_offsets\[i+1\]).
     Variable { key_offsets: Vec<IndexEntryCount> }, // len = n_entries + 1
 }
 
