@@ -19,8 +19,6 @@ pub mod introspect;
 pub mod metrics;
 pub mod query;
 
-// ----------------------------- ColumnStore -----------------------------
-
 pub struct ColumnStore<'p, P: Pager> {
     pager: &'p P,
     bootstrap_key: PhysicalKey,
