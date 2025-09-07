@@ -53,7 +53,11 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use llkv_column_map::{AppendOptions, ColumnStore, Put, ValueMode, storage::pager::MemPager};
+use llkv_column_map::{
+    ColumnStore,
+    column_store::ingest::{AppendOptions, Put, ValueMode},
+    storage::pager::MemPager,
+};
 
 // ----------------- dataset shape: 21 columns x 150_000 rows ---------------
 #[derive(Clone, Copy)]

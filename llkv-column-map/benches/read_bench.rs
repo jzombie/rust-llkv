@@ -13,7 +13,10 @@
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use llkv_column_map::{
-    AppendOptions, ColumnStore, Put, ValueMode, storage::pager::MemPager, types::LogicalFieldId,
+    ColumnStore,
+    column_store::ingest::{AppendOptions, Put, ValueMode},
+    storage::pager::MemPager,
+    types::LogicalFieldId,
 };
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::cmp::min;

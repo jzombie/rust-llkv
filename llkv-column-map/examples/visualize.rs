@@ -33,7 +33,10 @@ use std::time::Instant;
 
 use llkv_column_map::storage::{StorageKind, pager::MemPager};
 use llkv_column_map::types::PhysicalKey;
-use llkv_column_map::{AppendOptions, ColumnStore, Put, ValueMode};
+use llkv_column_map::{
+    ColumnStore,
+    column_store::ingest::{AppendOptions, Put, ValueMode},
+};
 
 // ---------------- Workload config (small, but shows batching clearly) --------
 
