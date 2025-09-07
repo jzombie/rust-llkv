@@ -885,6 +885,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     }
 }
 
+// TODO: Extract to debug ext
 impl<'p, P: Pager> ColumnStore<'p, P> {
     /// Scans the manifest -> ColumnIndex -> IndexSegments -> Data blobs,
     /// returns one entry per physical key with sizes and relationships.
