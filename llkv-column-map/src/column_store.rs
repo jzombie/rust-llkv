@@ -7,6 +7,7 @@ use crate::pager::{BatchGet, BatchPut, GetResult, Pager, TypedKind, TypedValue};
 use crate::types::{
     ByteLen, ByteOffset, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey,
 };
+use crate::utils::binary_search::binary_search_key_with_layout;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
 use std::fmt::Write;
@@ -108,44 +109,6 @@ pub enum StorageKind {
     DataBlob {
         owner_index_pk: PhysicalKey,
     },
-}
-
-// ----------------------------- helpers -----------------------------
-
-fn slice_key_by_layout<'a>(bytes: &'a [u8], layout: &'a KeyLayout, i: usize) -> &'a [u8] {
-    match layout {
-        KeyLayout::FixedWidth { width } => {
-            let w = *width as usize;
-            let a = i * w;
-            let b = a + w;
-            &bytes[a..b]
-        }
-        KeyLayout::Variable { key_offsets } => {
-            let a = key_offsets[i] as usize;
-            let b = key_offsets[i + 1] as usize;
-            &bytes[a..b]
-        }
-    }
-}
-
-fn binary_search_key_with_layout(
-    bytes: &[u8],
-    layout: &KeyLayout,
-    n_entries: usize,
-    target: &[u8],
-) -> Option<usize> {
-    let mut lo = 0usize;
-    let mut hi = n_entries; // exclusive
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        let k = slice_key_by_layout(bytes, layout, mid);
-        match k.cmp(target) {
-            std::cmp::Ordering::Less => lo = mid + 1,
-            std::cmp::Ordering::Greater => hi = mid,
-            std::cmp::Ordering::Equal => return Some(mid),
-        }
-    }
-    None
 }
 
 // ----------------------------- write API -----------------------------
