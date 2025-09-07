@@ -851,8 +851,10 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 }
 
                 for (kj, k) in keys.iter().enumerate() {
-                    // Route this key to all segments whose min/max covers it.
-                    // We'll decide which one wins later by processing order (newest-first).
+                    // Route this key to ALL segments whose min/max covers it.
+                    // We'll decide which one wins later by processing order (newest-first),
+                    // which preserves overwrite/tombstone semantics while allowing fallback
+                    // to older segments if the newest covering segment doesn't contain the key.
                     for segref in &col_index.segments {
                         if segref.logical_key_min.as_slice() <= k.as_slice()
                             && k.as_slice() <= segref.logical_key_max.as_slice()
@@ -943,12 +945,12 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                             }
                             if let Some(data_blob) = data_map.get(&data_pk) {
                                 let w = *width as usize;
-                                let a = pos * w;
-                                let b = a + w;
+                                let a = (pos * w) as ByteOffset;
+                                let b = a + w as ByteOffset;
                                 results[qi][kj] = Some(ValueSlice {
                                     data: data_blob.clone(),
-                                    start: a as ByteOffset,
-                                    end: b as ByteOffset,
+                                    start: a,
+                                    end: b,
                                 });
                             }
                             resolved_queries.insert((qi, kj));
@@ -977,6 +979,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 // else: not in this (newer) segment, keep looking in older ones
             }
         }
+
         results
     }
 }
