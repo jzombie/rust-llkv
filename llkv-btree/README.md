@@ -1,6 +1,6 @@
 # LLKV B+Tree
 
-**Work in Progress**
+**Note: This B+Tree implementation being replaced by [llkv-column-map](../llkv-column-map/).**
 
 Generic, paged B+Tree with batch-only pager I/O for the [LLKV](https://github.com/jzombie/rust-llkv) toolset.
 
