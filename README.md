@@ -2,9 +2,9 @@
 
 **Work in Progress**
 
-A small toolkit for building logical columnar layouts on top of a byte-ordered key-value store (B+Tree, pager, codecs).
+`LLKV` is a lightweight toolkit for building logical, columnar layouts and query primitives on top of generic key–value stores.
 
-Designed to provide columnar storage and expression-based querying to libraries like [SIMD R Drive](https://crates.io/crates/simd-r-drive) and other key-value stores optimized for zero-copy access to binary data.
+It's designed for storage engines that support zero-copy reads (e.g. [SIMD R Drive](https://crates.io/crates/simd-r-drive)) and aims to provide columnar storage with expression-based querying.
 
 ## License
 

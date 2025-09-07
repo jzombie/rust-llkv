@@ -1,6 +1,6 @@
 [package]
 name = "llkv-storage"
-description = "General-purpose storage adapters for the LLKV toolset."
+description = "General-purpose storage adapters for the LLKV toolkit."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true

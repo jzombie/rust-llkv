@@ -1,0 +1,28 @@
+[package]
+name = "llkv-column-map"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bitcode = "0.6.7"
+rustc-hash.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+rand.workspace = true
+
+[[bench]]
+name = "indexing_bench"
+harness = false
+
+[[bench]]
+name = "ingest_bench"
+harness = false
+
+[[bench]]
+name = "read_bench"
+harness = false

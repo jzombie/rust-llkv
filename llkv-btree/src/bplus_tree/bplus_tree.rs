@@ -4,7 +4,7 @@
 //! -----------------
 //!
 //! 1) Columnar leaf format (from prior patch):
-//!    \[Header\]\[Aux\][Keys block\][Values block\]\[Index\]
+//!    \[Header\]\[Aux\]\[Keys block\]/[Values block\]\[Index\]
 //!    * Keys are contiguous; values are contiguous.
 //!    * Index (per entry): k_off, k_len, v_off, v_len (u32 each).
 //!
@@ -26,6 +26,8 @@
 //!    * Writes/dealloc invalidate affected pages immediately.
 //!    * Pending writes bypass the cache (serve from in-memory bytes).
 
+#![allow(dead_code)] // Allowed because crate is being replaced
+
 use crate::{
     codecs::push_u32,
     codecs::{IdCodec, KeyCodec},
@@ -41,6 +43,7 @@ use crate::{
 use core::cmp::Ordering;
 use core::marker::PhantomData;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 
 // ============================ Node representation ============================
@@ -197,10 +200,85 @@ where
 
     pub(crate) state: Mutex<BPlusTreeState<P>>,
 
+    // TODO: Put behind `debug` flag?
+    // ---- instrumentation (debug-only) ----
+    reads_from_pager: AtomicU64,
+    cache_hits: AtomicU64,
+    write_page_calls: AtomicU64,
+
     // Page cache for reads (safe, O(1)).
     node_cache: Arc<RwLock<NodeCache<P>>>,
 
     _p: PhantomData<(KC, IC)>,
+}
+
+// -------------------------- Cursor (internal helper) -------------------------
+
+/// Small inline buffer for encoded keys. Exposes a slice view.
+/// If the key does not fit, we leave it empty (treated as "unknown").
+struct InlineKey {
+    buf: [u8; 64],
+    len: u16,
+}
+
+impl InlineKey {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0u8; 64],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    #[inline]
+    fn set_from_slice(&mut self, s: &[u8]) {
+        if s.len() <= self.buf.len() {
+            let n = s.len();
+            self.buf[..n].copy_from_slice(s);
+            self.len = n as u16;
+        } else {
+            // Too large to inline; treat as unknown.
+            self.len = 0;
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Reused across many inserts to avoid repeated root-to-leaf descent.
+struct LeafCursor<P: Pager> {
+    /// Current leaf node id, if positioned.
+    leaf_id: Option<P::Id>,
+    /// Encoded max key of current leaf (inline; may be empty if unknown).
+    max_key: InlineKey,
+    /// Path from root to current leaf: (internal_id, child_index).
+    path: Vec<(P::Id, usize)>,
+    /// Right sibling id, if known.
+    right_sibling: Option<P::Id>,
+}
+
+impl<P: Pager> Default for LeafCursor<P> {
+    fn default() -> Self {
+        Self {
+            leaf_id: None,
+            max_key: InlineKey::new(),
+            path: Vec::new(),
+            right_sibling: None,
+        }
+    }
 }
 
 impl<P, KC, IC> BPlusTree<P, KC, IC>
@@ -209,6 +287,15 @@ where
     KC: KeyCodec,
     IC: IdCodec<Id = P::Id>,
 {
+    // TODO: Put behind feature flag?
+    pub fn debug_metrics(&self) -> (u64, u64, u64) {
+        (
+            self.reads_from_pager.load(AtomicOrdering::Relaxed),
+            self.cache_hits.load(AtomicOrdering::Relaxed),
+            self.write_page_calls.load(AtomicOrdering::Relaxed),
+        )
+    }
+
     pub fn new(pager: P, root: P::Id, opt_node_cache: Option<Arc<RwLock<NodeCache<P>>>>) -> Self {
         let page_size = pager.page_size_hint().unwrap_or(DEFAULT_PAGE_SIZE_HINT);
         Self {
@@ -219,6 +306,9 @@ where
                 pending_writes: FxHashMap::default(),
                 pending_deletes: FxHashSet::default(),
             }),
+            reads_from_pager: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            write_page_calls: AtomicU64::new(0),
             node_cache: Self::init_node_cache(opt_node_cache),
             _p: PhantomData,
         }
@@ -246,6 +336,9 @@ where
                 pending_writes: FxHashMap::default(),
                 pending_deletes: FxHashSet::default(),
             }),
+            reads_from_pager: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            write_page_calls: AtomicU64::new(0),
             node_cache: Self::init_node_cache(opt_node_cache),
             _p: PhantomData,
         })
@@ -269,6 +362,9 @@ where
                 pending_writes: FxHashMap::default(),
                 pending_deletes: FxHashSet::default(),
             }),
+            reads_from_pager: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            write_page_calls: AtomicU64::new(0),
             node_cache,
             _p: PhantomData,
         }
@@ -455,14 +551,236 @@ where
         Ok(res.pop().flatten().is_some())
     }
 
-    pub fn insert_many(&self, items: &[(KC::Key, &[u8])]) -> Result<(), Error> {
-        // Sort by key to improve locality during splits and writes.
-        let mut owned: Vec<_> = items.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        owned.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        for (k, v) in owned {
-            self.upsert_internal(&k, v)?;
+    pub fn insert_many(&self, items: &[(KC::Key, &[u8])]) -> Result<(), Error>
+    where
+        KC::Key: Ord + Clone,
+    {
+        if items.is_empty() {
+            return Ok(());
         }
+
+        // 1) Sort by key (as before).
+        let mut owned: Vec<(KC::Key, &[u8])> = items.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        owned.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        // 2) Coalesce duplicates (keep last value per key).
+        let mut coalesced: Vec<(KC::Key, &[u8])> = Vec::with_capacity(owned.len());
+        for (k, v) in owned.into_iter() {
+            if let Some(last) = coalesced.last_mut()
+                && last.0 == k
+            {
+                last.1 = v; // overwrite last
+                continue;
+            }
+            coalesced.push((k, v));
+        }
+
+        // 3) Batch by leaf using the cursor hint.
+        let mut cur = LeafCursor::<P>::default();
+        let mut i = 0;
+
+        while i < coalesced.len() {
+            let (leaf_id, view) = self.find_leaf_with_hint(&mut cur, &coalesced[i].0)?;
+
+            // Compute the end of this run.
+            let mut j = i + 1;
+            if !cur.max_key.is_empty() {
+                // Non-empty leaf: take keys <= leaf's current max.
+                while j < coalesced.len()
+                    && KC::compare_encoded(cur.max_key.as_slice(), &coalesced[j].0)
+                        != Ordering::Less
+                {
+                    j += 1;
+                }
+            } else {
+                // Empty leaf: greedily pack up to page_size to avoid one-write-per-key.
+                j = self.choose_run_end_for_empty_leaf(&view, &coalesced, i);
+            }
+
+            // Build the new leaf once for the whole run.
+            let new_bytes = Self::encode_leaf_with_bulk(&view, &coalesced[i..j])?;
+
+            match self.split_if_needed_bytes(leaf_id.clone(), new_bytes)? {
+                InsertResult::Ok => {
+                    // Refresh cursor to updated leaf.
+                    let page = self.read_one(&leaf_id)?;
+                    let v2 = NodeView::<P>::new(page)?;
+                    self.update_cursor_from_view(&mut cur, leaf_id.clone(), &v2);
+                }
+                InsertResult::Split {
+                    separator,
+                    right_id,
+                } => {
+                    // Update parents; next loop will naturally walk into right leaf.
+                    self.update_parent_chain_after_split(
+                        &mut cur.path,
+                        leaf_id.clone(),
+                        separator,
+                        right_id.clone(),
+                    )?;
+                    cur.right_sibling = Some(right_id);
+                    let page = self.read_one(&leaf_id)?;
+                    let v2 = NodeView::<P>::new(page)?;
+                    self.update_cursor_from_view(&mut cur, leaf_id, &v2);
+                }
+            }
+
+            i = j;
+        }
+
         self.flush()
+    }
+
+    /// When a leaf is empty, greedily choose a run end `j` so the resulting
+    /// single rebuilt leaf fits in `page_size` (avoids one write per key).
+    fn choose_run_end_for_empty_leaf(
+        &self,
+        view: &NodeView<P>,
+        items: &[(KC::Key, &[u8])],
+        start: usize,
+    ) -> usize {
+        debug_assert_eq!(view.count(), 0);
+
+        // Leaf layout size = header(9) + aux + Σkeys + Σvals + 16 * count
+        let header = 9usize;
+        let aux = view.aux_len();
+        let mut k_bytes = 0usize;
+        let mut v_bytes = 0usize;
+        let mut added = 0usize;
+
+        let mut j = start;
+        while j < items.len() {
+            let (k, v) = &items[j];
+            let kl = KC::encoded_len(k);
+            let vl = v.len();
+            let new_added = added + 1;
+            let new_k = k_bytes + kl;
+            let new_v = v_bytes + vl;
+
+            let total = header + aux + new_k + new_v + 16 * new_added;
+            if total > self.page_size {
+                break;
+            }
+
+            added = new_added;
+            k_bytes = new_k;
+            v_bytes = new_v;
+            j += 1;
+        }
+
+        // Ensure forward progress even if a single (k,v) would overflow
+        // (the pager will enforce its own constraints).
+        if j == start { start + 1 } else { j }
+    }
+
+    fn encode_leaf_with_bulk(
+        view: &NodeView<P>,
+        inserts: &[(KC::Key, &[u8])],
+    ) -> Result<Vec<u8>, Error> {
+        let n_old = view.count();
+        let n_new = inserts.len();
+
+        // Merge old entries with new (sorted) inserts.
+        let mut i = 0usize; // old index
+        let mut j = 0usize; // new index
+
+        let mut keys_out = Vec::new();
+        let mut vals_out = Vec::new();
+        let mut idx_out = Vec::with_capacity((n_old + n_new) * 16);
+
+        let mut k_off: u32 = 0;
+        let mut v_off: u32 = 0;
+
+        while i < n_old || j < n_new {
+            if j == n_new {
+                // copy remaining old
+                let (k_bytes, v_bytes) = view.leaf_entry_slices(i);
+                push_u32(&mut idx_out, k_off);
+                push_u32(&mut idx_out, k_bytes.len() as u32);
+                push_u32(&mut idx_out, v_off);
+                push_u32(&mut idx_out, v_bytes.len() as u32);
+                keys_out.extend_from_slice(k_bytes);
+                vals_out.extend_from_slice(v_bytes);
+                k_off += k_bytes.len() as u32;
+                v_off += v_bytes.len() as u32;
+                i += 1;
+                continue;
+            }
+            if i == n_old {
+                // copy remaining new
+                let (k, v) = &inserts[j];
+                let mut k_tmp = Vec::with_capacity(KC::encoded_len(k));
+                KC::encode_into(k, &mut k_tmp);
+                push_u32(&mut idx_out, k_off);
+                push_u32(&mut idx_out, k_tmp.len() as u32);
+                push_u32(&mut idx_out, v_off);
+                push_u32(&mut idx_out, v.len() as u32);
+                keys_out.extend_from_slice(&k_tmp);
+                vals_out.extend_from_slice(v);
+                k_off += k_tmp.len() as u32;
+                v_off += v.len() as u32;
+                j += 1;
+                continue;
+            }
+
+            let (k_bytes_old, v_bytes_old) = view.leaf_entry_slices(i);
+            match KC::compare_encoded(k_bytes_old, &inserts[j].0) {
+                Ordering::Less => {
+                    // keep old
+                    push_u32(&mut idx_out, k_off);
+                    push_u32(&mut idx_out, k_bytes_old.len() as u32);
+                    push_u32(&mut idx_out, v_off);
+                    push_u32(&mut idx_out, v_bytes_old.len() as u32);
+                    keys_out.extend_from_slice(k_bytes_old);
+                    vals_out.extend_from_slice(v_bytes_old);
+                    k_off += k_bytes_old.len() as u32;
+                    v_off += v_bytes_old.len() as u32;
+                    i += 1;
+                }
+                Ordering::Equal => {
+                    // update value (reuse old key bytes)
+                    let (_k_new, v_new) = &inserts[j];
+                    push_u32(&mut idx_out, k_off);
+                    push_u32(&mut idx_out, k_bytes_old.len() as u32);
+                    push_u32(&mut idx_out, v_off);
+                    push_u32(&mut idx_out, v_new.len() as u32);
+                    keys_out.extend_from_slice(k_bytes_old);
+                    vals_out.extend_from_slice(v_new);
+                    k_off += k_bytes_old.len() as u32;
+                    v_off += v_new.len() as u32;
+                    i += 1;
+                    j += 1;
+                }
+                Ordering::Greater => {
+                    // insert new key/value
+                    let (k_new, v_new) = &inserts[j];
+                    let mut k_tmp = Vec::with_capacity(KC::encoded_len(k_new));
+                    KC::encode_into(k_new, &mut k_tmp);
+                    push_u32(&mut idx_out, k_off);
+                    push_u32(&mut idx_out, k_tmp.len() as u32);
+                    push_u32(&mut idx_out, v_off);
+                    push_u32(&mut idx_out, v_new.len() as u32);
+                    keys_out.extend_from_slice(&k_tmp);
+                    vals_out.extend_from_slice(v_new);
+                    k_off += k_tmp.len() as u32;
+                    v_off += v_new.len() as u32;
+                    j += 1;
+                }
+            }
+        }
+
+        // Assemble full page: [tag][count][aux_len][aux][keys][vals][index]
+        let mut out = Vec::with_capacity(
+            9 + view.aux_len() + keys_out.len() + vals_out.len() + idx_out.len(),
+        );
+        out.push(NodeTag::Leaf as u8);
+        push_u32(&mut out, (idx_out.len() / 16) as u32);
+        push_u32(&mut out, view.aux_len() as u32);
+        out.extend_from_slice(&view.as_slice()[view.aux_range()]);
+        out.extend_from_slice(&keys_out);
+        out.extend_from_slice(&vals_out);
+        out.extend_from_slice(&idx_out);
+        Ok(out)
     }
 
     pub fn delete_many(&self, keys: &[KC::Key]) -> Result<(), Error> {
@@ -719,6 +1037,7 @@ where
                 return Ok(DeleteResult::Ok);
             }
         }
+
         if child_pos > 0 {
             self.merge(parent_entries, child_pos - 1)?;
         } else {
@@ -967,7 +1286,6 @@ where
     //     Ok(page)
     // }
     pub(crate) fn read_one(&self, id: &P::Id) -> Result<P::Page, Error> {
-        // Check pending under lock, return fast-path if found.
         {
             let s = self.state.lock().unwrap();
             if s.pending_deletes.contains(id) {
@@ -976,25 +1294,32 @@ where
             if let Some(bytes) = s.pending_writes.get(id) {
                 return self.pager.materialize_owned(bytes);
             }
-        } // lock released here
-
+        }
         if let Some(p) = self.node_cache.read().unwrap().peek(id) {
+            self.cache_hits.fetch_add(1, AtomicOrdering::Relaxed);
             if let Ok(mut c) = self.node_cache.try_write() {
                 c.touch(id);
             }
             return Ok(p);
         }
-
         let page = self
             .pager
             .read_batch(std::slice::from_ref(id))?
             .remove(id)
             .ok_or(Error::MissingPage)?;
-
+        self.reads_from_pager.fetch_add(1, AtomicOrdering::Relaxed);
         if let Ok(mut c) = self.node_cache.try_write() {
             c.insert(id.clone(), page.clone());
         }
         Ok(page)
+    }
+
+    #[inline]
+    fn write_page(&self, id: P::Id, data: Vec<u8>) {
+        self.write_page_calls.fetch_add(1, AtomicOrdering::Relaxed);
+        let mut state = self.state.lock().unwrap();
+        self.node_cache.write().unwrap().invalidate(&id);
+        state.pending_writes.insert(id, data);
     }
 
     fn find_max_key(&self, node_id: &P::Id) -> Result<KC::Key, Error> {
@@ -1019,15 +1344,6 @@ where
     }
 
     #[inline]
-    fn write_page(&self, id: P::Id, data: Vec<u8>) {
-        let mut state = self.state.lock().unwrap();
-
-        // Invalidate any cached copy to avoid stale reads.
-        self.node_cache.write().unwrap().invalidate(&id);
-        state.pending_writes.insert(id, data);
-    }
-
-    #[inline]
     fn dealloc_page(&self, id: P::Id) {
         let mut state = self.state.lock().unwrap();
 
@@ -1038,6 +1354,293 @@ where
     #[inline]
     fn alloc_ids(&self, count: usize) -> Result<Vec<P::Id>, Error> {
         self.pager.alloc_ids(count)
+    }
+}
+
+// ---------------------- Cursor-based helpers (internal) ----------------------
+
+impl<P, KC, IC> BPlusTree<P, KC, IC>
+where
+    P: Pager,
+    KC: KeyCodec,
+    IC: IdCodec<Id = P::Id>,
+{
+    /// Update cursor fields from a leaf view.
+    fn update_cursor_from_view(&self, cur: &mut LeafCursor<P>, leaf_id: P::Id, view: &NodeView<P>) {
+        cur.leaf_id = Some(leaf_id);
+        cur.right_sibling = if view.leaf_next_aux().is_empty() {
+            None
+        } else {
+            IC::decode_from(view.leaf_next_aux()).ok().map(|t| t.0)
+        };
+
+        cur.max_key.clear();
+        let n = view.count();
+        if n > 0 {
+            let (k_enc, _) = view.leaf_entry_slices(n - 1);
+            cur.max_key.set_from_slice(k_enc);
+        }
+    }
+
+    /// Descend using an existing path hint where possible.
+    #[allow(clippy::type_complexity)] // Note: Allowed because crate is being replaced.
+    fn descend_with_path_hint(
+        &self,
+        path_hint: &[(P::Id, usize)],
+        key: &KC::Key,
+    ) -> Result<(P::Id, NodeView<P>, Option<P::Id>, Vec<(P::Id, usize)>), Error> {
+        // Start from the highest node in the hint that is still valid
+        // for this key; otherwise restart from root.
+        let root_id = {
+            let s = self.state.lock().unwrap();
+            s.root.clone()
+        };
+
+        let mut id = root_id.clone();
+        let mut path: Vec<(P::Id, usize)> = Vec::new();
+
+        // Try to reuse as much of the hint as we can.
+        if !path_hint.is_empty() {
+            id = root_id;
+            // Replay the hint, but verify child choice at each step.
+            for (node_id, child_idx_hint) in path_hint {
+                // If the root changed, hint is invalid; break.
+                if &id != node_id && path.is_empty() {
+                    break;
+                }
+                let page = self.read_one(node_id)?;
+                let view = NodeView::<P>::new(page)?;
+                if view.tag()? != NodeTag::Internal {
+                    break;
+                }
+                // Recompute child idx; if it matches, accept and push.
+                let idx = self.find_child_idx(&view, key)?;
+                if idx != *child_idx_hint {
+                    // Diverged; from now on we continue fresh from here.
+                    id = node_id.clone();
+                    break;
+                }
+                // Move to the hinted child.
+                let (_, child_raw) = view.internal_entry_slices(idx);
+                let (child_id, _) = IC::decode_from(child_raw)?;
+                path.push((node_id.clone(), idx));
+                id = child_id;
+            }
+        }
+
+        // Continue descending from current `id`.
+        loop {
+            let page = self.read_one(&id)?;
+            let view = NodeView::<P>::new(page)?;
+            match view.tag()? {
+                NodeTag::Internal => {
+                    let idx = self.find_child_idx(&view, key)?;
+                    let (_, child_raw) = view.internal_entry_slices(idx);
+                    let (child_id, _) = IC::decode_from(child_raw)?;
+                    path.push((id.clone(), idx));
+                    id = child_id;
+                }
+                NodeTag::Leaf => {
+                    let next = if view.leaf_next_aux().is_empty() {
+                        None
+                    } else {
+                        Some(IC::decode_from(view.leaf_next_aux())?.0)
+                    };
+                    return Ok((id, view, next, path));
+                }
+            }
+        }
+    }
+
+    /// Use the cursor to find a leaf for `key` with minimal navigation.
+    fn find_leaf_with_hint(
+        &self,
+        cur: &mut LeafCursor<P>,
+        key: &KC::Key,
+    ) -> Result<(P::Id, NodeView<P>), Error> {
+        // 1) If we have a current leaf and key <= max, stay.
+        if let (Some(leaf_id), false) = (cur.leaf_id.as_ref(), cur.max_key.is_empty()) {
+            let mk = cur.max_key.as_slice();
+            if KC::compare_encoded(mk, key) != Ordering::Less {
+                let page = self.read_one(leaf_id)?;
+                let view = NodeView::<P>::new(page)?;
+                return Ok((leaf_id.clone(), view));
+            }
+        }
+
+        // 2) If key > max and we know a right sibling, try stepping.
+        if let (Some(_leaf_id), Some(nid), false) = (
+            cur.leaf_id.as_ref(),
+            cur.right_sibling.clone(),
+            cur.max_key.is_empty(),
+        ) {
+            let page = self.read_one(&nid)?;
+            let view = NodeView::<P>::new(page.clone())?;
+            self.update_cursor_from_view(cur, nid.clone(), &view);
+
+            let last_ok = if view.count() == 0 {
+                true
+            } else {
+                let (last_enc, _) = view.leaf_entry_slices(view.count() - 1);
+                KC::compare_encoded(last_enc, key) != Ordering::Less
+            };
+            if last_ok {
+                return Ok((nid, view));
+            }
+            // Else we will partially descend with the path hint.
+        }
+
+        // 3) Partial descent reusing the saved path.
+        let (leaf_id, view, next, path) = self.descend_with_path_hint(&cur.path, key)?;
+        cur.path = path;
+        cur.right_sibling = next;
+        self.update_cursor_from_view(cur, leaf_id.clone(), &view);
+        Ok((leaf_id, view))
+    }
+
+    /// Upsert directly into the current leaf; propagate split up the
+    /// recorded path (creating a new root if needed).
+    fn upsert_into_leaf_with_path(
+        &self,
+        cur: &mut LeafCursor<P>,
+        leaf_id: &P::Id,
+        view: &NodeView<P>,
+        key: &KC::Key,
+        value: &[u8],
+    ) -> Result<(), Error> {
+        // Binary search within the provided leaf view.
+        let (pos, found) = self.leaf_lower_bound(view, key, 0);
+        let new_page_bytes = if found {
+            Self::encode_leaf_with_update(view, pos, value)?
+        } else {
+            Self::encode_leaf_with_insert(view, pos, key, value)?
+        };
+
+        match self.split_if_needed_bytes(leaf_id.clone(), new_page_bytes)? {
+            InsertResult::Ok => {
+                // No pager read: update cursor cheaply.
+                // If we inserted at end, max key becomes `key`.
+                if !found && pos == view.count() {
+                    cur.max_key.clear();
+                    let mut tmp = Vec::with_capacity(KC::encoded_len(key));
+                    KC::encode_into(key, &mut tmp);
+                    cur.max_key.set_from_slice(&tmp);
+                }
+                Ok(())
+            }
+            InsertResult::Split {
+                separator,
+                right_id,
+            } => {
+                // Update parent chain (or create new root).
+                self.update_parent_chain_after_split(
+                    &mut cur.path,
+                    leaf_id.clone(),
+                    separator.clone(),
+                    right_id.clone(),
+                )?;
+
+                // Use only the separator to place the cursor, no reads.
+                let mut sep_enc = Vec::with_capacity(KC::encoded_len(&separator));
+                KC::encode_into(&separator, &mut sep_enc);
+                let key_in_right = KC::compare_encoded(&sep_enc, key) == Ordering::Less;
+
+                if key_in_right {
+                    // We are in the new right leaf.
+                    cur.leaf_id = Some(right_id.clone());
+                    cur.max_key.clear();
+                    cur.max_key.set_from_slice(&sep_enc);
+                    // right_sibling stays as-is (old next).
+                } else {
+                    // Still in left; its right sibling is the new right.
+                    cur.leaf_id = Some(leaf_id.clone());
+                    cur.right_sibling = Some(right_id.clone());
+                    // Left max may have changed; clear to avoid a read now.
+                    cur.max_key.clear();
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Update internal parents following a child split, possibly
+    /// creating a new root if the old root overflows.
+    #[allow(clippy::ptr_arg)] // Note: Allowed because crate is being replaced.
+    fn update_parent_chain_after_split(
+        &self,
+        path: &mut Vec<(P::Id, usize)>,
+        left_child_id: P::Id,
+        mut sep: KC::Key,
+        mut right_id: P::Id,
+    ) -> Result<(), Error> {
+        // If there is no parent (split at root leaf), create a new root.
+        if path.is_empty() {
+            let max_left = self.find_max_key(&left_child_id)?;
+            let entries = vec![(max_left, left_child_id), (sep, right_id)];
+            let new_root = self.alloc_ids(1)?.remove(0);
+            let node: Node<KC::Key, P::Id> = Node::Internal { entries };
+            self.write_page(new_root.clone(), Self::encode_node(&node));
+            {
+                let mut s = self.state.lock().unwrap();
+                s.root = new_root.clone();
+            }
+            self.pager.on_root_changed(new_root)?;
+            return Ok(());
+        }
+
+        // Walk up and insert the new right sibling; split parents if needed.
+        let mut level = path.len();
+        let mut child_id = left_child_id;
+
+        loop {
+            level -= 1;
+            let (parent_id, child_idx) = path[level].clone();
+            let mut parent = self.read_node(&parent_id)?;
+            if let Node::Internal { entries } = &mut parent {
+                // Refresh max for the left child.
+                entries[child_idx].0 = self.find_max_key(&child_id)?;
+                // Insert the right sibling.
+                entries.insert(child_idx + 1, (sep, right_id.clone()));
+            } else {
+                return Err(Error::Corrupt("parent not internal"));
+            }
+
+            match self.split_if_needed(parent_id.clone(), parent)? {
+                InsertResult::Ok => {
+                    // Done; split_if_needed already wrote the parent.
+                    break;
+                }
+                InsertResult::Split {
+                    separator,
+                    right_id: pright,
+                } => {
+                    // Parent split; continue upward with the new pair.
+                    sep = separator;
+                    right_id = pright;
+                    child_id = parent_id;
+
+                    if level == 0 {
+                        // Split reached root; create a new root.
+                        let max_left = self.find_max_key(&child_id)?;
+                        let entries = vec![
+                            (max_left, child_id.clone()),
+                            (sep.clone(), right_id.clone()),
+                        ];
+                        let new_root = self.alloc_ids(1)?.remove(0);
+                        let node: Node<KC::Key, P::Id> = Node::Internal { entries };
+                        self.write_page(new_root.clone(), Self::encode_node(&node));
+                        {
+                            let mut s = self.state.lock().unwrap();
+                            s.root = new_root.clone();
+                        }
+                        self.pager.on_root_changed(new_root)?;
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

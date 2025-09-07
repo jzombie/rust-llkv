@@ -1,6 +1,6 @@
 [package]
 name = "llkv-table"
-description = "Columnar table using the LLKV toolset."
+description = "Columnar table using the LLKV toolkit."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true

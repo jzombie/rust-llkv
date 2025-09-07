@@ -17,3 +17,7 @@ out.txt
 
 # Temp DB files
 **.db
+
+# Graphviz files
+**/*.dot
+
