@@ -17,23 +17,6 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-// TODO: Move to utils?
-#[inline]
-fn min_max_bounds(values: &[Vec<u8>]) -> (ValueBound, ValueBound) {
-    debug_assert!(!values.is_empty());
-    let mut min = &values[0];
-    let mut max = &values[0];
-    for v in &values[1..] {
-        if v < min {
-            min = v;
-        }
-        if v > max {
-            max = v;
-        }
-    }
-    (ValueBound::from_bytes(min), ValueBound::from_bytes(max))
-}
-
 #[derive(Clone, Debug)]
 pub struct IndexLayoutInfo {
     pub kind: &'static str,             // "fixed" or "variable" (value layout)
@@ -531,7 +514,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             let index_pkey = index_keys[i];
 
             // compute value bounds once per segment
-            let (vmin, vmax) = min_max_bounds(&chunk.values);
+            let (vmin, vmax) = ValueBound::min_max_bounds(&chunk.values);
 
             // build data blob (+ value offsets for variable)
             let (data_blob, seg, n_entries) = match chunk.layout {

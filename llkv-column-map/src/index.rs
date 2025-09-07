@@ -30,6 +30,22 @@ impl ValueBound {
     pub fn is_truncated(&self) -> bool {
         (self.prefix.len() as u32) < self.total_len
     }
+
+    #[inline]
+    pub fn min_max_bounds(values: &[Vec<u8>]) -> (ValueBound, ValueBound) {
+        debug_assert!(!values.is_empty());
+        let mut min = &values[0];
+        let mut max = &values[0];
+        for v in &values[1..] {
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
+        }
+        (ValueBound::from_bytes(min), ValueBound::from_bytes(max))
+    }
 }
 
 // ── Bootstrapping ────────────────────────────────────────────────────────────
