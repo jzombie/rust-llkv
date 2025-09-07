@@ -13,7 +13,8 @@
 
 use llkv_column_map::pager::BlobLike;
 use llkv_column_map::{
-    AppendOptions, ColumnStore, Put, ValueMode, ValueSlice, pager::MemPager, types::LogicalFieldId,
+    AppendOptions, ColumnStore, Put, ValueMode, pager::MemPager, types::LogicalFieldId,
+    views::ValueSlice,
 };
 
 // -------- simple key/value generators ---------------------------------------
