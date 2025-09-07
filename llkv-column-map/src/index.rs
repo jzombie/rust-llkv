@@ -31,76 +31,52 @@ impl ValueBound {
     }
 }
 
-// TODO: Refactor
-pub fn concat_keys_and_offsets(mut keys: Vec<Vec<u8>>) -> (Vec<u8>, Vec<ByteOffset>) {
-    // Ensure sorted by logical key bytes
-    keys.sort_unstable();
-    let mut bytes = Vec::new();
-    let mut offs = Vec::with_capacity(keys.len() + 1);
-    let mut acc = 0u32;
-    offs.push(acc);
-    for k in keys {
-        bytes.extend_from_slice(&k);
-        acc += k.len() as ByteOffset;
-        offs.push(acc);
-    }
-    (bytes, offs)
-}
-
 // Helper: pack keys choosing the most space-efficient representation.
 // - If all keys have the same non-zero length -> FixedWidth { width }
-// - Otherwise -> Variable { key_offsets } (like the old format)
-fn pack_keys_with_layout(
-    mut keys: Vec<Vec<u8>>,
-) -> (Vec<u8>, KeyLayout, LogicalKeyBytes, LogicalKeyBytes) {
+// - Otherwise -> Variable { key_offsets }
+#[inline]
+fn pack_keys_with_layout(mut keys: Vec<Vec<u8>>) -> (Vec<u8>, KeyLayout) {
+    // sort exactly once here
     keys.sort_unstable();
     let n = keys.len();
 
-    // Compute fixed width if possible
-    let fixed_w_opt = if n == 0 {
-        Some(0usize)
-    } else {
+    // Fixed-width path (non-zero width, all equal)
+    if n > 0 {
         let w = keys[0].len();
         if w > 0 && keys.iter().all(|k| k.len() == w) {
-            Some(w)
-        } else {
-            None
-        }
-    };
-
-    match fixed_w_opt {
-        Some(w) => {
-            // Concatenate in order; no per-key offsets needed.
             let mut bytes = Vec::with_capacity(n * w);
             for k in &keys {
                 bytes.extend_from_slice(k);
             }
-            let min = keys.first().cloned().unwrap_or_default();
-            let max = keys.last().cloned().unwrap_or_default();
-            (
+            return (
                 bytes,
                 KeyLayout::FixedWidth {
                     width: w as ByteWidth,
                 },
-                min,
-                max,
-            )
-        }
-        None => {
-            // Use the legacy "bytes + offsets" representation.
-            let (bytes, offs) = concat_keys_and_offsets(keys.clone());
-            let min = keys.first().cloned().unwrap_or_default();
-            let max = keys.last().cloned().unwrap_or_default();
-            (
-                bytes,
-                KeyLayout::Variable {
-                    key_offsets: offs.into_iter().map(|v| v as IndexEntryCount).collect(),
-                },
-                min,
-                max,
-            )
+            );
         }
     }
+
+    // Variable-width path (or empty): pack bytes + offsets
+    // (Inline the helper or call concat_keys_and_offsets_sorted(keys))
+    let total: usize = keys.iter().map(|k| k.len()).sum();
+    let mut bytes = Vec::with_capacity(total);
+    let mut offs = Vec::with_capacity(n + 1);
+
+    let mut acc: ByteOffset = 0;
+    offs.push(acc);
+    for k in keys {
+        bytes.extend_from_slice(&k);
+        acc = acc.wrapping_add(k.len() as ByteOffset);
+        offs.push(acc);
+    }
+
+    (
+        bytes,
+        KeyLayout::Variable {
+            key_offsets: offs.into_iter().map(|v| v as IndexEntryCount).collect(),
+        },
+    )
 }
 
 // ── Bootstrapping ────────────────────────────────────────────────────────────
@@ -141,6 +117,9 @@ pub struct IndexSegmentRef {
     pub logical_key_min: LogicalKeyBytes,
     pub logical_key_max: LogicalKeyBytes,
 
+    pub value_min: Option<ValueBound>,
+    pub value_max: Option<ValueBound>,
+
     /// Number of entries in that segment (helps pre-alloc).
     pub n_entries: IndexEntryCount,
 }
@@ -178,13 +157,6 @@ pub struct IndexSegment {
 
     /// How to slice the *data* blob for the i-th value.
     pub value_layout: ValueLayout,
-
-    /// Redundant cached bounds for fast reject/prune.
-    pub logical_key_min: LogicalKeyBytes,
-    pub logical_key_max: LogicalKeyBytes,
-
-    pub value_min: Option<ValueBound>,
-    pub value_max: Option<ValueBound>,
 }
 
 impl IndexSegment {
@@ -194,18 +166,13 @@ impl IndexSegment {
         width: ByteWidth,
     ) -> IndexSegment {
         let n = logical_keys.len() as IndexEntryCount;
-        let (logical_key_bytes, key_layout, logical_key_min, logical_key_max) =
-            pack_keys_with_layout(logical_keys);
+        let (logical_key_bytes, key_layout) = pack_keys_with_layout(logical_keys);
         IndexSegment {
             data_physical_key: data_pkey,
             n_entries: n,
             logical_key_bytes,
             key_layout,
             value_layout: ValueLayout::FixedWidth { width },
-            logical_key_min,
-            logical_key_max,
-            value_min: None,
-            value_max: None,
         }
     }
 
@@ -216,8 +183,7 @@ impl IndexSegment {
     ) -> IndexSegment {
         assert_eq!(logical_keys.len(), value_sizes.len());
         let n = logical_keys.len() as IndexEntryCount;
-        let (logical_key_bytes, key_layout, logical_key_min, logical_key_max) =
-            pack_keys_with_layout(logical_keys);
+        let (logical_key_bytes, key_layout) = pack_keys_with_layout(logical_keys);
 
         let mut value_offsets = Vec::with_capacity(value_sizes.len() + 1);
         let mut acc = 0u32;
@@ -238,10 +204,6 @@ impl IndexSegment {
                     .map(|v| v as IndexEntryCount)
                     .collect(),
             },
-            logical_key_min,
-            logical_key_max,
-            value_min: None,
-            value_max: None,
         }
     }
 }
@@ -303,8 +265,6 @@ mod tests {
         let kv = MemPager::default();
 
         // ----- allocate physical ids (batched) -----
-        // data_100, idx_100, data_200, idx_200, col_100_idx_pkey,
-        // col_200_idx_pkey, manifest_pkey
         let ids = kv.alloc_many(7).unwrap();
         let data_100 = ids[0];
         let idx_100 = ids[1];
@@ -315,11 +275,9 @@ mod tests {
         let manifest_pkey = ids[6];
 
         // ----- build two segments for columns 100 and 200 -----
-        let seg_100 = IndexSegment::build_fixed(
-            data_100,
-            vec![b"a".to_vec(), b"b".to_vec(), b"d".to_vec()],
-            1,
-        );
+        let keys_100 = vec![b"a".to_vec(), b"b".to_vec(), b"d".to_vec()];
+        let seg_100 = IndexSegment::build_fixed(data_100, keys_100.clone(), 1);
+
         let animals = vec![b"ant".to_vec(), b"wolf".to_vec(), b"zebra".to_vec()];
         let sizes: Vec<u32> = vec![5, 2, 8]; // arbitrary payload lengths
         let seg_200 = IndexSegment::build_var(data_200, animals.clone(), &sizes);
@@ -343,8 +301,10 @@ mod tests {
             segments: vec![IndexSegmentRef {
                 index_physical_key: idx_100,
                 data_physical_key: data_100,
-                logical_key_min: seg_100.logical_key_min.clone(),
-                logical_key_max: seg_100.logical_key_max.clone(),
+                logical_key_min: b"a".to_vec(),
+                logical_key_max: b"d".to_vec(),
+                value_min: None,
+                value_max: None,
                 n_entries: seg_100.n_entries,
             }],
         };
@@ -353,8 +313,10 @@ mod tests {
             segments: vec![IndexSegmentRef {
                 index_physical_key: idx_200,
                 data_physical_key: data_200,
-                logical_key_min: seg_200.logical_key_min.clone(),
-                logical_key_max: seg_200.logical_key_max.clone(),
+                logical_key_min: animals.first().unwrap().clone(), // "ant"
+                logical_key_max: animals.last().unwrap().clone(),  // "zebra"
+                value_min: None,
+                value_max: None,
                 n_entries: seg_200.n_entries,
             }],
         };
@@ -464,19 +426,18 @@ mod tests {
         let col100_index = col_indexes.iter().find(|ci| ci.field_id == 100).unwrap();
         let col200_index = col_indexes.iter().find(|ci| ci.field_id == 200).unwrap();
 
-        // 2) Segment refs (newest-first)
+        // 2) Segment refs (newest-first) – assert min/max came through
         assert_eq!(col100_index.segments.len(), 1);
         assert_eq!(col200_index.segments.len(), 1);
         let segref_100 = &col100_index.segments[0];
         let segref_200 = &col200_index.segments[0];
 
-        // slice-coerced byte string literals (fix & [u8;N] vs &[u8])
-        assert!(&b"a"[..] <= segref_100.logical_key_min.as_slice());
-        assert!(&b"d"[..] >= segref_100.logical_key_max.as_slice());
-        assert!(&b"ant"[..] <= segref_200.logical_key_min.as_slice());
-        assert!(&b"zebra"[..] >= segref_200.logical_key_max.as_slice());
+        assert_eq!(segref_100.logical_key_min, b"a".to_vec());
+        assert_eq!(segref_100.logical_key_max, b"d".to_vec());
+        assert_eq!(segref_200.logical_key_min, b"ant".to_vec());
+        assert_eq!(segref_200.logical_key_max, b"zebra".to_vec());
 
-        // 3) Open both IndexSegments in a single batch read
+        // 3) Open both IndexSegments in a single batch read (unchanged)
         let resp = kv
             .batch_get(&[
                 BatchGet::Typed {
@@ -576,29 +537,35 @@ mod tests {
         ])
         .unwrap();
 
-        // ColumnIndex in-memory (no IO needed)
+        // ColumnIndex in-memory (no IO needed) — populate logical bounds here
         let col = ColumnIndex {
             field_id: 7,
             segments: vec![
                 IndexSegmentRef {
                     index_physical_key: p_c,
                     data_physical_key: data_c,
-                    logical_key_min: seg_c.logical_key_min.clone(),
-                    logical_key_max: seg_c.logical_key_max.clone(),
+                    logical_key_min: b"wolf".to_vec(),
+                    logical_key_max: b"zebra".to_vec(),
+                    value_min: None,
+                    value_max: None,
                     n_entries: seg_c.n_entries,
                 },
                 IndexSegmentRef {
                     index_physical_key: p_b,
                     data_physical_key: data_b,
-                    logical_key_min: seg_b.logical_key_min.clone(),
-                    logical_key_max: seg_b.logical_key_max.clone(),
+                    logical_key_min: b"b".to_vec(),
+                    logical_key_max: b"c".to_vec(),
+                    value_min: None,
+                    value_max: None,
                     n_entries: seg_b.n_entries,
                 },
                 IndexSegmentRef {
                     index_physical_key: p_a,
                     data_physical_key: data_a,
-                    logical_key_min: seg_a.logical_key_min.clone(),
-                    logical_key_max: seg_a.logical_key_max.clone(),
+                    logical_key_min: b"aa".to_vec(),
+                    logical_key_max: b"am".to_vec(),
+                    value_min: None,
+                    value_max: None,
                     n_entries: seg_a.n_entries,
                 },
             ],
@@ -719,13 +686,21 @@ mod tests {
             5u64.to_be_bytes().to_vec(),
         ];
         let seg = IndexSegment::build_fixed(123, keys, 4 /* any width for values */);
-        // bounds must be inclusive and lexicographic
-        assert_eq!(seg.logical_key_min, 1u64.to_be_bytes().to_vec());
-        assert_eq!(seg.logical_key_max, 9u64.to_be_bytes().to_vec());
+
+        // bounds must be inclusive and lexicographic — derive by slicing first/last
+        let first = slice_key(&seg.logical_key_bytes, &seg.key_layout, 0);
+        let last = slice_key(
+            &seg.logical_key_bytes,
+            &seg.key_layout,
+            seg.n_entries as usize - 1,
+        );
+        assert_eq!(first, &1u64.to_be_bytes()[..]);
+        assert_eq!(last, &9u64.to_be_bytes()[..]);
+
         // layout must be FixedWidth for keys too (since all keys same length)
         match seg.key_layout {
             KeyLayout::FixedWidth { width } => {
-                // 8 bytes per logical key
+                // 8 bytes per *logical key*
                 assert_eq!(width, 8);
             }
             _ => panic!("expected fixed-width key layout"),
@@ -743,11 +718,19 @@ mod tests {
         ];
         let sizes = vec![1u32; keys.len()]; // dummy value sizes
         let seg = IndexSegment::build_var(777, keys, &sizes);
-        // "a" .. "zebra", lexicographic order
-        assert_eq!(seg.logical_key_min, b"a".to_vec());
-        assert_eq!(seg.logical_key_max, b"zebra".to_vec());
-        match seg.key_layout {
-            KeyLayout::Variable { ref key_offsets } => {
+
+        // derive lexicographic min/max by slicing packed keys
+        let first = slice_key(&seg.logical_key_bytes, &seg.key_layout, 0);
+        let last = slice_key(
+            &seg.logical_key_bytes,
+            &seg.key_layout,
+            seg.n_entries as usize - 1,
+        );
+        assert_eq!(first, b"a");
+        assert_eq!(last, b"zebra");
+
+        match &seg.key_layout {
+            KeyLayout::Variable { key_offsets } => {
                 // one extra offset than entries
                 assert_eq!(key_offsets.len(), seg.n_entries as usize + 1);
             }

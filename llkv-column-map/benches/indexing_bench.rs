@@ -102,6 +102,10 @@ fn build_many_columns_fixed_width(
         // Pre-build logical keys once per batch (same key set for all columns).
         let logical_keys = make_numeric_keys(entries_per_col);
 
+        // Pre-compute key bounds (they live on IndexSegmentRef in the new schema).
+        let key_min = logical_keys.first().cloned().unwrap_or_default();
+        let key_max = logical_keys.last().cloned().unwrap_or_default();
+
         for i in 0..batch {
             let data_pkey = ids[i * 3 + 0];
             let seg_pkey = ids[i * 3 + 1];
@@ -114,8 +118,10 @@ fn build_many_columns_fixed_width(
             let segref = IndexSegmentRef {
                 index_physical_key: seg_pkey,
                 data_physical_key: seg.data_physical_key,
-                logical_key_min: seg.logical_key_min.clone(),
-                logical_key_max: seg.logical_key_max.clone(),
+                logical_key_min: key_min.clone(),
+                logical_key_max: key_max.clone(),
+                value_min: None, // metadata bench: no value bounds
+                value_max: None, // metadata bench: no value bounds
                 n_entries: seg.n_entries,
             };
 

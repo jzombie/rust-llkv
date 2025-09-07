@@ -8,7 +8,6 @@ use crate::types::{
     ByteLen, ByteOffset, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::cmp::min;
 use std::collections::hash_map::Entry;
 use std::fmt::Write;
 use std::sync::{
@@ -402,30 +401,29 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
         let mut planned_chunks: Vec<PlannedChunk> = Vec::new();
 
-        for put in puts {
+        for mut put in puts {
             if put.items.is_empty() {
                 continue;
             }
-            let mut items = put.items;
 
             if opts.last_write_wins_in_batch {
                 // last wins: overwrite by key
                 let mut last: FxHashMap<LogicalKeyBytes, Vec<u8>> =
-                    FxHashMap::with_capacity_and_hasher(items.len(), Default::default());
-                for (k, v) in items {
+                    FxHashMap::with_capacity_and_hasher(put.items.len(), Default::default());
+                for (k, v) in put.items {
                     last.insert(k, v);
                 }
-                items = last.into_iter().collect();
+                put.items = last.into_iter().collect();
             }
 
             // sort by key
-            items.sort_by(|a, b| a.0.cmp(&b.0));
+            put.items.sort_by(|a, b| a.0.cmp(&b.0));
 
             // decide layout
             let layout = match opts.mode {
                 ValueMode::ForceFixed(w) => {
                     assert!(w > 0, "fixed width must be > 0");
-                    for (_, v) in &items {
+                    for (_, v) in &put.items {
                         assert!(
                             v.len() == w as usize,
                             "ForceFixed width mismatch: expected {}, got {}",
@@ -437,8 +435,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 }
                 ValueMode::ForceVariable => PlannedLayout::Variable,
                 ValueMode::Auto => {
-                    let w = items[0].1.len();
-                    if w > 0 && items.iter().all(|(_, v)| v.len() == w) {
+                    let w = put.items[0].1.len();
+                    if w > 0 && put.items.iter().all(|(_, v)| v.len() == w) {
                         PlannedLayout::Fixed {
                             width: w as ByteWidth,
                         }
@@ -450,9 +448,9 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
             // chunk by thresholds
             let mut i = 0usize;
-            while i < items.len() {
-                let remain = items.len() - i;
-                let take_by_entries = min(remain, opts.segment_max_entries);
+            while i < put.items.len() {
+                let remain = put.items.len() - i;
+                let take_by_entries = core::cmp::min(remain, opts.segment_max_entries);
 
                 let take = match layout {
                     PlannedLayout::Fixed { width } => {
@@ -462,14 +460,14 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         } else {
                             (opts.segment_max_bytes / (width as usize)).max(1)
                         };
-                        min(take_by_entries, max_entries_by_bytes.max(1))
+                        core::cmp::min(take_by_entries, max_entries_by_bytes.max(1))
                     }
                     PlannedLayout::Variable => {
                         // grow until adding next would exceed bytes or entries
                         let mut acc = 0usize;
                         let mut cnt = 0usize;
                         for j in i..(i + take_by_entries) {
-                            let sz = items[j].1.len();
+                            let sz = put.items[j].1.len();
                             if cnt > 0 && acc + sz > opts.segment_max_bytes {
                                 break;
                             }
@@ -488,7 +486,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 let end = i + take;
                 let mut keys_sorted = Vec::with_capacity(take);
                 let mut vals = Vec::with_capacity(take);
-                for (k, v) in items[i..end].iter() {
+                for (k, v) in put.items[i..end].iter() {
                     keys_sorted.push(k.clone());
                     vals.push(v.clone());
                 }
@@ -522,7 +520,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         // Prepare map: field_id -> (col_index_pkey, ColumnIndex)
         let mut need_manifest_update = false;
         let mut ensure_column_loaded: FxHashSet<LogicalFieldId> = FxHashSet::default();
-        // NEW: track which ColumnIndex pkeys were actually modified this call.
+        // track which ColumnIndex pkeys were actually modified this call.
         let mut touched_colindex_pkeys: FxHashSet<PhysicalKey> = FxHashSet::default();
 
         // Bring column indexes we will touch into cache (batch-read where possible)
@@ -593,7 +591,6 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         segments: Vec::new(),
                     };
                     cache.insert(*fid, (col_index_pkey, col_index));
-                    // add to manifest (in-memory)
                     man.columns.push(ColumnEntry {
                         field_id: *fid,
                         column_index_physical_key: col_index_pkey,
@@ -608,6 +605,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             let data_pkey = data_keys[i];
             let index_pkey = index_keys[i];
 
+            // compute value bounds once per segment
             let (vmin, vmax) = min_max_bounds(&chunk.values);
 
             // build data blob (+ value offsets for variable)
@@ -619,12 +617,9 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         debug_assert_eq!(v.len(), width as usize);
                         blob.extend_from_slice(v);
                     }
-                    // index segment (lets the index module compute key layout & min/max)
-                    let mut seg =
+                    // index segment (keys packed + fixed value layout)
+                    let seg =
                         IndexSegment::build_fixed(data_pkey, chunk.keys_sorted.clone(), width);
-                    seg.value_min = Some(vmin);
-                    seg.value_max = Some(vmax);
-
                     (blob, seg, chunk.values.len() as IndexEntryCount)
                 }
                 PlannedLayout::Variable => {
@@ -635,12 +630,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         blob.extend_from_slice(v);
                         sizes.push(v.len() as ByteLen);
                     }
-                    // index segment
-                    let mut seg =
-                        IndexSegment::build_var(data_pkey, chunk.keys_sorted.clone(), &sizes);
-                    seg.value_min = Some(vmin);
-                    seg.value_max = Some(vmax);
-
+                    // index segment (keys packed + var value layout)
+                    let seg = IndexSegment::build_var(data_pkey, chunk.keys_sorted.clone(), &sizes);
                     (blob, seg, chunk.values.len() as IndexEntryCount)
                 }
             };
@@ -648,6 +639,18 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             // queue writes
             data_puts.push((data_pkey, data_blob));
             index_puts.push((index_pkey, seg.clone()));
+
+            // derive logical key span from already-sorted keys (first/last)
+            let logical_key_min = chunk
+                .keys_sorted
+                .first()
+                .cloned()
+                .expect("non-empty segment");
+            let logical_key_max = chunk
+                .keys_sorted
+                .last()
+                .cloned()
+                .expect("non-empty segment");
 
             // update ColumnIndex (newest-first: push_front semantics)
             {
@@ -661,8 +664,10 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     IndexSegmentRef {
                         index_physical_key: index_pkey,
                         data_physical_key: seg.data_physical_key,
-                        logical_key_min: seg.logical_key_min.clone(),
-                        logical_key_max: seg.logical_key_max.clone(),
+                        logical_key_min,
+                        logical_key_max,
+                        value_min: Some(vmin.clone()),
+                        value_max: Some(vmax.clone()),
                         n_entries,
                     },
                 );
@@ -712,7 +717,6 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         }
 
         if !puts_batch.is_empty() {
-            // Assert we're using storage efficiently
             #[cfg(debug_assertions)]
             {
                 let mut seen = FxHashSet::default();
@@ -723,7 +727,6 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     assert!(seen.insert(k), "duplicate PUT for key {}", k);
                 }
             }
-
             self.do_puts(puts_batch);
         }
     }
@@ -1720,33 +1723,18 @@ mod tests {
             },
         );
 
-        // find the segment pk we just wrote
-        let (seg_pk, _) = {
+        // Clone the newest ref while the lock is held
+        let sref: IndexSegmentRef = {
             let ci = store.colindex_cache.read().unwrap();
             let (_pk, colidx) = ci.get(&fid).expect("colindex");
-            let sref = &colidx.segments[0]; // newest-first
-            (sref.index_physical_key, sref.data_physical_key)
+            colidx.segments[0].clone()
         };
 
-        // load that IndexSegment and check value min/max
-        let got = store.do_gets(vec![BatchGet::Typed {
-            key: seg_pk,
-            kind: TypedKind::IndexSegment,
-        }]);
-
-        match &got[0] {
-            GetResult::Typed {
-                value: TypedValue::IndexSegment(seg),
-                ..
-            } => {
-                assert_eq!(seg.value_min, Some(ValueBound::from_bytes(&[0, 0, 0, 0])));
-                assert_eq!(
-                    seg.value_max,
-                    Some(ValueBound::from_bytes(&[255, 255, 255, 1]))
-                );
-            }
-            _ => panic!("expected IndexSegment"),
-        }
+        assert_eq!(sref.value_min, Some(ValueBound::from_bytes(&[0, 0, 0, 0])));
+        assert_eq!(
+            sref.value_max,
+            Some(ValueBound::from_bytes(&[255, 255, 255, 1]))
+        );
     }
 
     #[test]
@@ -1773,28 +1761,15 @@ mod tests {
             },
         );
 
-        let (seg_pk, _) = {
+        // Clone the newest ref while the lock is held
+        let sref: IndexSegmentRef = {
             let ci = store.colindex_cache.read().unwrap();
             let (_pk, colidx) = ci.get(&fid).expect("colindex");
-            let sref = &colidx.segments[0];
-            (sref.index_physical_key, sref.data_physical_key)
+            colidx.segments[0].clone()
         };
 
-        let got = store.do_gets(vec![BatchGet::Typed {
-            key: seg_pk,
-            kind: TypedKind::IndexSegment,
-        }]);
-
-        match &got[0] {
-            GetResult::Typed {
-                value: TypedValue::IndexSegment(seg),
-                ..
-            } => {
-                assert_eq!(seg.value_min, Some(ValueBound::from_bytes(b"ant")));
-                assert_eq!(seg.value_max, Some(ValueBound::from_bytes(b"zebra")));
-            }
-            _ => panic!("expected IndexSegment"),
-        }
+        assert_eq!(sref.value_min, Some(ValueBound::from_bytes(b"ant")));
+        assert_eq!(sref.value_max, Some(ValueBound::from_bytes(b"zebra")));
     }
 
     #[test]
@@ -1814,37 +1789,23 @@ mod tests {
             }],
             AppendOptions {
                 mode: ValueMode::ForceVariable,
-                segment_max_entries: 1_000_000, // don't force extra chunking
-                segment_max_bytes: usize::MAX,  // allow the one huge value in one segment
+                segment_max_entries: 1_000_000,
+                segment_max_bytes: usize::MAX,
                 last_write_wins_in_batch: true,
             },
         );
 
-        // find the freshly-written segment
-        let (seg_pk, _data_pk) = {
+        // Take ownership of the newest ref and seg pk while locked
+        let (seg_pk, sref): (PhysicalKey, IndexSegmentRef) = {
             let ci = store.colindex_cache.read().unwrap();
             let (_pk, colidx) = ci.get(&fid).expect("colindex");
-            let sref = &colidx.segments[0];
-            (sref.index_physical_key, sref.data_physical_key)
-        };
-
-        // read typed segment to inspect the bounds
-        let got = store.do_gets(vec![BatchGet::Typed {
-            key: seg_pk,
-            kind: TypedKind::IndexSegment,
-        }]);
-
-        let seg = match &got[0] {
-            GetResult::Typed {
-                value: TypedValue::IndexSegment(seg),
-                ..
-            } => seg,
-            _ => panic!("expected IndexSegment"),
+            let sref = colidx.segments[0].clone();
+            (sref.index_physical_key, sref)
         };
 
         // both min and max are the same single huge value
-        let vmin = seg.value_min.as_ref().expect("value_min");
-        let vmax = seg.value_max.as_ref().expect("value_max");
+        let vmin = sref.value_min.as_ref().expect("value_min");
+        let vmax = sref.value_max.as_ref().expect("value_max");
 
         assert_eq!(vmin.total_len, 1_048_576);
         assert_eq!(vmax.total_len, 1_048_576);
