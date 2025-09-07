@@ -7,7 +7,6 @@ use crate::pager::{BatchGet, BatchPut, GetResult, Pager, TypedKind, TypedValue};
 use crate::types::{
     ByteLen, ByteOffset, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey,
 };
-use crate::utils::binary_search::binary_search_key_with_layout;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
 use std::fmt::Write;
@@ -896,7 +895,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 }
 
                 let target = items[qi].1[kj].as_slice();
-                if let Some(pos) = binary_search_key_with_layout(
+                if let Some(pos) = KeyLayout::binary_search_key_with_layout(
                     &seg.logical_key_bytes,
                     &seg.key_layout,
                     seg.n_entries as usize,

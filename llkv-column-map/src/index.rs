@@ -4,7 +4,6 @@ use crate::layout::{KeyLayout, ValueLayout};
 use crate::types::{
     ByteLen, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey,
 };
-use crate::utils::pack::pack_keys_with_layout;
 
 // pick a small, cache-friendly cap
 pub const VALUE_BOUND_MAX: usize = 64;
@@ -110,7 +109,7 @@ impl IndexSegment {
         width: ByteWidth,
     ) -> IndexSegment {
         let n = logical_keys.len() as IndexEntryCount;
-        let (logical_key_bytes, key_layout) = pack_keys_with_layout(logical_keys);
+        let (logical_key_bytes, key_layout) = KeyLayout::pack_keys_with_layout(logical_keys);
         IndexSegment {
             data_physical_key: data_pkey,
             n_entries: n,
@@ -127,7 +126,7 @@ impl IndexSegment {
     ) -> IndexSegment {
         assert_eq!(logical_keys.len(), value_sizes.len());
         let n = logical_keys.len() as IndexEntryCount;
-        let (logical_key_bytes, key_layout) = pack_keys_with_layout(logical_keys);
+        let (logical_key_bytes, key_layout) = KeyLayout::pack_keys_with_layout(logical_keys);
 
         let mut value_offsets = Vec::with_capacity(value_sizes.len() + 1);
         let mut acc = 0u32;
@@ -157,7 +156,6 @@ mod tests {
     use super::*;
     use crate::constants::BOOTSTRAP_PKEY;
     use crate::pager::{BatchGet, BatchPut, GetResult, MemPager, Pager, TypedKind, TypedValue};
-    use crate::utils::slice::slice_key_by_layout;
 
     // ---------------- helpers to build/slice logical keys ----------------
 
@@ -389,9 +387,9 @@ mod tests {
         }
 
         // Inspect keys via KeyLayout
-        let k0 = slice_key_by_layout(&seg100.logical_key_bytes, &seg100.key_layout, 0);
-        let k1 = slice_key_by_layout(&seg100.logical_key_bytes, &seg100.key_layout, 1);
-        let k2 = slice_key_by_layout(&seg100.logical_key_bytes, &seg100.key_layout, 2);
+        let k0 = KeyLayout::slice_key_by_layout(&seg100.logical_key_bytes, &seg100.key_layout, 0);
+        let k1 = KeyLayout::slice_key_by_layout(&seg100.logical_key_bytes, &seg100.key_layout, 1);
+        let k2 = KeyLayout::slice_key_by_layout(&seg100.logical_key_bytes, &seg100.key_layout, 2);
         assert_eq!(k0, &b"a"[..]);
         assert_eq!(k1, &b"b"[..]);
         assert_eq!(k2, &b"d"[..]);
@@ -517,7 +515,7 @@ mod tests {
         let mut hit = None;
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let k = slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, mid);
+            let k = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, mid);
             match k.cmp(target) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
@@ -529,7 +527,7 @@ mod tests {
         }
         let pos = hit.expect("should find wolf");
         assert_eq!(
-            slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, pos),
+            KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, pos),
             &b"wolf"[..]
         );
     }
@@ -605,8 +603,8 @@ mod tests {
         let seg = IndexSegment::build_fixed(123, keys, 4 /* any width for values */);
 
         // bounds must be inclusive and lexicographic — derive by slicing first/last
-        let first = slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);
-        let last = slice_key_by_layout(
+        let first = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);
+        let last = KeyLayout::slice_key_by_layout(
             &seg.logical_key_bytes,
             &seg.key_layout,
             seg.n_entries as usize - 1,
@@ -637,8 +635,8 @@ mod tests {
         let seg = IndexSegment::build_var(777, keys, &sizes);
 
         // derive lexicographic min/max by slicing packed keys
-        let first = slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);
-        let last = slice_key_by_layout(
+        let first = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);
+        let last = KeyLayout::slice_key_by_layout(
             &seg.logical_key_bytes,
             &seg.key_layout,
             seg.n_entries as usize - 1,
