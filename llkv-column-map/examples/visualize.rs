@@ -31,9 +31,9 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use llkv_column_map::pager::MemPager;
+use llkv_column_map::storage::{StorageKind, pager::MemPager};
 use llkv_column_map::types::PhysicalKey;
-use llkv_column_map::{AppendOptions, ColumnStore, Put, StorageKind, ValueMode};
+use llkv_column_map::{AppendOptions, ColumnStore, Put, ValueMode};
 
 // ---------------- Workload config (small, but shows batching clearly) --------
 

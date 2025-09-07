@@ -3,7 +3,10 @@ use crate::index::{
     Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, Manifest, ValueBound,
 };
 use crate::layout::{IndexLayoutInfo, KeyLayout, ValueLayout};
-use crate::pager::{BatchGet, BatchPut, GetResult, Pager};
+use crate::storage::{
+    StorageKind, StorageNode,
+    pager::{BatchGet, BatchPut, GetResult, Pager},
+};
 use crate::types::{
     ByteLen, ByteOffset, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey,
     TypedKind, TypedValue,
@@ -16,35 +19,6 @@ use std::sync::{
     RwLock,
     atomic::{AtomicUsize, Ordering},
 };
-
-#[derive(Clone, Debug)]
-pub struct StorageNode {
-    pub pk: PhysicalKey,
-    pub stored_len: usize,
-    pub kind: StorageKind,
-}
-
-#[derive(Clone, Debug)]
-pub enum StorageKind {
-    Bootstrap,
-    Manifest {
-        column_count: usize,
-    },
-    ColumnIndex {
-        field_id: LogicalFieldId,
-        n_segments: usize,
-    },
-    IndexSegment {
-        field_id: LogicalFieldId,
-        n_entries: IndexEntryCount,
-        layout: IndexLayoutInfo,
-        data_pkey: PhysicalKey,
-        owner_colindex_pk: PhysicalKey,
-    },
-    DataBlob {
-        owner_index_pk: PhysicalKey,
-    },
-}
 
 // ----------------------------- write API -----------------------------
 
@@ -1307,7 +1281,7 @@ mod tests {
     use super::*;
 
     // Use the unified in-memory pager from the pager module.
-    use crate::pager::MemPager;
+    use crate::storage::pager::MemPager;
 
     #[test]
     fn put_get_fixed_auto() {

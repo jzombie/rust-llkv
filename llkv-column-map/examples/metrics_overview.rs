@@ -12,7 +12,7 @@
 //! “cells” = number of (key,value) entries written, i.e., len(items) per column.
 
 use llkv_column_map::{
-    AppendOptions, ColumnStore, Put, ValueMode, pager::MemPager, types::BlobLike,
+    AppendOptions, ColumnStore, Put, ValueMode, storage::pager::MemPager, types::BlobLike,
     types::LogicalFieldId, views::ValueSlice,
 };
 
@@ -88,7 +88,7 @@ impl core::ops::Sub for Counts {
 }
 
 // Uses your actual IoStats field names.
-fn read_counts<P: llkv_column_map::pager::Pager>(store: &ColumnStore<'_, P>) -> Counts {
+fn read_counts<P: llkv_column_map::storage::pager::Pager>(store: &ColumnStore<'_, P>) -> Counts {
     let s = store.io_stats(); // cumulative since process start
     Counts {
         batches: s.batches as u64,
@@ -153,7 +153,7 @@ fn print_data_summary(label: &str, a: &AppendSummary) {
 }
 
 // Prints the phase’s data summary and then the per-phase I/O deltas.
-fn show_phase_with_data<P: llkv_column_map::pager::Pager>(
+fn show_phase_with_data<P: llkv_column_map::storage::pager::Pager>(
     label: &str,
     store: &ColumnStore<'_, P>,
     prev: &mut Counts,
@@ -171,7 +171,7 @@ fn show_phase_with_data<P: llkv_column_map::pager::Pager>(
 }
 
 // Simple version (no data line), used for phases that don’t write (e.g. init, describe)
-fn show_phase<P: llkv_column_map::pager::Pager>(
+fn show_phase<P: llkv_column_map::storage::pager::Pager>(
     label: &str,
     store: &ColumnStore<'_, P>,
     prev: &mut Counts,

@@ -169,7 +169,7 @@ impl IndexSegment {
 mod tests {
     use super::*;
     use crate::constants::BOOTSTRAP_PKEY;
-    use crate::pager::{BatchGet, BatchPut, GetResult, MemPager, Pager};
+    use crate::storage::pager::{BatchGet, BatchPut, GetResult, MemPager, Pager};
     use crate::types::{TypedKind, TypedValue};
 
     // ---------------- helpers to build/slice logical keys ----------------
