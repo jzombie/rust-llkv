@@ -87,6 +87,9 @@ struct SegCtx<P: Pager> {
     /// Window in value_index.value_order: [begin, end).
     begin: usize,
     end: usize,
+    /// Cached logical-key bounds (for fast reject in membership probes).
+    min_key: Vec<u8>,
+    max_key: Vec<u8>,
 }
 
 /// Minimal metadata for shadow (index-only) membership checks.
@@ -385,10 +388,8 @@ impl<P: Pager> ValueScan<P> {
         let mut shadow_refs_all: Vec<ShadowRef> = Vec::new();
         for (rank, r) in colindex.segments.iter().enumerate() {
             let needed = match policy {
-                // rank 0 is newest; include strictly newer than some active
-                ConflictPolicy::LWW => rank < max_active_rank,
-                // include strictly older than some active
-                ConflictPolicy::FWW => rank > min_active_rank,
+                ConflictPolicy::LWW => rank < max_active_rank, // check strictly newer
+                ConflictPolicy::FWW => rank > min_active_rank, // check strictly older
             };
             if !needed {
                 continue;
@@ -493,6 +494,16 @@ impl<P: Pager> ValueScan<P> {
 
             let rank = *seg_rank.get(&r.index_physical_key).unwrap_or(&usize::MAX);
 
+            // --- cache min/max logical key for this segment (fast reject) ---
+            let min_key =
+                KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0).to_vec();
+            let max_key = KeyLayout::slice_key_by_layout(
+                &seg.logical_key_bytes,
+                &seg.key_layout,
+                seg.n_entries as usize - 1,
+            )
+            .to_vec();
+
             let seg_idx = segs.len();
             segs.push(SegCtx {
                 _seg_pk: r.index_physical_key,
@@ -502,6 +513,8 @@ impl<P: Pager> ValueScan<P> {
                 rank,
                 begin,
                 end,
+                min_key,
+                max_key,
             });
 
             // Head depends on direction.
@@ -517,6 +530,7 @@ impl<P: Pager> ValueScan<P> {
                 let d = &segs[seg_idx].data;
                 (s, d)
             };
+            // value_order position -> row position
             let head_row = row_pos_at(seg_ref, head_pos);
             let val = slice_value::<P>(seg_ref, data_ref, head_row);
             let (bucket, tag) = {
@@ -569,42 +583,69 @@ impl<P: Pager> ValueScan<P> {
         .is_some()
     }
 
+    /// Is this `key rank` shadowed by the chosen policy?
+    #[inline]
+    fn key_within_seg_bounds<'a>(seg: &'a IndexSegment, key: &[u8]) -> bool {
+        // Borrowed min/max from the segment without allocation.
+        let min = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);
+        let max = KeyLayout::slice_key_by_layout(
+            &seg.logical_key_bytes,
+            &seg.key_layout,
+            seg.n_entries as usize - 1,
+        );
+        !(key < min || key > max)
+    }
+
     /// Is this `key@rank` shadowed by the chosen policy?
     fn is_shadowed(&self, key: &[u8], rank: usize) -> bool {
-        // 1) Active segments we already hold (index+data).
+        // 1) Check against already-loaded active segments (index+data).
         for sc in &self.segs {
             let rel = sc.rank as isize - rank as isize;
             let dominates = match self.policy {
                 ConflictPolicy::LWW => rel < 0, // newer dominates
                 ConflictPolicy::FWW => rel > 0, // older dominates
             };
-            if dominates && Self::key_in_index(&sc.seg, key) {
+            if !dominates {
+                continue;
+            }
+            // Fast bound reject using cached min/max per active segment.
+            if key < sc.min_key.as_slice() || key > sc.max_key.as_slice() {
+                continue;
+            }
+            if Self::key_in_index(&sc.seg, key) {
                 return true;
             }
         }
 
-        // 2) Shadow segments (index-only).
+        // 2) Check index-only shadow segments (prefetched).
         match self.policy {
             ConflictPolicy::LWW => {
-                // Check strictly newer ranks [0 .. rank)
+                // strictly newer ranks [0 .. rank)
                 for r in 0..rank {
                     for rf in &self.shadow_by_rank[r] {
-                        if let Some(seg) = self.shadow_seg_map.get(&rf.pk)
-                            && Self::key_in_index(seg, key)
-                        {
-                            return true;
+                        if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
+                            // Fast bound reject (borrowed slices; no alloc).
+                            if !Self::key_within_seg_bounds(seg, key) {
+                                continue;
+                            }
+                            if Self::key_in_index(seg, key) {
+                                return true;
+                            }
                         }
                     }
                 }
             }
             ConflictPolicy::FWW => {
-                // Check strictly older ranks (rank+1 ..)
+                // strictly older ranks (rank+1 ..)
                 for r in (rank + 1)..self.shadow_by_rank.len() {
                     for rf in &self.shadow_by_rank[r] {
-                        if let Some(seg) = self.shadow_seg_map.get(&rf.pk)
-                            && Self::key_in_index(seg, key)
-                        {
-                            return true;
+                        if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
+                            if !Self::key_within_seg_bounds(seg, key) {
+                                continue;
+                            }
+                            if Self::key_in_index(seg, key) {
+                                return true;
+                            }
                         }
                     }
                 }
