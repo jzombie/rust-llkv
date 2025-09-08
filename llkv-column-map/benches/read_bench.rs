@@ -14,6 +14,7 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use llkv_column_map::{
     ColumnStore,
+    codecs::key::u64_be,
     column_store::write::{AppendOptions, Put, ValueMode},
     storage::pager::MemPager,
     types::LogicalFieldId,
@@ -30,11 +31,6 @@ const QUERY_SIZES: &[usize] = &[1_000, 10_000, 100_000]; // per-iteration keys
 const COLS: &[LogicalFieldId] = &[10, 11, 20, 21, 30, 31];
 
 // ---------------------- value generators ----------------------
-
-#[inline]
-fn be_key_u64(v: u64) -> Vec<u8> {
-    v.to_be_bytes().to_vec()
-}
 
 #[inline]
 fn fixed_value(width: usize, row: u64, fid: LogicalFieldId) -> Vec<u8> {
@@ -85,7 +81,7 @@ fn ingest_1m_rows(store: &ColumnStore<'static, MemPager>) {
         for &fid in &[COLS[0], COLS[1]] {
             let mut items = Vec::with_capacity((end - start) as usize);
             for r in start..end {
-                items.push((be_key_u64(r), fixed_value(8, r, fid)));
+                items.push((u64_be(r), fixed_value(8, r, fid)));
             }
             puts.push(Put {
                 field_id: fid,
@@ -97,7 +93,7 @@ fn ingest_1m_rows(store: &ColumnStore<'static, MemPager>) {
         for &fid in &[COLS[2], COLS[3]] {
             let mut items = Vec::with_capacity((end - start) as usize);
             for r in start..end {
-                items.push((be_key_u64(r), fixed_value(4, r, fid)));
+                items.push((u64_be(r), fixed_value(4, r, fid)));
             }
             puts.push(Put {
                 field_id: fid,
@@ -109,7 +105,7 @@ fn ingest_1m_rows(store: &ColumnStore<'static, MemPager>) {
         for &fid in &[COLS[4], COLS[5]] {
             let mut items = Vec::with_capacity((end - start) as usize);
             for r in start..end {
-                items.push((be_key_u64(r), var_value(r, fid, 5, 25)));
+                items.push((u64_be(r), var_value(r, fid, 5, 25)));
             }
             puts.push(Put {
                 field_id: fid,
@@ -149,7 +145,7 @@ fn bench_query_uniform(c: &mut Criterion) {
                     let mut keys: Vec<Vec<u8>> = Vec::with_capacity(q);
                     for _ in 0..q {
                         let row = rng.random_range(0..N_ROWS);
-                        keys.push(be_key_u64(row));
+                        keys.push(u64_be(row));
                     }
                     // Query all columns with the same key set
                     COLS.iter()

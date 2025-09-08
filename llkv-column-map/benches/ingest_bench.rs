@@ -55,6 +55,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 
 use llkv_column_map::{
     ColumnStore,
+    codecs::key::u64_be,
     column_store::write::{AppendOptions, Put, ValueMode},
     storage::pager::MemPager,
 };
@@ -85,7 +86,7 @@ fn col_spec_21() -> Vec<(u32, ColKind)> {
 
 #[inline]
 fn row_key(row: u64) -> Vec<u8> {
-    row.to_be_bytes().to_vec()
+    u64_be(row)
 }
 
 #[inline]
