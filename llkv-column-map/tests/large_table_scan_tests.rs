@@ -39,11 +39,13 @@ const SEGMENT_MAX_BYTES: usize = 64 << 20; // 64 MiB generous cap
 const REWRITE_LO: u32 = 200_000;
 const REWRITE_HI: u32 = 300_000;
 
+// TODO: Dedupe
 #[inline]
 fn be_u64_vec(x: u64) -> Vec<u8> {
     u64_be_array(x).to_vec()
 }
 
+// TODO: Dedupe
 #[inline]
 fn parse_be_u64(b: &[u8]) -> u64 {
     let mut a = [0u8; 8];
@@ -66,6 +68,7 @@ fn base_value(col: usize, i: u32) -> u64 {
 }
 
 #[test]
+#[ignore = "CPU intensive test"]
 fn large_table_end_to_end_scans() {
     let pager = MemPager::default();
     let store = ColumnStore::init_empty(&pager);
@@ -145,8 +148,7 @@ fn large_table_end_to_end_scans() {
     }
     let got = store.get_many(queries);
 
-    for col in 0..COLS {
-        let v = &got[col];
+    for (col, v) in got.iter().enumerate() {
         let expect0 = base_value(col, 0);
         let expect1 = base_value(col, 1);
         let expect_mid = base_value(col, 123_456);

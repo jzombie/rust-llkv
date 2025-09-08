@@ -13,6 +13,22 @@ Prototype B+Tree replacement with batch-only pager I/O for the [LLKV](https://gi
 - Logical key and value segment pruning.
 - `Graphviz` (`.dot`) visualization generation (see [examples/visualize.rs](examples/visualize.rs)) for illustrative purposes and debugging.
 
+## Testing
+
+Some large (expensive) tests are marked `#[ignore]` by default.
+
+### Quick Start
+
+```sh
+cargo test
+```
+
+### Run everything (including ignored)
+
+```sh
+cargo test -- --ignored
+```
+
 ## License
 
 Licensed under the [Apache-2.0 License](../LICENSE).

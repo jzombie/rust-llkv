@@ -139,7 +139,7 @@ impl<P: Pager> RadixPq<P> {
         let bit = 1u64 << (b % 64);
         self.buckets
             .entry(b)
-            .or_insert_with(BinaryHeap::new)
+            .or_default()
             .push(std::cmp::Reverse(node));
         self.bitset[idx] |= bit;
     }
@@ -199,7 +199,7 @@ struct Node<P: Pager> {
 
 impl<P: Pager> Node<P> {
     #[inline]
-    fn bytes<'a>(&'a self) -> &'a [u8] {
+    fn bytes(&self) -> &[u8] {
         let a = self.val.start as usize;
         let b = self.val.end as usize;
         &self.val.data.as_ref()[a..b]
@@ -588,10 +588,10 @@ impl<P: Pager> ValueScan<P> {
                 // Check strictly newer ranks [0 .. rank)
                 for r in 0..rank {
                     for rf in &self.shadow_by_rank[r] {
-                        if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
-                            if Self::key_in_index(seg, key) {
-                                return true;
-                            }
+                        if let Some(seg) = self.shadow_seg_map.get(&rf.pk)
+                            && Self::key_in_index(seg, key)
+                        {
+                            return true;
                         }
                     }
                 }
@@ -600,10 +600,10 @@ impl<P: Pager> ValueScan<P> {
                 // Check strictly older ranks (rank+1 ..)
                 for r in (rank + 1)..self.shadow_by_rank.len() {
                     for rf in &self.shadow_by_rank[r] {
-                        if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
-                            if Self::key_in_index(seg, key) {
-                                return true;
-                            }
+                        if let Some(seg) = self.shadow_seg_map.get(&rf.pk)
+                            && Self::key_in_index(seg, key)
+                        {
+                            return true;
                         }
                     }
                 }
@@ -851,7 +851,7 @@ fn upper_bound_by_value<P: Pager>(
 }
 
 fn l1_l2_window(vix: &ValueIndex, probe: &[u8]) -> (usize, usize) {
-    let b0 = probe.get(0).copied().unwrap_or(0) as usize;
+    let b0 = probe.first().copied().unwrap_or(0) as usize;
     let start = vix.l1_dir[b0] as usize;
     let end = vix.l1_dir[b0 + 1] as usize;
     if start >= end {
@@ -913,16 +913,16 @@ fn cmp_value_at<P: Pager>(
 
 fn bucket_and_tag(v: &[u8], bucket_prefix_len: usize, head_tag_len: usize) -> (u16, u64) {
     // bucket = first 2 bytes big-endian; zeros if missing
-    let b0 = *v.get(0).unwrap_or(&0) as u16;
+    let b0 = *v.first().unwrap_or(&0) as u16;
     let b1 = *v.get(1).unwrap_or(&0) as u16;
-    let bucket = ((b0 << 8) | b1) as u16;
+    let bucket = (b0 << 8) | b1;
 
     // tag = next up to 8 bytes big-endian after the bucket prefix
     let mut tag: u64 = 0;
     let start = bucket_prefix_len;
     let end = (start + head_tag_len).min(v.len());
-    for i in start..end {
-        tag = (tag << 8) | (v[i] as u64);
+    for &x in &v[start..end] {
+        tag = (tag << 8) | (x as u64);
     }
     if end - start < head_tag_len {
         tag <<= 8 * (head_tag_len - (end - start));
@@ -1071,7 +1071,7 @@ mod value_scan_tests {
 
         // spot-check winners come from the right generation
         // [0,200) -> gen1
-        assert_eq!(by_key[&0], 1000 + 0);
+        assert_eq!(by_key[&0], 1000);
         assert_eq!(by_key[&199], 1000 + 199);
         // [200,600) -> gen2
         assert_eq!(by_key[&200], 200_000 + 200);
@@ -1201,7 +1201,7 @@ mod value_scan_tests {
 
         // Oldest wins expectation:
         // [0,1000) -> gen1; [1000,1200) -> gen2; [1200,1400) -> gen3
-        assert_eq!(by_key[&0], 1000 + 0);
+        assert_eq!(by_key[&0], 1000);
         assert_eq!(by_key[&999], 1000 + 999);
         assert_eq!(by_key[&1000], 200_000 + 1000);
         assert_eq!(by_key[&1199], 200_000 + 1199);
@@ -1303,9 +1303,9 @@ mod value_scan_tests {
 
         // endpoints for reverse order under FWW:
         //   first (max)  -> gen3@1399 = 300_000 + 1399
-        //   last  (min)  -> gen1@0    = 1000 + 0
+        //   last  (min)  -> gen1@0    = 1000
         assert_eq!(first.unwrap(), 300_000 + 1399);
-        assert_eq!(prev.unwrap(), 1000 + 0);
+        assert_eq!(prev.unwrap(), 1000);
     }
 
     #[test]

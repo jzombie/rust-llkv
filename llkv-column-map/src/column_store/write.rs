@@ -25,6 +25,12 @@ struct PlannedWriteChunk {
     layout: PlannedWriteLayout,
 }
 
+pub(crate) struct BuiltValueDirs {
+    pub l1_dir: Vec<u32>,
+    pub value_order: Vec<u32>,
+    pub l2_dirs: Vec<(u8, Vec<u32>)>,
+}
+
 impl<'p, P: Pager> ColumnStore<'p, P> {
     // TODO: Return `Result` type
     // Single entrypoint for writing. Many columns, each with unordered items.
@@ -276,15 +282,21 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
             // Compute value index from the in-memory values for this segment.
             let hot_threshold = 4096; // tune later; promotes big L1 buckets
-            let (value_order, l1_dir, l2_pairs) =
+            let built_value_dirs =
                 Self::build_value_index_from_values(&chunk.values, hot_threshold);
             let value_index = ValueIndex {
-                value_order: value_order
+                value_order: built_value_dirs
+                    .value_order
                     .into_iter()
                     .map(|v| v as IndexEntryCount)
                     .collect(),
-                l1_dir: l1_dir.into_iter().map(|v| v as IndexEntryCount).collect(),
-                l2_dirs: l2_pairs
+                l1_dir: built_value_dirs
+                    .l1_dir
+                    .into_iter()
+                    .map(|v| v as IndexEntryCount)
+                    .collect(),
+                l2_dirs: built_value_dirs
+                    .l2_dirs
                     .into_iter()
                     .map(|(first_byte, dir257)| ValueDirL2 {
                         first_byte,
@@ -419,7 +431,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     fn build_value_index_from_values(
         values: &[Vec<u8>], // TODO: More efficient input?
         hot_threshold: usize,
-    ) -> (Vec<u32>, Vec<u32>, Vec<(u8, Vec<u32>)>) {
+    ) -> BuiltValueDirs {
         let n = values.len();
         let mut idx: Vec<u32> = (0..n as u32).collect();
 
@@ -430,13 +442,12 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         let mut l1 = vec![0u32; 257];
         let mut cur = 0usize;
         for b0 in 0..256usize {
-            while cur < n
-                && values[idx[cur] as usize]
-                    .get(0)
-                    .map(|v| *v as usize)
-                    .unwrap_or(0)
-                    == b0
-            {
+            while cur < n {
+                let idx_cur = idx[cur] as usize;
+                let v0 = values[idx_cur].first().copied().unwrap_or(0) as usize;
+                if v0 != b0 {
+                    break;
+                }
                 cur += 1;
             }
             l1[b0 + 1] = cur as u32;
@@ -466,6 +477,10 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             }
         }
 
-        (idx, l1, l2)
+        BuiltValueDirs {
+            l1_dir: l1,
+            value_order: idx,
+            l2_dirs: l2,
+        }
     }
 }
