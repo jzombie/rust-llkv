@@ -8,14 +8,16 @@
 //! What you can tweak easily:
 //! - `N_ROWS`, `QUERY_SIZES`, and the column set in `COLS`.
 //! - `ingest_chunk_rows`, segment limits in `AppendOptions`.
-//!
-//! No “hot set”, no custom RNG — just straightforward uniform queries.
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use llkv_column_map::{
-    AppendOptions, ColumnStore, Put, ValueMode, storage::pager::MemPager, types::LogicalFieldId,
+    ColumnStore,
+    codecs::big_endian::u64_be_vec,
+    storage::pager::MemPager,
+    types::{AppendOptions, LogicalFieldId, Put, ValueMode},
 };
 use rand::{Rng, SeedableRng, rngs::StdRng};
+use std::borrow::Cow;
 use std::cmp::min;
 use std::hint::black_box;
 
@@ -25,13 +27,7 @@ const N_ROWS: u64 = 1_000_000;
 const QUERY_SIZES: &[usize] = &[1_000, 10_000, 100_000]; // per-iteration keys
 // 6 columns: 2×8B fixed, 2×4B fixed, 2×variable (5..25)
 const COLS: &[LogicalFieldId] = &[10, 11, 20, 21, 30, 31];
-
 // ---------------------- value generators ----------------------
-
-#[inline]
-fn be_key_u64(v: u64) -> Vec<u8> {
-    v.to_be_bytes().to_vec()
-}
 
 #[inline]
 fn fixed_value(width: usize, row: u64, fid: LogicalFieldId) -> Vec<u8> {
@@ -67,22 +63,22 @@ fn ingest_1m_rows(store: &ColumnStore<'static, MemPager>) {
         segment_max_bytes: 8 * 1024 * 1024,
         last_write_wins_in_batch: true,
     };
-
     // Ingest in chunks so we don't build a gigantic Vec per column.
     let ingest_chunk_rows: u64 = 100_000;
-
     let mut start = 0u64;
     while start < N_ROWS {
         let end = min(N_ROWS, start + ingest_chunk_rows);
-
         // Build puts for our 6 columns over [start, end)
         let mut puts: Vec<Put> = Vec::with_capacity(COLS.len());
-
         // 10,11: fixed 8B
         for &fid in &[COLS[0], COLS[1]] {
             let mut items = Vec::with_capacity((end - start) as usize);
             for r in start..end {
-                items.push((be_key_u64(r), fixed_value(8, r, fid)));
+                // Explicitly create Cow::Owned to match the Put struct definition.
+                items.push((
+                    Cow::Owned(u64_be_vec(r)),
+                    Cow::Owned(fixed_value(8, r, fid)),
+                ));
             }
             puts.push(Put {
                 field_id: fid,
@@ -94,7 +90,11 @@ fn ingest_1m_rows(store: &ColumnStore<'static, MemPager>) {
         for &fid in &[COLS[2], COLS[3]] {
             let mut items = Vec::with_capacity((end - start) as usize);
             for r in start..end {
-                items.push((be_key_u64(r), fixed_value(4, r, fid)));
+                // Explicitly create Cow::Owned to match the Put struct definition.
+                items.push((
+                    Cow::Owned(u64_be_vec(r)),
+                    Cow::Owned(fixed_value(4, r, fid)),
+                ));
             }
             puts.push(Put {
                 field_id: fid,
@@ -106,7 +106,11 @@ fn ingest_1m_rows(store: &ColumnStore<'static, MemPager>) {
         for &fid in &[COLS[4], COLS[5]] {
             let mut items = Vec::with_capacity((end - start) as usize);
             for r in start..end {
-                items.push((be_key_u64(r), var_value(r, fid, 5, 25)));
+                // Explicitly create Cow::Owned to match the Put struct definition.
+                items.push((
+                    Cow::Owned(u64_be_vec(r)),
+                    Cow::Owned(var_value(r, fid, 5, 25)),
+                ));
             }
             puts.push(Put {
                 field_id: fid,
@@ -131,7 +135,6 @@ fn bench_query_uniform(c: &mut Criterion) {
 
     // Ingest once (not timed).
     ingest_1m_rows(&store);
-
     let mut group = c.benchmark_group("read_uniform_1M*6");
 
     for &q in QUERY_SIZES {
@@ -145,8 +148,8 @@ fn bench_query_uniform(c: &mut Criterion) {
                 || {
                     let mut keys: Vec<Vec<u8>> = Vec::with_capacity(q);
                     for _ in 0..q {
-                        let row = rng.random_range(0..N_ROWS);
-                        keys.push(be_key_u64(row));
+                        let row: u64 = rng.random_range(0..N_ROWS);
+                        keys.push(u64_be_vec(row));
                     }
                     // Query all columns with the same key set
                     COLS.iter()

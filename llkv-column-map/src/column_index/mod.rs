@@ -1,182 +1,63 @@
 use bitcode::{Decode, Encode};
 
-use crate::constants::VALUE_BOUND_MAX;
-use crate::layout::{KeyLayout, ValueLayout};
-use crate::types::{
-    ByteLen, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey,
-};
+use crate::types::LogicalFieldId;
 
-#[derive(Clone, Debug, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
-pub struct ValueBound {
-    /// Full byte length of the value this bound represents.
-    pub total_len: ByteLen,
-    /// First min(VALUE_BOUND_MAX, total_len) bytes of that value.
-    pub prefix: Vec<u8>,
-}
+pub mod bootstrap;
+pub use bootstrap::*;
 
-impl ValueBound {
-    #[inline]
-    pub fn from_bytes(b: &[u8]) -> Self {
-        let take = core::cmp::min(b.len(), VALUE_BOUND_MAX);
-        Self {
-            total_len: b.len() as u32,
-            prefix: b[..take].to_vec(),
-        }
-    }
+pub mod column_entry;
+pub use column_entry::*;
 
-    #[inline]
-    pub fn is_truncated(&self) -> bool {
-        (self.prefix.len() as u32) < self.total_len
-    }
+pub mod index_segment;
+pub use index_segment::*;
 
-    #[inline]
-    pub fn min_max_bounds(values: &[Vec<u8>]) -> (ValueBound, ValueBound) {
-        debug_assert!(!values.is_empty());
-        let mut min = &values[0];
-        let mut max = &values[0];
-        for v in &values[1..] {
-            if v < min {
-                min = v;
-            }
-            if v > max {
-                max = v;
-            }
-        }
-        (ValueBound::from_bytes(min), ValueBound::from_bytes(max))
-    }
-}
+pub mod manifest;
+pub use manifest::*;
 
-// ── Bootstrapping ────────────────────────────────────────────────────────────
-#[derive(Debug, Clone, Encode, Decode)]
-pub struct Bootstrap {
-    pub manifest_physical_key: PhysicalKey,
-}
-
-// A manifest maps columns → their current ColumnIndex blob (newest version).
-#[derive(Debug, Clone, Encode, Decode)]
-pub struct Manifest {
-    pub columns: Vec<ColumnEntry>,
-}
-
-#[derive(Debug, Clone, Encode, Decode)]
-pub struct ColumnEntry {
-    pub field_id: LogicalFieldId,
-    /// Physical key of the current ColumnIndex blob for this column.
-    pub column_index_physical_key: PhysicalKey,
-}
-
-// ── Column index (list of immutable segments) ────────────────────────────────
-// One per column. Newest-first so later segments shadow older ones.
+/// Immutable list of sealed index segments for a single column (newest-first).
+///
+/// A `ColumnIndex` is a *small* metadata object that enumerates the column’s
+/// sealed segments in **newest-first order**. Newer segments **shadow** older
+/// ones during reads. Each segment is represented by an `IndexSegmentRef` that
+/// carries:
+///
+/// - a pointer to the on-disk index blob (`index_physical_key`)
+/// - a pointer to the data blob (`data_physical_key`)
+/// - fast-prune bounds on **logical keys** (`logical_key_min`/`_max`)
+/// - optional fast-prune bounds on **values** (`value_min`/`_max`)
+/// - the number of entries
+///
+/// Typical read flow:
+/// 1. Load the `ColumnIndex` (via `Manifest` → `ColumnEntry`).
+/// 2. Prune candidate segments by key/value bounds.
+/// 3. Batch-fetch the necessary index blobs (`IndexSegment`) and then the
+///    referenced data slices.
+///
+/// `ColumnIndex` is immutable; a writer produces a new one when appending or
+/// compacting segments and updates the `Manifest` to point to it.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct ColumnIndex {
     pub field_id: LogicalFieldId,
-    pub segments: Vec<IndexSegmentRef>, // newest-first
-}
-
-// TODO: [perf] Ensure bounds are updated as keys are dereferenced.
-/// Pointer to a sealed segment + fast-prune info (all LOGICAL).
-#[derive(Debug, Clone, Encode, Decode)]
-pub struct IndexSegmentRef {
-    /// Physical key of the *index segment* blob.
-    pub index_physical_key: PhysicalKey,
-    pub data_physical_key: PhysicalKey,
-
-    /// Quick span prune (LOGICAL key bytes).
-    pub logical_key_min: LogicalKeyBytes,
-    pub logical_key_max: LogicalKeyBytes,
-
-    pub value_min: Option<ValueBound>,
-    pub value_max: Option<ValueBound>,
-
-    /// Number of entries in that segment (helps pre-alloc).
-    pub n_entries: IndexEntryCount,
-}
-
-// ── Your locked index segment & value layout ─────────────────────────────────
-/// One sealed batch. Describes how to fetch values from the *data* blob.
-/// The *data* blob contains only raw value bytes — no headers/markers.
-///
-/// This index stores:
-///   - the *physical* key of the data blob,
-///   - the *logical* keys (sorted, compact; either fixed-width or with offsets),
-///   - the value layout (fixed width or var-width offsets).
-#[derive(Debug, Clone, Encode, Decode)]
-pub struct IndexSegment {
-    /// Where the values live (physical KV key).
-    pub data_physical_key: PhysicalKey,
-
-    /// Number of entries.
-    pub n_entries: IndexEntryCount,
-
-    /// Sorted *logical* keys, stored compactly (see `key_layout`).
-    pub logical_key_bytes: Vec<u8>,
-    pub key_layout: KeyLayout,
-
-    /// How to slice the *data* blob for the i-th value.
-    pub value_layout: ValueLayout,
-}
-
-impl IndexSegment {
-    pub fn build_fixed(
-        data_pkey: PhysicalKey,
-        logical_keys: Vec<Vec<u8>>,
-        width: ByteWidth,
-    ) -> IndexSegment {
-        let n = logical_keys.len() as IndexEntryCount;
-        let (logical_key_bytes, key_layout) = KeyLayout::pack_keys_with_layout(logical_keys);
-        IndexSegment {
-            data_physical_key: data_pkey,
-            n_entries: n,
-            logical_key_bytes,
-            key_layout,
-            value_layout: ValueLayout::FixedWidth { width },
-        }
-    }
-
-    pub fn build_var(
-        data_pkey: PhysicalKey,
-        logical_keys: Vec<Vec<u8>>,
-        value_sizes: &[ByteLen], // one per entry
-    ) -> IndexSegment {
-        assert_eq!(logical_keys.len(), value_sizes.len());
-        let n = logical_keys.len() as IndexEntryCount;
-        let (logical_key_bytes, key_layout) = KeyLayout::pack_keys_with_layout(logical_keys);
-
-        let mut value_offsets = Vec::with_capacity(value_sizes.len() + 1);
-        let mut acc = 0u32;
-        value_offsets.push(acc);
-        for &sz in value_sizes {
-            acc += sz;
-            value_offsets.push(acc);
-        }
-
-        IndexSegment {
-            data_physical_key: data_pkey,
-            n_entries: n,
-            logical_key_bytes,
-            key_layout,
-            value_layout: ValueLayout::Variable {
-                value_offsets: value_offsets
-                    .into_iter()
-                    .map(|v| v as IndexEntryCount)
-                    .collect(),
-            },
-        }
-    }
+    pub segments: Vec<index_segment::IndexSegmentRef>, // newest-first
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codecs::big_endian::u64_be_vec;
     use crate::constants::BOOTSTRAP_PKEY;
+    use crate::layout::{KeyLayout, ValueLayout};
     use crate::storage::pager::{BatchGet, BatchPut, GetResult, MemPager, Pager};
-    use crate::types::{TypedKind, TypedValue};
+    use crate::types::{PhysicalKey, TypedKind, TypedValue};
 
     // ---------------- helpers to build/slice logical keys ----------------
 
     // TODO: Extract
     // Generic function (not a closure) to avoid HRTB/lifetime clash.
-    fn prune<'a>(refs: &'a [IndexSegmentRef], probe: &[u8]) -> Vec<&'a IndexSegmentRef> {
+    fn prune<'a>(
+        refs: &'a [index_segment::IndexSegmentRef],
+        probe: &[u8],
+    ) -> Vec<&'a index_segment::IndexSegmentRef> {
         refs.iter()
             .filter(|r| {
                 r.logical_key_min.as_slice() <= probe && probe <= r.logical_key_max.as_slice()
@@ -206,12 +87,12 @@ mod tests {
         let manifest_pkey = ids[6];
 
         // ----- build two segments for columns 100 and 200 -----
-        let keys_100 = vec![b"a".to_vec(), b"b".to_vec(), b"d".to_vec()];
-        let seg_100 = IndexSegment::build_fixed(data_100, keys_100.clone(), 1);
+        let keys_100 = &[b"a".to_vec(), b"b".to_vec(), b"d".to_vec()];
+        let seg_100 = IndexSegment::build_fixed(data_100, keys_100, 1);
 
-        let animals = vec![b"ant".to_vec(), b"wolf".to_vec(), b"zebra".to_vec()];
+        let animals = &[b"ant".to_vec(), b"wolf".to_vec(), b"zebra".to_vec()];
         let sizes: Vec<u32> = vec![5, 2, 8]; // arbitrary payload lengths
-        let seg_200 = IndexSegment::build_var(data_200, animals.clone(), &sizes);
+        let seg_200 = IndexSegment::build_var(data_200, animals, &sizes);
 
         // store index segments (one batch)
         kv.batch_put(&[
@@ -439,15 +320,12 @@ mod tests {
 
         // One column with three sealed segments, newest-first.
         // Ranges: ["aa".."am"], ["b".."c"], ["wolf".."zebra"]
-        let seg_a = IndexSegment::build_fixed(
-            data_a,
-            vec![b"aa".to_vec(), b"al".to_vec(), b"am".to_vec()],
-            4,
-        );
-        let seg_b = IndexSegment::build_fixed(data_b, vec![b"b".to_vec(), b"c".to_vec()], 2);
+        let seg_a =
+            IndexSegment::build_fixed(data_a, &[b"aa".to_vec(), b"al".to_vec(), b"am".to_vec()], 4);
+        let seg_b = IndexSegment::build_fixed(data_b, &[b"b".to_vec(), b"c".to_vec()], 2);
         let seg_c = IndexSegment::build_var(
             data_c,
-            vec![b"wolf".to_vec(), b"yak".to_vec(), b"zebra".to_vec()],
+            &[b"wolf".to_vec(), b"yak".to_vec(), b"zebra".to_vec()],
             &[7, 3, 9],
         );
 
@@ -556,7 +434,7 @@ mod tests {
         // Fixed width = 8 → ranges are [i*8 .. (i+1)*8)
         let seg_fixed = IndexSegment::build_fixed(
             data_key,
-            vec![
+            &[
                 b"k1".to_vec(),
                 b"k2".to_vec(),
                 b"k3".to_vec(),
@@ -579,7 +457,7 @@ mod tests {
         // Variable layout: explicit prefix sums
         let seg_var = IndexSegment::build_var(
             data_key,
-            vec![b"a".to_vec(), b"aa".to_vec(), b"aaa".to_vec()],
+            &[b"a".to_vec(), b"aa".to_vec(), b"aaa".to_vec()],
             &[3, 1, 9],
         );
         match seg_var.value_layout {
@@ -611,12 +489,8 @@ mod tests {
     #[test]
     fn min_max_fixed_width_keys() {
         // three 8-byte big-endian u64 keys: 1, 5, 9
-        let keys = vec![
-            1u64.to_be_bytes().to_vec(),
-            9u64.to_be_bytes().to_vec(),
-            5u64.to_be_bytes().to_vec(),
-        ];
-        let seg = IndexSegment::build_fixed(123, keys, 4 /* any width for values */);
+        let keys = vec![u64_be_vec(1), u64_be_vec(9), u64_be_vec(5)];
+        let seg = IndexSegment::build_fixed(123, &keys, 4 /* any width for values */);
 
         // bounds must be inclusive and lexicographic — derive by slicing first/last
         let first = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);
@@ -625,8 +499,8 @@ mod tests {
             &seg.key_layout,
             seg.n_entries as usize - 1,
         );
-        assert_eq!(first, &1u64.to_be_bytes()[..]);
-        assert_eq!(last, &9u64.to_be_bytes()[..]);
+        assert_eq!(first, &u64_be_vec(1)[..]);
+        assert_eq!(last, &u64_be_vec(9)[..]);
 
         // layout must be FixedWidth for keys too (since all keys same length)
         match seg.key_layout {
@@ -648,7 +522,7 @@ mod tests {
             b"ant".to_vec(),
         ];
         let sizes = vec![1u32; keys.len()]; // dummy value sizes
-        let seg = IndexSegment::build_var(777, keys, &sizes);
+        let seg = IndexSegment::build_var(777, &keys, &sizes);
 
         // derive lexicographic min/max by slicing packed keys
         let first = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);

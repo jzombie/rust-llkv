@@ -12,15 +12,14 @@
 //! “cells” = number of (key,value) entries written, i.e., len(items) per column.
 
 use llkv_column_map::{
-    AppendOptions, ColumnStore, Put, ValueMode, storage::pager::MemPager, types::BlobLike,
-    types::LogicalFieldId, views::ValueSlice,
+    ColumnStore,
+    codecs::big_endian::u64_be_vec,
+    storage::pager::MemPager,
+    types::{AppendOptions, BlobLike, LogicalFieldId, Put, ValueMode},
+    views::ValueSlice,
 };
 
 // -------- simple key/value generators ---------------------------------------
-
-fn be_key(v: u64) -> Vec<u8> {
-    v.to_be_bytes().to_vec()
-}
 
 fn fixed_value(row: u64, field: u32, width: usize) -> Vec<u8> {
     // Stable 8-byte seed then repeat/truncate to requested width
@@ -37,15 +36,21 @@ fn fixed_value(row: u64, field: u32, width: usize) -> Vec<u8> {
     }
 }
 
-fn build_put_fixed(field_id: LogicalFieldId, start: u64, end: u64, width: usize) -> Put {
+fn build_put_fixed(field_id: LogicalFieldId, start: u64, end: u64, width: usize) -> Put<'static> {
     let mut items = Vec::with_capacity((end - start) as usize);
     for r in start..end {
-        items.push((be_key(r), fixed_value(r, field_id, width)));
+        items.push((u64_be_vec(r).into(), fixed_value(r, field_id, width).into()));
     }
     Put { field_id, items }
 }
 
-fn build_put_var(field_id: LogicalFieldId, start: u64, end: u64, min: usize, max: usize) -> Put {
+fn build_put_var(
+    field_id: LogicalFieldId,
+    start: u64,
+    end: u64,
+    min: usize,
+    max: usize,
+) -> Put<'static> {
     let mut items = Vec::with_capacity((end - start) as usize);
     for r in start..end {
         // pseudo-var length that depends on (row, field)
@@ -56,13 +61,14 @@ fn build_put_var(field_id: LogicalFieldId, start: u64, end: u64, min: usize, max
             .rotate_left(13);
         let len = (min as u64 + (mix % span)) as usize;
         let byte = (((r as u32).wrapping_add(field_id)) & 0xFF) as u8;
-        items.push((be_key(r), vec![byte; len]));
+        items.push((u64_be_vec(r).into(), vec![byte; len].into()));
     }
     Put { field_id, items }
 }
 
 // -------- I/O metric helpers (compute per-phase delta locally) ---------------
 
+// TODO: Use `IoStats` directly?
 #[derive(Clone, Copy, Default)]
 struct Counts {
     batches: u64,
@@ -298,9 +304,9 @@ fn main() {
         let put_100 = Put {
             field_id: 100,
             items: vec![
-                (be_key(5), fixed_value(5, 100, 8)),
-                (be_key(7), fixed_value(7, 100, 8)),
-                (be_key(9), fixed_value(9, 100, 8)),
+                (u64_be_vec(5).into(), fixed_value(5, 100, 8).into()),
+                (u64_be_vec(7).into(), fixed_value(7, 100, 8).into()),
+                (u64_be_vec(9).into(), fixed_value(9, 100, 8).into()),
             ],
         };
         // Brand-new variable-width col 999: write 10 keys [1000..1010).
@@ -321,10 +327,19 @@ fn main() {
     // ---------------- Phase 5: multi-column read + describe ------------------
     {
         let queries = vec![
-            (100, vec![be_key(5), be_key(7), be_key(9), be_key(255)]), // col 100 has 10k rows → all HIT 8B
-            (200, vec![be_key(1), be_key(2), be_key(3)]),              // var
-            (201, vec![be_key(123), be_key(456), be_key(9_999)]),      // var
-            (999, vec![be_key(1_003), be_key(1_005), be_key(1_007)]), // var; all HIT (we wrote [1000..1010))
+            (
+                100,
+                vec![u64_be_vec(5), u64_be_vec(7), u64_be_vec(9), u64_be_vec(255)],
+            ), // col 100 has 10k rows → all HIT 8B
+            (200, vec![u64_be_vec(1), u64_be_vec(2), u64_be_vec(3)]), // var
+            (
+                201,
+                vec![u64_be_vec(123), u64_be_vec(456), u64_be_vec(9_999)],
+            ), // var
+            (
+                999,
+                vec![u64_be_vec(1_003), u64_be_vec(1_005), u64_be_vec(1_007)],
+            ), // var; all HIT (we wrote [1000..1010))
         ];
         let results = store.get_many(queries.iter().map(|(fid, ks)| (*fid, ks.clone())).collect());
         print_read_report("Read report (get_many)", &queries, &results);

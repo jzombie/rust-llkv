@@ -1,0 +1,708 @@
+// High-level append/query API on top of pager + index modules.
+use crate::column_index::{Bootstrap, ColumnIndex, IndexSegment, Manifest};
+use crate::layout::{IndexLayoutInfo, KeyLayout, ValueLayout};
+use crate::storage::{
+    StorageKind, StorageNode,
+    pager::{BatchGet, BatchPut, GetResult, Pager},
+};
+use crate::types::{ByteOffset, ByteWidth, LogicalFieldId, PhysicalKey, TypedKind, TypedValue};
+use rustc_hash::FxHashMap;
+use std::fmt::Write;
+use std::sync::{
+    RwLock,
+    atomic::{AtomicUsize, Ordering},
+};
+pub mod introspect;
+pub mod metrics;
+pub mod read;
+pub mod write;
+
+pub struct ColumnStore<'p, P: Pager> {
+    pager: &'p P,
+    bootstrap_key: PhysicalKey,
+    manifest_key: PhysicalKey,
+    // Interior mutability for concurrent reads/writes.
+    manifest: RwLock<Manifest>,
+    // field_id -> (column_index_pkey, decoded)
+    colindex_cache: RwLock<FxHashMap<LogicalFieldId, (PhysicalKey, ColumnIndex)>>,
+    // pager-hit metrics (counts only) via atomics
+    io_batches: AtomicUsize,
+    io_get_raw_ops: AtomicUsize,
+    io_get_typed_ops: AtomicUsize,
+    io_put_raw_ops: AtomicUsize,
+    io_put_typed_ops: AtomicUsize,
+    io_free_ops: AtomicUsize,
+}
+
+impl<'p, P: Pager> ColumnStore<'p, P> {
+    // Helper to route batch PUTs through here to bump metrics in one place.
+    fn do_puts(&self, puts: Vec<BatchPut>) {
+        if puts.is_empty() {
+            return;
+        }
+        // update counters before the call
+        self.io_batches.fetch_add(1, Ordering::Relaxed);
+        for p in &puts {
+            match p {
+                BatchPut::Raw { .. } => {
+                    self.io_put_raw_ops.fetch_add(1, Ordering::Relaxed);
+                }
+                BatchPut::Typed { .. } => {
+                    self.io_put_typed_ops.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        // ignore IO errors here for brevity, mirroring previous behavior
+        let _ = self.pager.batch_put(&puts);
+    }
+
+    // Helper to route batch GETs through here to bump metrics in one place.
+    fn do_gets(&self, gets: Vec<BatchGet>) -> Vec<GetResult<P::Blob>> {
+        if gets.is_empty() {
+            return Vec::new();
+        }
+        self.io_batches.fetch_add(1, Ordering::Relaxed);
+        for g in &gets {
+            match g {
+                BatchGet::Raw { .. } => {
+                    self.io_get_raw_ops.fetch_add(1, Ordering::Relaxed);
+                }
+                BatchGet::Typed { .. } => {
+                    self.io_get_typed_ops.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        self.pager.batch_get(&gets).unwrap_or_default()
+    }
+
+    // TODO: Implement with GC
+    // Helper to route batch Frees through here to bump metrics in one place.
+    // fn do_frees(&self, keys: &[PhysicalKey]) {
+    //     if keys.is_empty() {
+    //         return;
+    //     }
+    //     self.io_batches.fetch_add(1, Ordering::Relaxed);
+    //     self.io_free_ops.fetch_add(keys.len(), Ordering::Relaxed);
+    //     let _ = self.pager.free_many(keys);
+    // }
+
+    /// Access current metrics (counts of batch/ops).
+    pub fn io_stats(&self) -> metrics::IoStats {
+        metrics::IoStats {
+            batches: self.io_batches.load(Ordering::Relaxed),
+            get_raw_ops: self.io_get_raw_ops.load(Ordering::Relaxed),
+            get_typed_ops: self.io_get_typed_ops.load(Ordering::Relaxed),
+            put_raw_ops: self.io_put_raw_ops.load(Ordering::Relaxed),
+            put_typed_ops: self.io_put_typed_ops.load(Ordering::Relaxed),
+            free_ops: self.io_free_ops.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset metrics to zero.
+    pub fn reset_io_stats(&self) {
+        self.io_batches.store(0, Ordering::Relaxed);
+        self.io_get_raw_ops.store(0, Ordering::Relaxed);
+        self.io_get_typed_ops.store(0, Ordering::Relaxed);
+        self.io_put_raw_ops.store(0, Ordering::Relaxed);
+        self.io_put_typed_ops.store(0, Ordering::Relaxed);
+        self.io_free_ops.store(0, Ordering::Relaxed);
+    }
+
+    // Create fresh store (bootstrap->manifest, empty manifest).
+    pub fn init_empty(pager: &'p P) -> Self {
+        let bootstrap_key: PhysicalKey = 0;
+        let manifest_key = pager.alloc_many(1).unwrap()[0];
+        let manifest = Manifest {
+            columns: Vec::new(),
+        };
+
+        // Write Manifest and Bootstrap in a single batch.
+        // (Not counted in ColumnStore metrics since the store isn't constructed yet.)
+        let _ = pager.batch_put(&[
+            BatchPut::Typed {
+                key: manifest_key,
+                value: TypedValue::Manifest(manifest.clone()),
+            },
+            BatchPut::Typed {
+                key: bootstrap_key,
+                value: TypedValue::Bootstrap(Bootstrap {
+                    manifest_physical_key: manifest_key,
+                }),
+            },
+        ]);
+
+        ColumnStore {
+            pager,
+            bootstrap_key,
+            manifest_key,
+            manifest: RwLock::new(manifest),
+            colindex_cache: RwLock::new(FxHashMap::with_hasher(Default::default())),
+            io_batches: AtomicUsize::new(0),
+            io_get_raw_ops: AtomicUsize::new(0),
+            io_get_typed_ops: AtomicUsize::new(0),
+            io_put_raw_ops: AtomicUsize::new(0),
+            io_put_typed_ops: AtomicUsize::new(0),
+            io_free_ops: AtomicUsize::new(0),
+        }
+    }
+
+    // Open existing store (bootstrap(0) -> manifest).
+    pub fn open(pager: &'p P) -> Self {
+        let bootstrap_key: PhysicalKey = 0;
+
+        // Get Bootstrap (not counted; ColumnStore not constructed yet)
+        let resp = pager
+            .batch_get(&[BatchGet::Typed {
+                key: bootstrap_key,
+                kind: TypedKind::Bootstrap,
+            }])
+            .unwrap_or_default();
+        let boot = match &resp[0] {
+            GetResult::Typed {
+                value: TypedValue::Bootstrap(b),
+                ..
+            } => b.clone(),
+            _ => panic!("missing bootstrap at key 0"),
+        };
+        let manifest_key = boot.manifest_physical_key;
+
+        // Get Manifest (not counted; ColumnStore not constructed yet)
+        let resp = pager
+            .batch_get(&[BatchGet::Typed {
+                key: manifest_key,
+                kind: TypedKind::Manifest,
+            }])
+            .unwrap_or_default();
+        let manifest = match &resp[0] {
+            GetResult::Typed {
+                value: TypedValue::Manifest(m),
+                ..
+            } => m.clone(),
+            _ => panic!("missing manifest"),
+        };
+
+        ColumnStore {
+            pager,
+            bootstrap_key,
+            manifest_key,
+            manifest: RwLock::new(manifest),
+            colindex_cache: RwLock::new(FxHashMap::with_hasher(Default::default())),
+            io_batches: AtomicUsize::new(0),
+            io_get_raw_ops: AtomicUsize::new(0),
+            io_get_typed_ops: AtomicUsize::new(0),
+            io_put_raw_ops: AtomicUsize::new(0),
+            io_put_typed_ops: AtomicUsize::new(0),
+            io_free_ops: AtomicUsize::new(0),
+        }
+    }
+}
+
+// ----------------------------- tests -----------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Use the unified in-memory pager from the pager module.
+    use crate::bounds::ValueBound;
+    use crate::codecs::big_endian::{u64_be_array, u64_be_vec};
+    use crate::column_index::IndexSegmentRef;
+    use crate::storage::pager::MemPager;
+    use crate::types::{AppendOptions, Put, ValueMode};
+    use std::borrow::Cow;
+
+    #[test]
+    fn put_get_fixed_auto() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+
+        let put = Put {
+            field_id: 10,
+            items: vec![
+                (b"k3".into(), b"VVVVVVV3".into()),
+                (b"k1".into(), b"VVVVVVV1".into()),
+                (b"k2".into(), b"VVVVVVV2".into()),
+                // duplicate key, last wins
+                (b"k1".into(), b"NEWVVVV1".into()),
+            ],
+        };
+
+        store.append_many(vec![put], AppendOptions::default());
+
+        // batch get across columns (here only field 10)
+        let got = store.get_many(vec![(10, vec![b"k1".into(), b"k2".into(), b"kX".into()])]);
+
+        // got[0] corresponds to field 10's query vector
+        assert_eq!(got[0][0].as_deref().unwrap(), b"NEWVVVV1");
+        assert_eq!(got[0][1].as_deref().unwrap(), b"VVVVVVV2");
+        assert!(got[0][2].is_none());
+
+        // sanity: we should have issued at least one batch (append + get)
+        let stats = store.io_stats();
+        assert!(stats.batches >= 2);
+        assert!(stats.put_raw_ops > 0 || stats.put_typed_ops > 0);
+        assert!(stats.get_raw_ops > 0 || stats.get_typed_ops > 0);
+    }
+
+    #[test]
+    fn put_get_variable_auto_with_chunking() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+
+        // Values of different sizes force variable layout.
+        let mut items = Vec::new();
+        for i in 0..1000u32 {
+            let k = format!("key{:04}", i).into_bytes().into();
+            let v = vec![b'A' + (i % 26) as u8; (i % 17 + 1) as usize].into(); // 1..17
+            items.push((k, v));
+        }
+
+        let opts = AppendOptions {
+            mode: ValueMode::Auto,
+            segment_max_entries: 200, // small to force multiple segments
+            segment_max_bytes: 2_000, // also keep segments small
+            last_write_wins_in_batch: true,
+        };
+
+        store.append_many(
+            vec![Put {
+                field_id: 77,
+                items,
+            }],
+            opts,
+        );
+
+        // spot-check a few keys
+        let q = vec![
+            b"key0000".to_vec(),
+            b"key0001".to_vec(),
+            b"key0199".to_vec(),
+            b"key0200".to_vec(),
+            b"key0999".to_vec(),
+            b"nope".to_vec(),
+        ];
+
+        store.reset_io_stats(); // isolate the get path
+        let got = store.get_many(vec![(77, q.clone())]);
+
+        // recompute expected lengths
+        let expect_len = |s: &str| -> usize {
+            let i: ByteWidth = s[3..].parse().unwrap();
+            (i % 17 + 1) as usize
+        };
+
+        assert_eq!(got[0][0].as_deref().unwrap().len(), expect_len("key0000"));
+        assert_eq!(got[0][1].as_deref().unwrap().len(), expect_len("key0001"));
+        assert_eq!(got[0][2].as_deref().unwrap().len(), expect_len("key0199"));
+        assert_eq!(got[0][3].as_deref().unwrap().len(), expect_len("key0200"));
+        assert_eq!(got[0][4].as_deref().unwrap().len(), expect_len("key0999"));
+        assert!(got[0][5].is_none());
+
+        // sanity: get_many should have exactly 1 batch for segments+data,
+        // plus 0 or 1 for initial ColumnIndex fills (depending on cache)
+        let s = store.io_stats();
+        assert!(s.batches >= 1);
+        assert!(s.get_raw_ops > 0 || s.get_typed_ops > 0);
+    }
+
+    #[test]
+    fn force_fixed_validation() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let items = vec![
+            (b"a".into(), vec![1u8; 4].into()),
+            (b"b".into(), vec![2u8; 4].into()),
+            (b"c".into(), vec![3u8; 4].into()),
+        ];
+        let opts = AppendOptions {
+            mode: ValueMode::ForceFixed(4),
+            ..Default::default()
+        };
+        store.append_many(vec![Put { field_id: 5, items }], opts);
+
+        let got = store.get_many(vec![(5, vec![b"a".to_vec(), b"b".to_vec(), b"z".to_vec()])]);
+
+        assert_eq!(got[0][0].as_deref().unwrap(), &[1u8; 4]);
+        assert_eq!(got[0][1].as_deref().unwrap(), &[2u8; 4]);
+        assert!(got[0][2].is_none());
+    }
+    #[test]
+    fn last_write_wins_true_dedups_within_batch() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+
+        // Three items, with a duplicate for key "k": last is "ZZ".
+        let fid = 42;
+        let put = Put {
+            field_id: fid,
+            items: vec![
+                (b"k".into(), b"AA".into()),
+                (b"x".into(), b"BB".into()),
+                (b"k".into(), b"ZZ".into()),
+            ],
+        };
+
+        let opts = AppendOptions {
+            mode: ValueMode::ForceFixed(2), // keep sizes simple
+            segment_max_entries: 1024,      // ensure a single segment
+            last_write_wins_in_batch: true, // <- dedup ON
+            ..Default::default()
+        };
+
+        store.append_many(vec![put], opts);
+
+        // Read back the two keys we wrote; "k" should be the LAST value ("ZZ").
+        let got = store.get_many(vec![(fid, vec![b"k".into(), b"x".into()])]);
+        assert_eq!(got[0][0].as_deref().unwrap(), b"ZZ");
+        assert_eq!(got[0][1].as_deref().unwrap(), b"BB");
+
+        // Verify the segment entry count reflects deduplication (2 items).
+        let total_entries_for_fid: usize = store
+            .describe_storage()
+            .into_iter()
+            .map(|n| match n.kind {
+                StorageKind::IndexSegment {
+                    field_id,
+                    n_entries,
+                    ..
+                } if field_id == fid => n_entries as usize,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(total_entries_for_fid, 2);
+    }
+
+    #[test]
+    fn last_write_wins_false_keeps_dups_within_batch() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+
+        // Same three items; duplicates for "k" are KEPT.
+        let fid = 43;
+        let put = Put {
+            field_id: fid,
+            items: vec![
+                (b"k".into(), b"AA".into()),
+                (b"x".into(), b"BB".into()),
+                (b"k".into(), b"ZZ".into()),
+            ],
+        };
+
+        let opts = AppendOptions {
+            mode: ValueMode::ForceFixed(2),
+            segment_max_entries: 1024,
+            last_write_wins_in_batch: false, // <- dedup OFF
+            ..Default::default()
+        };
+
+        store.append_many(vec![put], opts);
+
+        // Reads for "k" will return one of the duplicate values.
+        // (Order among equal keys after sort is not guaranteed.)
+        let got = store.get_many(vec![(fid, vec![b"k".into(), b"x".into()])]);
+        let v_k = got[0][0].as_deref().unwrap();
+        assert!(
+            v_k == b"AA" || v_k == b"ZZ",
+            "expected one of the duplicate values, got {:?}",
+            v_k
+        );
+        assert_eq!(got[0][1].as_deref().unwrap(), b"BB");
+
+        // Verify the segment entry count reflects the duplicates (3 items).
+        let total_entries_for_fid: usize = store
+            .describe_storage()
+            .into_iter()
+            .map(|n| match n.kind {
+                StorageKind::IndexSegment {
+                    field_id,
+                    n_entries,
+                    ..
+                } if field_id == fid => n_entries as usize,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(total_entries_for_fid, 3);
+    }
+
+    #[test]
+    fn key_based_segment_pruning_uses_min_max_and_is_inclusive() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 1234;
+
+        // Two disjoint segments for same column:
+        //   seg A covers [0..100)      (keys 0..99)
+        //   seg B covers [200..300)    (keys 200..299)
+        // Make values fixed 4B to keep things simple.
+
+        // Build segment A
+        let items_a = {
+            const BB4: &[u8] = &[0xAA, 0, 0, 0];
+            (0u64..100u64)
+                .map(|k| (Cow::Owned(u64_be_array(k).to_vec()), Cow::Borrowed(BB4)))
+                .collect()
+        };
+
+        store.append_many(
+            vec![Put {
+                field_id: fid,
+                items: items_a,
+            }],
+            AppendOptions {
+                mode: ValueMode::ForceFixed(4),
+                segment_max_entries: 10_000,
+                segment_max_bytes: 1_000_000,
+                last_write_wins_in_batch: true,
+            },
+        );
+
+        // Build segment B (newest)
+
+        let items_b = {
+            const BB4: &[u8] = &[0xBB, 0, 0, 0];
+            (200u64..300u64)
+                .map(|k| (Cow::Owned(u64_be_array(k).to_vec()), Cow::Borrowed(BB4)))
+                .collect()
+        };
+
+        store.append_many(
+            vec![Put {
+                field_id: fid,
+                items: items_b,
+            }],
+            AppendOptions {
+                mode: ValueMode::ForceFixed(4),
+                segment_max_entries: 10_000,
+                segment_max_bytes: 1_000_000,
+                last_write_wins_in_batch: true,
+            },
+        );
+
+        // ------------- Query hits ONLY seg B ----------------
+        store.reset_io_stats();
+        let got = store.get_many(vec![(fid, vec![u64_be_vec(250)])]);
+        assert_eq!(got[0][0].as_deref().unwrap(), &[0xBB, 0, 0, 0]);
+
+        // Because of pruning, we should fetch exactly 1 IndexSegment (typed) and 1 data blob (raw)
+        let s = store.io_stats();
+        assert_eq!(
+            s.get_typed_ops, 1,
+            "should load only the matching index segment"
+        );
+        assert_eq!(s.get_raw_ops, 1, "should load only one data blob");
+
+        // ------------- Inclusivity: min & max are hits -------
+        store.reset_io_stats();
+        let got = store.get_many(vec![(fid, vec![u64_be_vec(200), u64_be_vec(299)])]);
+        assert_eq!(got[0][0].as_deref().unwrap(), &[0xBB, 0, 0, 0]); // min
+        assert_eq!(got[0][1].as_deref().unwrap(), &[0xBB, 0, 0, 0]); // max
+        let s = store.io_stats();
+        assert_eq!(s.get_typed_ops, 1);
+        assert_eq!(s.get_raw_ops, 1);
+
+        // ------------- Query hits ONLY seg A ----------------
+        store.reset_io_stats();
+        let got = store.get_many(vec![(fid, vec![u64_be_vec(5)])]);
+        assert_eq!(got[0][0].as_deref().unwrap(), &[0xAA, 0, 0, 0]);
+        let s = store.io_stats();
+        assert_eq!(s.get_typed_ops, 1);
+        assert_eq!(s.get_raw_ops, 1);
+    }
+
+    #[test]
+    fn value_min_max_recorded_fixed() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 5050;
+
+        // fixed 4B values with easy min/max
+        let items = vec![
+            (b"k1".into(), vec![9, 9, 9, 9].into()),
+            (b"k2".into(), vec![0, 0, 0, 0].into()), // min
+            (b"k3".into(), vec![255, 255, 255, 1].into()), // max (lexicographic)
+        ];
+
+        store.append_many(
+            vec![Put {
+                field_id: fid,
+                items,
+            }],
+            AppendOptions {
+                mode: ValueMode::ForceFixed(4),
+                ..Default::default()
+            },
+        );
+
+        // Clone the newest ref while the lock is held
+        let sref: IndexSegmentRef = {
+            let ci = store.colindex_cache.read().unwrap();
+            let (_pk, colidx) = ci.get(&fid).expect("colindex");
+            colidx.segments[0].clone()
+        };
+
+        assert_eq!(sref.value_min, Some(ValueBound::from_bytes(&[0, 0, 0, 0])));
+        assert_eq!(
+            sref.value_max,
+            Some(ValueBound::from_bytes(&[255, 255, 255, 1]))
+        );
+    }
+
+    #[test]
+    fn value_min_max_recorded_variable() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 6060;
+
+        // variable-length values; lexicographic min/max over raw bytes
+        let items = vec![
+            (b"a".into(), b"wolf".into()),
+            (b"b".into(), b"ant".into()), // min ("ant" < "wolf" < "zebra")
+            (b"c".into(), b"zebra".into()), // max
+        ];
+
+        store.append_many(
+            vec![Put {
+                field_id: fid,
+                items,
+            }],
+            AppendOptions {
+                mode: ValueMode::ForceVariable,
+                ..Default::default()
+            },
+        );
+
+        // Clone the newest ref while the lock is held
+        let sref: IndexSegmentRef = {
+            let ci = store.colindex_cache.read().unwrap();
+            let (_pk, colidx) = ci.get(&fid).expect("colindex");
+            colidx.segments[0].clone()
+        };
+
+        assert_eq!(sref.value_min, Some(ValueBound::from_bytes(b"ant")));
+        assert_eq!(sref.value_max, Some(ValueBound::from_bytes(b"zebra")));
+    }
+
+    #[test]
+    fn value_bounds_do_not_duplicate_huge_value() {
+        use crate::constants::VALUE_BOUND_MAX;
+
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 7070;
+
+        // Single huge value (1 MiB)
+        let huge = vec![42u8; 1_048_576];
+        store.append_many(
+            vec![Put {
+                field_id: fid,
+                items: vec![(b"k".into(), huge.into())],
+            }],
+            AppendOptions {
+                mode: ValueMode::ForceVariable,
+                segment_max_entries: 1_000_000,
+                segment_max_bytes: usize::MAX,
+                last_write_wins_in_batch: true,
+            },
+        );
+
+        // Take ownership of the newest ref and seg pk while locked
+        let (seg_pk, sref): (PhysicalKey, IndexSegmentRef) = {
+            let ci = store.colindex_cache.read().unwrap();
+            let (_pk, colidx) = ci.get(&fid).expect("colindex");
+            let sref = colidx.segments[0].clone();
+            (sref.index_physical_key, sref)
+        };
+
+        // both min and max are the same single huge value
+        let vmin = sref.value_min.as_ref().expect("value_min");
+        let vmax = sref.value_max.as_ref().expect("value_max");
+
+        assert_eq!(vmin.total_len, 1_048_576);
+        assert_eq!(vmax.total_len, 1_048_576);
+        assert!(vmin.is_truncated());
+        assert!(vmax.is_truncated());
+        assert_eq!(vmin.prefix.len(), VALUE_BOUND_MAX);
+        assert_eq!(vmax.prefix.len(), VALUE_BOUND_MAX);
+        assert_eq!(vmin.prefix, vmax.prefix);
+
+        // prove the index-segment blob on disk is tiny vs the 1 MiB data blob
+        let nodes = store.describe_storage();
+        let seg_node_size = nodes
+            .into_iter()
+            .find(|n| n.pk == seg_pk)
+            .expect("segment node")
+            .stored_len;
+
+        assert!(
+            seg_node_size < 32 * 1024,
+            "segment blob unexpectedly large: {}",
+            seg_node_size
+        );
+    }
+
+    #[test]
+    fn delete_many_and_get() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 101;
+
+        // 1. Write some initial data
+        let put = Put {
+            field_id: fid,
+            items: vec![
+                (b"k1".into(), b"val1".into()),
+                (b"k2".into(), b"val2".into()),
+                (b"k3".into(), b"val3".into()),
+            ],
+        };
+        store.append_many(vec![put], AppendOptions::default());
+
+        // 2. Verify initial data
+        let got1 = store.get_many(vec![(
+            fid,
+            vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()],
+        )]);
+        assert_eq!(got1[0][0].as_deref().unwrap(), b"val1");
+        assert_eq!(got1[0][1].as_deref().unwrap(), b"val2");
+        assert_eq!(got1[0][2].as_deref().unwrap(), b"val3");
+
+        // 3. Delete k2 and a non-existent key k4
+        store.delete_many(vec![(fid, vec![b"k2".to_vec(), b"k4".to_vec()])]);
+
+        // 4. Verify deletion
+        // NOTE: This test will FAIL until get_many is updated to handle tombstones.
+        // The current implementation of get_many does not check for tombstone segments
+        // (segments with value width 0) and will still find the old data.
+        let got2 = store.get_many(vec![(
+            fid,
+            vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()],
+        )]);
+        assert_eq!(
+            got2[0][0].as_deref().unwrap(),
+            b"val1",
+            "k1 should still exist"
+        );
+        assert!(got2[0][1].is_none(), "k2 should be deleted");
+        assert_eq!(
+            got2[0][2].as_deref().unwrap(),
+            b"val3",
+            "k3 should still exist"
+        );
+
+        // 5. Appending a new value for k2 should bring it back
+        let put2 = Put {
+            field_id: fid,
+            items: vec![(b"k2".into(), b"new_val2".into())],
+        };
+        store.append_many(vec![put2], AppendOptions::default());
+
+        let got3 = store.get_many(vec![(fid, vec![b"k1".to_vec(), b"k2".to_vec()])]);
+        assert_eq!(got3[0][0].as_deref().unwrap(), b"val1");
+        assert_eq!(
+            got3[0][1].as_deref().unwrap(),
+            b"new_val2",
+            "k2 should have new value"
+        );
+    }
+}
