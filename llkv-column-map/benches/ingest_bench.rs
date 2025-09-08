@@ -13,9 +13,9 @@
 //! - Generates **150,000 rows** and ingests them through `ColumnStore::append_many`,
 //!   using two batching patterns, each as a separate Criterion benchmark group:
 //! 1. **`bench_ingest_by_batches`**: sweep the **number of batches** (e.g., 1, 2, 5, 10, …).
-//! More batches ⇒ smaller per-append chunk size.
-//!   2. **`bench_ingest_by_rows_per_batch`**: sweep the **rows per batch** directly
-//! (e.g., 150k, 75k, 50k, …).
+//!    More batches ⇒ smaller per-append chunk size.
+//! 2. **`bench_ingest_by_rows_per_batch`**: sweep the **rows per batch** directly
+//!    (e.g., 150k, 75k, 50k, …).
 //!
 //! **Why two patterns?** //! They provide the same control from two angles: *“how many appends?”* vs
 //! *“how big is each append?”*. Both reveal how your segment thresholds and pager usage
@@ -24,9 +24,9 @@
 //! **How it measures** //! - Each benchmark creates a fresh in-memory `MemPager` and `ColumnStore`.
 //! - It runs one or more `append_many` calls until all 150k rows × 21 columns are ingested.
 //! - We call `store.describe_storage()` at the end of each iteration to prevent the optimizer
-//! from eliding the work and to force at least one read pass over the storage state.
+//!   from eliding the work and to force at least one read pass over the storage state.
 //! - Criterion reports time per iteration; we also set `Throughput::Elements(total_rows * 21)`
-//! so you can interpret results as *logical cells per second* if you want.
+//!   so you can interpret results as *logical cells per second* if you want.
 //!
 //! **Knobs to tweak** //! - `segment_max_entries`, `segment_max_bytes`: affect how often segments roll over.
 //! - `last_write_wins_in_batch`: whether duplicate keys in the same batch are deduped.
@@ -35,12 +35,13 @@
 //! **How to read the output** //! - **Fewer, larger batches** generally reduce overhead (fewer pager calls, fewer index objects),
 //! but increase memory pressure and produce larger segments.
 //! - **More, smaller batches** give you smaller segments and lower peaks in memory usage,
-//! but higher fixed overhead per batch.
+//!   but higher fixed overhead per batch.
 //!
 //! **Caveats** //! - Uses an in-memory pager;
 //! absolute timings won’t match a real backend, but **relative trends**
 //!   are very telling.
 //! - Values are synthetic.
+//!
 //! If your real payloads compress/branch differently, expect shifts.
 //! ```
 

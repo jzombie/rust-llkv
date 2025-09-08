@@ -9,11 +9,12 @@ use crate::types::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 
+pub type PutItem<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
+pub type PutItems<'a> = Vec<PutItem<'a>>;
+
 pub struct Put<'a> {
     pub field_id: LogicalFieldId,
-    // TODO: Alias accordingly
-    // pub items: Vec<(LogicalKeyBytes, Vec<u8>)>, // unordered; duplicates allowed (last wins)
-    pub items: Vec<(Cow<'a, [u8]>, Cow<'a, [u8]>)>, // unordered; duplicates allowed (last wins)
+    pub items: PutItems<'a>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -140,8 +141,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         // grow until adding next would exceed bytes or entries
                         let mut acc = 0usize;
                         let mut cnt = 0usize;
-                        for j in 0..take_by_entries {
-                            let sz = values[j].len();
+                        for v in values.iter().take(take_by_entries) {
+                            let sz = v.len();
                             if cnt > 0 && acc + sz > opts.segment_max_bytes {
                                 break;
                             }

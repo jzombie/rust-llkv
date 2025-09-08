@@ -23,7 +23,7 @@
 //! **What it measures** //! - Overhead of creating large numbers of small typed objects (`IndexSegment`, `ColumnIndex`,
 //!   `Manifest`, `Bootstrap`) and shuttling them through the **batched puts** path.
 //! - Effectiveness of batching: we minimize round-trips by staging puts into a single
-//! batch call per chunk (and once more at the end for `Manifest` + `Bootstrap`).
+//!   batch call per chunk (and once more at the end for `Manifest` + `Bootstrap`).
 //!
 //! **Why fixed-width + one segment per column?** //! - Keeps the test simple and deterministic (no variable-width offset building).
 //! - Focuses on index+manifest object counts and encoding costs rather than data slicing.
@@ -35,9 +35,10 @@
 //!
 //! **Interpreting results** //! - Larger `chunk_cols` ⇒ fewer batch calls, larger per-batch payloads.
 //! - More `columns` or more `entries_per_col` ⇒ more/larger typed blobs;
-//! timings should scale roughly with total bytes encoded + map insertions.
+//!   timings should scale roughly with total bytes encoded + map insertions.
 //!
-//! **Caveats** //! - Uses an in-memory pager; it exercises encode/decode and batching but not I/O latency.
+//! **Caveats**
+//! - Uses an in-memory pager; it exercises encode/decode and batching but not I/O latency.
 //! - Data blobs are treated as opaque; this benchmark targets **metadata path**, not reads.
 //! ```
 
