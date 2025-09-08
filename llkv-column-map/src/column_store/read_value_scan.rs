@@ -517,7 +517,8 @@ impl<P: Pager> ValueScan<P> {
                 let d = &segs[seg_idx].data;
                 (s, d)
             };
-            let val = slice_value::<P>(seg_ref, data_ref, head_pos);
+            let head_row = row_pos_at(seg_ref, head_pos);
+            let val = slice_value::<P>(seg_ref, data_ref, head_row);
             let (bucket, tag) = {
                 let a = val.start as usize;
                 let b = val.end as usize;
@@ -639,7 +640,10 @@ impl<P: Pager> Iterator for ValueScan<P> {
                 let begin = sc.begin;
                 let end = sc.end;
                 let next_pos_opt = next_pos(node.pos, begin, end, self.reverse);
-                let next_val_opt = next_pos_opt.map(|np| slice_value::<P>(&sc.seg, &sc.data, np));
+                let next_val_opt = next_pos_opt.map(|np| {
+                    let row = row_pos_at(&sc.seg, np);
+                    slice_value::<P>(&sc.seg, &sc.data, row)
+                });
                 (key_owned, sc.rank, next_pos_opt, next_val_opt)
             };
             // ---- immutable borrow dropped here ----

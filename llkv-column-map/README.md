@@ -26,7 +26,7 @@ cargo test
 ### Run everything (including ignored)
 
 ```sh
-cargo test -- --ignored
+cargo test -- --include-ignored
 ```
 
 ## License
