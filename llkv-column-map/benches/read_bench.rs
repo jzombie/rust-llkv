@@ -8,8 +8,6 @@
 //! What you can tweak easily:
 //! - `N_ROWS`, `QUERY_SIZES`, and the column set in `COLS`.
 //! - `ingest_chunk_rows`, segment limits in `AppendOptions`.
-//!
-//! No “hot set”, no custom RNG — just straightforward uniform queries.
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use llkv_column_map::{

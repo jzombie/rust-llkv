@@ -1,13 +1,14 @@
-//!
 //! # Benchmark: Build Many Columns (fixed-width, one segment per column)
 //!
-//! **Purpose** //! Stress the *metadata construction path* by creating lots of columns quickly.
+//! **Purpose**
+//! Stress the *metadata construction path* by creating lots of columns quickly.
 //! Each column receives exactly one sealed `IndexSegment` (fixed-width values) and a
 //! `ColumnIndex` pointing to it, then we write a single `Manifest` and `Bootstrap`.
 //! This isolates the cost of **allocating keys**, **encoding/decoding typed blobs**,
 //! and **batched puts** without mixing in high-volume value writes.
 //!
-//! **What it does** //! - Parameterized by:
+//! **What it does**
+//! - Parameterized by:
 //!   - `columns` (e.g., 5k, 50k), i.e., how many columns to create.
 //!   - `entries_per_col` (e.g., 8, 64, 128), i.e., logical rows per column.
 //! - `value_width` (e.g., 8), i.e., fixed width for every value in that column.
@@ -20,7 +21,8 @@
 //! - After all chunks: write **one `Manifest`** containing all column entries and **`Bootstrap`**
 //!   (physical key 0) in a **single batch**.
 //!
-//! **What it measures** //! - Overhead of creating large numbers of small typed objects (`IndexSegment`, `ColumnIndex`,
+//! **What it measures**
+//! - Overhead of creating large numbers of small typed objects (`IndexSegment`, `ColumnIndex`,
 //!   `Manifest`, `Bootstrap`) and shuttling them through the **batched puts** path.
 //! - Effectiveness of batching: we minimize round-trips by staging puts into a single
 //!   batch call per chunk (and once more at the end for `Manifest` + `Bootstrap`).
@@ -28,12 +30,14 @@
 //! **Why fixed-width + one segment per column?** //! - Keeps the test simple and deterministic (no variable-width offset building).
 //! - Focuses on index+manifest object counts and encoding costs rather than data slicing.
 //!
-//! **Knobs to tweak** //! - `columns`: increase to stress the manifest and the volume of typed puts.
+//! **Knobs to tweak**
+//! - `columns`: increase to stress the manifest and the volume of typed puts.
 //! - `entries_per_col`: increases `logical_key_bytes` and offsets size per segment.
 //! - `chunk_cols`: trade off peak memory vs. number of batched calls.
 //! - `value_width`: impacts how large each data blob *would* be (opaque here).
 //!
-//! **Interpreting results** //! - Larger `chunk_cols` ⇒ fewer batch calls, larger per-batch payloads.
+//! **Interpreting results**
+//! - Larger `chunk_cols` ⇒ fewer batch calls, larger per-batch payloads.
 //! - More `columns` or more `entries_per_col` ⇒ more/larger typed blobs;
 //!   timings should scale roughly with total bytes encoded + map insertions.
 //!
