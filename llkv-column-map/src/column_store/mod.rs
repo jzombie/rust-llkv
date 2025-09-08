@@ -206,7 +206,7 @@ mod tests {
 
     // Use the unified in-memory pager from the pager module.
     use crate::bounds::ValueBound;
-    use crate::codecs::big_endian::{u64_be_arr, u64_be_vec};
+    use crate::codecs::big_endian::{u64_be_array, u64_be_vec};
     use crate::column_index::IndexSegmentRef;
     use crate::storage::pager::MemPager;
     use std::borrow::Cow;
@@ -439,7 +439,7 @@ mod tests {
         let items_a = {
             const BB4: &[u8] = &[0xAA, 0, 0, 0];
             (0u64..100u64)
-                .map(|k| (Cow::Owned(u64_be_arr(k).to_vec()), Cow::Borrowed(BB4)))
+                .map(|k| (Cow::Owned(u64_be_array(k).to_vec()), Cow::Borrowed(BB4)))
                 .collect()
         };
 
@@ -461,7 +461,7 @@ mod tests {
         let items_b = {
             const BB4: &[u8] = &[0xBB, 0, 0, 0];
             (200u64..300u64)
-                .map(|k| (Cow::Owned(u64_be_arr(k).to_vec()), Cow::Borrowed(BB4)))
+                .map(|k| (Cow::Owned(u64_be_array(k).to_vec()), Cow::Borrowed(BB4)))
                 .collect()
         };
 

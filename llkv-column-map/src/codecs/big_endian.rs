@@ -6,7 +6,7 @@
 //! - Keep old names as aliases so existing code keeps compiling.
 //!
 //! Naming rules:
-//! - `*_be_arr` returns a fixed `[u8; N]` (no allocation).
+//! - `*_be_array` returns a fixed `[u8; N]` (no allocation).
 //! - `*_be_vec` returns an owned `Vec<u8>`.
 //! - `clone_bytes` clones a `&[u8]` into `Vec<u8>`.
 //! - `utf8_to_vec` converts `&str` into UTF-8 bytes `Vec<u8>`.
@@ -15,19 +15,19 @@
 
 /// Encode `u64` as big-endian fixed array (no allocation).
 #[inline]
-pub fn u64_be_arr(v: u64) -> [u8; 8] {
+pub fn u64_be_array(v: u64) -> [u8; 8] {
     v.to_be_bytes()
 }
 
 /// Encode `u32` as big-endian fixed array (no allocation).
 #[inline]
-pub fn u32_be_arr(v: u32) -> [u8; 4] {
+pub fn u32_be_array(v: u32) -> [u8; 4] {
     v.to_be_bytes()
 }
 
 /// Encode `u16` as big-endian fixed array (no allocation).
 #[inline]
-pub fn u16_be_arr(v: u16) -> [u8; 2] {
+pub fn u16_be_array(v: u16) -> [u8; 2] {
     v.to_be_bytes()
 }
 
