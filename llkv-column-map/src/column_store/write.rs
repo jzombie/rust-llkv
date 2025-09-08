@@ -35,7 +35,7 @@ impl Default for AppendOptions {
     fn default() -> Self {
         Self {
             mode: ValueMode::Auto,
-            segment_max_entries: 65_536,
+            segment_max_entries: u16::MAX as usize,
             segment_max_bytes: 8 * 1024 * 1024,
             last_write_wins_in_batch: true,
         }
