@@ -8,12 +8,13 @@
 //! and **batched puts** without mixing in high-volume value writes.
 //!
 //! **What it does**
-//! - Parameterized by:
-//!   - `columns` (e.g., 5k, 50k), i.e., how many columns to create.
-//!   - `entries_per_col` (e.g., 8, 64, 128), i.e., logical rows per column.
+//! Parameterized by:
+//! - `columns` (e.g., 5k, 50k), i.e., how many columns to create.
+//! - `entries_per_col` (e.g., 8, 64, 128), i.e., logical rows per column.
 //! - `value_width` (e.g., 8), i.e., fixed width for every value in that column.
 //! - `chunk_cols` (e.g., 2,048): columns processed per loop to cap peak allocations.
-//! - For each chunk of columns:
+//!
+//! For each chunk of columns:
 //! 1. Allocate **3 keys per column**: data blob key, index segment key, column index key.
 //! 2. Build an `IndexSegment::build_fixed` for that column (one per column).
 //! 3. Build a `ColumnIndex` that contains a single `IndexSegmentRef` (newest-first list).
@@ -27,7 +28,8 @@
 //! - Effectiveness of batching: we minimize round-trips by staging puts into a single
 //!   batch call per chunk (and once more at the end for `Manifest` + `Bootstrap`).
 //!
-//! **Why fixed-width + one segment per column?** //! - Keeps the test simple and deterministic (no variable-width offset building).
+//! **Why fixed-width + one segment per column?**
+//! - Keeps the test simple and deterministic (no variable-width offset building).
 //! - Focuses on index+manifest object counts and encoding costs rather than data slicing.
 //!
 //! **Knobs to tweak**
