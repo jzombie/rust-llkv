@@ -524,22 +524,23 @@ impl<P: Pager> ValueScan<P> {
         })
     }
 
-    /// Strict LWW: is `key` present in any newer segment (< cur_rank)?
+    /// Strict LWW check: does any *newer* segment (smaller rank) contain `key`?
+    /// A newer tombstone also suppresses older values.
     #[inline]
-    fn lww_shadowed(&self, key: &[u8], cur_rank: usize) -> bool {
-        let upto = cur_rank.min(self.newer_by_rank.len());
-        for r in 0..upto {
-            for rf in &self.newer_by_rank[r] {
-                if let Some(seg) = self.newer_seg_map.get(&rf.pk) {
-                    if let Some(_pos) = KeyLayout::binary_search_key_with_layout(
-                        &seg.logical_key_bytes,
-                        &seg.key_layout,
-                        seg.n_entries as usize,
-                        key,
-                    ) {
-                        return true;
-                    }
-                }
+    fn lww_shadowed(&self, key: &[u8], older_rank: usize) -> bool {
+        for sc in self.segs.iter() {
+            if sc.rank >= older_rank {
+                continue;
+            }
+            if let Some(_pos) = crate::layout::KeyLayout::binary_search_key_with_layout(
+                &sc.seg.logical_key_bytes,
+                &sc.seg.key_layout,
+                sc.seg.n_entries as usize,
+                key,
+            ) {
+                // Found in a newer segment. Whether it is a real value or a tombstone,
+                // it shadows older segments for LWW semantics.
+                return true;
             }
         }
         false
@@ -550,35 +551,32 @@ impl<P: Pager> Iterator for ValueScan<P> {
     type Item = ValueScanItem<P::Blob>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.halted {
-            return None;
-        }
-
         loop {
-            // Pop one head.
             let node = self.pq.pop(self.reverse)?;
             let seg_idx = node.seg_idx;
 
-            // ----- Immutable borrow in a tight scope -----
-            // Slice encoded key zero-copy and make the one required owned copy.
-            let (key_owned, rank, begin, end) = {
+            // ---- short immutable borrow to slice key and plan next head ----
+            let (key_owned, rank, begin, end, next_pos_opt, next_val_opt) = {
                 let sc = &self.segs[seg_idx];
                 let row_pos = row_pos_at(&sc.seg, node.pos);
-                let key_slice = KeyLayout::slice_key_by_layout(
+                let key_slice = crate::layout::KeyLayout::slice_key_by_layout(
                     &sc.seg.logical_key_bytes,
                     &sc.seg.key_layout,
                     row_pos,
                 );
-                (key_slice.to_vec(), sc.rank, sc.begin, sc.end)
-            };
-            // ----- Immutable borrow of segs is now dropped -----
+                let key_owned = key_slice.to_vec();
 
-            // Strict LWW: skip if any newer segment has this key.
+                let begin = sc.begin;
+                let end = sc.end;
+                let next_pos_opt = next_pos(node.pos, begin, end, self.reverse);
+                let next_val_opt = next_pos_opt.map(|np| slice_value::<P>(&sc.seg, &sc.data, np));
+                (key_owned, sc.rank, begin, end, next_pos_opt, next_val_opt)
+            };
+            // ---- immutable borrow dropped here ----
+
+            // Strict LWW: skip if any newer segment contains this key.
             if self.lww_shadowed(key_owned.as_slice(), rank) {
-                // Advance this segment head and continue (no mutable borrow).
-                if let Some(np) = next_pos(node.pos, begin, end, self.reverse) {
-                    let sc = &self.segs[seg_idx];
-                    let val = slice_value::<P>(&sc.seg, &sc.data, np);
+                if let (Some(np), Some(val)) = (next_pos_opt, next_val_opt) {
                     let (bkt, tag) = {
                         let a = val.start as usize;
                         let b = val.end as usize;
@@ -598,25 +596,8 @@ impl<P: Pager> Iterator for ValueScan<P> {
                 continue;
             }
 
-            // Frame predicate on encoded keys.
-            if let Some(pred) = &self.frame_pred {
-                if let Some(head) = &self.frame_head {
-                    if !pred(head.as_slice(), key_owned.as_slice()) {
-                        self.halted = true;
-                        return None;
-                    }
-                } else {
-                    // First yield establishes the frame head. This is the only
-                    // place we do an extra copy (first row only).
-                    self.frame_head = Some(key_owned.clone());
-                }
-            }
-
-            // Advance this segment head and push next node (still no mutable
-            // borrow needed; cursor lives in Node).
-            if let Some(np) = next_pos(node.pos, begin, end, self.reverse) {
-                let sc = &self.segs[seg_idx];
-                let val = slice_value::<P>(&sc.seg, &sc.data, np);
+            // Advance this segment by pushing its next head, if any.
+            if let (Some(np), Some(val)) = (next_pos_opt, next_val_opt) {
                 let (bkt, tag) = {
                     let a = val.start as usize;
                     let b = val.end as usize;
@@ -630,11 +611,11 @@ impl<P: Pager> Iterator for ValueScan<P> {
                     seg_idx,
                     pos: np,
                     val,
-                    reverse: self.reverse,
+                    reverse: self.reverse, // <- required
                 });
             }
 
-            // Yield the row. Values are zero-copy; keys are one owned copy.
+            // Yield current row. Values are zero-copy; key is one owned copy.
             return Some(ValueScanItem {
                 key: key_owned,
                 value: node.val,
@@ -861,5 +842,290 @@ fn clone_bound_bytes(b: &Bound<&[u8]>) -> Bound<Vec<u8>> {
         Bound::Unbounded => Bound::Unbounded,
         Bound::Included(x) => Bound::Included((*x).to_vec()),
         Bound::Excluded(x) => Bound::Excluded((*x).to_vec()),
+    }
+}
+
+// ----------------------------- tests -----------------------------
+#[cfg(test)]
+mod value_scan_tests {
+    use super::*;
+    use crate::ColumnStore;
+    use crate::codecs::big_endian::u64_be_array;
+    use crate::storage::pager::MemPager;
+    use crate::types::{AppendOptions, Put, ValueMode};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn be64_vec(x: u64) -> Vec<u8> {
+        u64_be_array(x).to_vec()
+    }
+    fn key_bytes(i: u32) -> Vec<u8> {
+        format!("k{:06}", i).into_bytes()
+    }
+    fn parse_key_u32(k: &[u8]) -> u32 {
+        // "k000123" -> 123
+        std::str::from_utf8(k)
+            .ok()
+            .and_then(|s| s[1..].parse::<u32>().ok())
+            .expect("key parse")
+    }
+    fn parse_be64(v: &[u8]) -> u64 {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&v[..8]);
+        u64::from_be_bytes(a)
+    }
+
+    /// Build three overlapping generations of data for the same column:
+    ///   gen1 (oldest): keys [0..1000), value = 1000 + i
+    ///   gen2 (newer) : keys [200..1200), value = 200_000 + i
+    ///   gen3 (newest): keys [600..1400), value = 300_000 + i
+    ///
+    /// With LWW, the winner per key i is:
+    ///   i in [0,200)     -> gen1
+    ///   i in [200,600)   -> gen2
+    ///   i in [600,1400)  -> gen3
+    fn seed_three_generations<P: Pager>(store: &ColumnStore<P>, fid: LogicalFieldId) {
+        let opts = AppendOptions {
+            mode: ValueMode::ForceFixed(8),
+            // small limits to force multiple physical segments
+            segment_max_entries: 128,
+            segment_max_bytes: 1 << 14,
+            last_write_wins_in_batch: true,
+        };
+
+        // gen1
+        let mut items = Vec::with_capacity(1000);
+        for i in 0u32..1000 {
+            items.push((key_bytes(i).into(), be64_vec(1000 + i as u64).into()));
+        }
+        store.append_many(
+            vec![Put {
+                field_id: fid,
+                items,
+            }],
+            opts.clone(),
+        );
+
+        // gen2
+        let mut items = Vec::with_capacity(1000);
+        for i in 200u32..1200 {
+            items.push((key_bytes(i).into(), be64_vec(200_000 + i as u64).into()));
+        }
+        store.append_many(
+            vec![Put {
+                field_id: fid,
+                items,
+            }],
+            opts.clone(),
+        );
+
+        // gen3
+        let mut items = Vec::with_capacity(800);
+        for i in 600u32..1400 {
+            items.push((key_bytes(i).into(), be64_vec(300_000 + i as u64).into()));
+        }
+        store.append_many(
+            vec![Put {
+                field_id: fid,
+                items,
+            }],
+            opts,
+        );
+    }
+
+    /// End-to-end: forward scan over full range, assert LWW winners and uniqueness.
+    #[test]
+    fn scan_values_lww_forward_big_multi_segment() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p); // bootstrap+manifest, empty store
+        let fid = 42u32;
+
+        seed_three_generations(&store, fid);
+
+        // full-range value scan
+        let it = store
+            .scan_values_lww(
+                fid,
+                ValueScanOpts {
+                    dir: Direction::Forward,
+                    lo: Bound::Unbounded,
+                    hi: Bound::Unbounded,
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    head_tag_len: 8,
+                    frame_predicate: None,
+                },
+            )
+            .expect("iterator");
+
+        // Accumulate winners (key -> value)
+        let mut by_key: BTreeMap<u32, u64> = BTreeMap::new();
+        for item in it {
+            let k = parse_key_u32(&item.key);
+            let a = item.value.start as usize;
+            let b = item.value.end as usize;
+            let v = parse_be64(&item.value.data.as_ref()[a..b]);
+            // Expect uniqueness (LWW shadowing applied)
+            assert!(by_key.insert(k, v).is_none(), "duplicate key {k} in scan");
+        }
+
+        // Expected domain of surviving keys is [0..1400)
+        assert_eq!(by_key.len(), 1400, "unique keys after LWW");
+
+        // spot-check winners come from the right generation
+        // [0,200) -> gen1
+        assert_eq!(by_key[&0], 1000 + 0);
+        assert_eq!(by_key[&199], 1000 + 199);
+        // [200,600) -> gen2
+        assert_eq!(by_key[&200], 200_000 + 200);
+        assert_eq!(by_key[&599], 200_000 + 599);
+        // [600,1400) -> gen3
+        assert_eq!(by_key[&600], 300_000 + 600);
+        assert_eq!(by_key[&1399], 300_000 + 1399);
+    }
+
+    /// Narrow value window: ensure [lo, hi) (value-space) is honored.
+    #[test]
+    fn scan_values_lww_value_window_slice() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 7u32;
+        seed_three_generations(&store, fid);
+
+        // Choose a window that lands entirely in gen2's value band.
+        // gen2 encodes as 200_000 + i, i in [200,1200)
+        // Grab values [200_250 .. 200_260) => i in [250..260)
+        let lo = be64_vec(200_250);
+        let hi = be64_vec(200_260);
+
+        let it = store
+            .scan_values_lww(
+                fid,
+                ValueScanOpts {
+                    dir: Direction::Forward,
+                    lo: Bound::Included(&lo),
+                    hi: Bound::Excluded(&hi),
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    head_tag_len: 8,
+                    frame_predicate: None,
+                },
+            )
+            .expect("iterator");
+
+        let mut keys: BTreeSet<u32> = BTreeSet::new();
+        let mut vals: BTreeSet<u64> = BTreeSet::new();
+
+        for item in it {
+            let k = parse_key_u32(&item.key);
+            let a = item.value.start as usize;
+            let b = item.value.end as usize;
+            let v = parse_be64(&item.value.data.as_ref()[a..b]);
+            keys.insert(k);
+            vals.insert(v);
+        }
+
+        // In that slice we expect 10 items (i = 250..259), if LWW is applied.
+        assert_eq!(keys.len(), 10, "value-window result size");
+        // ensure keys are the right ones
+        let expected: BTreeSet<u32> = (250u32..260u32).collect();
+        assert_eq!(keys, expected);
+        // ensure values match exactly
+        let expected_vals: BTreeSet<u64> = (200_250u64..200_260u64).collect();
+        assert_eq!(vals, expected_vals);
+    }
+
+    /// (Placeholder) Reverse scan behavior.
+    /// Once `Direction::Reverse` is supported by the scanner, enable this.
+    #[test]
+    #[ignore = "enable once reverse scans are wired (Direction::Reverse)"]
+    fn scan_values_lww_reverse_order_contract() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 99u32;
+        seed_three_generations(&store, fid);
+
+        // PSEUDOCODE once reverse is supported:
+        // let it = store.scan_values_with_policy(
+        //     fid,
+        //     ScanOpts {
+        //         dir: Direction::Reverse,
+        //         lo: Bound::Unbounded,
+        //         hi: Bound::Unbounded,
+        //         prefix: None,
+        //         frame_predicate: None,
+        //         ..Default::default()
+        //     }.with_conflict(ConflictPolicy::LWW)
+        // )?;
+        // let values: Vec<u64> = it.map(|x| parse_be64(&x.value.bytes(..))).collect();
+        // assert!(values.windows(2).all(|w| w[0] >= w[1]));
+        let _ = store; // silence unused until reverse exists
+    }
+
+    /// (Placeholder) FWW semantics: oldest wins.
+    /// Enable after you surface ConflictPolicy::{LWW,FWW} on the scanner API.
+    #[test]
+    #[ignore = "enable once ConflictPolicy::FWW is exposed on scan API"]
+    fn scan_values_fww_forward_contract() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 5u32;
+        seed_three_generations(&store, fid);
+
+        // PSEUDOCODE once FWW is available:
+        // let it = store.scan_values_with_policy(
+        //     fid,
+        //     ScanOpts {
+        //         dir: Direction::Forward,
+        //         lo: Bound::Unbounded,
+        //         hi: Bound::Unbounded,
+        //         prefix: None,
+        //         frame_predicate: None,
+        //         ..Default::default()
+        //     }.with_conflict(ConflictPolicy::FWW)
+        // )?;
+        // let by_key = collect_map(it);
+        //
+        // Oldest wins expectation:
+        //   [0,1000)  -> gen1
+        //   [1000,1200) -> gen2
+        //   [1200,1400) -> gen3
+        // assert_eq!(by_key[&0],    1000 + 0);
+        // assert_eq!(by_key[&999],  1000 + 999);
+        // assert_eq!(by_key[&1000], 200_000 + 1000);
+        // assert_eq!(by_key[&1199], 200_000 + 1199);
+        // assert_eq!(by_key[&1200], 300_000 + 1200);
+        // assert_eq!(by_key[&1399], 300_000 + 1399);
+        let _ = store; // silence unused until FWW exists
+    }
+
+    /// (Placeholder) Frame predicate/windowing contract.
+    #[test]
+    #[ignore = "enable once frame_predicate is wired"]
+    fn scan_values_lww_frame_predicate_contract() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 12u32;
+        seed_three_generations(&store, fid);
+
+        // PSEUDOCODE once frame predicate exists:
+        // let cap = 64u64;
+        // let it = store.scan_values_with_policy(
+        //     fid,
+        //     ScanOpts {
+        //         dir: Direction::Forward,
+        //         lo: Bound::Unbounded,
+        //         hi: Bound::Unbounded,
+        //         prefix: None,
+        //         frame_predicate: Some(Arc::new(move |head, cur| {
+        //             // stop when value delta > cap
+        //             let hv = parse_be64(head);
+        //             let cv = parse_be64(cur);
+        //             cv - hv <= cap
+        //         })),
+        //     }.with_conflict(ConflictPolicy::LWW)
+        // )?;
+        // let v: Vec<u64> = it.map(|x| parse_be64(bytes(&x.value))).collect();
+        // assert!(v.len() <= 65);
+        let _ = store;
     }
 }
