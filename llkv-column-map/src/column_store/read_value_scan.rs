@@ -231,7 +231,7 @@ impl<P: Pager> RadixPq<P> {
 
         self.buckets
             .entry(b)
-            .or_insert_with(BinaryHeap::new)
+            .or_default()
             .push(std::cmp::Reverse(node));
 
         self.bitset[idx] |= bit;
@@ -738,7 +738,7 @@ impl<P: Pager> ValueScan<P> {
 
     /// Is this `key rank` shadowed by the chosen policy?
     #[inline]
-    fn key_within_seg_bounds<'a>(seg: &'a IndexSegment, key: &[u8]) -> bool {
+    fn key_within_seg_bounds(seg: &IndexSegment, key: &[u8]) -> bool {
         // Borrowed min/max from the segment without allocation.
         let min = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);
         let max = KeyLayout::slice_key_by_layout(
