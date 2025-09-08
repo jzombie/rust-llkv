@@ -1,4 +1,4 @@
-# LLKV: Logical Columnar Storage for Binary Key-Value Storage Systems
+# LLKV: A Columnar Storage Layer for Key-Value Stores
 
 **Work in Progress**
 
