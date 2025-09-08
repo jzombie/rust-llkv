@@ -42,6 +42,20 @@ impl Default for AppendOptions {
     }
 }
 
+// Normalize per column: last-write-wins (optional), then sort by logical key.
+// Also decide value layout for this batch (fixed width or variable).
+#[derive(Clone)]
+enum PlannedWriteLayout {
+    Fixed { width: ByteWidth },
+    Variable, // offsets will be computed per segment
+}
+struct PlannedWriteChunk {
+    field_id: LogicalFieldId,
+    keys_sorted: Vec<LogicalKeyBytes>,
+    values: Vec<Vec<u8>>, // aligned to keys
+    layout: PlannedWriteLayout,
+}
+
 impl<'p, P: Pager> ColumnStore<'p, P> {
     // Single entrypoint for writing. Many columns, each with unordered items.
     // Auto-chooses fixed vs variable, chunks to segments, writes everything in batches.
@@ -50,21 +64,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             return;
         }
 
-        // Normalize per column: last-write-wins (optional), then sort by logical key.
-        // Also decide value layout for this batch (fixed width or variable).
-        #[derive(Clone)]
-        enum PlannedLayout {
-            Fixed { width: ByteWidth },
-            Variable, // offsets will be computed per segment
-        }
-        struct PlannedChunk {
-            field_id: LogicalFieldId,
-            keys_sorted: Vec<LogicalKeyBytes>,
-            values: Vec<Vec<u8>>, // aligned to keys
-            layout: PlannedLayout,
-        }
-
-        let mut planned_chunks: Vec<PlannedChunk> = Vec::new();
+        let mut planned_chunks: Vec<PlannedWriteChunk> = Vec::new();
 
         for mut put in puts {
             if put.items.is_empty() {
@@ -99,17 +99,17 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                             v.len()
                         );
                     }
-                    PlannedLayout::Fixed { width: w }
+                    PlannedWriteLayout::Fixed { width: w }
                 }
-                ValueMode::ForceVariable => PlannedLayout::Variable,
+                ValueMode::ForceVariable => PlannedWriteLayout::Variable,
                 ValueMode::Auto => {
                     let w = put.items[0].1.len();
                     if w > 0 && put.items.iter().all(|(_, v)| v.len() == w) {
-                        PlannedLayout::Fixed {
+                        PlannedWriteLayout::Fixed {
                             width: w as ByteWidth,
                         }
                     } else {
-                        PlannedLayout::Variable
+                        PlannedWriteLayout::Variable
                     }
                 }
             };
@@ -121,7 +121,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 let take_by_entries = core::cmp::min(remain, opts.segment_max_entries);
 
                 let take = match layout {
-                    PlannedLayout::Fixed { width } => {
+                    PlannedWriteLayout::Fixed { width } => {
                         // entries are uniform; respect both entry and byte budgets
                         let max_entries_by_bytes = if width == 0 {
                             take_by_entries
@@ -130,7 +130,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         };
                         core::cmp::min(take_by_entries, max_entries_by_bytes.max(1))
                     }
-                    PlannedLayout::Variable => {
+                    PlannedWriteLayout::Variable => {
                         // grow until adding next would exceed bytes or entries
                         let mut acc = 0usize;
                         let mut cnt = 0usize;
@@ -158,7 +158,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     keys_sorted.push(k.to_vec());
                     vals.push(v.to_vec());
                 }
-                planned_chunks.push(PlannedChunk {
+                planned_chunks.push(PlannedWriteChunk {
                     field_id: put.field_id,
                     keys_sorted,
                     values: vals,
@@ -277,7 +277,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
             // build data blob (+ value offsets for variable)
             let (data_blob, seg, n_entries) = match chunk.layout {
-                PlannedLayout::Fixed { width } => {
+                PlannedWriteLayout::Fixed { width } => {
                     // values blob
                     let mut blob = Vec::with_capacity(chunk.values.len() * (width as usize));
                     for v in &chunk.values {
@@ -289,7 +289,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         IndexSegment::build_fixed(data_pkey, chunk.keys_sorted.clone(), width);
                     (blob, seg, chunk.values.len() as IndexEntryCount)
                 }
-                PlannedLayout::Variable => {
+                PlannedWriteLayout::Variable => {
                     // values blob
                     let mut blob = Vec::new();
                     let mut sizes: Vec<ByteLen> = Vec::with_capacity(chunk.values.len());
