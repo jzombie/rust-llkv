@@ -121,11 +121,15 @@ pub struct ValueScan<P: Pager> {
 }
 
 /// Min-heap per bucket with a 65,536-bit tier-1 directory.
-/// We keep one `BinaryHeap<Reverse<Node>>`` per active bucket.
-/// Node carries a `reverse` flag that flips compare semantics.
+/// We keep one `BinaryHeap<Reverse<Node>>` per active bucket.
+/// Watermarks (min_word/max_word) avoid scanning empty tails.
 struct RadixPq<P: Pager> {
     bitset: [u64; 1024], // 1024 * 64 = 65,536 bits
     buckets: FxHashMap<u16, BinaryHeap<std::cmp::Reverse<Node<P>>>>,
+    // Watermarks in the bitset word space (0..=1023).
+    // Empty state is represented by min_word == usize::MAX.
+    min_word: usize,
+    max_word: usize,
 }
 
 impl<P: Pager> RadixPq<P> {
@@ -133,6 +137,8 @@ impl<P: Pager> RadixPq<P> {
         Self {
             bitset: [0u64; 1024],
             buckets: FxHashMap::default(),
+            min_word: usize::MAX, // empty
+            max_word: 0,
         }
     }
 
@@ -140,10 +146,22 @@ impl<P: Pager> RadixPq<P> {
         let b = node.bucket;
         let idx = (b / 64) as usize;
         let bit = 1u64 << (b % 64);
+
+        // If this word was previously empty, update watermarks before setting the bit.
+        if self.bitset[idx] == 0 {
+            if self.min_word == usize::MAX || idx < self.min_word {
+                self.min_word = idx;
+            }
+            if idx > self.max_word {
+                self.max_word = idx;
+            }
+        }
+
         self.buckets
             .entry(b)
-            .or_default()
+            .or_insert_with(BinaryHeap::new)
             .push(std::cmp::Reverse(node));
+
         self.bitset[idx] |= bit;
     }
 
@@ -151,39 +169,93 @@ impl<P: Pager> RadixPq<P> {
         let bi = self.find_bucket(reverse)?;
         let heap = self.buckets.get_mut(&bi)?;
         let out = heap.pop()?.0;
+
         if heap.is_empty() {
+            // Clear the bit for this bucket and potentially adjust watermarks.
             let idx = (bi / 64) as usize;
             let bit = 1u64 << (bi % 64);
             self.bitset[idx] &= !bit;
+            // Remove the (now empty) per-bucket heap
             self.buckets.remove(&bi);
+
+            if self.bitset[idx] == 0 {
+                // If this word became empty, move the corresponding watermark(s).
+                if idx == self.min_word {
+                    // Bump min_word up to the next non-empty word.
+                    let mut i = self.min_word;
+                    while i <= self.max_word && self.bitset[i] == 0 {
+                        i += 1;
+                    }
+                    if i > self.max_word {
+                        // Directory is now empty.
+                        self.min_word = usize::MAX;
+                        self.max_word = 0;
+                    } else {
+                        self.min_word = i;
+                    }
+                }
+                if self.min_word != usize::MAX && idx == self.max_word {
+                    // Drop max_word down to the previous non-empty word.
+                    let mut i = self.max_word;
+                    // (guard against underflow; min_word is valid here)
+                    while i >= self.min_word && self.bitset[i] == 0 {
+                        if i == 0 {
+                            break;
+                        }
+                        i -= 1;
+                    }
+                    if self.min_word > i || self.bitset[i] == 0 {
+                        // Empty after adjustment
+                        self.min_word = usize::MAX;
+                        self.max_word = 0;
+                    } else {
+                        self.max_word = i;
+                    }
+                }
+            }
         }
+
         Some(out)
     }
 
     fn find_bucket(&self, reverse: bool) -> Option<u16> {
+        // Fast empty test via watermark.
+        if self.min_word == usize::MAX {
+            return None;
+        }
+
         if !reverse {
-            for (i, word) in self.bitset.iter().enumerate() {
-                if *word == 0 {
-                    continue;
+            // Scan only within [min_word ..= max_word].
+            for i in self.min_word..=self.max_word {
+                let word = self.bitset[i];
+                if word != 0 {
+                    let t = word.trailing_zeros() as u16;
+                    return Some(((i as u16) * 64) + t);
                 }
-                let t = word.trailing_zeros() as u16;
-                return Some(((i as u16) * 64) + t);
             }
         } else {
-            for (i, word) in self.bitset.iter().enumerate().rev() {
-                if *word == 0 {
-                    continue;
+            // Reverse: scan [max_word ..= min_word] downward.
+            let mut i = self.max_word;
+            loop {
+                let word = self.bitset[i];
+                if word != 0 {
+                    let lz = word.leading_zeros() as u16; // 0..=63 when word != 0
+                    let bit = 63u16 - lz;
+                    return Some(((i as u16) * 64) + bit);
                 }
-                let lz = word.leading_zeros() as u16;
-                let bit = 63u16.saturating_sub(lz);
-                return Some(((i as u16) * 64) + bit);
+                if i == self.min_word {
+                    break;
+                }
+                i -= 1;
             }
         }
         None
     }
 
+    #[inline]
     fn is_empty(&self) -> bool {
-        self.buckets.is_empty()
+        // Either check the map, or the watermark.
+        self.min_word == usize::MAX
     }
 }
 
