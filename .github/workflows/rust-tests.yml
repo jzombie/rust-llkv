@@ -44,7 +44,7 @@ jobs:
         run: cargo build --workspace --all-targets ${{ matrix.flags }}
 
       - name: Test
-        run: cargo test --workspace --all-targets --verbose ${{ matrix.flags }}
+        run: cargo test --workspace --all-targets --verbose ${{ matrix.flags }} -- --ignored
 
       # Added step to ensure benchmarks compile. `--no-run` is important.
       - name: Check benchmarks compile
