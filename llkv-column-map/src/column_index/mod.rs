@@ -87,12 +87,12 @@ mod tests {
         let manifest_pkey = ids[6];
 
         // ----- build two segments for columns 100 and 200 -----
-        let keys_100 = vec![b"a".to_vec(), b"b".to_vec(), b"d".to_vec()];
-        let seg_100 = IndexSegment::build_fixed(data_100, keys_100.clone(), 1);
+        let keys_100 = &[b"a".to_vec(), b"b".to_vec(), b"d".to_vec()];
+        let seg_100 = IndexSegment::build_fixed(data_100, keys_100, 1);
 
-        let animals = vec![b"ant".to_vec(), b"wolf".to_vec(), b"zebra".to_vec()];
+        let animals = &[b"ant".to_vec(), b"wolf".to_vec(), b"zebra".to_vec()];
         let sizes: Vec<u32> = vec![5, 2, 8]; // arbitrary payload lengths
-        let seg_200 = IndexSegment::build_var(data_200, animals.clone(), &sizes);
+        let seg_200 = IndexSegment::build_var(data_200, animals, &sizes);
 
         // store index segments (one batch)
         kv.batch_put(&[
@@ -320,15 +320,12 @@ mod tests {
 
         // One column with three sealed segments, newest-first.
         // Ranges: ["aa".."am"], ["b".."c"], ["wolf".."zebra"]
-        let seg_a = IndexSegment::build_fixed(
-            data_a,
-            vec![b"aa".to_vec(), b"al".to_vec(), b"am".to_vec()],
-            4,
-        );
-        let seg_b = IndexSegment::build_fixed(data_b, vec![b"b".to_vec(), b"c".to_vec()], 2);
+        let seg_a =
+            IndexSegment::build_fixed(data_a, &[b"aa".to_vec(), b"al".to_vec(), b"am".to_vec()], 4);
+        let seg_b = IndexSegment::build_fixed(data_b, &[b"b".to_vec(), b"c".to_vec()], 2);
         let seg_c = IndexSegment::build_var(
             data_c,
-            vec![b"wolf".to_vec(), b"yak".to_vec(), b"zebra".to_vec()],
+            &[b"wolf".to_vec(), b"yak".to_vec(), b"zebra".to_vec()],
             &[7, 3, 9],
         );
 
@@ -437,7 +434,7 @@ mod tests {
         // Fixed width = 8 → ranges are [i*8 .. (i+1)*8)
         let seg_fixed = IndexSegment::build_fixed(
             data_key,
-            vec![
+            &[
                 b"k1".to_vec(),
                 b"k2".to_vec(),
                 b"k3".to_vec(),
@@ -460,7 +457,7 @@ mod tests {
         // Variable layout: explicit prefix sums
         let seg_var = IndexSegment::build_var(
             data_key,
-            vec![b"a".to_vec(), b"aa".to_vec(), b"aaa".to_vec()],
+            &[b"a".to_vec(), b"aa".to_vec(), b"aaa".to_vec()],
             &[3, 1, 9],
         );
         match seg_var.value_layout {
@@ -493,7 +490,7 @@ mod tests {
     fn min_max_fixed_width_keys() {
         // three 8-byte big-endian u64 keys: 1, 5, 9
         let keys = vec![u64_be_vec(1), u64_be_vec(9), u64_be_vec(5)];
-        let seg = IndexSegment::build_fixed(123, keys, 4 /* any width for values */);
+        let seg = IndexSegment::build_fixed(123, &keys, 4 /* any width for values */);
 
         // bounds must be inclusive and lexicographic — derive by slicing first/last
         let first = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);
@@ -525,7 +522,7 @@ mod tests {
             b"ant".to_vec(),
         ];
         let sizes = vec![1u32; keys.len()]; // dummy value sizes
-        let seg = IndexSegment::build_var(777, keys, &sizes);
+        let seg = IndexSegment::build_var(777, &keys, &sizes);
 
         // derive lexicographic min/max by slicing packed keys
         let first = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);

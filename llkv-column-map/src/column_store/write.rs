@@ -72,15 +72,20 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             }
 
             if opts.last_write_wins_in_batch {
-                // last wins: overwrite by key
-                let mut last: FxHashMap<Vec<u8>, Vec<u8>> =
+                // Use a map with borrowed keys (`&[u8]`) to avoid cloning key data for deduplication.
+                // We still clone the `Cow` value, but this is cheap if the value is borrowed
+                // and necessary to give the map ownership of the value.
+                let mut last: FxHashMap<&[u8], Cow<[u8]>> =
                     FxHashMap::with_capacity_and_hasher(put.items.len(), Default::default());
-                for (k, v) in put.items {
-                    last.insert(k.into_owned(), v.into_owned());
+                // Iterate with references to avoid moving and potentially cloning.
+                for (k, v) in put.items.iter() {
+                    last.insert(k.as_ref(), v.clone());
                 }
+                // Rebuild items from the map. This still allocates for keys,
+                // but we've avoided cloning all keys upfront just for the lookup.
                 put.items = last
                     .into_iter()
-                    .map(|(k, v)| (Cow::Owned(k), Cow::Owned(v)))
+                    .map(|(k, v)| (Cow::Owned(k.to_vec()), v))
                     .collect();
             }
 
@@ -286,7 +291,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     }
                     // index segment (keys packed + fixed value layout)
                     let seg =
-                        IndexSegment::build_fixed(data_pkey, chunk.keys_sorted.clone(), width);
+                        IndexSegment::build_fixed(data_pkey, &chunk.keys_sorted.clone(), width);
                     (blob, seg, chunk.values.len() as IndexEntryCount)
                 }
                 PlannedWriteLayout::Variable => {
@@ -298,7 +303,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         sizes.push(v.len() as ByteLen);
                     }
                     // index segment (keys packed + var value layout)
-                    let seg = IndexSegment::build_var(data_pkey, chunk.keys_sorted.clone(), &sizes);
+                    let seg =
+                        IndexSegment::build_var(data_pkey, &chunk.keys_sorted.clone(), &sizes);
                     (blob, seg, chunk.values.len() as IndexEntryCount)
                 }
             };
