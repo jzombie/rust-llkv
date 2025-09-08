@@ -26,6 +26,7 @@ struct PlannedWriteChunk {
 }
 
 impl<'p, P: Pager> ColumnStore<'p, P> {
+    // TODO: Return `Result` type
     // Single entrypoint for writing. Many columns, each with unordered items.
     // Auto-chooses fixed vs variable, chunks to segments, writes everything in batches.
     /// Single entrypoint for writing. Many columns, each with unordered items.
@@ -383,6 +384,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         }
     }
 
+    // TODO: Return `Result` type
     /// Logically delete keys by appending tombstones (zero-length values).
     /// We force variable layout so size=0 entries are valid.
     pub fn delete_many(&self, items: Vec<(LogicalFieldId, Vec<LogicalKeyBytes>)>) {
