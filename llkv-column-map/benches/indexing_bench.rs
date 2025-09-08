@@ -48,7 +48,7 @@
 //! ```
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use llkv_column_map::codecs::key::u64_be;
+use llkv_column_map::codecs::big_endian::u64_be;
 use llkv_column_map::column_index::{
     Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, Manifest,
 };

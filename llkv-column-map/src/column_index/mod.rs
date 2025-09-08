@@ -44,7 +44,7 @@ pub struct ColumnIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codecs::key::u64_be;
+    use crate::codecs::big_endian::u64_be;
     use crate::constants::BOOTSTRAP_PKEY;
     use crate::layout::{KeyLayout, ValueLayout};
     use crate::storage::pager::{BatchGet, BatchPut, GetResult, MemPager, Pager};

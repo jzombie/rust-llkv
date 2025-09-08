@@ -14,7 +14,7 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use llkv_column_map::{
     ColumnStore,
-    codecs::key::u64_be,
+    codecs::big_endian::u64_be,
     column_store::write::{AppendOptions, Put, ValueMode},
     storage::pager::MemPager,
     types::LogicalFieldId,

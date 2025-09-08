@@ -1,28 +1,24 @@
-use crate::types::LogicalKeyBytes;
-
-// TODO: Make generic over big endian (not just key)
-
 /// Encode a `u64` so lexicographic order == numeric order.
 #[inline]
-pub fn u64_be(v: u64) -> LogicalKeyBytes {
+pub fn u64_be(v: u64) -> Vec<u8> {
     v.to_be_bytes().to_vec()
 }
 
 /// Encode a `u32` so lexicographic order == numeric order.
 #[inline]
-pub fn u32_be(v: u32) -> LogicalKeyBytes {
+pub fn u32_be(v: u32) -> Vec<u8> {
     v.to_be_bytes().to_vec()
 }
 
 /// Pass-through bytes. Clones into an owned `LogicalKeyBytes`.
 #[inline]
-pub fn bytes<B: AsRef<[u8]>>(b: B) -> LogicalKeyBytes {
+pub fn bytes<B: AsRef<[u8]>>(b: B) -> Vec<u8> {
     b.as_ref().to_vec()
 }
 
 /// UTF-8 string → bytes (owned).
 #[inline]
-pub fn utf8(s: &str) -> LogicalKeyBytes {
+pub fn utf8(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
 }
 

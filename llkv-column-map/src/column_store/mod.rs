@@ -206,7 +206,7 @@ mod tests {
 
     // Use the unified in-memory pager from the pager module.
     use crate::bounds::ValueBound;
-    use crate::codecs::key::{u64_be, u64_be_arr};
+    use crate::codecs::big_endian::{u64_be, u64_be_arr};
     use crate::column_index::IndexSegmentRef;
     use crate::storage::pager::MemPager;
     use std::borrow::Cow;
