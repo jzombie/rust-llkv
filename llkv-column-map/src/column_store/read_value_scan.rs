@@ -1303,4 +1303,176 @@ mod value_scan_tests {
         assert_eq!(first.unwrap(), 300_000 + 1399);
         assert_eq!(prev.unwrap(), 1000 + 0);
     }
+
+    #[test]
+    fn scan_values_lww_reverse_windowed_gen3() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 101u32;
+        seed_three_generations(&store, fid);
+
+        // Window fully inside gen3 (i = 700..710)
+        let lo = be64_vec(300_700);
+        let hi = be64_vec(300_710);
+
+        let it = store
+            .scan_values_lww(
+                fid,
+                ValueScanOpts {
+                    dir: Direction::Reverse,
+                    lo: Bound::Included(&lo),
+                    hi: Bound::Excluded(&hi),
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    head_tag_len: 8,
+                    frame_predicate: None,
+                },
+            )
+            .expect("iterator");
+
+        let mut vals: Vec<u64> = Vec::new();
+        let mut keys: BTreeSet<u32> = BTreeSet::new();
+        for item in it {
+            let a = item.value.start as usize;
+            let b = item.value.end as usize;
+            vals.push(parse_be64(&item.value.data.as_ref()[a..b]));
+            keys.insert(parse_key_u32(&item.key));
+        }
+
+        // reverse monotonic in window
+        assert!(vals.windows(2).all(|w| w[0] >= w[1]));
+        assert_eq!(vals.len(), 10);
+
+        // keys are exactly 700..709
+        let expected: BTreeSet<u32> = (700u32..710u32).collect();
+        assert_eq!(keys, expected);
+
+        // endpoints
+        assert_eq!(vals.first().copied().unwrap(), 300_709);
+        assert_eq!(vals.last().copied().unwrap(), 300_700);
+    }
+
+    #[test]
+    fn scan_values_fww_forward_windowed_gen1_positive() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 102u32;
+        seed_three_generations(&store, fid);
+
+        // Window fully inside gen1 (i = 250..260) -> winners are gen1 under FWW
+        let lo = be64_vec(1000 + 250);
+        let hi = be64_vec(1000 + 260);
+
+        let it = store
+            .scan_values_fww(
+                fid,
+                ValueScanOpts {
+                    dir: Direction::Forward,
+                    lo: Bound::Included(&lo),
+                    hi: Bound::Excluded(&hi),
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    head_tag_len: 8,
+                    frame_predicate: None,
+                },
+            )
+            .expect("iterator");
+
+        let mut vals: Vec<u64> = Vec::new();
+        let mut keys: BTreeSet<u32> = BTreeSet::new();
+        for item in it {
+            let a = item.value.start as usize;
+            let b = item.value.end as usize;
+            vals.push(parse_be64(&item.value.data.as_ref()[a..b]));
+            keys.insert(parse_key_u32(&item.key));
+        }
+
+        assert_eq!(vals.len(), 10);
+        assert!(vals.windows(2).all(|w| w[0] <= w[1])); // forward monotonic
+        let expected_keys: BTreeSet<u32> = (250u32..260u32).collect();
+        assert_eq!(keys, expected_keys);
+        assert_eq!(vals.first().copied().unwrap(), 1000 + 250);
+        assert_eq!(vals.last().copied().unwrap(), 1000 + 259);
+    }
+
+    #[test]
+    fn scan_values_fww_forward_windowed_gen2_strict_suppression() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 103u32;
+        seed_three_generations(&store, fid);
+
+        // Window fully inside gen2’s value band (i = 250..260).
+        // Under strict FWW, the winners for those keys are in gen1,
+        // whose values (1000+i) lie OUTSIDE this window -> expect empty.
+        let lo = be64_vec(200_250);
+        let hi = be64_vec(200_260);
+
+        let it = store
+            .scan_values_fww(
+                fid,
+                ValueScanOpts {
+                    dir: Direction::Forward,
+                    lo: Bound::Included(&lo),
+                    hi: Bound::Excluded(&hi),
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    head_tag_len: 8,
+                    frame_predicate: None,
+                },
+            )
+            .expect("iterator");
+
+        assert_eq!(
+            it.count(),
+            0,
+            "strict FWW suppresses newer rewrites in-window"
+        );
+    }
+
+    #[test]
+    fn scan_values_fww_reverse_windowed_gen1() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 104u32;
+        seed_three_generations(&store, fid);
+
+        // Window at the high end of gen1 (i = 990..1000)
+        let lo = be64_vec(1000 + 990);
+        let hi = be64_vec(1000 + 1000);
+
+        let it = store
+            .scan_values_fww(
+                fid,
+                ValueScanOpts {
+                    dir: Direction::Reverse,
+                    lo: Bound::Included(&lo),
+                    hi: Bound::Excluded(&hi),
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    head_tag_len: 8,
+                    frame_predicate: None,
+                },
+            )
+            .expect("iterator");
+
+        let mut vals: Vec<u64> = Vec::new();
+        let mut keys: Vec<u32> = Vec::new();
+        for item in it {
+            let a = item.value.start as usize;
+            let b = item.value.end as usize;
+            vals.push(parse_be64(&item.value.data.as_ref()[a..b]));
+            keys.push(parse_key_u32(&item.key));
+        }
+
+        // reverse monotonic & correct endpoints
+        assert_eq!(vals.len(), 10);
+        assert!(vals.windows(2).all(|w| w[0] >= w[1]));
+        assert_eq!(vals.first().copied().unwrap(), 1000 + 999);
+        assert_eq!(vals.last().copied().unwrap(), 1000 + 990);
+
+        // exact keys
+        let expected: Vec<u32> = (990u32..1000u32).rev().collect();
+        assert_eq!(keys, expected);
+    }
 }
