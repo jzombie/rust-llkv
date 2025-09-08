@@ -7,7 +7,7 @@
 //!
 //! - Newer segments are batch-loaded as IndexSegment (no data blobs).
 //! - Active segments (value producers) load index + data blobs once.
-//! - Frame predicate is evaluated on encoded keys (zero copy).
+//! - Frame predicate is evaluated on encoded values (zero copy).
 
 use crate::bounds::ValueBound;
 use crate::column_index::{IndexSegment, ValueIndex};
@@ -29,7 +29,16 @@ pub enum Direction {
     Reverse,
 }
 
-/// Frame predicate type over encoded keys.
+/// Conflict resolution across generations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictPolicy {
+    /// Newest write wins: suppress older versions of the same key.
+    LWW,
+    /// First (oldest) write wins: suppress newer versions of the same key.
+    FWW,
+}
+
+/// Frame predicate type over encoded **values** (head vs current).
 pub type FramePred = Arc<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync>;
 
 /// Scan options for value-ordered range scans.
@@ -43,7 +52,7 @@ pub struct ValueScanOpts<'a> {
     pub bucket_prefix_len: usize,
     /// Head tag width in bytes used for fast compares.
     pub head_tag_len: usize,
-    /// Optional end-of-frame predicate on encoded keys.
+    /// Optional end-of-frame predicate on encoded **values**.
     pub frame_predicate: Option<FramePred>,
 }
 
@@ -80,8 +89,8 @@ struct SegCtx<P: Pager> {
     end: usize,
 }
 
-/// Minimal metadata for newer segments used by LWW membership.
-struct LwwRef {
+/// Minimal metadata for shadow (index-only) membership checks.
+struct ShadowRef {
     pk: PhysicalKey,
     rank: usize,
 }
@@ -94,16 +103,18 @@ pub struct ValueScan<P: Pager> {
     _lo: Bound<Vec<u8>>,
     _hi: Bound<Vec<u8>>,
     reverse: bool,
-    frame_pred: Option<FramePred>,
-    frame_head: Option<Vec<u8>>,
+    frame_pred: Option<FramePred>,           // evaluated on VALUE bytes
+    frame_head: Option<ValueSlice<P::Blob>>, // first emitted VALUE slice (zero-copy)
     halted: bool,
-    /// Strict LWW: newer segment refs grouped by rank (0 newest).
-    newer_by_rank: Vec<Vec<LwwRef>>,
-    /// Newer segments' index blobs (no data blobs).
-    newer_seg_map: FxHashMap<PhysicalKey, IndexSegment>,
+    /// Shadow refs grouped by rank for conflict evaluation.
+    shadow_by_rank: Vec<Vec<ShadowRef>>,
+    /// Prefetched index blobs for shadow refs (no data blobs).
+    shadow_seg_map: FxHashMap<PhysicalKey, IndexSegment>,
     /// PQ tuning (copied from opts).
     bucket_prefix_len: usize,
     head_tag_len: usize,
+    /// Conflict policy.
+    policy: ConflictPolicy,
 }
 
 /// Min-heap per bucket with a 65,536-bit tier-1 directory.
@@ -210,9 +221,8 @@ impl<P: Pager> PartialEq for Node<P> {
 }
 impl<P: Pager> Ord for Node<P> {
     fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap takes the greatest; we always wrap with Reverse,
-        // so this `cmp` defines "ascending" for forward and "descending"
-        // for reverse by flipping comparisons at the value levels only.
+        // BinaryHeap takes the greatest; we wrap with Reverse,
+        // so this defines ascending for Forward and descending for Reverse.
         let mut ord = if !self.reverse {
             self.bucket.cmp(&other.bucket)
         } else {
@@ -258,13 +268,31 @@ impl<P: Pager> PartialOrd for Node<P> {
 
 impl<P: Pager> super::ColumnStore<'_, P> {
     /// LWW-enforced, value-ordered scan over [lo, hi).
-    /// NOTE: requires segments to have `value_index`.
     pub fn scan_values_lww(
         &self,
         field_id: LogicalFieldId,
         opts: ValueScanOpts<'_>,
     ) -> Result<ValueScan<P>, ScanError> {
-        ValueScan::new(self, field_id, opts)
+        ValueScan::new(self, field_id, opts, ConflictPolicy::LWW)
+    }
+
+    /// FWW-enforced, value-ordered scan over [lo, hi).
+    pub fn scan_values_fww(
+        &self,
+        field_id: LogicalFieldId,
+        opts: ValueScanOpts<'_>,
+    ) -> Result<ValueScan<P>, ScanError> {
+        ValueScan::new(self, field_id, opts, ConflictPolicy::FWW)
+    }
+
+    /// Generic: explicit conflict policy.
+    pub fn scan_values_with_policy(
+        &self,
+        field_id: LogicalFieldId,
+        opts: ValueScanOpts<'_>,
+        policy: ConflictPolicy,
+    ) -> Result<ValueScan<P>, ScanError> {
+        ValueScan::new(self, field_id, opts, policy)
     }
 }
 
@@ -281,6 +309,7 @@ impl<P: Pager> ValueScan<P> {
         col: &super::ColumnStore<'_, P>,
         field_id: LogicalFieldId,
         opts: ValueScanOpts<'_>,
+        policy: ConflictPolicy,
     ) -> Result<Self, ScanError> {
         // -------- ensure ColumnIndex in cache ----------
         let colindex = {
@@ -337,17 +366,53 @@ impl<P: Pager> ValueScan<P> {
             return Err(ScanError::NoActiveSegments);
         }
 
-        // Collect sets to classify typed results.
-        let mut active_index_pks: FxHashSet<PhysicalKey> = FxHashSet::default();
-        let mut active_data_pks: FxHashSet<PhysicalKey> = FxHashSet::default();
+        // ---- active rank stats ----
+        let total_ranks = colindex.segments.len();
+        let mut active_ranks: Vec<usize> = Vec::with_capacity(act_refs.len());
+        for r in &act_refs {
+            active_ranks.push(*seg_rank.get(&r.index_physical_key).unwrap_or(&usize::MAX));
+        }
+        let min_active_rank = *active_ranks.iter().min().unwrap_or(&0);
+        let max_active_rank = *active_ranks.iter().max().unwrap_or(&0);
+
+        // ---- active logical-key spans (borrowed; no clones) ----
+        let mut active_spans: Vec<(&[u8], &[u8])> = Vec::new();
+        for r in &act_refs {
+            active_spans.push((r.logical_key_min.as_slice(), r.logical_key_max.as_slice()));
+        }
+
+        // ---- compute shadow refs depending on policy ----
+        let mut shadow_refs_all: Vec<ShadowRef> = Vec::new();
+        for (rank, r) in colindex.segments.iter().enumerate() {
+            let needed = match policy {
+                // rank 0 is newest; include strictly newer than some active
+                ConflictPolicy::LWW => rank < max_active_rank,
+                // include strictly older than some active
+                ConflictPolicy::FWW => rank > min_active_rank,
+            };
+            if !needed {
+                continue;
+            }
+            if overlaps_any(
+                r.logical_key_min.as_slice(),
+                r.logical_key_max.as_slice(),
+                &active_spans,
+            ) {
+                shadow_refs_all.push(ShadowRef {
+                    pk: r.index_physical_key,
+                    rank,
+                });
+            }
+        }
+
+        // ---- build gets: active (index+data) + shadow (index-only) ----
+        let mut gets: Vec<BatchGet> =
+            Vec::with_capacity(act_refs.len() * 2 + shadow_refs_all.len());
+        let mut active_index_pks = FxHashSet::default();
+        let mut active_data_pks = FxHashSet::default();
         for r in &act_refs {
             active_index_pks.insert(r.index_physical_key);
             active_data_pks.insert(r.data_physical_key);
-        }
-
-        // Collect index+data gets for active segments.
-        let mut gets: Vec<BatchGet> = Vec::with_capacity(act_refs.len() * 2);
-        for r in &act_refs {
             gets.push(BatchGet::Typed {
                 key: r.index_physical_key,
                 kind: TypedKind::IndexSegment,
@@ -356,44 +421,11 @@ impl<P: Pager> ValueScan<P> {
                 key: r.data_physical_key,
             });
         }
-
-        // -------- determine newer segments needed for strict LWW ----
-        let max_active_rank = act_refs
-            .iter()
-            .map(|r| *seg_rank.get(&r.index_physical_key).unwrap_or(&0))
-            .max()
-            .unwrap_or(0);
-
-        // Build a list of active logical key spans (borrowed; no clones).
-        let mut active_spans: Vec<(&[u8], &[u8])> = Vec::new();
-        for r in &act_refs {
-            active_spans.push((r.logical_key_min.as_slice(), r.logical_key_max.as_slice()));
-        }
-
-        let mut newer_refs_all: Vec<LwwRef> = Vec::new();
-        for (rank, r) in colindex.segments.iter().enumerate() {
-            if rank >= max_active_rank {
-                continue;
-            }
-            if overlaps_any(
-                r.logical_key_min.as_slice(),
-                r.logical_key_max.as_slice(),
-                &active_spans,
-            ) {
-                newer_refs_all.push(LwwRef {
-                    pk: r.index_physical_key,
-                    rank,
-                });
-            }
-        }
-
-        // Batch-load index blobs for all these newer segments (typed only).
-        let mut lww_gets: Vec<BatchGet> = Vec::new();
         {
             let mut seen = FxHashSet::default();
-            for rf in &newer_refs_all {
+            for rf in &shadow_refs_all {
                 if seen.insert(rf.pk) && !active_index_pks.contains(&rf.pk) {
-                    lww_gets.push(BatchGet::Typed {
+                    gets.push(BatchGet::Typed {
                         key: rf.pk,
                         kind: TypedKind::IndexSegment,
                     });
@@ -401,12 +433,12 @@ impl<P: Pager> ValueScan<P> {
             }
         }
 
-        // Execute both batches in one call.
-        let mut resp = col.do_gets([gets, lww_gets].concat());
+        // ---- fetch everything in one go ----
+        let mut resp = col.do_gets(gets);
 
         let mut seg_map: FxHashMap<PhysicalKey, IndexSegment> = FxHashMap::default();
         let mut data_map: FxHashMap<PhysicalKey, P::Blob> = FxHashMap::default();
-        let mut newer_seg_map: FxHashMap<PhysicalKey, IndexSegment> = FxHashMap::default();
+        let mut shadow_seg_map: FxHashMap<PhysicalKey, IndexSegment> = FxHashMap::default();
 
         for gr in resp.drain(..) {
             match gr {
@@ -417,7 +449,7 @@ impl<P: Pager> ValueScan<P> {
                     if active_index_pks.contains(&key) {
                         seg_map.insert(key, seg);
                     } else {
-                        newer_seg_map.insert(key, seg);
+                        shadow_seg_map.insert(key, seg);
                     }
                 }
                 GetResult::Raw { key, bytes } => {
@@ -429,11 +461,11 @@ impl<P: Pager> ValueScan<P> {
             }
         }
 
-        // Build newer_by_rank without requiring Clone on Vec<LwwRef>.
-        let mut newer_by_rank: Vec<Vec<LwwRef>> = Vec::new();
-        newer_by_rank.resize_with(max_active_rank, Vec::new);
-        for rf in newer_refs_all {
-            newer_by_rank[rf.rank].push(rf);
+        // ---- index shadow refs by rank (length = total_ranks) ----
+        let mut shadow_by_rank: Vec<Vec<ShadowRef>> = Vec::new();
+        shadow_by_rank.resize_with(total_ranks, Vec::new);
+        for rf in shadow_refs_all {
+            shadow_by_rank[rf.rank].push(rf);
         }
 
         // -------- build cursors and PQ heads ----------
@@ -517,30 +549,64 @@ impl<P: Pager> ValueScan<P> {
             frame_pred: opts.frame_predicate.clone(),
             frame_head: None,
             halted: false,
-            newer_by_rank,
-            newer_seg_map,
+            shadow_by_rank,
+            shadow_seg_map,
             bucket_prefix_len: opts.bucket_prefix_len,
             head_tag_len: opts.head_tag_len,
+            policy,
         })
     }
 
-    /// Strict LWW check: does any *newer* segment (smaller rank) contain `key`?
-    /// A newer tombstone also suppresses older values.
     #[inline]
-    fn lww_shadowed(&self, key: &[u8], older_rank: usize) -> bool {
-        for sc in self.segs.iter() {
-            if sc.rank >= older_rank {
-                continue;
-            }
-            if let Some(_pos) = crate::layout::KeyLayout::binary_search_key_with_layout(
-                &sc.seg.logical_key_bytes,
-                &sc.seg.key_layout,
-                sc.seg.n_entries as usize,
-                key,
-            ) {
-                // Found in a newer segment. Whether it is a real value or a tombstone,
-                // it shadows older segments for LWW semantics.
+    fn key_in_index(seg: &IndexSegment, key: &[u8]) -> bool {
+        KeyLayout::binary_search_key_with_layout(
+            &seg.logical_key_bytes,
+            &seg.key_layout,
+            seg.n_entries as usize,
+            key,
+        )
+        .is_some()
+    }
+
+    /// Is this `key@rank` shadowed by the chosen policy?
+    fn is_shadowed(&self, key: &[u8], rank: usize) -> bool {
+        // 1) Active segments we already hold (index+data).
+        for sc in &self.segs {
+            let rel = sc.rank as isize - rank as isize;
+            let dominates = match self.policy {
+                ConflictPolicy::LWW => rel < 0, // newer dominates
+                ConflictPolicy::FWW => rel > 0, // older dominates
+            };
+            if dominates && Self::key_in_index(&sc.seg, key) {
                 return true;
+            }
+        }
+
+        // 2) Shadow segments (index-only).
+        match self.policy {
+            ConflictPolicy::LWW => {
+                // Check strictly newer ranks [0 .. rank)
+                for r in 0..rank {
+                    for rf in &self.shadow_by_rank[r] {
+                        if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
+                            if Self::key_in_index(seg, key) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            ConflictPolicy::FWW => {
+                // Check strictly older ranks (rank+1 ..)
+                for r in (rank + 1)..self.shadow_by_rank.len() {
+                    for rf in &self.shadow_by_rank[r] {
+                        if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
+                            if Self::key_in_index(seg, key) {
+                                return true;
+                            }
+                        }
+                    }
+                }
             }
         }
         false
@@ -551,15 +617,19 @@ impl<P: Pager> Iterator for ValueScan<P> {
     type Item = ValueScanItem<P::Blob>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.halted {
+            return None;
+        }
+
         loop {
             let node = self.pq.pop(self.reverse)?;
             let seg_idx = node.seg_idx;
 
             // ---- short immutable borrow to slice key and plan next head ----
-            let (key_owned, rank, begin, end, next_pos_opt, next_val_opt) = {
+            let (key_owned, rank, next_pos_opt, next_val_opt) = {
                 let sc = &self.segs[seg_idx];
                 let row_pos = row_pos_at(&sc.seg, node.pos);
-                let key_slice = crate::layout::KeyLayout::slice_key_by_layout(
+                let key_slice = KeyLayout::slice_key_by_layout(
                     &sc.seg.logical_key_bytes,
                     &sc.seg.key_layout,
                     row_pos,
@@ -570,12 +640,12 @@ impl<P: Pager> Iterator for ValueScan<P> {
                 let end = sc.end;
                 let next_pos_opt = next_pos(node.pos, begin, end, self.reverse);
                 let next_val_opt = next_pos_opt.map(|np| slice_value::<P>(&sc.seg, &sc.data, np));
-                (key_owned, sc.rank, begin, end, next_pos_opt, next_val_opt)
+                (key_owned, sc.rank, next_pos_opt, next_val_opt)
             };
             // ---- immutable borrow dropped here ----
 
-            // Strict LWW: skip if any newer segment contains this key.
-            if self.lww_shadowed(key_owned.as_slice(), rank) {
+            // Conflict policy: skip if shadowed.
+            if self.is_shadowed(key_owned.as_slice(), rank) {
                 if let (Some(np), Some(val)) = (next_pos_opt, next_val_opt) {
                     let (bkt, tag) = {
                         let a = val.start as usize;
@@ -596,7 +666,29 @@ impl<P: Pager> Iterator for ValueScan<P> {
                 continue;
             }
 
-            // Advance this segment by pushing its next head, if any.
+            // Frame predicate on VALUE bytes (head vs current).
+            if let Some(pred) = &self.frame_pred {
+                if let Some(ref head_slice) = self.frame_head {
+                    let ha = head_slice.start as usize;
+                    let hb = head_slice.end as usize;
+                    let head = &head_slice.data.as_ref()[ha..hb];
+                    let ca = node.val.start as usize;
+                    let cb = node.val.end as usize;
+                    let cur = &node.val.data.as_ref()[ca..cb];
+                    if !(pred)(head, cur) {
+                        self.halted = true;
+                        return None;
+                    }
+                } else {
+                    // initialize head to first emitted value
+                    self.frame_head = Some(node.val.clone());
+                }
+            } else if self.frame_head.is_none() {
+                // keep consistent semantics even if predicate added later
+                self.frame_head = Some(node.val.clone());
+            }
+
+            // Accept: advance this segment by pushing its next head, if any.
             if let (Some(np), Some(val)) = (next_pos_opt, next_val_opt) {
                 let (bkt, tag) = {
                     let a = val.start as usize;
@@ -611,7 +703,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
                     seg_idx,
                     pos: np,
                     val,
-                    reverse: self.reverse, // <- required
+                    reverse: self.reverse,
                 });
             }
 
@@ -631,8 +723,10 @@ fn next_pos(cur: usize, begin: usize, end: usize, reverse: bool) -> Option<usize
     if !reverse {
         let np = cur + 1;
         if np < end { Some(np) } else { None }
+    } else if cur > begin {
+        Some(cur - 1)
     } else {
-        if cur > begin { Some(cur - 1) } else { None }
+        None
     }
 }
 
@@ -743,9 +837,9 @@ fn upper_bound_by_value<P: Pager>(
         let pos = row_pos_at(seg, mid);
         let cmp = cmp_value_at::<P>(seg, data, pos, probe);
         let go_right = if include_equal {
-            cmp != Ordering::Greater
+            cmp != Ordering::Greater // <=
         } else {
-            cmp == Ordering::Less
+            cmp == Ordering::Less // <
         };
         if go_right {
             lo = mid + 1;
@@ -964,7 +1058,7 @@ mod value_scan_tests {
             let a = item.value.start as usize;
             let b = item.value.end as usize;
             let v = parse_be64(&item.value.data.as_ref()[a..b]);
-            // Expect uniqueness (LWW shadowing applied)
+            // Expect uniqueness (shadowing applied)
             assert!(by_key.insert(k, v).is_none(), "duplicate key {k} in scan");
         }
 
@@ -1024,7 +1118,7 @@ mod value_scan_tests {
             vals.insert(v);
         }
 
-        // In that slice we expect 10 items (i = 250..259), if LWW is applied.
+        // In that slice we expect 10 items (i = 250..259), if shadowing is applied.
         assert_eq!(keys.len(), 10, "value-window result size");
         // ensure keys are the right ones
         let expected: BTreeSet<u32> = (250u32..260u32).collect();
@@ -1034,98 +1128,122 @@ mod value_scan_tests {
         assert_eq!(vals, expected_vals);
     }
 
-    /// (Placeholder) Reverse scan behavior.
-    /// Once `Direction::Reverse` is supported by the scanner, enable this.
+    /// Reverse scan order contract (LWW).
     #[test]
-    #[ignore = "enable once reverse scans are wired (Direction::Reverse)"]
     fn scan_values_lww_reverse_order_contract() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
         let fid = 99u32;
         seed_three_generations(&store, fid);
 
-        // PSEUDOCODE once reverse is supported:
-        // let it = store.scan_values_with_policy(
-        //     fid,
-        //     ScanOpts {
-        //         dir: Direction::Reverse,
-        //         lo: Bound::Unbounded,
-        //         hi: Bound::Unbounded,
-        //         prefix: None,
-        //         frame_predicate: None,
-        //         ..Default::default()
-        //     }.with_conflict(ConflictPolicy::LWW)
-        // )?;
-        // let values: Vec<u64> = it.map(|x| parse_be64(&x.value.bytes(..))).collect();
-        // assert!(values.windows(2).all(|w| w[0] >= w[1]));
-        let _ = store; // silence unused until reverse exists
+        let it = store
+            .scan_values_lww(
+                fid,
+                ValueScanOpts {
+                    dir: Direction::Reverse,
+                    lo: Bound::Unbounded,
+                    hi: Bound::Unbounded,
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    head_tag_len: 8,
+                    frame_predicate: None,
+                },
+            )
+            .expect("iterator");
+
+        let mut prev: Option<u64> = None;
+        for item in it {
+            let a = item.value.start as usize;
+            let b = item.value.end as usize;
+            let v = parse_be64(&item.value.data.as_ref()[a..b]);
+            if let Some(pv) = prev {
+                assert!(v <= pv, "reverse order expected: {} <= {}", v, pv);
+            }
+            prev = Some(v);
+        }
     }
 
-    /// (Placeholder) FWW semantics: oldest wins.
-    /// Enable after you surface ConflictPolicy::{LWW,FWW} on the scanner API.
+    /// FWW semantics: oldest wins.
     #[test]
-    #[ignore = "enable once ConflictPolicy::FWW is exposed on scan API"]
     fn scan_values_fww_forward_contract() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
         let fid = 5u32;
         seed_three_generations(&store, fid);
 
-        // PSEUDOCODE once FWW is available:
-        // let it = store.scan_values_with_policy(
-        //     fid,
-        //     ScanOpts {
-        //         dir: Direction::Forward,
-        //         lo: Bound::Unbounded,
-        //         hi: Bound::Unbounded,
-        //         prefix: None,
-        //         frame_predicate: None,
-        //         ..Default::default()
-        //     }.with_conflict(ConflictPolicy::FWW)
-        // )?;
-        // let by_key = collect_map(it);
-        //
+        let it = store
+            .scan_values_fww(
+                fid,
+                ValueScanOpts {
+                    dir: Direction::Forward,
+                    lo: Bound::Unbounded,
+                    hi: Bound::Unbounded,
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    head_tag_len: 8,
+                    frame_predicate: None,
+                },
+            )
+            .expect("iterator");
+
+        let mut by_key: BTreeMap<u32, u64> = BTreeMap::new();
+        for item in it {
+            let k = parse_key_u32(&item.key);
+            let a = item.value.start as usize;
+            let b = item.value.end as usize;
+            let v = parse_be64(&item.value.data.as_ref()[a..b]);
+            assert!(by_key.insert(k, v).is_none(), "duplicate key {}", k);
+        }
+
         // Oldest wins expectation:
-        //   [0,1000)  -> gen1
-        //   [1000,1200) -> gen2
-        //   [1200,1400) -> gen3
-        // assert_eq!(by_key[&0],    1000 + 0);
-        // assert_eq!(by_key[&999],  1000 + 999);
-        // assert_eq!(by_key[&1000], 200_000 + 1000);
-        // assert_eq!(by_key[&1199], 200_000 + 1199);
-        // assert_eq!(by_key[&1200], 300_000 + 1200);
-        // assert_eq!(by_key[&1399], 300_000 + 1399);
-        let _ = store; // silence unused until FWW exists
+        // [0,1000) -> gen1; [1000,1200) -> gen2; [1200,1400) -> gen3
+        assert_eq!(by_key[&0], 1000 + 0);
+        assert_eq!(by_key[&999], 1000 + 999);
+        assert_eq!(by_key[&1000], 200_000 + 1000);
+        assert_eq!(by_key[&1199], 200_000 + 1199);
+        assert_eq!(by_key[&1200], 300_000 + 1200);
+        assert_eq!(by_key[&1399], 300_000 + 1399);
     }
 
-    /// (Placeholder) Frame predicate/windowing contract.
+    /// Frame predicate/windowing contract (on values).
     #[test]
-    #[ignore = "enable once frame_predicate is wired"]
     fn scan_values_lww_frame_predicate_contract() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
         let fid = 12u32;
         seed_three_generations(&store, fid);
 
-        // PSEUDOCODE once frame predicate exists:
-        // let cap = 64u64;
-        // let it = store.scan_values_with_policy(
-        //     fid,
-        //     ScanOpts {
-        //         dir: Direction::Forward,
-        //         lo: Bound::Unbounded,
-        //         hi: Bound::Unbounded,
-        //         prefix: None,
-        //         frame_predicate: Some(Arc::new(move |head, cur| {
-        //             // stop when value delta > cap
-        //             let hv = parse_be64(head);
-        //             let cv = parse_be64(cur);
-        //             cv - hv <= cap
-        //         })),
-        //     }.with_conflict(ConflictPolicy::LWW)
-        // )?;
-        // let v: Vec<u64> = it.map(|x| parse_be64(bytes(&x.value))).collect();
-        // assert!(v.len() <= 65);
-        let _ = store;
+        let cap = 64u64;
+        let it = store
+            .scan_values_lww(
+                fid,
+                ValueScanOpts {
+                    dir: Direction::Forward,
+                    lo: Bound::Unbounded,
+                    hi: Bound::Unbounded,
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    head_tag_len: 8,
+                    frame_predicate: Some(Arc::new(move |head, cur| {
+                        let hv = parse_be64(head);
+                        let cv = parse_be64(cur);
+                        cv - hv <= cap
+                    })),
+                },
+            )
+            .expect("iterator");
+
+        let vals: Vec<u64> = it
+            .map(|x| {
+                let a = x.value.start as usize;
+                let b = x.value.end as usize;
+                parse_be64(&x.value.data.as_ref()[a..b])
+            })
+            .collect();
+
+        assert!(!vals.is_empty());
+        if let Some(&head) = vals.first() {
+            assert!(vals.iter().all(|&v| v - head <= cap));
+        }
     }
 }
