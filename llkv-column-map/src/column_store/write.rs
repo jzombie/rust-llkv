@@ -7,10 +7,13 @@ use crate::types::{
     TypedValue,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::borrow::Cow;
 
-pub struct Put {
+pub struct Put<'a> {
     pub field_id: LogicalFieldId,
-    pub items: Vec<(LogicalKeyBytes, Vec<u8>)>, // unordered; duplicates allowed (last wins)
+    // TODO: Alias accordingly
+    // pub items: Vec<(LogicalKeyBytes, Vec<u8>)>, // unordered; duplicates allowed (last wins)
+    pub items: Vec<(Cow<'a, [u8]>, Cow<'a, [u8]>)>, // unordered; duplicates allowed (last wins)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -70,16 +73,19 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
             if opts.last_write_wins_in_batch {
                 // last wins: overwrite by key
-                let mut last: FxHashMap<LogicalKeyBytes, Vec<u8>> =
+                let mut last: FxHashMap<Vec<u8>, Vec<u8>> =
                     FxHashMap::with_capacity_and_hasher(put.items.len(), Default::default());
                 for (k, v) in put.items {
-                    last.insert(k, v);
+                    last.insert(k.into_owned(), v.into_owned());
                 }
-                put.items = last.into_iter().collect();
+                put.items = last
+                    .into_iter()
+                    .map(|(k, v)| (Cow::Owned(k), Cow::Owned(v)))
+                    .collect();
             }
 
             // sort by key
-            put.items.sort_by(|a, b| a.0.cmp(&b.0));
+            put.items.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
 
             // decide layout
             let layout = match opts.mode {
@@ -146,13 +152,12 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 };
 
                 let end = i + take;
-                let mut keys_sorted = Vec::with_capacity(take);
-                let mut vals = Vec::with_capacity(take);
+                let mut keys_sorted: Vec<Vec<u8>> = Vec::with_capacity(take);
+                let mut vals: Vec<Vec<u8>> = Vec::with_capacity(take);
                 for (k, v) in put.items[i..end].iter() {
-                    keys_sorted.push(k.clone());
-                    vals.push(v.clone());
+                    keys_sorted.push(k.to_vec());
+                    vals.push(v.to_vec());
                 }
-
                 planned_chunks.push(PlannedChunk {
                     field_id: put.field_id,
                     keys_sorted,
@@ -405,7 +410,10 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             .into_iter()
             .map(|(fid, keys)| Put {
                 field_id: fid,
-                items: keys.into_iter().map(|k| (k, Vec::<u8>::new())).collect(),
+                items: keys
+                    .into_iter()
+                    .map(|k| (Cow::Owned(k), Cow::Borrowed(&[] as &[u8])))
+                    .collect(),
             })
             .collect();
 

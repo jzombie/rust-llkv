@@ -206,9 +206,10 @@ mod tests {
 
     // Use the unified in-memory pager from the pager module.
     use crate::bounds::ValueBound;
-    use crate::codecs::key::u64_be;
+    use crate::codecs::key::{u64_be, u64_be_arr};
     use crate::column_index::IndexSegmentRef;
     use crate::storage::pager::MemPager;
+    use std::borrow::Cow;
 
     #[test]
     fn put_get_fixed_auto() {
@@ -218,21 +219,18 @@ mod tests {
         let put = write::Put {
             field_id: 10,
             items: vec![
-                (b"k3".to_vec(), b"VVVVVVV3".to_vec()),
-                (b"k1".to_vec(), b"VVVVVVV1".to_vec()),
-                (b"k2".to_vec(), b"VVVVVVV2".to_vec()),
+                (b"k3".into(), b"VVVVVVV3".into()),
+                (b"k1".into(), b"VVVVVVV1".into()),
+                (b"k2".into(), b"VVVVVVV2".into()),
                 // duplicate key, last wins
-                (b"k1".to_vec(), b"NEWVVVV1".to_vec()),
+                (b"k1".into(), b"NEWVVVV1".into()),
             ],
         };
 
         store.append_many(vec![put], write::AppendOptions::default());
 
         // batch get across columns (here only field 10)
-        let got = store.get_many(vec![(
-            10,
-            vec![b"k1".to_vec(), b"k2".to_vec(), b"kX".to_vec()],
-        )]);
+        let got = store.get_many(vec![(10, vec![b"k1".into(), b"k2".into(), b"kX".into()])]);
 
         // got[0] corresponds to field 10's query vector
         assert_eq!(got[0][0].as_deref().unwrap(), b"NEWVVVV1");
@@ -254,8 +252,8 @@ mod tests {
         // Values of different sizes force variable layout.
         let mut items = Vec::new();
         for i in 0..1000u32 {
-            let k = format!("key{:04}", i).into_bytes();
-            let v = vec![b'A' + (i % 26) as u8; (i % 17 + 1) as usize]; // 1..17
+            let k = format!("key{:04}", i).into_bytes().into();
+            let v = vec![b'A' + (i % 26) as u8; (i % 17 + 1) as usize].into(); // 1..17
             items.push((k, v));
         }
 
@@ -312,9 +310,9 @@ mod tests {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
         let items = vec![
-            (b"a".to_vec(), vec![1u8; 4]),
-            (b"b".to_vec(), vec![2u8; 4]),
-            (b"c".to_vec(), vec![3u8; 4]),
+            (b"a".into(), vec![1u8; 4].into()),
+            (b"b".into(), vec![2u8; 4].into()),
+            (b"c".into(), vec![3u8; 4].into()),
         ];
         let opts = write::AppendOptions {
             mode: write::ValueMode::ForceFixed(4),
@@ -338,9 +336,9 @@ mod tests {
         let put = write::Put {
             field_id: fid,
             items: vec![
-                (b"k".to_vec(), b"AA".to_vec()),
-                (b"x".to_vec(), b"BB".to_vec()),
-                (b"k".to_vec(), b"ZZ".to_vec()),
+                (b"k".into(), b"AA".into()),
+                (b"x".into(), b"BB".into()),
+                (b"k".into(), b"ZZ".into()),
             ],
         };
 
@@ -354,7 +352,7 @@ mod tests {
         store.append_many(vec![put], opts);
 
         // Read back the two keys we wrote; "k" should be the LAST value ("ZZ").
-        let got = store.get_many(vec![(fid, vec![b"k".to_vec(), b"x".to_vec()])]);
+        let got = store.get_many(vec![(fid, vec![b"k".into(), b"x".into()])]);
         assert_eq!(got[0][0].as_deref().unwrap(), b"ZZ");
         assert_eq!(got[0][1].as_deref().unwrap(), b"BB");
 
@@ -384,9 +382,9 @@ mod tests {
         let put = write::Put {
             field_id: fid,
             items: vec![
-                (b"k".to_vec(), b"AA".to_vec()),
-                (b"x".to_vec(), b"BB".to_vec()),
-                (b"k".to_vec(), b"ZZ".to_vec()),
+                (b"k".into(), b"AA".into()),
+                (b"x".into(), b"BB".into()),
+                (b"k".into(), b"ZZ".into()),
             ],
         };
 
@@ -401,7 +399,7 @@ mod tests {
 
         // Reads for "k" will return one of the duplicate values.
         // (Order among equal keys after sort is not guaranteed.)
-        let got = store.get_many(vec![(fid, vec![b"k".to_vec(), b"x".to_vec()])]);
+        let got = store.get_many(vec![(fid, vec![b"k".into(), b"x".into()])]);
         let v_k = got[0][0].as_deref().unwrap();
         assert!(
             v_k == b"AA" || v_k == b"ZZ",
@@ -438,9 +436,13 @@ mod tests {
         // Make values fixed 4B to keep things simple.
 
         // Build segment A
-        let items_a: Vec<(Vec<u8>, Vec<u8>)> = (0u64..100u64)
-            .map(|k| (u64_be(k), vec![0xAA, 0, 0, 0]))
-            .collect();
+        let items_a = {
+            const BB4: &[u8] = &[0xAA, 0, 0, 0];
+            (0u64..100u64)
+                .map(|k| (Cow::Owned(u64_be_arr(k).to_vec()), Cow::Borrowed(BB4)))
+                .collect()
+        };
+
         store.append_many(
             vec![write::Put {
                 field_id: fid,
@@ -455,9 +457,14 @@ mod tests {
         );
 
         // Build segment B (newest)
-        let items_b: Vec<(Vec<u8>, Vec<u8>)> = (200u64..300u64)
-            .map(|k| (u64_be(k), vec![0xBB, 0, 0, 0]))
-            .collect();
+
+        let items_b = {
+            const BB4: &[u8] = &[0xBB, 0, 0, 0];
+            (200u64..300u64)
+                .map(|k| (Cow::Owned(u64_be_arr(k).to_vec()), Cow::Borrowed(BB4)))
+                .collect()
+        };
+
         store.append_many(
             vec![write::Put {
                 field_id: fid,
@@ -510,9 +517,9 @@ mod tests {
 
         // fixed 4B values with easy min/max
         let items = vec![
-            (b"k1".to_vec(), vec![9, 9, 9, 9]),
-            (b"k2".to_vec(), vec![0, 0, 0, 0]),       // min
-            (b"k3".to_vec(), vec![255, 255, 255, 1]), // max (lexicographic)
+            (b"k1".into(), vec![9, 9, 9, 9].into()),
+            (b"k2".into(), vec![0, 0, 0, 0].into()), // min
+            (b"k3".into(), vec![255, 255, 255, 1].into()), // max (lexicographic)
         ];
 
         store.append_many(
@@ -548,9 +555,9 @@ mod tests {
 
         // variable-length values; lexicographic min/max over raw bytes
         let items = vec![
-            (b"a".to_vec(), b"wolf".to_vec()),
-            (b"b".to_vec(), b"ant".to_vec()), // min ("ant" < "wolf" < "zebra")
-            (b"c".to_vec(), b"zebra".to_vec()), // max
+            (b"a".into(), b"wolf".into()),
+            (b"b".into(), b"ant".into()), // min ("ant" < "wolf" < "zebra")
+            (b"c".into(), b"zebra".into()), // max
         ];
 
         store.append_many(
@@ -588,7 +595,7 @@ mod tests {
         store.append_many(
             vec![write::Put {
                 field_id: fid,
-                items: vec![(b"k".to_vec(), huge.clone())],
+                items: vec![(b"k".into(), huge.into())],
             }],
             write::AppendOptions {
                 mode: write::ValueMode::ForceVariable,
@@ -643,9 +650,9 @@ mod tests {
         let put = write::Put {
             field_id: fid,
             items: vec![
-                (b"k1".to_vec(), b"val1".to_vec()),
-                (b"k2".to_vec(), b"val2".to_vec()),
-                (b"k3".to_vec(), b"val3".to_vec()),
+                (b"k1".into(), b"val1".into()),
+                (b"k2".into(), b"val2".into()),
+                (b"k3".into(), b"val3".into()),
             ],
         };
         store.append_many(vec![put], write::AppendOptions::default());
@@ -685,7 +692,7 @@ mod tests {
         // 5. Appending a new value for k2 should bring it back
         let put2 = write::Put {
             field_id: fid,
-            items: vec![(b"k2".to_vec(), b"new_val2".to_vec())],
+            items: vec![(b"k2".into(), b"new_val2".into())],
         };
         store.append_many(vec![put2], write::AppendOptions::default());
 

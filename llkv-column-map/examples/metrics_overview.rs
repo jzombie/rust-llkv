@@ -38,15 +38,21 @@ fn fixed_value(row: u64, field: u32, width: usize) -> Vec<u8> {
     }
 }
 
-fn build_put_fixed(field_id: LogicalFieldId, start: u64, end: u64, width: usize) -> Put {
+fn build_put_fixed(field_id: LogicalFieldId, start: u64, end: u64, width: usize) -> Put<'static> {
     let mut items = Vec::with_capacity((end - start) as usize);
     for r in start..end {
-        items.push((u64_be(r), fixed_value(r, field_id, width)));
+        items.push((u64_be(r).into(), fixed_value(r, field_id, width).into()));
     }
     Put { field_id, items }
 }
 
-fn build_put_var(field_id: LogicalFieldId, start: u64, end: u64, min: usize, max: usize) -> Put {
+fn build_put_var(
+    field_id: LogicalFieldId,
+    start: u64,
+    end: u64,
+    min: usize,
+    max: usize,
+) -> Put<'static> {
     let mut items = Vec::with_capacity((end - start) as usize);
     for r in start..end {
         // pseudo-var length that depends on (row, field)
@@ -57,7 +63,7 @@ fn build_put_var(field_id: LogicalFieldId, start: u64, end: u64, min: usize, max
             .rotate_left(13);
         let len = (min as u64 + (mix % span)) as usize;
         let byte = (((r as u32).wrapping_add(field_id)) & 0xFF) as u8;
-        items.push((u64_be(r), vec![byte; len]));
+        items.push((u64_be(r).into(), vec![byte; len].into()));
     }
     Put { field_id, items }
 }
@@ -300,9 +306,9 @@ fn main() {
         let put_100 = Put {
             field_id: 100,
             items: vec![
-                (u64_be(5), fixed_value(5, 100, 8)),
-                (u64_be(7), fixed_value(7, 100, 8)),
-                (u64_be(9), fixed_value(9, 100, 8)),
+                (u64_be(5).into(), fixed_value(5, 100, 8).into()),
+                (u64_be(7).into(), fixed_value(7, 100, 8).into()),
+                (u64_be(9).into(), fixed_value(9, 100, 8).into()),
             ],
         };
         // Brand-new variable-width col 999: write 10 keys [1000..1010).

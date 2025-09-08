@@ -49,7 +49,7 @@ const C1_ROWS: usize = 500;
 const C2_ROWS: usize = 500;
 const C3_ROWS: usize = 5_000;
 
-fn build_put_for_col1(start: usize, end: usize) -> Option<Put> {
+fn build_put_for_col1(start: usize, end: usize) -> Option<Put<'static>> {
     let s = start.min(C1_ROWS);
     let e = end.min(C1_ROWS);
     if s >= e {
@@ -59,12 +59,12 @@ fn build_put_for_col1(start: usize, end: usize) -> Option<Put> {
     for i in s..e {
         let key = format!("id:{:06}", i).into_bytes();
         let val = (i as u32).to_le_bytes().to_vec(); // width=4
-        items.push((key, val));
+        items.push((key.into(), val.into()));
     }
     Some(Put { field_id: 1, items })
 }
 
-fn build_put_for_col2(start: usize, end: usize) -> Option<Put> {
+fn build_put_for_col2(start: usize, end: usize) -> Option<Put<'static>> {
     let s = start.min(C2_ROWS);
     let e = end.min(C2_ROWS);
     if s >= e {
@@ -74,12 +74,12 @@ fn build_put_for_col2(start: usize, end: usize) -> Option<Put> {
     for i in s..e {
         let key = format!("id:{:06}", i).into_bytes();
         let len = i % 21 + 1; // 1..21
-        items.push((key, vec![b'A' + (i % 26) as u8; len]));
+        items.push((key.into(), vec![b'A' + (i % 26) as u8; len].into()));
     }
     Some(Put { field_id: 2, items })
 }
 
-fn build_put_for_col3(start: usize, end: usize) -> Option<Put> {
+fn build_put_for_col3(start: usize, end: usize) -> Option<Put<'static>> {
     let s = start.min(C3_ROWS);
     let e = end.min(C3_ROWS);
     if s >= e {
@@ -89,7 +89,7 @@ fn build_put_for_col3(start: usize, end: usize) -> Option<Put> {
     for i in s..e {
         let key = format!("k{:06}", i).into_bytes();
         let val = vec![0x55; 8]; // width=8
-        items.push((key, val));
+        items.push((key.into(), val.into()));
     }
     Some(Put { field_id: 3, items })
 }
