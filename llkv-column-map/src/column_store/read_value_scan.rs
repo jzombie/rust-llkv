@@ -2,8 +2,8 @@
 //!
 //! Iterator uses per-segment value_order + L1/L2 directories to seed
 //! one head per candidate segment, and a 2-tier radix PQ to pop the
-//! next smallest value across segments. LWW gate is a placeholder;
-//! wire in newest[key] before enabling in prod.
+//! next value across segments. LWW gate is a placeholder; wire in
+//! newest[key] before enabling in prod.
 
 use crate::bounds::ValueBound;
 use crate::column_index::{IndexSegment, ValueIndex};
@@ -16,27 +16,43 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::ops::Bound;
+use std::sync::Arc;
+
+/// Direction for value-ordered scans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Forward,
+    Reverse,
+}
+
+/// Frame predicate type over encoded keys.
+pub type FramePred = Arc<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync>;
 
 /// Scan options for value-ordered range scans.
 pub struct ValueScanOpts<'a> {
+    pub dir: Direction,
     pub lo: Bound<&'a [u8]>,
     pub hi: Bound<&'a [u8]>,
     /// Optional prefix to prune quickly (value-side).
     pub prefix: Option<&'a [u8]>,
     /// First 2 bytes are the bucket id. Keep at 2 for now.
     pub bucket_prefix_len: usize,
-    /// Head tag width in bytes used for fast compares (8 or 16 typical).
+    /// Head tag width in bytes used for fast compares.
     pub head_tag_len: usize,
+    /// Optional end-of-frame predicate on encoded keys.
+    pub frame_predicate: Option<FramePred>,
 }
 
 impl<'a> Default for ValueScanOpts<'a> {
     fn default() -> Self {
         Self {
+            dir: Direction::Forward,
             lo: Bound::Unbounded,
             hi: Bound::Unbounded,
             prefix: None,
             bucket_prefix_len: 2,
             head_tag_len: 8,
+            frame_predicate: None,
         }
     }
 }
@@ -55,8 +71,8 @@ struct SegCtx<P: Pager> {
     data: P::Blob,
     /// Newest-first order rank (0 == newest).
     rank: usize,
-    /// [pos, end) in seg.value_index.value_order for this query window.
-    pos: usize,
+    /// Window in value_index.value_order: [begin, end)
+    begin: usize,
     end: usize,
 }
 
@@ -68,22 +84,69 @@ pub struct ValueScan<P: Pager> {
     /// Bounds copied for short-circuit checks.
     lo: Bound<Vec<u8>>,
     hi: Bound<Vec<u8>>,
+    /// Direction flag (true => reverse).
+    reverse: bool,
     /// Enable/disable LWW while wiring. Keep true in prod.
     enforce_lww: bool,
+    /// Frame predicate and head.
+    frame_pred: Option<FramePred>,
+    frame_head: Option<Vec<u8>>,
+    /// If frame ended, terminate immediately.
+    halted: bool,
 }
 
 /// Min-heap over active heads using a 2-tier radix design:
-/// Tier 1: 16-bit bucket id with a bitset (65,536 buckets).
-/// Tier 2: per-bucket heap ordered by (head_tag, full bytes, rank, pos).
+/// Tier 1: 16-bit bucket bitset (65,536 buckets).
+/// Tier 2: per-bucket heap ordered by value.
+/// - Forward: per-bucket min-heap (BinaryHeap<Reverse<Node>>).
+/// - Reverse: per-bucket max-heap (BinaryHeap<Node>).
 struct RadixPq<P: Pager> {
     bitset: [u64; 1024], // 1024 * 64 = 65,536 bits
-    buckets: HashMap<u16, SmallHeap<P>>,
+    reverse: bool,
+    buckets: HashMap<u16, BucketHeap<P>>,
+}
+
+enum BucketHeap<P: Pager> {
+    Fwd(BinaryHeap<std::cmp::Reverse<Node<P>>>),
+    Rev(BinaryHeap<Node<P>>),
+}
+
+impl<P: Pager> BucketHeap<P> {
+    fn new(reverse: bool) -> Self {
+        if reverse {
+            BucketHeap::Rev(BinaryHeap::new())
+        } else {
+            BucketHeap::Fwd(BinaryHeap::new())
+        }
+    }
+
+    fn push(&mut self, n: Node<P>) {
+        match self {
+            BucketHeap::Fwd(h) => h.push(std::cmp::Reverse(n)),
+            BucketHeap::Rev(h) => h.push(n),
+        }
+    }
+
+    fn pop(&mut self) -> Option<Node<P>> {
+        match self {
+            BucketHeap::Fwd(h) => h.pop().map(|r| r.0),
+            BucketHeap::Rev(h) => h.pop(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            BucketHeap::Fwd(h) => h.is_empty(),
+            BucketHeap::Rev(h) => h.is_empty(),
+        }
+    }
 }
 
 impl<P: Pager> RadixPq<P> {
-    fn new() -> Self {
+    fn new(reverse: bool) -> Self {
         Self {
             bitset: [0u64; 1024],
+            reverse,
             buckets: HashMap::new(),
         }
     }
@@ -94,13 +157,13 @@ impl<P: Pager> RadixPq<P> {
         let bit = 1u64 << (b % 64);
         self.buckets
             .entry(b)
-            .or_insert_with(SmallHeap::new)
+            .or_insert_with(|| BucketHeap::new(self.reverse))
             .push(node);
         self.bitset[idx] |= bit;
     }
 
     fn pop(&mut self) -> Option<Node<P>> {
-        let bi = self.find_lowest_bucket()?;
+        let bi = self.find_bucket()?;
         let heap = self.buckets.get_mut(&bi)?;
         let out = heap.pop()?;
         if heap.is_empty() {
@@ -112,13 +175,25 @@ impl<P: Pager> RadixPq<P> {
         Some(out)
     }
 
-    fn find_lowest_bucket(&self) -> Option<u16> {
-        for (i, word) in self.bitset.iter().enumerate() {
-            if *word == 0 {
-                continue;
+    fn find_bucket(&self) -> Option<u16> {
+        if !self.reverse {
+            for (i, word) in self.bitset.iter().enumerate() {
+                if *word == 0 {
+                    continue;
+                }
+                let t = word.trailing_zeros() as u16;
+                return Some(((i as u16) * 64) + t);
             }
-            let t = word.trailing_zeros() as u16;
-            return Some(((i as u16) * 64) + t);
+        } else {
+            for (i, word) in self.bitset.iter().enumerate().rev() {
+                if *word == 0 {
+                    continue;
+                }
+                // highest set bit in word
+                let lz = word.leading_zeros() as u16;
+                let bit = 63u16.saturating_sub(lz);
+                return Some(((i as u16) * 64) + bit);
+            }
         }
         None
     }
@@ -128,25 +203,7 @@ impl<P: Pager> RadixPq<P> {
     }
 }
 
-/// Small per-bucket heap using BinaryHeap with Reverse nodes.
-struct SmallHeap<P: Pager>(BinaryHeap<std::cmp::Reverse<Node<P>>>);
-
-impl<P: Pager> SmallHeap<P> {
-    fn new() -> Self {
-        Self(BinaryHeap::new())
-    }
-    fn push(&mut self, n: Node<P>) {
-        self.0.push(std::cmp::Reverse(n));
-    }
-    fn pop(&mut self) -> Option<Node<P>> {
-        self.0.pop().map(|r| r.0)
-    }
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-/// PQ node: one active head (segment cursor).
+/// Small per-bucket node with full ordering.
 #[derive(Clone)]
 struct Node<P: Pager> {
     bucket: u16,
@@ -167,7 +224,7 @@ impl<P: Pager> Node<P> {
     }
 }
 
-/// Order ascending by (bucket, head_tag, full bytes, rank asc, pos asc).
+/// Order ascending by (bucket, head_tag, full bytes, rank, pos).
 impl<P: Pager> Eq for Node<P> {}
 impl<P: Pager> PartialEq for Node<P> {
     fn eq(&self, other: &Self) -> bool {
@@ -180,7 +237,7 @@ impl<P: Pager> PartialEq for Node<P> {
 }
 impl<P: Pager> Ord for Node<P> {
     fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap is a max-heap; we wrap with Reverse in SmallHeap.
+        // BinaryHeap pops the "greatest". We use Reverse for forward.
         match self.bucket.cmp(&other.bucket) {
             Ordering::Equal => {}
             ord => return ord.reverse(),
@@ -322,7 +379,7 @@ impl<P: Pager> ValueScan<P> {
 
         // -------- build cursors and PQ heads ----------
         let mut segs: Vec<SegCtx<P>> = Vec::with_capacity(act_refs.len());
-        let mut pq = RadixPq::new();
+        let mut pq = RadixPq::new(matches!(opts.dir, Direction::Reverse));
 
         for r in act_refs {
             let seg = seg_map
@@ -337,10 +394,10 @@ impl<P: Pager> ValueScan<P> {
                 None => return Err(ScanError::ValueIndexMissing(r.index_physical_key)),
             };
 
-            // Compute [pos, end) in value_order for [lo, hi).
-            let (pos, end) = range_in_value_index::<P>(&seg, vix, &data, &opts.lo, &opts.hi);
+            // Compute [begin, end) in value_order for [lo, hi).
+            let (begin, end) = range_in_value_index::<P>(&seg, vix, &data, &opts.lo, &opts.hi);
 
-            if pos >= end {
+            if begin >= end {
                 continue;
             }
 
@@ -353,9 +410,16 @@ impl<P: Pager> ValueScan<P> {
                 seg,
                 data,
                 rank,
-                pos,
+                begin,
                 end,
             });
+
+            // Head position depends on direction.
+            let head_pos = if matches!(opts.dir, Direction::Reverse) {
+                end - 1
+            } else {
+                begin
+            };
 
             // Push the head node for this segment.
             let (seg_ref, data_ref) = {
@@ -363,7 +427,7 @@ impl<P: Pager> ValueScan<P> {
                 let d = &segs[seg_idx].data;
                 (s, d)
             };
-            let val = slice_value::<P>(seg_ref, data_ref, pos);
+            let val = slice_value::<P>(seg_ref, data_ref, head_pos);
             let (bucket, tag) = {
                 let a = val.start as usize;
                 let b = val.end as usize;
@@ -375,7 +439,7 @@ impl<P: Pager> ValueScan<P> {
                 head_tag: tag,
                 rank,
                 seg_idx,
-                pos,
+                pos: head_pos,
                 val,
             });
         }
@@ -390,7 +454,11 @@ impl<P: Pager> ValueScan<P> {
             field_id,
             lo: clone_bound_bytes(&opts.lo),
             hi: clone_bound_bytes(&opts.hi),
+            reverse: matches!(opts.dir, Direction::Reverse),
             enforce_lww: true,
+            frame_pred: opts.frame_predicate.clone(),
+            frame_head: None,
+            halted: false,
         })
     }
 }
@@ -399,6 +467,10 @@ impl<P: Pager> Iterator for ValueScan<P> {
     type Item = ValueScanItem<P::Blob>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.halted {
+            return None;
+        }
+
         loop {
             let node = self.pq.pop()?;
             let sc = &mut self.segs[node.seg_idx];
@@ -407,13 +479,13 @@ impl<P: Pager> Iterator for ValueScan<P> {
             if self.enforce_lww {
                 let accept = true;
                 if !accept {
-                    sc.pos += 1;
-                    if sc.pos < sc.end {
-                        let val = slice_value::<P>(&sc.seg, &sc.data, sc.pos);
+                    // Advance and continue.
+                    if let Some(np) = next_pos(node.pos, sc.begin, sc.end, self.reverse) {
+                        let val = slice_value::<P>(&sc.seg, &sc.data, np);
                         let (b, t) = {
                             let a = val.start as usize;
-                            let b = val.end as usize;
-                            let bytes = &val.data.as_ref()[a..b];
+                            let b2 = val.end as usize;
+                            let bytes = &val.data.as_ref()[a..b2];
                             bucket_and_tag(bytes, 2, 8)
                         };
                         self.pq.push(Node {
@@ -421,7 +493,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
                             head_tag: t,
                             rank: sc.rank,
                             seg_idx: node.seg_idx,
-                            pos: sc.pos,
+                            pos: np,
                             val,
                         });
                     }
@@ -433,10 +505,21 @@ impl<P: Pager> Iterator for ValueScan<P> {
             let row_pos = row_pos_at(&sc.seg, node.pos);
             let key = slice_key(&sc.seg, row_pos);
 
+            // Frame predicate handling.
+            if let Some(pred) = &self.frame_pred {
+                if let Some(head) = &self.frame_head {
+                    if !pred(head.as_slice(), key.as_slice()) {
+                        self.halted = true;
+                        return None;
+                    }
+                } else {
+                    self.frame_head = Some(key.clone());
+                }
+            }
+
             // Advance this segment's cursor and push next head if any.
-            sc.pos += 1;
-            if sc.pos < sc.end {
-                let val = slice_value::<P>(&sc.seg, &sc.data, sc.pos);
+            if let Some(np) = next_pos(node.pos, sc.begin, sc.end, self.reverse) {
+                let val = slice_value::<P>(&sc.seg, &sc.data, np);
                 let (b, t) = {
                     let a = val.start as usize;
                     let b2 = val.end as usize;
@@ -448,7 +531,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
                     head_tag: t,
                     rank: sc.rank,
                     seg_idx: node.seg_idx,
-                    pos: sc.pos,
+                    pos: np,
                     val,
                 });
             }
@@ -461,7 +544,17 @@ impl<P: Pager> Iterator for ValueScan<P> {
     }
 }
 
-// -------- helpers: bounds, seeding, slicing, compare --------
+// -------- helpers: direction, bounds, seeding, slicing, compare -----
+
+#[inline]
+fn next_pos(cur: usize, begin: usize, end: usize, reverse: bool) -> Option<usize> {
+    if !reverse {
+        let np = cur + 1;
+        if np < end { Some(np) } else { None }
+    } else {
+        if cur > begin { Some(cur - 1) } else { None }
+    }
+}
 
 fn overlap_bounds(
     lo: &Bound<&[u8]>,
@@ -513,7 +606,7 @@ fn range_in_value_index<P: Pager>(
         return (0, 0);
     }
     // lower bound
-    let pos = match lo {
+    let begin = match lo {
         Bound::Unbounded => 0usize,
         Bound::Included(x) | Bound::Excluded(x) => lower_bound_by_value::<P>(seg, vix, data, x),
     };
@@ -523,7 +616,7 @@ fn range_in_value_index<P: Pager>(
         Bound::Included(x) => upper_bound_by_value::<P>(seg, vix, data, x, true),
         Bound::Excluded(x) => upper_bound_by_value::<P>(seg, vix, data, x, false),
     };
-    (pos.min(n), end.min(n))
+    (begin.min(n), end.min(n))
 }
 
 fn lower_bound_by_value<P: Pager>(
