@@ -1246,4 +1246,61 @@ mod value_scan_tests {
             assert!(vals.iter().all(|&v| v - head <= cap));
         }
     }
+
+    #[test]
+    fn scan_values_fww_reverse_order_contract() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 77u32;
+        seed_three_generations(&store, fid);
+
+        let it = store
+            .scan_values_fww(
+                fid,
+                ValueScanOpts {
+                    dir: Direction::Reverse,
+                    lo: Bound::Unbounded,
+                    hi: Bound::Unbounded,
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    head_tag_len: 8,
+                    frame_predicate: None,
+                },
+            )
+            .expect("iterator");
+
+        let mut seen_keys = BTreeSet::new();
+        let mut prev: Option<u64> = None;
+        let mut first: Option<u64> = None;
+        let mut count = 0usize;
+
+        for item in it {
+            // keys unique under FWW
+            let k = parse_key_u32(&item.key);
+            assert!(seen_keys.insert(k), "duplicate key {}", k);
+
+            // values non-increasing in reverse
+            let a = item.value.start as usize;
+            let b = item.value.end as usize;
+            let v = parse_be64(&item.value.data.as_ref()[a..b]);
+
+            if first.is_none() {
+                first = Some(v);
+            }
+            if let Some(pv) = prev {
+                assert!(v <= pv, "reverse order expected: {} <= {}", v, pv);
+            }
+            prev = Some(v);
+            count += 1;
+        }
+
+        // exactly one winner per key (0..1400)
+        assert_eq!(count, 1400, "FWW should keep exactly one value per key");
+
+        // endpoints for reverse order under FWW:
+        //   first (max)  -> gen3@1399 = 300_000 + 1399
+        //   last  (min)  -> gen1@0    = 1000 + 0
+        assert_eq!(first.unwrap(), 300_000 + 1399);
+        assert_eq!(prev.unwrap(), 1000 + 0);
+    }
 }
