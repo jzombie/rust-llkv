@@ -1,6 +1,8 @@
 use super::ColumnStore;
 use crate::bounds::ValueBound;
-use crate::column_index::{ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef};
+use crate::column_index::{
+    ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, ValueDirL2, ValueIndex,
+};
 use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::types::{
     AppendOptions, ByteLen, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes,
@@ -23,9 +25,19 @@ struct PlannedWriteChunk {
     layout: PlannedWriteLayout,
 }
 
+pub(crate) struct BuiltValueDirs {
+    pub l1_dir: Vec<u32>,
+    pub value_order: Vec<u32>,
+    pub l2_dirs: Vec<(u8, Vec<u32>)>,
+}
+
 impl<'p, P: Pager> ColumnStore<'p, P> {
+    // TODO: Return `Result` type
     // Single entrypoint for writing. Many columns, each with unordered items.
     // Auto-chooses fixed vs variable, chunks to segments, writes everything in batches.
+    /// Single entrypoint for writing. Many columns, each with unordered items.
+    /// Auto-chooses fixed vs variable, chunks to segments, writes everything
+    /// in batches.
     pub fn append_many(&self, puts: Vec<Put>, opts: AppendOptions) {
         if puts.is_empty() {
             return;
@@ -57,6 +69,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 .into_iter()
                 .map(|(k, v)| (k.into_owned(), v.into_owned()))
                 .unzip();
+
             // decide layout
             let layout = match opts.mode {
                 ValueMode::ForceFixed(w) => {
@@ -88,7 +101,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 }
             };
 
-            //  Chunk the data by draining vectors instead of slicing and cloning.
+            // Chunk the data by draining vectors instead of slicing and cloning.
             while !keys_sorted.is_empty() {
                 let remain = keys_sorted.len();
                 let take_by_entries = core::cmp::min(remain, opts.segment_max_entries);
@@ -148,7 +161,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         let data_keys: Vec<PhysicalKey> = pkeys.drain(0..n_segs).collect();
         let index_keys: Vec<PhysicalKey> = pkeys.drain(0..n_segs).collect();
 
-        // Build concrete IndexSegments and data blobs; group by column to update ColumnIndex.
+        // Build concrete IndexSegments and data blobs; group by column to update
+        // ColumnIndex.
         let mut data_puts: Vec<(PhysicalKey, Vec<u8>)> = Vec::with_capacity(n_segs);
         let mut index_puts: Vec<(PhysicalKey, IndexSegment)> = Vec::with_capacity(n_segs);
 
@@ -212,7 +226,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             }
         }
 
-        // For any columns still missing, create fresh ColumnIndex and manifest entry.
+        // For any columns still missing, create fresh ColumnIndex and manifest
+        // entry.
         {
             let mut cache = self.colindex_cache.write().unwrap();
             let mut man = self.manifest.write().unwrap();
@@ -233,15 +248,17 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             }
         }
 
-        // Now materialize each planned chunk into data blob + IndexSegment, and update ColumnIndex.
+        // Now materialize each planned chunk into data blob + IndexSegment, and
+        // update ColumnIndex.
         for (i, chunk) in planned_chunks.into_iter().enumerate() {
             let data_pkey = data_keys[i];
             let index_pkey = index_keys[i];
 
             // compute value bounds once per segment
             let (vmin, vmax) = ValueBound::min_max_bounds(&chunk.values);
+
             // build data blob (+ value offsets for variable)
-            let (data_blob, seg, n_entries) = match chunk.layout {
+            let (data_blob, mut seg, n_entries) = match chunk.layout {
                 PlannedWriteLayout::Fixed { width } => {
                     // values blob
                     let blob = chunk.values.concat();
@@ -263,6 +280,32 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 }
             };
 
+            // Compute value index from the in-memory values for this segment.
+            let hot_threshold = 4096; // tune later; promotes big L1 buckets
+            let built_value_dirs =
+                Self::build_value_index_from_values(&chunk.values, hot_threshold);
+            let value_index = ValueIndex {
+                value_order: built_value_dirs
+                    .value_order
+                    .into_iter()
+                    .map(|v| v as IndexEntryCount)
+                    .collect(),
+                l1_dir: built_value_dirs
+                    .l1_dir
+                    .into_iter()
+                    .map(|v| v as IndexEntryCount)
+                    .collect(),
+                l2_dirs: built_value_dirs
+                    .l2_dirs
+                    .into_iter()
+                    .map(|(first_byte, dir257)| ValueDirL2 {
+                        first_byte,
+                        dir257: dir257.into_iter().map(|v| v as IndexEntryCount).collect(),
+                    })
+                    .collect(),
+            };
+            seg.value_index = Some(value_index);
+
             // queue writes
             data_puts.push((data_pkey, data_blob));
             index_puts.push((index_pkey, seg.clone()));
@@ -278,6 +321,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 .last()
                 .cloned()
                 .expect("non-empty segment");
+
             // update ColumnIndex (newest-first: push_front semantics)
             {
                 let mut cache = self.colindex_cache.write().unwrap();
@@ -297,7 +341,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     },
                 );
 
-                // mark this ColumnIndex as touched so we persist only these (ingest perf fix)
+                // mark this ColumnIndex as touched so we persist only these
+                // (ingest perf fix)
                 touched_colindex_pkeys.insert(*col_pkey);
             }
         }
@@ -344,13 +389,14 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     let k = match p {
                         BatchPut::Raw { key, .. } | BatchPut::Typed { key, .. } => *key,
                     };
-                    assert!(seen.insert(k), "duplicate PUT for key {}", k);
+                    assert!(seen.insert(k), "duplicate PUT for key {k}");
                 }
             }
             self.do_puts(puts_batch);
         }
     }
 
+    // TODO: Return `Result` type
     /// Logically delete keys by appending tombstones (zero-length values).
     /// We force variable layout so size=0 entries are valid.
     pub fn delete_many(&self, items: Vec<(LogicalFieldId, Vec<LogicalKeyBytes>)>) {
@@ -378,5 +424,63 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         };
 
         self.append_many(puts, opts);
+    }
+
+    /// Build value_order + l1/l2 directories from in-memory `values`.
+    /// `hot_threshold`: promote a first-byte bucket to L2 if its span >= this.
+    fn build_value_index_from_values(
+        values: &[Vec<u8>], // TODO: More efficient input?
+        hot_threshold: usize,
+    ) -> BuiltValueDirs {
+        let n = values.len();
+        let mut idx: Vec<u32> = (0..n as u32).collect();
+
+        // Stable sort by raw bytes (lexicographic).
+        idx.sort_by(|&a, &b| values[a as usize].cmp(&values[b as usize]));
+
+        // L1: 257 absolute offsets.
+        let mut l1 = vec![0u32; 257];
+        let mut cur = 0usize;
+        for b0 in 0..256usize {
+            while cur < n {
+                let idx_cur = idx[cur] as usize;
+                let v0 = values[idx_cur].first().copied().unwrap_or(0) as usize;
+                if v0 != b0 {
+                    break;
+                }
+                cur += 1;
+            }
+            l1[b0 + 1] = cur as u32;
+        }
+
+        // L2: sparse second-byte split for hot first-byte buckets.
+        let mut l2: Vec<(u8, Vec<u32>)> = Vec::new();
+        for b0 in 0..256usize {
+            let start = l1[b0] as usize;
+            let end = l1[b0 + 1] as usize;
+            let len = end - start;
+            if len >= hot_threshold {
+                let mut dir = vec![0u32; 257];
+                let mut cur2 = start;
+                for b1 in 0..256usize {
+                    while cur2 < end {
+                        let s = &values[idx[cur2] as usize];
+                        let v1 = if s.len() >= 2 { s[1] as usize } else { 0 };
+                        if v1 != b1 {
+                            break;
+                        }
+                        cur2 += 1;
+                    }
+                    dir[b1 + 1] = (cur2 - start) as u32;
+                }
+                l2.push((b0 as u8, dir));
+            }
+        }
+
+        BuiltValueDirs {
+            l1_dir: l1,
+            value_order: idx,
+            l2_dirs: l2,
+        }
     }
 }

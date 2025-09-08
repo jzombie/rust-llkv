@@ -139,11 +139,13 @@ impl TypedValue {
 pub type PutItem<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
 pub type PutItems<'a> = Vec<PutItem<'a>>;
 
+// TODO: Document
 pub struct Put<'a> {
     pub field_id: LogicalFieldId,
     pub items: PutItems<'a>,
 }
 
+// TODO: Document
 #[derive(Clone, Copy, Debug)]
 pub enum ValueMode {
     Auto,
@@ -151,6 +153,7 @@ pub enum ValueMode {
     ForceVariable,
 }
 
+// TODO: Document
 #[derive(Clone, Debug)]
 pub struct AppendOptions {
     pub mode: ValueMode,

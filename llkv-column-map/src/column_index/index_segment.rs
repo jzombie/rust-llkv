@@ -47,6 +47,10 @@ pub struct IndexSegment {
 
     /// How to slice the *data* blob for the i-th value.
     pub value_layout: ValueLayout,
+
+    /// Optional value index for value-ordered scans and prefix pruning.
+    /// Older segments can omit this and still load.
+    pub value_index: Option<ValueIndex>,
 }
 
 impl IndexSegment {
@@ -63,6 +67,7 @@ impl IndexSegment {
             logical_key_bytes,
             key_layout,
             value_layout: ValueLayout::FixedWidth { width },
+            value_index: None,
         }
     }
 
@@ -94,6 +99,29 @@ impl IndexSegment {
                     .map(|v| v as IndexEntryCount)
                     .collect(),
             },
+            value_index: None,
         }
     }
+}
+
+/// Per-segment directory for value-ordered access.
+/// Offsets index into `value_order` using 257 entries per level
+/// (256 buckets + sentinel).
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct ValueDirL2 {
+    /// First-byte bucket this table refines.
+    pub first_byte: u8,
+    /// Second-byte directory (len = 257). Offsets are relative to the
+    /// parent first-byte slice (base = l1_dir\[first_byte\]).
+    pub dir257: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct ValueIndex {
+    /// Rank-by-value -> row position (row index into logical keys/values).
+    pub value_order: Vec<IndexEntryCount>,
+    /// First-byte directory, len = 257, absolute offsets into value_order.
+    pub l1_dir: Vec<IndexEntryCount>,
+    /// Optional refinements for hot first-byte buckets.
+    pub l2_dirs: Vec<ValueDirL2>,
 }

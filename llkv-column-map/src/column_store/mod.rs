@@ -15,6 +15,7 @@ use std::sync::{
 pub mod introspect;
 pub mod metrics;
 pub mod read;
+pub mod read_value_scan;
 pub mod write;
 
 pub struct ColumnStore<'p, P: Pager> {
@@ -671,9 +672,6 @@ mod tests {
         store.delete_many(vec![(fid, vec![b"k2".to_vec(), b"k4".to_vec()])]);
 
         // 4. Verify deletion
-        // NOTE: This test will FAIL until get_many is updated to handle tombstones.
-        // The current implementation of get_many does not check for tombstone segments
-        // (segments with value width 0) and will still find the old data.
         let got2 = store.get_many(vec![(
             fid,
             vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()],

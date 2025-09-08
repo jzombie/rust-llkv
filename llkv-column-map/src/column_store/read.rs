@@ -11,6 +11,7 @@ use std::collections::hash_map::Entry;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 impl<'p, P: Pager> ColumnStore<'p, P> {
+    // TODO: Return `Result` type
     /// Batched point lookups across many columns.
     /// Each item is (field_id, keys). Output is aligned per input.
     ///

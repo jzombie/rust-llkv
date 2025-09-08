@@ -11,7 +11,24 @@ Prototype B+Tree replacement with batch-only pager I/O for the [LLKV](https://gi
 - Supports variable and fixed width keys.
 - Supports variable and fixed width values.
 - Logical key and value segment pruning.
+- Value-based scanning iterator without maintaining a separate reverse index.
 - `Graphviz` (`.dot`) visualization generation (see [examples/visualize.rs](examples/visualize.rs)) for illustrative purposes and debugging.
+
+## Testing
+
+Some large (expensive) tests are marked `#[ignore]` by default.
+
+### Quick Start
+
+```sh
+cargo test
+```
+
+### Run everything (including ignored)
+
+```sh
+cargo test -- --include-ignored
+```
 
 ## License
 

@@ -1,4 +1,6 @@
 pub mod pager;
+pub use pager::*;
+
 use crate::layout::IndexLayoutInfo;
 use crate::types::{IndexEntryCount, LogicalFieldId, PhysicalKey};
 
