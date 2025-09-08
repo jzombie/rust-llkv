@@ -206,7 +206,7 @@ mod tests {
 
     // Use the unified in-memory pager from the pager module.
     use crate::bounds::ValueBound;
-    use crate::codecs::big_endian::{u64_be, u64_be_arr};
+    use crate::codecs::big_endian::{u64_be_arr, u64_be_vec};
     use crate::column_index::IndexSegmentRef;
     use crate::storage::pager::MemPager;
     use std::borrow::Cow;
@@ -480,7 +480,7 @@ mod tests {
 
         // ------------- Query hits ONLY seg B ----------------
         store.reset_io_stats();
-        let got = store.get_many(vec![(fid, vec![u64_be(250)])]);
+        let got = store.get_many(vec![(fid, vec![u64_be_vec(250)])]);
         assert_eq!(got[0][0].as_deref().unwrap(), &[0xBB, 0, 0, 0]);
 
         // Because of pruning, we should fetch exactly 1 IndexSegment (typed) and 1 data blob (raw)
@@ -493,7 +493,7 @@ mod tests {
 
         // ------------- Inclusivity: min & max are hits -------
         store.reset_io_stats();
-        let got = store.get_many(vec![(fid, vec![u64_be(200), u64_be(299)])]);
+        let got = store.get_many(vec![(fid, vec![u64_be_vec(200), u64_be_vec(299)])]);
         assert_eq!(got[0][0].as_deref().unwrap(), &[0xBB, 0, 0, 0]); // min
         assert_eq!(got[0][1].as_deref().unwrap(), &[0xBB, 0, 0, 0]); // max
         let s = store.io_stats();
@@ -502,7 +502,7 @@ mod tests {
 
         // ------------- Query hits ONLY seg A ----------------
         store.reset_io_stats();
-        let got = store.get_many(vec![(fid, vec![u64_be(5)])]);
+        let got = store.get_many(vec![(fid, vec![u64_be_vec(5)])]);
         assert_eq!(got[0][0].as_deref().unwrap(), &[0xAA, 0, 0, 0]);
         let s = store.io_stats();
         assert_eq!(s.get_typed_ops, 1);

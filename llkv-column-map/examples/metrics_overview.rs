@@ -13,7 +13,7 @@
 
 use llkv_column_map::{
     ColumnStore,
-    codecs::big_endian::u64_be,
+    codecs::big_endian::u64_be_vec,
     column_store::write::{AppendOptions, Put, ValueMode},
     storage::pager::MemPager,
     types::BlobLike,
@@ -41,7 +41,7 @@ fn fixed_value(row: u64, field: u32, width: usize) -> Vec<u8> {
 fn build_put_fixed(field_id: LogicalFieldId, start: u64, end: u64, width: usize) -> Put<'static> {
     let mut items = Vec::with_capacity((end - start) as usize);
     for r in start..end {
-        items.push((u64_be(r).into(), fixed_value(r, field_id, width).into()));
+        items.push((u64_be_vec(r).into(), fixed_value(r, field_id, width).into()));
     }
     Put { field_id, items }
 }
@@ -63,7 +63,7 @@ fn build_put_var(
             .rotate_left(13);
         let len = (min as u64 + (mix % span)) as usize;
         let byte = (((r as u32).wrapping_add(field_id)) & 0xFF) as u8;
-        items.push((u64_be(r).into(), vec![byte; len].into()));
+        items.push((u64_be_vec(r).into(), vec![byte; len].into()));
     }
     Put { field_id, items }
 }
@@ -306,9 +306,9 @@ fn main() {
         let put_100 = Put {
             field_id: 100,
             items: vec![
-                (u64_be(5).into(), fixed_value(5, 100, 8).into()),
-                (u64_be(7).into(), fixed_value(7, 100, 8).into()),
-                (u64_be(9).into(), fixed_value(9, 100, 8).into()),
+                (u64_be_vec(5).into(), fixed_value(5, 100, 8).into()),
+                (u64_be_vec(7).into(), fixed_value(7, 100, 8).into()),
+                (u64_be_vec(9).into(), fixed_value(9, 100, 8).into()),
             ],
         };
         // Brand-new variable-width col 999: write 10 keys [1000..1010).
@@ -329,10 +329,19 @@ fn main() {
     // ---------------- Phase 5: multi-column read + describe ------------------
     {
         let queries = vec![
-            (100, vec![u64_be(5), u64_be(7), u64_be(9), u64_be(255)]), // col 100 has 10k rows → all HIT 8B
-            (200, vec![u64_be(1), u64_be(2), u64_be(3)]),              // var
-            (201, vec![u64_be(123), u64_be(456), u64_be(9_999)]),      // var
-            (999, vec![u64_be(1_003), u64_be(1_005), u64_be(1_007)]), // var; all HIT (we wrote [1000..1010))
+            (
+                100,
+                vec![u64_be_vec(5), u64_be_vec(7), u64_be_vec(9), u64_be_vec(255)],
+            ), // col 100 has 10k rows → all HIT 8B
+            (200, vec![u64_be_vec(1), u64_be_vec(2), u64_be_vec(3)]), // var
+            (
+                201,
+                vec![u64_be_vec(123), u64_be_vec(456), u64_be_vec(9_999)],
+            ), // var
+            (
+                999,
+                vec![u64_be_vec(1_003), u64_be_vec(1_005), u64_be_vec(1_007)],
+            ), // var; all HIT (we wrote [1000..1010))
         ];
         let results = store.get_many(queries.iter().map(|(fid, ks)| (*fid, ks.clone())).collect());
         print_read_report("Read report (get_many)", &queries, &results);
