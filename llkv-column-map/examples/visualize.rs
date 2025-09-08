@@ -31,11 +31,10 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use llkv_column_map::storage::{StorageKind, pager::MemPager};
-use llkv_column_map::types::PhysicalKey;
 use llkv_column_map::{
     ColumnStore,
-    column_store::write::{AppendOptions, Put, ValueMode},
+    storage::{StorageKind, pager::MemPager},
+    types::{AppendOptions, PhysicalKey, Put, ValueMode},
 };
 
 // ---------------- Workload config (small, but shows batching clearly) --------

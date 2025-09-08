@@ -3,45 +3,11 @@ use crate::bounds::ValueBound;
 use crate::column_index::{ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef};
 use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::types::{
-    ByteLen, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes, PhysicalKey, TypedKind,
-    TypedValue,
+    AppendOptions, ByteLen, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes,
+    PhysicalKey, Put, TypedKind, TypedValue, ValueMode,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
-
-pub type PutItem<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
-pub type PutItems<'a> = Vec<PutItem<'a>>;
-
-pub struct Put<'a> {
-    pub field_id: LogicalFieldId,
-    pub items: PutItems<'a>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum ValueMode {
-    Auto,
-    ForceFixed(ByteWidth),
-    ForceVariable,
-}
-
-#[derive(Clone, Debug)]
-pub struct AppendOptions {
-    pub mode: ValueMode,
-    pub segment_max_entries: usize,
-    pub segment_max_bytes: usize, // data payload budget per segment
-    pub last_write_wins_in_batch: bool,
-}
-
-impl Default for AppendOptions {
-    fn default() -> Self {
-        Self {
-            mode: ValueMode::Auto,
-            segment_max_entries: u16::MAX as usize,
-            segment_max_bytes: 8 * 1024 * 1024,
-            last_write_wins_in_batch: true,
-        }
-    }
-}
 
 // Normalize per column: last-write-wins (optional), then sort by logical key.
 // Also decide value layout for this batch (fixed width or variable).

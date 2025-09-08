@@ -209,6 +209,7 @@ mod tests {
     use crate::codecs::big_endian::{u64_be_array, u64_be_vec};
     use crate::column_index::IndexSegmentRef;
     use crate::storage::pager::MemPager;
+    use crate::types::{AppendOptions, Put, ValueMode};
     use std::borrow::Cow;
 
     #[test]
@@ -216,7 +217,7 @@ mod tests {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
 
-        let put = write::Put {
+        let put = Put {
             field_id: 10,
             items: vec![
                 (b"k3".into(), b"VVVVVVV3".into()),
@@ -227,7 +228,7 @@ mod tests {
             ],
         };
 
-        store.append_many(vec![put], write::AppendOptions::default());
+        store.append_many(vec![put], AppendOptions::default());
 
         // batch get across columns (here only field 10)
         let got = store.get_many(vec![(10, vec![b"k1".into(), b"k2".into(), b"kX".into()])]);
@@ -257,15 +258,15 @@ mod tests {
             items.push((k, v));
         }
 
-        let opts = write::AppendOptions {
-            mode: write::ValueMode::Auto,
+        let opts = AppendOptions {
+            mode: ValueMode::Auto,
             segment_max_entries: 200, // small to force multiple segments
             segment_max_bytes: 2_000, // also keep segments small
             last_write_wins_in_batch: true,
         };
 
         store.append_many(
-            vec![write::Put {
+            vec![Put {
                 field_id: 77,
                 items,
             }],
@@ -314,11 +315,11 @@ mod tests {
             (b"b".into(), vec![2u8; 4].into()),
             (b"c".into(), vec![3u8; 4].into()),
         ];
-        let opts = write::AppendOptions {
-            mode: write::ValueMode::ForceFixed(4),
+        let opts = AppendOptions {
+            mode: ValueMode::ForceFixed(4),
             ..Default::default()
         };
-        store.append_many(vec![write::Put { field_id: 5, items }], opts);
+        store.append_many(vec![Put { field_id: 5, items }], opts);
 
         let got = store.get_many(vec![(5, vec![b"a".to_vec(), b"b".to_vec(), b"z".to_vec()])]);
 
@@ -333,7 +334,7 @@ mod tests {
 
         // Three items, with a duplicate for key "k": last is "ZZ".
         let fid = 42;
-        let put = write::Put {
+        let put = Put {
             field_id: fid,
             items: vec![
                 (b"k".into(), b"AA".into()),
@@ -342,10 +343,10 @@ mod tests {
             ],
         };
 
-        let opts = write::AppendOptions {
-            mode: write::ValueMode::ForceFixed(2), // keep sizes simple
-            segment_max_entries: 1024,             // ensure a single segment
-            last_write_wins_in_batch: true,        // <- dedup ON
+        let opts = AppendOptions {
+            mode: ValueMode::ForceFixed(2), // keep sizes simple
+            segment_max_entries: 1024,      // ensure a single segment
+            last_write_wins_in_batch: true, // <- dedup ON
             ..Default::default()
         };
 
@@ -379,7 +380,7 @@ mod tests {
 
         // Same three items; duplicates for "k" are KEPT.
         let fid = 43;
-        let put = write::Put {
+        let put = Put {
             field_id: fid,
             items: vec![
                 (b"k".into(), b"AA".into()),
@@ -388,8 +389,8 @@ mod tests {
             ],
         };
 
-        let opts = write::AppendOptions {
-            mode: write::ValueMode::ForceFixed(2),
+        let opts = AppendOptions {
+            mode: ValueMode::ForceFixed(2),
             segment_max_entries: 1024,
             last_write_wins_in_batch: false, // <- dedup OFF
             ..Default::default()
@@ -444,12 +445,12 @@ mod tests {
         };
 
         store.append_many(
-            vec![write::Put {
+            vec![Put {
                 field_id: fid,
                 items: items_a,
             }],
-            write::AppendOptions {
-                mode: write::ValueMode::ForceFixed(4),
+            AppendOptions {
+                mode: ValueMode::ForceFixed(4),
                 segment_max_entries: 10_000,
                 segment_max_bytes: 1_000_000,
                 last_write_wins_in_batch: true,
@@ -466,12 +467,12 @@ mod tests {
         };
 
         store.append_many(
-            vec![write::Put {
+            vec![Put {
                 field_id: fid,
                 items: items_b,
             }],
-            write::AppendOptions {
-                mode: write::ValueMode::ForceFixed(4),
+            AppendOptions {
+                mode: ValueMode::ForceFixed(4),
                 segment_max_entries: 10_000,
                 segment_max_bytes: 1_000_000,
                 last_write_wins_in_batch: true,
@@ -523,12 +524,12 @@ mod tests {
         ];
 
         store.append_many(
-            vec![write::Put {
+            vec![Put {
                 field_id: fid,
                 items,
             }],
-            write::AppendOptions {
-                mode: write::ValueMode::ForceFixed(4),
+            AppendOptions {
+                mode: ValueMode::ForceFixed(4),
                 ..Default::default()
             },
         );
@@ -561,12 +562,12 @@ mod tests {
         ];
 
         store.append_many(
-            vec![write::Put {
+            vec![Put {
                 field_id: fid,
                 items,
             }],
-            write::AppendOptions {
-                mode: write::ValueMode::ForceVariable,
+            AppendOptions {
+                mode: ValueMode::ForceVariable,
                 ..Default::default()
             },
         );
@@ -593,12 +594,12 @@ mod tests {
         // Single huge value (1 MiB)
         let huge = vec![42u8; 1_048_576];
         store.append_many(
-            vec![write::Put {
+            vec![Put {
                 field_id: fid,
                 items: vec![(b"k".into(), huge.into())],
             }],
-            write::AppendOptions {
-                mode: write::ValueMode::ForceVariable,
+            AppendOptions {
+                mode: ValueMode::ForceVariable,
                 segment_max_entries: 1_000_000,
                 segment_max_bytes: usize::MAX,
                 last_write_wins_in_batch: true,
@@ -647,7 +648,7 @@ mod tests {
         let fid = 101;
 
         // 1. Write some initial data
-        let put = write::Put {
+        let put = Put {
             field_id: fid,
             items: vec![
                 (b"k1".into(), b"val1".into()),
@@ -655,7 +656,7 @@ mod tests {
                 (b"k3".into(), b"val3".into()),
             ],
         };
-        store.append_many(vec![put], write::AppendOptions::default());
+        store.append_many(vec![put], AppendOptions::default());
 
         // 2. Verify initial data
         let got1 = store.get_many(vec![(
@@ -690,11 +691,11 @@ mod tests {
         );
 
         // 5. Appending a new value for k2 should bring it back
-        let put2 = write::Put {
+        let put2 = Put {
             field_id: fid,
             items: vec![(b"k2".into(), b"new_val2".into())],
         };
-        store.append_many(vec![put2], write::AppendOptions::default());
+        store.append_many(vec![put2], AppendOptions::default());
 
         let got3 = store.get_many(vec![(fid, vec![b"k1".to_vec(), b"k2".to_vec()])]);
         assert_eq!(got3[0][0].as_deref().unwrap(), b"val1");

@@ -49,8 +49,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use llkv_column_map::{
     ColumnStore,
     codecs::big_endian::u64_be_vec,
-    column_store::write::{AppendOptions, Put, ValueMode},
     storage::pager::MemPager,
+    types::{AppendOptions, Put, ValueMode},
 };
 use std::borrow::Cow;
 use std::hint::black_box;

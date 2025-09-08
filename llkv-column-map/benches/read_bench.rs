@@ -15,9 +15,8 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 use llkv_column_map::{
     ColumnStore,
     codecs::big_endian::u64_be_vec,
-    column_store::write::{AppendOptions, Put, ValueMode},
     storage::pager::MemPager,
-    types::LogicalFieldId,
+    types::{AppendOptions, LogicalFieldId, Put, ValueMode},
 };
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::borrow::Cow;

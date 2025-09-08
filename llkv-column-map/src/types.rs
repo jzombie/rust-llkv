@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 /// Opaque 64-bit address in the KV/pager namespace.
 ///
 /// - Treated as an **opaque handle** by higher layers (never interpreted).
@@ -130,6 +132,40 @@ impl TypedValue {
             TypedValue::Manifest(_) => TypedKind::Manifest,
             TypedValue::ColumnIndex(_) => TypedKind::ColumnIndex,
             TypedValue::IndexSegment(_) => TypedKind::IndexSegment,
+        }
+    }
+}
+
+pub type PutItem<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
+pub type PutItems<'a> = Vec<PutItem<'a>>;
+
+pub struct Put<'a> {
+    pub field_id: LogicalFieldId,
+    pub items: PutItems<'a>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ValueMode {
+    Auto,
+    ForceFixed(ByteWidth),
+    ForceVariable,
+}
+
+#[derive(Clone, Debug)]
+pub struct AppendOptions {
+    pub mode: ValueMode,
+    pub segment_max_entries: usize,
+    pub segment_max_bytes: usize, // data payload budget per segment
+    pub last_write_wins_in_batch: bool,
+}
+
+impl Default for AppendOptions {
+    fn default() -> Self {
+        Self {
+            mode: ValueMode::Auto,
+            segment_max_entries: u16::MAX as usize,
+            segment_max_bytes: 8 * 1024 * 1024,
+            last_write_wins_in_batch: true,
         }
     }
 }
