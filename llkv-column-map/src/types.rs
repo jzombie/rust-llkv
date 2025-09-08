@@ -62,13 +62,33 @@ pub type ByteLen = u32;
 pub trait BlobLike: AsRef<[u8]> + Clone + Send + Sync + 'static {}
 impl<T> BlobLike for T where T: AsRef<[u8]> + Clone + Send + Sync + 'static {}
 
-/// Typed kinds the pager knows how to decode/encode. Keep this set
-/// scoped to storage types you persist via `bitcode`.
+/// Wire tag for typed blobs stored in the pager.
+///
+/// Each persisted metadata object (e.g., `Manifest`, `ColumnIndex`, `IndexSegment`)
+/// is saved as a *typed* bitcode blob. `TypedKind` is the small, stable tag
+/// that tells the pager which concrete type to decode into on read.
+///
+/// Why this exists:
+/// - **Safety:** Prevents decoding a value as the wrong struct when multiple
+///   blob types share the same key space.
+/// - **Speed:** Lets the pager pick the right decode path without trial-and-error.
+/// - **Clarity:** Callers explicitly state what they expect to read.
+///
+/// Versioning notes:
+/// - Treat this as a wire-level enum. Adding new variants is fine, but removing
+///   or reusing existing variants will break compatibility for blobs already
+///   written.
+/// - If you evolve on-disk layouts, version those structs (or the manifest)
+///   rather than reusing a `TypedKind` variant with a new meaning.
 #[derive(Clone, Copy, Debug)]
 pub enum TypedKind {
+    /// Tiny record that points to the current `Manifest` (often at physical key 0).
     Bootstrap,
+    /// Top-level directory mapping columns to their current `ColumnIndex`.
     Manifest,
+    /// Per-column list of sealed segments (newest-first) with fast-prune bounds.
     ColumnIndex,
+    /// Packed logical keys and value layout for one sealed segment (points to data blob).
     IndexSegment,
 }
 
@@ -82,8 +102,28 @@ pub enum TypedValue {
     IndexSegment(crate::column_index::IndexSegment),
 }
 
+/// Type-erased container for all metadata blobs we persist via `bitcode`.
+///
+/// At write time you construct the concrete value (e.g., `Manifest`) and wrap it
+/// in the corresponding `TypedValue` variant before handing it to the pager.
+/// At read time, you ask the pager for a given `TypedKind`, and it returns a
+/// `TypedValue` you can `match` to regain the concrete type.
+///
+/// Why not `Any`/downcast?
+/// - This enum is **zero-alloc** and **explicit** about what the storage layer
+///   can serialize/deserialize. It’s also friendlier to non-std environments.
+///
+/// Gotchas:
+/// - The `TypedKind` you request **must** match the variant that was written,
+///   or decode will fail (by design).
+/// - Keep these variants aligned with the set of persisted structs in
+///   `crate::column_index`; treat changes as on-disk format changes.
 impl TypedValue {
-    /// Helper to get the kind tag for a value.
+    /// Return the wire tag (`TypedKind`) corresponding to this value.
+    ///
+    /// Useful when building batched puts where the pager needs to know the kind
+    /// alongside the encoded bytes.
+    #[inline]
     pub fn kind(&self) -> TypedKind {
         match self {
             TypedValue::Bootstrap(_) => TypedKind::Bootstrap,
