@@ -38,7 +38,7 @@
 //!
 //! **How to read the output**
 //! - **Fewer, larger batches** generally reduce overhead (fewer pager calls, fewer index objects),
-//! but increase memory pressure and produce larger segments.
+//!   but increase memory pressure and produce larger segments.
 //! - **More, smaller batches** give you smaller segments and lower peaks in memory usage,
 //!   but higher fixed overhead per batch.
 //!
