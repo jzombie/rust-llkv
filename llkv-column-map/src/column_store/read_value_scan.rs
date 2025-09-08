@@ -120,19 +120,87 @@ pub struct ValueScan<P: Pager> {
     policy: ConflictPolicy,
 }
 
-/// Min-heap per bucket with a 65,536-bit tier-1 directory.
-/// We keep one `BinaryHeap<Reverse<Node>>` per active bucket.
-/// Watermarks (min_word/max_word) avoid scanning empty tails.
+/// A radix-bucketed **priority queue** specialized for byte-sorted values.
+///
+/// **PQ** stands for *priority queue*. `RadixPq` is a two-tier structure:
+///
+/// 1) **Tier-1 directory (radix):** a fixed 65,536-bit directory keyed by the
+///    first two bytes (big-endian) of the value slice. Each bit says whether
+///    bucket `b ∈ [0, 65535]` is non-empty. Bits are stored as 1024 u64 words,
+///    so we can find the next non-empty bucket with a single `trailing_zeros`
+///    (forward scans) or `leading_zeros` (reverse scans).
+///
+/// 2) **Tier-2 per-bucket PQ:** for each active bucket we keep a
+///    `BinaryHeap<Reverse<Node>>`. The heap orders by value prefix/tag and then
+///    full bytes, with rank/pos tie-breakers. The `Node::reverse` flag flips the
+///    value ordering so the same structure supports forward *and* reverse scans.
+///
+/// ### Why radix?
+/// - The next-bucket search is O(1) over a small 8KiB directory with
+///   bit-twiddling (instead of probing many empty heaps).
+/// - Grouping by the first two bytes keeps individual heaps small and reduces
+///   the log-factor in `push`/`pop`.
+///
+/// ### Direction semantics
+/// - **Forward:** find the lowest set bit (smallest bucket), then pop that
+///   bucket’s min element.
+/// - **Reverse:** find the highest set bit (largest bucket), then pop that
+///   bucket’s max element (achieved by flipping compares in `Node::Ord`).
+///
+/// ### Reverse optimization: **bitset watermarks**
+/// We track `min_word`/`max_word`, the lowest/highest u64 **word** index in
+/// `bitset` that currently has any set bits. `find_bucket()` bounds its scan to
+/// `[min_word ..= max_word]`, avoiding long empty tails—especially helpful for
+/// reverse scans over sparse buckets.
+///
+/// - On `push`, we set the directory bit and expand watermarks if needed.
+/// - On `pop`, when a bucket becomes empty we clear its bit; if that cleared the
+///   last bit in its word, we contract the corresponding watermark.
+/// - Empty state is represented by `min_word == usize::MAX` (and `is_empty()`
+///   remains the authoritative check).
+///
+/// ### Complexity
+/// - `push`: O(log k) in the destination heap (k = nodes in that bucket) + O(1)
+///   bitset/watermark maintenance.
+/// - `pop`: O(1) bucket discovery (bit scan constrained by watermarks) + O(log k)
+///   for the heap pop; plus O(1) maintenance when the bucket empties.
+/// - Memory: one heap per active bucket; directory is ~8 KiB.
+///
+/// ### Trade-offs & gotchas
+/// - **Skewed prefixes:** if most values share the same first two bytes, one
+///   bucket dominates and you pay a larger O(log k); consider widening/narrowing
+///   the bucket prefix if your value distribution is known to be skewed.
+/// - **Churn:** if buckets flip between empty/non-empty very frequently,
+///   watermark updates add a tiny branch/bit cost per op. For random data this
+///   is a net win; with adversarial patterns the benefit may flatten.
+/// - **Coupling:** the bucketing must match `bucket_and_tag()`. If you change
+///   the prefix width (currently 2 bytes), adjust the directory size accordingly.
+///
+/// ### Invariants
+/// - `bitset[i] != 0`  ⇔  at least one bucket in word `i` is present in
+///   `buckets`.
+/// - When a bucket heap becomes empty we both clear the bit **and**
+///   remove the heap entry from `buckets`.
+/// - When non-empty, `min_word <= max_word`.
 struct RadixPq<P: Pager> {
-    bitset: [u64; 1024], // 1024 * 64 = 65,536 bits
+    /// 65,536 one-bit entries (u16 bucket ids), packed into 1024 64-bit words
+    /// for constant-time trailing/leading zero scans.
+    bitset: [u64; 1024],
+
+    /// Second tier: one heap per active bucket. Wrapped in `Reverse` so it acts
+    /// as a min-heap with respect to `Node::Ord` (which itself flips value
+    /// comparisons when scanning in reverse).
     buckets: FxHashMap<u16, BinaryHeap<std::cmp::Reverse<Node<P>>>>,
-    // Watermarks in the bitset word space (0..=1023).
-    // Empty state is represented by min_word == usize::MAX.
+
+    /// Watermarks over `bitset` words that currently contain any set bits.
+    /// Used by `find_bucket()` to bound scanning. When empty,
+    /// `min_word` is set to `usize::MAX`.
     min_word: usize,
     max_word: usize,
 }
 
 impl<P: Pager> RadixPq<P> {
+    /// Create an empty radix PQ. Watermarks are initialized to the empty state.
     fn new() -> Self {
         Self {
             bitset: [0u64; 1024],
@@ -142,6 +210,10 @@ impl<P: Pager> RadixPq<P> {
         }
     }
 
+    /// Insert a node:
+    /// - Sets the directory bit for `bucket`,
+    /// - pushes into that bucket’s heap,
+    /// - expands watermarks if this is the first bit in its word.
     fn push(&mut self, node: Node<P>) {
         let b = node.bucket;
         let idx = (b / 64) as usize;
@@ -165,6 +237,11 @@ impl<P: Pager> RadixPq<P> {
         self.bitset[idx] |= bit;
     }
 
+    /// Pop the next node in the current scan direction:
+    /// - Uses `find_bucket(reverse)` which scans only within the watermark range,
+    /// - pops from that bucket’s heap,
+    /// - if the heap becomes empty, clears the directory bit, removes the heap,
+    ///   and contracts watermarks if the word goes to zero.
     fn pop(&mut self, reverse: bool) -> Option<Node<P>> {
         let bi = self.find_bucket(reverse)?;
         let heap = self.buckets.get_mut(&bi)?;
@@ -218,6 +295,9 @@ impl<P: Pager> RadixPq<P> {
         Some(out)
     }
 
+    /// Locate the next non-empty bucket id in the chosen direction by scanning
+    /// the bitset. Scans are bounded to `[min_word ..= max_word]` via the
+    /// watermarks to avoid long empty tails.
     fn find_bucket(&self, reverse: bool) -> Option<u16> {
         // Fast empty test via watermark.
         if self.min_word == usize::MAX {
@@ -252,6 +332,7 @@ impl<P: Pager> RadixPq<P> {
         None
     }
 
+    /// True iff no buckets are active (all bits zero).
     #[inline]
     fn is_empty(&self) -> bool {
         // Either check the map, or the watermark.
