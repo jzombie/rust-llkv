@@ -67,6 +67,7 @@ fn build_put_var(field_id: LogicalFieldId, start: u64, end: u64, min: usize, max
 
 // -------- I/O metric helpers (compute per-phase delta locally) ---------------
 
+// TODO: Use `IoStats` directly?
 #[derive(Clone, Copy, Default)]
 struct Counts {
     batches: u64,
