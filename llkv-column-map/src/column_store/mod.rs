@@ -206,6 +206,7 @@ mod tests {
 
     // Use the unified in-memory pager from the pager module.
     use crate::bounds::ValueBound;
+    use crate::codecs::key::u64_be;
     use crate::column_index::IndexSegmentRef;
     use crate::storage::pager::MemPager;
 
@@ -427,10 +428,6 @@ mod tests {
 
     #[test]
     fn key_based_segment_pruning_uses_min_max_and_is_inclusive() {
-        fn be_key(v: u64) -> Vec<u8> {
-            v.to_be_bytes().to_vec()
-        }
-
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
         let fid = 1234;
@@ -442,7 +439,7 @@ mod tests {
 
         // Build segment A
         let items_a: Vec<(Vec<u8>, Vec<u8>)> = (0u64..100u64)
-            .map(|k| (be_key(k), vec![0xAA, 0, 0, 0]))
+            .map(|k| (u64_be(k), vec![0xAA, 0, 0, 0]))
             .collect();
         store.append_many(
             vec![write::Put {
@@ -459,7 +456,7 @@ mod tests {
 
         // Build segment B (newest)
         let items_b: Vec<(Vec<u8>, Vec<u8>)> = (200u64..300u64)
-            .map(|k| (be_key(k), vec![0xBB, 0, 0, 0]))
+            .map(|k| (u64_be(k), vec![0xBB, 0, 0, 0]))
             .collect();
         store.append_many(
             vec![write::Put {
@@ -476,7 +473,7 @@ mod tests {
 
         // ------------- Query hits ONLY seg B ----------------
         store.reset_io_stats();
-        let got = store.get_many(vec![(fid, vec![be_key(250)])]);
+        let got = store.get_many(vec![(fid, vec![u64_be(250)])]);
         assert_eq!(got[0][0].as_deref().unwrap(), &[0xBB, 0, 0, 0]);
 
         // Because of pruning, we should fetch exactly 1 IndexSegment (typed) and 1 data blob (raw)
@@ -489,7 +486,7 @@ mod tests {
 
         // ------------- Inclusivity: min & max are hits -------
         store.reset_io_stats();
-        let got = store.get_many(vec![(fid, vec![be_key(200), be_key(299)])]);
+        let got = store.get_many(vec![(fid, vec![u64_be(200), u64_be(299)])]);
         assert_eq!(got[0][0].as_deref().unwrap(), &[0xBB, 0, 0, 0]); // min
         assert_eq!(got[0][1].as_deref().unwrap(), &[0xBB, 0, 0, 0]); // max
         let s = store.io_stats();
@@ -498,7 +495,7 @@ mod tests {
 
         // ------------- Query hits ONLY seg A ----------------
         store.reset_io_stats();
-        let got = store.get_many(vec![(fid, vec![be_key(5)])]);
+        let got = store.get_many(vec![(fid, vec![u64_be(5)])]);
         assert_eq!(got[0][0].as_deref().unwrap(), &[0xAA, 0, 0, 0]);
         let s = store.io_stats();
         assert_eq!(s.get_typed_ops, 1);

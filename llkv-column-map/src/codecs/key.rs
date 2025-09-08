@@ -1,5 +1,7 @@
 use crate::types::LogicalKeyBytes;
 
+// TODO: Make generic over big endian (not just key)
+
 /// Encode a `u64` so lexicographic order == numeric order.
 #[inline]
 pub fn u64_be(v: u64) -> LogicalKeyBytes {

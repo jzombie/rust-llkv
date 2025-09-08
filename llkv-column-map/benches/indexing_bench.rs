@@ -48,6 +48,7 @@
 //! ```
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use llkv_column_map::codecs::key::u64_be;
 use llkv_column_map::column_index::{
     Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, Manifest,
 };
@@ -59,7 +60,7 @@ use std::hint::black_box;
 /// Make monotonically increasing numeric logical keys (already sorted).
 #[inline]
 fn make_numeric_keys(n: usize) -> Vec<LogicalKeyBytes> {
-    (0..n).map(|i| (i as u64).to_be_bytes().to_vec()).collect()
+    (0..n).map(|i| u64_be(i as u64)).collect()
 }
 
 /// Build *and persist* many columns in batches:

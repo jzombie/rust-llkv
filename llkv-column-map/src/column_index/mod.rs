@@ -44,6 +44,7 @@ pub struct ColumnIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codecs::key::u64_be;
     use crate::constants::BOOTSTRAP_PKEY;
     use crate::layout::{KeyLayout, ValueLayout};
     use crate::storage::pager::{BatchGet, BatchPut, GetResult, MemPager, Pager};
@@ -491,11 +492,7 @@ mod tests {
     #[test]
     fn min_max_fixed_width_keys() {
         // three 8-byte big-endian u64 keys: 1, 5, 9
-        let keys = vec![
-            1u64.to_be_bytes().to_vec(),
-            9u64.to_be_bytes().to_vec(),
-            5u64.to_be_bytes().to_vec(),
-        ];
+        let keys = vec![u64_be(1), u64_be(9), u64_be(5)];
         let seg = IndexSegment::build_fixed(123, keys, 4 /* any width for values */);
 
         // bounds must be inclusive and lexicographic — derive by slicing first/last
@@ -505,8 +502,8 @@ mod tests {
             &seg.key_layout,
             seg.n_entries as usize - 1,
         );
-        assert_eq!(first, &1u64.to_be_bytes()[..]);
-        assert_eq!(last, &9u64.to_be_bytes()[..]);
+        assert_eq!(first, &u64_be(1)[..]);
+        assert_eq!(last, &u64_be(9)[..]);
 
         // layout must be FixedWidth for keys too (since all keys same length)
         match seg.key_layout {
