@@ -1,9 +1,13 @@
-//! Value-ordered range scan with strict LWW hook points.
+//! Value-ordered range scan with strict LWW and frame predicate.
 //!
 //! Iterator uses per-segment value_order + L1/L2 directories to seed
 //! one head per candidate segment, and a 2-tier radix PQ to pop the
-//! next value across segments. LWW gate is a placeholder; wire in
-//! newest[key] before enabling in prod.
+//! next value across segments. Strict LWW is enforced by probing any
+//! newer segment (by recency rank) for membership of the same key.
+//!
+//! - Newer segments are batch-loaded as IndexSegment (no data blobs).
+//! - Active segments (value producers) load index + data blobs once.
+//! - Frame predicate is evaluated on encoded keys (zero copy).
 
 use crate::bounds::ValueBound;
 use crate::column_index::{IndexSegment, ValueIndex};
@@ -14,7 +18,7 @@ use crate::views::ValueSlice;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -65,89 +69,56 @@ pub struct ValueScanItem<B> {
 
 /// Internal: context per active segment.
 struct SegCtx<P: Pager> {
-    seg_pk: PhysicalKey,
-    data_pk: PhysicalKey,
+    _seg_pk: PhysicalKey,
+    _data_pk: PhysicalKey,
     seg: IndexSegment,
     data: P::Blob,
     /// Newest-first order rank (0 == newest).
     rank: usize,
-    /// Window in value_index.value_order: [begin, end)
+    /// Window in value_index.value_order: [begin, end).
     begin: usize,
     end: usize,
+}
+
+/// Minimal metadata for newer segments used by LWW membership.
+struct LwwRef {
+    pk: PhysicalKey,
+    rank: usize,
 }
 
 /// The iterator. Owns the PQ and segment cursors.
 pub struct ValueScan<P: Pager> {
     segs: Vec<SegCtx<P>>,
     pq: RadixPq<P>,
-    field_id: LogicalFieldId,
-    /// Bounds copied for short-circuit checks.
-    lo: Bound<Vec<u8>>,
-    hi: Bound<Vec<u8>>,
-    /// Direction flag (true => reverse).
+    _field_id: LogicalFieldId,
+    _lo: Bound<Vec<u8>>,
+    _hi: Bound<Vec<u8>>,
     reverse: bool,
-    /// Enable/disable LWW while wiring. Keep true in prod.
-    enforce_lww: bool,
-    /// Frame predicate and head.
     frame_pred: Option<FramePred>,
     frame_head: Option<Vec<u8>>,
-    /// If frame ended, terminate immediately.
     halted: bool,
+    /// Strict LWW: newer segment refs grouped by rank (0 newest).
+    newer_by_rank: Vec<Vec<LwwRef>>,
+    /// Newer segments' index blobs (no data blobs).
+    newer_seg_map: FxHashMap<PhysicalKey, IndexSegment>,
+    /// PQ tuning (copied from opts).
+    bucket_prefix_len: usize,
+    head_tag_len: usize,
 }
 
-/// Min-heap over active heads using a 2-tier radix design:
-/// Tier 1: 16-bit bucket bitset (65,536 buckets).
-/// Tier 2: per-bucket heap ordered by value.
-/// - Forward: per-bucket min-heap (BinaryHeap<Reverse<Node>>).
-/// - Reverse: per-bucket max-heap (BinaryHeap<Node>).
+/// Min-heap per bucket with a 65,536-bit tier-1 directory.
+/// We keep one BinaryHeap<Reverse<Node>> per active bucket.
+/// Node carries a `reverse` flag that flips compare semantics.
 struct RadixPq<P: Pager> {
     bitset: [u64; 1024], // 1024 * 64 = 65,536 bits
-    reverse: bool,
-    buckets: HashMap<u16, BucketHeap<P>>,
-}
-
-enum BucketHeap<P: Pager> {
-    Fwd(BinaryHeap<std::cmp::Reverse<Node<P>>>),
-    Rev(BinaryHeap<Node<P>>),
-}
-
-impl<P: Pager> BucketHeap<P> {
-    fn new(reverse: bool) -> Self {
-        if reverse {
-            BucketHeap::Rev(BinaryHeap::new())
-        } else {
-            BucketHeap::Fwd(BinaryHeap::new())
-        }
-    }
-
-    fn push(&mut self, n: Node<P>) {
-        match self {
-            BucketHeap::Fwd(h) => h.push(std::cmp::Reverse(n)),
-            BucketHeap::Rev(h) => h.push(n),
-        }
-    }
-
-    fn pop(&mut self) -> Option<Node<P>> {
-        match self {
-            BucketHeap::Fwd(h) => h.pop().map(|r| r.0),
-            BucketHeap::Rev(h) => h.pop(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        match self {
-            BucketHeap::Fwd(h) => h.is_empty(),
-            BucketHeap::Rev(h) => h.is_empty(),
-        }
-    }
+    buckets: FxHashMap<u16, BinaryHeap<std::cmp::Reverse<Node<P>>>>,
 }
 
 impl<P: Pager> RadixPq<P> {
-    fn new(reverse: bool) -> Self {
+    fn new() -> Self {
         Self {
             bitset: [0u64; 1024],
-            reverse,
-            buckets: HashMap::new(),
+            buckets: FxHashMap::default(),
         }
     }
 
@@ -157,15 +128,15 @@ impl<P: Pager> RadixPq<P> {
         let bit = 1u64 << (b % 64);
         self.buckets
             .entry(b)
-            .or_insert_with(|| BucketHeap::new(self.reverse))
-            .push(node);
+            .or_insert_with(BinaryHeap::new)
+            .push(std::cmp::Reverse(node));
         self.bitset[idx] |= bit;
     }
 
-    fn pop(&mut self) -> Option<Node<P>> {
-        let bi = self.find_bucket()?;
+    fn pop(&mut self, reverse: bool) -> Option<Node<P>> {
+        let bi = self.find_bucket(reverse)?;
         let heap = self.buckets.get_mut(&bi)?;
-        let out = heap.pop()?;
+        let out = heap.pop()?.0;
         if heap.is_empty() {
             let idx = (bi / 64) as usize;
             let bit = 1u64 << (bi % 64);
@@ -175,8 +146,8 @@ impl<P: Pager> RadixPq<P> {
         Some(out)
     }
 
-    fn find_bucket(&self) -> Option<u16> {
-        if !self.reverse {
+    fn find_bucket(&self, reverse: bool) -> Option<u16> {
+        if !reverse {
             for (i, word) in self.bitset.iter().enumerate() {
                 if *word == 0 {
                     continue;
@@ -189,7 +160,6 @@ impl<P: Pager> RadixPq<P> {
                 if *word == 0 {
                     continue;
                 }
-                // highest set bit in word
                 let lz = word.leading_zeros() as u16;
                 let bit = 63u16.saturating_sub(lz);
                 return Some(((i as u16) * 64) + bit);
@@ -203,7 +173,7 @@ impl<P: Pager> RadixPq<P> {
     }
 }
 
-/// Small per-bucket node with full ordering.
+/// PQ node: one active head (segment cursor).
 #[derive(Clone)]
 struct Node<P: Pager> {
     bucket: u16,
@@ -213,6 +183,7 @@ struct Node<P: Pager> {
     seg_idx: usize,
     pos: usize,
     val: ValueSlice<P::Blob>,
+    reverse: bool,
 }
 
 impl<P: Pager> Node<P> {
@@ -224,7 +195,8 @@ impl<P: Pager> Node<P> {
     }
 }
 
-/// Order ascending by (bucket, head_tag, full bytes, rank, pos).
+/// Ordering toggles by `reverse` for value fields. Rank is always asc
+/// (newer first) on ties.
 impl<P: Pager> Eq for Node<P> {}
 impl<P: Pager> PartialEq for Node<P> {
     fn eq(&self, other: &Self) -> bool {
@@ -233,27 +205,48 @@ impl<P: Pager> PartialEq for Node<P> {
             && self.bytes() == other.bytes()
             && self.rank == other.rank
             && self.pos == other.pos
+            && self.reverse == other.reverse
     }
 }
 impl<P: Pager> Ord for Node<P> {
     fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap pops the "greatest". We use Reverse for forward.
-        match self.bucket.cmp(&other.bucket) {
-            Ordering::Equal => {}
-            ord => return ord.reverse(),
+        // BinaryHeap takes the greatest; we always wrap with Reverse,
+        // so this `cmp` defines "ascending" for forward and "descending"
+        // for reverse by flipping comparisons at the value levels only.
+        let mut ord = if !self.reverse {
+            self.bucket.cmp(&other.bucket)
+        } else {
+            other.bucket.cmp(&self.bucket)
+        };
+        if ord != Ordering::Equal {
+            return ord;
         }
-        match self.head_tag.cmp(&other.head_tag) {
-            Ordering::Equal => {}
-            ord => return ord.reverse(),
+
+        ord = if !self.reverse {
+            self.head_tag.cmp(&other.head_tag)
+        } else {
+            other.head_tag.cmp(&self.head_tag)
+        };
+        if ord != Ordering::Equal {
+            return ord;
         }
-        match self.bytes().cmp(other.bytes()) {
-            Ordering::Equal => {}
-            ord => return ord.reverse(),
+
+        ord = if !self.reverse {
+            self.bytes().cmp(other.bytes())
+        } else {
+            other.bytes().cmp(self.bytes())
+        };
+        if ord != Ordering::Equal {
+            return ord;
         }
-        match self.rank.cmp(&other.rank) {
-            Ordering::Equal => {}
-            ord => return ord, // newer (smaller) ranks come first
+
+        // Newer (smaller rank) first on perfect byte ties.
+        ord = self.rank.cmp(&other.rank);
+        if ord != Ordering::Equal {
+            return ord;
         }
+
+        // Stable within-segment ordering.
         self.pos.cmp(&other.pos)
     }
 }
@@ -344,42 +337,108 @@ impl<P: Pager> ValueScan<P> {
             return Err(ScanError::NoActiveSegments);
         }
 
-        // -------- batch load segments + data blobs ----------
+        // Collect sets to classify typed results.
+        let mut active_index_pks: FxHashSet<PhysicalKey> = FxHashSet::default();
+        let mut active_data_pks: FxHashSet<PhysicalKey> = FxHashSet::default();
+        for r in &act_refs {
+            active_index_pks.insert(r.index_physical_key);
+            active_data_pks.insert(r.data_physical_key);
+        }
+
+        // Collect index+data gets for active segments.
         let mut gets: Vec<BatchGet> = Vec::with_capacity(act_refs.len() * 2);
-        let mut seen_data: FxHashSet<PhysicalKey> = FxHashSet::default();
         for r in &act_refs {
             gets.push(BatchGet::Typed {
                 key: r.index_physical_key,
                 kind: TypedKind::IndexSegment,
             });
-            if seen_data.insert(r.data_physical_key) {
-                gets.push(BatchGet::Raw {
-                    key: r.data_physical_key,
+            gets.push(BatchGet::Raw {
+                key: r.data_physical_key,
+            });
+        }
+
+        // -------- determine newer segments needed for strict LWW ----
+        let max_active_rank = act_refs
+            .iter()
+            .map(|r| *seg_rank.get(&r.index_physical_key).unwrap_or(&0))
+            .max()
+            .unwrap_or(0);
+
+        // Build a list of active logical key spans (borrowed; no clones).
+        let mut active_spans: Vec<(&[u8], &[u8])> = Vec::new();
+        for r in &act_refs {
+            active_spans.push((r.logical_key_min.as_slice(), r.logical_key_max.as_slice()));
+        }
+
+        let mut newer_refs_all: Vec<LwwRef> = Vec::new();
+        for (rank, r) in colindex.segments.iter().enumerate() {
+            if rank >= max_active_rank {
+                continue;
+            }
+            if overlaps_any(
+                r.logical_key_min.as_slice(),
+                r.logical_key_max.as_slice(),
+                &active_spans,
+            ) {
+                newer_refs_all.push(LwwRef {
+                    pk: r.index_physical_key,
+                    rank,
                 });
             }
         }
-        let resp = col.do_gets(gets);
+
+        // Batch-load index blobs for all these newer segments (typed only).
+        let mut lww_gets: Vec<BatchGet> = Vec::new();
+        {
+            let mut seen = FxHashSet::default();
+            for rf in &newer_refs_all {
+                if seen.insert(rf.pk) && !active_index_pks.contains(&rf.pk) {
+                    lww_gets.push(BatchGet::Typed {
+                        key: rf.pk,
+                        kind: TypedKind::IndexSegment,
+                    });
+                }
+            }
+        }
+
+        // Execute both batches in one call.
+        let mut resp = col.do_gets([gets, lww_gets].concat());
 
         let mut seg_map: FxHashMap<PhysicalKey, IndexSegment> = FxHashMap::default();
         let mut data_map: FxHashMap<PhysicalKey, P::Blob> = FxHashMap::default();
-        for gr in resp {
+        let mut newer_seg_map: FxHashMap<PhysicalKey, IndexSegment> = FxHashMap::default();
+
+        for gr in resp.drain(..) {
             match gr {
                 GetResult::Typed {
                     key,
                     value: TypedValue::IndexSegment(seg),
                 } => {
-                    seg_map.insert(key, seg);
+                    if active_index_pks.contains(&key) {
+                        seg_map.insert(key, seg);
+                    } else {
+                        newer_seg_map.insert(key, seg);
+                    }
                 }
                 GetResult::Raw { key, bytes } => {
-                    data_map.insert(key, bytes);
+                    if active_data_pks.contains(&key) {
+                        data_map.insert(key, bytes);
+                    }
                 }
                 _ => {}
             }
         }
 
+        // Build newer_by_rank without requiring Clone on Vec<LwwRef>.
+        let mut newer_by_rank: Vec<Vec<LwwRef>> = Vec::new();
+        newer_by_rank.resize_with(max_active_rank, Vec::new);
+        for rf in newer_refs_all {
+            newer_by_rank[rf.rank].push(rf);
+        }
+
         // -------- build cursors and PQ heads ----------
         let mut segs: Vec<SegCtx<P>> = Vec::with_capacity(act_refs.len());
-        let mut pq = RadixPq::new(matches!(opts.dir, Direction::Reverse));
+        let mut pq = RadixPq::new();
 
         for r in act_refs {
             let seg = seg_map
@@ -396,7 +455,6 @@ impl<P: Pager> ValueScan<P> {
 
             // Compute [begin, end) in value_order for [lo, hi).
             let (begin, end) = range_in_value_index::<P>(&seg, vix, &data, &opts.lo, &opts.hi);
-
             if begin >= end {
                 continue;
             }
@@ -405,8 +463,8 @@ impl<P: Pager> ValueScan<P> {
 
             let seg_idx = segs.len();
             segs.push(SegCtx {
-                seg_pk: r.index_physical_key,
-                data_pk: r.data_physical_key,
+                _seg_pk: r.index_physical_key,
+                _data_pk: r.data_physical_key,
                 seg,
                 data,
                 rank,
@@ -414,14 +472,14 @@ impl<P: Pager> ValueScan<P> {
                 end,
             });
 
-            // Head position depends on direction.
+            // Head depends on direction.
             let head_pos = if matches!(opts.dir, Direction::Reverse) {
                 end - 1
             } else {
                 begin
             };
 
-            // Push the head node for this segment.
+            // Push head node.
             let (seg_ref, data_ref) = {
                 let s = &segs[seg_idx].seg;
                 let d = &segs[seg_idx].data;
@@ -441,6 +499,7 @@ impl<P: Pager> ValueScan<P> {
                 seg_idx,
                 pos: head_pos,
                 val,
+                reverse: matches!(opts.dir, Direction::Reverse),
             });
         }
 
@@ -451,15 +510,39 @@ impl<P: Pager> ValueScan<P> {
         Ok(Self {
             segs,
             pq,
-            field_id,
-            lo: clone_bound_bytes(&opts.lo),
-            hi: clone_bound_bytes(&opts.hi),
+            _field_id: field_id,
+            _lo: clone_bound_bytes(&opts.lo),
+            _hi: clone_bound_bytes(&opts.hi),
             reverse: matches!(opts.dir, Direction::Reverse),
-            enforce_lww: true,
             frame_pred: opts.frame_predicate.clone(),
             frame_head: None,
             halted: false,
+            newer_by_rank,
+            newer_seg_map,
+            bucket_prefix_len: opts.bucket_prefix_len,
+            head_tag_len: opts.head_tag_len,
         })
+    }
+
+    /// Strict LWW: is `key` present in any newer segment (< cur_rank)?
+    #[inline]
+    fn lww_shadowed(&self, key: &[u8], cur_rank: usize) -> bool {
+        let upto = cur_rank.min(self.newer_by_rank.len());
+        for r in 0..upto {
+            for rf in &self.newer_by_rank[r] {
+                if let Some(seg) = self.newer_seg_map.get(&rf.pk) {
+                    if let Some(_pos) = KeyLayout::binary_search_key_with_layout(
+                        &seg.logical_key_bytes,
+                        &seg.key_layout,
+                        seg.n_entries as usize,
+                        key,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -472,72 +555,88 @@ impl<P: Pager> Iterator for ValueScan<P> {
         }
 
         loop {
-            let node = self.pq.pop()?;
-            let sc = &mut self.segs[node.seg_idx];
+            // Pop one head.
+            let node = self.pq.pop(self.reverse)?;
+            let seg_idx = node.seg_idx;
 
-            // LWW gate (placeholder).
-            if self.enforce_lww {
-                let accept = true;
-                if !accept {
-                    // Advance and continue.
-                    if let Some(np) = next_pos(node.pos, sc.begin, sc.end, self.reverse) {
-                        let val = slice_value::<P>(&sc.seg, &sc.data, np);
-                        let (b, t) = {
-                            let a = val.start as usize;
-                            let b2 = val.end as usize;
-                            let bytes = &val.data.as_ref()[a..b2];
-                            bucket_and_tag(bytes, 2, 8)
-                        };
-                        self.pq.push(Node {
-                            bucket: b,
-                            head_tag: t,
-                            rank: sc.rank,
-                            seg_idx: node.seg_idx,
-                            pos: np,
-                            val,
-                        });
-                    }
-                    continue;
+            // ----- Immutable borrow in a tight scope -----
+            // Slice encoded key zero-copy and make the one required owned copy.
+            let (key_owned, rank, begin, end) = {
+                let sc = &self.segs[seg_idx];
+                let row_pos = row_pos_at(&sc.seg, node.pos);
+                let key_slice = KeyLayout::slice_key_by_layout(
+                    &sc.seg.logical_key_bytes,
+                    &sc.seg.key_layout,
+                    row_pos,
+                );
+                (key_slice.to_vec(), sc.rank, sc.begin, sc.end)
+            };
+            // ----- Immutable borrow of segs is now dropped -----
+
+            // Strict LWW: skip if any newer segment has this key.
+            if self.lww_shadowed(key_owned.as_slice(), rank) {
+                // Advance this segment head and continue (no mutable borrow).
+                if let Some(np) = next_pos(node.pos, begin, end, self.reverse) {
+                    let sc = &self.segs[seg_idx];
+                    let val = slice_value::<P>(&sc.seg, &sc.data, np);
+                    let (bkt, tag) = {
+                        let a = val.start as usize;
+                        let b = val.end as usize;
+                        let bytes = &val.data.as_ref()[a..b];
+                        bucket_and_tag(bytes, self.bucket_prefix_len, self.head_tag_len)
+                    };
+                    self.pq.push(Node {
+                        bucket: bkt,
+                        head_tag: tag,
+                        rank,
+                        seg_idx,
+                        pos: np,
+                        val,
+                        reverse: self.reverse,
+                    });
                 }
+                continue;
             }
 
-            // Prepare output (key + value).
-            let row_pos = row_pos_at(&sc.seg, node.pos);
-            let key = slice_key(&sc.seg, row_pos);
-
-            // Frame predicate handling.
+            // Frame predicate on encoded keys.
             if let Some(pred) = &self.frame_pred {
                 if let Some(head) = &self.frame_head {
-                    if !pred(head.as_slice(), key.as_slice()) {
+                    if !pred(head.as_slice(), key_owned.as_slice()) {
                         self.halted = true;
                         return None;
                     }
                 } else {
-                    self.frame_head = Some(key.clone());
+                    // First yield establishes the frame head. This is the only
+                    // place we do an extra copy (first row only).
+                    self.frame_head = Some(key_owned.clone());
                 }
             }
 
-            // Advance this segment's cursor and push next head if any.
-            if let Some(np) = next_pos(node.pos, sc.begin, sc.end, self.reverse) {
+            // Advance this segment head and push next node (still no mutable
+            // borrow needed; cursor lives in Node).
+            if let Some(np) = next_pos(node.pos, begin, end, self.reverse) {
+                let sc = &self.segs[seg_idx];
                 let val = slice_value::<P>(&sc.seg, &sc.data, np);
-                let (b, t) = {
+                let (bkt, tag) = {
                     let a = val.start as usize;
-                    let b2 = val.end as usize;
-                    let bytes = &val.data.as_ref()[a..b2];
-                    bucket_and_tag(bytes, 2, 8)
+                    let b = val.end as usize;
+                    let bytes = &val.data.as_ref()[a..b];
+                    bucket_and_tag(bytes, self.bucket_prefix_len, self.head_tag_len)
                 };
                 self.pq.push(Node {
-                    bucket: b,
-                    head_tag: t,
-                    rank: sc.rank,
-                    seg_idx: node.seg_idx,
+                    bucket: bkt,
+                    head_tag: tag,
+                    rank,
+                    seg_idx,
                     pos: np,
                     val,
+                    reverse: self.reverse,
                 });
             }
 
+            // Yield the row. Values are zero-copy; keys are one owned copy.
             return Some(ValueScanItem {
-                key,
+                key: key_owned,
                 value: node.val,
             });
         }
@@ -554,6 +653,15 @@ fn next_pos(cur: usize, begin: usize, end: usize, reverse: bool) -> Option<usize
     } else {
         if cur > begin { Some(cur - 1) } else { None }
     }
+}
+
+fn overlaps_any(a_min: &[u8], a_max: &[u8], spans: &[(&[u8], &[u8])]) -> bool {
+    for (b_min, b_max) in spans {
+        if !(a_max < *b_min || a_min > *b_max) {
+            return true;
+        }
+    }
+    false
 }
 
 fn overlap_bounds(
@@ -747,18 +855,11 @@ fn bucket_and_tag(v: &[u8], bucket_prefix_len: usize, head_tag_len: usize) -> (u
     (bucket, tag)
 }
 
-/// Clone `Bound<&[u8]>` into owned `Bound<Vec<u8>>` for storage in the
-/// iterator. Keeps API ergonomic at the callsite.
+/// Clone `Bound<&[u8]>` into owned `Bound<Vec<u8>>` for storage.
 fn clone_bound_bytes(b: &Bound<&[u8]>) -> Bound<Vec<u8>> {
     match b {
         Bound::Unbounded => Bound::Unbounded,
         Bound::Included(x) => Bound::Included((*x).to_vec()),
         Bound::Excluded(x) => Bound::Excluded((*x).to_vec()),
     }
-}
-
-/// Slice key bytes for the given row position (owned).
-fn slice_key(seg: &IndexSegment, row_pos: usize) -> Vec<u8> {
-    let s = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, row_pos);
-    s.to_vec()
 }
