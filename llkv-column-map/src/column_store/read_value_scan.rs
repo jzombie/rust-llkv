@@ -118,7 +118,7 @@ pub struct ValueScan<P: Pager> {
 }
 
 /// Min-heap per bucket with a 65,536-bit tier-1 directory.
-/// We keep one BinaryHeap<Reverse<Node>> per active bucket.
+/// We keep one `BinaryHeap<Reverse<Node>>`` per active bucket.
 /// Node carries a `reverse` flag that flips compare semantics.
 struct RadixPq<P: Pager> {
     bitset: [u64; 1024], // 1024 * 64 = 65,536 bits

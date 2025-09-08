@@ -112,7 +112,7 @@ pub struct ValueDirL2 {
     /// First-byte bucket this table refines.
     pub first_byte: u8,
     /// Second-byte directory (len = 257). Offsets are relative to the
-    /// parent first-byte slice (base = l1_dir[first_byte]).
+    /// parent first-byte slice (base = l1_dir\[first_byte\]).
     pub dir257: Vec<u32>,
 }
 
