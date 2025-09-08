@@ -4,7 +4,11 @@ use crate::types::{ByteLen, ByteWidth, IndexEntryCount, LogicalKeyBytes, Physica
 use bitcode::{Decode, Encode};
 
 // TODO: [perf] Ensure bounds are updated as keys are dereferenced.
-/// Pointer to a sealed segment + fast-prune info (all LOGICAL).
+/// Pointer to a sealed segment plus fast-prune metadata (all **logical**).
+///
+/// This is intentionally compact to keep the `ColumnIndex` small and hot in
+/// cache. It is enough to cheaply decide if a segment can satisfy a probe or a
+/// range without opening the full `IndexSegment`.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct IndexSegmentRef {
     /// Physical key of the *index segment* blob.
@@ -22,7 +26,6 @@ pub struct IndexSegmentRef {
     pub n_entries: IndexEntryCount,
 }
 
-// ── Your locked index segment & value layout ─────────────────────────────────
 /// One sealed batch. Describes how to fetch values from the *data* blob.
 /// The *data* blob contains only raw value bytes — no headers/markers.
 ///

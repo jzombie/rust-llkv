@@ -14,8 +14,27 @@ pub use index_segment::*;
 pub mod manifest;
 pub use manifest::*;
 
-// ── Column index (list of immutable segments) ────────────────────────────────
-// One per column. Newest-first so later segments shadow older ones.
+/// Immutable list of sealed index segments for a single column (newest-first).
+///
+/// A `ColumnIndex` is a *small* metadata object that enumerates the column’s
+/// sealed segments in **newest-first order**. Newer segments **shadow** older
+/// ones during reads. Each segment is represented by an `IndexSegmentRef` that
+/// carries:
+///
+/// - a pointer to the on-disk index blob (`index_physical_key`)
+/// - a pointer to the data blob (`data_physical_key`)
+/// - fast-prune bounds on **logical keys** (`logical_key_min`/`_max`)
+/// - optional fast-prune bounds on **values** (`value_min`/`_max`)
+/// - the number of entries
+///
+/// Typical read flow:
+/// 1. Load the `ColumnIndex` (via `Manifest` → `ColumnEntry`).
+/// 2. Prune candidate segments by key/value bounds.
+/// 3. Batch-fetch the necessary index blobs (`IndexSegment`) and then the
+///    referenced data slices.
+///
+/// `ColumnIndex` is immutable; a writer produces a new one when appending or
+/// compacting segments and updates the `Manifest` to point to it.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct ColumnIndex {
     pub field_id: LogicalFieldId,
