@@ -14,13 +14,30 @@ impl<B: AsRef<[u8]> + Clone> ValueSlice<B> {
     pub fn as_slice(&self) -> &[u8] {
         &self.data.as_ref()[self.start as usize..self.end as usize]
     }
+
     #[inline]
     pub fn len(&self) -> usize {
         (self.end - self.start) as usize
     }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    #[inline]
+    pub fn data(&self) -> B {
+        self.data.clone()
+    }
+
+    #[inline]
+    pub fn start(&self) -> ByteOffset {
+        self.start
+    }
+
+    #[inline]
+    pub fn end(&self) -> ByteOffset {
+        self.end
     }
 }
 
