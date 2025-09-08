@@ -74,7 +74,7 @@ fn append_random_column(
     let mut vals = Vec::with_capacity(n_rows as usize);
 
     // Generate values (random), keys increasing (k00000000..)
-    for i in 0..n_rows {
+    for _ in 0..n_rows {
         vals.push(rng.next_u64());
     }
 
