@@ -949,12 +949,15 @@ mod value_scan_tests {
     use crate::types::{AppendOptions, Put, ValueMode};
     use std::collections::{BTreeMap, BTreeSet};
 
+    // TODO: Dedupe
     fn be64_vec(x: u64) -> Vec<u8> {
         u64_be_array(x).to_vec()
     }
+    // TODO: Dedupe
     fn key_bytes(i: u32) -> Vec<u8> {
         format!("k{:06}", i).into_bytes()
     }
+    // TODO: Dedupe
     fn parse_key_u32(k: &[u8]) -> u32 {
         // "k000123" -> 123
         std::str::from_utf8(k)
@@ -962,6 +965,7 @@ mod value_scan_tests {
             .and_then(|s| s[1..].parse::<u32>().ok())
             .expect("key parse")
     }
+    // TODO: Dedupe
     fn parse_be64(v: &[u8]) -> u64 {
         let mut a = [0u8; 8];
         a.copy_from_slice(&v[..8]);
