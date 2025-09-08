@@ -65,24 +65,17 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         }
 
         let mut planned_chunks: Vec<PlannedWriteChunk> = Vec::new();
-
         for mut put in puts {
             if put.items.is_empty() {
                 continue;
             }
 
             if opts.last_write_wins_in_batch {
-                // Use a map with borrowed keys (`&[u8]`) to avoid cloning key data for deduplication.
-                // We still clone the `Cow` value, but this is cheap if the value is borrowed
-                // and necessary to give the map ownership of the value.
                 let mut last: FxHashMap<&[u8], Cow<[u8]>> =
                     FxHashMap::with_capacity_and_hasher(put.items.len(), Default::default());
-                // Iterate with references to avoid moving and potentially cloning.
                 for (k, v) in put.items.iter() {
                     last.insert(k.as_ref(), v.clone());
                 }
-                // Rebuild items from the map. This still allocates for keys,
-                // but we've avoided cloning all keys upfront just for the lookup.
                 put.items = last
                     .into_iter()
                     .map(|(k, v)| (Cow::Owned(k.to_vec()), v))
@@ -92,11 +85,16 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             // sort by key
             put.items.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
 
+            let (mut keys_sorted, mut values): (Vec<Vec<u8>>, Vec<Vec<u8>>) = put
+                .items
+                .into_iter()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .unzip();
             // decide layout
             let layout = match opts.mode {
                 ValueMode::ForceFixed(w) => {
                     assert!(w > 0, "fixed width must be > 0");
-                    for (_, v) in &put.items {
+                    for v in &values {
                         assert!(
                             v.len() == w as usize,
                             "ForceFixed width mismatch: expected {}, got {}",
@@ -108,21 +106,24 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 }
                 ValueMode::ForceVariable => PlannedWriteLayout::Variable,
                 ValueMode::Auto => {
-                    let w = put.items[0].1.len();
-                    if w > 0 && put.items.iter().all(|(_, v)| v.len() == w) {
-                        PlannedWriteLayout::Fixed {
-                            width: w as ByteWidth,
+                    if !values.is_empty() {
+                        let w = values[0].len();
+                        if w > 0 && values.iter().all(|v| v.len() == w) {
+                            PlannedWriteLayout::Fixed {
+                                width: w as ByteWidth,
+                            }
+                        } else {
+                            PlannedWriteLayout::Variable
                         }
                     } else {
-                        PlannedWriteLayout::Variable
+                        PlannedWriteLayout::Variable // Default for empty
                     }
                 }
             };
 
-            // chunk by thresholds
-            let mut i = 0usize;
-            while i < put.items.len() {
-                let remain = put.items.len() - i;
+            //  Chunk the data by draining vectors instead of slicing and cloning.
+            while !keys_sorted.is_empty() {
+                let remain = keys_sorted.len();
                 let take_by_entries = core::cmp::min(remain, opts.segment_max_entries);
 
                 let take = match layout {
@@ -139,8 +140,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         // grow until adding next would exceed bytes or entries
                         let mut acc = 0usize;
                         let mut cnt = 0usize;
-                        for j in i..(i + take_by_entries) {
-                            let sz = put.items[j].1.len();
+                        for j in 0..take_by_entries {
+                            let sz = values[j].len();
                             if cnt > 0 && acc + sz > opts.segment_max_bytes {
                                 break;
                             }
@@ -156,21 +157,15 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                     }
                 };
 
-                let end = i + take;
-                let mut keys_sorted: Vec<Vec<u8>> = Vec::with_capacity(take);
-                let mut vals: Vec<Vec<u8>> = Vec::with_capacity(take);
-                for (k, v) in put.items[i..end].iter() {
-                    keys_sorted.push(k.to_vec());
-                    vals.push(v.to_vec());
-                }
+                let chunk_keys: Vec<Vec<u8>> = keys_sorted.drain(..take).collect();
+                let chunk_values: Vec<Vec<u8>> = values.drain(..take).collect();
+
                 planned_chunks.push(PlannedWriteChunk {
                     field_id: put.field_id,
-                    keys_sorted,
-                    values: vals,
+                    keys_sorted: chunk_keys,
+                    values: chunk_values,
                     layout: layout.clone(),
                 });
-
-                i = end;
             }
         }
 
@@ -181,6 +176,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         // Allocate physical keys for all data blobs and index blobs in one go.
         let n_segs = planned_chunks.len();
         let mut pkeys = self.pager.alloc_many(n_segs * 2).unwrap();
+
         // first half used for data blobs, second half for index blobs
         let data_keys: Vec<PhysicalKey> = pkeys.drain(0..n_segs).collect();
         let index_keys: Vec<PhysicalKey> = pkeys.drain(0..n_segs).collect();
@@ -192,6 +188,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         // Prepare map: field_id -> (col_index_pkey, ColumnIndex)
         let mut need_manifest_update = false;
         let mut ensure_column_loaded: FxHashSet<LogicalFieldId> = FxHashSet::default();
+
         // track which ColumnIndex pkeys were actually modified this call.
         let mut touched_colindex_pkeys: FxHashSet<PhysicalKey> = FxHashSet::default();
 
@@ -208,7 +205,6 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 .copied()
                 .collect()
         };
-
         if !missing.is_empty() {
             // find entries in manifest
             let lookups: Vec<(LogicalFieldId, PhysicalKey)> = {
@@ -221,7 +217,6 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 }
                 v
             };
-
             if !lookups.is_empty() {
                 let gets: Vec<BatchGet> = lookups
                     .iter()
@@ -254,7 +249,6 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         {
             let mut cache = self.colindex_cache.write().unwrap();
             let mut man = self.manifest.write().unwrap();
-
             for fid in &missing {
                 if !cache.contains_key(fid) {
                     let col_index_pkey = self.pager.alloc_many(1).unwrap()[0];
@@ -279,19 +273,13 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
 
             // compute value bounds once per segment
             let (vmin, vmax) = ValueBound::min_max_bounds(&chunk.values);
-
             // build data blob (+ value offsets for variable)
             let (data_blob, seg, n_entries) = match chunk.layout {
                 PlannedWriteLayout::Fixed { width } => {
                     // values blob
-                    let mut blob = Vec::with_capacity(chunk.values.len() * (width as usize));
-                    for v in &chunk.values {
-                        debug_assert_eq!(v.len(), width as usize);
-                        blob.extend_from_slice(v);
-                    }
+                    let blob = chunk.values.concat();
                     // index segment (keys packed + fixed value layout)
-                    let seg =
-                        IndexSegment::build_fixed(data_pkey, &chunk.keys_sorted.clone(), width);
+                    let seg = IndexSegment::build_fixed(data_pkey, &chunk.keys_sorted, width);
                     (blob, seg, chunk.values.len() as IndexEntryCount)
                 }
                 PlannedWriteLayout::Variable => {
@@ -303,8 +291,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         sizes.push(v.len() as ByteLen);
                     }
                     // index segment (keys packed + var value layout)
-                    let seg =
-                        IndexSegment::build_var(data_pkey, &chunk.keys_sorted.clone(), &sizes);
+                    let seg = IndexSegment::build_var(data_pkey, &chunk.keys_sorted, &sizes);
                     (blob, seg, chunk.values.len() as IndexEntryCount)
                 }
             };
@@ -324,14 +311,12 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 .last()
                 .cloned()
                 .expect("non-empty segment");
-
             // update ColumnIndex (newest-first: push_front semantics)
             {
                 let mut cache = self.colindex_cache.write().unwrap();
                 let (col_pkey, col_index) = cache
                     .get_mut(&chunk.field_id)
                     .expect("column index present");
-
                 col_index.segments.insert(
                     0,
                     IndexSegmentRef {
@@ -353,19 +338,14 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         // Persist: data blobs, index segments, column indexes, manifest (if needed).
         // Combine everything into a SINGLE batch.
         let mut puts_batch: Vec<BatchPut> = Vec::new();
-
-        if !data_puts.is_empty() {
-            for (k, v) in data_puts {
-                puts_batch.push(BatchPut::Raw { key: k, bytes: v });
-            }
+        for (k, v) in data_puts {
+            puts_batch.push(BatchPut::Raw { key: k, bytes: v });
         }
-        if !index_puts.is_empty() {
-            for (k, seg) in index_puts {
-                puts_batch.push(BatchPut::Typed {
-                    key: k,
-                    value: TypedValue::IndexSegment(seg),
-                });
-            }
+        for (k, seg) in index_puts {
+            puts_batch.push(BatchPut::Typed {
+                key: k,
+                value: TypedValue::IndexSegment(seg),
+            });
         }
 
         // Only write ColumnIndex blobs that were actually touched this call.
