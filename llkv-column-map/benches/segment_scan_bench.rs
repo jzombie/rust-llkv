@@ -26,7 +26,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use llkv_column_map::ColumnStore;
 use llkv_column_map::codecs::big_endian::u64_be_array;
-use llkv_column_map::column_store::read_value_scan::{Direction, ValueScanOpts};
+use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ValueScanOpts};
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, ValueMode};
 
@@ -140,6 +140,7 @@ fn scan_full_count_forward(store: &ColumnStore<'_, MemPager>, fid: LogicalFieldI
         .scan_values_lww(
             fid,
             ValueScanOpts {
+                order_by: OrderBy::Value,
                 dir: Direction::Forward,
                 lo: Bound::Unbounded,
                 hi: Bound::Unbounded,
@@ -163,6 +164,7 @@ fn scan_full_count_reverse(store: &ColumnStore<'_, MemPager>, fid: LogicalFieldI
         .scan_values_lww(
             fid,
             ValueScanOpts {
+                order_by: OrderBy::Value,
                 dir: Direction::Reverse,
                 lo: Bound::Unbounded,
                 hi: Bound::Unbounded,

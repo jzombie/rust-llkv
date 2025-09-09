@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 use llkv_column_map::codecs::big_endian::u64_be_array;
-use llkv_column_map::column_store::read_value_scan::{Direction, ValueScanOpts};
+use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ValueScanOpts};
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, ValueMode};
 use llkv_column_map::{ColumnStore, storage::StorageKind};
@@ -177,6 +177,7 @@ fn large_table_end_to_end_scans() {
         .scan_values_lww(
             fid0,
             ValueScanOpts {
+                order_by: OrderBy::Value,
                 dir: Direction::Forward,
                 lo: Bound::Unbounded,
                 hi: Bound::Unbounded,
@@ -219,6 +220,7 @@ fn large_table_end_to_end_scans() {
         .scan_values_lww(
             fid0,
             ValueScanOpts {
+                order_by: OrderBy::Value,
                 dir: Direction::Reverse,
                 lo: Bound::Unbounded,
                 hi: Bound::Unbounded,
@@ -261,6 +263,7 @@ fn large_table_end_to_end_scans() {
         .scan_values_lww(
             fid0,
             ValueScanOpts {
+                order_by: OrderBy::Value,
                 dir: Direction::Forward,
                 lo: Bound::Included(&lo),
                 hi: Bound::Excluded(&hi),
@@ -293,6 +296,7 @@ fn large_table_end_to_end_scans() {
         .scan_values_lww(
             fid0,
             ValueScanOpts {
+                order_by: OrderBy::Value,
                 dir: Direction::Reverse,
                 lo: Bound::Included(&lo),
                 hi: Bound::Excluded(&hi),
@@ -323,6 +327,7 @@ fn large_table_end_to_end_scans() {
         .scan_values_lww(
             fid0,
             ValueScanOpts {
+                order_by: OrderBy::Value,
                 dir: Direction::Forward,
                 lo: Bound::Included(&lo2),
                 hi: Bound::Excluded(&hi2),

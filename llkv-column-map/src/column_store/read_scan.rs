@@ -1,13 +1,19 @@
-//! Value-ordered range scan with strict LWW and frame predicate.
+//! Value-/key-ordered range scan with strict LWW/FWW and optional frame predicate.
 //!
-//! Iterator uses per-segment value_order + L1/L2 directories to seed
-//! one head per candidate segment, and a 2-tier radix PQ to pop the
-//! next value across segments. Strict LWW is enforced by probing any
-//! newer segment (by recency rank) for membership of the same key.
+//! Iterator uses per-segment order + L1/L2 directories (for value order) to seed
+//! one head per candidate segment, and a 2-tier radix PQ to pop the next item
+//! across segments. Strict conflict policy (LWW/FWW) is enforced by probing any
+//! newer/older segment (by recency rank) for membership of the same key.
 //!
-//! - Newer segments are batch-loaded as IndexSegment (no data blobs).
-//! - Active segments (value producers) load index + data blobs once.
-//! - Frame predicate is evaluated on encoded values (zero copy).
+//! Modes:
+//! - OrderBy::Value  (default): preserves the previous behavior (value-ordered).
+//! - OrderBy::Key               : “natural” logical key order (segment key order).
+//!
+//! - Newer/older segments for shadow checks are batch-loaded as IndexSegment
+//!   (no data blobs).
+//! - Active segments (producers) load index + data blobs once.
+//! - Frame predicate is evaluated on encoded **values** (zero copy), regardless
+//!   of the chosen ordering (value/key).
 
 use crate::bounds::ValueBound;
 use crate::column_index::{IndexSegment, ValueIndex};
@@ -22,11 +28,20 @@ use std::collections::BinaryHeap;
 use std::ops::Bound;
 use std::sync::Arc;
 
-/// Direction for value-ordered scans.
+/// Direction along the chosen ordering (value or key).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     Forward,
     Reverse,
+}
+
+/// What to order the scan by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderBy {
+    /// Order by encoded VALUE bytes (old behavior).
+    Value,
+    /// Order by LOGICAL KEY bytes (segment’s natural key order).
+    Key,
 }
 
 /// Conflict resolution across generations.
@@ -41,12 +56,16 @@ pub enum ConflictPolicy {
 /// Frame predicate type over encoded **values** (head vs current).
 pub type FramePred = Arc<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync>;
 
-/// Scan options for value-ordered range scans.
+/// Scan options.
 pub struct ValueScanOpts<'a> {
+    /// Direction along the chosen `order_by`.
     pub dir: Direction,
+    /// Lower/upper bound in the chosen domain:
+    /// - OrderBy::Value => VALUE bounds
+    /// - OrderBy::Key   => KEY   bounds
     pub lo: Bound<&'a [u8]>,
     pub hi: Bound<&'a [u8]>,
-    /// Optional prefix to prune quickly (value-side).
+    /// Optional prefix to prune quickly (domain-specific; not currently used).
     pub prefix: Option<&'a [u8]>,
     /// First 2 bytes are the bucket id. Keep at 2 for now.
     pub bucket_prefix_len: usize,
@@ -54,6 +73,8 @@ pub struct ValueScanOpts<'a> {
     pub head_tag_len: usize,
     /// Optional end-of-frame predicate on encoded **values**.
     pub frame_predicate: Option<FramePred>,
+    /// Order by VALUE (default) or KEY (natural key order).
+    pub order_by: OrderBy,
 }
 
 impl<'a> Default for ValueScanOpts<'a> {
@@ -66,6 +87,7 @@ impl<'a> Default for ValueScanOpts<'a> {
             bucket_prefix_len: 2,
             head_tag_len: 8,
             frame_predicate: None,
+            order_by: OrderBy::Value,
         }
     }
 }
@@ -84,7 +106,9 @@ struct SegCtx<P: Pager> {
     data: P::Blob,
     /// Newest-first order rank (0 == newest).
     rank: usize,
-    /// Window in value_index.value_order: [begin, end).
+    /// Window in the ACTIVE ORDER:
+    /// - value order: range into value_index.value_order: [begin, end)
+    /// - key   order: range into key rows (0..n_entries): [begin, end)
     begin: usize,
     end: usize,
     /// Cached logical-key bounds (for fast reject in membership probes).
@@ -106,6 +130,8 @@ pub struct ValueScan<P: Pager> {
     _lo: Bound<Vec<u8>>,
     _hi: Bound<Vec<u8>>,
     reverse: bool,
+    /// True if ordering is VALUE-based (else KEY-based).
+    by_value: bool,
     frame_pred: Option<FramePred>,           // evaluated on VALUE bytes
     frame_head: Option<ValueSlice<P::Blob>>, // first emitted VALUE slice (zero-copy)
     halted: bool,
@@ -120,87 +146,23 @@ pub struct ValueScan<P: Pager> {
     policy: ConflictPolicy,
 }
 
-/// A radix-bucketed **priority queue** specialized for byte-sorted values.
+/// A radix-bucketed **priority queue** specialized for byte-sorted streams (value or key).
 ///
-/// **PQ** stands for *priority queue*. `RadixPq` is a two-tier structure:
-///
-/// 1) **Tier-1 directory (radix):** a fixed 65,536-bit directory keyed by the
-///    first two bytes (big-endian) of the value slice. Each bit says whether
-///    bucket `b ∈ [0, 65535]` is non-empty. Bits are stored as 1024 u64 words,
-///    so we can find the next non-empty bucket with a single `trailing_zeros`
-///    (forward scans) or `leading_zeros` (reverse scans).
-///
-/// 2) **Tier-2 per-bucket PQ:** for each active bucket we keep a
-///    `BinaryHeap<Reverse<Node>>`. The heap orders by value prefix/tag and then
-///    full bytes, with rank/pos tie-breakers. The `Node::reverse` flag flips the
-///    value ordering so the same structure supports forward *and* reverse scans.
-///
-/// ### Why radix?
-/// - The next-bucket search is O(1) over a small 8KiB directory with
-///   bit-twiddling (instead of probing many empty heaps).
-/// - Grouping by the first two bytes keeps individual heaps small and reduces
-///   the log-factor in `push`/`pop`.
-///
-/// ### Direction semantics
-/// - **Forward:** find the lowest set bit (smallest bucket), then pop that
-///   bucket’s min element.
-/// - **Reverse:** find the highest set bit (largest bucket), then pop that
-///   bucket’s max element (achieved by flipping compares in `Node::Ord`).
-///
-/// ### Reverse optimization: **bitset watermarks**
-/// We track `min_word`/`max_word`, the lowest/highest u64 **word** index in
-/// `bitset` that currently has any set bits. `find_bucket()` bounds its scan to
-/// `[min_word ..= max_word]`, avoiding long empty tails—especially helpful for
-/// reverse scans over sparse buckets.
-///
-/// - On `push`, we set the directory bit and expand watermarks if needed.
-/// - On `pop`, when a bucket becomes empty we clear its bit; if that cleared the
-///   last bit in its word, we contract the corresponding watermark.
-/// - Empty state is represented by `min_word == usize::MAX` (and `is_empty()`
-///   remains the authoritative check).
-///
-/// ### Complexity
-/// - `push`: O(log k) in the destination heap (k = nodes in that bucket) + O(1)
-///   bitset/watermark maintenance.
-/// - `pop`: O(1) bucket discovery (bit scan constrained by watermarks) + O(log k)
-///   for the heap pop; plus O(1) maintenance when the bucket empties.
-/// - Memory: one heap per active bucket; directory is ~8 KiB.
-///
-/// ### Trade-offs & gotchas
-/// - **Skewed prefixes:** if most values share the same first two bytes, one
-///   bucket dominates and you pay a larger O(log k); consider widening/narrowing
-///   the bucket prefix if your value distribution is known to be skewed.
-/// - **Churn:** if buckets flip between empty/non-empty very frequently,
-///   watermark updates add a tiny branch/bit cost per op. For random data this
-///   is a net win; with adversarial patterns the benefit may flatten.
-/// - **Coupling:** the bucketing must match `bucket_and_tag()`. If you change
-///   the prefix width (currently 2 bytes), adjust the directory size accordingly.
-///
-/// ### Invariants
-/// - `bitset[i] != 0`  ⇔  at least one bucket in word `i` is present in
-///   `buckets`.
-/// - When a bucket heap becomes empty we both clear the bit **and**
-///   remove the heap entry from `buckets`.
-/// - When non-empty, `min_word <= max_word`.
+/// See long comment in previous revisions; unchanged except it now also supports KEY ordering
+/// by letting each node provide its own ordering bytes (value bytes by default; key bytes when
+/// `key_ord` is present).
 struct RadixPq<P: Pager> {
-    /// 65,536 one-bit entries (u16 bucket ids), packed into 1024 64-bit words
-    /// for constant-time trailing/leading zero scans.
+    /// 65,536 one-bit entries (u16 bucket ids), packed into 1024 64-bit words.
     bitset: [u64; 1024],
-
     /// Second tier: one heap per active bucket. Wrapped in `Reverse` so it acts
-    /// as a min-heap with respect to `Node::Ord` (which itself flips value
-    /// comparisons when scanning in reverse).
+    /// as a min-heap with respect to `Node::Ord` (which flips value/key ordering for reverse).
     buckets: FxHashMap<u16, BinaryHeap<std::cmp::Reverse<Node<P>>>>,
-
     /// Watermarks over `bitset` words that currently contain any set bits.
-    /// Used by `find_bucket()` to bound scanning. When empty,
-    /// `min_word` is set to `usize::MAX`.
     min_word: usize,
     max_word: usize,
 }
 
 impl<P: Pager> RadixPq<P> {
-    /// Create an empty radix PQ. Watermarks are initialized to the empty state.
     fn new() -> Self {
         Self {
             bitset: [0u64; 1024],
@@ -210,16 +172,11 @@ impl<P: Pager> RadixPq<P> {
         }
     }
 
-    /// Insert a node:
-    /// - Sets the directory bit for `bucket`,
-    /// - pushes into that bucket’s heap,
-    /// - expands watermarks if this is the first bit in its word.
     fn push(&mut self, node: Node<P>) {
         let b = node.bucket;
         let idx = (b / 64) as usize;
         let bit = 1u64 << (b % 64);
 
-        // If this word was previously empty, update watermarks before setting the bit.
         if self.bitset[idx] == 0 {
             if self.min_word == usize::MAX || idx < self.min_word {
                 self.min_word = idx;
@@ -237,34 +194,24 @@ impl<P: Pager> RadixPq<P> {
         self.bitset[idx] |= bit;
     }
 
-    /// Pop the next node in the current scan direction:
-    /// - Uses `find_bucket(reverse)` which scans only within the watermark range,
-    /// - pops from that bucket’s heap,
-    /// - if the heap becomes empty, clears the directory bit, removes the heap,
-    ///   and contracts watermarks if the word goes to zero.
     fn pop(&mut self, reverse: bool) -> Option<Node<P>> {
         let bi = self.find_bucket(reverse)?;
         let heap = self.buckets.get_mut(&bi)?;
         let out = heap.pop()?.0;
 
         if heap.is_empty() {
-            // Clear the bit for this bucket and potentially adjust watermarks.
             let idx = (bi / 64) as usize;
             let bit = 1u64 << (bi % 64);
             self.bitset[idx] &= !bit;
-            // Remove the (now empty) per-bucket heap
             self.buckets.remove(&bi);
 
             if self.bitset[idx] == 0 {
-                // If this word became empty, move the corresponding watermark(s).
                 if idx == self.min_word {
-                    // Bump min_word up to the next non-empty word.
                     let mut i = self.min_word;
                     while i <= self.max_word && self.bitset[i] == 0 {
                         i += 1;
                     }
                     if i > self.max_word {
-                        // Directory is now empty.
                         self.min_word = usize::MAX;
                         self.max_word = 0;
                     } else {
@@ -272,9 +219,7 @@ impl<P: Pager> RadixPq<P> {
                     }
                 }
                 if self.min_word != usize::MAX && idx == self.max_word {
-                    // Drop max_word down to the previous non-empty word.
                     let mut i = self.max_word;
-                    // (guard against underflow; min_word is valid here)
                     while i >= self.min_word && self.bitset[i] == 0 {
                         if i == 0 {
                             break;
@@ -282,7 +227,6 @@ impl<P: Pager> RadixPq<P> {
                         i -= 1;
                     }
                     if self.min_word > i || self.bitset[i] == 0 {
-                        // Empty after adjustment
                         self.min_word = usize::MAX;
                         self.max_word = 0;
                     } else {
@@ -295,17 +239,12 @@ impl<P: Pager> RadixPq<P> {
         Some(out)
     }
 
-    /// Locate the next non-empty bucket id in the chosen direction by scanning
-    /// the bitset. Scans are bounded to `[min_word ..= max_word]` via the
-    /// watermarks to avoid long empty tails.
     fn find_bucket(&self, reverse: bool) -> Option<u16> {
-        // Fast empty test via watermark.
         if self.min_word == usize::MAX {
             return None;
         }
 
         if !reverse {
-            // Scan only within [min_word ..= max_word].
             for i in self.min_word..=self.max_word {
                 let word = self.bitset[i];
                 if word != 0 {
@@ -314,12 +253,11 @@ impl<P: Pager> RadixPq<P> {
                 }
             }
         } else {
-            // Reverse: scan [max_word ..= min_word] downward.
             let mut i = self.max_word;
             loop {
                 let word = self.bitset[i];
                 if word != 0 {
-                    let lz = word.leading_zeros() as u16; // 0..=63 when word != 0
+                    let lz = word.leading_zeros() as u16;
                     let bit = 63u16 - lz;
                     return Some(((i as u16) * 64) + bit);
                 }
@@ -332,10 +270,8 @@ impl<P: Pager> RadixPq<P> {
         None
     }
 
-    /// True iff no buckets are active (all bits zero).
     #[inline]
     fn is_empty(&self) -> bool {
-        // Either check the map, or the watermark.
         self.min_word == usize::MAX
     }
 }
@@ -348,22 +284,30 @@ struct Node<P: Pager> {
     /// Newest-first tie-breaker: lower rank means newer.
     rank: usize,
     seg_idx: usize,
+    /// Position in the ACTIVE ORDER:
+    /// - value order: value-rank (index into value_index.value_order)
+    /// - key   order: row position (0..n_entries)
     pos: usize,
+    /// Zero-copy value slice (for returning and for frame predicate).
     val: ValueSlice<P::Blob>,
+    /// When present, ordering is by KEY bytes; otherwise by VALUE bytes.
+    key_ord: Option<Vec<u8>>,
     reverse: bool,
 }
 
 impl<P: Pager> Node<P> {
-    #[inline]
+    #[inline(always)]
     fn bytes(&self) -> &[u8] {
-        let a = self.val.start as usize;
-        let b = self.val.end as usize;
-        &self.val.data.as_ref()[a..b]
+        if let Some(ref k) = self.key_ord {
+            k.as_slice()
+        } else {
+            let a = self.val.start as usize;
+            let b = self.val.end as usize;
+            &self.val.data.as_ref()[a..b]
+        }
     }
 }
 
-/// Ordering toggles by `reverse` for value fields. Rank is always asc
-/// (newer first) on ties.
 impl<P: Pager> Eq for Node<P> {}
 impl<P: Pager> PartialEq for Node<P> {
     fn eq(&self, other: &Self) -> bool {
@@ -377,8 +321,6 @@ impl<P: Pager> PartialEq for Node<P> {
 }
 impl<P: Pager> Ord for Node<P> {
     fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap takes the greatest; we wrap with Reverse,
-        // so this defines ascending for Forward and descending for Reverse.
         let mut ord = if !self.reverse {
             self.bucket.cmp(&other.bucket)
         } else {
@@ -423,7 +365,7 @@ impl<P: Pager> PartialOrd for Node<P> {
 }
 
 impl<P: Pager> super::ColumnStore<'_, P> {
-    /// LWW-enforced, value-ordered scan over [lo, hi).
+    /// LWW-enforced scan over [lo, hi) in the chosen domain (value/key).
     pub fn scan_values_lww(
         &self,
         field_id: LogicalFieldId,
@@ -432,7 +374,7 @@ impl<P: Pager> super::ColumnStore<'_, P> {
         ValueScan::new(self, field_id, opts, ConflictPolicy::LWW)
     }
 
-    /// FWW-enforced, value-ordered scan over [lo, hi).
+    /// FWW-enforced scan over [lo, hi) in the chosen domain (value/key).
     pub fn scan_values_fww(
         &self,
         field_id: LogicalFieldId,
@@ -467,6 +409,8 @@ impl<P: Pager> ValueScan<P> {
         opts: ValueScanOpts<'_>,
         policy: ConflictPolicy,
     ) -> Result<Self, ScanError> {
+        let by_value = matches!(opts.order_by, OrderBy::Value);
+
         // -------- ensure ColumnIndex in cache ----------
         let colindex = {
             let cache = col.colindex_cache.read().unwrap();
@@ -501,17 +445,27 @@ impl<P: Pager> ValueScan<P> {
             }
         };
 
-        // -------- prune segments by value_min..value_max ----------
+        // -------- choose candidate segments by bounds ----------
         let (act_refs, seg_rank) = {
             let mut v = Vec::new();
             let mut ranks = FxHashMap::default();
             for (rank, r) in colindex.segments.iter().enumerate() {
-                if overlap_bounds(
-                    &opts.lo,
-                    &opts.hi,
-                    r.value_min.as_ref(),
-                    r.value_max.as_ref(),
-                ) {
+                let keep = if by_value {
+                    overlap_bounds(
+                        &opts.lo,
+                        &opts.hi,
+                        r.value_min.as_ref(),
+                        r.value_max.as_ref(),
+                    )
+                } else {
+                    overlap_bounds_key(
+                        &opts.lo,
+                        &opts.hi,
+                        r.logical_key_min.as_slice(),
+                        r.logical_key_max.as_slice(),
+                    )
+                };
+                if keep {
                     v.push(r.clone());
                     ranks.insert(r.index_physical_key, rank);
                 }
@@ -634,13 +588,15 @@ impl<P: Pager> ValueScan<P> {
                 .remove(&r.data_physical_key)
                 .ok_or_else(|| ScanError::Storage("data blob missing".into()))?;
 
-            let vix = match &seg.value_index {
-                Some(v) => v,
-                None => return Err(ScanError::ValueIndexMissing(r.index_physical_key)),
+            let (begin, end) = if by_value {
+                let vix = match &seg.value_index {
+                    Some(v) => v,
+                    None => return Err(ScanError::ValueIndexMissing(r.index_physical_key)),
+                };
+                range_in_value_index::<P>(&seg, vix, &data, &opts.lo, &opts.hi)
+            } else {
+                range_in_key_index(&seg, &opts.lo, &opts.hi)
             };
-
-            // Compute [begin, end) in value_order for [lo, hi).
-            let (begin, end) = range_in_value_index::<P>(&seg, vix, &data, &opts.lo, &opts.hi);
             if begin >= end {
                 continue;
             }
@@ -677,21 +633,40 @@ impl<P: Pager> ValueScan<P> {
                 begin
             };
 
-            // Push head node.
+            // Build first node for this segment.
             let (seg_ref, data_ref) = {
                 let s = &segs[seg_idx].seg;
                 let d = &segs[seg_idx].data;
                 (s, d)
             };
-            // value_order position -> row position
-            let head_row = row_pos_at(seg_ref, head_pos);
-            let val = slice_value::<P>(seg_ref, data_ref, head_row);
-            let (bucket, tag) = {
-                let a = val.start as usize;
-                let b = val.end as usize;
-                let bytes = &val.data.as_ref()[a..b];
-                bucket_and_tag(bytes, opts.bucket_prefix_len, opts.head_tag_len)
+            // Row position depends on ordering.
+            let head_row = if by_value {
+                row_pos_at(seg_ref, head_pos)
+            } else {
+                head_pos
             };
+            let val = slice_value::<P>(seg_ref, data_ref, head_row);
+
+            // Ordering fields (bucket/tag) + optional key bytes.
+            let (bucket, tag, key_ord) = if by_value {
+                let (bkt, tg) = bucket_and_tag_from_value_slice::<P>(
+                    &val,
+                    opts.bucket_prefix_len,
+                    opts.head_tag_len,
+                );
+                (bkt, tg, None)
+            } else {
+                let key_slice = KeyLayout::slice_key_by_layout(
+                    &seg_ref.logical_key_bytes,
+                    &seg_ref.key_layout,
+                    head_row,
+                );
+                let kb = key_slice.to_vec();
+                let (bkt, tg) =
+                    bucket_and_tag_bytes_fast(&kb, opts.bucket_prefix_len, opts.head_tag_len);
+                (bkt, tg, Some(kb))
+            };
+
             pq.push(Node {
                 bucket,
                 head_tag: tag,
@@ -699,6 +674,7 @@ impl<P: Pager> ValueScan<P> {
                 seg_idx,
                 pos: head_pos,
                 val,
+                key_ord,
                 reverse: matches!(opts.dir, Direction::Reverse),
             });
         }
@@ -714,6 +690,7 @@ impl<P: Pager> ValueScan<P> {
             _lo: clone_bound_bytes(&opts.lo),
             _hi: clone_bound_bytes(&opts.hi),
             reverse: matches!(opts.dir, Direction::Reverse),
+            by_value,
             frame_pred: opts.frame_predicate.clone(),
             frame_head: None,
             halted: false,
@@ -736,10 +713,9 @@ impl<P: Pager> ValueScan<P> {
         .is_some()
     }
 
-    /// Is this `key rank` shadowed by the chosen policy?
+    /// Fast bound check using borrowed min/max from the segment.
     #[inline]
     fn key_within_seg_bounds(seg: &IndexSegment, key: &[u8]) -> bool {
-        // Borrowed min/max from the segment without allocation.
         let min = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);
         let max = KeyLayout::slice_key_by_layout(
             &seg.logical_key_bytes,
@@ -761,7 +737,6 @@ impl<P: Pager> ValueScan<P> {
             if !dominates {
                 continue;
             }
-            // Fast bound reject using cached min/max per active segment.
             if key < sc.min_key.as_slice() || key > sc.max_key.as_slice() {
                 continue;
             }
@@ -773,11 +748,9 @@ impl<P: Pager> ValueScan<P> {
         // 2) Check index-only shadow segments (prefetched).
         match self.policy {
             ConflictPolicy::LWW => {
-                // strictly newer ranks [0 .. rank)
                 for r in 0..rank {
                     for rf in &self.shadow_by_rank[r] {
                         if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
-                            // Fast bound reject (borrowed slices; no alloc).
                             if !Self::key_within_seg_bounds(seg, key) {
                                 continue;
                             }
@@ -789,7 +762,6 @@ impl<P: Pager> ValueScan<P> {
                 }
             }
             ConflictPolicy::FWW => {
-                // strictly older ranks (rank+1 ..)
                 for r in (rank + 1)..self.shadow_by_rank.len() {
                     for rf in &self.shadow_by_rank[r] {
                         if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
@@ -821,9 +793,14 @@ impl<P: Pager> Iterator for ValueScan<P> {
             let seg_idx = node.seg_idx;
 
             // ---- short immutable borrow to slice key and plan next head ----
-            let (key_owned, rank, next_pos_opt, next_val_opt) = {
+            let (key_owned, rank, next_pos_opt, next_val_opt, next_key_for_order) = {
                 let sc = &self.segs[seg_idx];
-                let row_pos = row_pos_at(&sc.seg, node.pos);
+                // Row position depends on active ordering.
+                let row_pos = if self.by_value {
+                    row_pos_at(&sc.seg, node.pos)
+                } else {
+                    node.pos
+                };
                 let key_slice = KeyLayout::slice_key_by_layout(
                     &sc.seg.logical_key_bytes,
                     &sc.seg.key_layout,
@@ -834,32 +811,73 @@ impl<P: Pager> Iterator for ValueScan<P> {
                 let begin = sc.begin;
                 let end = sc.end;
                 let next_pos_opt = next_pos(node.pos, begin, end, self.reverse);
-                let next_val_opt = next_pos_opt.map(|np| {
-                    let row = row_pos_at(&sc.seg, np);
-                    slice_value::<P>(&sc.seg, &sc.data, row)
+                // For the next head we always need value slice; for KEY ordering we also
+                // prepare the next key bytes (to avoid re-slicing after borrow ends).
+                let (next_val_opt, next_key_for_order) = next_pos_opt.map_or((None, None), |np| {
+                    let row = if self.by_value {
+                        row_pos_at(&sc.seg, np)
+                    } else {
+                        np
+                    };
+                    let sval = slice_value::<P>(&sc.seg, &sc.data, row);
+                    let skey_ord = if self.by_value {
+                        None
+                    } else {
+                        Some(
+                            KeyLayout::slice_key_by_layout(
+                                &sc.seg.logical_key_bytes,
+                                &sc.seg.key_layout,
+                                row,
+                            )
+                            .to_vec(),
+                        )
+                    };
+                    (Some(sval), skey_ord)
                 });
-                (key_owned, sc.rank, next_pos_opt, next_val_opt)
+                (
+                    key_owned,
+                    sc.rank,
+                    next_pos_opt,
+                    next_val_opt,
+                    next_key_for_order,
+                )
             };
             // ---- immutable borrow dropped here ----
 
             // Conflict policy: skip if shadowed.
             if self.is_shadowed(key_owned.as_slice(), rank) {
                 if let (Some(np), Some(val)) = (next_pos_opt, next_val_opt) {
-                    let (bkt, tag) = {
-                        let a = val.start as usize;
-                        let b = val.end as usize;
-                        let bytes = &val.data.as_ref()[a..b];
-                        bucket_and_tag(bytes, self.bucket_prefix_len, self.head_tag_len)
-                    };
-                    self.pq.push(Node {
-                        bucket: bkt,
-                        head_tag: tag,
-                        rank,
-                        seg_idx,
-                        pos: np,
-                        val,
-                        reverse: self.reverse,
-                    });
+                    // Compute ordering tuple for the next node.
+                    if self.by_value {
+                        let (bkt, tag) = bucket_and_tag_from_value_slice::<P>(
+                            &val,
+                            self.bucket_prefix_len,
+                            self.head_tag_len,
+                        );
+                        self.pq.push(Node {
+                            bucket: bkt,
+                            head_tag: tag,
+                            rank,
+                            seg_idx,
+                            pos: np,
+                            val,
+                            key_ord: None,
+                            reverse: self.reverse,
+                        });
+                    } else {
+                        let kb = next_key_for_order.expect("key bytes prepared for key order");
+                        push_next_keyordered(
+                            &mut self.pq,
+                            rank,
+                            seg_idx,
+                            np,
+                            val,
+                            kb,
+                            self.reverse,
+                            self.bucket_prefix_len,
+                            self.head_tag_len,
+                        );
+                    }
                 }
                 continue;
             }
@@ -888,21 +906,36 @@ impl<P: Pager> Iterator for ValueScan<P> {
 
             // Accept: advance this segment by pushing its next head, if any.
             if let (Some(np), Some(val)) = (next_pos_opt, next_val_opt) {
-                let (bkt, tag) = {
-                    let a = val.start as usize;
-                    let b = val.end as usize;
-                    let bytes = &val.data.as_ref()[a..b];
-                    bucket_and_tag(bytes, self.bucket_prefix_len, self.head_tag_len)
-                };
-                self.pq.push(Node {
-                    bucket: bkt,
-                    head_tag: tag,
-                    rank,
-                    seg_idx,
-                    pos: np,
-                    val,
-                    reverse: self.reverse,
-                });
+                if self.by_value {
+                    let (bkt, tag) = bucket_and_tag_from_value_slice::<P>(
+                        &val,
+                        self.bucket_prefix_len,
+                        self.head_tag_len,
+                    );
+                    self.pq.push(Node {
+                        bucket: bkt,
+                        head_tag: tag,
+                        rank,
+                        seg_idx,
+                        pos: np,
+                        val,
+                        key_ord: None,
+                        reverse: self.reverse,
+                    });
+                } else {
+                    let kb = next_key_for_order.expect("key bytes prepared for key order");
+                    push_next_keyordered(
+                        &mut self.pq,
+                        rank,
+                        seg_idx,
+                        np,
+                        val,
+                        kb,
+                        self.reverse,
+                        self.bucket_prefix_len,
+                        self.head_tag_len,
+                    );
+                }
             }
 
             // Yield current row. Values are zero-copy; key is one owned copy.
@@ -916,7 +949,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
 
 // -------- helpers: direction, bounds, seeding, slicing, compare -----
 
-#[inline]
+#[inline(always)]
 fn next_pos(cur: usize, begin: usize, end: usize, reverse: bool) -> Option<usize> {
     if !reverse {
         let np = cur + 1;
@@ -975,6 +1008,24 @@ fn overlap_bounds(
     lower_ok && upper_ok
 }
 
+fn overlap_bounds_key(lo: &Bound<&[u8]>, hi: &Bound<&[u8]>, s_lo: &[u8], s_hi: &[u8]) -> bool {
+    let lower_ok = match lo {
+        Bound::Unbounded => true,
+        Bound::Included(x) => s_hi >= *x,
+        Bound::Excluded(x) => s_hi > *x,
+    };
+    if !lower_ok {
+        return false;
+    }
+    let upper_ok = match hi {
+        Bound::Unbounded => true,
+        Bound::Included(x) => s_lo <= *x,
+        Bound::Excluded(x) => s_lo < *x,
+    };
+    lower_ok && upper_ok
+}
+
+#[inline(always)]
 fn range_in_value_index<P: Pager>(
     seg: &IndexSegment,
     vix: &ValueIndex,
@@ -1000,13 +1051,68 @@ fn range_in_value_index<P: Pager>(
     (begin.min(n), end.min(n))
 }
 
+#[inline(always)]
+fn range_in_key_index(seg: &IndexSegment, lo: &Bound<&[u8]>, hi: &Bound<&[u8]>) -> (usize, usize) {
+    let n = seg.n_entries as usize;
+    if n == 0 {
+        return (0, 0);
+    }
+    let begin = match lo {
+        Bound::Unbounded => 0usize,
+        Bound::Included(x) | Bound::Excluded(x) => key_lower_bound(seg, x),
+    };
+    let end = match hi {
+        Bound::Unbounded => n,
+        Bound::Included(x) => key_upper_bound(seg, x, true),
+        Bound::Excluded(x) => key_upper_bound(seg, x, false),
+    };
+    (begin.min(n), end.min(n))
+}
+
+#[inline(always)]
+fn key_lower_bound(seg: &IndexSegment, probe: &[u8]) -> usize {
+    let n = seg.n_entries as usize;
+    let (mut lo, mut hi) = (0usize, n);
+    while lo < hi {
+        let mid = (lo + hi) >> 1;
+        let k = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, mid);
+        if k < probe {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+#[inline(always)]
+fn key_upper_bound(seg: &IndexSegment, probe: &[u8], include_equal: bool) -> usize {
+    let n = seg.n_entries as usize;
+    let (mut lo, mut hi) = (0usize, n);
+    while lo < hi {
+        let mid = (lo + hi) >> 1;
+        let k = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, mid);
+        let go_right = if include_equal {
+            !(k > probe)
+        } else {
+            k < probe
+        };
+        if go_right {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+#[inline(always)]
 fn lower_bound_by_value<P: Pager>(
     seg: &IndexSegment,
     vix: &ValueIndex,
     data: &P::Blob,
     probe: &[u8],
 ) -> usize {
-    // Narrow by L1/L2, then binary-search the subrange.
     let (mut lo, mut hi) = l1_l2_window(vix, probe);
     while lo < hi {
         let mid = (lo + hi) >> 1;
@@ -1021,6 +1127,7 @@ fn lower_bound_by_value<P: Pager>(
     lo
 }
 
+#[inline(always)]
 fn upper_bound_by_value<P: Pager>(
     seg: &IndexSegment,
     vix: &ValueIndex,
@@ -1028,16 +1135,15 @@ fn upper_bound_by_value<P: Pager>(
     probe: &[u8],
     include_equal: bool,
 ) -> usize {
-    // If include_equal, we want first index > probe; else >= probe.
     let (mut lo, mut hi) = l1_l2_window(vix, probe);
     while lo < hi {
         let mid = (lo + hi) >> 1;
         let pos = row_pos_at(seg, mid);
         let cmp = cmp_value_at::<P>(seg, data, pos, probe);
         let go_right = if include_equal {
-            cmp != Ordering::Greater // <=
+            cmp != Ordering::Greater
         } else {
-            cmp == Ordering::Less // <
+            cmp == Ordering::Less
         };
         if go_right {
             lo = mid + 1;
@@ -1048,6 +1154,7 @@ fn upper_bound_by_value<P: Pager>(
     lo
 }
 
+#[inline(always)]
 fn l1_l2_window(vix: &ValueIndex, probe: &[u8]) -> (usize, usize) {
     let b0 = probe.first().copied().unwrap_or(0) as usize;
     let start = vix.l1_dir[b0] as usize;
@@ -1055,7 +1162,6 @@ fn l1_l2_window(vix: &ValueIndex, probe: &[u8]) -> (usize, usize) {
     if start >= end {
         return (start, end);
     }
-    // Optional L2 split
     if let Some(dir) = vix.l2_dirs.iter().find(|d| d.first_byte as usize == b0) {
         let b1 = probe.get(1).copied().unwrap_or(0) as usize;
         let off0 = dir.dir257[b1] as usize;
@@ -1065,6 +1171,7 @@ fn l1_l2_window(vix: &ValueIndex, probe: &[u8]) -> (usize, usize) {
     (start, end)
 }
 
+#[inline(always)]
 fn row_pos_at(seg: &IndexSegment, rank: usize) -> usize {
     seg.value_index
         .as_ref()
@@ -1072,6 +1179,7 @@ fn row_pos_at(seg: &IndexSegment, rank: usize) -> usize {
         .value_order[rank] as usize
 }
 
+#[inline(always)]
 fn slice_value<P: Pager>(seg: &IndexSegment, data: &P::Blob, pos: usize) -> ValueSlice<P::Blob> {
     match &seg.value_layout {
         ValueLayout::FixedWidth { width } => {
@@ -1096,6 +1204,7 @@ fn slice_value<P: Pager>(seg: &IndexSegment, data: &P::Blob, pos: usize) -> Valu
     }
 }
 
+#[inline(always)]
 fn cmp_value_at<P: Pager>(
     seg: &IndexSegment,
     data: &P::Blob,
@@ -1115,7 +1224,7 @@ fn bucket_and_tag(v: &[u8], bucket_prefix_len: usize, head_tag_len: usize) -> (u
     let b1 = *v.get(1).unwrap_or(&0) as u16;
     let bucket = (b0 << 8) | b1;
 
-    // tag = next up to 8 bytes big-endian after the bucket prefix
+    // tag = next up to head_tag_len bytes big-endian after the bucket prefix
     let mut tag: u64 = 0;
     let start = bucket_prefix_len;
     let end = (start + head_tag_len).min(v.len());
@@ -1126,6 +1235,88 @@ fn bucket_and_tag(v: &[u8], bucket_prefix_len: usize, head_tag_len: usize) -> (u
         tag <<= 8 * (head_tag_len - (end - start));
     }
     (bucket, tag)
+}
+
+// --------- hot-path specializations & cold helper ----------
+
+/// Fast path for (bucket_prefix_len == 2 && head_tag_len == 8) on VALUE slices.
+#[inline(always)]
+fn bucket_and_tag_from_value_slice<P: Pager>(
+    v: &ValueSlice<P::Blob>,
+    bucket_prefix_len: usize,
+    head_tag_len: usize,
+) -> (u16, u64) {
+    if bucket_prefix_len == 2 && head_tag_len == 8 {
+        let bytes = &v.data.as_ref()[v.start as usize..v.end as usize];
+        let b0 = *bytes.get(0).unwrap_or(&0) as u16;
+        let b1 = *bytes.get(1).unwrap_or(&0) as u16;
+        let bucket = (b0 << 8) | b1;
+        let mut tag: u64 = 0;
+        let mut i = 2usize;
+        let end = (2 + 8).min(bytes.len());
+        while i < end {
+            tag = (tag << 8) | (bytes[i] as u64);
+            i += 1;
+        }
+        tag <<= 8 * (2 + 8 - end);
+        (bucket, tag)
+    } else {
+        let a = v.start as usize;
+        let b = v.end as usize;
+        bucket_and_tag(&v.data.as_ref()[a..b], bucket_prefix_len, head_tag_len)
+    }
+}
+
+/// Fast path for (bucket_prefix_len == 2 && head_tag_len == 8) on KEY bytes.
+#[inline(always)]
+fn bucket_and_tag_bytes_fast(
+    v: &[u8],
+    bucket_prefix_len: usize,
+    head_tag_len: usize,
+) -> (u16, u64) {
+    if bucket_prefix_len == 2 && head_tag_len == 8 {
+        let b0 = *v.get(0).unwrap_or(&0) as u16;
+        let b1 = *v.get(1).unwrap_or(&0) as u16;
+        let bucket = (b0 << 8) | b1;
+        let mut tag: u64 = 0;
+        let mut i = 2usize;
+        let end = (2 + 8).min(v.len());
+        while i < end {
+            tag = (tag << 8) | (v[i] as u64);
+            i += 1;
+        }
+        tag <<= 8 * (2 + 8 - end);
+        (bucket, tag)
+    } else {
+        bucket_and_tag(v, bucket_prefix_len, head_tag_len)
+    }
+}
+
+/// Keep the key-ordered reseed path out of the hot icache.
+#[cold]
+#[inline(never)]
+fn push_next_keyordered<P: Pager>(
+    pq: &mut RadixPq<P>,
+    rank: usize,
+    seg_idx: usize,
+    pos: usize,
+    val: ValueSlice<P::Blob>,
+    kb: Vec<u8>,
+    reverse: bool,
+    bucket_prefix_len: usize,
+    head_tag_len: usize,
+) {
+    let (bkt, tag) = bucket_and_tag_bytes_fast(&kb, bucket_prefix_len, head_tag_len);
+    pq.push(Node {
+        bucket: bkt,
+        head_tag: tag,
+        rank,
+        seg_idx,
+        pos,
+        val,
+        key_ord: Some(kb),
+        reverse,
+    });
 }
 
 /// Clone `Bound<&[u8]>` into owned `Bound<Vec<u8>>` for storage.
@@ -1242,6 +1433,7 @@ mod value_scan_tests {
             .scan_values_lww(
                 fid,
                 ValueScanOpts {
+                    order_by: OrderBy::Value,
                     dir: Direction::Forward,
                     lo: Bound::Unbounded,
                     hi: Bound::Unbounded,
@@ -1297,6 +1489,7 @@ mod value_scan_tests {
             .scan_values_lww(
                 fid,
                 ValueScanOpts {
+                    order_by: OrderBy::Value,
                     dir: Direction::Forward,
                     lo: Bound::Included(&lo),
                     hi: Bound::Excluded(&hi),
@@ -1342,6 +1535,7 @@ mod value_scan_tests {
             .scan_values_lww(
                 fid,
                 ValueScanOpts {
+                    order_by: OrderBy::Value,
                     dir: Direction::Reverse,
                     lo: Bound::Unbounded,
                     hi: Bound::Unbounded,
@@ -1377,6 +1571,7 @@ mod value_scan_tests {
             .scan_values_fww(
                 fid,
                 ValueScanOpts {
+                    order_by: OrderBy::Value,
                     dir: Direction::Forward,
                     lo: Bound::Unbounded,
                     hi: Bound::Unbounded,
@@ -1420,6 +1615,7 @@ mod value_scan_tests {
             .scan_values_lww(
                 fid,
                 ValueScanOpts {
+                    order_by: OrderBy::Value,
                     dir: Direction::Forward,
                     lo: Bound::Unbounded,
                     hi: Bound::Unbounded,
@@ -1460,6 +1656,7 @@ mod value_scan_tests {
             .scan_values_fww(
                 fid,
                 ValueScanOpts {
+                    order_by: OrderBy::Value,
                     dir: Direction::Reverse,
                     lo: Bound::Unbounded,
                     hi: Bound::Unbounded,
@@ -1521,6 +1718,7 @@ mod value_scan_tests {
             .scan_values_lww(
                 fid,
                 ValueScanOpts {
+                    order_by: OrderBy::Value,
                     dir: Direction::Reverse,
                     lo: Bound::Included(&lo),
                     hi: Bound::Excluded(&hi),
@@ -1569,6 +1767,7 @@ mod value_scan_tests {
             .scan_values_fww(
                 fid,
                 ValueScanOpts {
+                    order_by: OrderBy::Value,
                     dir: Direction::Forward,
                     lo: Bound::Included(&lo),
                     hi: Bound::Excluded(&hi),
@@ -1614,6 +1813,7 @@ mod value_scan_tests {
             .scan_values_fww(
                 fid,
                 ValueScanOpts {
+                    order_by: OrderBy::Value,
                     dir: Direction::Forward,
                     lo: Bound::Included(&lo),
                     hi: Bound::Excluded(&hi),
@@ -1647,6 +1847,7 @@ mod value_scan_tests {
             .scan_values_fww(
                 fid,
                 ValueScanOpts {
+                    order_by: OrderBy::Value,
                     dir: Direction::Reverse,
                     lo: Bound::Included(&lo),
                     hi: Bound::Excluded(&hi),
@@ -1676,5 +1877,53 @@ mod value_scan_tests {
         // exact keys
         let expected: Vec<u32> = (990u32..1000u32).rev().collect();
         assert_eq!(keys, expected);
+    }
+
+    /// LWW + key-ordered, reverse: keys must be descending.
+    #[test]
+    fn scan_values_lww_key_order_reverse() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 4343u32;
+
+        seed_three_generations(&store, fid);
+
+        let it = store
+            .scan_values_lww(
+                fid,
+                ValueScanOpts {
+                    order_by: OrderBy::Key,
+                    dir: Direction::Reverse,
+                    lo: Bound::Unbounded,
+                    hi: Bound::Unbounded,
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    head_tag_len: 8,
+                    frame_predicate: None,
+                },
+            )
+            .expect("iterator (key-ordered, reverse)");
+
+        let mut last_key: Option<u32> = None;
+        let mut count = 0usize;
+
+        for item in it {
+            let k = parse_key_u32(&item.key);
+            if let Some(prev) = last_key {
+                assert!(
+                    k <= prev,
+                    "keys must be non-increasing in reverse key order"
+                );
+            }
+            last_key = Some(k);
+            count += 1;
+        }
+
+        assert_eq!(count, 1400, "one winner per key in reverse key order");
+        assert_eq!(
+            last_key.unwrap(),
+            0,
+            "last yielded key should be the minimum"
+        );
     }
 }
