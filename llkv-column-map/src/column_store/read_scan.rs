@@ -839,18 +839,18 @@ impl<P: Pager> Iterator for ValueScan<P> {
             let seg_idx = node.seg_idx;
 
             // 0) Early frame check (value bytes only) — avoid extra work if we’ll halt.
-            if let Some(pred) = &self.frame_pred {
-                if let Some(ref head_slice) = self.frame_head {
-                    let ha = head_slice.start as usize;
-                    let hb = head_slice.end as usize;
-                    let head = &head_slice.data.as_ref()[ha..hb];
-                    let ca = node.val.start as usize;
-                    let cb = node.val.end as usize;
-                    let cur = &node.val.data.as_ref()[ca..cb];
-                    if !(pred)(head, cur) {
-                        self.halted = true;
-                        return None;
-                    }
+            if let Some(pred) = &self.frame_pred
+                && let Some(ref head_slice) = self.frame_head
+            {
+                let ha = head_slice.start as usize;
+                let hb = head_slice.end as usize;
+                let head = &head_slice.data.as_ref()[ha..hb];
+                let ca = node.val.start as usize;
+                let cb = node.val.end as usize;
+                let cur = &node.val.data.as_ref()[ca..cb];
+                if !(pred)(head, cur) {
+                    self.halted = true;
+                    return None;
                 }
             }
             // Initialize frame head lazily (semantics preserved).
@@ -1132,11 +1132,7 @@ fn key_upper_bound(seg: &IndexSegment, probe: &[u8], include_equal: bool) -> usi
     while lo < hi {
         let mid = (lo + hi) >> 1;
         let k = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, mid);
-        let go_right = if include_equal {
-            !(k > probe)
-        } else {
-            k < probe
-        };
+        let go_right = if include_equal { k <= probe } else { k < probe };
         if go_right {
             lo = mid + 1;
         } else {
@@ -1288,7 +1284,7 @@ fn bucket_and_tag_from_value_slice<P: Pager>(
 ) -> (u16, u64) {
     if bucket_prefix_len == 2 && head_tag_len == 8 {
         let bytes = &v.data.as_ref()[v.start as usize..v.end as usize];
-        let b0 = *bytes.get(0).unwrap_or(&0) as u16;
+        let b0 = *bytes.first().unwrap_or(&0) as u16;
         let b1 = *bytes.get(1).unwrap_or(&0) as u16;
         let bucket = (b0 << 8) | b1;
         let mut tag: u64 = 0;
@@ -1315,7 +1311,7 @@ fn bucket_and_tag_bytes_fast(
     head_tag_len: usize,
 ) -> (u16, u64) {
     if bucket_prefix_len == 2 && head_tag_len == 8 {
-        let b0 = *v.get(0).unwrap_or(&0) as u16;
+        let b0 = *v.first().unwrap_or(&0) as u16;
         let b1 = *v.get(1).unwrap_or(&0) as u16;
         let bucket = (b0 << 8) | b1;
         let mut tag: u64 = 0;
@@ -1333,6 +1329,7 @@ fn bucket_and_tag_bytes_fast(
 }
 
 /// Keep the key-ordered reseed path out of the hot icache.
+#[allow(clippy::too_many_arguments)] // TODO: Refactor
 #[cold]
 #[inline(never)]
 fn push_next_keyordered<P: Pager>(

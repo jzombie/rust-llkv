@@ -124,6 +124,7 @@ pub fn batch_to_puts<'a>(batch: &'a RecordBatch, keys: &KeySpec, map: &ColumnMap
 }
 
 /// Extract (key, value) pairs for one Arrow column.
+#[allow(clippy::type_complexity)] // TODO: Use return type alias
 fn gather_items<'a>(
     col: &'a ArrayRef,
     rows: usize,
@@ -205,7 +206,7 @@ fn value_bytes<'a>(col: &'a ArrayRef, row: usize) -> Option<Cow<'a, [u8]>> {
     if let Some(fsl) = a.as_any().downcast_ref::<FixedSizeListArray>() {
         let width = fsl.value_length() as usize;
         let child = fsl.values();
-        let offset = (row * width) as usize;
+        let offset = row * width;
         let mut out = Vec::with_capacity(width * 8);
 
         macro_rules! pack_slice {
@@ -341,10 +342,6 @@ fn decode_column<P: Pager>(
         ReadCodec::F32Fixed { len } => decode_f32_fixed::<P>(vals, len),
     }
 }
-
-/// ZERO-COPY NOTE: The `bytes_of` helper function has been removed.
-/// All decoders now use `vs.as_slice()` to get a borrowed slice `&[u8]`
-/// directly from the underlying blob, avoiding any per-value allocation.
 
 /// Minimal-copy decoder for u64.
 /// It iterates through the value slices, copies their content into a single

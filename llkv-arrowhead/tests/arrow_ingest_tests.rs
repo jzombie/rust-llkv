@@ -56,9 +56,12 @@ fn arrow_recordbatch_roundtrip() {
     // ---------- create store and append ----------
     let p = MemPager::default();
     let store = ColumnStore::init_empty(&p);
-    let mut opts = AppendOptions::default();
-    // keep segments comfortably large for the test
-    opts.segment_max_entries = 1_000;
+    let opts = AppendOptions {
+        // keep segments comfortably large for the test
+        segment_max_entries: 1_000,
+        ..Default::default()
+    };
+
     append_batch(&store, &batch, &keys, &map, opts);
 
     // ---------- read back a couple keys ----------

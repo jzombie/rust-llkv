@@ -19,7 +19,7 @@ use arrow_ord::cmp::gt;
 // ==================================
 
 const NUM_ROWS: usize = 1_000_000;
-const COL_KEY: LogicalFieldId = 0;
+// const COL_KEY: LogicalFieldId = 0; // TODO: Remove?
 const COL_VAL1: LogicalFieldId = 1;
 const COL_VAL2: LogicalFieldId = 2;
 

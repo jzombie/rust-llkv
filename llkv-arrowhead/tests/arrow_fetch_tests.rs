@@ -54,8 +54,10 @@ fn upsert_then_fetch_recordbatch() {
     let p = MemPager::default();
     let store = ColumnStore::init_empty(&p);
 
-    let mut opts = AppendOptions::default();
-    opts.segment_max_entries = 1_000;
+    let opts = AppendOptions {
+        segment_max_entries: 1_000,
+        ..Default::default()
+    };
 
     // Writer encodes values as LE (as updated).
     append_batch(&store, &batch, &keyspec, &map, opts);
