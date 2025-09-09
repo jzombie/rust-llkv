@@ -1081,17 +1081,25 @@ fn range_in_value_index<P: Pager>(
     if n == 0 {
         return (0, 0);
     }
-    // lower bound
+
+    // Lower bound:
+    //   Included(x) -> first k >= x
+    //   Excluded(x) -> first k >  x
     let begin = match lo {
         Bound::Unbounded => 0usize,
-        Bound::Included(x) | Bound::Excluded(x) => lower_bound_by_value::<P>(seg, vix, data, x),
+        Bound::Included(x) => lower_bound_by_value::<P>(seg, vix, data, x),
+        Bound::Excluded(x) => upper_bound_by_value::<P>(seg, vix, data, x, true),
     };
-    // upper bound (exclusive)
+
+    // Upper bound (exclusive end):
+    //   Included(x) -> first k >  x
+    //   Excluded(x) -> first k >= x
     let end = match hi {
         Bound::Unbounded => n,
         Bound::Included(x) => upper_bound_by_value::<P>(seg, vix, data, x, true),
         Bound::Excluded(x) => upper_bound_by_value::<P>(seg, vix, data, x, false),
     };
+
     (begin.min(n), end.min(n))
 }
 
@@ -1370,6 +1378,185 @@ fn clone_bound_bytes(b: &Bound<&[u8]>) -> Bound<Vec<u8>> {
         Bound::Unbounded => Bound::Unbounded,
         Bound::Included(x) => Bound::Included((*x).to_vec()),
         Bound::Excluded(x) => Bound::Excluded((*x).to_vec()),
+    }
+}
+
+// ========================= pagination: public types =======================
+
+/// Page of results plus a continuation token in the chosen domain.
+/// - OrderBy::Key   => token is the last emitted KEY bytes.
+/// - OrderBy::Value => token is the last emitted VALUE bytes.
+pub struct PageResult<B> {
+    pub items: Vec<ValueScanItem<B>>,
+    pub next: Option<Vec<u8>>,
+}
+
+// ====================== pagination: bound combinators =====================
+
+#[inline]
+fn lower_bound_max<'a>(a: Bound<&'a [u8]>, b: Bound<&'a [u8]>) -> Bound<&'a [u8]> {
+    use Bound::*;
+    match (a, b) {
+        (Unbounded, x) => x,
+        (x, Unbounded) => x,
+        (Included(ax), Included(bx)) => {
+            if ax < bx {
+                Included(bx)
+            } else {
+                Included(ax)
+            }
+        }
+        (Included(ax), Excluded(bx)) => {
+            if ax < bx {
+                Excluded(bx)
+            } else {
+                Included(ax)
+            }
+        }
+        (Excluded(ax), Included(bx)) => {
+            if ax <= bx {
+                Included(bx)
+            } else {
+                Excluded(ax)
+            }
+        }
+        (Excluded(ax), Excluded(bx)) => {
+            if ax < bx {
+                Excluded(bx)
+            } else {
+                Excluded(ax)
+            }
+        }
+    }
+}
+
+#[inline]
+fn upper_bound_min<'a>(a: Bound<&'a [u8]>, b: Bound<&'a [u8]>) -> Bound<&'a [u8]> {
+    use Bound::*;
+    match (a, b) {
+        (Unbounded, x) => x,
+        (x, Unbounded) => x,
+        (Included(ax), Included(bx)) => {
+            if ax <= bx {
+                Included(ax)
+            } else {
+                Included(bx)
+            }
+        }
+        (Included(ax), Excluded(bx)) => {
+            if ax < bx {
+                Included(ax)
+            } else {
+                Excluded(bx)
+            }
+        }
+        (Excluded(ax), Included(bx)) => {
+            if ax <= bx {
+                Excluded(ax)
+            } else {
+                Included(bx)
+            }
+        }
+        (Excluded(ax), Excluded(bx)) => {
+            if ax <= bx {
+                Excluded(ax)
+            } else {
+                Excluded(bx)
+            }
+        }
+    }
+}
+
+// =================== pagination: opts-driven entry points =================
+
+impl<P: Pager> super::ColumnStore<'_, P> {
+    /// Keyset pagination with LWW over key or value order. Accepts a
+    /// full `ValueScanOpts` template; only lo/hi are tightened by the
+    /// cursor in the correct domain; everything else (prefix, frame,
+    /// bucket/tag widths, etc.) is preserved.
+    pub fn page_scan_lww_with_opts(
+        &self,
+        field_id: LogicalFieldId,
+        base: &ValueScanOpts<'_>,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<PageResult<P::Blob>, ScanError> {
+        self.page_scan_with_opts_and_policy(field_id, base, cursor, limit, ConflictPolicy::LWW)
+    }
+
+    /// FWW variant of the same.
+    pub fn page_scan_fww_with_opts(
+        &self,
+        field_id: LogicalFieldId,
+        base: &ValueScanOpts<'_>,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<PageResult<P::Blob>, ScanError> {
+        self.page_scan_with_opts_and_policy(field_id, base, cursor, limit, ConflictPolicy::FWW)
+    }
+
+    fn page_scan_with_opts_and_policy(
+        &self,
+        field_id: LogicalFieldId,
+        base: &ValueScanOpts<'_>,
+        cursor: Option<&[u8]>,
+        limit: usize,
+        policy: ConflictPolicy,
+    ) -> Result<PageResult<P::Blob>, ScanError> {
+        // Compute effective lo/hi by composing the base bounds with
+        // the keyset cursor in the chosen direction.
+        let curb = cursor.map(Bound::Excluded).unwrap_or(Bound::Unbounded);
+
+        let (eff_lo, eff_hi) = match base.dir {
+            Direction::Forward => (lower_bound_max(base.lo, curb), base.hi),
+            Direction::Reverse => (base.lo, upper_bound_min(base.hi, curb)),
+        };
+
+        // Build the concrete opts for this page. Everything except lo/hi
+        // is preserved from `base`.
+        let opts = ValueScanOpts {
+            dir: base.dir,
+            lo: eff_lo,
+            hi: eff_hi,
+            prefix: base.prefix,
+            bucket_prefix_len: base.bucket_prefix_len,
+            head_tag_len: base.head_tag_len,
+            frame_predicate: base.frame_predicate.clone(),
+            order_by: base.order_by,
+        };
+
+        // Start the scan. Natural end: NoActiveSegments -> empty page.
+        let mut it = match self.scan_values_with_policy(field_id, opts, policy) {
+            Ok(it) => it,
+            Err(ScanError::NoActiveSegments) => {
+                return Ok(PageResult {
+                    items: vec![],
+                    next: None,
+                });
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Pull up to `limit` items. Compute the next token in the
+        // ordering domain (key or value).
+        let mut items: Vec<ValueScanItem<P::Blob>> = Vec::new();
+        items.reserve(limit);
+
+        let mut next: Option<Vec<u8>> = None;
+
+        for x in it.by_ref().take(limit) {
+            next = Some(match base.order_by {
+                OrderBy::Key => x.key.clone(),
+                OrderBy::Value => {
+                    let a = x.value.start as usize;
+                    let b = x.value.end as usize;
+                    x.value.data.as_ref()[a..b].to_vec()
+                }
+            });
+            items.push(x);
+        }
+
+        Ok(PageResult { items, next })
     }
 }
 
@@ -1973,9 +2160,9 @@ mod value_scan_tests {
     }
 
     // TODO: Refactor
-    /// Keyset pagination forward over natural key order. Uses the last key
-    /// of each page as the cursor for the next page. Does not use the
-    /// frame predicate; relies on bounds and key order.
+    /// Keyset pagination forward over natural key order using the paging API.
+    /// Uses the last key of each page as the cursor for the next page.
+    /// Does not use the frame predicate; relies on bounds and key order.
     #[test]
     fn scan_values_lww_keyset_pagination_forward() {
         let p = MemPager::default();
@@ -1985,50 +2172,39 @@ mod value_scan_tests {
         seed_three_generations(&store, fid);
 
         let page_size = 137usize; // odd size to test boundaries
-        let mut after: Option<Vec<u8>> = None;
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut last_global: Option<Vec<u8>> = None;
         let mut all_keys: Vec<Vec<u8>> = Vec::new();
 
+        let base = ValueScanOpts {
+            order_by: OrderBy::Key,
+            dir: Direction::Forward,
+            lo: Bound::Unbounded,
+            hi: Bound::Unbounded,
+            prefix: None,
+            bucket_prefix_len: 2,
+            head_tag_len: 8,
+            frame_predicate: None,
+        };
+
         loop {
-            let lo = match after.as_deref() {
-                None => Bound::Unbounded,
-                Some(k) => Bound::Excluded(k),
-            };
+            let page = store
+                .page_scan_lww_with_opts(fid, &base, cursor.as_deref(), page_size)
+                .expect("page fwd");
 
-            let it = match store.scan_values_lww(
-                fid,
-                ValueScanOpts {
-                    order_by: OrderBy::Key,
-                    dir: Direction::Forward,
-                    lo,
-                    hi: Bound::Unbounded,
-                    prefix: None,
-                    bucket_prefix_len: 2,
-                    head_tag_len: 8,
-                    frame_predicate: None,
-                },
-            ) {
-                Ok(it) => it,
-                Err(ScanError::NoActiveSegments) => break, // normal end
-                Err(e) => panic!("scan init error: {:?}", e),
-            };
-
-            let mut count = 0usize;
-
-            for item in it.take(page_size) {
-                if let Some(prev) = all_keys.last() {
-                    assert!(
-                        item.key.as_slice() > prev.as_slice(),
-                        "keys must be strictly increasing"
-                    );
-                }
-                after = Some(item.key.clone());
-                all_keys.push(item.key);
-                count += 1;
-            }
-
-            if count == 0 {
+            if page.items.is_empty() {
                 break;
             }
+
+            for it in page.items {
+                if let Some(prev) = last_global.as_deref() {
+                    assert!(it.key.as_slice() > prev, "keys must be strictly increasing");
+                }
+                last_global = Some(it.key.clone());
+                all_keys.push(it.key);
+            }
+
+            cursor = page.next;
         }
 
         // One winner per logical key
@@ -2042,8 +2218,9 @@ mod value_scan_tests {
     }
 
     // TODO: Refactor
-    /// Keyset pagination in reverse. Uses the last key of each page as the
-    /// upper bound for the next page. Ensures global non-increasing order.
+    /// Keyset pagination in reverse using the paging API. Uses the last key
+    /// of each page as the upper bound for the next page. Ensures global
+    /// non-increasing order.
     #[test]
     fn scan_values_lww_keyset_pagination_reverse() {
         let p = MemPager::default();
@@ -2053,50 +2230,39 @@ mod value_scan_tests {
         seed_three_generations(&store, fid);
 
         let page_size = 127usize;
-        let mut before: Option<Vec<u8>> = None;
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut last_global: Option<Vec<u8>> = None;
         let mut all_keys: Vec<Vec<u8>> = Vec::new();
 
+        let base = ValueScanOpts {
+            order_by: OrderBy::Key,
+            dir: Direction::Reverse,
+            lo: Bound::Unbounded,
+            hi: Bound::Unbounded,
+            prefix: None,
+            bucket_prefix_len: 2,
+            head_tag_len: 8,
+            frame_predicate: None,
+        };
+
         loop {
-            let hi = match before.as_deref() {
-                None => Bound::Unbounded,
-                Some(k) => Bound::Excluded(k),
-            };
+            let page = store
+                .page_scan_lww_with_opts(fid, &base, cursor.as_deref(), page_size)
+                .expect("page rev");
 
-            let it = match store.scan_values_lww(
-                fid,
-                ValueScanOpts {
-                    order_by: OrderBy::Key,
-                    dir: Direction::Reverse,
-                    lo: Bound::Unbounded,
-                    hi,
-                    prefix: None,
-                    bucket_prefix_len: 2,
-                    head_tag_len: 8,
-                    frame_predicate: None,
-                },
-            ) {
-                Ok(it) => it,
-                Err(ScanError::NoActiveSegments) => break, // normal end
-                Err(e) => panic!("scan init error: {:?}", e),
-            };
-
-            let mut count = 0usize;
-
-            for item in it.take(page_size) {
-                if let Some(prev) = all_keys.last() {
-                    assert!(
-                        item.key.as_slice() < prev.as_slice(),
-                        "keys must be strictly decreasing"
-                    );
-                }
-                before = Some(item.key.clone());
-                all_keys.push(item.key);
-                count += 1;
-            }
-
-            if count == 0 {
+            if page.items.is_empty() {
                 break;
             }
+
+            for it in page.items {
+                if let Some(prev) = last_global.as_deref() {
+                    assert!(it.key.as_slice() < prev, "keys must be strictly decreasing");
+                }
+                last_global = Some(it.key.clone());
+                all_keys.push(it.key);
+            }
+
+            cursor = page.next;
         }
 
         assert_eq!(all_keys.len(), 1400);
