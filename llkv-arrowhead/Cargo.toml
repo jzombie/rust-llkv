@@ -8,3 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+arrow = { version = "56.1.0", default-features = false }
+arrow-array = "56.1.0"
+arrow-schema = "56.1.0"
+llkv-column-map.workspace = true
