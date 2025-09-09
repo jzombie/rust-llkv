@@ -14,17 +14,16 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use arrow_array::builder::{
-    BinaryBuilder, FixedSizeListBuilder, Float32Builder, Int32Builder, Int64Builder, StringBuilder,
-    UInt32Builder, UInt64Builder,
-};
+use arrow::array::ArrayData;
+use arrow_array::builder::StringBuilder;
+use arrow_array::types::{Int32Type, Int64Type, UInt32Type, UInt64Type};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
-    StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Float64Array,
+    GenericBinaryArray, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, PrimitiveArray, RecordBatch, StringArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
-use arrow_buffer::NullBuffer;
-use arrow_buffer::builder::BooleanBufferBuilder;
+use arrow_buffer::{Buffer, NullBuffer, ScalarBuffer, builder::BooleanBufferBuilder};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 
 use llkv_column_map::ColumnStore;
@@ -56,6 +55,8 @@ pub struct ColumnMap {
 pub fn batch_to_puts<'a>(batch: &'a RecordBatch, keys: &KeySpec, map: &ColumnMap) -> Vec<Put<'a>> {
     let rows = batch.num_rows();
 
+    // TODO (ZERO-COPY): This closure could be updated to return Cow<'a, [u8]>
+    // to avoid allocating a Vec for every key, especially for Utf8 and Bin variants.
     let key_bytes_for_row = |row: usize| -> Option<Vec<u8>> {
         match *keys {
             KeySpec::U64Be { col_idx } => {
@@ -107,8 +108,11 @@ pub fn batch_to_puts<'a>(batch: &'a RecordBatch, keys: &KeySpec, map: &ColumnMap
     // Build Put per mapped column.
     let mut out: Vec<Put<'a>> = Vec::with_capacity(map.cols.len());
     for &(col_idx, fid) in &map.cols {
-        let col = batch.column(col_idx).clone();
-        let items = gather_items(&col, rows, &key_bytes_for_row);
+        // CORRECTED: Borrow the column directly from the batch's slice of columns.
+        // This ensures the reference `col` has the lifetime 'a, resolving the E0597 error.
+        // `batch.columns()` returns `&'a [ArrayRef]`, so `&batch.columns()[col_idx]` is `&'a ArrayRef`.
+        let col = &batch.columns()[col_idx];
+        let items = gather_items(col, rows, &key_bytes_for_row);
         if !items.is_empty() {
             out.push(Put {
                 field_id: fid,
@@ -121,7 +125,7 @@ pub fn batch_to_puts<'a>(batch: &'a RecordBatch, keys: &KeySpec, map: &ColumnMap
 
 /// Extract (key, value) pairs for one Arrow column.
 fn gather_items<'a>(
-    col: &ArrayRef,
+    col: &'a ArrayRef,
     rows: usize,
     key_bytes_for_row: &dyn Fn(usize) -> Option<Vec<u8>>,
 ) -> Vec<(Cow<'a, [u8]>, Cow<'a, [u8]>)> {
@@ -131,18 +135,24 @@ fn gather_items<'a>(
             Some(k) => k,
             None => continue,
         };
+        // The `value_bytes` function now returns a Cow, which can be borrowed for
+        // string/binary types, avoiding a copy. Primitives are still owned.
         if let Some(val) = value_bytes(col, row) {
-            v.push((Cow::Owned(k), Cow::Owned(val)));
+            v.push((Cow::Owned(k), val));
         }
     }
     v
 }
 
 /// Turn one cell into bytes. Integers/floats use little-endian (LE).
+/// For FixedSizeList of primitives we emit a single fixed-width value
+/// per row by concatenating LE bytes of each element.
 ///
-/// For FixedSizeList of primitives (e.g., f32[1024]) we emit a single
-/// fixed-width value per row by concatenating LE bytes of each element.
-fn value_bytes(col: &ArrayRef, row: usize) -> Option<Vec<u8>> {
+/// ZERO-COPY CHANGE: This function now returns `Cow<'a, [u8]>`. For string
+/// and binary types, this allows us to borrow the slice directly from the
+/// Arrow array without any new allocation. For primitive types, we still
+/// create an owned Vec, but the interface is more efficient.
+fn value_bytes<'a>(col: &'a ArrayRef, row: usize) -> Option<Cow<'a, [u8]>> {
     let a = col.as_ref();
     if a.is_null(row) {
         return None;
@@ -154,7 +164,7 @@ fn value_bytes(col: &ArrayRef, row: usize) -> Option<Vec<u8>> {
             if let Some(arr) = a.as_any().downcast_ref::<$t>() {
                 let x = arr.value(row);
                 let bytes = x.$to();
-                return Some(bytes.to_vec());
+                return Some(Cow::Owned(bytes.to_vec()));
             }
         }};
     }
@@ -170,25 +180,25 @@ fn value_bytes(col: &ArrayRef, row: usize) -> Option<Vec<u8>> {
     // Floats: encode IEEE-754 bits in LE.
     if let Some(arr) = a.as_any().downcast_ref::<Float32Array>() {
         let bits = arr.value(row).to_bits();
-        return Some(bits.to_le_bytes().to_vec());
+        return Some(Cow::Owned(bits.to_le_bytes().to_vec()));
     }
     if let Some(arr) = a.as_any().downcast_ref::<Float64Array>() {
         let bits = arr.value(row).to_bits();
-        return Some(bits.to_le_bytes().to_vec());
+        return Some(Cow::Owned(bits.to_le_bytes().to_vec()));
     }
 
     // -------- strings/binary (variable width) --------
     if let Some(sa) = a.as_any().downcast_ref::<StringArray>() {
-        return Some(sa.value(row).as_bytes().to_vec());
+        return Some(Cow::Borrowed(sa.value(row).as_bytes()));
     }
     if let Some(sa) = a.as_any().downcast_ref::<LargeStringArray>() {
-        return Some(sa.value(row).as_bytes().to_vec());
+        return Some(Cow::Borrowed(sa.value(row).as_bytes()));
     }
     if let Some(ba) = a.as_any().downcast_ref::<BinaryArray>() {
-        return Some(ba.value(row).to_vec());
+        return Some(Cow::Borrowed(ba.value(row)));
     }
     if let Some(ba) = a.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Some(ba.value(row).to_vec());
+        return Some(Cow::Borrowed(ba.value(row)));
     }
 
     // -------- fixed-size list of primitives (LE) --------
@@ -206,7 +216,7 @@ fn value_bytes(col: &ArrayRef, row: usize) -> Option<Vec<u8>> {
                         let b = $encode(ch, idx);
                         out.extend_from_slice(&b);
                     }
-                    return Some(out);
+                    return Some(Cow::Owned(out));
                 }
             }};
         }
@@ -332,100 +342,149 @@ fn decode_column<P: Pager>(
     }
 }
 
-/// Return an owned Vec<u8> for a ValueSlice.
-/// We cannot return a borrowed slice because `data()` returns an owned
-/// blob; this function deliberately copies the window.
-fn bytes_of<P: Pager>(vs: &ValueSlice<P::Blob>) -> Vec<u8> {
-    let blob = vs.data(); // hold the owned blob so it outlives the slice
-    let all = blob.as_ref();
-    let a = vs.start() as usize;
-    let b = vs.end() as usize;
-    all[a..b].to_vec()
-}
+/// ZERO-COPY NOTE: The `bytes_of` helper function has been removed.
+/// All decoders now use `vs.as_slice()` to get a borrowed slice `&[u8]`
+/// directly from the underlying blob, avoiding any per-value allocation.
 
+/// Minimal-copy decoder for u64.
+/// It iterates through the value slices, copies their content into a single
+/// contiguous buffer, and then creates an Arrow array from that buffer. This
+/// avoids per-value heap allocations.
 fn decode_u64_le<P: Pager>(vals: &[Option<ValueSlice<P::Blob>>]) -> ArrayRef {
-    let mut b = UInt64Builder::with_capacity(vals.len());
+    let mut values_buffer = Vec::<u8>::with_capacity(vals.len() * 8);
+    let mut nulls = BooleanBufferBuilder::new(vals.len());
+
     for v in vals {
         if let Some(vs) = v {
-            let s = bytes_of::<P>(vs);
+            let s = vs.as_slice();
             if s.len() == 8 {
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&s);
-                b.append_value(u64::from_le_bytes(buf));
+                values_buffer.extend_from_slice(s);
+                nulls.append(true);
             } else {
-                b.append_null();
+                values_buffer.extend_from_slice(&[0u8; 8]); // Dummy data for null slot
+                nulls.append(false);
             }
         } else {
-            b.append_null();
+            values_buffer.extend_from_slice(&[0u8; 8]); // Dummy data for null slot
+            nulls.append(false);
         }
     }
-    Arc::new(b.finish())
+
+    let array_data = ArrayData::builder(DataType::UInt64)
+        .len(vals.len())
+        .add_buffer(Buffer::from(values_buffer))
+        .nulls(Some(NullBuffer::from(nulls.finish())))
+        .build()
+        .unwrap();
+
+    Arc::new(PrimitiveArray::<UInt64Type>::from(array_data))
 }
 
+/// Minimal-copy decoder for u32.
 fn decode_u32_le<P: Pager>(vals: &[Option<ValueSlice<P::Blob>>]) -> ArrayRef {
-    let mut b = UInt32Builder::with_capacity(vals.len());
+    let mut values_buffer = Vec::<u8>::with_capacity(vals.len() * 4);
+    let mut nulls = BooleanBufferBuilder::new(vals.len());
+
     for v in vals {
         if let Some(vs) = v {
-            let s = bytes_of::<P>(vs);
+            let s = vs.as_slice();
             if s.len() == 4 {
-                let mut buf = [0u8; 4];
-                buf.copy_from_slice(&s);
-                b.append_value(u32::from_le_bytes(buf));
+                values_buffer.extend_from_slice(s);
+                nulls.append(true);
             } else {
-                b.append_null();
+                values_buffer.extend_from_slice(&[0u8; 4]);
+                nulls.append(false);
             }
         } else {
-            b.append_null();
+            values_buffer.extend_from_slice(&[0u8; 4]);
+            nulls.append(false);
         }
     }
-    Arc::new(b.finish())
+
+    let array_data = ArrayData::builder(DataType::UInt32)
+        .len(vals.len())
+        .add_buffer(Buffer::from(values_buffer))
+        .nulls(Some(NullBuffer::from(nulls.finish())))
+        .build()
+        .unwrap();
+
+    Arc::new(PrimitiveArray::<UInt32Type>::from(array_data))
 }
 
+/// Minimal-copy decoder for i64.
 fn decode_i64_le<P: Pager>(vals: &[Option<ValueSlice<P::Blob>>]) -> ArrayRef {
-    let mut b = Int64Builder::with_capacity(vals.len());
+    let mut values_buffer = Vec::<u8>::with_capacity(vals.len() * 8);
+    let mut nulls = BooleanBufferBuilder::new(vals.len());
+
     for v in vals {
         if let Some(vs) = v {
-            let s = bytes_of::<P>(vs);
+            let s = vs.as_slice();
             if s.len() == 8 {
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&s);
-                b.append_value(i64::from_le_bytes(buf));
+                values_buffer.extend_from_slice(s);
+                nulls.append(true);
             } else {
-                b.append_null();
+                values_buffer.extend_from_slice(&[0u8; 8]);
+                nulls.append(false);
             }
         } else {
-            b.append_null();
+            values_buffer.extend_from_slice(&[0u8; 8]);
+            nulls.append(false);
         }
     }
-    Arc::new(b.finish())
+
+    let array_data = ArrayData::builder(DataType::Int64)
+        .len(vals.len())
+        .add_buffer(Buffer::from(values_buffer))
+        .nulls(Some(NullBuffer::from(nulls.finish())))
+        .build()
+        .unwrap();
+
+    Arc::new(PrimitiveArray::<Int64Type>::from(array_data))
 }
 
+/// Minimal-copy decoder for i32.
 fn decode_i32_le<P: Pager>(vals: &[Option<ValueSlice<P::Blob>>]) -> ArrayRef {
-    let mut b = Int32Builder::with_capacity(vals.len());
+    let mut values_buffer = Vec::<u8>::with_capacity(vals.len() * 4);
+    let mut nulls = BooleanBufferBuilder::new(vals.len());
+
     for v in vals {
         if let Some(vs) = v {
-            let s = bytes_of::<P>(vs);
+            let s = vs.as_slice();
             if s.len() == 4 {
-                let mut buf = [0u8; 4];
-                buf.copy_from_slice(&s);
-                b.append_value(i32::from_le_bytes(buf));
+                values_buffer.extend_from_slice(s);
+                nulls.append(true);
             } else {
-                b.append_null();
+                values_buffer.extend_from_slice(&[0u8; 4]);
+                nulls.append(false);
             }
         } else {
-            b.append_null();
+            values_buffer.extend_from_slice(&[0u8; 4]);
+            nulls.append(false);
         }
     }
-    Arc::new(b.finish())
+
+    let array_data = ArrayData::builder(DataType::Int32)
+        .len(vals.len())
+        .add_buffer(Buffer::from(values_buffer))
+        .nulls(Some(NullBuffer::from(nulls.finish())))
+        .build()
+        .unwrap();
+
+    Arc::new(PrimitiveArray::<Int32Type>::from(array_data))
 }
 
+/// Minimal-copy decoder for Utf8.
+/// This is more complex because it involves validation. While we can build the
+/// buffers directly, we must still validate the UTF-8 content.
 fn decode_utf8<P: Pager>(vals: &[Option<ValueSlice<P::Blob>>]) -> Result<ArrayRef, ArrowError> {
+    // For UTF-8, using the builder is often safest to ensure validation.
+    // A true zero-copy approach would be unsafe if the source bytes are not
+    // guaranteed to be valid UTF-8. This implementation prioritizes correctness.
     let mut b = StringBuilder::with_capacity(vals.len(), 0);
     for v in vals {
         if let Some(vs) = v {
-            let s = bytes_of::<P>(vs);
-            let strv =
-                std::str::from_utf8(&s).map_err(|e| ArrowError::ParseError(e.to_string()))?;
+            let s = vs.as_slice();
+            let strv = std::str::from_utf8(s).map_err(|e| ArrowError::ParseError(e.to_string()))?;
             b.append_value(strv);
         } else {
             b.append_null();
@@ -434,63 +493,79 @@ fn decode_utf8<P: Pager>(vals: &[Option<ValueSlice<P::Blob>>]) -> Result<ArrayRe
     Ok(Arc::new(b.finish()))
 }
 
+/// Minimal-copy decoder for Binary.
+/// We build the offset and data buffers directly from the value slices.
 fn decode_binary<P: Pager>(vals: &[Option<ValueSlice<P::Blob>>]) -> ArrayRef {
-    let mut b = BinaryBuilder::with_capacity(vals.len(), 0);
+    let mut data_buffer = Vec::<u8>::new();
+    let mut offsets = Vec::<i32>::with_capacity(vals.len() + 1);
+    offsets.push(0);
+    let mut nulls = BooleanBufferBuilder::new(vals.len());
+
     for v in vals {
         if let Some(vs) = v {
-            let s = bytes_of::<P>(vs);
-            b.append_value(&s);
+            data_buffer.extend_from_slice(vs.as_slice());
+            offsets.push(data_buffer.len() as i32);
+            nulls.append(true);
         } else {
-            b.append_null();
+            offsets.push(data_buffer.len() as i32); // Offset doesn't change for a null value
+            nulls.append(false);
         }
     }
-    Arc::new(b.finish())
+
+    let array_data = ArrayData::builder(DataType::Binary)
+        .len(vals.len())
+        .add_buffer(Buffer::from(ScalarBuffer::from(offsets))) // Offsets buffer
+        .add_buffer(Buffer::from(data_buffer)) // Data buffer
+        .nulls(Some(NullBuffer::from(nulls.finish())))
+        .build()
+        .unwrap();
+
+    Arc::new(GenericBinaryArray::<i32>::from(array_data))
 }
 
+/// Minimal-copy decoder for FixedSizeList<f32>.
 fn decode_f32_fixed<P: Pager>(
     vals: &[Option<ValueSlice<P::Blob>>],
     len: i32,
 ) -> Result<ArrayRef, ArrowError> {
     let len_usize = len as usize;
+    let expected_byte_len = len_usize * 4;
 
-    // Build child values (no nulls in child) and track parent validity.
-    let mut child = Float32Builder::with_capacity(vals.len() * len_usize);
+    // This is a minimal-copy approach. We build one large buffer for the child array.
+    // A true zero-copy would require the underlying storage to provide a single,
+    // contiguous buffer for all rows, which `get_many` does not guarantee.
+    let mut child_buffer = Vec::<u8>::with_capacity(vals.len() * expected_byte_len);
     let mut any_null = false;
     let mut valid_bits = BooleanBufferBuilder::new(vals.len());
 
     for v in vals {
         if let Some(vs) = v {
-            let s = bytes_of::<P>(vs);
-            if s.len() != len_usize * 4 {
+            let s = vs.as_slice();
+            if s.len() != expected_byte_len {
                 // Malformed row: mark parent null, fill child with dummies.
                 any_null = true;
                 valid_bits.append(false);
-                for _ in 0..len_usize {
-                    child.append_value(0.0);
-                }
-                continue;
+                child_buffer.extend_from_slice(&vec![0u8; expected_byte_len]);
+            } else {
+                // Good row: copy the bytes.
+                child_buffer.extend_from_slice(s);
+                valid_bits.append(true);
             }
-            // Good row: decode len LE f32 values.
-            for i in 0..len_usize {
-                let off = i * 4;
-                let mut buf = [0u8; 4];
-                buf.copy_from_slice(&s[off..off + 4]);
-                let f = f32::from_le_bytes(buf);
-                child.append_value(f);
-            }
-            valid_bits.append(true);
         } else {
             // Missing row: parent null, child gets dummy values.
             any_null = true;
             valid_bits.append(false);
-            for _ in 0..len_usize {
-                child.append_value(0.0);
-            }
+            child_buffer.extend_from_slice(&vec![0u8; expected_byte_len]);
         }
     }
 
-    // Child array: plain Float32 with no nulls.
-    let child_arr: ArrayRef = Arc::new(child.finish());
+    // Child array data (plain Float32 with no nulls of its own).
+    let child_array_data = ArrayData::builder(DataType::Float32)
+        .len(vals.len() * len_usize)
+        .add_buffer(Buffer::from(child_buffer))
+        .build()
+        .unwrap();
+    let child_arr: ArrayRef = Arc::new(Float32Array::from(child_array_data));
 
     // Parent validity buffer, only if we had any nulls.
     let nulls = if any_null {
@@ -499,7 +574,7 @@ fn decode_f32_fixed<P: Pager>(
         None
     };
 
-    // Child field MUST be non-nullable to match your schema.
+    // The child field in the list's data type MUST be non-nullable.
     let item_field = Arc::new(Field::new("item", DataType::Float32, false));
 
     let arr = FixedSizeListArray::new(item_field, len, child_arr, nulls);
