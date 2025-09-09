@@ -49,7 +49,7 @@ pub struct ColumnMap {
     pub cols: Vec<(usize, LogicalFieldId)>,
 }
 
-/// Convert a RecordBatch into a Vec<Put> ready for append_many.
+/// Convert a RecordBatch into a `Vec<Put>` ready for append_many.
 ///
 /// All columns use ValueMode::Auto (per-column fixed/variable inferred).
 pub fn batch_to_puts<'a>(batch: &'a RecordBatch, keys: &KeySpec, map: &ColumnMap) -> Vec<Put<'a>> {
@@ -520,7 +520,7 @@ fn decode_binary<P: Pager>(vals: &[Option<ValueSlice<P::Blob>>]) -> ArrayRef {
     Arc::new(GenericBinaryArray::<i32>::from(array_data))
 }
 
-/// Minimal-copy decoder for FixedSizeList<f32>.
+/// Minimal-copy decoder for `FixedSizeList<f32>`.
 fn decode_f32_fixed<P: Pager>(
     vals: &[Option<ValueSlice<P::Blob>>],
     len: i32,
