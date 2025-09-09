@@ -146,67 +146,108 @@ pub struct ValueScan<P: Pager> {
     policy: ConflictPolicy,
 }
 
+// -------- priority queue (radix buckets) --------
+
+const BUCKETS: usize = 1 << 16; // 65_536 buckets for u16 ids [0..=65535]
+const WORDS: usize = BUCKETS / 64;
+
+struct HeapSlot<P: Pager> {
+    bucket: u16,
+    heap: BinaryHeap<std::cmp::Reverse<Node<P>>>,
+}
+
 /// A radix-bucketed **priority queue** specialized for byte-sorted streams (value or key).
-///
-/// See long comment in previous revisions; unchanged except it now also supports KEY ordering
-/// by letting each node provide its own ordering bytes (value bytes by default; key bytes when
-/// `key_ord` is present).
 struct RadixPq<P: Pager> {
-    /// 65,536 one-bit entries (u16 bucket ids), packed into 1024 64-bit words.
-    bitset: [u64; 1024],
-    /// Second tier: one heap per active bucket. Wrapped in `Reverse` so it acts
-    /// as a min-heap with respect to `Node::Ord` (which flips value/key ordering for reverse).
-    buckets: FxHashMap<u16, BinaryHeap<std::cmp::Reverse<Node<P>>>>,
-    /// Watermarks over `bitset` words that currently contain any set bits.
+    /// 65_536 one-bit entries, packed into 1024 u64 words.
+    bitset: [u64; WORDS],
     min_word: usize,
     max_word: usize,
+
+    /// Sparse set of active buckets -> per-bucket heap.
+    slots: Vec<HeapSlot<P>>,
+    /// Directory: bucket id -> slots index (u32::MAX means empty).
+    slot_of_bucket: Vec<u32>, // len == BUCKETS
 }
 
 impl<P: Pager> RadixPq<P> {
+    #[inline]
     fn new() -> Self {
         Self {
-            bitset: [0u64; 1024],
-            buckets: FxHashMap::default(),
-            min_word: usize::MAX, // empty
+            bitset: [0u64; WORDS],
+            min_word: usize::MAX,
             max_word: 0,
+            slots: Vec::new(),
+            // **Important**: 65_536 entries, not 65_535.
+            slot_of_bucket: vec![u32::MAX; BUCKETS],
         }
     }
 
+    #[inline]
     fn push(&mut self, node: Node<P>) {
-        let b = node.bucket;
-        let idx = (b / 64) as usize;
-        let bit = 1u64 << (b % 64);
+        let b = node.bucket as usize;
+        debug_assert!(b < BUCKETS);
+        let word_idx = b >> 6;
+        let bit_mask = 1u64 << (b & 63);
 
-        if self.bitset[idx] == 0 {
-            if self.min_word == usize::MAX || idx < self.min_word {
-                self.min_word = idx;
+        // If this word was previously empty, update watermarks before setting the bit.
+        if self.bitset[word_idx] == 0 {
+            if self.min_word == usize::MAX || word_idx < self.min_word {
+                self.min_word = word_idx;
             }
-            if idx > self.max_word {
-                self.max_word = idx;
+            if word_idx > self.max_word {
+                self.max_word = word_idx;
             }
         }
 
-        self.buckets
-            .entry(b)
-            .or_default()
-            .push(std::cmp::Reverse(node));
+        // Find or create the heap slot for this bucket.
+        let slot_idx_u32 = self.slot_of_bucket[b];
+        let idx = if slot_idx_u32 == u32::MAX {
+            let idx = self.slots.len();
+            self.slot_of_bucket[b] = idx as u32;
+            self.slots.push(HeapSlot {
+                bucket: node.bucket,
+                heap: BinaryHeap::new(),
+            });
+            idx
+        } else {
+            slot_idx_u32 as usize
+        };
 
-        self.bitset[idx] |= bit;
+        self.slots[idx].heap.push(std::cmp::Reverse(node));
+        self.bitset[word_idx] |= bit_mask;
     }
 
+    #[inline]
     fn pop(&mut self, reverse: bool) -> Option<Node<P>> {
-        let bi = self.find_bucket(reverse)?;
-        let heap = self.buckets.get_mut(&bi)?;
-        let out = heap.pop()?.0;
+        let bi = self.find_bucket(reverse)? as usize;
+        debug_assert!(bi < BUCKETS);
 
-        if heap.is_empty() {
-            let idx = (bi / 64) as usize;
-            let bit = 1u64 << (bi % 64);
-            self.bitset[idx] &= !bit;
-            self.buckets.remove(&bi);
+        let slot_idx_u32 = self.slot_of_bucket[bi];
+        debug_assert!(slot_idx_u32 != u32::MAX, "active bucket without slot");
+        let idx = slot_idx_u32 as usize;
 
-            if self.bitset[idx] == 0 {
-                if idx == self.min_word {
+        let out = self.slots[idx].heap.pop()?.0;
+
+        if self.slots[idx].heap.is_empty() {
+            // Clear bit & directory entry, maintain watermarks.
+            let word_idx = bi >> 6;
+            let bit_mask = 1u64 << (bi & 63);
+            self.bitset[word_idx] &= !bit_mask;
+            self.slot_of_bucket[bi] = u32::MAX;
+
+            // Remove empty slot with swap_remove; fix mapping of the moved one.
+            let last = self.slots.len() - 1;
+            if idx != last {
+                self.slots.swap_remove(idx);
+                let moved_bucket = self.slots[idx].bucket as usize;
+                self.slot_of_bucket[moved_bucket] = idx as u32;
+            } else {
+                self.slots.pop();
+            }
+
+            // Adjust watermarks if the word became empty.
+            if self.bitset[word_idx] == 0 {
+                if word_idx == self.min_word {
                     let mut i = self.min_word;
                     while i <= self.max_word && self.bitset[i] == 0 {
                         i += 1;
@@ -218,19 +259,20 @@ impl<P: Pager> RadixPq<P> {
                         self.min_word = i;
                     }
                 }
-                if self.min_word != usize::MAX && idx == self.max_word {
+                if self.min_word != usize::MAX && word_idx == self.max_word {
                     let mut i = self.max_word;
-                    while i >= self.min_word && self.bitset[i] == 0 {
-                        if i == 0 {
+                    loop {
+                        if self.bitset[i] != 0 {
+                            self.max_word = i;
+                            break;
+                        }
+                        if i == self.min_word {
+                            // all empty
+                            self.min_word = usize::MAX;
+                            self.max_word = 0;
                             break;
                         }
                         i -= 1;
-                    }
-                    if self.min_word > i || self.bitset[i] == 0 {
-                        self.min_word = usize::MAX;
-                        self.max_word = 0;
-                    } else {
-                        self.max_word = i;
                     }
                 }
             }
@@ -239,27 +281,31 @@ impl<P: Pager> RadixPq<P> {
         Some(out)
     }
 
+    #[inline]
     fn find_bucket(&self, reverse: bool) -> Option<u16> {
         if self.min_word == usize::MAX {
             return None;
         }
 
         if !reverse {
-            for i in self.min_word..=self.max_word {
-                let word = self.bitset[i];
-                if word != 0 {
-                    let t = word.trailing_zeros() as u16;
-                    return Some(((i as u16) * 64) + t);
+            let mut i = self.min_word;
+            while i <= self.max_word {
+                let w = self.bitset[i];
+                if w != 0 {
+                    let t = w.trailing_zeros() as u16;
+                    // (i * 64) + first-set-bit
+                    return Some(((i as u16) << 6) | t);
                 }
+                i += 1;
             }
         } else {
             let mut i = self.max_word;
             loop {
-                let word = self.bitset[i];
-                if word != 0 {
-                    let lz = word.leading_zeros() as u16;
-                    let bit = 63u16 - lz;
-                    return Some(((i as u16) * 64) + bit);
+                let w = self.bitset[i];
+                if w != 0 {
+                    let lz = w.leading_zeros() as u16;
+                    let bit = 63u16.saturating_sub(lz);
+                    return Some(((i as u16) << 6) | bit);
                 }
                 if i == self.min_word {
                     break;
@@ -792,97 +838,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
             let node = self.pq.pop(self.reverse)?;
             let seg_idx = node.seg_idx;
 
-            // ---- short immutable borrow to slice key and plan next head ----
-            let (key_owned, rank, next_pos_opt, next_val_opt, next_key_for_order) = {
-                let sc = &self.segs[seg_idx];
-                // Row position depends on active ordering.
-                let row_pos = if self.by_value {
-                    row_pos_at(&sc.seg, node.pos)
-                } else {
-                    node.pos
-                };
-                let key_slice = KeyLayout::slice_key_by_layout(
-                    &sc.seg.logical_key_bytes,
-                    &sc.seg.key_layout,
-                    row_pos,
-                );
-                let key_owned = key_slice.to_vec();
-
-                let begin = sc.begin;
-                let end = sc.end;
-                let next_pos_opt = next_pos(node.pos, begin, end, self.reverse);
-                // For the next head we always need value slice; for KEY ordering we also
-                // prepare the next key bytes (to avoid re-slicing after borrow ends).
-                let (next_val_opt, next_key_for_order) = next_pos_opt.map_or((None, None), |np| {
-                    let row = if self.by_value {
-                        row_pos_at(&sc.seg, np)
-                    } else {
-                        np
-                    };
-                    let sval = slice_value::<P>(&sc.seg, &sc.data, row);
-                    let skey_ord = if self.by_value {
-                        None
-                    } else {
-                        Some(
-                            KeyLayout::slice_key_by_layout(
-                                &sc.seg.logical_key_bytes,
-                                &sc.seg.key_layout,
-                                row,
-                            )
-                            .to_vec(),
-                        )
-                    };
-                    (Some(sval), skey_ord)
-                });
-                (
-                    key_owned,
-                    sc.rank,
-                    next_pos_opt,
-                    next_val_opt,
-                    next_key_for_order,
-                )
-            };
-            // ---- immutable borrow dropped here ----
-
-            // Conflict policy: skip if shadowed.
-            if self.is_shadowed(key_owned.as_slice(), rank) {
-                if let (Some(np), Some(val)) = (next_pos_opt, next_val_opt) {
-                    // Compute ordering tuple for the next node.
-                    if self.by_value {
-                        let (bkt, tag) = bucket_and_tag_from_value_slice::<P>(
-                            &val,
-                            self.bucket_prefix_len,
-                            self.head_tag_len,
-                        );
-                        self.pq.push(Node {
-                            bucket: bkt,
-                            head_tag: tag,
-                            rank,
-                            seg_idx,
-                            pos: np,
-                            val,
-                            key_ord: None,
-                            reverse: self.reverse,
-                        });
-                    } else {
-                        let kb = next_key_for_order.expect("key bytes prepared for key order");
-                        push_next_keyordered(
-                            &mut self.pq,
-                            rank,
-                            seg_idx,
-                            np,
-                            val,
-                            kb,
-                            self.reverse,
-                            self.bucket_prefix_len,
-                            self.head_tag_len,
-                        );
-                    }
-                }
-                continue;
-            }
-
-            // Frame predicate on VALUE bytes (head vs current).
+            // 0) Early frame check (value bytes only) — avoid extra work if we’ll halt.
             if let Some(pred) = &self.frame_pred {
                 if let Some(ref head_slice) = self.frame_head {
                     let ha = head_slice.start as usize;
@@ -895,17 +851,84 @@ impl<P: Pager> Iterator for ValueScan<P> {
                         self.halted = true;
                         return None;
                     }
-                } else {
-                    // initialize head to first emitted value
-                    self.frame_head = Some(node.val.clone());
                 }
-            } else if self.frame_head.is_none() {
-                // keep consistent semantics even if predicate added later
+            }
+            // Initialize frame head lazily (semantics preserved).
+            if self.frame_head.is_none() {
                 self.frame_head = Some(node.val.clone());
             }
 
-            // Accept: advance this segment by pushing its next head, if any.
-            if let (Some(np), Some(val)) = (next_pos_opt, next_val_opt) {
+            // 1) Borrow the segment briefly to get:
+            //    - current row position (in the active ordering)
+            //    - a borrowed key slice for membership checks
+            //    - the next position + its value (and key bytes if key-ordered)
+            //    - whether this row is shadowed (under policy)
+            let (rank, next_pos_opt, next_val_opt, next_key_for_order, shadowed, key_owned_if_emit) = {
+                let sc = &self.segs[seg_idx];
+
+                // Row position depends on active ordering.
+                let row_pos = if self.by_value {
+                    row_pos_at(&sc.seg, node.pos)
+                } else {
+                    node.pos
+                };
+
+                // Borrowed key slice for membership checks.
+                let key_slice = KeyLayout::slice_key_by_layout(
+                    &sc.seg.logical_key_bytes,
+                    &sc.seg.key_layout,
+                    row_pos,
+                );
+
+                // Compute next cursor position in active window.
+                let next_pos_opt = next_pos(node.pos, sc.begin, sc.end, self.reverse);
+
+                // Prepare next value (and next key bytes if key-ordered) now,
+                // while we still have the borrow. Values are zero-copy.
+                let (next_val_opt, next_key_for_order) = next_pos_opt.map_or((None, None), |np| {
+                    let next_row = if self.by_value {
+                        row_pos_at(&sc.seg, np)
+                    } else {
+                        np
+                    };
+                    let sval = slice_value::<P>(&sc.seg, &sc.data, next_row);
+                    let skey_ord = if self.by_value {
+                        None
+                    } else {
+                        Some(
+                            KeyLayout::slice_key_by_layout(
+                                &sc.seg.logical_key_bytes,
+                                &sc.seg.key_layout,
+                                next_row,
+                            )
+                            .to_vec(),
+                        )
+                    };
+                    (Some(sval), skey_ord)
+                });
+
+                // Shadow check uses the borrowed slice; no allocation yet.
+                let shadowed = self.is_shadowed(key_slice, sc.rank);
+
+                // Only allocate the owned key if we are going to emit.
+                let key_owned_if_emit = if shadowed {
+                    None
+                } else {
+                    Some(key_slice.to_vec())
+                };
+
+                (
+                    sc.rank,
+                    next_pos_opt,
+                    next_val_opt,
+                    next_key_for_order,
+                    shadowed,
+                    key_owned_if_emit,
+                )
+            }; // <-- borrow of self.segs ends here
+
+            // Helper to push the next head if present (value- or key-ordered).
+            let mut push_next = |np: usize, val: ValueSlice<P::Blob>| {
                 if self.by_value {
                     let (bkt, tag) = bucket_and_tag_from_value_slice::<P>(
                         &val,
@@ -923,7 +946,10 @@ impl<P: Pager> Iterator for ValueScan<P> {
                         reverse: self.reverse,
                     });
                 } else {
-                    let kb = next_key_for_order.expect("key bytes prepared for key order");
+                    let kb = next_key_for_order
+                        .as_ref()
+                        .expect("prepared key bytes for key order")
+                        .clone();
                     push_next_keyordered(
                         &mut self.pq,
                         rank,
@@ -936,9 +962,23 @@ impl<P: Pager> Iterator for ValueScan<P> {
                         self.head_tag_len,
                     );
                 }
+            };
+
+            // 2) If shadowed, just advance this segment and continue.
+            if shadowed {
+                if let (Some(np), Some(v)) = (next_pos_opt, next_val_opt) {
+                    push_next(np, v);
+                }
+                continue;
             }
 
-            // Yield current row. Values are zero-copy; key is one owned copy.
+            // 3) Accepted: advance this segment before yielding.
+            if let (Some(np), Some(v)) = (next_pos_opt, next_val_opt) {
+                push_next(np, v);
+            }
+
+            // 4) Yield the current row (value zero-copy; key owned).
+            let key_owned = key_owned_if_emit.expect("owned key prepared for emission");
             return Some(ValueScanItem {
                 key: key_owned,
                 value: node.val,
