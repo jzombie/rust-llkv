@@ -2159,21 +2159,19 @@ mod value_scan_tests {
         );
     }
 
-    // TODO: Refactor
-    /// Keyset pagination forward over natural key order using the paging API.
-    /// Uses the last key of each page as the cursor for the next page.
-    /// Does not use the frame predicate; relies on bounds and key order.
+    // Key-ordered pagination, forward.
+    // Uses last key of each page as the cursor for the next page.
     #[test]
-    fn scan_values_lww_keyset_pagination_forward() {
+    fn scan_values_lww_pagination_key_forward() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
         let fid = 551u32;
 
         seed_three_generations(&store, fid);
 
-        let page_size = 137usize; // odd size to test boundaries
+        let page_size = 137usize;
         let mut cursor: Option<Vec<u8>> = None;
-        let mut last_global: Option<Vec<u8>> = None;
+        let mut last_key: Option<Vec<u8>> = None;
         let mut all_keys: Vec<Vec<u8>> = Vec::new();
 
         let base = ValueScanOpts {
@@ -2190,39 +2188,35 @@ mod value_scan_tests {
         loop {
             let page = store
                 .page_scan_lww_with_opts(fid, &base, cursor.as_deref(), page_size)
-                .expect("page fwd");
+                .expect("page fwd (key)");
 
             if page.items.is_empty() {
                 break;
             }
 
             for it in page.items {
-                if let Some(prev) = last_global.as_deref() {
+                if let Some(prev) = last_key.as_deref() {
                     assert!(it.key.as_slice() > prev, "keys must be strictly increasing");
                 }
-                last_global = Some(it.key.clone());
+                last_key = Some(it.key.clone());
                 all_keys.push(it.key);
             }
 
             cursor = page.next;
         }
 
-        // One winner per logical key
-        assert_eq!(all_keys.len(), 1400);
+        assert_eq!(all_keys.len(), 1400, "winners by key, forward");
 
-        // Spot-check endpoints under LWW winners
         let first = parse_key_u32(&all_keys.first().unwrap());
         let last = parse_key_u32(&all_keys.last().unwrap());
         assert_eq!(first, 0u32);
         assert_eq!(last, 1399u32);
     }
 
-    // TODO: Refactor
-    /// Keyset pagination in reverse using the paging API. Uses the last key
-    /// of each page as the upper bound for the next page. Ensures global
-    /// non-increasing order.
+    // Key-ordered pagination, reverse.
+    // Uses last key of each page as the upper bound for the next page.
     #[test]
-    fn scan_values_lww_keyset_pagination_reverse() {
+    fn scan_values_lww_pagination_key_reverse() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
         let fid = 552u32;
@@ -2231,7 +2225,7 @@ mod value_scan_tests {
 
         let page_size = 127usize;
         let mut cursor: Option<Vec<u8>> = None;
-        let mut last_global: Option<Vec<u8>> = None;
+        let mut last_key: Option<Vec<u8>> = None;
         let mut all_keys: Vec<Vec<u8>> = Vec::new();
 
         let base = ValueScanOpts {
@@ -2248,29 +2242,144 @@ mod value_scan_tests {
         loop {
             let page = store
                 .page_scan_lww_with_opts(fid, &base, cursor.as_deref(), page_size)
-                .expect("page rev");
+                .expect("page rev (key)");
 
             if page.items.is_empty() {
                 break;
             }
 
             for it in page.items {
-                if let Some(prev) = last_global.as_deref() {
+                if let Some(prev) = last_key.as_deref() {
                     assert!(it.key.as_slice() < prev, "keys must be strictly decreasing");
                 }
-                last_global = Some(it.key.clone());
+                last_key = Some(it.key.clone());
                 all_keys.push(it.key);
             }
 
             cursor = page.next;
         }
 
-        assert_eq!(all_keys.len(), 1400);
+        assert_eq!(all_keys.len(), 1400, "winners by key, reverse");
 
-        // Endpoints for reverse order
         let first = parse_key_u32(&all_keys.first().unwrap());
         let last = parse_key_u32(&all_keys.last().unwrap());
         assert_eq!(first, 1399u32);
         assert_eq!(last, 0u32);
+    }
+
+    // Value-ordered pagination, forward.
+    // Cursor is the last VALUE bytes of each page.
+    #[test]
+    fn scan_values_lww_pagination_value_forward() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 661u32;
+
+        seed_three_generations(&store, fid);
+
+        let page_size = 131usize;
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut last_val: Option<u64> = None;
+        let mut all_vals: Vec<u64> = Vec::new();
+
+        let base = ValueScanOpts {
+            order_by: OrderBy::Value,
+            dir: Direction::Forward,
+            lo: Bound::Unbounded,
+            hi: Bound::Unbounded,
+            prefix: None,
+            bucket_prefix_len: 2,
+            head_tag_len: 8,
+            frame_predicate: None,
+        };
+
+        loop {
+            let page = store
+                .page_scan_lww_with_opts(fid, &base, cursor.as_deref(), page_size)
+                .expect("page fwd (value)");
+
+            if page.items.is_empty() {
+                break;
+            }
+
+            for it in page.items {
+                let a = it.value.start as usize;
+                let b = it.value.end as usize;
+                let v = parse_be64(&it.value.data.as_ref()[a..b]);
+
+                if let Some(pv) = last_val {
+                    assert!(v > pv, "values must be strictly increasing");
+                }
+                last_val = Some(v);
+                all_vals.push(v);
+            }
+
+            cursor = page.next;
+        }
+
+        assert_eq!(all_vals.len(), 1400, "winners by value, forward");
+
+        let first = *all_vals.first().unwrap();
+        let last = *all_vals.last().unwrap();
+        assert_eq!(first, 1000u64);
+        assert_eq!(last, 300_000u64 + 1399u64); // 301_399
+    }
+
+    // Value-ordered pagination, reverse.
+    // Cursor is the last VALUE bytes of each page.
+    #[test]
+    fn scan_values_lww_pagination_value_reverse() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 662u32;
+
+        seed_three_generations(&store, fid);
+
+        let page_size = 113usize;
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut last_val: Option<u64> = None;
+        let mut all_vals: Vec<u64> = Vec::new();
+
+        let base = ValueScanOpts {
+            order_by: OrderBy::Value,
+            dir: Direction::Reverse,
+            lo: Bound::Unbounded,
+            hi: Bound::Unbounded,
+            prefix: None,
+            bucket_prefix_len: 2,
+            head_tag_len: 8,
+            frame_predicate: None,
+        };
+
+        loop {
+            let page = store
+                .page_scan_lww_with_opts(fid, &base, cursor.as_deref(), page_size)
+                .expect("page rev (value)");
+
+            if page.items.is_empty() {
+                break;
+            }
+
+            for it in page.items {
+                let a = it.value.start as usize;
+                let b = it.value.end as usize;
+                let v = parse_be64(&it.value.data.as_ref()[a..b]);
+
+                if let Some(pv) = last_val {
+                    assert!(v < pv, "values must be strictly decreasing");
+                }
+                last_val = Some(v);
+                all_vals.push(v);
+            }
+
+            cursor = page.next;
+        }
+
+        assert_eq!(all_vals.len(), 1400, "winners by value, reverse");
+
+        let first = *all_vals.first().unwrap();
+        let last = *all_vals.last().unwrap();
+        assert_eq!(first, 300_000u64 + 1399u64); // 301_399
+        assert_eq!(last, 1000u64);
     }
 }
