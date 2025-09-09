@@ -17,7 +17,6 @@ use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, ValueMode};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng, seq::SliceRandom};
 
-use std::env;
 use std::ops::Bound;
 
 // ---------------------- random string helpers -----------------------
@@ -29,13 +28,13 @@ const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr
 /// ordering is unique and stable across runs with same seed.
 fn rand_unique_ascii(rng: &mut StdRng, min_len: usize, max_len: usize, ordinal: usize) -> Vec<u8> {
     let len = if max_len >= min_len {
-        rng.gen_range(min_len..=max_len)
+        rng.random_range(min_len..=max_len)
     } else {
         min_len
     };
     let mut s = Vec::with_capacity(len + 1 + 8);
     for _ in 0..len {
-        let i = rng.gen_range(0..ALPHABET.len());
+        let i = rng.random_range(0..ALPHABET.len());
         s.push(ALPHABET[i]);
     }
     s.push(b'#');
