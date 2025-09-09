@@ -7,7 +7,6 @@ repository = "https://github.com/jzombie/rust-llkv"
 publish = true
 
 [workspace.dependencies]
-llkv-arrowhead = { path = "./llkv-arrowhead", version = "0.1.0-alpha" }
 llkv-btree = { path = "./llkv-btree", version = "0.1.0-alpha" }
 llkv-column-map = { path = "./llkv-column-map", version = "0.1.0-alpha" }
 llkv-expr = { path = "./llkv-expr", version = "0.1.0-alpha" }
