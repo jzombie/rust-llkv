@@ -13,7 +13,7 @@ use crate::bounds::ValueBound;
 use crate::column_index::{IndexSegment, ValueIndex};
 use crate::layout::{KeyLayout, ValueLayout};
 use crate::storage::pager::{BatchGet, GetResult, Pager};
-use crate::types::{LogicalFieldId, PhysicalKey, TypedKind, TypedValue};
+use crate::types::{LogicalFieldId, LogicalKeyBytes, PhysicalKey, TypedKind, TypedValue};
 use crate::views::ValueSlice;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -72,7 +72,7 @@ impl<'a> Default for ValueScanOpts<'a> {
 
 /// Public item: zero-copy value slice + owned key bytes.
 pub struct ValueScanItem<B> {
-    pub key: Vec<u8>,
+    pub key: LogicalKeyBytes,
     pub value: ValueSlice<B>,
 }
 
@@ -88,8 +88,8 @@ struct SegCtx<P: Pager> {
     begin: usize,
     end: usize,
     /// Cached logical-key bounds (for fast reject in membership probes).
-    min_key: Vec<u8>,
-    max_key: Vec<u8>,
+    min_key: LogicalKeyBytes,
+    max_key: LogicalKeyBytes,
 }
 
 /// Minimal metadata for shadow (index-only) membership checks.
