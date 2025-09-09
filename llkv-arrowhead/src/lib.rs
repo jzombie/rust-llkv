@@ -122,17 +122,17 @@ fn gather_items<'a>(
     v
 }
 
-/// Turn one cell into bytes. Integers/floats use big-endian.
+/// Turn one cell into bytes. Integers/floats use little-endian (LE).
 ///
 /// For FixedSizeList of primitives (e.g., f32[1024]) we emit a single
-/// fixed-width value per row by concatenating BE bytes of each element.
+/// fixed-width value per row by concatenating LE bytes of each element.
 fn value_bytes(col: &ArrayRef, row: usize) -> Option<Vec<u8>> {
     let a = col.as_ref();
     if a.is_null(row) {
         return None;
     }
 
-    // -------- primitives --------
+    // -------- primitives (LE) --------
     macro_rules! prim {
         ($t:ty, $to:ident) => {{
             if let Some(arr) = a.as_any().downcast_ref::<$t>() {
@@ -142,24 +142,23 @@ fn value_bytes(col: &ArrayRef, row: usize) -> Option<Vec<u8>> {
             }
         }};
     }
-    // Unsigned / signed ints: to_be_bytes directly.
-    prim!(UInt8Array, to_be_bytes);
-    prim!(UInt16Array, to_be_bytes);
-    prim!(UInt32Array, to_be_bytes);
-    prim!(UInt64Array, to_be_bytes);
-    prim!(Int8Array, to_be_bytes);
-    prim!(Int16Array, to_be_bytes);
-    prim!(Int32Array, to_be_bytes);
-    prim!(Int64Array, to_be_bytes);
+    prim!(UInt8Array, to_le_bytes);
+    prim!(UInt16Array, to_le_bytes);
+    prim!(UInt32Array, to_le_bytes);
+    prim!(UInt64Array, to_le_bytes);
+    prim!(Int8Array, to_le_bytes);
+    prim!(Int16Array, to_le_bytes);
+    prim!(Int32Array, to_le_bytes);
+    prim!(Int64Array, to_le_bytes);
 
-    // Floats: encode IEEE-754 bits in BE.
+    // Floats: encode IEEE-754 bits in LE.
     if let Some(arr) = a.as_any().downcast_ref::<Float32Array>() {
         let bits = arr.value(row).to_bits();
-        return Some(bits.to_be_bytes().to_vec());
+        return Some(bits.to_le_bytes().to_vec());
     }
     if let Some(arr) = a.as_any().downcast_ref::<Float64Array>() {
         let bits = arr.value(row).to_bits();
-        return Some(bits.to_be_bytes().to_vec());
+        return Some(bits.to_le_bytes().to_vec());
     }
 
     // -------- strings/binary (variable width) --------
@@ -176,7 +175,7 @@ fn value_bytes(col: &ArrayRef, row: usize) -> Option<Vec<u8>> {
         return Some(ba.value(row).to_vec());
     }
 
-    // -------- fixed-size list of primitives --------
+    // -------- fixed-size list of primitives (LE) --------
     if let Some(fsl) = a.as_any().downcast_ref::<FixedSizeListArray>() {
         let width = fsl.value_length() as usize;
         let child = fsl.values();
@@ -195,19 +194,19 @@ fn value_bytes(col: &ArrayRef, row: usize) -> Option<Vec<u8>> {
                 }
             }};
         }
-        pack_slice!(UInt8Array, |c: &UInt8Array, i| c.value(i).to_be_bytes());
-        pack_slice!(Int8Array, |c: &Int8Array, i| c.value(i).to_be_bytes());
-        pack_slice!(UInt16Array, |c: &UInt16Array, i| c.value(i).to_be_bytes());
-        pack_slice!(Int16Array, |c: &Int16Array, i| c.value(i).to_be_bytes());
-        pack_slice!(UInt32Array, |c: &UInt32Array, i| c.value(i).to_be_bytes());
-        pack_slice!(Int32Array, |c: &Int32Array, i| c.value(i).to_be_bytes());
-        pack_slice!(UInt64Array, |c: &UInt64Array, i| c.value(i).to_be_bytes());
-        pack_slice!(Int64Array, |c: &Int64Array, i| c.value(i).to_be_bytes());
+        pack_slice!(UInt8Array, |c: &UInt8Array, i| c.value(i).to_le_bytes());
+        pack_slice!(Int8Array, |c: &Int8Array, i| c.value(i).to_le_bytes());
+        pack_slice!(UInt16Array, |c: &UInt16Array, i| c.value(i).to_le_bytes());
+        pack_slice!(Int16Array, |c: &Int16Array, i| c.value(i).to_le_bytes());
+        pack_slice!(UInt32Array, |c: &UInt32Array, i| c.value(i).to_le_bytes());
+        pack_slice!(Int32Array, |c: &Int32Array, i| c.value(i).to_le_bytes());
+        pack_slice!(UInt64Array, |c: &UInt64Array, i| c.value(i).to_le_bytes());
+        pack_slice!(Int64Array, |c: &Int64Array, i| c.value(i).to_le_bytes());
         pack_slice!(Float32Array, |c: &Float32Array, i| {
-            c.value(i).to_bits().to_be_bytes()
+            c.value(i).to_bits().to_le_bytes()
         });
         pack_slice!(Float64Array, |c: &Float64Array, i| {
-            c.value(i).to_bits().to_be_bytes()
+            c.value(i).to_bits().to_le_bytes()
         });
 
         panic!("unsupported FixedSizeList child type");

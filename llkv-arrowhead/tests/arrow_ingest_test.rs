@@ -69,8 +69,8 @@ fn arrow_recordbatch_roundtrip() {
 
     // Check column A (i32 values).
     let got_a = store.get_many(vec![(FID_A, vec![k1.clone(), k3.clone()])]);
-    assert_eq!(got_a[0][0].as_deref().unwrap(), 10i32.to_be_bytes());
-    assert_eq!(got_a[0][1].as_deref().unwrap(), 30i32.to_be_bytes());
+    assert_eq!(got_a[0][0].as_deref().unwrap(), 10i32.to_le_bytes());
+    assert_eq!(got_a[0][1].as_deref().unwrap(), 30i32.to_le_bytes());
 
     // Check column B (Utf8 -> bytes).
     let got_b = store.get_many(vec![(FID_B, vec![k1.clone(), k3.clone()])]);
