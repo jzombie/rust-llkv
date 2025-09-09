@@ -1292,48 +1292,25 @@ fn range_in_key_index(seg: &IndexSegment, lo: &Bound<&[u8]>, hi: &Bound<&[u8]>) 
     (begin.min(n), end.min(n))
 }
 
-// TODO: dedupe
-#[inline(always)]
-fn slice_key<'a>(seg: &'a IndexSegment, row: usize) -> &'a [u8] {
-    match &seg.key_layout {
-        // Fixed: row * width .. (row+1) * width
-        KeyLayout::FixedWidth { width } => {
-            let w = *width as usize;
-            let a = row * w;
-            &seg.logical_key_bytes[a..a + w]
-        }
-        // Var: offsets[row] .. offsets[row+1]
-        KeyLayout::Variable { key_offsets } => {
-            let a = key_offsets[row] as usize;
-            let b = key_offsets[row + 1] as usize;
-            &seg.logical_key_bytes[a..b]
-        }
-    }
-}
-
 #[inline(always)]
 fn key_lower_bound(seg: &IndexSegment, probe: &[u8]) -> usize {
-    let n = seg.n_entries as usize;
-    let (mut lo, mut hi) = (0usize, n);
-    while lo < hi {
-        let mid = (lo + hi) >> 1;
-        let k = slice_key(seg, mid);
-        if k < probe { lo = mid + 1 } else { hi = mid }
-    }
-    lo
+    KeyLayout::lower_bound(
+        &seg.logical_key_bytes,
+        &seg.key_layout,
+        seg.n_entries as usize,
+        probe,
+    )
 }
 
 #[inline(always)]
 fn key_upper_bound(seg: &IndexSegment, probe: &[u8], include_equal: bool) -> usize {
-    let n = seg.n_entries as usize;
-    let (mut lo, mut hi) = (0usize, n);
-    while lo < hi {
-        let mid = (lo + hi) >> 1;
-        let k = slice_key(seg, mid);
-        let go_right = if include_equal { k <= probe } else { k < probe };
-        if go_right { lo = mid + 1 } else { hi = mid }
-    }
-    lo
+    KeyLayout::upper_bound(
+        &seg.logical_key_bytes,
+        &seg.key_layout,
+        seg.n_entries as usize,
+        probe,
+        include_equal,
+    )
 }
 
 #[inline(always)]
