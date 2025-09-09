@@ -134,6 +134,30 @@ fn dominates_by_policy(policy: ConflictPolicy, winner_rank: usize, candidate_ran
     }
 }
 
+/// Borrowed key slice packed into a pointer + length.
+/// Safety: the slice must outlive the node (the iterator owns the segments).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyRef {
+    ptr: *const u8,
+    len: u32,
+}
+
+impl KeyRef {
+    #[inline(always)]
+    fn from_slice(s: &[u8]) -> Self {
+        Self {
+            ptr: s.as_ptr(),
+            len: s.len() as u32,
+        }
+    }
+
+    #[inline(always)]
+    fn as_slice<'a>(self) -> &'a [u8] {
+        // SAFETY: ValueScan holds all segment storage for the iterator lifetime.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len as usize) }
+    }
+}
+
 /// Minimal metadata for shadow (index-only) membership checks.
 struct ShadowRef {
     pk: PhysicalKey,
@@ -356,15 +380,15 @@ struct Node<P: Pager> {
     /// Zero-copy value slice (for returning and for frame predicate).
     val: ValueSlice<P::Blob>,
     /// When present, ordering is by KEY bytes; otherwise by VALUE bytes.
-    key_ord: Option<Vec<u8>>,
+    key_ord: Option<KeyRef>,
     reverse: bool,
 }
 
 impl<P: Pager> Node<P> {
     #[inline(always)]
-    fn bytes(&self) -> &[u8] {
-        if let Some(ref k) = self.key_ord {
-            k.as_slice()
+    fn bytes<'a>(&'a self) -> &'a [u8] {
+        if let Some(kref) = self.key_ord {
+            kref.as_slice()
         } else {
             let a = self.val.start as usize;
             let b = self.val.end as usize;
@@ -374,6 +398,7 @@ impl<P: Pager> Node<P> {
 }
 
 impl<P: Pager> Eq for Node<P> {}
+
 impl<P: Pager> PartialEq for Node<P> {
     fn eq(&self, other: &Self) -> bool {
         self.bucket == other.bucket
@@ -384,14 +409,16 @@ impl<P: Pager> PartialEq for Node<P> {
             && self.reverse == other.reverse
     }
 }
+
 impl<P: Pager> Ord for Node<P> {
-    fn cmp(&self, other: &Self) -> Ordering {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
         let mut ord = if !self.reverse {
             self.bucket.cmp(&other.bucket)
         } else {
             other.bucket.cmp(&self.bucket)
         };
-        if ord != Ordering::Equal {
+        if ord != Equal {
             return ord;
         }
 
@@ -400,7 +427,7 @@ impl<P: Pager> Ord for Node<P> {
         } else {
             other.head_tag.cmp(&self.head_tag)
         };
-        if ord != Ordering::Equal {
+        if ord != Equal {
             return ord;
         }
 
@@ -409,13 +436,13 @@ impl<P: Pager> Ord for Node<P> {
         } else {
             other.bytes().cmp(self.bytes())
         };
-        if ord != Ordering::Equal {
+        if ord != Equal {
             return ord;
         }
 
         // Newer (smaller rank) first on perfect byte ties.
         ord = self.rank.cmp(&other.rank);
-        if ord != Ordering::Equal {
+        if ord != Equal {
             return ord;
         }
 
@@ -423,8 +450,9 @@ impl<P: Pager> Ord for Node<P> {
         self.pos.cmp(&other.pos)
     }
 }
+
 impl<P: Pager> PartialOrd for Node<P> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
@@ -728,10 +756,9 @@ impl<P: Pager> ValueScan<P> {
                     &seg_ref.key_layout,
                     head_row,
                 );
-                let kb = key_slice.to_vec();
                 let (bkt, tg) =
-                    bucket_and_tag_bytes_fast(&kb, opts.bucket_prefix_len, opts.head_tag_len);
-                (bkt, tg, Some(kb))
+                    bucket_and_tag_bytes_fast(key_slice, opts.bucket_prefix_len, opts.head_tag_len);
+                (bkt, tg, Some(KeyRef::from_slice(key_slice)))
             };
 
             pq.push(Node {
@@ -936,12 +963,15 @@ impl<P: Pager> Iterator for ValueScan<P> {
                 self.frame_head = Some(node.val.clone());
             }
 
-            // Borrow segment to compute:
-            // - row position in segment
-            // - borrowed key slice for membership
-            // - next cursor position & its value (and key bytes if key-ordered)
-            // - shadow bit using precomputed dominators
-            let (rank, next_pos_opt, next_val_opt, next_key_for_order, shadowed, key_owned_if_emit) = {
+            // Borrow the segment once; prepare everything we need.
+            let (
+                rank,
+                next_pos_opt,
+                next_val_opt,
+                next_key_for_order, // Option<KeyRef>
+                shadowed,
+                key_owned_if_emit, // Option<Vec<u8>>
+            ) = {
                 let sc = &self.segs[seg_idx];
 
                 let row_pos = if self.by_value {
@@ -950,7 +980,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
                     node.pos
                 };
 
-                // Borrowed key slice (zero-copy) to decide shadowing & later ownership.
+                // Borrowed key slice for membership check + eventual emission.
                 let key_slice = KeyLayout::slice_key_by_layout(
                     &sc.seg.logical_key_bytes,
                     &sc.seg.key_layout,
@@ -959,7 +989,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
 
                 let next_pos_opt = next_pos(node.pos, sc.begin, sc.end, self.reverse);
 
-                // Prepare next value (and next key bytes for key-ordered) while borrowed.
+                // Prepare next node's value (and key-ref if key-ordered).
                 let (next_val_opt, next_key_for_order) = next_pos_opt.map_or((None, None), |np| {
                     let next_row = if self.by_value {
                         row_pos_at(&sc.seg, np)
@@ -967,22 +997,20 @@ impl<P: Pager> Iterator for ValueScan<P> {
                         np
                     };
                     let sval = slice_value::<P>(&sc.seg, &sc.data, next_row);
-                    let skey_ord = if self.by_value {
+                    let skey_ref = if self.by_value {
                         None
                     } else {
-                        Some(
-                            KeyLayout::slice_key_by_layout(
-                                &sc.seg.logical_key_bytes,
-                                &sc.seg.key_layout,
-                                next_row,
-                            )
-                            .to_vec(),
-                        )
+                        let ks = KeyLayout::slice_key_by_layout(
+                            &sc.seg.logical_key_bytes,
+                            &sc.seg.key_layout,
+                            next_row,
+                        );
+                        Some(KeyRef::from_slice(ks))
                     };
-                    (Some(sval), skey_ord)
+                    (Some(sval), skey_ref)
                 });
 
-                // Fast shadowing using precomputed dominators.
+                // Shadow check using precomputed dominators.
                 let shadowed = self.is_shadowed_for_seg(seg_idx, key_slice);
 
                 let key_owned_if_emit = if shadowed {
@@ -1020,10 +1048,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
                         reverse: self.reverse,
                     });
                 } else {
-                    let kb = next_key_for_order
-                        .as_ref()
-                        .expect("prepared key bytes for key order")
-                        .clone();
+                    let kb = next_key_for_order.expect("prepared KeyRef for key-ordered reseed");
                     push_next_keyordered(
                         &mut self.pq,
                         rank,
@@ -1038,7 +1063,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
                 }
             };
 
-            // If shadowed, just advance this segment and continue.
+            // If shadowed, advance this segment and continue.
             if shadowed {
                 if let (Some(np), Some(v)) = (next_pos_opt, next_val_opt) {
                     push_next(np, v);
@@ -1051,7 +1076,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
                 push_next(np, v);
             }
 
-            // Yield the current row (value zero-copy; key owned).
+            // Yield current row (value zero-copy; key is owned once).
             let key_owned = key_owned_if_emit.expect("owned key prepared for emission");
             return Some(ValueScanItem {
                 key: key_owned,
@@ -1424,12 +1449,12 @@ fn push_next_keyordered<P: Pager>(
     seg_idx: usize,
     pos: usize,
     val: ValueSlice<P::Blob>,
-    kb: Vec<u8>,
+    kb: KeyRef,
     reverse: bool,
     bucket_prefix_len: usize,
     head_tag_len: usize,
 ) {
-    let (bkt, tag) = bucket_and_tag_bytes_fast(&kb, bucket_prefix_len, head_tag_len);
+    let (bkt, tag) = bucket_and_tag_bytes_fast(kb.as_slice(), bucket_prefix_len, head_tag_len);
     pq.push(Node {
         bucket: bkt,
         head_tag: tag,
