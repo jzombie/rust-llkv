@@ -369,8 +369,10 @@ impl<P: Pager> RadixPq<P> {
 #[derive(Clone)]
 struct Node<P: Pager> {
     bucket: u16,
-    head_tag_hi: u64, // next 8 bytes (big-endian)
-    head_tag_lo: u64, // next 8 bytes (big-endian)
+    // 16-byte big-endian prefix after the bucket (left-aligned, zero-padded).
+    // We store it as two u64's to keep Ord impl simple and branchless.
+    head_tag_hi: u64, // most significant 8 bytes
+    head_tag_lo: u64, // least significant 8 bytes
     /// Newest-first tie-breaker: lower rank means newer.
     rank: usize,
     seg_idx: usize,
@@ -413,6 +415,7 @@ impl<P: Pager> PartialEq for Node<P> {
 impl<P: Pager> Ord for Node<P> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         use std::cmp::Ordering::*;
+        // radix bucket first (fast reject)
         let mut ord = if !self.reverse {
             self.bucket.cmp(&other.bucket)
         } else {
@@ -422,6 +425,7 @@ impl<P: Pager> Ord for Node<P> {
             return ord;
         }
 
+        // 16-byte tag (hi then lo) — already left-aligned BE so lexicographic
         ord = if !self.reverse {
             (self.head_tag_hi, self.head_tag_lo).cmp(&(other.head_tag_hi, other.head_tag_lo))
         } else {
@@ -431,6 +435,7 @@ impl<P: Pager> Ord for Node<P> {
             return ord;
         }
 
+        // Full bytes comparison only on ties inside the same 16-byte tag bucket
         ord = if !self.reverse {
             self.bytes().cmp(other.bytes())
         } else {
@@ -440,7 +445,7 @@ impl<P: Pager> Ord for Node<P> {
             return ord;
         }
 
-        // tie-breakers
+        // tie-breakers keep iteration stable
         ord = self.rank.cmp(&other.rank);
         if ord != Equal {
             return ord;
@@ -449,145 +454,67 @@ impl<P: Pager> Ord for Node<P> {
     }
 }
 
-#[inline(always)]
-fn pack_be_left_justified_u64(src: &[u8], take: usize) -> u64 {
-    debug_assert!(take <= 8);
-    let mut acc: u64 = 0;
-    let mut i = 0usize;
-
-    // accumulate up to `take` bytes big-endian
-    while i < take && i < src.len() {
-        acc = (acc << 8) | (src[i] as u64);
-        i += 1;
-    }
-
-    // left-justify into 8 bytes without overflowing shift
-    let missing = 8 - i; // 0..=8
-    if missing == 0 {
-        acc
-    } else if missing >= 8 {
-        0
-    } else {
-        acc << (missing * 8)
-    }
-}
-
-/// Generic: compute (bucket, hi, lo) from an arbitrary byte slice.
-/// - bucket = first 2 bytes (big-endian; zeros if missing)
-/// - tag bytes start at `bucket_prefix_len`
-/// - we take up to `head_tag_len` bytes (0..=16), first 8 -> hi, next 8 -> lo
-#[inline(always)]
-fn bucket_and_tag128(v: &[u8], bucket_prefix_len: usize, head_tag_len: usize) -> (u16, u64, u64) {
-    // bucket is always first 2 bytes big-endian
-    let b0 = *v.first().unwrap_or(&0) as u16;
-    let b1 = *v.get(1).unwrap_or(&0) as u16;
-    let bucket = (b0 << 8) | b1;
-
-    // how many tag bytes do we want?
-    let want = head_tag_len.min(16);
-    let want_hi = want.min(8);
-    let want_lo = want.saturating_sub(8).min(8);
-
-    // slice at tag start
-    let start = bucket_prefix_len;
-    let rest = if start <= v.len() {
-        &v[start..]
-    } else {
-        &[][..]
-    };
-
-    let hi = pack_be_left_justified_u64(rest, want_hi);
-
-    let rest2 = if want_hi <= rest.len() {
-        &rest[want_hi..]
-    } else {
-        &[][..]
-    };
-    let lo = pack_be_left_justified_u64(rest2, want_lo);
-
-    (bucket, hi, lo)
-}
-
-/// Fast path for VALUE slices when (bucket_prefix_len == 2 && head_tag_len == 8).
-#[inline(always)]
-fn bucket_and_tag128_from_value_slice<P: Pager>(
-    v: &ValueSlice<P::Blob>,
-    bucket_prefix_len: usize,
-    head_tag_len: usize,
-) -> (u16, u64, u64) {
-    if bucket_prefix_len == 2 && head_tag_len == 8 {
-        let bytes = &v.data.as_ref()[v.start as usize..v.end as usize];
-
-        let b0 = *bytes.first().unwrap_or(&0) as u16;
-        let b1 = *bytes.get(1).unwrap_or(&0) as u16;
-        let bucket = (b0 << 8) | b1;
-
-        // next 8 bytes after the 2-byte bucket, left-justified
-        let start = 2usize;
-        let end = (start + 8).min(bytes.len());
-        let mut hi: u64 = 0;
-        let mut i = start;
-        while i < end {
-            hi = (hi << 8) | (bytes[i] as u64);
-            i += 1;
-        }
-        let missing = (start + 8) - end; // 0..=8
-        if missing != 0 {
-            // missing will never be >= 8 here, but guard anyway
-            if missing < 8 {
-                hi <<= missing * 8;
-            } else {
-                hi = 0;
-            }
-        }
-
-        (bucket, hi, 0)
-    } else {
-        let a = v.start as usize;
-        let b = v.end as usize;
-        bucket_and_tag128(&v.data.as_ref()[a..b], bucket_prefix_len, head_tag_len)
-    }
-}
-
-/// Fast path for KEY bytes when (bucket_prefix_len == 2 && head_tag_len == 8).
-#[inline(always)]
-fn bucket_and_tag128_bytes_fast(
-    v: &[u8],
-    bucket_prefix_len: usize,
-    head_tag_len: usize,
-) -> (u16, u64, u64) {
-    if bucket_prefix_len == 2 && head_tag_len == 8 {
-        let b0 = *v.first().unwrap_or(&0) as u16;
-        let b1 = *v.get(1).unwrap_or(&0) as u16;
-        let bucket = (b0 << 8) | b1;
-
-        let start = 2usize;
-        let end = (start + 8).min(v.len());
-        let mut hi: u64 = 0;
-        let mut i = start;
-        while i < end {
-            hi = (hi << 8) | (v[i] as u64);
-            i += 1;
-        }
-        let missing = (start + 8) - end; // 0..=8
-        if missing != 0 {
-            if missing < 8 {
-                hi <<= missing * 8;
-            } else {
-                hi = 0;
-            }
-        }
-
-        (bucket, hi, 0)
-    } else {
-        bucket_and_tag128(v, bucket_prefix_len, head_tag_len)
-    }
-}
-
 impl<P: Pager> PartialOrd for Node<P> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// Build (bucket, 16B tag) from VALUE bytes.
+/// The tag is the next `head_tag_len` bytes after the bucket prefix,
+/// left-aligned in a big-endian u128, then split into (hi, lo).
+#[inline(always)]
+fn bucket_and_tag128_from_value_slice<P: Pager>(
+    v: &ValueSlice<P::Blob>,
+    bucket_prefix_len: usize,
+    head_tag_len: usize, // ≤ 16 in current design
+) -> (u16, u64, u64) {
+    let bytes = &v.data.as_ref()[v.start as usize..v.end as usize];
+    bucket_and_tag128_from_bytes(bytes, bucket_prefix_len, head_tag_len)
+}
+
+/// Build (bucket, 16B tag) from KEY bytes with a fast path.
+/// For (bucket_prefix_len==2 && head_tag_len==8) we could keep a u64 path,
+/// but using the unified u128 path is already cheap and simpler.
+#[inline(always)]
+fn bucket_and_tag128_bytes_fast(
+    key_bytes: &[u8],
+    bucket_prefix_len: usize,
+    head_tag_len: usize,
+) -> (u16, u64, u64) {
+    bucket_and_tag128_from_bytes(key_bytes, bucket_prefix_len, head_tag_len)
+}
+
+#[inline(always)]
+fn bucket_and_tag128_from_bytes(
+    bytes: &[u8],
+    bucket_prefix_len: usize,
+    head_tag_len: usize, // ≤ 16
+) -> (u16, u64, u64) {
+    // bucket = first 2 bytes big-endian; zeros if missing
+    let b0 = *bytes.get(0).unwrap_or(&0) as u16;
+    let b1 = *bytes.get(1).unwrap_or(&0) as u16;
+    let bucket = (b0 << 8) | b1;
+
+    // tag window begins after the configured prefix (usually 2)
+    let start = bucket_prefix_len.min(bytes.len());
+    let avail = bytes.len().saturating_sub(start);
+    let take = core::cmp::min(avail, head_tag_len.min(16));
+
+    // Build a BE u128 by shifting-in each byte, then left-pad to 16B so that
+    // shorter prefixes compare correctly (memcmp semantics).
+    let mut acc: u128 = 0;
+    for &x in &bytes[start..start + take] {
+        acc = (acc << 8) | (x as u128);
+    }
+    // Left-pad: place the taken bytes at the MSB side of the 16-byte lane.
+    // This keeps (hi, lo) tuple compares equivalent to memcmp on the prefix.
+    let pad_bytes = 16usize.saturating_sub(take);
+    acc <<= (pad_bytes * 8) as u32; // safe: pad_bytes ∈ [0,16) → shift < 128
+
+    let hi = (acc >> 64) as u64;
+    let lo = acc as u64;
+    (bucket, hi, lo)
 }
 
 // TODO: Rename * from `scan_values_*` to `scan_*` since this can do key or value based scanning
@@ -1365,18 +1292,33 @@ fn range_in_key_index(seg: &IndexSegment, lo: &Bound<&[u8]>, hi: &Bound<&[u8]>) 
     (begin.min(n), end.min(n))
 }
 
+// TODO: dedupe
+#[inline(always)]
+fn slice_key<'a>(seg: &'a IndexSegment, row: usize) -> &'a [u8] {
+    match &seg.key_layout {
+        // Fixed: row * width .. (row+1) * width
+        KeyLayout::FixedWidth { width } => {
+            let w = *width as usize;
+            let a = row * w;
+            &seg.logical_key_bytes[a..a + w]
+        }
+        // Var: offsets[row] .. offsets[row+1]
+        KeyLayout::Variable { key_offsets } => {
+            let a = key_offsets[row] as usize;
+            let b = key_offsets[row + 1] as usize;
+            &seg.logical_key_bytes[a..b]
+        }
+    }
+}
+
 #[inline(always)]
 fn key_lower_bound(seg: &IndexSegment, probe: &[u8]) -> usize {
     let n = seg.n_entries as usize;
     let (mut lo, mut hi) = (0usize, n);
     while lo < hi {
         let mid = (lo + hi) >> 1;
-        let k = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, mid);
-        if k < probe {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
+        let k = slice_key(seg, mid);
+        if k < probe { lo = mid + 1 } else { hi = mid }
     }
     lo
 }
@@ -1387,13 +1329,9 @@ fn key_upper_bound(seg: &IndexSegment, probe: &[u8], include_equal: bool) -> usi
     let (mut lo, mut hi) = (0usize, n);
     while lo < hi {
         let mid = (lo + hi) >> 1;
-        let k = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, mid);
+        let k = slice_key(seg, mid);
         let go_right = if include_equal { k <= probe } else { k < probe };
-        if go_right {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
+        if go_right { lo = mid + 1 } else { hi = mid }
     }
     lo
 }
