@@ -1,23 +1,38 @@
-// src/arrow_bridge.rs
+//! Arrow <-> llkv-column-map bridge.
+//!
+//! Writer:
+//!   - Builds Put vectors from an Arrow RecordBatch.
+//!   - Keys: BE if using numeric u64; values encoded LE.
+//!
+//! Reader:
+//!   - Builds an Arrow RecordBatch via ColumnStore::get_many.
+//!   - Decodes values with codecs (LE numerics, UTF-8, binary,
+//!     fixed-size f32 vectors).
 
-//! Arrow <-> llkv-column-map ingest bridge.
-//!
-//! Keys are taken from a user-selected column. For integer keys we
-//! encode as big-endian bytes so lex order matches numeric order.
-//!
-//! Nulls are skipped (no Put for that row). If you want nulls to map
-//! to tombstones, pass ValueMode::Auto and write empty slices for
-//! variable-width columns only.
+#![forbid(unsafe_code)]
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
+use arrow_array::builder::{
+    BinaryBuilder, FixedSizeListBuilder, Float32Builder, Int32Builder, Int64Builder, StringBuilder,
+    UInt32Builder, UInt64Builder,
+};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
     StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
+use arrow_buffer::NullBuffer;
+use arrow_buffer::builder::BooleanBufferBuilder;
+use arrow_schema::{ArrowError, DataType, Field, Schema};
+
 use llkv_column_map::ColumnStore;
-use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, ValueMode};
+use llkv_column_map::storage::pager::Pager;
+use llkv_column_map::types::{AppendOptions, LogicalFieldId, LogicalKeyBytes, Put, ValueMode};
+use llkv_column_map::views::ValueSlice;
+
+/* ============================== WRITER ============================== */
 
 /// Which column supplies row keys, and how to encode them.
 pub enum KeySpec {
@@ -40,6 +55,7 @@ pub struct ColumnMap {
 /// All columns use ValueMode::Auto (per-column fixed/variable inferred).
 pub fn batch_to_puts<'a>(batch: &'a RecordBatch, keys: &KeySpec, map: &ColumnMap) -> Vec<Put<'a>> {
     let rows = batch.num_rows();
+
     let key_bytes_for_row = |row: usize| -> Option<Vec<u8>> {
         match *keys {
             KeySpec::U64Be { col_idx } => {
@@ -196,11 +212,17 @@ fn value_bytes(col: &ArrayRef, row: usize) -> Option<Vec<u8>> {
         }
         pack_slice!(UInt8Array, |c: &UInt8Array, i| c.value(i).to_le_bytes());
         pack_slice!(Int8Array, |c: &Int8Array, i| c.value(i).to_le_bytes());
-        pack_slice!(UInt16Array, |c: &UInt16Array, i| c.value(i).to_le_bytes());
+        pack_slice!(UInt16Array, |c: &UInt16Array, i| {
+            c.value(i).to_le_bytes()
+        });
         pack_slice!(Int16Array, |c: &Int16Array, i| c.value(i).to_le_bytes());
-        pack_slice!(UInt32Array, |c: &UInt32Array, i| c.value(i).to_le_bytes());
+        pack_slice!(UInt32Array, |c: &UInt32Array, i| {
+            c.value(i).to_le_bytes()
+        });
         pack_slice!(Int32Array, |c: &Int32Array, i| c.value(i).to_le_bytes());
-        pack_slice!(UInt64Array, |c: &UInt64Array, i| c.value(i).to_le_bytes());
+        pack_slice!(UInt64Array, |c: &UInt64Array, i| {
+            c.value(i).to_le_bytes()
+        });
         pack_slice!(Int64Array, |c: &Int64Array, i| c.value(i).to_le_bytes());
         pack_slice!(Float32Array, |c: &Float32Array, i| {
             c.value(i).to_bits().to_le_bytes()
@@ -225,11 +247,261 @@ pub fn append_batch<P: llkv_column_map::storage::pager::Pager>(
     map: &ColumnMap,
     mut opts: AppendOptions,
 ) {
-    // Ensure ValueMode::Auto so different columns can choose their own
-    // layout (fixed vs variable) in one append_many call.
     opts.mode = ValueMode::Auto;
     let puts = batch_to_puts(batch, keys, map);
     if !puts.is_empty() {
         store.append_many(puts, opts);
     }
+}
+
+/* ============================== READER ============================== */
+
+/// Arrow read bridge built on ColumnStore::get_many.
+/// Caller supplies ReadSpec per column. Rows align with `keys`.
+/// Numerics decode as LE. Keys remain BE.
+#[derive(Clone, Debug)]
+pub enum ReadCodec {
+    U64Le,
+    U32Le,
+    I64Le,
+    I32Le,
+    Utf8,
+    Binary,
+    /// Fixed-size vector of f32, length `len`, LE elements.
+    F32Fixed {
+        len: i32,
+    },
+}
+
+/// Per-column read plan.
+#[derive(Clone, Debug)]
+pub struct ReadSpec {
+    /// Logical field id in your store.
+    pub field_id: LogicalFieldId,
+    /// Arrow field to emit (name, datatype, nullability).
+    pub field: Field,
+    /// Codec for decoding bytes -> Arrow array.
+    pub codec: ReadCodec,
+}
+
+/// Build a RecordBatch for `specs` and `keys` using get_many.
+/// Rows align with `keys`. Each spec becomes one Arrow column.
+pub fn read_record_batch<P: Pager>(
+    store: &ColumnStore<P>,
+    keys: &[LogicalKeyBytes],
+    specs: &[ReadSpec],
+) -> Result<RecordBatch, ArrowError> {
+    // 1) get_many for all requested fields.
+    let items = specs
+        .iter()
+        .map(|s| (s.field_id, keys.to_vec()))
+        .collect::<Vec<_>>();
+    let fetched = store.get_many(items);
+    debug_assert_eq!(fetched.len(), specs.len());
+
+    // 2) Decode per column.
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(specs.len());
+    for (i, spec) in specs.iter().enumerate() {
+        let col_vals = &fetched[i];
+        let arr = decode_column::<P>(spec, col_vals)?;
+        arrays.push(arr);
+    }
+
+    // 3) Assemble schema and batch.
+    let fields = specs
+        .iter()
+        .map(|s| Arc::new(s.field.clone()))
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, arrays)
+}
+
+/// Decode one column based on a ReadSpec.
+fn decode_column<P: Pager>(
+    spec: &ReadSpec,
+    vals: &[Option<ValueSlice<P::Blob>>],
+) -> Result<ArrayRef, ArrowError> {
+    match spec.codec {
+        ReadCodec::U64Le => Ok(decode_u64_le::<P>(vals)),
+        ReadCodec::U32Le => Ok(decode_u32_le::<P>(vals)),
+        ReadCodec::I64Le => Ok(decode_i64_le::<P>(vals)),
+        ReadCodec::I32Le => Ok(decode_i32_le::<P>(vals)),
+        ReadCodec::Utf8 => decode_utf8::<P>(vals),
+        ReadCodec::Binary => Ok(decode_binary::<P>(vals)),
+        ReadCodec::F32Fixed { len } => decode_f32_fixed::<P>(vals, len),
+    }
+}
+
+/// Return an owned Vec<u8> for a ValueSlice.
+/// We cannot return a borrowed slice because `data()` returns an owned
+/// blob; this function deliberately copies the window.
+fn bytes_of<P: Pager>(vs: &ValueSlice<P::Blob>) -> Vec<u8> {
+    let blob = vs.data(); // hold the owned blob so it outlives the slice
+    let all = blob.as_ref();
+    let a = vs.start() as usize;
+    let b = vs.end() as usize;
+    all[a..b].to_vec()
+}
+
+fn decode_u64_le<P: Pager>(vals: &[Option<ValueSlice<P::Blob>>]) -> ArrayRef {
+    let mut b = UInt64Builder::with_capacity(vals.len());
+    for v in vals {
+        if let Some(vs) = v {
+            let s = bytes_of::<P>(vs);
+            if s.len() == 8 {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&s);
+                b.append_value(u64::from_le_bytes(buf));
+            } else {
+                b.append_null();
+            }
+        } else {
+            b.append_null();
+        }
+    }
+    Arc::new(b.finish())
+}
+
+fn decode_u32_le<P: Pager>(vals: &[Option<ValueSlice<P::Blob>>]) -> ArrayRef {
+    let mut b = UInt32Builder::with_capacity(vals.len());
+    for v in vals {
+        if let Some(vs) = v {
+            let s = bytes_of::<P>(vs);
+            if s.len() == 4 {
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(&s);
+                b.append_value(u32::from_le_bytes(buf));
+            } else {
+                b.append_null();
+            }
+        } else {
+            b.append_null();
+        }
+    }
+    Arc::new(b.finish())
+}
+
+fn decode_i64_le<P: Pager>(vals: &[Option<ValueSlice<P::Blob>>]) -> ArrayRef {
+    let mut b = Int64Builder::with_capacity(vals.len());
+    for v in vals {
+        if let Some(vs) = v {
+            let s = bytes_of::<P>(vs);
+            if s.len() == 8 {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&s);
+                b.append_value(i64::from_le_bytes(buf));
+            } else {
+                b.append_null();
+            }
+        } else {
+            b.append_null();
+        }
+    }
+    Arc::new(b.finish())
+}
+
+fn decode_i32_le<P: Pager>(vals: &[Option<ValueSlice<P::Blob>>]) -> ArrayRef {
+    let mut b = Int32Builder::with_capacity(vals.len());
+    for v in vals {
+        if let Some(vs) = v {
+            let s = bytes_of::<P>(vs);
+            if s.len() == 4 {
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(&s);
+                b.append_value(i32::from_le_bytes(buf));
+            } else {
+                b.append_null();
+            }
+        } else {
+            b.append_null();
+        }
+    }
+    Arc::new(b.finish())
+}
+
+fn decode_utf8<P: Pager>(vals: &[Option<ValueSlice<P::Blob>>]) -> Result<ArrayRef, ArrowError> {
+    let mut b = StringBuilder::with_capacity(vals.len(), 0);
+    for v in vals {
+        if let Some(vs) = v {
+            let s = bytes_of::<P>(vs);
+            let strv =
+                std::str::from_utf8(&s).map_err(|e| ArrowError::ParseError(e.to_string()))?;
+            b.append_value(strv);
+        } else {
+            b.append_null();
+        }
+    }
+    Ok(Arc::new(b.finish()))
+}
+
+fn decode_binary<P: Pager>(vals: &[Option<ValueSlice<P::Blob>>]) -> ArrayRef {
+    let mut b = BinaryBuilder::with_capacity(vals.len(), 0);
+    for v in vals {
+        if let Some(vs) = v {
+            let s = bytes_of::<P>(vs);
+            b.append_value(&s);
+        } else {
+            b.append_null();
+        }
+    }
+    Arc::new(b.finish())
+}
+
+fn decode_f32_fixed<P: Pager>(
+    vals: &[Option<ValueSlice<P::Blob>>],
+    len: i32,
+) -> Result<ArrayRef, ArrowError> {
+    let len_usize = len as usize;
+
+    // Build child values (no nulls in child) and track parent validity.
+    let mut child = Float32Builder::with_capacity(vals.len() * len_usize);
+    let mut any_null = false;
+    let mut valid_bits = BooleanBufferBuilder::new(vals.len());
+
+    for v in vals {
+        if let Some(vs) = v {
+            let s = bytes_of::<P>(vs);
+            if s.len() != len_usize * 4 {
+                // Malformed row: mark parent null, fill child with dummies.
+                any_null = true;
+                valid_bits.append(false);
+                for _ in 0..len_usize {
+                    child.append_value(0.0);
+                }
+                continue;
+            }
+            // Good row: decode len LE f32 values.
+            for i in 0..len_usize {
+                let off = i * 4;
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(&s[off..off + 4]);
+                let f = f32::from_le_bytes(buf);
+                child.append_value(f);
+            }
+            valid_bits.append(true);
+        } else {
+            // Missing row: parent null, child gets dummy values.
+            any_null = true;
+            valid_bits.append(false);
+            for _ in 0..len_usize {
+                child.append_value(0.0);
+            }
+        }
+    }
+
+    // Child array: plain Float32 with no nulls.
+    let child_arr: ArrayRef = Arc::new(child.finish());
+
+    // Parent validity buffer, only if we had any nulls.
+    let nulls = if any_null {
+        Some(NullBuffer::from(valid_bits.finish()))
+    } else {
+        None
+    };
+
+    // Child field MUST be non-nullable to match your schema.
+    let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+
+    let arr = FixedSizeListArray::new(item_field, len, child_arr, nulls);
+    Ok(Arc::new(arr))
 }
