@@ -369,7 +369,8 @@ impl<P: Pager> RadixPq<P> {
 #[derive(Clone)]
 struct Node<P: Pager> {
     bucket: u16,
-    head_tag: u64,
+    head_tag_hi: u64, // next 8 bytes (big-endian)
+    head_tag_lo: u64, // next 8 bytes (big-endian)
     /// Newest-first tie-breaker: lower rank means newer.
     rank: usize,
     seg_idx: usize,
@@ -386,13 +387,11 @@ struct Node<P: Pager> {
 
 impl<P: Pager> Node<P> {
     #[inline(always)]
-    fn bytes<'a>(&'a self) -> &'a [u8] {
+    fn bytes(&self) -> &[u8] {
         if let Some(kref) = self.key_ord {
             kref.as_slice()
         } else {
-            let a = self.val.start as usize;
-            let b = self.val.end as usize;
-            &self.val.data.as_ref()[a..b]
+            &self.val.data.as_ref()[self.val.start as usize..self.val.end as usize]
         }
     }
 }
@@ -402,7 +401,8 @@ impl<P: Pager> Eq for Node<P> {}
 impl<P: Pager> PartialEq for Node<P> {
     fn eq(&self, other: &Self) -> bool {
         self.bucket == other.bucket
-            && self.head_tag == other.head_tag
+            && self.head_tag_hi == other.head_tag_hi
+            && self.head_tag_lo == other.head_tag_lo
             && self.bytes() == other.bytes()
             && self.rank == other.rank
             && self.pos == other.pos
@@ -423,9 +423,9 @@ impl<P: Pager> Ord for Node<P> {
         }
 
         ord = if !self.reverse {
-            self.head_tag.cmp(&other.head_tag)
+            (self.head_tag_hi, self.head_tag_lo).cmp(&(other.head_tag_hi, other.head_tag_lo))
         } else {
-            other.head_tag.cmp(&self.head_tag)
+            (other.head_tag_hi, other.head_tag_lo).cmp(&(self.head_tag_hi, self.head_tag_lo))
         };
         if ord != Equal {
             return ord;
@@ -440,14 +440,147 @@ impl<P: Pager> Ord for Node<P> {
             return ord;
         }
 
-        // Newer (smaller rank) first on perfect byte ties.
+        // tie-breakers
         ord = self.rank.cmp(&other.rank);
         if ord != Equal {
             return ord;
         }
-
-        // Stable within-segment ordering.
         self.pos.cmp(&other.pos)
+    }
+}
+
+#[inline(always)]
+fn pack_be_left_justified_u64(src: &[u8], take: usize) -> u64 {
+    debug_assert!(take <= 8);
+    let mut acc: u64 = 0;
+    let mut i = 0usize;
+
+    // accumulate up to `take` bytes big-endian
+    while i < take && i < src.len() {
+        acc = (acc << 8) | (src[i] as u64);
+        i += 1;
+    }
+
+    // left-justify into 8 bytes without overflowing shift
+    let missing = 8 - i; // 0..=8
+    if missing == 0 {
+        acc
+    } else if missing >= 8 {
+        0
+    } else {
+        acc << (missing * 8)
+    }
+}
+
+/// Generic: compute (bucket, hi, lo) from an arbitrary byte slice.
+/// - bucket = first 2 bytes (big-endian; zeros if missing)
+/// - tag bytes start at `bucket_prefix_len`
+/// - we take up to `head_tag_len` bytes (0..=16), first 8 -> hi, next 8 -> lo
+#[inline(always)]
+fn bucket_and_tag128(v: &[u8], bucket_prefix_len: usize, head_tag_len: usize) -> (u16, u64, u64) {
+    // bucket is always first 2 bytes big-endian
+    let b0 = *v.first().unwrap_or(&0) as u16;
+    let b1 = *v.get(1).unwrap_or(&0) as u16;
+    let bucket = (b0 << 8) | b1;
+
+    // how many tag bytes do we want?
+    let want = head_tag_len.min(16);
+    let want_hi = want.min(8);
+    let want_lo = want.saturating_sub(8).min(8);
+
+    // slice at tag start
+    let start = bucket_prefix_len;
+    let rest = if start <= v.len() {
+        &v[start..]
+    } else {
+        &[][..]
+    };
+
+    let hi = pack_be_left_justified_u64(rest, want_hi);
+
+    let rest2 = if want_hi <= rest.len() {
+        &rest[want_hi..]
+    } else {
+        &[][..]
+    };
+    let lo = pack_be_left_justified_u64(rest2, want_lo);
+
+    (bucket, hi, lo)
+}
+
+/// Fast path for VALUE slices when (bucket_prefix_len == 2 && head_tag_len == 8).
+#[inline(always)]
+fn bucket_and_tag128_from_value_slice<P: Pager>(
+    v: &ValueSlice<P::Blob>,
+    bucket_prefix_len: usize,
+    head_tag_len: usize,
+) -> (u16, u64, u64) {
+    if bucket_prefix_len == 2 && head_tag_len == 8 {
+        let bytes = &v.data.as_ref()[v.start as usize..v.end as usize];
+
+        let b0 = *bytes.first().unwrap_or(&0) as u16;
+        let b1 = *bytes.get(1).unwrap_or(&0) as u16;
+        let bucket = (b0 << 8) | b1;
+
+        // next 8 bytes after the 2-byte bucket, left-justified
+        let start = 2usize;
+        let end = (start + 8).min(bytes.len());
+        let mut hi: u64 = 0;
+        let mut i = start;
+        while i < end {
+            hi = (hi << 8) | (bytes[i] as u64);
+            i += 1;
+        }
+        let missing = (start + 8) - end; // 0..=8
+        if missing != 0 {
+            // missing will never be >= 8 here, but guard anyway
+            if missing < 8 {
+                hi <<= missing * 8;
+            } else {
+                hi = 0;
+            }
+        }
+
+        (bucket, hi, 0)
+    } else {
+        let a = v.start as usize;
+        let b = v.end as usize;
+        bucket_and_tag128(&v.data.as_ref()[a..b], bucket_prefix_len, head_tag_len)
+    }
+}
+
+/// Fast path for KEY bytes when (bucket_prefix_len == 2 && head_tag_len == 8).
+#[inline(always)]
+fn bucket_and_tag128_bytes_fast(
+    v: &[u8],
+    bucket_prefix_len: usize,
+    head_tag_len: usize,
+) -> (u16, u64, u64) {
+    if bucket_prefix_len == 2 && head_tag_len == 8 {
+        let b0 = *v.first().unwrap_or(&0) as u16;
+        let b1 = *v.get(1).unwrap_or(&0) as u16;
+        let bucket = (b0 << 8) | b1;
+
+        let start = 2usize;
+        let end = (start + 8).min(v.len());
+        let mut hi: u64 = 0;
+        let mut i = start;
+        while i < end {
+            hi = (hi << 8) | (v[i] as u64);
+            i += 1;
+        }
+        let missing = (start + 8) - end; // 0..=8
+        if missing != 0 {
+            if missing < 8 {
+                hi <<= missing * 8;
+            } else {
+                hi = 0;
+            }
+        }
+
+        (bucket, hi, 0)
+    } else {
+        bucket_and_tag128(v, bucket_prefix_len, head_tag_len)
     }
 }
 
@@ -718,7 +851,6 @@ impl<P: Pager> ValueScan<P> {
                 end,
                 min_key,
                 max_key,
-                // NEW: will be filled by precompute_dominators()
                 dominators_active: Vec::new(),
                 dominators_shadow: Vec::new(),
             });
@@ -743,34 +875,46 @@ impl<P: Pager> ValueScan<P> {
             let val = slice_value::<P>(seg_ref, data_ref, head_row);
 
             // Ordering fields (bucket/tag) + optional key bytes.
-            let (bucket, tag, key_ord) = if by_value {
-                let (bkt, tg) = bucket_and_tag_from_value_slice::<P>(
+            if by_value {
+                let (bkt, hi, lo) = bucket_and_tag128_from_value_slice::<P>(
                     &val,
                     opts.bucket_prefix_len,
                     opts.head_tag_len,
                 );
-                (bkt, tg, None)
+                pq.push(Node {
+                    bucket: bkt,
+                    head_tag_hi: hi,
+                    head_tag_lo: lo,
+                    rank,
+                    seg_idx,
+                    pos: head_pos,
+                    val,
+                    key_ord: None,
+                    reverse: matches!(opts.dir, Direction::Reverse),
+                });
             } else {
                 let key_slice = KeyLayout::slice_key_by_layout(
                     &seg_ref.logical_key_bytes,
                     &seg_ref.key_layout,
                     head_row,
                 );
-                let (bkt, tg) =
-                    bucket_and_tag_bytes_fast(key_slice, opts.bucket_prefix_len, opts.head_tag_len);
-                (bkt, tg, Some(KeyRef::from_slice(key_slice)))
-            };
-
-            pq.push(Node {
-                bucket,
-                head_tag: tag,
-                rank,
-                seg_idx,
-                pos: head_pos,
-                val,
-                key_ord,
-                reverse: matches!(opts.dir, Direction::Reverse),
-            });
+                let (bkt, hi, lo) = bucket_and_tag128_bytes_fast(
+                    key_slice,
+                    opts.bucket_prefix_len,
+                    opts.head_tag_len,
+                );
+                pq.push(Node {
+                    bucket: bkt,
+                    head_tag_hi: hi,
+                    head_tag_lo: lo,
+                    rank,
+                    seg_idx,
+                    pos: head_pos,
+                    val,
+                    key_ord: Some(KeyRef::from_slice(key_slice)),
+                    reverse: matches!(opts.dir, Direction::Reverse),
+                });
+            }
         }
 
         if pq.is_empty() {
@@ -1032,14 +1176,15 @@ impl<P: Pager> Iterator for ValueScan<P> {
             // Helper to push the next head if present.
             let mut push_next = |np: usize, val: ValueSlice<P::Blob>| {
                 if self.by_value {
-                    let (bkt, tag) = bucket_and_tag_from_value_slice::<P>(
+                    let (bkt, hi, lo) = bucket_and_tag128_from_value_slice::<P>(
                         &val,
                         self.bucket_prefix_len,
                         self.head_tag_len,
                     );
                     self.pq.push(Node {
                         bucket: bkt,
-                        head_tag: tag,
+                        head_tag_hi: hi,
+                        head_tag_lo: lo,
                         rank,
                         seg_idx,
                         pos: np,
@@ -1365,79 +1510,7 @@ fn cmp_value_at<P: Pager>(
     bytes.cmp(probe)
 }
 
-fn bucket_and_tag(v: &[u8], bucket_prefix_len: usize, head_tag_len: usize) -> (u16, u64) {
-    // bucket = first 2 bytes big-endian; zeros if missing
-    let b0 = *v.first().unwrap_or(&0) as u16;
-    let b1 = *v.get(1).unwrap_or(&0) as u16;
-    let bucket = (b0 << 8) | b1;
-
-    // tag = next up to head_tag_len bytes big-endian after the bucket prefix
-    let mut tag: u64 = 0;
-    let start = bucket_prefix_len;
-    let end = (start + head_tag_len).min(v.len());
-    for &x in &v[start..end] {
-        tag = (tag << 8) | (x as u64);
-    }
-    if end - start < head_tag_len {
-        tag <<= 8 * (head_tag_len - (end - start));
-    }
-    (bucket, tag)
-}
-
 // --------- hot-path specializations & cold helper ----------
-
-/// Fast path for (bucket_prefix_len == 2 && head_tag_len == 8) on VALUE slices.
-#[inline(always)]
-fn bucket_and_tag_from_value_slice<P: Pager>(
-    v: &ValueSlice<P::Blob>,
-    bucket_prefix_len: usize,
-    head_tag_len: usize,
-) -> (u16, u64) {
-    if bucket_prefix_len == 2 && head_tag_len == 8 {
-        let bytes = &v.data.as_ref()[v.start as usize..v.end as usize];
-        let b0 = *bytes.first().unwrap_or(&0) as u16;
-        let b1 = *bytes.get(1).unwrap_or(&0) as u16;
-        let bucket = (b0 << 8) | b1;
-        let mut tag: u64 = 0;
-        let mut i = 2usize;
-        let end = (2 + 8).min(bytes.len());
-        while i < end {
-            tag = (tag << 8) | (bytes[i] as u64);
-            i += 1;
-        }
-        tag <<= 8 * (2 + 8 - end);
-        (bucket, tag)
-    } else {
-        let a = v.start as usize;
-        let b = v.end as usize;
-        bucket_and_tag(&v.data.as_ref()[a..b], bucket_prefix_len, head_tag_len)
-    }
-}
-
-/// Fast path for (bucket_prefix_len == 2 && head_tag_len == 8) on KEY bytes.
-#[inline(always)]
-fn bucket_and_tag_bytes_fast(
-    v: &[u8],
-    bucket_prefix_len: usize,
-    head_tag_len: usize,
-) -> (u16, u64) {
-    if bucket_prefix_len == 2 && head_tag_len == 8 {
-        let b0 = *v.first().unwrap_or(&0) as u16;
-        let b1 = *v.get(1).unwrap_or(&0) as u16;
-        let bucket = (b0 << 8) | b1;
-        let mut tag: u64 = 0;
-        let mut i = 2usize;
-        let end = (2 + 8).min(v.len());
-        while i < end {
-            tag = (tag << 8) | (v[i] as u64);
-            i += 1;
-        }
-        tag <<= 8 * (2 + 8 - end);
-        (bucket, tag)
-    } else {
-        bucket_and_tag(v, bucket_prefix_len, head_tag_len)
-    }
-}
 
 /// Keep the key-ordered reseed path out of the hot icache.
 #[allow(clippy::too_many_arguments)] // TODO: Refactor
@@ -1454,10 +1527,12 @@ fn push_next_keyordered<P: Pager>(
     bucket_prefix_len: usize,
     head_tag_len: usize,
 ) {
-    let (bkt, tag) = bucket_and_tag_bytes_fast(kb.as_slice(), bucket_prefix_len, head_tag_len);
+    let (bkt, hi, lo) =
+        bucket_and_tag128_bytes_fast(kb.as_slice(), bucket_prefix_len, head_tag_len);
     pq.push(Node {
         bucket: bkt,
-        head_tag: tag,
+        head_tag_hi: hi,
+        head_tag_lo: lo,
         rank,
         seg_idx,
         pos,
