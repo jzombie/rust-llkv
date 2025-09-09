@@ -56,6 +56,7 @@ pub enum ConflictPolicy {
 /// Frame predicate type over encoded **values** (head vs current).
 pub type FramePred = Arc<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync>;
 
+// TODO: Rename to `ColumnScanOpts`?
 /// Scan options.
 pub struct ValueScanOpts<'a> {
     /// Direction along the chosen `order_by`.
@@ -92,6 +93,7 @@ impl<'a> Default for ValueScanOpts<'a> {
     }
 }
 
+// TODO: Rename to `ColumnScanItem`?
 /// Public item: zero-copy value slice + owned key bytes.
 pub struct ValueScanItem<B> {
     pub key: LogicalKeyBytes,
@@ -122,6 +124,7 @@ struct ShadowRef {
     rank: usize,
 }
 
+// TODO: Rename to `ColumnScan`?
 /// The iterator. Owns the PQ and segment cursors.
 pub struct ValueScan<P: Pager> {
     segs: Vec<SegCtx<P>>,
@@ -410,6 +413,7 @@ impl<P: Pager> PartialOrd for Node<P> {
     }
 }
 
+// TODO: Rename * from `scan_values_*` to `scan_*` since this can do key or value based scanning
 impl<P: Pager> super::ColumnStore<'_, P> {
     /// LWW-enforced scan over [lo, hi) in the chosen domain (value/key).
     pub fn scan_values_lww(
@@ -1099,7 +1103,8 @@ fn range_in_key_index(seg: &IndexSegment, lo: &Bound<&[u8]>, hi: &Bound<&[u8]>) 
     }
     let begin = match lo {
         Bound::Unbounded => 0usize,
-        Bound::Included(x) | Bound::Excluded(x) => key_lower_bound(seg, x),
+        Bound::Included(x) => key_lower_bound(seg, x),
+        Bound::Excluded(x) => key_upper_bound(seg, x, false), // strictly >
     };
     let end = match hi {
         Bound::Unbounded => n,
@@ -1962,5 +1967,138 @@ mod value_scan_tests {
             0,
             "last yielded key should be the minimum"
         );
+    }
+
+    // TODO: Refactor
+    /// Keyset pagination forward over natural key order. Uses the last key
+    /// of each page as the cursor for the next page. Does not use the
+    /// frame predicate; relies on bounds and key order.
+    #[test]
+    fn scan_values_lww_keyset_pagination_forward() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 551u32;
+
+        seed_three_generations(&store, fid);
+
+        let page_size = 137usize; // odd size to test boundaries
+        let mut after: Option<Vec<u8>> = None;
+        let mut all_keys: Vec<Vec<u8>> = Vec::new();
+
+        loop {
+            let lo = match after.as_deref() {
+                None => Bound::Unbounded,
+                Some(k) => Bound::Excluded(k),
+            };
+
+            let it = store
+                .scan_values_lww(
+                    fid,
+                    ValueScanOpts {
+                        order_by: OrderBy::Key,
+                        dir: Direction::Forward,
+                        lo,
+                        hi: Bound::Unbounded,
+                        prefix: None,
+                        bucket_prefix_len: 2,
+                        head_tag_len: 8,
+                        frame_predicate: None,
+                    },
+                )
+                .expect("iterator");
+
+            let mut count = 0usize;
+
+            for item in it.take(page_size) {
+                // Global monotonicity across pages
+                if let Some(prev) = all_keys.last() {
+                    assert!(
+                        item.key.as_slice() > prev.as_slice(),
+                        "keys must be strictly increasing"
+                    );
+                }
+                after = Some(item.key.clone());
+                all_keys.push(item.key);
+                count += 1;
+            }
+
+            if count == 0 {
+                break;
+            }
+        }
+
+        // One winner per logical key
+        assert_eq!(all_keys.len(), 1400);
+
+        // Spot-check endpoints under LWW winners
+        let first = parse_key_u32(&all_keys.first().unwrap());
+        let last = parse_key_u32(&all_keys.last().unwrap());
+        assert_eq!(first, 0u32);
+        assert_eq!(last, 1399u32);
+    }
+
+    // TODO: Refactor
+    /// Keyset pagination in reverse. Uses the last key of each page as the
+    /// upper bound for the next page. Ensures global non-increasing order.
+    #[test]
+    fn scan_values_lww_keyset_pagination_reverse() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 552u32;
+
+        seed_three_generations(&store, fid);
+
+        let page_size = 127usize;
+        let mut before: Option<Vec<u8>> = None;
+        let mut all_keys: Vec<Vec<u8>> = Vec::new();
+
+        loop {
+            let hi = match before.as_deref() {
+                None => Bound::Unbounded,
+                Some(k) => Bound::Excluded(k),
+            };
+
+            let it = store
+                .scan_values_lww(
+                    fid,
+                    ValueScanOpts {
+                        order_by: OrderBy::Key,
+                        dir: Direction::Reverse,
+                        lo: Bound::Unbounded,
+                        hi,
+                        prefix: None,
+                        bucket_prefix_len: 2,
+                        head_tag_len: 8,
+                        frame_predicate: None,
+                    },
+                )
+                .expect("iterator");
+
+            let mut count = 0usize;
+
+            for item in it.take(page_size) {
+                if let Some(prev) = all_keys.last() {
+                    assert!(
+                        item.key.as_slice() < prev.as_slice(),
+                        "keys must be strictly decreasing"
+                    );
+                }
+                before = Some(item.key.clone());
+                all_keys.push(item.key);
+                count += 1;
+            }
+
+            if count == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(all_keys.len(), 1400);
+
+        // Endpoints for reverse order
+        let first = parse_key_u32(&all_keys.first().unwrap());
+        let last = parse_key_u32(&all_keys.last().unwrap());
+        assert_eq!(first, 1399u32);
+        assert_eq!(last, 0u32);
     }
 }
