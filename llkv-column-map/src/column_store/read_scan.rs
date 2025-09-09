@@ -2276,8 +2276,8 @@ mod value_scan_tests {
 
         assert_eq!(all_keys.len(), 1400, "winners by key, forward");
 
-        let first = parse_key_u32(&all_keys.first().unwrap());
-        let last = parse_key_u32(&all_keys.last().unwrap());
+        let first = parse_key_u32(all_keys.first().unwrap());
+        let last = parse_key_u32(all_keys.last().unwrap());
         assert_eq!(first, 0u32);
         assert_eq!(last, 1399u32);
     }
@@ -2330,8 +2330,8 @@ mod value_scan_tests {
 
         assert_eq!(all_keys.len(), 1400, "winners by key, reverse");
 
-        let first = parse_key_u32(&all_keys.first().unwrap());
-        let last = parse_key_u32(&all_keys.last().unwrap());
+        let first = parse_key_u32(all_keys.first().unwrap());
+        let last = parse_key_u32(all_keys.last().unwrap());
         assert_eq!(first, 1399u32);
         assert_eq!(last, 0u32);
     }
