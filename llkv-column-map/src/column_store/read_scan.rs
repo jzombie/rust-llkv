@@ -1101,16 +1101,19 @@ fn range_in_key_index(seg: &IndexSegment, lo: &Bound<&[u8]>, hi: &Bound<&[u8]>) 
     if n == 0 {
         return (0, 0);
     }
+
     let begin = match lo {
         Bound::Unbounded => 0usize,
-        Bound::Included(x) => key_lower_bound(seg, x),
-        Bound::Excluded(x) => key_upper_bound(seg, x, false), // strictly >
+        Bound::Included(x) => key_lower_bound(seg, x), // k >= x
+        Bound::Excluded(x) => key_upper_bound(seg, x, true), // k > x
     };
+
     let end = match hi {
         Bound::Unbounded => n,
-        Bound::Included(x) => key_upper_bound(seg, x, true),
-        Bound::Excluded(x) => key_upper_bound(seg, x, false),
+        Bound::Included(x) => key_upper_bound(seg, x, true), // k > x
+        Bound::Excluded(x) => key_upper_bound(seg, x, false), // k >= x
     };
+
     (begin.min(n), end.min(n))
 }
 
@@ -1991,26 +1994,27 @@ mod value_scan_tests {
                 Some(k) => Bound::Excluded(k),
             };
 
-            let it = store
-                .scan_values_lww(
-                    fid,
-                    ValueScanOpts {
-                        order_by: OrderBy::Key,
-                        dir: Direction::Forward,
-                        lo,
-                        hi: Bound::Unbounded,
-                        prefix: None,
-                        bucket_prefix_len: 2,
-                        head_tag_len: 8,
-                        frame_predicate: None,
-                    },
-                )
-                .expect("iterator");
+            let it = match store.scan_values_lww(
+                fid,
+                ValueScanOpts {
+                    order_by: OrderBy::Key,
+                    dir: Direction::Forward,
+                    lo,
+                    hi: Bound::Unbounded,
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    head_tag_len: 8,
+                    frame_predicate: None,
+                },
+            ) {
+                Ok(it) => it,
+                Err(ScanError::NoActiveSegments) => break, // normal end
+                Err(e) => panic!("scan init error: {:?}", e),
+            };
 
             let mut count = 0usize;
 
             for item in it.take(page_size) {
-                // Global monotonicity across pages
                 if let Some(prev) = all_keys.last() {
                     assert!(
                         item.key.as_slice() > prev.as_slice(),
@@ -2058,21 +2062,23 @@ mod value_scan_tests {
                 Some(k) => Bound::Excluded(k),
             };
 
-            let it = store
-                .scan_values_lww(
-                    fid,
-                    ValueScanOpts {
-                        order_by: OrderBy::Key,
-                        dir: Direction::Reverse,
-                        lo: Bound::Unbounded,
-                        hi,
-                        prefix: None,
-                        bucket_prefix_len: 2,
-                        head_tag_len: 8,
-                        frame_predicate: None,
-                    },
-                )
-                .expect("iterator");
+            let it = match store.scan_values_lww(
+                fid,
+                ValueScanOpts {
+                    order_by: OrderBy::Key,
+                    dir: Direction::Reverse,
+                    lo: Bound::Unbounded,
+                    hi,
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    head_tag_len: 8,
+                    frame_predicate: None,
+                },
+            ) {
+                Ok(it) => it,
+                Err(ScanError::NoActiveSegments) => break, // normal end
+                Err(e) => panic!("scan init error: {:?}", e),
+            };
 
             let mut count = 0usize;
 
