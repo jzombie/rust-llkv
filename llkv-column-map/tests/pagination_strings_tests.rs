@@ -396,8 +396,8 @@ fn paginate_strings_reverse_smoke() {
 }
 
 /// Heavy test (ignored by default): run with up to a million rows.
-#[ignore]
 #[test]
+#[ignore = "CPU intensive test"]
 fn paginate_strings_heavy_ignored() {
     let p = MemPager::default();
     let store = ColumnStore::init_empty(&p);
