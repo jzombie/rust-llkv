@@ -1609,8 +1609,7 @@ impl<P: Pager> super::ColumnStore<'_, P> {
 
         // Pull up to `limit` items. Compute the next token in the
         // ordering domain (key or value).
-        let mut items: Vec<ValueScanItem<P::Blob>> = Vec::new();
-        items.reserve(limit);
+        let mut items: Vec<ValueScanItem<P::Blob>> = Vec::with_capacity(limit);
 
         let mut next: Option<Vec<u8>> = None;
 
