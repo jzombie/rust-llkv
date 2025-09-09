@@ -116,6 +116,22 @@ struct SegCtx<P: Pager> {
     /// Cached logical-key bounds (for fast reject in membership probes).
     min_key: LogicalKeyBytes,
     max_key: LogicalKeyBytes,
+
+    // prefiltered domination candidates
+    /// Indices into `self.segs` that dominate this segment (active, index+data loaded).
+    dominators_active: Vec<usize>,
+    /// Shadow (index-only) segments that dominate this segment (physical keys).
+    dominators_shadow: Vec<PhysicalKey>,
+}
+
+#[inline]
+fn dominates_by_policy(policy: ConflictPolicy, winner_rank: usize, candidate_rank: usize) -> bool {
+    match policy {
+        // Lower rank == newer. In LWW, newer dominates older.
+        ConflictPolicy::LWW => winner_rank < candidate_rank,
+        // In FWW, older dominates newer.
+        ConflictPolicy::FWW => winner_rank > candidate_rank,
+    }
 }
 
 /// Minimal metadata for shadow (index-only) membership checks.
@@ -674,6 +690,9 @@ impl<P: Pager> ValueScan<P> {
                 end,
                 min_key,
                 max_key,
+                // NEW: will be filled by precompute_dominators()
+                dominators_active: Vec::new(),
+                dominators_shadow: Vec::new(),
             });
 
             // Head depends on direction.
@@ -683,13 +702,11 @@ impl<P: Pager> ValueScan<P> {
                 begin
             };
 
-            // Build first node for this segment.
             let (seg_ref, data_ref) = {
                 let s = &segs[seg_idx].seg;
                 let d = &segs[seg_idx].data;
                 (s, d)
             };
-            // Row position depends on ordering.
             let head_row = if by_value {
                 row_pos_at(seg_ref, head_pos)
             } else {
@@ -733,7 +750,8 @@ impl<P: Pager> ValueScan<P> {
             return Err(ScanError::NoActiveSegments);
         }
 
-        Ok(Self {
+        // Construct, precompute dominators once, return.
+        let mut me = Self {
             segs,
             pq,
             _field_id: field_id,
@@ -749,7 +767,118 @@ impl<P: Pager> ValueScan<P> {
             bucket_prefix_len: opts.bucket_prefix_len,
             head_tag_len: opts.head_tag_len,
             policy,
-        })
+        };
+
+        // One-time precomputation for cheap shadow checks
+        me.precompute_dominators();
+
+        Ok(me)
+    }
+
+    /// One-time preprocessing: for each active segment, compute the (tiny) sets
+    /// of other segments that can dominate it under the policy, filtered by
+    /// logical-key span overlap. This makes per-row shadow checks cheap.
+    fn precompute_dominators(&mut self) {
+        let n = self.segs.len();
+
+        // Active-vs-active: find dominating active segments whose key spans overlap.
+        for i in 0..n {
+            let (ri, min_i, max_i) = (
+                self.segs[i].rank,
+                self.segs[i].min_key.as_slice(),
+                self.segs[i].max_key.as_slice(),
+            );
+            let mut acc: Vec<usize> = Vec::new();
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let rj = self.segs[j].rank;
+                if !dominates_by_policy(self.policy, rj, ri) {
+                    continue;
+                }
+                let min_j = self.segs[j].min_key.as_slice();
+                let max_j = self.segs[j].max_key.as_slice();
+                // span overlap: !(max_i < min_j || min_i > max_j)
+                if !(max_i < min_j || min_i > max_j) {
+                    acc.push(j);
+                }
+            }
+            self.segs[i].dominators_active = acc;
+        }
+
+        // Shadow: use preloaded index-only segments grouped by rank.
+        // For each active segment, collect only shadow segments that:
+        //   (a) are at ranks that dominate it, and
+        //   (b) overlap its key span.
+        // We already have all shadow IndexSegments in `shadow_seg_map`.
+        let ranks_len = self.shadow_by_rank.len();
+        for i in 0..n {
+            let (ri, min_i, max_i) = (
+                self.segs[i].rank,
+                self.segs[i].min_key.as_slice(),
+                self.segs[i].max_key.as_slice(),
+            );
+            let mut acc: Vec<PhysicalKey> = Vec::new();
+
+            let rank_iter: Box<dyn Iterator<Item = usize>> = match self.policy {
+                ConflictPolicy::LWW => Box::new(0..ri), // newer ranks only
+                ConflictPolicy::FWW => Box::new((ri + 1)..ranks_len), // older ranks only
+            };
+
+            for r in rank_iter {
+                for rf in &self.shadow_by_rank[r] {
+                    if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
+                        // Compute shadow key span once here (cheap).
+                        let min_j = KeyLayout::slice_key_by_layout(
+                            &seg.logical_key_bytes,
+                            &seg.key_layout,
+                            0,
+                        );
+                        let max_j = KeyLayout::slice_key_by_layout(
+                            &seg.logical_key_bytes,
+                            &seg.key_layout,
+                            seg.n_entries as usize - 1,
+                        );
+                        if !(max_i < min_j || min_i > max_j) {
+                            acc.push(rf.pk);
+                        }
+                    }
+                }
+            }
+            self.segs[i].dominators_shadow = acc;
+        }
+    }
+
+    /// Check whether `key` from active segment `seg_idx` is shadowed under the current policy.
+    #[inline]
+    fn is_shadowed_for_seg(&self, seg_idx: usize, key: &[u8]) -> bool {
+        let sc = &self.segs[seg_idx];
+
+        // 1) Check active dominators (index+data already loaded).
+        for &j in &sc.dominators_active {
+            let other = &self.segs[j];
+            if key < other.min_key.as_slice() || key > other.max_key.as_slice() {
+                continue;
+            }
+            if Self::key_in_index(&other.seg, key) {
+                return true;
+            }
+        }
+
+        // 2) Check shadow dominators (index-only, preloaded).
+        for pk in &sc.dominators_shadow {
+            if let Some(seg) = self.shadow_seg_map.get(pk) {
+                if !Self::key_within_seg_bounds(seg, key) {
+                    continue;
+                }
+                if Self::key_in_index(seg, key) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     #[inline]
@@ -774,60 +903,6 @@ impl<P: Pager> ValueScan<P> {
         );
         !(key < min || key > max)
     }
-
-    /// Is this `key@rank` shadowed by the chosen policy?
-    fn is_shadowed(&self, key: &[u8], rank: usize) -> bool {
-        // 1) Check against already-loaded active segments (index+data).
-        for sc in &self.segs {
-            let rel = sc.rank as isize - rank as isize;
-            let dominates = match self.policy {
-                ConflictPolicy::LWW => rel < 0, // newer dominates
-                ConflictPolicy::FWW => rel > 0, // older dominates
-            };
-            if !dominates {
-                continue;
-            }
-            if key < sc.min_key.as_slice() || key > sc.max_key.as_slice() {
-                continue;
-            }
-            if Self::key_in_index(&sc.seg, key) {
-                return true;
-            }
-        }
-
-        // 2) Check index-only shadow segments (prefetched).
-        match self.policy {
-            ConflictPolicy::LWW => {
-                for r in 0..rank {
-                    for rf in &self.shadow_by_rank[r] {
-                        if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
-                            if !Self::key_within_seg_bounds(seg, key) {
-                                continue;
-                            }
-                            if Self::key_in_index(seg, key) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-            ConflictPolicy::FWW => {
-                for r in (rank + 1)..self.shadow_by_rank.len() {
-                    for rf in &self.shadow_by_rank[r] {
-                        if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
-                            if !Self::key_within_seg_bounds(seg, key) {
-                                continue;
-                            }
-                            if Self::key_in_index(seg, key) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        false
-    }
 }
 
 impl<P: Pager> Iterator for ValueScan<P> {
@@ -842,7 +917,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
             let node = self.pq.pop(self.reverse)?;
             let seg_idx = node.seg_idx;
 
-            // 0) Early frame check (value bytes only) — avoid extra work if we’ll halt.
+            // Early frame check (value-only).
             if let Some(pred) = &self.frame_pred
                 && let Some(ref head_slice) = self.frame_head
             {
@@ -857,38 +932,34 @@ impl<P: Pager> Iterator for ValueScan<P> {
                     return None;
                 }
             }
-            // Initialize frame head lazily (semantics preserved).
             if self.frame_head.is_none() {
                 self.frame_head = Some(node.val.clone());
             }
 
-            // 1) Borrow the segment briefly to get:
-            //    - current row position (in the active ordering)
-            //    - a borrowed key slice for membership checks
-            //    - the next position + its value (and key bytes if key-ordered)
-            //    - whether this row is shadowed (under policy)
+            // Borrow segment to compute:
+            // - row position in segment
+            // - borrowed key slice for membership
+            // - next cursor position & its value (and key bytes if key-ordered)
+            // - shadow bit using precomputed dominators
             let (rank, next_pos_opt, next_val_opt, next_key_for_order, shadowed, key_owned_if_emit) = {
                 let sc = &self.segs[seg_idx];
 
-                // Row position depends on active ordering.
                 let row_pos = if self.by_value {
                     row_pos_at(&sc.seg, node.pos)
                 } else {
                     node.pos
                 };
 
-                // Borrowed key slice for membership checks.
+                // Borrowed key slice (zero-copy) to decide shadowing & later ownership.
                 let key_slice = KeyLayout::slice_key_by_layout(
                     &sc.seg.logical_key_bytes,
                     &sc.seg.key_layout,
                     row_pos,
                 );
 
-                // Compute next cursor position in active window.
                 let next_pos_opt = next_pos(node.pos, sc.begin, sc.end, self.reverse);
 
-                // Prepare next value (and next key bytes if key-ordered) now,
-                // while we still have the borrow. Values are zero-copy.
+                // Prepare next value (and next key bytes for key-ordered) while borrowed.
                 let (next_val_opt, next_key_for_order) = next_pos_opt.map_or((None, None), |np| {
                     let next_row = if self.by_value {
                         row_pos_at(&sc.seg, np)
@@ -911,10 +982,9 @@ impl<P: Pager> Iterator for ValueScan<P> {
                     (Some(sval), skey_ord)
                 });
 
-                // Shadow check uses the borrowed slice; no allocation yet.
-                let shadowed = self.is_shadowed(key_slice, sc.rank);
+                // Fast shadowing using precomputed dominators.
+                let shadowed = self.is_shadowed_for_seg(seg_idx, key_slice);
 
-                // Only allocate the owned key if we are going to emit.
                 let key_owned_if_emit = if shadowed {
                     None
                 } else {
@@ -929,9 +999,9 @@ impl<P: Pager> Iterator for ValueScan<P> {
                     shadowed,
                     key_owned_if_emit,
                 )
-            }; // <-- borrow of self.segs ends here
+            };
 
-            // Helper to push the next head if present (value- or key-ordered).
+            // Helper to push the next head if present.
             let mut push_next = |np: usize, val: ValueSlice<P::Blob>| {
                 if self.by_value {
                     let (bkt, tag) = bucket_and_tag_from_value_slice::<P>(
@@ -968,7 +1038,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
                 }
             };
 
-            // 2) If shadowed, just advance this segment and continue.
+            // If shadowed, just advance this segment and continue.
             if shadowed {
                 if let (Some(np), Some(v)) = (next_pos_opt, next_val_opt) {
                     push_next(np, v);
@@ -976,12 +1046,12 @@ impl<P: Pager> Iterator for ValueScan<P> {
                 continue;
             }
 
-            // 3) Accepted: advance this segment before yielding.
+            // Accepted: advance before yielding.
             if let (Some(np), Some(v)) = (next_pos_opt, next_val_opt) {
                 push_next(np, v);
             }
 
-            // 4) Yield the current row (value zero-copy; key owned).
+            // Yield the current row (value zero-copy; key owned).
             let key_owned = key_owned_if_emit.expect("owned key prepared for emission");
             return Some(ValueScanItem {
                 key: key_owned,
