@@ -492,7 +492,7 @@ fn bucket_and_tag128_from_bytes(
     head_tag_len: usize, // ≤ 16
 ) -> (u16, u64, u64) {
     // bucket = first 2 bytes big-endian; zeros if missing
-    let b0 = *bytes.get(0).unwrap_or(&0) as u16;
+    let b0 = *bytes.first().unwrap_or(&0) as u16;
     let b1 = *bytes.get(1).unwrap_or(&0) as u16;
     let bucket = (b0 << 8) | b1;
 

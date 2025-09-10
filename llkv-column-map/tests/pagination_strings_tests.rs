@@ -108,7 +108,7 @@ fn seed_strings_as_keys(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n: u
     );
 
     const CHUNK: usize = 10_000;
-    let total_batches = (items.len() + CHUNK - 1) / CHUNK;
+    let total_batches = items.len().div_ceil(CHUNK);
 
     // Aggregates for "lump" reporting.
     let t_seed = Instant::now();
@@ -207,7 +207,7 @@ fn seed_strings_as_values(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n:
     );
 
     const CHUNK: usize = 10_000;
-    let total_batches = (items.len() + CHUNK - 1) / CHUNK;
+    let total_batches = items.len().div_ceil(CHUNK);
 
     // Aggregates for "lump" reporting.
     let t_seed = Instant::now();
@@ -315,7 +315,7 @@ max_total={}",
     );
 
     const CHUNK: usize = 10_000;
-    let total_batches = (items.len() + CHUNK - 1) / CHUNK;
+    let total_batches = items.len().div_ceil(CHUNK);
 
     let t_seed = Instant::now();
     let mut sum_make_ms = 0.0f64;
@@ -420,7 +420,7 @@ max_total={}",
     );
 
     const CHUNK: usize = 10_000;
-    let total_batches = (items.len() + CHUNK - 1) / CHUNK;
+    let total_batches = items.len().div_ceil(CHUNK);
 
     let t_seed = Instant::now();
     let mut sum_make_ms = 0.0f64;
