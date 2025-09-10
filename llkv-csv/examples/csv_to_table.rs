@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build the new non-generic Table.
-    let table = Table::new(TableCfg::default());
+    let table = Table::new(1, TableCfg::default());
 
     // Reader and config for ingest.
     let reader = BufReader::new(file);
