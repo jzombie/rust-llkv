@@ -11,8 +11,8 @@ use llkv_types::Utf8CaseFold;
 #[test]
 fn utf8_casefold_orders_case_insensitively_and_preserves_original() {
     // Set up a fresh in-memory ColumnStore.
-    let pager = Box::leak(Box::new(MemPager::default()));
-    let store = ColumnStore::init_empty(pager);
+    let pager = MemPager::default();
+    let store = ColumnStore::init_empty(&pager);
 
     // Any field id is fine for this test.
     let fid: LogicalFieldId = 42;
