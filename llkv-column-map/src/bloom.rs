@@ -109,7 +109,7 @@ impl KeyBloom {
         let k_hashes = k as u8;
 
         // Allocate bitset.
-        let bytes_len = ((m_bits + 7) / 8) as usize;
+        let bytes_len = m_bits.div_ceil(8) as usize;
         let mut bits = vec![0u8; bytes_len];
 
         for &key in &collected {
@@ -251,6 +251,6 @@ mod bloom_fastmod_tests {
         assert!(bloom.m_bits >= 8);
         assert!((1..=16).contains(&bloom.k_hashes));
         // bitset length matches m_bits
-        assert_eq!(bloom.bits.len(), ((bloom.m_bits as usize + 7) / 8));
+        assert_eq!(bloom.bits.len(), (bloom.m_bits as usize).div_ceil(8));
     }
 }
