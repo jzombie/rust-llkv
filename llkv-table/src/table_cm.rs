@@ -317,3 +317,322 @@ impl ColumnMapTable {
         &self.store
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ColumnInput;
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::ops::Bound;
+
+    /// Build a single row patch from simple (field, value) pairs.
+    #[inline]
+    fn mk_row(
+        rid: RowId,
+        kv: &[(FieldId, ColumnInput<'static>)],
+    ) -> (RowId, HashMap<FieldId, (u64, ColumnInput<'static>)>) {
+        let mut m = HashMap::new();
+        for (fid, v) in kv.iter() {
+            m.insert(*fid, (0u64, v.clone()));
+        }
+        (rid, m)
+    }
+
+    /// String helper: own bytes to avoid 'static lifetime requirements.
+    #[inline]
+    fn s(x: &str) -> ColumnInput<'static> {
+        Cow::Owned(x.as_bytes().to_vec())
+    }
+
+    #[inline]
+    fn be_u64(x: u64) -> Vec<u8> {
+        x.to_be_bytes().to_vec()
+    }
+
+    #[inline]
+    fn from_be_u64(b: &[u8]) -> u64 {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&b[..8]);
+        u64::from_be_bytes(a)
+    }
+
+    /// u64 helper: store as big-endian bytes (lex order == numeric).
+    #[inline]
+    fn be64_bytes(x: u64) -> ColumnInput<'static> {
+        Cow::Owned(x.to_be_bytes().to_vec())
+    }
+
+    fn mk_rowpatch_u64(
+        rid: RowId,
+        pairs: &[(FieldId, u64)],
+    ) -> (RowId, HashMap<FieldId, (u64, ColumnInput<'static>)>) {
+        let mut m = HashMap::new();
+        for &(fid, n) in pairs {
+            m.insert(fid, (0u64, Cow::Owned(be_u64(n))));
+        }
+        (rid, m)
+    }
+
+    #[test]
+    fn insert_many_strings_readable() {
+        let table = ColumnMapTable::new(CmTableConfig::default());
+
+        // Columns (FieldId == logical column id)
+        const COL_NAME: FieldId = 11;
+        const COL_CITY: FieldId = 12;
+        const COL_ROLE: FieldId = 13;
+
+        // Three rows, each maps row id -> column values (strings).
+        // No synthetic columns; the driver will be COL_NAME.
+        let rows: Vec<RowPatch> = vec![
+            mk_row(
+                1,
+                &[
+                    (COL_NAME, s("alice")),
+                    (COL_CITY, s("austin")),
+                    (COL_ROLE, s("dev")),
+                ],
+            ),
+            mk_row(
+                2,
+                &[
+                    (COL_NAME, s("bob")),
+                    (COL_CITY, s("boston")),
+                    (COL_ROLE, s("pm")),
+                ],
+            ),
+            mk_row(
+                3,
+                &[
+                    (COL_NAME, s("carol")),
+                    (COL_CITY, s("chicago")),
+                    (COL_ROLE, s("qa")),
+                ],
+            ),
+        ];
+
+        table.insert_many(&rows);
+
+        // Scan row ids 1..=3. The scan uses COL_NAME as the driver
+        // (because it exists on all three rows).
+        let mut got: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
+        table.scan_by_row_id_range(
+            COL_NAME,
+            Bound::Excluded(0),
+            Bound::Included(3),
+            &[COL_NAME, COL_CITY, COL_ROLE],
+            2,
+            |rid, cols| got.push((rid, cols)),
+        );
+
+        assert_eq!(got.len(), 3);
+
+        // Check values round-trip cleanly (own strings to avoid lifetimes).
+        let to_s = |o: &Option<Vec<u8>>| -> String {
+            String::from_utf8(o.as_ref().unwrap().clone()).unwrap()
+        };
+
+        assert_eq!(got[0].0, 1);
+        assert_eq!(to_s(&got[0].1[0]), "alice");
+        assert_eq!(to_s(&got[0].1[1]), "austin");
+        assert_eq!(to_s(&got[0].1[2]), "dev");
+
+        assert_eq!(got[1].0, 2);
+        assert_eq!(to_s(&got[1].1[0]), "bob");
+        assert_eq!(to_s(&got[1].1[1]), "boston");
+        assert_eq!(to_s(&got[1].1[2]), "pm");
+
+        assert_eq!(got[2].0, 3);
+        assert_eq!(to_s(&got[2].1[0]), "carol");
+        assert_eq!(to_s(&got[2].1[1]), "chicago");
+        assert_eq!(to_s(&got[2].1[2]), "qa");
+    }
+
+    #[test]
+    fn insert_many_u64_readable() {
+        let table = ColumnMapTable::new(CmTableConfig::default());
+
+        // Columns (FieldId == logical column id)
+        const COL_A: FieldId = 21; // driver
+        const COL_B: FieldId = 22; // numeric payload
+        const COL_C: FieldId = 23; // numeric payload (sparse)
+
+        // Five rows, u64 payloads stored as big-endian bytes.
+        // COL_C is only present on odd row ids to show sparsity.
+        let rows: Vec<RowPatch> = (1..=5)
+            .map(|rid| {
+                let mut cols = vec![
+                    (COL_A, be64_bytes(10 + rid)),
+                    (COL_B, be64_bytes(100 + rid)),
+                ];
+                if rid % 2 == 1 {
+                    cols.push((COL_C, be64_bytes(1000 + rid)));
+                }
+                mk_row(rid, &cols)
+            })
+            .collect();
+
+        table.insert_many(&rows);
+
+        // Scan all rows using COL_A as the driver.
+        let mut got: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
+        table.scan_by_row_id_range(
+            COL_A,
+            Bound::Excluded(0),
+            Bound::Included(5),
+            &[COL_A, COL_B, COL_C],
+            3,
+            |rid, cols| got.push((rid, cols)),
+        );
+
+        assert_eq!(got.len(), 5);
+        for i in 0..5 {
+            let (rid, cols) = &got[i];
+            let expect = (i as u64) + 1;
+            assert_eq!(*rid, expect);
+
+            let a = from_be_u64(cols[0].as_ref().unwrap());
+            let b = from_be_u64(cols[1].as_ref().unwrap());
+            assert_eq!(a, 10 + expect);
+            assert_eq!(b, 100 + expect);
+
+            if expect % 2 == 1 {
+                let c = from_be_u64(cols[2].as_ref().unwrap());
+                assert_eq!(c, 1000 + expect);
+            } else {
+                assert!(cols[2].is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn scan_unmatched_range_returns_no_rows_u64() {
+        let cfg = CmTableConfig::default();
+        let table = ColumnMapTable::new(cfg);
+
+        let fid_row: FieldId = 10;
+        let fid_d1: FieldId = 11;
+        let fid_d2: FieldId = 12;
+
+        // Seed rows 1..=3 so driver exists.
+        let rows: Vec<RowPatch> = (1..=3)
+            .map(|rid| {
+                mk_rowpatch_u64(rid, &[(fid_row, rid), (fid_d1, rid + 7), (fid_d2, rid + 9)])
+            })
+            .collect();
+        table.insert_many(&rows);
+
+        // Ask for a range above any inserted row ids.
+        let mut called = false;
+        table.scan_by_row_id_range(
+            fid_row,
+            Bound::Excluded(10),
+            Bound::Included(20),
+            &[fid_row, fid_d1, fid_d2],
+            8,
+            |_rid, _cols| {
+                called = true;
+            },
+        );
+        assert!(!called, "no rows should be returned");
+    }
+
+    #[test]
+    fn stream_value_order_multi_cols() {
+        let cfg = CmTableConfig::default();
+        let table = ColumnMapTable::new(cfg);
+
+        let fid_row: FieldId = 20; // driver
+        let fid_v1: FieldId = 21; // rid * 10
+        let fid_v2: FieldId = 22; // 500 - rid (reverse order baseline)
+        let fid_sparse: FieldId = 23; // multiples of 3, 3000 + rid
+
+        let rows: Vec<RowPatch> = (1..=12)
+            .map(|rid| {
+                let mut pairs = vec![(fid_row, rid), (fid_v1, rid * 10), (fid_v2, 500 - rid)];
+                if rid % 3 == 0 {
+                    pairs.push((fid_sparse, 3000 + rid));
+                }
+                mk_rowpatch_u64(rid, &pairs)
+            })
+            .collect();
+        table.insert_many(&rows);
+
+        // Stream v1 forward: strictly increasing.
+        let mut v1_f: Vec<(RowId, u64)> = Vec::new();
+        table.stream_column_values(fid_v1, Direction::Forward, 4, |rid, v| {
+            v1_f.push((rid, from_be_u64(&v)));
+        });
+        assert_eq!(v1_f.len(), 12);
+        for w in v1_f.windows(2) {
+            assert!(w[0].1 < w[1].1, "v1 must increase forward");
+        }
+
+        // Stream v2 reverse: strictly decreasing (since base is 500 - rid).
+        let mut v2_r: Vec<(RowId, u64)> = Vec::new();
+        table.stream_column_values(fid_v2, Direction::Reverse, 5, |rid, v| {
+            v2_r.push((rid, from_be_u64(&v)));
+        });
+        assert_eq!(v2_r.len(), 12);
+        for w in v2_r.windows(2) {
+            assert!(w[0].1 > w[1].1, "v2 must decrease reverse");
+        }
+
+        // Stream sparse forward: only rid % 3 == 0.
+        let mut sp_f: Vec<(RowId, u64)> = Vec::new();
+        table.stream_column_values(fid_sparse, Direction::Forward, 3, |rid, v| {
+            sp_f.push((rid, from_be_u64(&v)));
+        });
+        // rows 3,6,9,12
+        assert_eq!(sp_f.len(), 4);
+        assert_eq!(
+            sp_f.iter().map(|x| x.0).collect::<Vec<_>>(),
+            vec![3, 6, 9, 12]
+        );
+        for (i, (_rid, val)) in sp_f.iter().enumerate() {
+            assert_eq!(*val, 3000 + ((i as u64 + 1) * 3));
+        }
+    }
+
+    #[test]
+    fn pagination_chunks_are_consistent_u64_multi_proj() {
+        let cfg = CmTableConfig::default();
+        let table = ColumnMapTable::new(cfg);
+
+        let fid_row: FieldId = 30; // driver
+        let fid_d1: FieldId = 31;
+        let fid_d2: FieldId = 32;
+
+        // 1..=50 rows, three projected columns.
+        let rows: Vec<RowPatch> = (1..=50)
+            .map(|rid| {
+                mk_rowpatch_u64(
+                    rid,
+                    &[(fid_row, rid), (fid_d1, 1000 + rid), (fid_d2, 2000 + rid)],
+                )
+            })
+            .collect();
+        table.insert_many(&rows);
+
+        // Collect with page=7 and ensure we see all rows once with projections.
+        let mut got: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
+        table.scan_by_row_id_range(
+            fid_row,
+            Bound::Excluded(0),
+            Bound::Included(50),
+            &[fid_row, fid_d1, fid_d2],
+            7,
+            |rid, cols| got.push((rid, cols)),
+        );
+
+        assert_eq!(got.len(), 50);
+        for (i, (rid, cols)) in got.into_iter().enumerate() {
+            let expect = (i as u64) + 1;
+            assert_eq!(rid, expect);
+            assert_eq!(from_be_u64(cols[0].as_ref().unwrap()), expect);
+            assert_eq!(from_be_u64(cols[1].as_ref().unwrap()), 1000 + expect);
+            assert_eq!(from_be_u64(cols[2].as_ref().unwrap()), 2000 + expect);
+        }
+    }
+}
