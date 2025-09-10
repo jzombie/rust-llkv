@@ -22,11 +22,30 @@ use crate::storage::pager::{BatchGet, GetResult, Pager};
 use crate::types::{LogicalFieldId, LogicalKeyBytes, PhysicalKey, TypedKind, TypedValue};
 use crate::views::ValueSlice;
 
+use bloomfilter::Bloom;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::ops::Bound;
 use std::sync::Arc;
+
+// -------- bloom prefilter (scan-time build) --------
+
+// ~0.3% false-positive rate (tune as needed)
+const BF_FP_RATE: f64 = 0.003;
+
+#[inline]
+fn build_key_bloom(seg: &IndexSegment) -> Bloom<[u8]> {
+    let n = seg.n_entries as usize;
+    // bloomfilter::Bloom::new_for_fp_rate returns Result<_, &str>
+    let mut bf =
+        Bloom::<[u8]>::new_for_fp_rate(n.max(1), BF_FP_RATE).expect("Bloom::new_for_fp_rate");
+    for i in 0..n {
+        let k = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, i);
+        bf.set(k);
+    }
+    bf
+}
 
 /// Direction along the chosen ordering (value or key).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +141,9 @@ struct SegCtx<P: Pager> {
     dominators_active: Vec<usize>,
     /// Shadow (index-only) segments that dominate this segment (physical keys).
     dominators_shadow: Vec<PhysicalKey>,
+
+    /// Fast “maybe-contains(key)” prefilter to avoid most binary searches.
+    key_bloom: Bloom<[u8]>,
 }
 
 #[inline]
@@ -187,6 +209,8 @@ pub struct ValueScan<P: Pager> {
     head_tag_len: usize,
     /// Conflict policy.
     policy: ConflictPolicy,
+    /// Bloom filters for shadow (index-only) segments.
+    shadow_bloom_map: FxHashMap<PhysicalKey, Bloom<[u8]>>,
 }
 
 // -------- priority queue (radix buckets) --------
@@ -461,8 +485,6 @@ impl<P: Pager> PartialOrd for Node<P> {
 }
 
 /// Build (bucket, 16B tag) from VALUE bytes.
-/// The tag is the next `head_tag_len` bytes after the bucket prefix,
-/// left-aligned in a big-endian u128, then split into (hi, lo).
 #[inline(always)]
 fn bucket_and_tag128_from_value_slice<P: Pager>(
     v: &ValueSlice<P::Blob>,
@@ -474,8 +496,6 @@ fn bucket_and_tag128_from_value_slice<P: Pager>(
 }
 
 /// Build (bucket, 16B tag) from KEY bytes with a fast path.
-/// For (bucket_prefix_len==2 && head_tag_len==8) we could keep a u64 path,
-/// but using the unified u128 path is already cheap and simpler.
 #[inline(always)]
 fn bucket_and_tag128_bytes_fast(
     key_bytes: &[u8],
@@ -508,9 +528,8 @@ fn bucket_and_tag128_from_bytes(
         acc = (acc << 8) | (x as u128);
     }
     // Left-pad: place the taken bytes at the MSB side of the 16-byte lane.
-    // This keeps (hi, lo) tuple compares equivalent to memcmp on the prefix.
     let pad_bytes = 16usize.saturating_sub(take);
-    acc <<= (pad_bytes * 8) as u32; // safe: pad_bytes ∈ [0,16) → shift < 128
+    acc <<= (pad_bytes * 8) as u32;
 
     let hi = (acc >> 64) as u64;
     let lo = acc as u64;
@@ -767,6 +786,9 @@ impl<P: Pager> ValueScan<P> {
             )
             .to_vec();
 
+            // Build the Bloom for this active segment (scan-time).
+            let key_bloom = build_key_bloom(&seg);
+
             let seg_idx = segs.len();
             segs.push(SegCtx {
                 _seg_pk: r.index_physical_key,
@@ -780,6 +802,7 @@ impl<P: Pager> ValueScan<P> {
                 max_key,
                 dominators_active: Vec::new(),
                 dominators_shadow: Vec::new(),
+                key_bloom,
             });
 
             // Head depends on direction.
@@ -848,6 +871,12 @@ impl<P: Pager> ValueScan<P> {
             return Err(ScanError::NoActiveSegments);
         }
 
+        // Build Bloom filters for shadow segments we already loaded (index-only).
+        let mut shadow_bloom_map: FxHashMap<PhysicalKey, Bloom<[u8]>> = FxHashMap::default();
+        for (pk, seg) in &shadow_seg_map {
+            shadow_bloom_map.insert(pk.clone(), build_key_bloom(seg));
+        }
+
         // Construct, precompute dominators once, return.
         let mut me = Self {
             segs,
@@ -865,6 +894,7 @@ impl<P: Pager> ValueScan<P> {
             bucket_prefix_len: opts.bucket_prefix_len,
             head_tag_len: opts.head_tag_len,
             policy,
+            shadow_bloom_map,
         };
 
         // One-time precomputation for cheap shadow checks
@@ -956,9 +986,15 @@ impl<P: Pager> ValueScan<P> {
         // 1) Check active dominators (index+data already loaded).
         for &j in &sc.dominators_active {
             let other = &self.segs[j];
+            // Fast span reject.
             if key < other.min_key.as_slice() || key > other.max_key.as_slice() {
                 continue;
             }
+            // Bloom prefilter to avoid most binary searches.
+            if !other.key_bloom.check(key) {
+                continue; // definitely not present in that segment
+            }
+            // Confirm with exact index probe.
             if Self::key_in_index(&other.seg, key) {
                 return true;
             }
@@ -967,9 +1003,17 @@ impl<P: Pager> ValueScan<P> {
         // 2) Check shadow dominators (index-only, preloaded).
         for pk in &sc.dominators_shadow {
             if let Some(seg) = self.shadow_seg_map.get(pk) {
+                // Optional bound check (cheap).
                 if !Self::key_within_seg_bounds(seg, key) {
                     continue;
                 }
+                // Bloom prefilter for shadow segment.
+                if let Some(bf) = self.shadow_bloom_map.get(pk) {
+                    if !bf.check(key) {
+                        continue;
+                    }
+                }
+                // Confirm with exact index probe.
                 if Self::key_in_index(seg, key) {
                     return true;
                 }
@@ -1081,7 +1125,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
                     (Some(sval), skey_ref)
                 });
 
-                // Shadow check using precomputed dominators.
+                // Shadow check using precomputed dominators (+ Bloom prefilter).
                 let shadowed = self.is_shadowed_for_seg(seg_idx, key_slice);
 
                 let key_owned_if_emit = if shadowed {
