@@ -1,25 +1,24 @@
-//! Integration tests for key/value pagination with randomized strings.
+//! Integration tests for key/value pagination with randomized var-width strings
+//! and fixed-width integers.
 //!
 //! Uses only `rand`.
 //! Heavy tests are #[ignore] and run independently so the store is
 //! seeded once per process.
 //!
-//! Run heavy tests (examples):
-//!   RUST_TEST_THREADS=1 cargo test --release \
-//!     --test pagination_strings_tests \
-//!     paginate_strings_heavy_keys_1kb_ignored \
-//!     -- --ignored --nocapture
+//! Run heavy tests (copy-paste one-liners):
+//! RUST_TEST_THREADS=1 cargo test --release --test pagination_tests paginate_strings_heavy_keys_1kb_ignored -- --ignored --nocapture
+//! RUST_TEST_THREADS=1 cargo test --release --test pagination_tests paginate_strings_heavy_vals_1kb_ignored -- --ignored --nocapture
+//! RUST_TEST_THREADS=1 cargo test --release --test pagination_tests paginate_ints_heavy_keys_fixed_ignored -- --ignored --nocapture
+//! RUST_TEST_THREADS=1 cargo test --release --test pagination_tests paginate_ints_heavy_vals_fixed_ignored -- --ignored --nocapture
 //!
-//!   RUST_TEST_THREADS=1 cargo test --release \
-//!     --test pagination_strings_tests \
-//!     paginate_strings_heavy_vals_1kb_ignored \
-//!     -- --ignored --nocapture
+//! Run all ignored heavy tests in this file:
+//! RUST_TEST_THREADS=1 cargo test --release --test pagination_tests -- --ignored --nocapture
 //!
-//! You can override sizes via env vars for the ignored tests:
-//!   N=1000000 PAGE=4096 MAX_TOTAL=1024 cargo test --release \
-//!     --test pagination_strings_tests -- --ignored
+//! With size overrides (examples):
+//! N=1000000 PAGE=4096 MAX_TOTAL=1024 RUST_TEST_THREADS=1 cargo test --release --test pagination_tests paginate_strings_heavy_keys_1kb_ignored -- --ignored --nocapture
+//! N=1000000 PAGE=4096 MAX_TOTAL=1024 RUST_TEST_THREADS=1 cargo test --release --test pagination_tests paginate_strings_heavy_vals_1kb_ignored -- --ignored --nocapture
 //!
-//! To see printed timings in any test, add: -- --nocapture
+//! (All commands include `-- --nocapture` to print timings; drop it if you don’t want logs.)
 
 use llkv_column_map::ColumnStore;
 use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ValueScanOpts};

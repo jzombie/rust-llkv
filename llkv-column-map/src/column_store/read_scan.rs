@@ -461,8 +461,6 @@ impl<P: Pager> PartialOrd for Node<P> {
 }
 
 /// Build (bucket, 16B tag) from VALUE bytes.
-/// The tag is the next `head_tag_len` bytes after the bucket prefix,
-/// left-aligned in a big-endian u128, then split into (hi, lo).
 #[inline(always)]
 fn bucket_and_tag128_from_value_slice<P: Pager>(
     v: &ValueSlice<P::Blob>,
@@ -474,8 +472,6 @@ fn bucket_and_tag128_from_value_slice<P: Pager>(
 }
 
 /// Build (bucket, 16B tag) from KEY bytes with a fast path.
-/// For (bucket_prefix_len==2 && head_tag_len==8) we could keep a u64 path,
-/// but using the unified u128 path is already cheap and simpler.
 #[inline(always)]
 fn bucket_and_tag128_bytes_fast(
     key_bytes: &[u8],
@@ -508,9 +504,8 @@ fn bucket_and_tag128_from_bytes(
         acc = (acc << 8) | (x as u128);
     }
     // Left-pad: place the taken bytes at the MSB side of the 16-byte lane.
-    // This keeps (hi, lo) tuple compares equivalent to memcmp on the prefix.
     let pad_bytes = 16usize.saturating_sub(take);
-    acc <<= (pad_bytes * 8) as u32; // safe: pad_bytes ∈ [0,16) → shift < 128
+    acc <<= (pad_bytes * 8) as u32;
 
     let hi = (acc >> 64) as u64;
     let lo = acc as u64;
@@ -953,23 +948,39 @@ impl<P: Pager> ValueScan<P> {
     fn is_shadowed_for_seg(&self, seg_idx: usize, key: &[u8]) -> bool {
         let sc = &self.segs[seg_idx];
 
-        // 1) Check active dominators (index+data already loaded).
+        // 1) Active dominators (index+data already loaded).
         for &j in &sc.dominators_active {
             let other = &self.segs[j];
+
+            // quick span reject
             if key < other.min_key.as_slice() || key > other.max_key.as_slice() {
                 continue;
             }
+
+            // persisted Bloom prefilter
+            if !other.seg.key_bloom.check(key) {
+                continue;
+            }
+
+            // precise probe
             if Self::key_in_index(&other.seg, key) {
                 return true;
             }
         }
 
-        // 2) Check shadow dominators (index-only, preloaded).
+        // 2) Shadow dominators (index-only, preloaded).
         for pk in &sc.dominators_shadow {
             if let Some(seg) = self.shadow_seg_map.get(pk) {
                 if !Self::key_within_seg_bounds(seg, key) {
                     continue;
                 }
+
+                // persisted Bloom prefilter
+                if !seg.key_bloom.check(key) {
+                    continue;
+                }
+
+                // precise probe
                 if Self::key_in_index(seg, key) {
                     return true;
                 }
@@ -1081,7 +1092,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
                     (Some(sval), skey_ref)
                 });
 
-                // Shadow check using precomputed dominators.
+                // Shadow check using precomputed dominators (+ Bloom prefilter).
                 let shadowed = self.is_shadowed_for_seg(seg_idx, key_slice);
 
                 let key_owned_if_emit = if shadowed {
