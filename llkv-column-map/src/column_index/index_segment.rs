@@ -9,7 +9,7 @@ use std::hash::Hasher;
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct KeyBloom {
-    /// Number of bits in the filter.
+    /// Number of bits in the filter (power of two).
     pub m_bits: u32,
     /// Number of hash probes.
     pub k_hashes: u8,
@@ -25,9 +25,9 @@ impl KeyBloom {
     const SEED2: u64 = 0xD1B5_4A32_D192_ED03;
 
     /// Target bits/key. ~12.0 → ≈1.5 B/key; ~0.35–0.5% FP.
-    const BITS_PER_KEY: f64 = 12.0;
+    pub const BITS_PER_KEY: f64 = 12.0;
 
-    #[inline]
+    #[inline(always)]
     fn fxhash64_with_seed(seed: u64, bytes: &[u8]) -> u64 {
         let mut h = FxHasher::default();
         h.write_u64(seed);
@@ -35,27 +35,25 @@ impl KeyBloom {
         h.finish()
     }
 
-    #[inline]
+    #[inline(always)]
     fn index_of(bit: u32) -> (usize, u8) {
         let byte = (bit >> 3) as usize;
         let mask = 1u8 << (bit & 7);
         (byte, mask)
     }
 
-    #[inline]
+    #[inline(always)]
     fn set_bit(bits: &mut [u8], bit: u32) {
         let (byte, mask) = Self::index_of(bit);
         unsafe {
-            // safe: callers ensure capacity
-            let p = bits.get_unchecked_mut(byte);
-            *p |= mask;
+            // SAFETY: callers ensure capacity
+            *bits.get_unchecked_mut(byte) |= mask;
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn test_bit(bits: &[u8], bit: u32) -> bool {
         let (byte, mask) = Self::index_of(bit);
-        // bounds-checked (we build the filter, so it matches)
         (bits[byte] & mask) != 0
     }
 
@@ -64,22 +62,24 @@ impl KeyBloom {
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
-        // gather to know n
+        // Gather to know n (segments already have keys in memory; this is cheap).
         let collected: Vec<&[u8]> = keys.into_iter().collect();
         let n = collected.len().max(1);
 
-        let m_bits = ((n as f64) * Self::BITS_PER_KEY).ceil() as u32;
-        let m_bits = m_bits.max(8); // at least 1 byte
-        let m = m_bits as u64;
+        // Compute target bits and round up to the next power of two
+        // so we can mask instead of divide on the hot path.
+        let mut m_bits = ((n as f64) * Self::BITS_PER_KEY).ceil() as u32;
+        m_bits = m_bits.max(8).next_power_of_two();
+        let m_mask = m_bits - 1; // safe: power of two
 
-        // k ≈ (m/n) ln2
+        // k ≈ (m/n) ln2, clamped to [1, 16]
         let kf = (m_bits as f64 / n as f64) * std::f64::consts::LN_2;
         let mut k = kf.round() as i32;
         if k <= 0 {
             k = 1;
         }
         if k > 16 {
-            k = 16; // hedge
+            k = 16;
         }
         let k_hashes = k as u8;
 
@@ -90,9 +90,9 @@ impl KeyBloom {
             let h1 = Self::fxhash64_with_seed(Self::SEED1, key);
             let h2 = Self::fxhash64_with_seed(Self::SEED2, key);
             let mut x = h1;
-            for i in 0..(k as u32) {
-                // (h1 + i*h2) % m
-                let bit = ((x % m) as u32) % m_bits;
+            // Double hashing: (h1 + i*h2) mod m
+            for _ in 0..(k as u32) {
+                let bit = (x as u32) & m_mask;
                 Self::set_bit(&mut bits, bit);
                 x = x.wrapping_add(h2);
             }
@@ -108,17 +108,20 @@ impl KeyBloom {
     }
 
     /// Check membership (fast; may return false positives).
-    #[inline]
+    #[inline(always)]
     pub fn check(&self, key: &[u8]) -> bool {
-        let m = self.m_bits as u64;
-        if m == 0 {
+        // If disabled/minimal, treat as "maybe" to avoid false negatives.
+        if self.m_bits == 0 {
             return true;
         }
+        let m_mask = self.m_bits - 1;
+
         let h1 = Self::fxhash64_with_seed(self.seed1, key);
         let h2 = Self::fxhash64_with_seed(self.seed2, key);
         let mut x = h1;
+
         for _ in 0..self.k_hashes {
-            let bit = ((x % m) as u32) % self.m_bits;
+            let bit = (x as u32) & m_mask;
             if !Self::test_bit(&self.bits, bit) {
                 return false;
             }
