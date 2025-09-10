@@ -12,15 +12,18 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 impl<'p, P: Pager> ColumnStore<'p, P> {
     // TODO: Return `Result` type
-    /// Batched point lookups across many columns.
-    /// Each item is (field_id, keys). Output is aligned per input.
-    ///
-    /// I/O pattern (whole batch):
-    ///   1) batch(ColumnIndex gets) for any missing columns (once)
-    ///   2) batch(IndexSegment typed + DataBlob raw gets) (once)
-    ///
-    /// Newest-first shadowing: for each key we pick the first segment whose
-    /// \[min,max\] covers it.
+    /// Convenience: shared-keyset API that uses the single core.
+    pub fn get_many_projected<'a>(
+        &self,
+        fids: &[LogicalFieldId],
+        keys: &'a [&'a [u8]],
+    ) -> Vec<Vec<Option<ValueSlice<P::Blob>>>> {
+        self.get_many_core(fids, keys)
+    }
+
+    // TODO: Return `Result` type
+    /// Public API: accepts arbitrary (fid, keys) groups. Internally
+    /// normalizes to a single deduped keyset and calls the single core.
     pub fn get_many(
         &self,
         items: Vec<(LogicalFieldId, Vec<LogicalKeyBytes>)>,
@@ -29,26 +32,82 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             return Vec::new();
         }
 
-        // Pre-size outputs: one vector per input, one slot per key.
-        let mut results: Vec<Vec<Option<ValueSlice<P::Blob>>>> =
-            items.iter().map(|(_, ks)| vec![None; ks.len()]).collect();
+        // Build unified (deduped) keyset and a mapping from each original key
+        // to its unified index.
+        let mut unified_keys: Vec<&[u8]> = Vec::new();
+        let mut key_to_idx: FxHashMap<&[u8], usize> = FxHashMap::default();
 
-        // Track which queries have been resolved (found value or tombstone).
-        // Key: (query_index, key_index)
-        let mut resolved_queries: FxHashSet<(usize, usize)> = FxHashSet::default();
+        // Keep fids unique for the core call, but remember mapping for rebuild.
+        let mut unique_fids: Vec<LogicalFieldId> = Vec::new();
+        let mut fid_to_u: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();
 
-        // -------- ensure ColumnIndex in cache for all referenced fields --------
-        let mut need_fids: FxHashSet<LogicalFieldId> = FxHashSet::default();
-        for (fid, _) in &items {
-            need_fids.insert(*fid);
+        for (fid, keys) in &items {
+            if !fid_to_u.contains_key(fid) {
+                let u = unique_fids.len();
+                unique_fids.push(*fid);
+                fid_to_u.insert(*fid, u);
+            }
+            for k in keys {
+                let ks = k.as_slice();
+                if let Entry::Vacant(e) = key_to_idx.entry(ks) {
+                    let u = unified_keys.len();
+                    unified_keys.push(ks);
+                    e.insert(u);
+                }
+            }
         }
 
+        // Execute the single core path once for all columns and unified keys.
+        let core = self.get_many_core(&unique_fids, &unified_keys);
+
+        // Rebuild outputs in the original (fid, keys) grouping/shape.
+        let mut out: Vec<Vec<Option<ValueSlice<P::Blob>>>> =
+            items.iter().map(|(_, ks)| vec![None; ks.len()]).collect();
+
+        for (qi, (fid, keys)) in items.iter().enumerate() {
+            let fi = match fid_to_u.get(fid) {
+                Some(i) => *i,
+                None => {
+                    // Shouldn't happen (we inserted above), but keep safe.
+                    continue;
+                }
+            };
+            for (kj, k) in keys.iter().enumerate() {
+                if let Some(&uk) = key_to_idx.get(k.as_slice()) {
+                    out[qi][kj] = core[fi][uk].clone();
+                }
+            }
+        }
+
+        out
+    }
+
+    // TODO: Return `Result` type
+    /// Core: single codepath that executes a batched point-lookup for
+    /// a set of columns (`fids`) over a single shared keyset (`keys`).
+    fn get_many_core<'a>(
+        &self,
+        fids: &[LogicalFieldId],
+        keys: &[&'a [u8]],
+    ) -> Vec<Vec<Option<ValueSlice<P::Blob>>>> {
+        if fids.is_empty() || keys.is_empty() {
+            return (0..fids.len()).map(|_| Vec::new()).collect();
+        }
+
+        // Output: one vec per fid, one slot per key.
+        let mut results: Vec<Vec<Option<ValueSlice<P::Blob>>>> =
+            (0..fids.len()).map(|_| vec![None; keys.len()]).collect();
+
+        // (fid_index, key_index) pairs that have been satisfied (value or tombstone).
+        let mut resolved: FxHashSet<(usize, usize)> = FxHashSet::default();
+
+        // -------- ensure ColumnIndex in cache for all referenced fields --------
         let mut to_load: Vec<(LogicalFieldId, PhysicalKey)> = Vec::new();
         {
             let cache = self.colindex_cache.read().unwrap();
             let man = self.manifest.read().unwrap();
 
-            for fid in need_fids {
+            for &fid in fids {
                 if cache.contains_key(&fid) {
                     continue;
                 }
@@ -85,8 +144,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             }
         }
 
-        // -------- routing: segment -> (data_pk, [(item_i, key_j), ...]) --------
-        // We also compute a "recency rank" per segment pk so we can process newest-first globally.
+        // -------- routing: segment -> (data_pk, [(fid_i, key_j), ...]) --------
+        // and record a global newest-first rank per segment pk.
         let mut per_seg: FxHashMap<PhysicalKey, (PhysicalKey, Vec<(usize, usize)>)> =
             FxHashMap::default();
         let mut seg_rank: FxHashMap<PhysicalKey, usize> = FxHashMap::default();
@@ -94,13 +153,12 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         {
             let cache = self.colindex_cache.read().unwrap();
 
-            for (qi, (fid, keys)) in items.iter().enumerate() {
+            for (fi, fid) in fids.iter().enumerate() {
                 let col_index = match cache.get(fid) {
                     Some((_, ci)) => ci,
-                    None => continue, // unknown field => all None for that entry
+                    None => continue, // unknown field => remains all None
                 };
 
-                // Record recency ranks for this column's segments (0 == newest).
                 for (rank, segref) in col_index.segments.iter().enumerate() {
                     seg_rank
                         .entry(segref.index_physical_key)
@@ -108,21 +166,15 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                         .or_insert(rank);
                 }
 
-                for (kj, k) in keys.iter().enumerate() {
-                    // Route this key to ALL segments whose min/max covers it.
-                    // We'll decide which one wins later by processing order (newest-first),
-                    // which preserves overwrite/tombstone semantics while allowing fallback
-                    // to older segments if the newest covering segment doesn't contain the key.
+                for (kj, &k) in keys.iter().enumerate() {
                     for segref in &col_index.segments {
-                        if segref.logical_key_min.as_slice() <= k.as_slice()
-                            && k.as_slice() <= segref.logical_key_max.as_slice()
+                        if segref.logical_key_min.as_slice() <= k
+                            && k <= segref.logical_key_max.as_slice()
                         {
                             match per_seg.entry(segref.index_physical_key) {
-                                Entry::Occupied(mut e) => {
-                                    e.get_mut().1.push((qi, kj));
-                                }
+                                Entry::Occupied(mut e) => e.get_mut().1.push((fi, kj)),
                                 Entry::Vacant(e) => {
-                                    e.insert((segref.data_physical_key, vec![(qi, kj)]));
+                                    e.insert((segref.data_physical_key, vec![(fi, kj)]));
                                 }
                             }
                         }
@@ -135,7 +187,7 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             return results;
         }
 
-        // Build a processing order of segments: strictly newest-first using the recorded ranks.
+        // Newest-first across all segments.
         let mut seg_order: Vec<PhysicalKey> = per_seg.keys().copied().collect();
         seg_order.sort_by_key(|pk| *seg_rank.get(pk).unwrap_or(&usize::MAX));
 
@@ -150,7 +202,6 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
         let mut seen_data: FxHashSet<PhysicalKey> = FxHashSet::default();
         for pk in &seg_order {
             let (data_pk, _) = per_seg.get(pk).unwrap();
-            // Defensive: skip impossible/sentinel data keys.
             if *data_pk != u64::MAX && seen_data.insert(*data_pk) {
                 gets.push(BatchGet::Raw { key: *data_pk });
             }
@@ -181,13 +232,12 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 .get(&seg_pk)
                 .expect("loaded segment missing from seg_map");
 
-            for (qi, kj) in pairs {
-                // Skip if already satisfied by a newer segment (value or tombstone).
-                if resolved_queries.contains(&(qi, kj)) {
+            for (fi, kj) in pairs {
+                if resolved.contains(&(fi, kj)) {
                     continue;
                 }
 
-                let target = items[qi].1[kj].as_slice();
+                let target = keys[kj];
                 if let Some(pos) = KeyLayout::binary_search_key_with_layout(
                     &seg.logical_key_bytes,
                     &seg.key_layout,
@@ -196,45 +246,45 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
                 ) {
                     match &seg.value_layout {
                         ValueLayout::FixedWidth { width } => {
-                            // Fixed-width tombstone is only defensive (ForceFixed(0) is rejected).
                             if *width == 0 {
-                                resolved_queries.insert((qi, kj));
+                                // tombstone
+                                resolved.insert((fi, kj));
                                 continue;
                             }
                             if let Some(data_blob) = data_map.get(&data_pk) {
                                 let w = *width as usize;
                                 let a = (pos * w) as ByteOffset;
                                 let b = a + w as ByteOffset;
-                                results[qi][kj] = Some(ValueSlice {
+                                results[fi][kj] = Some(ValueSlice {
                                     data: data_blob.clone(),
                                     start: a,
                                     end: b,
                                 });
                             }
-                            resolved_queries.insert((qi, kj));
+                            resolved.insert((fi, kj));
                         }
                         ValueLayout::Variable { value_offsets } => {
                             let a = value_offsets[pos] as ByteOffset;
                             let b = value_offsets[pos + 1] as ByteOffset;
 
                             if a == b {
-                                // zero-length value => tombstone
-                                resolved_queries.insert((qi, kj));
+                                // TODO: If these are tombstones, how do we store potential null values?  Skip them entirely?
+                                // tombstone
+                                resolved.insert((fi, kj));
                                 continue;
                             }
 
                             if let Some(data_blob) = data_map.get(&data_pk) {
-                                results[qi][kj] = Some(ValueSlice {
+                                results[fi][kj] = Some(ValueSlice {
                                     data: data_blob.clone(),
                                     start: a,
                                     end: b,
                                 });
                             }
-                            resolved_queries.insert((qi, kj));
+                            resolved.insert((fi, kj));
                         }
                     }
                 }
-                // else: not in this (newer) segment, keep looking in older ones
             }
         }
 
