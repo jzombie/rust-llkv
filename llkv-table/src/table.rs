@@ -115,6 +115,7 @@ impl Table {
     ///
     /// `table_id` namespaces logical field ids as (table_id << 32) | column_id.
     pub fn new(table_id: u32, cfg: TableCfg) -> Self {
+        // TODO: Don't box leak
         let pager = Box::leak(Box::new(MemPager::default()));
         let store = ColumnStore::init_empty(pager);
         Self {
