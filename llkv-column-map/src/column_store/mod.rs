@@ -15,7 +15,7 @@ use std::sync::{
 pub mod introspect;
 pub mod metrics;
 pub mod read;
-pub mod read_value_scan;
+pub mod read_scan;
 pub mod write;
 
 pub struct ColumnStore<'p, P: Pager> {

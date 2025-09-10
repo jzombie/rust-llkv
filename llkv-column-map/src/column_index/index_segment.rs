@@ -1,44 +1,30 @@
+use crate::bloom::KeyBloom;
 use crate::bounds::ValueBound;
 use crate::layout::{KeyLayout, ValueLayout};
 use crate::types::{ByteLen, ByteWidth, IndexEntryCount, LogicalKeyBytes, PhysicalKey};
 use bitcode::{Decode, Encode};
 
-// TODO: [perf] Ensure bounds are updated as keys are dereferenced.
+// ----------------- IndexSegmentRef / IndexSegment / ValueIndex -----------------
+
 /// Pointer to a sealed segment plus fast-prune metadata (all **logical**).
-///
-/// This is intentionally compact to keep the `ColumnIndex` small and hot in
-/// cache. It is enough to cheaply decide if a segment can satisfy a probe or a
-/// range without opening the full `IndexSegment`.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct IndexSegmentRef {
-    /// Physical key of the *index segment* blob.
     pub index_physical_key: PhysicalKey,
     pub data_physical_key: PhysicalKey,
 
-    /// Quick span prune (LOGICAL key bytes).
     pub logical_key_min: LogicalKeyBytes,
     pub logical_key_max: LogicalKeyBytes,
 
     pub value_min: Option<ValueBound>,
     pub value_max: Option<ValueBound>,
 
-    /// Number of entries in that segment (helps pre-alloc).
     pub n_entries: IndexEntryCount,
 }
 
 /// One sealed batch. Describes how to fetch values from the *data* blob.
-/// The *data* blob contains only raw value bytes — no headers/markers.
-///
-/// This index stores:
-///   - the *physical* key of the data blob,
-///   - the *logical* keys (sorted, compact; either fixed-width or with offsets),
-///   - the value layout (fixed width or var-width offsets).
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct IndexSegment {
-    /// Where the values live (physical KV key).
     pub data_physical_key: PhysicalKey,
-
-    /// Number of entries.
     pub n_entries: IndexEntryCount,
 
     /// Sorted *logical* keys, stored compactly (see `key_layout`).
@@ -49,8 +35,10 @@ pub struct IndexSegment {
     pub value_layout: ValueLayout,
 
     /// Optional value index for value-ordered scans and prefix pruning.
-    /// Older segments can omit this and still load.
     pub value_index: Option<ValueIndex>,
+
+    /// Persisted Bloom filter over **logical keys** for fast conflict probes.
+    pub key_bloom: KeyBloom,
 }
 
 impl IndexSegment {
@@ -60,7 +48,12 @@ impl IndexSegment {
         width: ByteWidth,
     ) -> IndexSegment {
         let n = logical_keys.len() as IndexEntryCount;
+
+        // build compact key layout
         let (logical_key_bytes, key_layout) = KeyLayout::pack_keys_with_layout(logical_keys);
+        // build Bloom (persisted)
+        let bloom = KeyBloom::from_keys(logical_keys.iter().map(|k| k.as_ref()));
+
         IndexSegment {
             data_physical_key: data_pkey,
             n_entries: n,
@@ -68,6 +61,7 @@ impl IndexSegment {
             key_layout,
             value_layout: ValueLayout::FixedWidth { width },
             value_index: None,
+            key_bloom: bloom,
         }
     }
 
@@ -78,8 +72,10 @@ impl IndexSegment {
     ) -> IndexSegment {
         assert_eq!(logical_keys.len(), value_sizes.len());
         let n = logical_keys.len() as IndexEntryCount;
+
         let (logical_key_bytes, key_layout) = KeyLayout::pack_keys_with_layout(logical_keys);
 
+        // build offsets
         let mut value_offsets = Vec::with_capacity(value_sizes.len() + 1);
         let mut acc = 0u32;
         value_offsets.push(acc);
@@ -87,6 +83,9 @@ impl IndexSegment {
             acc += sz;
             value_offsets.push(acc);
         }
+
+        // build Bloom (persisted)
+        let bloom = KeyBloom::from_keys(logical_keys.iter().map(|k| k.as_ref()));
 
         IndexSegment {
             data_physical_key: data_pkey,
@@ -100,28 +99,21 @@ impl IndexSegment {
                     .collect(),
             },
             value_index: None,
+            key_bloom: bloom,
         }
     }
 }
 
 /// Per-segment directory for value-ordered access.
-/// Offsets index into `value_order` using 257 entries per level
-/// (256 buckets + sentinel).
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct ValueDirL2 {
-    /// First-byte bucket this table refines.
     pub first_byte: u8,
-    /// Second-byte directory (len = 257). Offsets are relative to the
-    /// parent first-byte slice (base = l1_dir\[first_byte\]).
     pub dir257: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct ValueIndex {
-    /// Rank-by-value -> row position (row index into logical keys/values).
     pub value_order: Vec<IndexEntryCount>,
-    /// First-byte directory, len = 257, absolute offsets into value_order.
     pub l1_dir: Vec<IndexEntryCount>,
-    /// Optional refinements for hot first-byte buckets.
     pub l2_dirs: Vec<ValueDirL2>,
 }

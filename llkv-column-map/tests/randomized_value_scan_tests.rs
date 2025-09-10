@@ -13,7 +13,7 @@ use std::ops::Bound;
 
 use llkv_column_map::ColumnStore;
 use llkv_column_map::codecs::big_endian::u64_be_array;
-use llkv_column_map::column_store::read_value_scan::{Direction, ValueScanOpts};
+use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ValueScanOpts};
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, ValueMode};
 
@@ -145,6 +145,7 @@ fn randomized_single_generation_forward_and_reverse() {
         .scan_values_lww(
             fid,
             ValueScanOpts {
+                order_by: OrderBy::Value,
                 dir: Direction::Forward,
                 lo: Bound::Included(&lo),
                 hi: Bound::Excluded(&hi),
@@ -174,6 +175,7 @@ fn randomized_single_generation_forward_and_reverse() {
         .scan_values_lww(
             fid,
             ValueScanOpts {
+                order_by: OrderBy::Value,
                 dir: Direction::Reverse,
                 lo: Bound::Included(&lo),
                 hi: Bound::Excluded(&hi),
@@ -254,6 +256,7 @@ fn randomized_two_generation_lww_correctness() {
         .scan_values_lww(
             fid,
             ValueScanOpts {
+                order_by: OrderBy::Value,
                 dir: Direction::Forward,
                 lo: Bound::Unbounded,
                 hi: Bound::Unbounded,
@@ -290,6 +293,7 @@ fn randomized_two_generation_lww_correctness() {
         .scan_values_lww(
             fid,
             ValueScanOpts {
+                order_by: OrderBy::Value,
                 dir: Direction::Reverse,
                 lo: Bound::Unbounded,
                 hi: Bound::Unbounded,
