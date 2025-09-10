@@ -9,13 +9,13 @@
 //! you decide to switch. No indexes here yet by design.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 
 use crossbeam_channel as xchan;
 
 use llkv_column_map::ColumnStore;
-use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ValueScanOpts};
+use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ScanError, ValueScanOpts};
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, ValueMode};
 use llkv_column_map::views::ValueSlice;
@@ -23,14 +23,15 @@ use llkv_column_map::views::ValueSlice;
 use crate::expr::{Expr, Filter, Operator};
 use crate::types::{FieldId, RowId, RowPatch};
 
-/// Internal "presence" column:
-/// - We write a single byte for every inserted row into this hidden column.
-/// - This lets us stream *all* row_ids in row-id order, enabling proper
-///   semantics for `NOT` (complement against the universe of rows),
-///   and future helpers like row_count(), existence checks, etc.
-/// - Kept entirely private; callers never see or pass this fid.
-const PRESENCE_FID: LogicalFieldId = u32::MAX - 7;
-const PRESENCE_VAL: &[u8] = b"\x01";
+/// Compose a 64-bit logical field id from a 32-bit table id and a 32-bit column id.
+/// Layout: [ table_id: u32 | column_id: u32 ]
+#[inline]
+fn lfid_for(table_id: u32, column_id: FieldId) -> LogicalFieldId {
+    ((table_id as u64) << 32) | (column_id as u64)
+}
+
+/// Reserved column id for per-table presence. Clients should not use this id.
+const PRESENCE_COL_ID: FieldId = u32::MAX;
 
 /// Encode row id as big-endian bytes so lexicographic order == numeric.
 #[inline]
@@ -54,16 +55,31 @@ fn value_slice_bytes(v: &ValueSlice<std::sync::Arc<[u8]>>) -> Vec<u8> {
     v.data().as_ref()[a..b].to_vec()
 }
 
+/// Compute the smallest byte string strictly greater than all strings
+/// that start with `prefix`. If none exists (e.g. prefix is all 0xFF),
+/// returns None.
+#[inline]
+fn next_prefix_upper(prefix: &[u8]) -> Option<Vec<u8>> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut up = prefix.to_vec();
+    for i in (0..up.len()).rev() {
+        if up[i] != 0xFF {
+            up[i] = up[i].saturating_add(1);
+            up.truncate(i + 1);
+            return Some(up);
+        }
+    }
+    None
+}
+
 /// Thin configuration for ingest segmentation and LWW policy.
 #[derive(Clone, Debug)]
 pub struct TableCfg {
     pub segment_max_entries: usize,
     pub segment_max_bytes: usize,
     pub last_write_wins_in_batch: bool,
-
-    /// Track presence for each row in a hidden internal column.
-    /// Enables `NOT` and "full table" scans without exposing any fid.
-    pub track_presence: bool,
 }
 
 impl Default for TableCfg {
@@ -72,7 +88,6 @@ impl Default for TableCfg {
             segment_max_entries: 100_000,
             segment_max_bytes: 32 << 20,
             last_write_wins_in_batch: true,
-            track_presence: true,
         }
     }
 }
@@ -90,21 +105,45 @@ pub struct Table {
     pager: &'static MemPager,
     store: ColumnStore<'static, MemPager>,
     cfg: TableCfg,
+    /// 32-bit table id used to namespace logical field ids.
+    table_id: u32,
 }
 
 impl Table {
     /// Create a new in-memory table.
-    pub fn new(cfg: TableCfg) -> Self {
+    ///
+    /// `table_id` namespaces logical field ids as (table_id << 32) | column_id.
+    pub fn new(table_id: u32, cfg: TableCfg) -> Self {
         let pager = Box::leak(Box::new(MemPager::default()));
         let store = ColumnStore::init_empty(pager);
-        Self { pager, store, cfg }
+        Self {
+            pager,
+            store,
+            cfg,
+            table_id,
+        }
     }
 
     /// Optional: declare a column; ColumnStore creates on first append.
     pub fn add_column(&mut self, _fid: FieldId) {}
 
+    /// Internal: per-table presence logical field id.
+    #[inline]
+    fn presence_lfid(&self) -> LogicalFieldId {
+        lfid_for(self.table_id, PRESENCE_COL_ID)
+    }
+
+    /// Internal: map an external FieldId to a namespaced LogicalFieldId.
+    #[inline]
+    fn lfid(&self, fid: FieldId) -> LogicalFieldId {
+        lfid_for(self.table_id, fid)
+    }
+
     /// Row-based ingest. Each row contains (field_id -> value).
     /// We map to per-column `Put` batches and call append_many.
+    ///
+    /// Additionally, we write to the per-table presence column once per row
+    /// (value is empty), enabling efficient "universe" scans and NOT queries.
     pub fn insert_many(&self, rows: &[RowPatch]) {
         if rows.is_empty() {
             return;
@@ -115,20 +154,19 @@ impl Table {
 
         for (row_id, cols) in rows.iter() {
             let key = row_key_bytes(*row_id);
+
+            // presence marker (empty value)
+            by_col
+                .entry(self.presence_lfid())
+                .or_default()
+                .push((Cow::Owned(key.clone()), Cow::Borrowed(b"")));
+
             for (fid, (_index_key, col_in)) in cols {
                 // Ignoring _index_key for now (no secondary indexes).
                 by_col
-                    .entry(*fid as LogicalFieldId)
+                    .entry(self.lfid(*fid))
                     .or_default()
                     .push((Cow::Owned(key.clone()), col_in.clone()));
-            }
-
-            // --- Internal presence write (hidden column) ---
-            if self.cfg.track_presence {
-                by_col
-                    .entry(PRESENCE_FID)
-                    .or_default()
-                    .push((Cow::Owned(key), Cow::Borrowed(PRESENCE_VAL)));
             }
         }
 
@@ -209,7 +247,7 @@ impl Table {
             };
 
             let it = match self.store.scan_values_lww(
-                driver_fid as LogicalFieldId,
+                self.lfid(driver_fid),
                 ValueScanOpts {
                     order_by: OrderBy::Key,
                     dir: Direction::Forward,
@@ -223,7 +261,7 @@ impl Table {
                 },
             ) {
                 Ok(it) => it,
-                Err(llkv_column_map::column_store::read_scan::ScanError::NoActiveSegments) => break,
+                Err(ScanError::NoActiveSegments) => break,
                 Err(e) => panic!("scan init error: {:?}", e),
             };
 
@@ -242,8 +280,7 @@ impl Table {
 
             // Build shared keyset & fid list for get_many_projected.
             let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-            let fids: Vec<LogicalFieldId> =
-                project.iter().map(|fid| *fid as LogicalFieldId).collect();
+            let fids: Vec<LogicalFieldId> = project.iter().map(|fid| self.lfid(*fid)).collect();
 
             let results = self.store.get_many_projected(&fids, &key_refs);
 
@@ -303,7 +340,7 @@ impl Table {
             };
 
             let it = match self.store.scan_values_lww(
-                fid as LogicalFieldId,
+                self.lfid(fid),
                 ValueScanOpts {
                     order_by: OrderBy::Value,
                     dir,
@@ -317,7 +354,7 @@ impl Table {
                 },
             ) {
                 Ok(it) => it,
-                Err(llkv_column_map::column_store::read_scan::ScanError::NoActiveSegments) => break,
+                Err(ScanError::NoActiveSegments) => break,
                 Err(e) => panic!("scan init error (value-ordered): {:?}", e),
             };
 
@@ -327,7 +364,11 @@ impl Table {
                 let rid = parse_row_id(item.key.as_slice());
                 let a = item.value.start() as usize;
                 let b = item.value.end() as usize;
-                let v = item.value.data().as_ref()[a..b].to_vec();
+
+                // Keep Arc alive; avoid slicing from a temporary.
+                let data_arc = item.value.data();
+                let data = data_arc.as_ref();
+                let v = data[a..b].to_vec();
 
                 cursor_v = Some(v.clone());
                 on_item(rid, v);
@@ -338,6 +379,37 @@ impl Table {
                 break;
             }
         }
+    }
+
+    /// Stream all row ids present in this table (by scanning the presence column by KEY).
+    pub fn stream_all_row_ids(&self) -> xchan::Receiver<RowId> {
+        let (tx, rx) = xchan::unbounded();
+        let it = match self.store.scan_values_lww(
+            self.presence_lfid(),
+            ValueScanOpts {
+                order_by: OrderBy::Key,
+                dir: Direction::Forward,
+                lo: Bound::Unbounded,
+                hi: Bound::Unbounded,
+                prefix: None,
+                bucket_prefix_len: 2,
+                head_tag_len: 16,
+                frame_predicate: None,
+            },
+        ) {
+            Ok(it) => it,
+            Err(_) => return rx, // empty stream if column missing / no segments
+        };
+
+        // Fill synchronously; iterator isn't Send.
+        for item in it {
+            let rid = parse_row_id(item.key.as_slice());
+            if tx.send(rid).is_err() {
+                break;
+            }
+        }
+        drop(tx);
+        rx
     }
 
     /// Scan rows using an expression over column values (by value order),
@@ -368,10 +440,7 @@ impl Table {
         // Shared keyset for this projection batch.
         let keys: Vec<Vec<u8>> = rids.iter().map(|r| row_key_bytes(*r)).collect();
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-        let fids: Vec<LogicalFieldId> = projection
-            .iter()
-            .map(|fid| (*fid as LogicalFieldId))
-            .collect();
+        let fids: Vec<LogicalFieldId> = projection.iter().map(|fid| self.lfid(*fid)).collect();
 
         let results = self.store.get_many_projected(&fids, &key_refs);
 
@@ -414,7 +483,6 @@ impl Table {
                 // Combine via intersection in a worker thread.
                 let (tx, rx) = xchan::unbounded();
                 std::thread::spawn(move || {
-                    use std::collections::HashSet;
                     let first: HashSet<RowId> = streams.remove(0).into_iter().collect();
                     let mut acc = first;
                     for s in streams {
@@ -441,8 +509,7 @@ impl Table {
                 }
                 let (tx, rx) = xchan::unbounded();
                 std::thread::spawn(move || {
-                    use std::collections::HashSet;
-                    let mut acc: HashSet<RowId> = std::collections::HashSet::new();
+                    let mut acc: HashSet<RowId> = HashSet::new();
                     for s in streams {
                         for rid in s {
                             acc.insert(rid);
@@ -457,27 +524,23 @@ impl Table {
                 Ok(Some(rx))
             }
             Expr::Not(inner) => {
-                // Presence complement Universe \ Positives.
-                if !self.cfg.track_presence {
-                    // Defensive: if someone disables presence, make it explicit.
-                    return Err(CmError::ScanInit(
-                        "Expr::Not requires TableCfg.track_presence=true".into(),
-                    ));
-                }
+                // NOT: (Universe \ Matches(inner)).
+                // Universe = presence column scan by KEY.
+                let universe_rx = self.stream_all_row_ids();
 
-                // Evaluate the positive side first (synchronously).
-                let pos_rx_opt = self.get_row_id_stream(inner)?;
-                let pos_set: std::collections::HashSet<RowId> = match pos_rx_opt {
-                    None => std::collections::HashSet::new(),
-                    Some(rx) => rx.into_iter().collect(),
+                // Collect inner matches into a set.
+                let inner_rx_opt = self.get_row_id_stream(inner)?;
+                let Some(inner_rx) = inner_rx_opt else {
+                    // NOT over empty -> all rows (i.e., Universe).
+                    return Ok(Some(universe_rx));
                 };
+                let inner_set: HashSet<RowId> = inner_rx.into_iter().collect();
 
-                // Stream all rows via presence and subtract positives.
-                let all_rx = self.stream_all_row_ids();
+                // Filter the universe by membership.
                 let (tx, rx) = xchan::unbounded();
                 std::thread::spawn(move || {
-                    for rid in all_rx {
-                        if !pos_set.contains(&rid) {
+                    for rid in universe_rx {
+                        if !inner_set.contains(&rid) {
                             if tx.send(rid).is_err() {
                                 break;
                             }
@@ -494,106 +557,193 @@ impl Table {
         &'b self,
         filter: &Filter<'b, FieldId>,
     ) -> Result<Option<xchan::Receiver<RowId>>, CmError> {
-        // Map the predicate to lo/hi bounds on VALUE bytes.
-        let (lo_bound, hi_bound): (Bound<&[u8]>, Bound<&[u8]>);
+        // Helper that runs a scan with lo/hi bounds and an optional value predicate.
+        let scan_stream = |fid: LogicalFieldId,
+                           lo: Bound<&[u8]>,
+                           hi: Bound<&[u8]>,
+                           mut keep: Option<Box<dyn FnMut(&[u8]) -> bool + 'b>>|
+         -> Result<Option<xchan::Receiver<RowId>>, CmError> {
+            let it = match self.store.scan_values_lww(
+                fid,
+                ValueScanOpts {
+                    order_by: OrderBy::Value,
+                    dir: Direction::Forward,
+                    lo,
+                    hi,
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    head_tag_len: 16,
+                    frame_predicate: None,
+                },
+            ) {
+                Ok(it) => it,
+                Err(ScanError::NoActiveSegments) => {
+                    return Ok(None);
+                }
+                Err(ScanError::ColumnMissing(_)) => {
+                    return Ok(None);
+                }
+                Err(e) => return Err(CmError::ScanInit(format!("{:?}", e))),
+            };
 
-        match &filter.op {
-            Operator::Equals(val) => {
-                lo_bound = Bound::Included(*val);
-                hi_bound = Bound::Included(*val);
-            }
-            Operator::Range { lower, upper } => {
-                // Lower
-                lo_bound = match lower {
-                    Bound::Unbounded => Bound::Unbounded,
-                    Bound::Included(b) => Bound::Included(*b),
-                    Bound::Excluded(b) => Bound::Excluded(*b),
-                };
-                // Upper
-                hi_bound = match upper {
-                    Bound::Unbounded => Bound::Unbounded,
-                    Bound::Included(b) => Bound::Included(*b),
-                    Bound::Excluded(b) => Bound::Excluded(*b),
-                };
-            }
-            _ => {
-                unimplemented!("Only Equals and Range are supported here");
-            }
-        }
+            // Fill the channel synchronously; ValueScan isn't Send.
+            let (tx, rx) = xchan::unbounded();
+            let mut started = false;
 
-        // Kick off a value-ordered scan for this column.
-        let iter = match self.store.scan_values_lww(
-            filter.field_id as LogicalFieldId,
-            ValueScanOpts {
-                order_by: OrderBy::Value,
-                dir: Direction::Forward,
-                lo: lo_bound,
-                hi: hi_bound,
-                prefix: None,
-                bucket_prefix_len: 2,
-                head_tag_len: 16,
-                frame_predicate: None,
-            },
-        ) {
-            Ok(it) => it,
-            Err(llkv_column_map::column_store::read_scan::ScanError::NoActiveSegments) => {
-                return Ok(None);
-            }
-            Err(llkv_column_map::column_store::read_scan::ScanError::ColumnMissing(_)) => {
-                return Ok(None);
-            }
-            Err(e) => return Err(CmError::ScanInit(format!("{:?}", e))),
-        };
+            for item in it {
+                let rid = parse_row_id(item.key.as_slice());
+                let a = item.value.start() as usize;
+                let b = item.value.end() as usize;
 
-        // Fill the channel synchronously to avoid requiring Send on the
-        // iterator (ValueScan is not Send).
-        let (tx, rx) = xchan::unbounded();
-        for item in iter {
-            let rid = parse_row_id(item.key.as_slice());
-            if tx.send(rid).is_err() {
-                break;
-            }
-        }
-        drop(tx);
+                // Hold Arc to extend lifetime while we slice.
+                let data_arc = item.value.data();
+                let data = data_arc.as_ref();
+                let v = &data[a..b];
 
-        Ok(Some(rx))
-    }
-
-    /// Stream all row ids in **row-id order** via the hidden presence column.
-    fn stream_all_row_ids(&self) -> xchan::Receiver<RowId> {
-        use llkv_column_map::column_store::read_scan::ScanError;
-        let (tx, rx) = xchan::unbounded();
-
-        match self.store.scan_values_lww(
-            PRESENCE_FID,
-            ValueScanOpts {
-                order_by: OrderBy::Key,
-                dir: Direction::Forward,
-                lo: Bound::Unbounded,
-                hi: Bound::Unbounded,
-                prefix: None,
-                bucket_prefix_len: 2,
-                // 16 minimizes head-tie fallbacks inside column-map.
-                head_tag_len: 16,
-                frame_predicate: None,
-            },
-        ) {
-            Ok(iter) => {
-                for item in iter {
-                    let rid = parse_row_id(item.key.as_slice());
-                    if tx.send(rid).is_err() {
-                        break;
+                if let Some(ref mut predicate) = keep {
+                    // For prefix scans we can early-exit once we leave the prefix region.
+                    if !predicate(v) {
+                        if started {
+                            break;
+                        } else {
+                            continue;
+                        }
                     }
                 }
-            }
-            Err(ScanError::NoActiveSegments) | Err(ScanError::ColumnMissing(_)) => {
-                // Empty table or presence not yet written => empty stream.
-            }
-            Err(e) => panic!("presence scan init error: {:?}", e),
-        }
 
-        drop(tx);
-        rx
+                started = true;
+                if tx.send(rid).is_err() {
+                    break;
+                }
+            }
+            drop(tx);
+            Ok(Some(rx))
+        };
+
+        match &filter.op {
+            // Equality
+            Operator::Equals(val) => scan_stream(
+                self.lfid(filter.field_id),
+                Bound::Included(*val),
+                Bound::Included(*val),
+                None,
+            ),
+
+            // Half-open range
+            Operator::Range { lower, upper } => {
+                let lo = match lower {
+                    Bound::Unbounded => Bound::Unbounded,
+                    Bound::Included(b) => Bound::Included(*b),
+                    Bound::Excluded(b) => Bound::Excluded(*b),
+                };
+                let hi = match upper {
+                    Bound::Unbounded => Bound::Unbounded,
+                    Bound::Included(b) => Bound::Included(*b),
+                    Bound::Excluded(b) => Bound::Excluded(*b),
+                };
+                scan_stream(self.lfid(filter.field_id), lo, hi, None)
+            }
+
+            // Simple comparisons mapped to ranges
+            Operator::GreaterThan(b) => scan_stream(
+                self.lfid(filter.field_id),
+                Bound::Excluded(*b),
+                Bound::Unbounded,
+                None,
+            ),
+            Operator::GreaterThanOrEquals(b) => scan_stream(
+                self.lfid(filter.field_id),
+                Bound::Included(*b),
+                Bound::Unbounded,
+                None,
+            ),
+            Operator::LessThan(b) => scan_stream(
+                self.lfid(filter.field_id),
+                Bound::Unbounded,
+                Bound::Excluded(*b),
+                None,
+            ),
+            Operator::LessThanOrEquals(b) => scan_stream(
+                self.lfid(filter.field_id),
+                Bound::Unbounded,
+                Bound::Included(*b),
+                None,
+            ),
+
+            // Set membership: union of equals scans.
+            Operator::In(arr) => {
+                let mut streams: Vec<xchan::Receiver<RowId>> = Vec::new();
+                for v in *arr {
+                    if let Some(rx) = self.get_stream_for_predicate(&Filter {
+                        field_id: filter.field_id,
+                        op: Operator::Equals(v),
+                    })? {
+                        streams.push(rx);
+                    }
+                }
+                if streams.is_empty() {
+                    return Ok(None);
+                }
+                let (tx, rx) = xchan::unbounded();
+                std::thread::spawn(move || {
+                    let mut seen: HashSet<RowId> = HashSet::new();
+                    for s in streams {
+                        for rid in s {
+                            if seen.insert(rid) {
+                                if tx.send(rid).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+                Ok(Some(rx))
+            }
+
+            // Prefix: tight bound [prefix, next_prefix_upper(prefix))
+            Operator::StartsWith(prefix) => {
+                let upper_buf = next_prefix_upper(prefix);
+                let hi = match upper_buf.as_ref() {
+                    Some(u) => Bound::Excluded(u.as_slice()),
+                    None => Bound::Unbounded,
+                };
+                // If hi is Unbounded (all 0xFF), add a predicate to short-circuit once we pass.
+                let pred: Option<Box<dyn FnMut(&[u8]) -> bool + 'b>> = if upper_buf.is_none() {
+                    let p = *prefix;
+                    Some(Box::new(move |v: &[u8]| v.starts_with(p)))
+                } else {
+                    None
+                };
+                scan_stream(
+                    self.lfid(filter.field_id),
+                    Bound::Included(*prefix),
+                    hi,
+                    pred,
+                )
+            }
+
+            // EndsWith / Contains: full column scan + predicate (cannot bound in value-order).
+            Operator::EndsWith(suf) => {
+                let suf = *suf;
+                scan_stream(
+                    self.lfid(filter.field_id),
+                    Bound::Unbounded,
+                    Bound::Unbounded,
+                    Some(Box::new(move |v: &[u8]| v.ends_with(suf))),
+                )
+            }
+            Operator::Contains(sub) => {
+                let sub = *sub;
+                scan_stream(
+                    self.lfid(filter.field_id),
+                    Bound::Unbounded,
+                    Bound::Unbounded,
+                    Some(Box::new(move |v: &[u8]| {
+                        v.windows(sub.len()).any(|w| w == sub)
+                    })),
+                )
+            }
+        }
     }
 
     /// Access to the underlying store for power users.
@@ -660,7 +810,7 @@ mod tests {
 
     #[test]
     fn insert_many_strings_readable() {
-        let table = Table::new(TableCfg::default());
+        let table = Table::new(1, TableCfg::default());
 
         const COL_NAME: FieldId = 11;
         const COL_CITY: FieldId = 12;
@@ -729,7 +879,7 @@ mod tests {
 
     #[test]
     fn insert_many_u64_readable() {
-        let table = Table::new(TableCfg::default());
+        let table = Table::new(1, TableCfg::default());
 
         const COL_A: FieldId = 21; // driver
         const COL_B: FieldId = 22; // numeric payload
@@ -783,7 +933,7 @@ mod tests {
     #[test]
     fn scan_unmatched_range_returns_no_rows_u64() {
         let cfg = TableCfg::default();
-        let table = Table::new(cfg);
+        let table = Table::new(1, cfg);
 
         let fid_row: FieldId = 10;
         let fid_d1: FieldId = 11;
@@ -813,7 +963,7 @@ mod tests {
     #[test]
     fn stream_value_order_multi_cols() {
         let cfg = TableCfg::default();
-        let table = Table::new(cfg);
+        let table = Table::new(1, cfg);
 
         let fid_row: FieldId = 20; // driver
         let fid_v1: FieldId = 21; // rid * 10
@@ -869,7 +1019,7 @@ mod tests {
     #[test]
     fn pagination_chunks_are_consistent_u64_multi_proj() {
         let cfg = TableCfg::default();
-        let table = Table::new(cfg);
+        let table = Table::new(1, cfg);
 
         let fid_row: FieldId = 30; // driver
         let fid_d1: FieldId = 31;
@@ -909,7 +1059,7 @@ mod tests {
 
     #[test]
     fn expr_equals_and_range_scan_projects_values() {
-        let table = Table::new(TableCfg::default());
+        let table = Table::new(1, TableCfg::default());
 
         const COL_NAME: FieldId = 101;
         const COL_CITY: FieldId = 102;
@@ -1003,8 +1153,98 @@ mod tests {
     }
 
     #[test]
+    fn expr_other_comparisons_and_patterns() {
+        let table = Table::new(1, TableCfg::default());
+
+        const COL_S: FieldId = 301; // strings
+        const COL_N: FieldId = 302; // numbers (be64)
+
+        let rows: Vec<RowPatch> = vec![
+            mk_row(1, &[(COL_S, s("alpha")), (COL_N, be64_bytes(10))]),
+            mk_row(2, &[(COL_S, s("beta")), (COL_N, be64_bytes(20))]),
+            mk_row(3, &[(COL_S, s("gamma")), (COL_N, be64_bytes(30))]),
+            mk_row(4, &[(COL_S, s("alphabet")), (COL_N, be64_bytes(40))]),
+            mk_row(5, &[(COL_S, s("alphanumeric")), (COL_N, be64_bytes(50))]),
+        ];
+        table.insert_many(&rows);
+
+        // GreaterThanOrEquals 30
+        let k30 = 30u64.to_be_bytes();
+        let e_gte = Expr::Pred(Filter {
+            field_id: COL_N,
+            op: Operator::GreaterThanOrEquals(&k30),
+        });
+        let mut got: Vec<RowId> = Vec::new();
+        table
+            .scan_expr(&e_gte, &[], |rid, _| got.push(rid))
+            .unwrap();
+        got.sort_unstable();
+        assert_eq!(got, vec![3, 4, 5]);
+
+        // LessThan 30
+        let e_lt = Expr::Pred(Filter {
+            field_id: COL_N,
+            op: Operator::LessThan(&k30),
+        });
+        let mut lt_rows: Vec<RowId> = Vec::new();
+        table
+            .scan_expr(&e_lt, &[], |rid, _| lt_rows.push(rid))
+            .unwrap();
+        lt_rows.sort_unstable();
+        assert_eq!(lt_rows, vec![1, 2]);
+
+        // IN {"beta","gamma"}
+        let e_in = Expr::Pred(Filter {
+            field_id: COL_S,
+            op: Operator::In(&[b"beta", b"gamma"]),
+        });
+        let mut in_rows: Vec<RowId> = Vec::new();
+        table
+            .scan_expr(&e_in, &[], |rid, _| in_rows.push(rid))
+            .unwrap();
+        in_rows.sort_unstable();
+        assert_eq!(in_rows, vec![2, 3]);
+
+        // StartsWith "alph"
+        let e_sw = Expr::Pred(Filter {
+            field_id: COL_S,
+            op: Operator::StartsWith(b"alph"),
+        });
+        let mut sw_rows: Vec<RowId> = Vec::new();
+        table
+            .scan_expr(&e_sw, &[], |rid, _| sw_rows.push(rid))
+            .unwrap();
+        sw_rows.sort_unstable();
+        assert_eq!(sw_rows, vec![1, 4, 5]);
+
+        // EndsWith "a"
+        let e_ew = Expr::Pred(Filter {
+            field_id: COL_S,
+            op: Operator::EndsWith(b"a"),
+        });
+        let mut ew_rows: Vec<RowId> = Vec::new();
+        table
+            .scan_expr(&e_ew, &[], |rid, _| ew_rows.push(rid))
+            .unwrap();
+        ew_rows.sort_unstable();
+        assert_eq!(ew_rows, vec![1]);
+
+        // Contains "num"
+        let e_ct = Expr::Pred(Filter {
+            field_id: COL_S,
+            op: Operator::Contains(b"num"),
+        });
+        let mut ct_rows: Vec<RowId> = Vec::new();
+        table
+            .scan_expr(&e_ct, &[], |rid, _| ct_rows.push(rid))
+            .unwrap();
+        ct_rows.sort_unstable();
+        assert_eq!(ct_rows, vec![5]);
+    }
+
+    #[test]
     fn expr_intersection_and_union() {
-        let table = Table::new(TableCfg::default());
+        let table = Table::new(1, TableCfg::default());
 
         const COL_COUNTRY: FieldId = 201;
         const COL_STATUS: FieldId = 202;
@@ -1067,9 +1307,11 @@ mod tests {
         assert_eq!(or_rows, vec![1, 4, 6, 8, 11, 12, 16, 20]);
     }
 
+    // --- Presence + NOT tests re-added ---
+
     #[test]
     fn not_equals_returns_complement_including_missing_field() {
-        let table = Table::new(TableCfg::default());
+        let table = Table::new(1, TableCfg::default());
 
         const F_NAME: FieldId = 301;
 
@@ -1102,7 +1344,7 @@ mod tests {
 
     #[test]
     fn not_over_empty_predicate_yields_all_rows() {
-        let table = Table::new(TableCfg::default());
+        let table = Table::new(1, TableCfg::default());
 
         const F_TAG: FieldId = 401;
 
@@ -1124,14 +1366,13 @@ mod tests {
 
     #[test]
     fn presence_stream_orders_row_ids_by_key() {
-        let table = Table::new(TableCfg::default());
+        let table = Table::new(1, TableCfg::default());
         let rows: Vec<RowPatch> = vec![mk_row(3, &[]), mk_row(1, &[]), mk_row(2, &[])];
         table.insert_many(&rows);
 
-        // Stream all and check order 1,2,3
+        // Stream all and check order 1,2,3 (by key order)
         let rx = table.stream_all_row_ids();
-        let mut got: Vec<RowId> = rx.into_iter().collect();
-        got.sort_unstable();
+        let got: Vec<RowId> = rx.into_iter().collect();
         assert_eq!(got, vec![1, 2, 3]);
     }
 }
