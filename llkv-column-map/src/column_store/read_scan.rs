@@ -1555,10 +1555,12 @@ fn upper_bound_min<'a>(a: Bound<&'a [u8]>, b: Bound<&'a [u8]>) -> Bound<&'a [u8]
 // =================== pagination: opts-driven entry points =================
 
 impl<P: Pager> super::ColumnStore<'_, P> {
-    /// Keyset pagination with LWW over key or value order. Accepts a
-    /// full `ValueScanOpts` template; only lo/hi are tightened by the
-    /// cursor in the correct domain; everything else (prefix, frame,
-    /// bucket/tag widths, etc.) is preserved.
+    /// Keyset pagination with LWW over key or value order, designed for stateless API calls.
+    ///
+    /// This helper function creates a new scan iterator on every call, making it suitable for
+    /// environments where state cannot be held between requests (e.g., a web API).
+    /// For high-performance, continuous scans within a single process, create the `ValueScan`
+    /// iterator directly and consume it in a loop.
     pub fn page_scan_lww_with_opts(
         &self,
         field_id: LogicalFieldId,
