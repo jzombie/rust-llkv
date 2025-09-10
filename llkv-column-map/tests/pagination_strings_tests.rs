@@ -7,7 +7,11 @@
 //!   cargo test --release --test pagination_strings_tests -- --ignored
 //!
 //! You can override sizes via env vars for the ignored test:
-//!   N=1000000 PAGE=4096 cargo test --release --test pagination_strings_tests -- --ignored
+//!   N=1000000 PAGE=4096 cargo test --release --test \
+//!     pagination_strings_tests -- --ignored
+//!
+//! To see printed timings in the main test, use:
+//!   cargo test --release paginate_strings_heavy_ignored -- --ignored --nocapture
 
 use llkv_column_map::ColumnStore;
 use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ValueScanOpts};
@@ -18,6 +22,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng, seq::SliceRandom};
 
 use std::ops::Bound;
+use std::time::Instant;
 
 // ---------------------- random string helpers -----------------------
 
@@ -46,6 +51,7 @@ fn rand_unique_ascii(rng: &mut StdRng, min_len: usize, max_len: usize, ordinal: 
 // --------------------------- seeders ---------------------------------
 
 /// Append in multiple batches to ensure multiple segments/generations.
+/// Prints per-batch creation and ingestion timings.
 fn seed_strings_as_keys(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n: usize, seed: u64) {
     let opts = AppendOptions {
         mode: ValueMode::ForceFixed(8),
@@ -53,7 +59,10 @@ fn seed_strings_as_keys(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n: u
         segment_max_bytes: 1 << 20,
         last_write_wins_in_batch: true,
     };
+
     let mut rng = StdRng::seed_from_u64(seed);
+
+    let t_build_all = Instant::now();
     let mut items: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
         .map(|i| {
             let k = rand_unique_ascii(&mut rng, 0, 64, i);
@@ -61,15 +70,38 @@ fn seed_strings_as_keys(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n: u
             (k, v)
         })
         .collect();
+    let build_all_ms = t_build_all.elapsed().as_secs_f64() * 1e3;
+
+    let t_shuffle = Instant::now();
     items.shuffle(&mut rng);
+    let shuffle_ms = t_shuffle.elapsed().as_secs_f64() * 1e3;
+
+    println!(
+        "[seed keys] built all items: {:.3} ms, shuffle: {:.3} ms, n={}",
+        build_all_ms, shuffle_ms, n
+    );
 
     const CHUNK: usize = 10_000;
-    for chunk in items.chunks(CHUNK) {
+    let total_batches = (items.len() + CHUNK - 1) / CHUNK;
+
+    // Aggregates for "lump" reporting.
+    let t_seed = Instant::now();
+    let mut sum_make_ms = 0.0f64;
+    let mut sum_ingest_ms = 0.0f64;
+    let mut max_make_ms = 0.0f64;
+    let mut max_ingest_ms = 0.0f64;
+    let mut slow_ingests = 0usize; // ingest > 8 ms
+
+    for (bi, chunk) in items.chunks(CHUNK).enumerate() {
+        let t_batch_make = Instant::now();
         let batch = chunk
             .iter()
             .cloned()
             .map(|(k, v)| (k.into(), v.into()))
             .collect();
+        let make_ms = t_batch_make.elapsed().as_secs_f64() * 1e3;
+
+        let t_ingest = Instant::now();
         store.append_many(
             vec![Put {
                 field_id: fid,
@@ -77,9 +109,50 @@ fn seed_strings_as_keys(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n: u
             }],
             opts.clone(),
         );
+        let ingest_ms = t_ingest.elapsed().as_secs_f64() * 1e3;
+
+        // Existing per-batch log (unchanged).
+        println!(
+            "[seed keys] batch {}/{}: make={:.3} ms, ingest={:.3} ms, \
+items={}",
+            bi + 1,
+            total_batches,
+            make_ms,
+            ingest_ms,
+            chunk.len()
+        );
+
+        // Aggregate updates.
+        sum_make_ms += make_ms;
+        sum_ingest_ms += ingest_ms;
+        if make_ms > max_make_ms {
+            max_make_ms = make_ms;
+        }
+        if ingest_ms > max_ingest_ms {
+            max_ingest_ms = ingest_ms;
+        }
+        if ingest_ms > 8.0 {
+            slow_ingests += 1;
+        }
     }
+
+    let seed_ms = t_seed.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "[seed keys] totals: batches={}, make_sum={:.3} ms, \
+ingest_sum={:.3} ms, make_max={:.3} ms, ingest_max={:.3} ms, \
+slow_ingests_gt8ms={}, seed_end_to_end={:.3} ms",
+        total_batches,
+        sum_make_ms,
+        sum_ingest_ms,
+        max_make_ms,
+        max_ingest_ms,
+        slow_ingests,
+        seed_ms
+    );
 }
 
+/// Append in multiple batches to ensure multiple segments/generations.
+/// Prints per-batch creation and ingestion timings.
 fn seed_strings_as_values(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n: usize, seed: u64) {
     let opts = AppendOptions {
         mode: ValueMode::Auto,
@@ -87,7 +160,10 @@ fn seed_strings_as_values(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n:
         segment_max_bytes: 1 << 20,
         last_write_wins_in_batch: true,
     };
+
     let mut rng = StdRng::seed_from_u64(seed);
+
+    let t_build_all = Instant::now();
     let mut items: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
         .map(|i| {
             let k = format!("k{:08x}", i).into_bytes();
@@ -95,15 +171,38 @@ fn seed_strings_as_values(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n:
             (k, v)
         })
         .collect();
+    let build_all_ms = t_build_all.elapsed().as_secs_f64() * 1e3;
+
+    let t_shuffle = Instant::now();
     items.shuffle(&mut rng);
+    let shuffle_ms = t_shuffle.elapsed().as_secs_f64() * 1e3;
+
+    println!(
+        "[seed vals] built all items: {:.3} ms, shuffle: {:.3} ms, n={}",
+        build_all_ms, shuffle_ms, n
+    );
 
     const CHUNK: usize = 10_000;
-    for chunk in items.chunks(CHUNK) {
+    let total_batches = (items.len() + CHUNK - 1) / CHUNK;
+
+    // Aggregates for "lump" reporting.
+    let t_seed = Instant::now();
+    let mut sum_make_ms = 0.0f64;
+    let mut sum_ingest_ms = 0.0f64;
+    let mut max_make_ms = 0.0f64;
+    let mut max_ingest_ms = 0.0f64;
+    let mut slow_ingests = 0usize; // ingest > 8 ms
+
+    for (bi, chunk) in items.chunks(CHUNK).enumerate() {
+        let t_batch_make = Instant::now();
         let batch = chunk
             .iter()
             .cloned()
             .map(|(k, v)| (k.into(), v.into()))
             .collect();
+        let make_ms = t_batch_make.elapsed().as_secs_f64() * 1e3;
+
+        let t_ingest = Instant::now();
         store.append_many(
             vec![Put {
                 field_id: fid,
@@ -111,7 +210,46 @@ fn seed_strings_as_values(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n:
             }],
             opts.clone(),
         );
+        let ingest_ms = t_ingest.elapsed().as_secs_f64() * 1e3;
+
+        // Existing per-batch log (unchanged).
+        println!(
+            "[seed vals] batch {}/{}: make={:.3} ms, ingest={:.3} ms, \
+items={}",
+            bi + 1,
+            total_batches,
+            make_ms,
+            ingest_ms,
+            chunk.len()
+        );
+
+        // Aggregate updates.
+        sum_make_ms += make_ms;
+        sum_ingest_ms += ingest_ms;
+        if make_ms > max_make_ms {
+            max_make_ms = make_ms;
+        }
+        if ingest_ms > max_ingest_ms {
+            max_ingest_ms = ingest_ms;
+        }
+        if ingest_ms > 8.0 {
+            slow_ingests += 1;
+        }
     }
+
+    let seed_ms = t_seed.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "[seed vals] totals: batches={}, make_sum={:.3} ms, \
+ingest_sum={:.3} ms, make_max={:.3} ms, ingest_max={:.3} ms, \
+slow_ingests_gt8ms={}, seed_end_to_end={:.3} ms",
+        total_batches,
+        sum_make_ms,
+        sum_ingest_ms,
+        max_make_ms,
+        max_ingest_ms,
+        slow_ingests,
+        seed_ms
+    );
 }
 
 // ----------------------------- tests ---------------------------------
@@ -124,6 +262,7 @@ fn paginate_strings_as_keys_smoke() {
     let fid = 9001u32;
     let n = 50_000usize;
     let page_size = 1009usize;
+
     seed_strings_as_keys(&store, fid, n, 0xDEADBEEF);
 
     // Create the iterator once for the entire scan.
@@ -143,6 +282,9 @@ fn paginate_strings_as_keys_smoke() {
     let mut seen: usize = 0;
     let mut last_key: Option<Vec<u8>> = None;
 
+    // Time the full scan over all pages.
+    let t_scan = Instant::now();
+
     // Loop by consuming the single iterator instance in pages.
     loop {
         let page_items: Vec<_> = it.by_ref().take(page_size).collect();
@@ -159,6 +301,12 @@ fn paginate_strings_as_keys_smoke() {
         }
     }
 
+    let scan_ms = t_scan.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "[scan keys fwd] pagesize={}, items={}, total={:.3} ms",
+        page_size, seen, scan_ms
+    );
+
     assert_eq!(seen, n, "one row per inserted key");
 }
 
@@ -170,6 +318,7 @@ fn paginate_strings_as_values_smoke() {
     let fid = 9002u32;
     let n = 50_000usize;
     let page_size = 977usize;
+
     seed_strings_as_values(&store, fid, n, 0xBADF00D);
 
     // Create the iterator once for the entire scan.
@@ -189,6 +338,9 @@ fn paginate_strings_as_values_smoke() {
     let mut seen: usize = 0;
     let mut last_val: Option<Vec<u8>> = None;
 
+    // Time the full scan over all pages.
+    let t_scan = Instant::now();
+
     // Loop by consuming the single iterator instance in pages.
     loop {
         let page_items: Vec<_> = it.by_ref().take(page_size).collect();
@@ -206,6 +358,12 @@ fn paginate_strings_as_values_smoke() {
         }
     }
 
+    let scan_ms = t_scan.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "[scan vals fwd] pagesize={}, items={}, total={:.3} ms",
+        page_size, seen, scan_ms
+    );
+
     assert_eq!(seen, n, "one row per inserted value");
 }
 
@@ -218,6 +376,7 @@ fn paginate_strings_reverse_smoke() {
     let fid_v = 9004u32;
     let n = 30_000usize;
     let page_size = 997usize;
+
     seed_strings_as_keys(&store, fid_k, n, 1234);
     seed_strings_as_values(&store, fid_v, n, 4321);
 
@@ -235,6 +394,8 @@ fn paginate_strings_reverse_smoke() {
         )
         .expect("reverse key scan init should succeed");
 
+    let t_scan_k = Instant::now();
+
     let mut last_key: Option<Vec<u8>> = None;
     let mut seen_k = 0usize;
     loop {
@@ -250,6 +411,11 @@ fn paginate_strings_reverse_smoke() {
             seen_k += 1;
         }
     }
+    let scan_k_ms = t_scan_k.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "[scan keys rev] pagesize={}, items={}, total={:.3} ms",
+        page_size, seen_k, scan_k_ms
+    );
     assert_eq!(seen_k, n, "must consume all items (reverse keys)");
 
     // -------- Reverse value-ordered pagination --------
@@ -265,6 +431,8 @@ fn paginate_strings_reverse_smoke() {
             },
         )
         .expect("reverse value scan init should succeed");
+
+    let t_scan_v = Instant::now();
 
     let mut last_val: Option<Vec<u8>> = None;
     let mut seen_v = 0usize;
@@ -282,10 +450,16 @@ fn paginate_strings_reverse_smoke() {
             seen_v += 1;
         }
     }
+    let scan_v_ms = t_scan_v.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "[scan vals rev] pagesize={}, items={}, total={:.3} ms",
+        page_size, seen_v, scan_v_ms
+    );
     assert_eq!(seen_v, n, "must consume all items (reverse values)");
 }
 
 /// Heavy test (ignored by default): run with up to a million rows.
+/// Prints the same batch and scan timings as the smoke tests.
 #[test]
 #[ignore = "CPU intensive test"]
 fn paginate_strings_heavy_ignored() {
@@ -320,6 +494,8 @@ fn paginate_strings_heavy_ignored() {
         )
         .expect("forward key scan init should succeed");
 
+    let t_scan_k = Instant::now();
+
     let mut last_k: Option<Vec<u8>> = None;
     let mut seen_k = 0usize;
     loop {
@@ -335,6 +511,11 @@ fn paginate_strings_heavy_ignored() {
             seen_k += 1;
         }
     }
+    let scan_k_ms = t_scan_k.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "[scan keys fwd HEAVY] pagesize={}, items={}, total={:.3} ms",
+        page_size, seen_k, scan_k_ms
+    );
     assert_eq!(seen_k, n, "must consume all items (forward keys, heavy)");
 
     // -------- Value-ordered reverse pagination (stress) --------
@@ -350,6 +531,8 @@ fn paginate_strings_heavy_ignored() {
             },
         )
         .expect("reverse value scan init should succeed");
+
+    let t_scan_v = Instant::now();
 
     let mut last_v: Option<Vec<u8>> = None;
     let mut seen_v = 0usize;
@@ -367,5 +550,10 @@ fn paginate_strings_heavy_ignored() {
             seen_v += 1;
         }
     }
+    let scan_v_ms = t_scan_v.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "[scan vals rev HEAVY] pagesize={}, items={}, total={:.3} ms",
+        page_size, seen_v, scan_v_ms
+    );
     assert_eq!(seen_v, n, "must consume all items (reverse values, heavy)");
 }
