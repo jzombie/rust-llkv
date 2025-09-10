@@ -16,16 +16,8 @@ use std::ops::Bound;
 
 use csv::ReaderBuilder;
 use llkv_csv::{CsvConfig, load_into_table};
-use llkv_table::Table;
-use llkv_table::btree::pager::{SharedPager, define_mem_pager};
-use llkv_table::expr::{Expr, Filter, Operator};
 use llkv_table::types::{ColumnInput, FieldId, IndexKey, RowId};
-
-define_mem_pager! {
-    name: MemPager64,
-    id: u64,
-    default_page_size: 256
-}
+use llkv_table::{Table, TableCfg};
 
 fn parse_args() -> Result<(String, usize, bool, u8), String> {
     let mut it = env::args().skip(1);
@@ -67,7 +59,7 @@ fn sniff_width(f: &mut File, delimiter: u8) -> Result<usize, Box<dyn std::error:
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (path, page_sz, has_headers, delimiter) =
+    let (path, _page_sz, has_headers, delimiter) =
         parse_args().map_err(|e| format!("arg error: {}", e))?;
 
     // Open, sniff width, rewind.
@@ -79,17 +71,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("csv must have at least 1 column".into());
     }
 
-    // Build pager and table.
-    let base = MemPager64::new(page_sz);
-    let pager = SharedPager::new(base);
-    let mut table: Table<_> = Table::with_pager(pager);
+    // Build the new non-generic Table.
+    let mut table = Table::new(TableCfg::default());
 
     // Create columns for FieldId 1..=width (all CSV columns become fields).
     for fid in 1..=width as FieldId {
         table.add_column(fid);
     }
-    // Add an index on FieldId 1 so we can scan everything later.
-    table.add_index(1);
 
     // Reader and config for ingest.
     let reader = BufReader::new(file);
@@ -104,6 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Map each record to:
     // (RowId, HashMap<FieldId, (IndexKey, ColumnInput)>)
+    // Note: IndexKey is unused by the new table backend; we pass 0.
     let res = load_into_table(reader, &cfg, &table, move |rec| {
         let rid = {
             let r = next_row_id;
@@ -118,16 +107,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let val = rec.get(col)?;
             let field_id = (col + 1) as FieldId;
 
-            // Use the RowId as the IndexKey for the indexed field (FieldId 1).
-            // For other non-indexed fields, the key can remain 0.
-            let index_key = if field_id == 1 { rid } else { 0 };
-
             patch.insert(
                 field_id,
-                (
-                    index_key,
-                    ColumnInput::from(Cow::Owned(val.as_bytes().to_vec())),
-                ),
+                (0u64, ColumnInput::from(Cow::Owned(val.as_bytes().to_vec()))),
             );
         }
         Some((rid, patch))
@@ -141,39 +123,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // ---- Stream the table contents back out (in sorted order) ----
+    // ---- Stream the table contents back out (row-id order) ----
     let projection: Vec<FieldId> = (1..=width as FieldId).collect();
 
-    // Use a full range scan on the index to get all rows in sorted order.
-    let expr = Expr::Pred(Filter {
-        field_id: 1,
-        op: Operator::Range {
-            lower: Bound::Unbounded,
-            upper: Bound::Unbounded,
-        },
-    });
-
     println!("--- table dump start ---");
-    table
-        .scan(&expr, &projection, &mut |row_id, values_iter| {
+    // We scan by row-id range. Use column 1 as the driver (present on every row).
+    // Bounds are unbounded to dump everything; choose a page size that’s reasonable.
+    table.scan_by_row_id_range(
+        1,                // driver_fid
+        Bound::Unbounded, // lo row_id
+        Bound::Unbounded, // hi row_id
+        &projection,      // project all CSV columns
+        4096,             // page size
+        |row_id, cols| {
             print!("row_id={}:", row_id);
-            for i in 0..projection.len() {
-                if let Some(v) = values_iter.next() {
-                    let s = String::from_utf8_lossy(v.as_slice());
-                    if i == 0 {
-                        print!(" [{}]", s);
-                    } else {
-                        print!(" | [{}]", s);
+            for (i, cell) in cols.iter().enumerate() {
+                match cell {
+                    Some(bytes) => {
+                        let s = String::from_utf8_lossy(bytes);
+                        if i == 0 {
+                            print!(" [{}]", s);
+                        } else {
+                            print!(" | [{}]", s);
+                        }
                     }
-                } else if i == 0 {
-                    print!(" [NULL]");
-                } else {
-                    print!(" | [NULL]");
+                    None => {
+                        if i == 0 {
+                            print!(" [NULL]");
+                        } else {
+                            print!(" | [NULL]");
+                        }
+                    }
                 }
             }
             println!();
-        })
-        .map_err(|e| std::io::Error::other(format!("{:?}", e)))?;
+        },
+    );
     println!("--- table dump end ---");
 
     Ok(())

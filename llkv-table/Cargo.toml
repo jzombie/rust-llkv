@@ -10,7 +10,6 @@ publish.workspace = true
 
 [dependencies]
 crossbeam-channel.workspace = true
-llkv-btree.workspace = true
 llkv-column-map.workspace = true
 llkv-expr.workspace = true
 llkv-storage.workspace = true
