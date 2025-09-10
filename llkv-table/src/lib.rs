@@ -20,6 +20,7 @@ pub mod btree {
 pub mod codecs;
 pub mod constants;
 pub mod table;
+pub mod table_cm;
 pub mod types;
 
 pub use table::{Table, TableCfg};

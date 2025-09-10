@@ -889,6 +889,7 @@ version = "0.1.0-alpha"
 dependencies = [
  "crossbeam-channel",
  "llkv-btree",
+ "llkv-column-map",
  "llkv-expr",
  "llkv-storage",
  "rayon",
