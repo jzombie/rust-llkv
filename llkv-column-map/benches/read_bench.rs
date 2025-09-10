@@ -49,7 +49,7 @@ fn fixed_value(width: usize, row: u64, fid: LogicalFieldId) -> Vec<u8> {
 fn var_value(row: u64, fid: LogicalFieldId, min_len: usize, max_len: usize) -> Vec<u8> {
     let span = (max_len - min_len + 1) as u64;
     let len = min_len as u64 + ((row.wrapping_mul(1103515245) ^ fid as u64) % span);
-    let byte = (((row as u32).wrapping_add(fid)) & 0xFF) as u8;
+    let byte = (((row as LogicalFieldId).wrapping_add(fid)) & 0xFF) as u8;
     vec![byte; len as usize]
 }
 

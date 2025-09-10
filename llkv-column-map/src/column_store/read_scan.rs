@@ -1753,7 +1753,7 @@ mod value_scan_tests {
     fn scan_values_lww_forward_big_multi_segment() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p); // bootstrap+manifest, empty store
-        let fid = 42u32;
+        let fid: LogicalFieldId = 42;
 
         seed_three_generations(&store, fid);
 
@@ -1805,7 +1805,7 @@ mod value_scan_tests {
     fn scan_values_lww_value_window_slice() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
-        let fid = 7u32;
+        let fid: LogicalFieldId = 7;
         seed_three_generations(&store, fid);
 
         // Choose a window that lands entirely in gen2's value band.
@@ -1857,7 +1857,7 @@ mod value_scan_tests {
     fn scan_values_lww_reverse_order_contract() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
-        let fid = 99u32;
+        let fid: LogicalFieldId = 99;
         seed_three_generations(&store, fid);
 
         let it = store
@@ -1893,7 +1893,7 @@ mod value_scan_tests {
     fn scan_values_fww_forward_contract() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
-        let fid = 5u32;
+        let fid: LogicalFieldId = 5;
         seed_three_generations(&store, fid);
 
         let it = store
@@ -1936,7 +1936,7 @@ mod value_scan_tests {
     fn scan_values_lww_frame_predicate_contract() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
-        let fid = 12u32;
+        let fid: LogicalFieldId = 12;
         seed_three_generations(&store, fid);
 
         let cap = 64u64;
@@ -1978,7 +1978,7 @@ mod value_scan_tests {
     fn scan_values_fww_reverse_order_contract() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
-        let fid = 77u32;
+        let fid: LogicalFieldId = 77;
         seed_three_generations(&store, fid);
 
         let it = store
@@ -2036,7 +2036,7 @@ mod value_scan_tests {
     fn scan_values_lww_reverse_windowed_gen3() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
-        let fid = 101u32;
+        let fid: LogicalFieldId = 101;
         seed_three_generations(&store, fid);
 
         // Window fully inside gen3 (i = 700..710)
@@ -2085,7 +2085,7 @@ mod value_scan_tests {
     fn scan_values_fww_forward_windowed_gen1_positive() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
-        let fid = 102u32;
+        let fid: LogicalFieldId = 102;
         seed_three_generations(&store, fid);
 
         // Window fully inside gen1 (i = 250..260) -> winners are gen1 under FWW
@@ -2129,7 +2129,7 @@ mod value_scan_tests {
     fn scan_values_fww_forward_windowed_gen2_strict_suppression() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
-        let fid = 103u32;
+        let fid: LogicalFieldId = 103;
         seed_three_generations(&store, fid);
 
         // Window fully inside gen2’s value band (i = 250..260).
@@ -2165,7 +2165,7 @@ mod value_scan_tests {
     fn scan_values_fww_reverse_windowed_gen1() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
-        let fid = 104u32;
+        let fid: LogicalFieldId = 104;
         seed_three_generations(&store, fid);
 
         // Window at the high end of gen1 (i = 990..1000)
@@ -2213,7 +2213,7 @@ mod value_scan_tests {
     fn scan_values_lww_key_order_reverse() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
-        let fid = 4343u32;
+        let fid: LogicalFieldId = 4343;
 
         seed_three_generations(&store, fid);
 
@@ -2262,7 +2262,7 @@ mod value_scan_tests {
     fn scan_values_lww_pagination_key_forward() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
-        let fid = 551u32;
+        let fid: LogicalFieldId = 551;
 
         seed_three_generations(&store, fid);
 
@@ -2316,7 +2316,7 @@ mod value_scan_tests {
     fn scan_values_lww_pagination_key_reverse() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
-        let fid = 552u32;
+        let fid: LogicalFieldId = 552;
 
         seed_three_generations(&store, fid);
 
@@ -2370,7 +2370,7 @@ mod value_scan_tests {
     fn scan_values_lww_pagination_value_forward() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
-        let fid = 661u32;
+        let fid: LogicalFieldId = 661;
 
         seed_three_generations(&store, fid);
 
@@ -2428,7 +2428,7 @@ mod value_scan_tests {
     fn scan_values_lww_pagination_value_reverse() {
         let p = MemPager::default();
         let store = ColumnStore::init_empty(&p);
-        let fid = 662u32;
+        let fid: LogicalFieldId = 662;
 
         seed_three_generations(&store, fid);
 

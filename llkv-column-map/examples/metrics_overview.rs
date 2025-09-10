@@ -21,7 +21,7 @@ use llkv_column_map::{
 
 // -------- simple key/value generators ---------------------------------------
 
-fn fixed_value(row: u64, field: u32, width: usize) -> Vec<u8> {
+fn fixed_value(row: u64, field: LogicalFieldId, width: usize) -> Vec<u8> {
     // Stable 8-byte seed then repeat/truncate to requested width
     let seed = (row ^ field as u64).to_le_bytes();
     if width <= 8 {
@@ -60,7 +60,7 @@ fn build_put_var(
             .wrapping_add(field_id as u64)
             .rotate_left(13);
         let len = (min as u64 + (mix % span)) as usize;
-        let byte = (((r as u32).wrapping_add(field_id)) & 0xFF) as u8;
+        let byte = (((r as LogicalFieldId).wrapping_add(field_id)) & 0xFF) as u8;
         items.push((u64_be_vec(r).into(), vec![byte; len].into()));
     }
     Put { field_id, items }

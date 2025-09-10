@@ -55,7 +55,7 @@ use llkv_column_map::{
     ColumnStore,
     codecs::big_endian::u64_be_vec,
     storage::pager::MemPager,
-    types::{AppendOptions, Put, ValueMode},
+    types::{AppendOptions, LogicalFieldId, Put, ValueMode},
 };
 use std::borrow::Cow;
 use std::hint::black_box;
@@ -67,7 +67,7 @@ enum ColKind {
     Var { min: usize, max: usize },
 }
 
-fn col_spec_21() -> Vec<(u32, ColKind)> {
+fn col_spec_21() -> Vec<(LogicalFieldId, ColKind)> {
     let mut spec = Vec::new();
     for i in 0..8 {
         spec.push((100 + i, ColKind::Fixed(8)));
@@ -90,7 +90,7 @@ fn row_key(row: u64) -> Vec<u8> {
 }
 
 #[inline]
-fn var_len_for(row: u64, field: u32, min: usize, max: usize) -> usize {
+fn var_len_for(row: u64, field: LogicalFieldId, min: usize, max: usize) -> usize {
     let span = (max - min + 1) as u64;
     let mix = row
         .wrapping_mul(1103515245)
@@ -99,7 +99,11 @@ fn var_len_for(row: u64, field: u32, min: usize, max: usize) -> usize {
     (min as u64 + (mix % span)) as usize
 }
 
-fn build_puts_for_range<'a>(start: u64, end: u64, spec: &[(u32, ColKind)]) -> Vec<Put<'a>> {
+fn build_puts_for_range<'a>(
+    start: u64,
+    end: u64,
+    spec: &[(LogicalFieldId, ColKind)],
+) -> Vec<Put<'a>> {
     let mut puts = Vec::with_capacity(spec.len());
     for (field_id, kind) in spec.iter().copied() {
         let mut items = Vec::with_capacity((end - start) as usize);
@@ -124,7 +128,7 @@ fn build_puts_for_range<'a>(start: u64, end: u64, spec: &[(u32, ColKind)]) -> Ve
                 }
                 ColKind::Var { min, max } => {
                     let len = var_len_for(r, field_id, min, max);
-                    let byte = (((r as u32).wrapping_add(field_id)) & 0xFF) as u8;
+                    let byte = (((r as LogicalFieldId).wrapping_add(field_id)) & 0xFF) as u8;
                     vec![byte; len]
                 }
             };

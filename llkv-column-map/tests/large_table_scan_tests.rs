@@ -84,7 +84,7 @@ fn large_table_end_to_end_scans() {
     // -------------------------- Build 10 columns --------------------------
     // Single append per column (one big segment per column is allowed by limits).
     for col in 0..COLS {
-        let fid = BASE_FID + col as u32;
+        let fid = BASE_FID + col as LogicalFieldId;
         let mut items = Vec::with_capacity(ROWS as usize);
         for i in 0..ROWS {
             items.push((
@@ -143,7 +143,7 @@ fn large_table_end_to_end_scans() {
 
     let mut queries = Vec::with_capacity(COLS);
     for col in 0..COLS {
-        let fid = BASE_FID + col as u32;
+        let fid = BASE_FID + col as LogicalFieldId;
         queries.push((fid, sample_keys.clone()));
     }
     let got = store.get_many(queries);
