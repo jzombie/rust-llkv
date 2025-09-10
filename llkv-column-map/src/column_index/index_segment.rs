@@ -7,6 +7,10 @@ use std::hash::Hasher;
 
 // -------------------------- Bloom (persisted) --------------------------
 
+// TODO: Consider (if ever using var-width or long keys): Keep the Bloom on keys but make
+// its hash O(1) in key length (sample head+tail + length), and consider head_tag_len = 16
+// for key-ordered scans to reduce full key memcmps.
+//
 /// Compact Bloom filter persisted inside `IndexSegment`.
 ///
 /// Design:
