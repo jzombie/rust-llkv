@@ -1,4 +1,4 @@
-//! Arrow <-> llkv-column-map bridge.
+//! Experimental Arrow <-> llkv-column-map bridge.
 //!
 //! Writer:
 //!   - Builds Put vectors from an Arrow RecordBatch.

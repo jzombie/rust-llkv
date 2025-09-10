@@ -1,5 +1,3 @@
-// benches/olap_bench.rs
-
 use arrow::compute::{filter, sum};
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
