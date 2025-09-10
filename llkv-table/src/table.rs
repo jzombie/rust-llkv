@@ -131,7 +131,7 @@ impl Table {
     /// column. Choose `driver_fid` with wide coverage (e.g., PK or
     /// common column).
     ///
-    /// For each row, projected columns are fetched via `get_many`.
+    /// For each row, projected columns are fetched via `get_many_projected`.
     pub fn scan_by_row_id_range<F>(
         &self,
         driver_fid: FieldId,
@@ -205,6 +205,7 @@ impl Table {
                 Err(e) => panic!("scan init error: {:?}", e),
             };
 
+            // Own the keys for this page and keep them alive while we query.
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(page);
             let mut last_key: Option<Vec<u8>> = None;
 
@@ -217,13 +218,12 @@ impl Table {
                 break;
             }
 
-            // Batch point-lookups across projected columns.
-            let queries: Vec<(LogicalFieldId, Vec<Vec<u8>>)> = project
-                .iter()
-                .map(|fid| (*fid as LogicalFieldId, keys.clone()))
-                .collect();
+            // Build shared keyset & fid list for get_many_projected.
+            let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+            let fids: Vec<LogicalFieldId> =
+                project.iter().map(|fid| *fid as LogicalFieldId).collect();
 
-            let results = self.store.get_many(queries);
+            let results = self.store.get_many_projected(&fids, &key_refs);
 
             // Emit rows in the same order as `keys`.
             for (i, key) in keys.iter().enumerate() {
@@ -343,14 +343,15 @@ impl Table {
             return Ok(());
         }
 
-        // Align keys for batch point-lookups across projection.
+        // Shared keyset for this projection batch.
         let keys: Vec<Vec<u8>> = rids.iter().map(|r| row_key_bytes(*r)).collect();
-        let queries: Vec<(LogicalFieldId, Vec<Vec<u8>>)> = projection
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let fids: Vec<LogicalFieldId> = projection
             .iter()
-            .map(|fid| (*fid as LogicalFieldId, keys.clone()))
+            .map(|fid| (*fid as LogicalFieldId))
             .collect();
 
-        let results = self.store.get_many(queries);
+        let results = self.store.get_many_projected(&fids, &key_refs);
 
         // Emit per-row, preserving rids order.
         for (i, rid) in rids.into_iter().enumerate() {
