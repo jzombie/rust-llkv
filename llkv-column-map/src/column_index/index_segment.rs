@@ -114,7 +114,7 @@ impl KeyBloom {
         let k_hashes = k as u8;
 
         // Allocate bitset.
-        let bytes_len = ((m_bits + 7) / 8) as usize;
+        let bytes_len = m_bits.div_ceil(8) as usize;
         let mut bits = vec![0u8; bytes_len];
 
         // Insert each key using double hashing.
