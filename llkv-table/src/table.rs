@@ -23,6 +23,15 @@ use llkv_column_map::views::ValueSlice;
 use crate::expr::{Expr, Filter, Operator};
 use crate::types::{FieldId, RowId, RowPatch};
 
+/// Internal "presence" column:
+/// - We write a single byte for every inserted row into this hidden column.
+/// - This lets us stream *all* row_ids in row-id order, enabling proper
+///   semantics for `NOT` (complement against the universe of rows),
+///   and future helpers like row_count(), existence checks, etc.
+/// - Kept entirely private; callers never see or pass this fid.
+const PRESENCE_FID: LogicalFieldId = u32::MAX - 7;
+const PRESENCE_VAL: &[u8] = b"\x01";
+
 /// Encode row id as big-endian bytes so lexicographic order == numeric.
 #[inline]
 fn row_key_bytes(row_id: RowId) -> Vec<u8> {
@@ -51,6 +60,10 @@ pub struct TableCfg {
     pub segment_max_entries: usize,
     pub segment_max_bytes: usize,
     pub last_write_wins_in_batch: bool,
+
+    /// Track presence for each row in a hidden internal column.
+    /// Enables `NOT` and "full table" scans without exposing any fid.
+    pub track_presence: bool,
 }
 
 impl Default for TableCfg {
@@ -59,6 +72,7 @@ impl Default for TableCfg {
             segment_max_entries: 100_000,
             segment_max_bytes: 32 << 20,
             last_write_wins_in_batch: true,
+            track_presence: true,
         }
     }
 }
@@ -107,6 +121,14 @@ impl Table {
                     .entry(*fid as LogicalFieldId)
                     .or_default()
                     .push((Cow::Owned(key.clone()), col_in.clone()));
+            }
+
+            // --- Internal presence write (hidden column) ---
+            if self.cfg.track_presence {
+                by_col
+                    .entry(PRESENCE_FID)
+                    .or_default()
+                    .push((Cow::Owned(key), Cow::Borrowed(PRESENCE_VAL)));
             }
         }
 
@@ -420,7 +442,7 @@ impl Table {
                 let (tx, rx) = xchan::unbounded();
                 std::thread::spawn(move || {
                     use std::collections::HashSet;
-                    let mut acc: HashSet<RowId> = HashSet::new();
+                    let mut acc: HashSet<RowId> = std::collections::HashSet::new();
                     for s in streams {
                         for rid in s {
                             acc.insert(rid);
@@ -434,9 +456,35 @@ impl Table {
                 });
                 Ok(Some(rx))
             }
-            Expr::Not(_) => {
-                // Old impl left this unimplemented; do the same here.
-                unimplemented!("Expr::Not is not implemented");
+            Expr::Not(inner) => {
+                // Presence complement Universe \ Positives.
+                if !self.cfg.track_presence {
+                    // Defensive: if someone disables presence, make it explicit.
+                    return Err(CmError::ScanInit(
+                        "Expr::Not requires TableCfg.track_presence=true".into(),
+                    ));
+                }
+
+                // Evaluate the positive side first (synchronously).
+                let pos_rx_opt = self.get_row_id_stream(inner)?;
+                let pos_set: std::collections::HashSet<RowId> = match pos_rx_opt {
+                    None => std::collections::HashSet::new(),
+                    Some(rx) => rx.into_iter().collect(),
+                };
+
+                // Stream all rows via presence and subtract positives.
+                let all_rx = self.stream_all_row_ids();
+                let (tx, rx) = xchan::unbounded();
+                std::thread::spawn(move || {
+                    for rid in all_rx {
+                        if !pos_set.contains(&rid) {
+                            if tx.send(rid).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+                Ok(Some(rx))
             }
         }
     }
@@ -509,6 +557,43 @@ impl Table {
         drop(tx);
 
         Ok(Some(rx))
+    }
+
+    /// Stream all row ids in **row-id order** via the hidden presence column.
+    fn stream_all_row_ids(&self) -> xchan::Receiver<RowId> {
+        use llkv_column_map::column_store::read_scan::ScanError;
+        let (tx, rx) = xchan::unbounded();
+
+        match self.store.scan_values_lww(
+            PRESENCE_FID,
+            ValueScanOpts {
+                order_by: OrderBy::Key,
+                dir: Direction::Forward,
+                lo: Bound::Unbounded,
+                hi: Bound::Unbounded,
+                prefix: None,
+                bucket_prefix_len: 2,
+                // 16 minimizes head-tie fallbacks inside column-map.
+                head_tag_len: 16,
+                frame_predicate: None,
+            },
+        ) {
+            Ok(iter) => {
+                for item in iter {
+                    let rid = parse_row_id(item.key.as_slice());
+                    if tx.send(rid).is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(ScanError::NoActiveSegments) | Err(ScanError::ColumnMissing(_)) => {
+                // Empty table or presence not yet written => empty stream.
+            }
+            Err(e) => panic!("presence scan init error: {:?}", e),
+        }
+
+        drop(tx);
+        rx
     }
 
     /// Access to the underlying store for power users.
@@ -980,5 +1065,73 @@ mod tests {
             .unwrap();
         or_rows.sort_unstable();
         assert_eq!(or_rows, vec![1, 4, 6, 8, 11, 12, 16, 20]);
+    }
+
+    #[test]
+    fn not_equals_returns_complement_including_missing_field() {
+        let table = Table::new(TableCfg::default());
+
+        const F_NAME: FieldId = 301;
+
+        // 1..=5; only rows 2 and 4 have the value "target"
+        let rows: Vec<RowPatch> = (1..=5)
+            .map(|rid| {
+                if rid % 2 == 0 {
+                    mk_row(rid, &[(F_NAME, s("target"))])
+                } else {
+                    // row present but field missing
+                    mk_row(rid, &[])
+                }
+            })
+            .collect();
+        table.insert_many(&rows);
+
+        let tgt = b"target";
+        let expr = Expr::Not(Box::new(Expr::Pred(Filter {
+            field_id: F_NAME,
+            op: Operator::Equals(tgt),
+        })));
+
+        let mut got: Vec<RowId> = Vec::new();
+        table.scan_expr(&expr, &[], |rid, _| got.push(rid)).unwrap();
+        got.sort_unstable();
+
+        // Expect all rows except {2,4}
+        assert_eq!(got, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn not_over_empty_predicate_yields_all_rows() {
+        let table = Table::new(TableCfg::default());
+
+        const F_TAG: FieldId = 401;
+
+        // Insert 4 rows with **no** F_TAG values at all.
+        let rows: Vec<RowPatch> = (1..=4).map(|rid| mk_row(rid, &[])).collect();
+        table.insert_many(&rows);
+
+        // Positive predicate has no matches -> NOT(empty) == all rows.
+        let expr = Expr::Not(Box::new(Expr::Pred(Filter {
+            field_id: F_TAG,
+            op: Operator::Equals(b"never-appears"),
+        })));
+
+        let mut got: Vec<RowId> = Vec::new();
+        table.scan_expr(&expr, &[], |rid, _| got.push(rid)).unwrap();
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn presence_stream_orders_row_ids_by_key() {
+        let table = Table::new(TableCfg::default());
+        let rows: Vec<RowPatch> = vec![mk_row(3, &[]), mk_row(1, &[]), mk_row(2, &[])];
+        table.insert_many(&rows);
+
+        // Stream all and check order 1,2,3
+        let rx = table.stream_all_row_ids();
+        let mut got: Vec<RowId> = rx.into_iter().collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2, 3]);
     }
 }
