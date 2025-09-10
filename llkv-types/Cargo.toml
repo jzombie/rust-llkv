@@ -9,3 +9,6 @@ publish.workspace = true
 
 [dependencies]
 bitcode.workspace = true
+
+[dev-dependencies]
+llkv-column-map.workspace = true

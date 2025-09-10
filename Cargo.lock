@@ -901,6 +901,7 @@ name = "llkv-types"
 version = "0.1.0-alpha"
 dependencies = [
  "bitcode",
+ "llkv-column-map",
 ]
 
 [[package]]
