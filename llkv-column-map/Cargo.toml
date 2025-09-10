@@ -9,7 +9,6 @@ publish.workspace = true
 
 [dependencies]
 bitcode.workspace = true
-bloomfilter = "3.0.1"
 rustc-hash.workspace = true
 
 [dev-dependencies]
