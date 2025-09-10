@@ -126,7 +126,7 @@ fn paginate_strings_as_keys_smoke() {
     let page_size = 1009usize;
     seed_strings_as_keys(&store, fid, n, 0xDEADBEEF);
 
-    // REFACTORED: Create the iterator once for the entire scan.
+    // Create the iterator once for the entire scan.
     let mut it = store
         .scan_values_lww(
             fid,
@@ -143,7 +143,7 @@ fn paginate_strings_as_keys_smoke() {
     let mut seen: usize = 0;
     let mut last_key: Option<Vec<u8>> = None;
 
-    // REFACTORED: Loop by consuming the single iterator instance in pages.
+    // Loop by consuming the single iterator instance in pages.
     loop {
         let page_items: Vec<_> = it.by_ref().take(page_size).collect();
         if page_items.is_empty() {
