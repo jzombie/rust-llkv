@@ -897,6 +897,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-types"
+version = "0.1.0-alpha"
+dependencies = [
+ "bitcode",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
