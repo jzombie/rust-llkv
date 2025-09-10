@@ -56,6 +56,7 @@ pub enum ConflictPolicy {
 /// Frame predicate type over encoded **values** (head vs current).
 pub type FramePred = Arc<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync>;
 
+// TODO: Rename to `ColumnScanOpts`?
 /// Scan options.
 pub struct ValueScanOpts<'a> {
     /// Direction along the chosen `order_by`.
@@ -92,6 +93,7 @@ impl<'a> Default for ValueScanOpts<'a> {
     }
 }
 
+// TODO: Rename to `ColumnScanItem`?
 /// Public item: zero-copy value slice + owned key bytes.
 pub struct ValueScanItem<B> {
     pub key: LogicalKeyBytes,
@@ -114,6 +116,46 @@ struct SegCtx<P: Pager> {
     /// Cached logical-key bounds (for fast reject in membership probes).
     min_key: LogicalKeyBytes,
     max_key: LogicalKeyBytes,
+
+    // prefiltered domination candidates
+    /// Indices into `self.segs` that dominate this segment (active, index+data loaded).
+    dominators_active: Vec<usize>,
+    /// Shadow (index-only) segments that dominate this segment (physical keys).
+    dominators_shadow: Vec<PhysicalKey>,
+}
+
+#[inline]
+fn dominates_by_policy(policy: ConflictPolicy, winner_rank: usize, candidate_rank: usize) -> bool {
+    match policy {
+        // Lower rank == newer. In LWW, newer dominates older.
+        ConflictPolicy::LWW => winner_rank < candidate_rank,
+        // In FWW, older dominates newer.
+        ConflictPolicy::FWW => winner_rank > candidate_rank,
+    }
+}
+
+/// Borrowed key slice packed into a pointer + length.
+/// Safety: the slice must outlive the node (the iterator owns the segments).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyRef {
+    ptr: *const u8,
+    len: u32,
+}
+
+impl KeyRef {
+    #[inline(always)]
+    fn from_slice(s: &[u8]) -> Self {
+        Self {
+            ptr: s.as_ptr(),
+            len: s.len() as u32,
+        }
+    }
+
+    #[inline(always)]
+    fn as_slice<'a>(self) -> &'a [u8] {
+        // SAFETY: ValueScan holds all segment storage for the iterator lifetime.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len as usize) }
+    }
 }
 
 /// Minimal metadata for shadow (index-only) membership checks.
@@ -122,6 +164,7 @@ struct ShadowRef {
     rank: usize,
 }
 
+// TODO: Rename to `ColumnScan`?
 /// The iterator. Owns the PQ and segment cursors.
 pub struct ValueScan<P: Pager> {
     segs: Vec<SegCtx<P>>,
@@ -326,7 +369,10 @@ impl<P: Pager> RadixPq<P> {
 #[derive(Clone)]
 struct Node<P: Pager> {
     bucket: u16,
-    head_tag: u64,
+    // 16-byte big-endian prefix after the bucket (left-aligned, zero-padded).
+    // We store it as two u64's to keep Ord impl simple and branchless.
+    head_tag_hi: u64, // most significant 8 bytes
+    head_tag_lo: u64, // least significant 8 bytes
     /// Newest-first tie-breaker: lower rank means newer.
     rank: usize,
     seg_idx: usize,
@@ -337,79 +383,136 @@ struct Node<P: Pager> {
     /// Zero-copy value slice (for returning and for frame predicate).
     val: ValueSlice<P::Blob>,
     /// When present, ordering is by KEY bytes; otherwise by VALUE bytes.
-    key_ord: Option<Vec<u8>>,
+    key_ord: Option<KeyRef>,
     reverse: bool,
 }
 
 impl<P: Pager> Node<P> {
     #[inline(always)]
     fn bytes(&self) -> &[u8] {
-        if let Some(ref k) = self.key_ord {
-            k.as_slice()
+        if let Some(kref) = self.key_ord {
+            kref.as_slice()
         } else {
-            let a = self.val.start as usize;
-            let b = self.val.end as usize;
-            &self.val.data.as_ref()[a..b]
+            &self.val.data.as_ref()[self.val.start as usize..self.val.end as usize]
         }
     }
 }
 
 impl<P: Pager> Eq for Node<P> {}
+
 impl<P: Pager> PartialEq for Node<P> {
     fn eq(&self, other: &Self) -> bool {
         self.bucket == other.bucket
-            && self.head_tag == other.head_tag
+            && self.head_tag_hi == other.head_tag_hi
+            && self.head_tag_lo == other.head_tag_lo
             && self.bytes() == other.bytes()
             && self.rank == other.rank
             && self.pos == other.pos
             && self.reverse == other.reverse
     }
 }
+
 impl<P: Pager> Ord for Node<P> {
-    fn cmp(&self, other: &Self) -> Ordering {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+        // radix bucket first (fast reject)
         let mut ord = if !self.reverse {
             self.bucket.cmp(&other.bucket)
         } else {
             other.bucket.cmp(&self.bucket)
         };
-        if ord != Ordering::Equal {
+        if ord != Equal {
             return ord;
         }
 
+        // 16-byte tag (hi then lo) — already left-aligned BE so lexicographic
         ord = if !self.reverse {
-            self.head_tag.cmp(&other.head_tag)
+            (self.head_tag_hi, self.head_tag_lo).cmp(&(other.head_tag_hi, other.head_tag_lo))
         } else {
-            other.head_tag.cmp(&self.head_tag)
+            (other.head_tag_hi, other.head_tag_lo).cmp(&(self.head_tag_hi, self.head_tag_lo))
         };
-        if ord != Ordering::Equal {
+        if ord != Equal {
             return ord;
         }
 
+        // Full bytes comparison only on ties inside the same 16-byte tag bucket
         ord = if !self.reverse {
             self.bytes().cmp(other.bytes())
         } else {
             other.bytes().cmp(self.bytes())
         };
-        if ord != Ordering::Equal {
+        if ord != Equal {
             return ord;
         }
 
-        // Newer (smaller rank) first on perfect byte ties.
+        // tie-breakers keep iteration stable
         ord = self.rank.cmp(&other.rank);
-        if ord != Ordering::Equal {
+        if ord != Equal {
             return ord;
         }
-
-        // Stable within-segment ordering.
         self.pos.cmp(&other.pos)
     }
 }
+
 impl<P: Pager> PartialOrd for Node<P> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
+/// Build (bucket, 16B tag) from VALUE bytes.
+#[inline(always)]
+fn bucket_and_tag128_from_value_slice<P: Pager>(
+    v: &ValueSlice<P::Blob>,
+    bucket_prefix_len: usize,
+    head_tag_len: usize, // ≤ 16 in current design
+) -> (u16, u64, u64) {
+    let bytes = &v.data.as_ref()[v.start as usize..v.end as usize];
+    bucket_and_tag128_from_bytes(bytes, bucket_prefix_len, head_tag_len)
+}
+
+/// Build (bucket, 16B tag) from KEY bytes with a fast path.
+#[inline(always)]
+fn bucket_and_tag128_bytes_fast(
+    key_bytes: &[u8],
+    bucket_prefix_len: usize,
+    head_tag_len: usize,
+) -> (u16, u64, u64) {
+    bucket_and_tag128_from_bytes(key_bytes, bucket_prefix_len, head_tag_len)
+}
+
+#[inline(always)]
+fn bucket_and_tag128_from_bytes(
+    bytes: &[u8],
+    bucket_prefix_len: usize,
+    head_tag_len: usize, // ≤ 16
+) -> (u16, u64, u64) {
+    // bucket = first 2 bytes big-endian; zeros if missing
+    let b0 = *bytes.first().unwrap_or(&0) as u16;
+    let b1 = *bytes.get(1).unwrap_or(&0) as u16;
+    let bucket = (b0 << 8) | b1;
+
+    // tag window begins after the configured prefix (usually 2)
+    let start = bucket_prefix_len.min(bytes.len());
+    let avail = bytes.len().saturating_sub(start);
+    let take = core::cmp::min(avail, head_tag_len.min(16));
+
+    // Build a BE u128 by shifting-in each byte, then left-pad to 16B so that
+    // shorter prefixes compare correctly (memcmp semantics).
+    let mut acc: u128 = 0;
+    for &x in &bytes[start..start + take] {
+        acc = (acc << 8) | (x as u128);
+    }
+    // Left-pad: place the taken bytes at the MSB side of the 16-byte lane.
+    let pad_bytes = 16usize.saturating_sub(take);
+    acc <<= (pad_bytes * 8) as u32;
+
+    let hi = (acc >> 64) as u64;
+    let lo = acc as u64;
+    (bucket, hi, lo)
+}
+
+// TODO: Rename * from `scan_values_*` to `scan_*` since this can do key or value based scanning
 impl<P: Pager> super::ColumnStore<'_, P> {
     /// LWW-enforced scan over [lo, hi) in the chosen domain (value/key).
     pub fn scan_values_lww(
@@ -670,6 +773,8 @@ impl<P: Pager> ValueScan<P> {
                 end,
                 min_key,
                 max_key,
+                dominators_active: Vec::new(),
+                dominators_shadow: Vec::new(),
             });
 
             // Head depends on direction.
@@ -679,13 +784,11 @@ impl<P: Pager> ValueScan<P> {
                 begin
             };
 
-            // Build first node for this segment.
             let (seg_ref, data_ref) = {
                 let s = &segs[seg_idx].seg;
                 let d = &segs[seg_idx].data;
                 (s, d)
             };
-            // Row position depends on ordering.
             let head_row = if by_value {
                 row_pos_at(seg_ref, head_pos)
             } else {
@@ -694,42 +797,54 @@ impl<P: Pager> ValueScan<P> {
             let val = slice_value::<P>(seg_ref, data_ref, head_row);
 
             // Ordering fields (bucket/tag) + optional key bytes.
-            let (bucket, tag, key_ord) = if by_value {
-                let (bkt, tg) = bucket_and_tag_from_value_slice::<P>(
+            if by_value {
+                let (bkt, hi, lo) = bucket_and_tag128_from_value_slice::<P>(
                     &val,
                     opts.bucket_prefix_len,
                     opts.head_tag_len,
                 );
-                (bkt, tg, None)
+                pq.push(Node {
+                    bucket: bkt,
+                    head_tag_hi: hi,
+                    head_tag_lo: lo,
+                    rank,
+                    seg_idx,
+                    pos: head_pos,
+                    val,
+                    key_ord: None,
+                    reverse: matches!(opts.dir, Direction::Reverse),
+                });
             } else {
                 let key_slice = KeyLayout::slice_key_by_layout(
                     &seg_ref.logical_key_bytes,
                     &seg_ref.key_layout,
                     head_row,
                 );
-                let kb = key_slice.to_vec();
-                let (bkt, tg) =
-                    bucket_and_tag_bytes_fast(&kb, opts.bucket_prefix_len, opts.head_tag_len);
-                (bkt, tg, Some(kb))
-            };
-
-            pq.push(Node {
-                bucket,
-                head_tag: tag,
-                rank,
-                seg_idx,
-                pos: head_pos,
-                val,
-                key_ord,
-                reverse: matches!(opts.dir, Direction::Reverse),
-            });
+                let (bkt, hi, lo) = bucket_and_tag128_bytes_fast(
+                    key_slice,
+                    opts.bucket_prefix_len,
+                    opts.head_tag_len,
+                );
+                pq.push(Node {
+                    bucket: bkt,
+                    head_tag_hi: hi,
+                    head_tag_lo: lo,
+                    rank,
+                    seg_idx,
+                    pos: head_pos,
+                    val,
+                    key_ord: Some(KeyRef::from_slice(key_slice)),
+                    reverse: matches!(opts.dir, Direction::Reverse),
+                });
+            }
         }
 
         if pq.is_empty() {
             return Err(ScanError::NoActiveSegments);
         }
 
-        Ok(Self {
+        // Construct, precompute dominators once, return.
+        let mut me = Self {
             segs,
             pq,
             _field_id: field_id,
@@ -745,7 +860,134 @@ impl<P: Pager> ValueScan<P> {
             bucket_prefix_len: opts.bucket_prefix_len,
             head_tag_len: opts.head_tag_len,
             policy,
-        })
+        };
+
+        // One-time precomputation for cheap shadow checks
+        me.precompute_dominators();
+
+        Ok(me)
+    }
+
+    /// One-time preprocessing: for each active segment, compute the (tiny) sets
+    /// of other segments that can dominate it under the policy, filtered by
+    /// logical-key span overlap. This makes per-row shadow checks cheap.
+    fn precompute_dominators(&mut self) {
+        let n = self.segs.len();
+
+        // Active-vs-active: find dominating active segments whose key spans overlap.
+        for i in 0..n {
+            let (ri, min_i, max_i) = (
+                self.segs[i].rank,
+                self.segs[i].min_key.as_slice(),
+                self.segs[i].max_key.as_slice(),
+            );
+            let mut acc: Vec<usize> = Vec::new();
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let rj = self.segs[j].rank;
+                if !dominates_by_policy(self.policy, rj, ri) {
+                    continue;
+                }
+                let min_j = self.segs[j].min_key.as_slice();
+                let max_j = self.segs[j].max_key.as_slice();
+                // span overlap: !(max_i < min_j || min_i > max_j)
+                if !(max_i < min_j || min_i > max_j) {
+                    acc.push(j);
+                }
+            }
+            self.segs[i].dominators_active = acc;
+        }
+
+        // Shadow: use preloaded index-only segments grouped by rank.
+        // For each active segment, collect only shadow segments that:
+        //   (a) are at ranks that dominate it, and
+        //   (b) overlap its key span.
+        // We already have all shadow IndexSegments in `shadow_seg_map`.
+        let ranks_len = self.shadow_by_rank.len();
+        for i in 0..n {
+            let (ri, min_i, max_i) = (
+                self.segs[i].rank,
+                self.segs[i].min_key.as_slice(),
+                self.segs[i].max_key.as_slice(),
+            );
+            let mut acc: Vec<PhysicalKey> = Vec::new();
+
+            let rank_iter: Box<dyn Iterator<Item = usize>> = match self.policy {
+                ConflictPolicy::LWW => Box::new(0..ri), // newer ranks only
+                ConflictPolicy::FWW => Box::new((ri + 1)..ranks_len), // older ranks only
+            };
+
+            for r in rank_iter {
+                for rf in &self.shadow_by_rank[r] {
+                    if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
+                        // Compute shadow key span once here (cheap).
+                        let min_j = KeyLayout::slice_key_by_layout(
+                            &seg.logical_key_bytes,
+                            &seg.key_layout,
+                            0,
+                        );
+                        let max_j = KeyLayout::slice_key_by_layout(
+                            &seg.logical_key_bytes,
+                            &seg.key_layout,
+                            seg.n_entries as usize - 1,
+                        );
+                        if !(max_i < min_j || min_i > max_j) {
+                            acc.push(rf.pk);
+                        }
+                    }
+                }
+            }
+            self.segs[i].dominators_shadow = acc;
+        }
+    }
+
+    /// Check whether `key` from active segment `seg_idx` is shadowed under the current policy.
+    #[inline]
+    fn is_shadowed_for_seg(&self, seg_idx: usize, key: &[u8]) -> bool {
+        let sc = &self.segs[seg_idx];
+
+        // 1) Active dominators (index+data already loaded).
+        for &j in &sc.dominators_active {
+            let other = &self.segs[j];
+
+            // quick span reject
+            if key < other.min_key.as_slice() || key > other.max_key.as_slice() {
+                continue;
+            }
+
+            // persisted Bloom prefilter
+            if !other.seg.key_bloom.check(key) {
+                continue;
+            }
+
+            // precise probe
+            if Self::key_in_index(&other.seg, key) {
+                return true;
+            }
+        }
+
+        // 2) Shadow dominators (index-only, preloaded).
+        for pk in &sc.dominators_shadow {
+            if let Some(seg) = self.shadow_seg_map.get(pk) {
+                if !Self::key_within_seg_bounds(seg, key) {
+                    continue;
+                }
+
+                // persisted Bloom prefilter
+                if !seg.key_bloom.check(key) {
+                    continue;
+                }
+
+                // precise probe
+                if Self::key_in_index(seg, key) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     #[inline]
@@ -770,60 +1012,6 @@ impl<P: Pager> ValueScan<P> {
         );
         !(key < min || key > max)
     }
-
-    /// Is this `key@rank` shadowed by the chosen policy?
-    fn is_shadowed(&self, key: &[u8], rank: usize) -> bool {
-        // 1) Check against already-loaded active segments (index+data).
-        for sc in &self.segs {
-            let rel = sc.rank as isize - rank as isize;
-            let dominates = match self.policy {
-                ConflictPolicy::LWW => rel < 0, // newer dominates
-                ConflictPolicy::FWW => rel > 0, // older dominates
-            };
-            if !dominates {
-                continue;
-            }
-            if key < sc.min_key.as_slice() || key > sc.max_key.as_slice() {
-                continue;
-            }
-            if Self::key_in_index(&sc.seg, key) {
-                return true;
-            }
-        }
-
-        // 2) Check index-only shadow segments (prefetched).
-        match self.policy {
-            ConflictPolicy::LWW => {
-                for r in 0..rank {
-                    for rf in &self.shadow_by_rank[r] {
-                        if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
-                            if !Self::key_within_seg_bounds(seg, key) {
-                                continue;
-                            }
-                            if Self::key_in_index(seg, key) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-            ConflictPolicy::FWW => {
-                for r in (rank + 1)..self.shadow_by_rank.len() {
-                    for rf in &self.shadow_by_rank[r] {
-                        if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
-                            if !Self::key_within_seg_bounds(seg, key) {
-                                continue;
-                            }
-                            if Self::key_in_index(seg, key) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        false
-    }
 }
 
 impl<P: Pager> Iterator for ValueScan<P> {
@@ -838,7 +1026,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
             let node = self.pq.pop(self.reverse)?;
             let seg_idx = node.seg_idx;
 
-            // 0) Early frame check (value bytes only) — avoid extra work if we’ll halt.
+            // Early frame check (value-only).
             if let Some(pred) = &self.frame_pred
                 && let Some(ref head_slice) = self.frame_head
             {
@@ -853,38 +1041,37 @@ impl<P: Pager> Iterator for ValueScan<P> {
                     return None;
                 }
             }
-            // Initialize frame head lazily (semantics preserved).
             if self.frame_head.is_none() {
                 self.frame_head = Some(node.val.clone());
             }
 
-            // 1) Borrow the segment briefly to get:
-            //    - current row position (in the active ordering)
-            //    - a borrowed key slice for membership checks
-            //    - the next position + its value (and key bytes if key-ordered)
-            //    - whether this row is shadowed (under policy)
-            let (rank, next_pos_opt, next_val_opt, next_key_for_order, shadowed, key_owned_if_emit) = {
+            // Borrow the segment once; prepare everything we need.
+            let (
+                rank,
+                next_pos_opt,
+                next_val_opt,
+                next_key_for_order, // Option<KeyRef>
+                shadowed,
+                key_owned_if_emit, // Option<Vec<u8>>
+            ) = {
                 let sc = &self.segs[seg_idx];
 
-                // Row position depends on active ordering.
                 let row_pos = if self.by_value {
                     row_pos_at(&sc.seg, node.pos)
                 } else {
                     node.pos
                 };
 
-                // Borrowed key slice for membership checks.
+                // Borrowed key slice for membership check + eventual emission.
                 let key_slice = KeyLayout::slice_key_by_layout(
                     &sc.seg.logical_key_bytes,
                     &sc.seg.key_layout,
                     row_pos,
                 );
 
-                // Compute next cursor position in active window.
                 let next_pos_opt = next_pos(node.pos, sc.begin, sc.end, self.reverse);
 
-                // Prepare next value (and next key bytes if key-ordered) now,
-                // while we still have the borrow. Values are zero-copy.
+                // Prepare next node's value (and key-ref if key-ordered).
                 let (next_val_opt, next_key_for_order) = next_pos_opt.map_or((None, None), |np| {
                     let next_row = if self.by_value {
                         row_pos_at(&sc.seg, np)
@@ -892,25 +1079,22 @@ impl<P: Pager> Iterator for ValueScan<P> {
                         np
                     };
                     let sval = slice_value::<P>(&sc.seg, &sc.data, next_row);
-                    let skey_ord = if self.by_value {
+                    let skey_ref = if self.by_value {
                         None
                     } else {
-                        Some(
-                            KeyLayout::slice_key_by_layout(
-                                &sc.seg.logical_key_bytes,
-                                &sc.seg.key_layout,
-                                next_row,
-                            )
-                            .to_vec(),
-                        )
+                        let ks = KeyLayout::slice_key_by_layout(
+                            &sc.seg.logical_key_bytes,
+                            &sc.seg.key_layout,
+                            next_row,
+                        );
+                        Some(KeyRef::from_slice(ks))
                     };
-                    (Some(sval), skey_ord)
+                    (Some(sval), skey_ref)
                 });
 
-                // Shadow check uses the borrowed slice; no allocation yet.
-                let shadowed = self.is_shadowed(key_slice, sc.rank);
+                // Shadow check using precomputed dominators (+ Bloom prefilter).
+                let shadowed = self.is_shadowed_for_seg(seg_idx, key_slice);
 
-                // Only allocate the owned key if we are going to emit.
                 let key_owned_if_emit = if shadowed {
                     None
                 } else {
@@ -925,19 +1109,20 @@ impl<P: Pager> Iterator for ValueScan<P> {
                     shadowed,
                     key_owned_if_emit,
                 )
-            }; // <-- borrow of self.segs ends here
+            };
 
-            // Helper to push the next head if present (value- or key-ordered).
+            // Helper to push the next head if present.
             let mut push_next = |np: usize, val: ValueSlice<P::Blob>| {
                 if self.by_value {
-                    let (bkt, tag) = bucket_and_tag_from_value_slice::<P>(
+                    let (bkt, hi, lo) = bucket_and_tag128_from_value_slice::<P>(
                         &val,
                         self.bucket_prefix_len,
                         self.head_tag_len,
                     );
                     self.pq.push(Node {
                         bucket: bkt,
-                        head_tag: tag,
+                        head_tag_hi: hi,
+                        head_tag_lo: lo,
                         rank,
                         seg_idx,
                         pos: np,
@@ -946,10 +1131,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
                         reverse: self.reverse,
                     });
                 } else {
-                    let kb = next_key_for_order
-                        .as_ref()
-                        .expect("prepared key bytes for key order")
-                        .clone();
+                    let kb = next_key_for_order.expect("prepared KeyRef for key-ordered reseed");
                     push_next_keyordered(
                         &mut self.pq,
                         rank,
@@ -964,7 +1146,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
                 }
             };
 
-            // 2) If shadowed, just advance this segment and continue.
+            // If shadowed, advance this segment and continue.
             if shadowed {
                 if let (Some(np), Some(v)) = (next_pos_opt, next_val_opt) {
                     push_next(np, v);
@@ -972,12 +1154,12 @@ impl<P: Pager> Iterator for ValueScan<P> {
                 continue;
             }
 
-            // 3) Accepted: advance this segment before yielding.
+            // Accepted: advance before yielding.
             if let (Some(np), Some(v)) = (next_pos_opt, next_val_opt) {
                 push_next(np, v);
             }
 
-            // 4) Yield the current row (value zero-copy; key owned).
+            // Yield current row (value zero-copy; key is owned once).
             let key_owned = key_owned_if_emit.expect("owned key prepared for emission");
             return Some(ValueScanItem {
                 key: key_owned,
@@ -1077,17 +1259,25 @@ fn range_in_value_index<P: Pager>(
     if n == 0 {
         return (0, 0);
     }
-    // lower bound
+
+    // Lower bound:
+    //   Included(x) -> first k >= x
+    //   Excluded(x) -> first k >  x
     let begin = match lo {
         Bound::Unbounded => 0usize,
-        Bound::Included(x) | Bound::Excluded(x) => lower_bound_by_value::<P>(seg, vix, data, x),
+        Bound::Included(x) => lower_bound_by_value::<P>(seg, vix, data, x),
+        Bound::Excluded(x) => upper_bound_by_value::<P>(seg, vix, data, x, true),
     };
-    // upper bound (exclusive)
+
+    // Upper bound (exclusive end):
+    //   Included(x) -> first k >  x
+    //   Excluded(x) -> first k >= x
     let end = match hi {
         Bound::Unbounded => n,
         Bound::Included(x) => upper_bound_by_value::<P>(seg, vix, data, x, true),
         Bound::Excluded(x) => upper_bound_by_value::<P>(seg, vix, data, x, false),
     };
+
     (begin.min(n), end.min(n))
 }
 
@@ -1097,49 +1287,41 @@ fn range_in_key_index(seg: &IndexSegment, lo: &Bound<&[u8]>, hi: &Bound<&[u8]>) 
     if n == 0 {
         return (0, 0);
     }
+
     let begin = match lo {
         Bound::Unbounded => 0usize,
-        Bound::Included(x) | Bound::Excluded(x) => key_lower_bound(seg, x),
+        Bound::Included(x) => key_lower_bound(seg, x), // k >= x
+        Bound::Excluded(x) => key_upper_bound(seg, x, true), // k > x
     };
+
     let end = match hi {
         Bound::Unbounded => n,
-        Bound::Included(x) => key_upper_bound(seg, x, true),
-        Bound::Excluded(x) => key_upper_bound(seg, x, false),
+        Bound::Included(x) => key_upper_bound(seg, x, true), // k > x
+        Bound::Excluded(x) => key_upper_bound(seg, x, false), // k >= x
     };
+
     (begin.min(n), end.min(n))
 }
 
 #[inline(always)]
 fn key_lower_bound(seg: &IndexSegment, probe: &[u8]) -> usize {
-    let n = seg.n_entries as usize;
-    let (mut lo, mut hi) = (0usize, n);
-    while lo < hi {
-        let mid = (lo + hi) >> 1;
-        let k = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, mid);
-        if k < probe {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
+    KeyLayout::lower_bound(
+        &seg.logical_key_bytes,
+        &seg.key_layout,
+        seg.n_entries as usize,
+        probe,
+    )
 }
 
 #[inline(always)]
 fn key_upper_bound(seg: &IndexSegment, probe: &[u8], include_equal: bool) -> usize {
-    let n = seg.n_entries as usize;
-    let (mut lo, mut hi) = (0usize, n);
-    while lo < hi {
-        let mid = (lo + hi) >> 1;
-        let k = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, mid);
-        let go_right = if include_equal { k <= probe } else { k < probe };
-        if go_right {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
+    KeyLayout::upper_bound(
+        &seg.logical_key_bytes,
+        &seg.key_layout,
+        seg.n_entries as usize,
+        probe,
+        include_equal,
+    )
 }
 
 #[inline(always)]
@@ -1254,79 +1436,7 @@ fn cmp_value_at<P: Pager>(
     bytes.cmp(probe)
 }
 
-fn bucket_and_tag(v: &[u8], bucket_prefix_len: usize, head_tag_len: usize) -> (u16, u64) {
-    // bucket = first 2 bytes big-endian; zeros if missing
-    let b0 = *v.first().unwrap_or(&0) as u16;
-    let b1 = *v.get(1).unwrap_or(&0) as u16;
-    let bucket = (b0 << 8) | b1;
-
-    // tag = next up to head_tag_len bytes big-endian after the bucket prefix
-    let mut tag: u64 = 0;
-    let start = bucket_prefix_len;
-    let end = (start + head_tag_len).min(v.len());
-    for &x in &v[start..end] {
-        tag = (tag << 8) | (x as u64);
-    }
-    if end - start < head_tag_len {
-        tag <<= 8 * (head_tag_len - (end - start));
-    }
-    (bucket, tag)
-}
-
 // --------- hot-path specializations & cold helper ----------
-
-/// Fast path for (bucket_prefix_len == 2 && head_tag_len == 8) on VALUE slices.
-#[inline(always)]
-fn bucket_and_tag_from_value_slice<P: Pager>(
-    v: &ValueSlice<P::Blob>,
-    bucket_prefix_len: usize,
-    head_tag_len: usize,
-) -> (u16, u64) {
-    if bucket_prefix_len == 2 && head_tag_len == 8 {
-        let bytes = &v.data.as_ref()[v.start as usize..v.end as usize];
-        let b0 = *bytes.first().unwrap_or(&0) as u16;
-        let b1 = *bytes.get(1).unwrap_or(&0) as u16;
-        let bucket = (b0 << 8) | b1;
-        let mut tag: u64 = 0;
-        let mut i = 2usize;
-        let end = (2 + 8).min(bytes.len());
-        while i < end {
-            tag = (tag << 8) | (bytes[i] as u64);
-            i += 1;
-        }
-        tag <<= 8 * (2 + 8 - end);
-        (bucket, tag)
-    } else {
-        let a = v.start as usize;
-        let b = v.end as usize;
-        bucket_and_tag(&v.data.as_ref()[a..b], bucket_prefix_len, head_tag_len)
-    }
-}
-
-/// Fast path for (bucket_prefix_len == 2 && head_tag_len == 8) on KEY bytes.
-#[inline(always)]
-fn bucket_and_tag_bytes_fast(
-    v: &[u8],
-    bucket_prefix_len: usize,
-    head_tag_len: usize,
-) -> (u16, u64) {
-    if bucket_prefix_len == 2 && head_tag_len == 8 {
-        let b0 = *v.first().unwrap_or(&0) as u16;
-        let b1 = *v.get(1).unwrap_or(&0) as u16;
-        let bucket = (b0 << 8) | b1;
-        let mut tag: u64 = 0;
-        let mut i = 2usize;
-        let end = (2 + 8).min(v.len());
-        while i < end {
-            tag = (tag << 8) | (v[i] as u64);
-            i += 1;
-        }
-        tag <<= 8 * (2 + 8 - end);
-        (bucket, tag)
-    } else {
-        bucket_and_tag(v, bucket_prefix_len, head_tag_len)
-    }
-}
 
 /// Keep the key-ordered reseed path out of the hot icache.
 #[allow(clippy::too_many_arguments)] // TODO: Refactor
@@ -1338,15 +1448,17 @@ fn push_next_keyordered<P: Pager>(
     seg_idx: usize,
     pos: usize,
     val: ValueSlice<P::Blob>,
-    kb: Vec<u8>,
+    kb: KeyRef,
     reverse: bool,
     bucket_prefix_len: usize,
     head_tag_len: usize,
 ) {
-    let (bkt, tag) = bucket_and_tag_bytes_fast(&kb, bucket_prefix_len, head_tag_len);
+    let (bkt, hi, lo) =
+        bucket_and_tag128_bytes_fast(kb.as_slice(), bucket_prefix_len, head_tag_len);
     pq.push(Node {
         bucket: bkt,
-        head_tag: tag,
+        head_tag_hi: hi,
+        head_tag_lo: lo,
         rank,
         seg_idx,
         pos,
@@ -1362,6 +1474,186 @@ fn clone_bound_bytes(b: &Bound<&[u8]>) -> Bound<Vec<u8>> {
         Bound::Unbounded => Bound::Unbounded,
         Bound::Included(x) => Bound::Included((*x).to_vec()),
         Bound::Excluded(x) => Bound::Excluded((*x).to_vec()),
+    }
+}
+
+// ========================= pagination: public types =======================
+
+/// Page of results plus a continuation token in the chosen domain.
+/// - OrderBy::Key   => token is the last emitted KEY bytes.
+/// - OrderBy::Value => token is the last emitted VALUE bytes.
+pub struct PageResult<B> {
+    pub items: Vec<ValueScanItem<B>>,
+    pub next: Option<Vec<u8>>,
+}
+
+// ====================== pagination: bound combinators =====================
+
+#[inline]
+fn lower_bound_max<'a>(a: Bound<&'a [u8]>, b: Bound<&'a [u8]>) -> Bound<&'a [u8]> {
+    use Bound::*;
+    match (a, b) {
+        (Unbounded, x) => x,
+        (x, Unbounded) => x,
+        (Included(ax), Included(bx)) => {
+            if ax < bx {
+                Included(bx)
+            } else {
+                Included(ax)
+            }
+        }
+        (Included(ax), Excluded(bx)) => {
+            if ax < bx {
+                Excluded(bx)
+            } else {
+                Included(ax)
+            }
+        }
+        (Excluded(ax), Included(bx)) => {
+            if ax <= bx {
+                Included(bx)
+            } else {
+                Excluded(ax)
+            }
+        }
+        (Excluded(ax), Excluded(bx)) => {
+            if ax < bx {
+                Excluded(bx)
+            } else {
+                Excluded(ax)
+            }
+        }
+    }
+}
+
+#[inline]
+fn upper_bound_min<'a>(a: Bound<&'a [u8]>, b: Bound<&'a [u8]>) -> Bound<&'a [u8]> {
+    use Bound::*;
+    match (a, b) {
+        (Unbounded, x) => x,
+        (x, Unbounded) => x,
+        (Included(ax), Included(bx)) => {
+            if ax <= bx {
+                Included(ax)
+            } else {
+                Included(bx)
+            }
+        }
+        (Included(ax), Excluded(bx)) => {
+            if ax < bx {
+                Included(ax)
+            } else {
+                Excluded(bx)
+            }
+        }
+        (Excluded(ax), Included(bx)) => {
+            if ax <= bx {
+                Excluded(ax)
+            } else {
+                Included(bx)
+            }
+        }
+        (Excluded(ax), Excluded(bx)) => {
+            if ax <= bx {
+                Excluded(ax)
+            } else {
+                Excluded(bx)
+            }
+        }
+    }
+}
+
+// =================== pagination: opts-driven entry points =================
+
+impl<P: Pager> super::ColumnStore<'_, P> {
+    /// Keyset pagination with LWW over key or value order, designed for stateless API calls.
+    ///
+    /// This helper function creates a new scan iterator on every call, making it suitable for
+    /// environments where state cannot be held between requests (e.g., a web API).
+    /// For high-performance, continuous scans within a single process, create the `ValueScan`
+    /// iterator directly and consume it in a loop.
+    pub fn page_scan_lww_with_opts(
+        &self,
+        field_id: LogicalFieldId,
+        base: &ValueScanOpts<'_>,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<PageResult<P::Blob>, ScanError> {
+        self.page_scan_with_opts_and_policy(field_id, base, cursor, limit, ConflictPolicy::LWW)
+    }
+
+    /// FWW variant of the same.
+    pub fn page_scan_fww_with_opts(
+        &self,
+        field_id: LogicalFieldId,
+        base: &ValueScanOpts<'_>,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<PageResult<P::Blob>, ScanError> {
+        self.page_scan_with_opts_and_policy(field_id, base, cursor, limit, ConflictPolicy::FWW)
+    }
+
+    fn page_scan_with_opts_and_policy(
+        &self,
+        field_id: LogicalFieldId,
+        base: &ValueScanOpts<'_>,
+        cursor: Option<&[u8]>,
+        limit: usize,
+        policy: ConflictPolicy,
+    ) -> Result<PageResult<P::Blob>, ScanError> {
+        // Compute effective lo/hi by composing the base bounds with
+        // the keyset cursor in the chosen direction.
+        let curb = cursor.map(Bound::Excluded).unwrap_or(Bound::Unbounded);
+
+        let (eff_lo, eff_hi) = match base.dir {
+            Direction::Forward => (lower_bound_max(base.lo, curb), base.hi),
+            Direction::Reverse => (base.lo, upper_bound_min(base.hi, curb)),
+        };
+
+        // Build the concrete opts for this page. Everything except lo/hi
+        // is preserved from `base`.
+        let opts = ValueScanOpts {
+            dir: base.dir,
+            lo: eff_lo,
+            hi: eff_hi,
+            prefix: base.prefix,
+            bucket_prefix_len: base.bucket_prefix_len,
+            head_tag_len: base.head_tag_len,
+            frame_predicate: base.frame_predicate.clone(),
+            order_by: base.order_by,
+        };
+
+        // Start the scan. Natural end: NoActiveSegments -> empty page.
+        let mut it = match self.scan_values_with_policy(field_id, opts, policy) {
+            Ok(it) => it,
+            Err(ScanError::NoActiveSegments) => {
+                return Ok(PageResult {
+                    items: vec![],
+                    next: None,
+                });
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Pull up to `limit` items. Compute the next token in the
+        // ordering domain (key or value).
+        let mut items: Vec<ValueScanItem<P::Blob>> = Vec::with_capacity(limit);
+
+        let mut next: Option<Vec<u8>> = None;
+
+        for x in it.by_ref().take(limit) {
+            next = Some(match base.order_by {
+                OrderBy::Key => x.key.clone(),
+                OrderBy::Value => {
+                    let a = x.value.start as usize;
+                    let b = x.value.end as usize;
+                    x.value.data.as_ref()[a..b].to_vec()
+                }
+            });
+            items.push(x);
+        }
+
+        Ok(PageResult { items, next })
     }
 }
 
@@ -1962,5 +2254,229 @@ mod value_scan_tests {
             0,
             "last yielded key should be the minimum"
         );
+    }
+
+    // Key-ordered pagination, forward.
+    // Uses last key of each page as the cursor for the next page.
+    #[test]
+    fn scan_values_lww_pagination_key_forward() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 551u32;
+
+        seed_three_generations(&store, fid);
+
+        let page_size = 137usize;
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut last_key: Option<Vec<u8>> = None;
+        let mut all_keys: Vec<Vec<u8>> = Vec::new();
+
+        let base = ValueScanOpts {
+            order_by: OrderBy::Key,
+            dir: Direction::Forward,
+            lo: Bound::Unbounded,
+            hi: Bound::Unbounded,
+            prefix: None,
+            bucket_prefix_len: 2,
+            head_tag_len: 8,
+            frame_predicate: None,
+        };
+
+        loop {
+            let page = store
+                .page_scan_lww_with_opts(fid, &base, cursor.as_deref(), page_size)
+                .expect("page fwd (key)");
+
+            if page.items.is_empty() {
+                break;
+            }
+
+            for it in page.items {
+                if let Some(prev) = last_key.as_deref() {
+                    assert!(it.key.as_slice() > prev, "keys must be strictly increasing");
+                }
+                last_key = Some(it.key.clone());
+                all_keys.push(it.key);
+            }
+
+            cursor = page.next;
+        }
+
+        assert_eq!(all_keys.len(), 1400, "winners by key, forward");
+
+        let first = parse_key_u32(all_keys.first().unwrap());
+        let last = parse_key_u32(all_keys.last().unwrap());
+        assert_eq!(first, 0u32);
+        assert_eq!(last, 1399u32);
+    }
+
+    // Key-ordered pagination, reverse.
+    // Uses last key of each page as the upper bound for the next page.
+    #[test]
+    fn scan_values_lww_pagination_key_reverse() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 552u32;
+
+        seed_three_generations(&store, fid);
+
+        let page_size = 127usize;
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut last_key: Option<Vec<u8>> = None;
+        let mut all_keys: Vec<Vec<u8>> = Vec::new();
+
+        let base = ValueScanOpts {
+            order_by: OrderBy::Key,
+            dir: Direction::Reverse,
+            lo: Bound::Unbounded,
+            hi: Bound::Unbounded,
+            prefix: None,
+            bucket_prefix_len: 2,
+            head_tag_len: 8,
+            frame_predicate: None,
+        };
+
+        loop {
+            let page = store
+                .page_scan_lww_with_opts(fid, &base, cursor.as_deref(), page_size)
+                .expect("page rev (key)");
+
+            if page.items.is_empty() {
+                break;
+            }
+
+            for it in page.items {
+                if let Some(prev) = last_key.as_deref() {
+                    assert!(it.key.as_slice() < prev, "keys must be strictly decreasing");
+                }
+                last_key = Some(it.key.clone());
+                all_keys.push(it.key);
+            }
+
+            cursor = page.next;
+        }
+
+        assert_eq!(all_keys.len(), 1400, "winners by key, reverse");
+
+        let first = parse_key_u32(all_keys.first().unwrap());
+        let last = parse_key_u32(all_keys.last().unwrap());
+        assert_eq!(first, 1399u32);
+        assert_eq!(last, 0u32);
+    }
+
+    // Value-ordered pagination, forward.
+    // Cursor is the last VALUE bytes of each page.
+    #[test]
+    fn scan_values_lww_pagination_value_forward() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 661u32;
+
+        seed_three_generations(&store, fid);
+
+        let page_size = 131usize;
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut last_val: Option<u64> = None;
+        let mut all_vals: Vec<u64> = Vec::new();
+
+        let base = ValueScanOpts {
+            order_by: OrderBy::Value,
+            dir: Direction::Forward,
+            lo: Bound::Unbounded,
+            hi: Bound::Unbounded,
+            prefix: None,
+            bucket_prefix_len: 2,
+            head_tag_len: 8,
+            frame_predicate: None,
+        };
+
+        loop {
+            let page = store
+                .page_scan_lww_with_opts(fid, &base, cursor.as_deref(), page_size)
+                .expect("page fwd (value)");
+
+            if page.items.is_empty() {
+                break;
+            }
+
+            for it in page.items {
+                let a = it.value.start as usize;
+                let b = it.value.end as usize;
+                let v = parse_be64(&it.value.data.as_ref()[a..b]);
+
+                if let Some(pv) = last_val {
+                    assert!(v > pv, "values must be strictly increasing");
+                }
+                last_val = Some(v);
+                all_vals.push(v);
+            }
+
+            cursor = page.next;
+        }
+
+        assert_eq!(all_vals.len(), 1400, "winners by value, forward");
+
+        let first = *all_vals.first().unwrap();
+        let last = *all_vals.last().unwrap();
+        assert_eq!(first, 1000u64);
+        assert_eq!(last, 300_000u64 + 1399u64); // 301_399
+    }
+
+    // Value-ordered pagination, reverse.
+    // Cursor is the last VALUE bytes of each page.
+    #[test]
+    fn scan_values_lww_pagination_value_reverse() {
+        let p = MemPager::default();
+        let store = ColumnStore::init_empty(&p);
+        let fid = 662u32;
+
+        seed_three_generations(&store, fid);
+
+        let page_size = 113usize;
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut last_val: Option<u64> = None;
+        let mut all_vals: Vec<u64> = Vec::new();
+
+        let base = ValueScanOpts {
+            order_by: OrderBy::Value,
+            dir: Direction::Reverse,
+            lo: Bound::Unbounded,
+            hi: Bound::Unbounded,
+            prefix: None,
+            bucket_prefix_len: 2,
+            head_tag_len: 8,
+            frame_predicate: None,
+        };
+
+        loop {
+            let page = store
+                .page_scan_lww_with_opts(fid, &base, cursor.as_deref(), page_size)
+                .expect("page rev (value)");
+
+            if page.items.is_empty() {
+                break;
+            }
+
+            for it in page.items {
+                let a = it.value.start as usize;
+                let b = it.value.end as usize;
+                let v = parse_be64(&it.value.data.as_ref()[a..b]);
+
+                if let Some(pv) = last_val {
+                    assert!(v < pv, "values must be strictly decreasing");
+                }
+                last_val = Some(v);
+                all_vals.push(v);
+            }
+
+            cursor = page.next;
+        }
+
+        assert_eq!(all_vals.len(), 1400, "winners by value, reverse");
+
+        let first = *all_vals.first().unwrap();
+        let last = *all_vals.last().unwrap();
+        assert_eq!(first, 300_000u64 + 1399u64); // 301_399
+        assert_eq!(last, 1000u64);
     }
 }

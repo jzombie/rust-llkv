@@ -19,6 +19,9 @@ pub enum BatchGet {
     Typed { key: PhysicalKey, kind: TypedKind },
 }
 
+// TODO: Clippy recommends boxing `TypedValue`, but I'm not yet sure of the
+// performance impact, so I'm skipping it for now.
+//
 /// Result for a single get. For raw reads, the pager returns a **blob handle**
 /// chosen by the pager implementation (see `Pager::Blob`). This blob must be
 /// cheap to clone and must expose its bytes via `AsRef<[u8]>`.
@@ -27,6 +30,7 @@ pub enum BatchGet {
 /// - In-memory pager: `Blob = Arc<[u8]>`
 /// - File-backed pager: `Blob = EntryHandle` (which wraps `Arc<Mmap> + Range`)
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum GetResult<B> {
     Raw { key: PhysicalKey, bytes: B },
     Typed { key: PhysicalKey, value: TypedValue },
