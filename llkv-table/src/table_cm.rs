@@ -12,12 +12,15 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Bound;
 
+use crossbeam_channel as xchan;
+
 use llkv_column_map::ColumnStore;
 use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ValueScanOpts};
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, ValueMode};
 use llkv_column_map::views::ValueSlice;
 
+use crate::expr::{Expr, Filter, Operator};
 use crate::types::{FieldId, RowId, RowPatch};
 
 /// Encode row id as big-endian bytes so lexicographic order == numeric.
@@ -60,9 +63,16 @@ impl Default for CmTableConfig {
     }
 }
 
+/// Scan/init error wrapper for this module.
+#[derive(Debug)]
+pub enum CmError {
+    ScanInit(String),
+}
+
 /// ColumnMap-backed table.
 pub struct ColumnMapTable {
-    /// Leaked pager to satisfy ColumnStore's lifetime without gymnastics.
+    /// Leaked pager to satisfy ColumnStore's lifetime without
+    /// gymnastics.
     pager: &'static MemPager,
     store: ColumnStore<'static, MemPager>,
     cfg: CmTableConfig,
@@ -117,8 +127,9 @@ impl ColumnMapTable {
 
     /// Scan rows by a row-id range, projecting a set of columns.
     ///
-    /// Semantics: rows appear if they have a value in the driver column.
-    /// Choose `driver_fid` with wide coverage (e.g., PK or common column).
+    /// Semantics: rows appear if they have a value in the driver
+    /// column. Choose `driver_fid` with wide coverage (e.g., PK or
+    /// common column).
     ///
     /// For each row, projected columns are fetched via `get_many`.
     pub fn scan_by_row_id_range<F>(
@@ -184,15 +195,13 @@ impl ColumnMapTable {
                     hi: hi_bound,
                     prefix: None,
                     bucket_prefix_len: 2,
-                    // 16 minimizes head-tie fallbacks inside column-map
+                    // 16 minimizes head-tie fallbacks inside column-map.
                     head_tag_len: 16,
                     frame_predicate: None,
                 },
             ) {
                 Ok(it) => it,
-                Err(llkv_column_map::column_store::read_scan::ScanError::NoActiveSegments) => {
-                    break;
-                }
+                Err(llkv_column_map::column_store::read_scan::ScanError::NoActiveSegments) => break,
                 Err(e) => panic!("scan init error: {:?}", e),
             };
 
@@ -280,16 +289,13 @@ impl ColumnMapTable {
                     hi: hi_bound,
                     prefix: None,
                     bucket_prefix_len: 2,
-                    // 16 minimizes tag-ties across segments
+                    // 16 minimizes tag-ties across segments.
                     head_tag_len: 16,
                     frame_predicate: None,
                 },
             ) {
                 Ok(it) => it,
-                Err(llkv_column_map::column_store::read_scan::ScanError::NoActiveSegments) => {
-                    // Normal end once bound excludes all segments.
-                    break;
-                }
+                Err(llkv_column_map::column_store::read_scan::ScanError::NoActiveSegments) => break,
                 Err(e) => panic!("scan init error (value-ordered): {:?}", e),
             };
 
@@ -310,6 +316,198 @@ impl ColumnMapTable {
                 break;
             }
         }
+    }
+
+    /// Scan rows using an expression over column values (by value order),
+    /// then project the requested columns.
+    pub fn scan_expr<F>(
+        &self,
+        expr: &Expr<'_, FieldId>,
+        projection: &[FieldId],
+        mut on_row: F,
+    ) -> Result<(), CmError>
+    where
+        F: FnMut(RowId, Vec<Option<Vec<u8>>>),
+    {
+        let rx_opt = self.get_row_id_stream(expr)?;
+        let Some(rx) = rx_opt else {
+            return Ok(());
+        };
+
+        // Drain all row ids from the stream.
+        let mut rids: Vec<RowId> = Vec::new();
+        for rid in rx {
+            rids.push(rid);
+        }
+        if rids.is_empty() {
+            return Ok(());
+        }
+
+        // Align keys for batch point-lookups across projection.
+        let keys: Vec<Vec<u8>> = rids.iter().map(|r| row_key_bytes(*r)).collect();
+        let queries: Vec<(LogicalFieldId, Vec<Vec<u8>>)> = projection
+            .iter()
+            .map(|fid| (*fid as LogicalFieldId, keys.clone()))
+            .collect();
+
+        let results = self.store.get_many(queries);
+
+        // Emit per-row, preserving rids order.
+        for (i, rid) in rids.into_iter().enumerate() {
+            let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(projection.len());
+            for col in 0..projection.len() {
+                let cell = &results[col][i];
+                let owned = cell.as_ref().map(|s| value_slice_bytes(s));
+                row.push(owned);
+            }
+            on_row(rid, row);
+        }
+        Ok(())
+    }
+
+    /// Build a stream (receiver) of row ids that satisfy the expression.
+    /// Uses value-ordered scans per predicate; AND/OR combine via sets.
+    pub fn get_row_id_stream<'b>(
+        &'b self,
+        expr: &Expr<'b, FieldId>,
+    ) -> Result<Option<xchan::Receiver<RowId>>, CmError> {
+        match expr {
+            Expr::Pred(filter) => self.get_stream_for_predicate(filter),
+            Expr::And(children) => {
+                // Collect child streams.
+                let mut streams: Vec<xchan::Receiver<RowId>> = Vec::new();
+                for ch in children {
+                    if let Some(rx) = self.get_row_id_stream(ch)? {
+                        streams.push(rx);
+                    }
+                }
+
+                // No predicates? return closed empty stream.
+                if streams.is_empty() {
+                    let (_tx, rx) = xchan::unbounded();
+                    return Ok(Some(rx));
+                }
+
+                // Combine via intersection in a worker thread.
+                let (tx, rx) = xchan::unbounded();
+                std::thread::spawn(move || {
+                    use std::collections::HashSet;
+                    let first: HashSet<RowId> = streams.remove(0).into_iter().collect();
+                    let mut acc = first;
+                    for s in streams {
+                        if acc.is_empty() {
+                            break;
+                        }
+                        let set: HashSet<RowId> = s.into_iter().collect();
+                        acc.retain(|rid| set.contains(rid));
+                    }
+                    for rid in acc {
+                        if tx.send(rid).is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok(Some(rx))
+            }
+            Expr::Or(children) => {
+                let mut streams: Vec<xchan::Receiver<RowId>> = Vec::new();
+                for ch in children {
+                    if let Some(rx) = self.get_row_id_stream(ch)? {
+                        streams.push(rx);
+                    }
+                }
+                let (tx, rx) = xchan::unbounded();
+                std::thread::spawn(move || {
+                    use std::collections::HashSet;
+                    let mut acc: HashSet<RowId> = HashSet::new();
+                    for s in streams {
+                        for rid in s {
+                            acc.insert(rid);
+                        }
+                    }
+                    for rid in acc {
+                        if tx.send(rid).is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok(Some(rx))
+            }
+            Expr::Not(_) => {
+                // Old impl left this unimplemented; do the same here.
+                unimplemented!("Expr::Not is not implemented");
+            }
+        }
+    }
+
+    /// Single-predicate stream using a value-ordered scan on the column.
+    fn get_stream_for_predicate<'b>(
+        &'b self,
+        filter: &Filter<'b, FieldId>,
+    ) -> Result<Option<xchan::Receiver<RowId>>, CmError> {
+        // Map the predicate to lo/hi bounds on VALUE bytes.
+        let (lo_bound, hi_bound): (Bound<&[u8]>, Bound<&[u8]>);
+
+        match &filter.op {
+            Operator::Equals(val) => {
+                lo_bound = Bound::Included(*val);
+                hi_bound = Bound::Included(*val);
+            }
+            Operator::Range { lower, upper } => {
+                // Lower
+                lo_bound = match lower {
+                    Bound::Unbounded => Bound::Unbounded,
+                    Bound::Included(b) => Bound::Included(*b),
+                    Bound::Excluded(b) => Bound::Excluded(*b),
+                };
+                // Upper
+                hi_bound = match upper {
+                    Bound::Unbounded => Bound::Unbounded,
+                    Bound::Included(b) => Bound::Included(*b),
+                    Bound::Excluded(b) => Bound::Excluded(*b),
+                };
+            }
+            _ => {
+                unimplemented!("Only Equals and Range are supported here");
+            }
+        }
+
+        // Kick off a value-ordered scan for this column.
+        let iter = match self.store.scan_values_lww(
+            filter.field_id as LogicalFieldId,
+            ValueScanOpts {
+                order_by: OrderBy::Value,
+                dir: Direction::Forward,
+                lo: lo_bound,
+                hi: hi_bound,
+                prefix: None,
+                bucket_prefix_len: 2,
+                head_tag_len: 16,
+                frame_predicate: None,
+            },
+        ) {
+            Ok(it) => it,
+            Err(llkv_column_map::column_store::read_scan::ScanError::NoActiveSegments) => {
+                return Ok(None);
+            }
+            Err(llkv_column_map::column_store::read_scan::ScanError::ColumnMissing(_)) => {
+                return Ok(None);
+            }
+            Err(e) => return Err(CmError::ScanInit(format!("{:?}", e))),
+        };
+
+        // Fill the channel synchronously to avoid requiring Send on the
+        // iterator (ValueScan is not Send).
+        let (tx, rx) = xchan::unbounded();
+        for item in iter {
+            let rid = parse_row_id(item.key.as_slice());
+            if tx.send(rid).is_err() {
+                break;
+            }
+        }
+        drop(tx);
+
+        Ok(Some(rx))
     }
 
     /// Access to the underlying store for power users.
@@ -378,13 +576,10 @@ mod tests {
     fn insert_many_strings_readable() {
         let table = ColumnMapTable::new(CmTableConfig::default());
 
-        // Columns (FieldId == logical column id)
         const COL_NAME: FieldId = 11;
         const COL_CITY: FieldId = 12;
         const COL_ROLE: FieldId = 13;
 
-        // Three rows, each maps row id -> column values (strings).
-        // No synthetic columns; the driver will be COL_NAME.
         let rows: Vec<RowPatch> = vec![
             mk_row(
                 1,
@@ -414,8 +609,6 @@ mod tests {
 
         table.insert_many(&rows);
 
-        // Scan row ids 1..=3. The scan uses COL_NAME as the driver
-        // (because it exists on all three rows).
         let mut got: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
         table.scan_by_row_id_range(
             COL_NAME,
@@ -428,7 +621,6 @@ mod tests {
 
         assert_eq!(got.len(), 3);
 
-        // Check values round-trip cleanly (own strings to avoid lifetimes).
         let to_s = |o: &Option<Vec<u8>>| -> String {
             String::from_utf8(o.as_ref().unwrap().clone()).unwrap()
         };
@@ -453,13 +645,10 @@ mod tests {
     fn insert_many_u64_readable() {
         let table = ColumnMapTable::new(CmTableConfig::default());
 
-        // Columns (FieldId == logical column id)
         const COL_A: FieldId = 21; // driver
         const COL_B: FieldId = 22; // numeric payload
         const COL_C: FieldId = 23; // numeric payload (sparse)
 
-        // Five rows, u64 payloads stored as big-endian bytes.
-        // COL_C is only present on odd row ids to show sparsity.
         let rows: Vec<RowPatch> = (1..=5)
             .map(|rid| {
                 let mut cols = vec![
@@ -475,7 +664,6 @@ mod tests {
 
         table.insert_many(&rows);
 
-        // Scan all rows using COL_A as the driver.
         let mut got: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
         table.scan_by_row_id_range(
             COL_A,
@@ -515,7 +703,6 @@ mod tests {
         let fid_d1: FieldId = 11;
         let fid_d2: FieldId = 12;
 
-        // Seed rows 1..=3 so driver exists.
         let rows: Vec<RowPatch> = (1..=3)
             .map(|rid| {
                 mk_rowpatch_u64(rid, &[(fid_row, rid), (fid_d1, rid + 7), (fid_d2, rid + 9)])
@@ -523,7 +710,6 @@ mod tests {
             .collect();
         table.insert_many(&rows);
 
-        // Ask for a range above any inserted row ids.
         let mut called = false;
         table.scan_by_row_id_range(
             fid_row,
@@ -545,7 +731,7 @@ mod tests {
 
         let fid_row: FieldId = 20; // driver
         let fid_v1: FieldId = 21; // rid * 10
-        let fid_v2: FieldId = 22; // 500 - rid (reverse order baseline)
+        let fid_v2: FieldId = 22; // 500 - rid (reverse baseline)
         let fid_sparse: FieldId = 23; // multiples of 3, 3000 + rid
 
         let rows: Vec<RowPatch> = (1..=12)
@@ -569,7 +755,7 @@ mod tests {
             assert!(w[0].1 < w[1].1, "v1 must increase forward");
         }
 
-        // Stream v2 reverse: strictly decreasing (since base is 500 - rid).
+        // Stream v2 reverse: strictly decreasing.
         let mut v2_r: Vec<(RowId, u64)> = Vec::new();
         table.stream_column_values(fid_v2, Direction::Reverse, 5, |rid, v| {
             v2_r.push((rid, from_be_u64(&v)));
@@ -584,7 +770,6 @@ mod tests {
         table.stream_column_values(fid_sparse, Direction::Forward, 3, |rid, v| {
             sp_f.push((rid, from_be_u64(&v)));
         });
-        // rows 3,6,9,12
         assert_eq!(sp_f.len(), 4);
         assert_eq!(
             sp_f.iter().map(|x| x.0).collect::<Vec<_>>(),
@@ -604,7 +789,6 @@ mod tests {
         let fid_d1: FieldId = 31;
         let fid_d2: FieldId = 32;
 
-        // 1..=50 rows, three projected columns.
         let rows: Vec<RowPatch> = (1..=50)
             .map(|rid| {
                 mk_rowpatch_u64(
@@ -615,7 +799,6 @@ mod tests {
             .collect();
         table.insert_many(&rows);
 
-        // Collect with page=7 and ensure we see all rows once with projections.
         let mut got: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
         table.scan_by_row_id_range(
             fid_row,
@@ -634,5 +817,167 @@ mod tests {
             assert_eq!(from_be_u64(cols[1].as_ref().unwrap()), 1000 + expect);
             assert_eq!(from_be_u64(cols[2].as_ref().unwrap()), 2000 + expect);
         }
+    }
+
+    use crate::expr::{Expr, Filter, Operator};
+
+    #[test]
+    fn expr_equals_and_range_scan_projects_values() {
+        let table = ColumnMapTable::new(CmTableConfig::default());
+
+        const COL_NAME: FieldId = 101;
+        const COL_CITY: FieldId = 102;
+        const COL_SCORE: FieldId = 103;
+
+        let rows: Vec<RowPatch> = vec![
+            mk_row(
+                1,
+                &[
+                    (COL_NAME, s("alice")),
+                    (COL_CITY, s("austin")),
+                    (COL_SCORE, be64_bytes(10)),
+                ],
+            ),
+            mk_row(
+                2,
+                &[
+                    (COL_NAME, s("bob")),
+                    (COL_CITY, s("boston")),
+                    (COL_SCORE, be64_bytes(20)),
+                ],
+            ),
+            mk_row(
+                3,
+                &[
+                    (COL_NAME, s("carol")),
+                    (COL_CITY, s("chicago")),
+                    (COL_SCORE, be64_bytes(30)),
+                ],
+            ),
+            mk_row(
+                4,
+                &[
+                    (COL_NAME, s("dave")),
+                    (COL_CITY, s("dallas")),
+                    (COL_SCORE, be64_bytes(40)),
+                ],
+            ),
+            mk_row(
+                5,
+                &[
+                    (COL_NAME, s("erin")),
+                    (COL_CITY, s("el paso")),
+                    (COL_SCORE, be64_bytes(50)),
+                ],
+            ),
+            mk_row(
+                6,
+                &[
+                    (COL_NAME, s("frank")),
+                    (COL_CITY, s("fresno")),
+                    (COL_SCORE, be64_bytes(60)),
+                ],
+            ),
+        ];
+        table.insert_many(&rows);
+
+        // WHERE score = 30
+        let key_eq = 30u64.to_be_bytes();
+        let expr_eq = Expr::Pred(Filter {
+            field_id: COL_SCORE,
+            op: Operator::Equals(&key_eq),
+        });
+        let mut got_eq: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
+        table
+            .scan_expr(&expr_eq, &[COL_NAME, COL_CITY], |rid, cols| {
+                got_eq.push((rid, cols));
+            })
+            .unwrap();
+        assert_eq!(got_eq.len(), 1);
+        assert_eq!(got_eq[0].0, 3);
+
+        // WHERE 20 <= score < 50
+        let lo = 20u64.to_be_bytes();
+        let hi = 50u64.to_be_bytes();
+        let expr_rng = Expr::Pred(Filter {
+            field_id: COL_SCORE,
+            op: Operator::Range {
+                lower: Bound::Included(&lo),
+                upper: Bound::Excluded(&hi),
+            },
+        });
+        let mut got_rng: Vec<RowId> = Vec::new();
+        table
+            .scan_expr(&expr_rng, &[], |rid, _| {
+                got_rng.push(rid);
+            })
+            .unwrap();
+        got_rng.sort_unstable();
+        assert_eq!(got_rng, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn expr_intersection_and_union() {
+        let table = ColumnMapTable::new(CmTableConfig::default());
+
+        const COL_COUNTRY: FieldId = 201;
+        const COL_STATUS: FieldId = 202;
+        const COL_PAYLOAD: FieldId = 203;
+
+        let rows: Vec<RowPatch> = (1..=20)
+            .map(|rid| {
+                mk_row(
+                    rid,
+                    &[
+                        (COL_COUNTRY, be64_bytes((rid % 5) as u64)),
+                        (COL_STATUS, be64_bytes((rid % 4) as u64)),
+                        (COL_PAYLOAD, s("x")),
+                    ],
+                )
+            })
+            .collect();
+        table.insert_many(&rows);
+
+        // country=3 AND status=2
+        let c3 = (3u64).to_be_bytes();
+        let s2 = (2u64).to_be_bytes();
+        let expr_and = Expr::And(vec![
+            Expr::Pred(Filter {
+                field_id: COL_COUNTRY,
+                op: Operator::Equals(&c3),
+            }),
+            Expr::Pred(Filter {
+                field_id: COL_STATUS,
+                op: Operator::Equals(&s2),
+            }),
+        ]);
+
+        let mut and_rows: Vec<RowId> = Vec::new();
+        table
+            .scan_expr(&expr_and, &[], |rid, _| and_rows.push(rid))
+            .unwrap();
+        and_rows.sort_unstable();
+        assert_eq!(and_rows, vec![18]);
+
+        // country=1 OR status=0
+        let c1 = (1u64).to_be_bytes();
+        let s0 = (0u64).to_be_bytes();
+        let expr_or = Expr::Or(vec![
+            Expr::Pred(Filter {
+                field_id: COL_COUNTRY,
+                op: Operator::Equals(&c1),
+            }),
+            Expr::Pred(Filter {
+                field_id: COL_STATUS,
+                op: Operator::Equals(&s0),
+            }),
+        ]);
+
+        let mut or_rows: Vec<RowId> = Vec::new();
+        table
+            .scan_expr(&expr_or, &[], |rid, _| or_rows.push(rid))
+            .unwrap();
+        or_rows.sort_unstable();
+        assert_eq!(or_rows, vec![1, 4, 6, 8, 11, 12, 16, 20]);
     }
 }
