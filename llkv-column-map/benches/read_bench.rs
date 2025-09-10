@@ -129,6 +129,7 @@ fn ingest_1m_rows(store: &ColumnStore<'static, MemPager>) {
 // ------------------------- bench ------------------------------
 
 fn bench_query_uniform(c: &mut Criterion) {
+    // TODO: Rewire so this doesn't need leaking
     // Leak the pager to give the store a 'static lifetime (so we can move it into the closure).
     let pager: &'static MemPager = Box::leak(Box::new(MemPager::default()));
     let store: ColumnStore<'static, MemPager> = ColumnStore::init_empty(pager);
