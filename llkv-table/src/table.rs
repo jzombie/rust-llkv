@@ -1,281 +1,432 @@
-//! Note: `FxHashMap` and `FxHashSet` are used internally in the table while
-//! exposing a `HashMap` interface via `RowPatch` to make it potentially easier
-//! to upsert from consuming applications.
+//! Table: a column-store-backed table with row-based ingest.
+//!
+//! Goals:
+//! - No B+Tree, no rayon.
+//! - Row-based inserts -> column_map append_many.
+//! - Scans delegate to column_map read_scan utilities.
+//!
+//! NOTE: This lives alongside your current Table so nothing breaks until
+//! you decide to switch. No indexes here yet by design.
 
-#![forbid(unsafe_code)]
-
-use crate::codecs::decode_root_id;
-use crate::expr::{Expr, Filter, Operator};
-use crate::types::{
-    ColumnTree, FieldId, IndexKey, IndexKeyCodec, OnRowOf, PrimaryIndexTree, RootId, RootIdBytes,
-    RowId, RowIdCmp, RowIdKeyCodec, RowIdSetTree, RowPatch,
-};
-use crossbeam_channel as xchan;
-use llkv_btree::codecs::KeyCodec;
-use llkv_btree::define_mem_pager;
-use llkv_btree::errors::Error;
-use llkv_btree::iter::{BPlusTreeIter, ScanOpts};
-use llkv_btree::node_cache::NodeCache;
-use llkv_btree::pager::{Pager as BTreePager, SharedPager};
-use llkv_btree::prelude::*;
-use llkv_btree::views::value_view::ValueRef;
-use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::Bound;
-use std::sync::{Arc, RwLock};
-use std::thread;
 
+use crossbeam_channel as xchan;
+
+use llkv_column_map::ColumnStore;
+use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ValueScanOpts};
+use llkv_column_map::storage::pager::MemPager;
+use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, ValueMode};
+use llkv_column_map::views::ValueSlice;
+
+use crate::expr::{Expr, Filter, Operator};
+use crate::types::{FieldId, RowId, RowPatch};
+
+/// Encode row id as big-endian bytes so lexicographic order == numeric.
+#[inline]
+fn row_key_bytes(row_id: RowId) -> Vec<u8> {
+    row_id.to_be_bytes().to_vec()
+}
+
+/// Parse big-endian row id from the first 8 bytes of a key.
+#[inline]
+fn parse_row_id(key: &[u8]) -> RowId {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&key[..8]);
+    u64::from_be_bytes(a)
+}
+
+/// Extract owned bytes from a ValueSlice<Arc<[u8]>>.
+#[inline]
+fn value_slice_bytes(v: &ValueSlice<std::sync::Arc<[u8]>>) -> Vec<u8> {
+    let a = v.start() as usize;
+    let b = v.end() as usize;
+    v.data().as_ref()[a..b].to_vec()
+}
+
+/// Thin configuration for ingest segmentation and LWW policy.
+#[derive(Clone, Debug)]
 pub struct TableCfg {
-    pub row_id_cmp: RowIdCmp,
+    pub segment_max_entries: usize,
+    pub segment_max_bytes: usize,
+    pub last_write_wins_in_batch: bool,
 }
 
-/// The Table manages a collection of B-Trees for columns and indexes.
-pub struct Table<P>
-where
-    P: BTreePager<Id = RootId> + Clone + Send + Sync + 'static,
-    <P as BTreePager>::Page: Send + Sync + 'static,
-{
-    columns: BTreeMap<FieldId, ColumnTree<P>>,
-    indexes: BTreeMap<FieldId, PrimaryIndexTree<P>>,
-    pager: P,
-    shared_node_cache: Arc<RwLock<NodeCache<P>>>,
-}
-
-define_mem_pager! {
-    /// In-memory pager with u64 page IDs.
-    name: MemPager64,
-    id: u64,
-    default_page_size: 256
-}
-
-impl Table<SharedPager<MemPager64>> {
-    pub fn new(page_size: usize) -> Self {
-        let base = MemPager64::new(page_size);
-        let pager = SharedPager::new(base);
-        Self::with_pager(pager)
-    }
-}
-
-impl<P> Table<P>
-where
-    P: BTreePager<Id = RootId> + Clone + Send + Sync + 'static,
-    <P as BTreePager>::Page: Send + Sync + 'static,
-{
-    pub fn with_pager(pager: P) -> Self {
-        let shared_node_cache = Arc::new(RwLock::new(NodeCache::default()));
+impl Default for TableCfg {
+    fn default() -> Self {
         Self {
-            columns: BTreeMap::new(),
-            indexes: BTreeMap::new(),
-            pager,
-            shared_node_cache,
+            segment_max_entries: 100_000,
+            segment_max_bytes: 32 << 20,
+            last_write_wins_in_batch: true,
         }
     }
+}
 
-    pub fn add_column(&mut self, field_id: FieldId) {
-        let column_tree = ColumnTree::create_empty(
-            self.pager.clone(),
-            Some(Arc::clone(&self.shared_node_cache)),
-        )
-        .unwrap();
-        self.columns.insert(field_id, column_tree);
+/// Scan/init error wrapper for this module.
+#[derive(Debug)]
+pub enum CmError {
+    ScanInit(String),
+}
+
+/// ColumnMap-backed table.
+pub struct Table {
+    /// Leaked pager to satisfy ColumnStore's lifetime without
+    /// gymnastics.
+    pager: &'static MemPager,
+    store: ColumnStore<'static, MemPager>,
+    cfg: TableCfg,
+}
+
+impl Table {
+    /// Create a new in-memory table.
+    pub fn new(cfg: TableCfg) -> Self {
+        let pager = Box::leak(Box::new(MemPager::default()));
+        let store = ColumnStore::init_empty(pager);
+        Self { pager, store, cfg }
     }
 
-    pub fn add_index(&mut self, field_id: FieldId) {
-        let index_tree = PrimaryIndexTree::create_empty(
-            self.pager.clone(),
-            Some(Arc::clone(&self.shared_node_cache)),
-        )
-        .unwrap();
-        self.indexes.insert(field_id, index_tree);
-    }
+    /// Optional: declare a column; ColumnStore creates on first append.
+    pub fn add_column(&mut self, _fid: FieldId) {}
 
-    pub fn insert_many(&self, rows: &[RowPatch]) -> Result<(), Error> {
-        // Step 1: Aggregate all writes across all rows (sequentially, this is fast)
-        let mut all_column_writes: BTreeMap<FieldId, Vec<(RowId, &[u8])>> = BTreeMap::new();
-        let mut all_index_updates: BTreeMap<FieldId, Vec<(IndexKey, RowId)>> = BTreeMap::new();
+    /// Row-based ingest. Each row contains (field_id -> value).
+    /// We map to per-column `Put` batches and call append_many.
+    pub fn insert_many(&self, rows: &[RowPatch]) {
+        if rows.is_empty() {
+            return;
+        }
 
-        for (row_id, data) in rows {
-            for (field_id, (index_key, value)) in data {
-                all_column_writes
-                    .entry(*field_id)
+        // FieldId -> Vec<(key, val)>
+        let mut by_col: HashMap<LogicalFieldId, Vec<(Cow<[u8]>, Cow<[u8]>)>> = HashMap::new();
+
+        for (row_id, cols) in rows.iter() {
+            let key = row_key_bytes(*row_id);
+            for (fid, (_index_key, col_in)) in cols {
+                // Ignoring _index_key for now (no secondary indexes).
+                by_col
+                    .entry(*fid as LogicalFieldId)
                     .or_default()
-                    .push((*row_id, &**value));
-
-                if self.indexes.contains_key(field_id) {
-                    all_index_updates
-                        .entry(*field_id)
-                        .or_default()
-                        .push((*index_key, *row_id));
-                }
+                    .push((Cow::Owned(key.clone()), col_in.clone()));
             }
         }
 
-        // Step 2 & 3: Perform all database writes in parallel using Rayon
-        rayon::join(
-            || {
-                // --- Parallel Column Writes ---
-                all_column_writes
-                    .into_par_iter()
-                    .for_each(|(field_id, writes)| {
-                        if let Some(column_tree) = self.columns.get(&field_id) {
-                            // Assuming BTree::insert_many now takes &self
-                            column_tree.insert_many(&writes).unwrap();
-                        }
-                    });
-            },
-            || {
-                // --- Parallel Index Writes ---
-                all_index_updates
-                    .into_par_iter()
-                    .for_each(|(field_id, updates)| {
-                        if let Some(primary_index) = self.indexes.get(&field_id) {
-                            self.update_index_parallel(primary_index, updates).unwrap();
-                        }
-                    });
-            },
-        );
-
-        Ok(())
-    }
-
-    fn update_index_parallel(
-        &self,
-        primary_index: &PrimaryIndexTree<P>,
-        updates: Vec<(IndexKey, RowId)>,
-    ) -> Result<(), Error> {
-        let mut updates_by_key: BTreeMap<IndexKey, Vec<RowId>> = BTreeMap::new();
-        for (index_key, row_id) in updates {
-            updates_by_key.entry(index_key).or_default().push(row_id);
-        }
-
-        let unique_keys: Vec<IndexKey> = updates_by_key.keys().cloned().collect();
-        let primary_snapshot = primary_index.snapshot();
-        let existing_roots_map: FxHashMap<IndexKey, RootId> = primary_snapshot
-            .get_many(&unique_keys)?
+        let puts: Vec<Put> = by_col
             .into_iter()
-            .enumerate()
-            .filter_map(|(i, root_ref_opt)| {
-                root_ref_opt.map(|r| (unique_keys[i], decode_root_id(&r)))
-            })
+            .map(|(field_id, items)| Put { field_id, items })
             .collect();
 
-        let new_primary_entries: Vec<(IndexKey, RootIdBytes)> = updates_by_key
-            .into_par_iter()
-            .filter_map(|(index_key, row_ids)| {
-                if let Some(root_id) = existing_roots_map.get(&index_key) {
-                    let row_id_set = RowIdSetTree::open(self.pager.clone(), *root_id, None);
-                    let writes: Vec<_> = row_ids.iter().map(|rid| (*rid, &[][..])).collect();
-                    row_id_set.insert_many(&writes).ok()?;
-                    None
-                } else {
-                    let new_row_id_set =
-                        RowIdSetTree::create_empty(self.pager.clone(), None).ok()?;
-                    let writes: Vec<_> = row_ids.iter().map(|rid| (*rid, &[][..])).collect();
-                    new_row_id_set.insert_many(&writes).ok()?;
-                    let new_root_id = new_row_id_set.snapshot().root_id();
-                    Some((index_key, new_root_id.to_be_bytes()))
-                }
-            })
-            .collect();
-
-        if !new_primary_entries.is_empty() {
-            let writes_slice: Vec<(IndexKey, &[u8])> = new_primary_entries
-                .iter()
-                .map(|(k, v)| (*k, &v[..]))
-                .collect();
-            primary_index.insert_many(&writes_slice)?;
-        }
-
-        Ok(())
-    }
-
-    pub fn scan<'a>(
-        &'a self,
-        expr: &Expr<'a, FieldId>,
-        projection: &[FieldId],
-        on_row: &mut OnRowOf<P>,
-    ) -> Result<(), Error> {
-        let row_id_stream = self.get_row_id_stream(expr)?;
-        let row_id_stream = match row_id_stream {
-            Some(rx) => rx,
-            None => return Ok(()),
+        let opts = AppendOptions {
+            mode: ValueMode::Auto,
+            segment_max_entries: self.cfg.segment_max_entries,
+            segment_max_bytes: self.cfg.segment_max_bytes,
+            last_write_wins_in_batch: self.cfg.last_write_wins_in_batch,
         };
-        for row_id in row_id_stream {
-            let mut value_refs: Vec<ValueRef<<P>::Page>> = Vec::with_capacity(projection.len());
-            for field_id in projection {
-                if let Some(column_tree) = self.columns.get(field_id)
-                    && let Some(value_ref) = column_tree.snapshot().get(&row_id)?
-                {
-                    value_refs.push(value_ref);
+
+        self.store.append_many(puts, opts);
+    }
+
+    /// Scan rows by a row-id range, projecting a set of columns.
+    ///
+    /// Semantics: rows appear if they have a value in the driver
+    /// column. Choose `driver_fid` with wide coverage (e.g., PK or
+    /// common column).
+    ///
+    /// For each row, projected columns are fetched via `get_many`.
+    pub fn scan_by_row_id_range<F>(
+        &self,
+        driver_fid: FieldId,
+        lo: Bound<RowId>,
+        hi: Bound<RowId>,
+        project: &[FieldId],
+        page: usize,
+        mut on_row: F,
+    ) where
+        F: FnMut(RowId, Vec<Option<Vec<u8>>>),
+    {
+        if page == 0 {
+            return;
+        }
+
+        let mut after: Option<Vec<u8>> = match lo {
+            Bound::Unbounded => None,
+            Bound::Included(x) => Some(row_key_bytes(x)),
+            Bound::Excluded(x) => Some(row_key_bytes(x)),
+        };
+
+        loop {
+            // Backing storage for &[u8] bounds.
+            let mut lo_buf: Option<Vec<u8>> = None;
+            let mut hi_buf: Option<Vec<u8>> = None;
+
+            let lo_bound: Bound<&[u8]> = match (&after, lo) {
+                (None, Bound::Unbounded) => Bound::Unbounded,
+                (None, Bound::Included(x)) => {
+                    lo_buf = Some(row_key_bytes(x));
+                    Bound::Included(lo_buf.as_ref().unwrap().as_slice())
                 }
+                (None, Bound::Excluded(x)) => {
+                    lo_buf = Some(row_key_bytes(x));
+                    Bound::Excluded(lo_buf.as_ref().unwrap().as_slice())
+                }
+                (Some(k), _) => {
+                    lo_buf = Some(k.clone());
+                    Bound::Excluded(lo_buf.as_ref().unwrap().as_slice())
+                }
+            };
+
+            let hi_bound: Bound<&[u8]> = match hi {
+                Bound::Unbounded => Bound::Unbounded,
+                Bound::Included(x) => {
+                    hi_buf = Some(row_key_bytes(x));
+                    Bound::Included(hi_buf.as_ref().unwrap().as_slice())
+                }
+                Bound::Excluded(x) => {
+                    hi_buf = Some(row_key_bytes(x));
+                    Bound::Excluded(hi_buf.as_ref().unwrap().as_slice())
+                }
+            };
+
+            let it = match self.store.scan_values_lww(
+                driver_fid as LogicalFieldId,
+                ValueScanOpts {
+                    order_by: OrderBy::Key,
+                    dir: Direction::Forward,
+                    lo: lo_bound,
+                    hi: hi_bound,
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    // 16 minimizes head-tie fallbacks inside column-map.
+                    head_tag_len: 16,
+                    frame_predicate: None,
+                },
+            ) {
+                Ok(it) => it,
+                Err(llkv_column_map::column_store::read_scan::ScanError::NoActiveSegments) => break,
+                Err(e) => panic!("scan init error: {:?}", e),
+            };
+
+            let mut keys: Vec<Vec<u8>> = Vec::with_capacity(page);
+            let mut last_key: Option<Vec<u8>> = None;
+
+            for item in it.take(page) {
+                last_key = Some(item.key.clone());
+                keys.push(item.key);
             }
-            let mut values_iter = value_refs.into_iter();
-            on_row(row_id, &mut values_iter);
+
+            if keys.is_empty() {
+                break;
+            }
+
+            // Batch point-lookups across projected columns.
+            let queries: Vec<(LogicalFieldId, Vec<Vec<u8>>)> = project
+                .iter()
+                .map(|fid| (*fid as LogicalFieldId, keys.clone()))
+                .collect();
+
+            let results = self.store.get_many(queries);
+
+            // Emit rows in the same order as `keys`.
+            for (i, key) in keys.iter().enumerate() {
+                let rid = parse_row_id(key);
+                let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(project.len());
+                for col in 0..project.len() {
+                    let cell = &results[col][i];
+                    let owned = cell.as_ref().map(|s| value_slice_bytes(s));
+                    row.push(owned);
+                }
+                on_row(rid, row);
+            }
+
+            after = last_key;
+        }
+    }
+
+    /// Stream (row_id, value) pairs for one column ordered by VALUE.
+    /// Efficient due to segment-local order + heads in column-map.
+    pub fn stream_column_values<F>(&self, fid: FieldId, dir: Direction, page: usize, mut on_item: F)
+    where
+        F: FnMut(RowId, Vec<u8>),
+    {
+        if page == 0 {
+            return;
+        }
+
+        let mut cursor_v: Option<Vec<u8>> = None;
+
+        loop {
+            let mut lo_buf: Option<Vec<u8>> = None;
+            let mut hi_buf: Option<Vec<u8>> = None;
+
+            let (lo_bound, hi_bound): (Bound<&[u8]>, Bound<&[u8]>) = match dir {
+                Direction::Forward => {
+                    let lo = match cursor_v.as_deref() {
+                        None => Bound::Unbounded,
+                        Some(v) => {
+                            lo_buf = Some(v.to_vec());
+                            Bound::Excluded(lo_buf.as_ref().unwrap().as_slice())
+                        }
+                    };
+                    (lo, Bound::Unbounded)
+                }
+                Direction::Reverse => {
+                    let hi = match cursor_v.as_deref() {
+                        None => Bound::Unbounded,
+                        Some(v) => {
+                            hi_buf = Some(v.to_vec());
+                            Bound::Excluded(hi_buf.as_ref().unwrap().as_slice())
+                        }
+                    };
+                    (Bound::Unbounded, hi)
+                }
+            };
+
+            let it = match self.store.scan_values_lww(
+                fid as LogicalFieldId,
+                ValueScanOpts {
+                    order_by: OrderBy::Value,
+                    dir,
+                    lo: lo_bound,
+                    hi: hi_bound,
+                    prefix: None,
+                    bucket_prefix_len: 2,
+                    // 16 minimizes tag-ties across segments.
+                    head_tag_len: 16,
+                    frame_predicate: None,
+                },
+            ) {
+                Ok(it) => it,
+                Err(llkv_column_map::column_store::read_scan::ScanError::NoActiveSegments) => break,
+                Err(e) => panic!("scan init error (value-ordered): {:?}", e),
+            };
+
+            let mut took = 0usize;
+
+            for item in it.take(page) {
+                let rid = parse_row_id(item.key.as_slice());
+                let a = item.value.start() as usize;
+                let b = item.value.end() as usize;
+                let v = item.value.data().as_ref()[a..b].to_vec();
+
+                cursor_v = Some(v.clone());
+                on_item(rid, v);
+                took += 1;
+            }
+
+            if took == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Scan rows using an expression over column values (by value order),
+    /// then project the requested columns.
+    pub fn scan_expr<F>(
+        &self,
+        expr: &Expr<'_, FieldId>,
+        projection: &[FieldId],
+        mut on_row: F,
+    ) -> Result<(), CmError>
+    where
+        F: FnMut(RowId, Vec<Option<Vec<u8>>>),
+    {
+        let rx_opt = self.get_row_id_stream(expr)?;
+        let Some(rx) = rx_opt else {
+            return Ok(());
+        };
+
+        // Drain all row ids from the stream.
+        let mut rids: Vec<RowId> = Vec::new();
+        for rid in rx {
+            rids.push(rid);
+        }
+        if rids.is_empty() {
+            return Ok(());
+        }
+
+        // Align keys for batch point-lookups across projection.
+        let keys: Vec<Vec<u8>> = rids.iter().map(|r| row_key_bytes(*r)).collect();
+        let queries: Vec<(LogicalFieldId, Vec<Vec<u8>>)> = projection
+            .iter()
+            .map(|fid| (*fid as LogicalFieldId, keys.clone()))
+            .collect();
+
+        let results = self.store.get_many(queries);
+
+        // Emit per-row, preserving rids order.
+        for (i, rid) in rids.into_iter().enumerate() {
+            let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(projection.len());
+            for col in 0..projection.len() {
+                let cell = &results[col][i];
+                let owned = cell.as_ref().map(|s| value_slice_bytes(s));
+                row.push(owned);
+            }
+            on_row(rid, row);
         }
         Ok(())
     }
 
-    fn get_row_id_stream<'b>(
+    /// Build a stream (receiver) of row ids that satisfy the expression.
+    /// Uses value-ordered scans per predicate; AND/OR combine via sets.
+    pub fn get_row_id_stream<'b>(
         &'b self,
         expr: &Expr<'b, FieldId>,
-    ) -> Result<Option<xchan::Receiver<RowId>>, Error> {
+    ) -> Result<Option<xchan::Receiver<RowId>>, CmError> {
         match expr {
             Expr::Pred(filter) => self.get_stream_for_predicate(filter),
-            Expr::And(sub_expressions) => {
-                let mut streams: Vec<_> = sub_expressions
-                    .iter()
-                    .map(|sub_expr| self.get_row_id_stream(sub_expr))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect();
+            Expr::And(children) => {
+                // Collect child streams.
+                let mut streams: Vec<xchan::Receiver<RowId>> = Vec::new();
+                for ch in children {
+                    if let Some(rx) = self.get_row_id_stream(ch)? {
+                        streams.push(rx);
+                    }
+                }
 
+                // No predicates? return closed empty stream.
                 if streams.is_empty() {
-                    let (tx, rx) = xchan::unbounded();
-                    drop(tx);
+                    let (_tx, rx) = xchan::unbounded();
                     return Ok(Some(rx));
                 }
 
+                // Combine via intersection in a worker thread.
                 let (tx, rx) = xchan::unbounded();
-                thread::spawn(move || {
-                    let mut intersection: FxHashSet<RowId> =
-                        streams.remove(0).into_iter().collect();
-                    for stream in streams {
-                        if intersection.is_empty() {
+                std::thread::spawn(move || {
+                    use std::collections::HashSet;
+                    let first: HashSet<RowId> = streams.remove(0).into_iter().collect();
+                    let mut acc = first;
+                    for s in streams {
+                        if acc.is_empty() {
                             break;
                         }
-                        let next_set: FxHashSet<RowId> = stream.into_iter().collect();
-                        intersection.retain(|item| next_set.contains(item));
+                        let set: HashSet<RowId> = s.into_iter().collect();
+                        acc.retain(|rid| set.contains(rid));
                     }
-
-                    for row_id in intersection {
-                        if tx.send(row_id).is_err() {
+                    for rid in acc {
+                        if tx.send(rid).is_err() {
                             break;
                         }
                     }
                 });
                 Ok(Some(rx))
             }
-            Expr::Or(sub_expressions) => {
-                let streams: Vec<_> = sub_expressions
-                    .iter()
-                    .map(|sub_expr| self.get_row_id_stream(sub_expr))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect();
-
+            Expr::Or(children) => {
+                let mut streams: Vec<xchan::Receiver<RowId>> = Vec::new();
+                for ch in children {
+                    if let Some(rx) = self.get_row_id_stream(ch)? {
+                        streams.push(rx);
+                    }
+                }
                 let (tx, rx) = xchan::unbounded();
-                thread::spawn(move || {
-                    let mut union_set = FxHashSet::default();
-                    for stream in streams {
-                        for row_id in stream {
-                            union_set.insert(row_id);
+                std::thread::spawn(move || {
+                    use std::collections::HashSet;
+                    let mut acc: HashSet<RowId> = HashSet::new();
+                    for s in streams {
+                        for rid in s {
+                            acc.insert(rid);
                         }
                     }
-                    for row_id in union_set {
-                        if tx.send(row_id).is_err() {
+                    for rid in acc {
+                        if tx.send(rid).is_err() {
                             break;
                         }
                     }
@@ -283,522 +434,550 @@ where
                 Ok(Some(rx))
             }
             Expr::Not(_) => {
-                unimplemented!("`Not` is currently unimplemented");
+                // Old impl left this unimplemented; do the same here.
+                unimplemented!("Expr::Not is not implemented");
             }
         }
     }
 
+    /// Single-predicate stream using a value-ordered scan on the column.
     fn get_stream_for_predicate<'b>(
         &'b self,
         filter: &Filter<'b, FieldId>,
-    ) -> Result<Option<xchan::Receiver<RowId>>, Error> {
-        if let Some(primary_index) = self.indexes.get(&filter.field_id) {
-            match filter.op {
-                Operator::Equals(val) => {
-                    let index_key = IndexKeyCodec::decode_from(val)?;
-                    let primary_snapshot = primary_index.snapshot();
-                    if let Some(root_id_ref) = primary_snapshot.get(&index_key)? {
-                        let root_id = decode_root_id(&root_id_ref);
-                        let (tx, rx) = xchan::unbounded();
-                        let pager = self.pager.clone();
+    ) -> Result<Option<xchan::Receiver<RowId>>, CmError> {
+        // Map the predicate to lo/hi bounds on VALUE bytes.
+        let (lo_bound, hi_bound): (Bound<&[u8]>, Bound<&[u8]>);
 
-                        std::thread::spawn(move || {
-                            let row_id_set = RowIdSetTree::open(pager, root_id, None);
-                            let snapshot = row_id_set.snapshot();
-                            if let Ok(iter) = snapshot.iter() {
-                                for (row_id_ref, _) in iter {
-                                    if let Ok(row_id) =
-                                        RowIdKeyCodec::decode_from(row_id_ref.as_ref())
-                                        && tx.send(row_id).is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                        return Ok(Some(rx));
-                    }
-                }
-                Operator::Range { lower, upper } => {
-                    let lower_key: Option<IndexKey> = match lower {
-                        Bound::Included(b) | Bound::Excluded(b) => {
-                            Some(IndexKeyCodec::decode_from(b)?)
-                        }
-                        Bound::Unbounded => None,
-                    };
-
-                    let upper_key: Option<IndexKey> = match upper {
-                        Bound::Included(b) | Bound::Excluded(b) => {
-                            Some(IndexKeyCodec::decode_from(b)?)
-                        }
-                        Bound::Unbounded => None,
-                    };
-                    let lower_bound = match (lower, lower_key.as_ref()) {
-                        (Bound::Included(_), Some(k)) => Bound::Included(k),
-                        (Bound::Excluded(_), Some(k)) => Bound::Excluded(k),
-                        _ => Bound::Unbounded,
-                    };
-                    let upper_bound = match (upper, upper_key.as_ref()) {
-                        (Bound::Included(_), Some(k)) => Bound::Included(k),
-                        (Bound::Excluded(_), Some(k)) => Bound::Excluded(k),
-                        _ => Bound::Unbounded,
-                    };
-                    let opts = ScanOpts::forward().with_bounds(lower_bound, upper_bound);
-                    let primary_snapshot = primary_index.snapshot();
-                    let mut root_ids: Vec<RootId> = Vec::new();
-                    if let Ok(primary_iter) = BPlusTreeIter::with_opts(&primary_snapshot, opts) {
-                        for (_, root_id_ref) in primary_iter {
-                            root_ids.push(decode_root_id(&root_id_ref));
-                        }
-                    }
-                    let (tx, rx) = xchan::unbounded();
-                    let pager = self.pager.clone();
-                    rayon::spawn(move || {
-                        root_ids.into_par_iter().for_each(|root_id| {
-                            let row_id_set = RowIdSetTree::open(pager.clone(), root_id, None);
-                            let snapshot = row_id_set.snapshot();
-
-                            if let Ok(iter) = snapshot.iter() {
-                                for (row_id_ref, _) in iter {
-                                    if let Ok(row_id) =
-                                        RowIdKeyCodec::decode_from(row_id_ref.as_ref())
-                                        && tx.send(row_id).is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                    });
-                    return Ok(Some(rx));
-                }
-                _ => {
-                    unimplemented!()
-                }
+        match &filter.op {
+            Operator::Equals(val) => {
+                lo_bound = Bound::Included(*val);
+                hi_bound = Bound::Included(*val);
+            }
+            Operator::Range { lower, upper } => {
+                // Lower
+                lo_bound = match lower {
+                    Bound::Unbounded => Bound::Unbounded,
+                    Bound::Included(b) => Bound::Included(*b),
+                    Bound::Excluded(b) => Bound::Excluded(*b),
+                };
+                // Upper
+                hi_bound = match upper {
+                    Bound::Unbounded => Bound::Unbounded,
+                    Bound::Included(b) => Bound::Included(*b),
+                    Bound::Excluded(b) => Bound::Excluded(*b),
+                };
+            }
+            _ => {
+                unimplemented!("Only Equals and Range are supported here");
             }
         }
-        let (_tx, rx) = xchan::unbounded();
+
+        // Kick off a value-ordered scan for this column.
+        let iter = match self.store.scan_values_lww(
+            filter.field_id as LogicalFieldId,
+            ValueScanOpts {
+                order_by: OrderBy::Value,
+                dir: Direction::Forward,
+                lo: lo_bound,
+                hi: hi_bound,
+                prefix: None,
+                bucket_prefix_len: 2,
+                head_tag_len: 16,
+                frame_predicate: None,
+            },
+        ) {
+            Ok(it) => it,
+            Err(llkv_column_map::column_store::read_scan::ScanError::NoActiveSegments) => {
+                return Ok(None);
+            }
+            Err(llkv_column_map::column_store::read_scan::ScanError::ColumnMissing(_)) => {
+                return Ok(None);
+            }
+            Err(e) => return Err(CmError::ScanInit(format!("{:?}", e))),
+        };
+
+        // Fill the channel synchronously to avoid requiring Send on the
+        // iterator (ValueScan is not Send).
+        let (tx, rx) = xchan::unbounded();
+        for item in iter {
+            let rid = parse_row_id(item.key.as_slice());
+            if tx.send(rid).is_err() {
+                break;
+            }
+        }
+        drop(tx);
+
         Ok(Some(rx))
+    }
+
+    /// Access to the underlying store for power users.
+    pub fn store(&self) -> &ColumnStore<'_, MemPager> {
+        &self.store
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::EMPTY_COL;
-    use crate::expr::Filter;
-    use std::collections::{HashMap, HashSet};
+    use crate::types::ColumnInput;
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::ops::Bound;
 
-    // All tests from the previous version are included here...
-    // They will pass with this new, correct architecture.
-    #[test]
-    fn it_works_insert_and_scan_using_index() {
-        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
-        table.add_column(1); // Name
-        table.add_index(1);
-        table.add_column(2); // Country
-
-        let row1 = HashMap::from([(1, (100u64, b"Alice".into())), (2, (0u64, b"USA".into()))]);
-        let row2 = HashMap::from([(1, (200u64, b"Bob".into())), (2, (0u64, b"Canada".into()))]);
-        let row3 = HashMap::from([(1, (100u64, b"Alice".into())), (2, (0u64, b"UK".into()))]);
-
-        table
-            .insert_many(&[(101, row1), (102, row2), (103, row3)])
-            .unwrap();
-
-        let filter = Filter {
-            field_id: 1,
-            op: Operator::Equals(&100u64.to_be_bytes()),
-        };
-        let expr = Expr::Pred(filter);
-        let projection = &[2];
-
-        let mut results = Vec::new();
-        table
-            .scan(&expr, projection, &mut |row_id, values_iter| {
-                let values: Vec<Vec<u8>> = values_iter.map(|v| v.as_slice().to_vec()).collect();
-                results.push((row_id, values));
-            })
-            .unwrap();
-
-        assert_eq!(results.len(), 2);
-
-        let results_set: HashSet<(u64, Vec<Vec<u8>>)> = results.into_iter().collect();
-        let expected_set =
-            HashSet::from([(101, vec![b"USA".to_vec()]), (103, vec![b"UK".to_vec()])]);
-
-        assert_eq!(results_set, expected_set);
-    }
-
-    #[test]
-    fn it_works_range_scan_using_index() {
-        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
-        table.add_column(1); // User ID
-        table.add_index(1);
-        table.add_column(2); // Data
-
-        table
-            .insert_many(&[
-                (
-                    1,
-                    HashMap::from([(1, (100u64, EMPTY_COL)), (2, (0u64, b"data_100".into()))]),
-                ),
-                (
-                    2,
-                    HashMap::from([(1, (101u64, EMPTY_COL)), (2, (0u64, b"data_101".into()))]),
-                ),
-                (
-                    3,
-                    HashMap::from([(1, (102u64, EMPTY_COL)), (2, (0u64, b"data_102".into()))]),
-                ),
-                (
-                    4,
-                    HashMap::from([(1, (103u64, EMPTY_COL)), (2, (0u64, b"data_103".into()))]),
-                ),
-                (
-                    5,
-                    HashMap::from([(1, (104u64, EMPTY_COL)), (2, (0u64, b"data_104".into()))]),
-                ),
-                (
-                    6,
-                    HashMap::from([(1, (105u64, EMPTY_COL)), (2, (0u64, b"data_105".into()))]),
-                ),
-            ])
-            .unwrap();
-
-        // Define bounds for the range scan: keys >= 102 and < 105
-        let lower_bound_bytes = 102u64.to_be_bytes();
-        let upper_bound_bytes = 105u64.to_be_bytes();
-
-        let filter = Filter {
-            field_id: 1,
-            op: Operator::Range {
-                lower: Bound::Included(&lower_bound_bytes),
-                upper: Bound::Excluded(&upper_bound_bytes),
-            },
-        };
-        let expr = Expr::Pred(filter);
-        let projection = &[2]; // Project the data column
-
-        let mut results = Vec::new();
-        table
-            .scan(&expr, projection, &mut |row_id, values_iter| {
-                let values: Vec<Vec<u8>> = values_iter.map(|v| v.as_slice().to_vec()).collect();
-                results.push((row_id, values));
-            })
-            .unwrap();
-
-        // Expect to find rows with index keys 102, 103, and 104
-        assert_eq!(results.len(), 3);
-
-        let results_set: HashSet<(u64, Vec<Vec<u8>>)> = results.into_iter().collect();
-        let expected_set = HashSet::from([
-            (3, vec![b"data_102".to_vec()]),
-            (4, vec![b"data_103".to_vec()]),
-            (5, vec![b"data_104".to_vec()]),
-        ]);
-
-        assert_eq!(results_set, expected_set);
-    }
-
-    #[test]
-    fn it_works_complex_multi_column_scans() {
-        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
-
-        // --- Setup: 10 columns, 3 of which are indexed ---
-        for i in 1..=10 {
-            table.add_column(i);
+    /// Build a single row patch from simple (field, value) pairs.
+    #[inline]
+    fn mk_row(
+        rid: RowId,
+        kv: &[(FieldId, ColumnInput<'static>)],
+    ) -> (RowId, HashMap<FieldId, (u64, ColumnInput<'static>)>) {
+        let mut m = HashMap::new();
+        for (fid, v) in kv.iter() {
+            m.insert(*fid, (0u64, v.clone()));
         }
-        table.add_index(1); // High cardinality (unique)
-        table.add_index(2); // Medium cardinality (100 unique values)
-        table.add_index(3); // Low cardinality (5 unique values)
+        (rid, m)
+    }
 
-        // --- Insert 5000 rows ---
-        let num_rows = 5000;
-        let mut rows_to_insert = Vec::with_capacity(num_rows);
-        for i in 0..num_rows {
-            let row_id = i as RowId;
-            let mut row_data = HashMap::new();
+    /// String helper: own bytes to avoid 'static lifetime requirements.
+    #[inline]
+    fn s(x: &str) -> ColumnInput<'static> {
+        Cow::Owned(x.as_bytes().to_vec())
+    }
 
-            // Indexed columns
-            row_data.insert(1, (1000 + row_id, EMPTY_COL)); // Unique key
-            row_data.insert(2, (row_id % 100, EMPTY_COL)); // 100 different keys
-            row_data.insert(3, (row_id % 5, EMPTY_COL)); // 5 different keys
+    #[inline]
+    fn be_u64(x: u64) -> Vec<u8> {
+        x.to_be_bytes().to_vec()
+    }
 
-            // Non-indexed data payload columns
-            for j in 4..=10 {
-                row_data.insert(
-                    j,
-                    (0, format!("col{}_row{}", j, row_id).into_bytes().into()),
-                );
-            }
-            rows_to_insert.push((row_id, row_data));
+    #[inline]
+    fn from_be_u64(b: &[u8]) -> u64 {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&b[..8]);
+        u64::from_be_bytes(a)
+    }
+
+    /// u64 helper: store as big-endian bytes (lex order == numeric).
+    #[inline]
+    fn be64_bytes(x: u64) -> ColumnInput<'static> {
+        Cow::Owned(x.to_be_bytes().to_vec())
+    }
+
+    fn mk_rowpatch_u64(
+        rid: RowId,
+        pairs: &[(FieldId, u64)],
+    ) -> (RowId, HashMap<FieldId, (u64, ColumnInput<'static>)>) {
+        let mut m = HashMap::new();
+        for &(fid, n) in pairs {
+            m.insert(fid, (0u64, Cow::Owned(be_u64(n))));
         }
-        table.insert_many(&rows_to_insert).unwrap();
-
-        // --- Test 1: Forward Range Scan on high-cardinality index (Field 1) ---
-        let lower_1 = 3000u64.to_be_bytes();
-        let upper_1 = 4000u64.to_be_bytes();
-        let filter_1 = Filter {
-            field_id: 1,
-            op: Operator::Range {
-                lower: Bound::Included(&lower_1),
-                upper: Bound::Excluded(&upper_1),
-            },
-        };
-        let expr_1 = Expr::Pred(filter_1);
-        let mut results_1 = Vec::new();
-        table
-            .scan(&expr_1, &[4], &mut |row_id, values_iter| {
-                results_1.push((row_id, values_iter.last().unwrap().as_slice().to_vec()));
-            })
-            .unwrap();
-
-        assert_eq!(results_1.len(), 1000); // Should find 1000 rows
-        results_1.sort_by_key(|(k, _)| *k);
-        assert_eq!(results_1[0].0, 2000); // 1000 + 2000 = 3000
-        assert_eq!(results_1[0].1, b"col4_row2000".to_vec());
-        assert_eq!(results_1[999].0, 2999); // 1000 + 2999 = 3999
-        assert_eq!(results_1[999].1, b"col4_row2999".to_vec());
-
-        // --- Test 2: Equality Scan on medium-cardinality index (Field 2) ---
-        let key_2 = 42u64.to_be_bytes();
-        let filter_2 = Filter {
-            field_id: 2,
-            op: Operator::Equals(&key_2),
-        };
-        let expr_2 = Expr::Pred(filter_2);
-        let mut results_2 = Vec::new();
-        table
-            .scan(&expr_2, &[], &mut |row_id, _| {
-                results_2.push(row_id);
-            })
-            .unwrap();
-
-        assert_eq!(results_2.len(), 50); // 5000 / 100 = 50
-        assert!(results_2.iter().all(|&rid| rid % 100 == 42));
-
-        // --- Test 3: Range Scan on low-cardinality index (Field 3) ---
-        let lower_3 = 2u64.to_be_bytes();
-        let upper_3 = 4u64.to_be_bytes();
-        let filter_3 = Filter {
-            field_id: 3,
-            op: Operator::Range {
-                lower: Bound::Included(&lower_3),
-                upper: Bound::Excluded(&upper_3),
-            },
-        };
-        let expr_3 = Expr::Pred(filter_3);
-        let mut results_3 = Vec::new();
-        table
-            .scan(&expr_3, &[], &mut |row_id, _| {
-                results_3.push(row_id);
-            })
-            .unwrap();
-
-        // Should find rows where row_id % 5 is 2 or 3.
-        // Each category has 5000 / 5 = 1000 rows. So 2000 total.
-        assert_eq!(results_3.len(), 2000);
-        assert!(results_3.iter().all(|&rid| rid % 5 == 2 || rid % 5 == 3));
+        (rid, m)
     }
 
     #[test]
-    fn it_works_intersections_and_unions() {
-        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
-        table.add_column(1);
-        table.add_index(1); // City ID
-        table.add_column(2);
-        table.add_index(2); // Category ID
-        table.add_column(3); // Payload
+    fn insert_many_strings_readable() {
+        let table = Table::new(TableCfg::default());
 
-        let rows = vec![
-            (
-                10,
-                HashMap::from([
-                    (1, (1, EMPTY_COL)),
-                    (2, (10, EMPTY_COL)),
-                    (3, (0, b"Restaurant in NYC".into())),
-                ]),
+        const COL_NAME: FieldId = 11;
+        const COL_CITY: FieldId = 12;
+        const COL_ROLE: FieldId = 13;
+
+        let rows: Vec<RowPatch> = vec![
+            mk_row(
+                1,
+                &[
+                    (COL_NAME, s("alice")),
+                    (COL_CITY, s("austin")),
+                    (COL_ROLE, s("dev")),
+                ],
             ),
-            (
-                20,
-                HashMap::from([
-                    (1, (1, EMPTY_COL)),
-                    (2, (20, EMPTY_COL)),
-                    (3, (0, b"Museum in NYC".into())),
-                ]),
+            mk_row(
+                2,
+                &[
+                    (COL_NAME, s("bob")),
+                    (COL_CITY, s("boston")),
+                    (COL_ROLE, s("pm")),
+                ],
             ),
-            (
-                30,
-                HashMap::from([
-                    (1, (2, EMPTY_COL)),
-                    (2, (10, EMPTY_COL)),
-                    (3, (0, b"Restaurant in London".into())),
-                ]),
-            ),
-            (
-                40,
-                HashMap::from([
-                    (1, (2, EMPTY_COL)),
-                    (2, (30, EMPTY_COL)),
-                    (3, (0, b"Theatre in London".into())),
-                ]),
-            ),
-            (
-                50,
-                HashMap::from([
-                    (1, (1, EMPTY_COL)),
-                    (2, (10, EMPTY_COL)),
-                    (3, (0, b"Another Restaurant in NYC".into())),
-                ]),
+            mk_row(
+                3,
+                &[
+                    (COL_NAME, s("carol")),
+                    (COL_CITY, s("chicago")),
+                    (COL_ROLE, s("qa")),
+                ],
             ),
         ];
-        table.insert_many(&rows).unwrap();
 
-        // --- Test 1: Intersection (AND) ---
-        // Find: Restaurants (category 10) in NYC (city 1)
-        let city_nyc = 1u64.to_be_bytes();
-        let cat_restaurant = 10u64.to_be_bytes();
-        let expr_and = Expr::And(vec![
-            Expr::Pred(Filter {
-                field_id: 1,
-                op: Operator::Equals(&city_nyc),
-            }),
-            Expr::Pred(Filter {
-                field_id: 2,
-                op: Operator::Equals(&cat_restaurant),
-            }),
-        ]);
+        table.insert_many(&rows);
 
-        let mut results_and = Vec::new();
-        table
-            .scan(&expr_and, &[], &mut |row_id, _| {
-                results_and.push(row_id);
-            })
-            .unwrap();
+        let mut got: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
+        table.scan_by_row_id_range(
+            COL_NAME,
+            Bound::Excluded(0),
+            Bound::Included(3),
+            &[COL_NAME, COL_CITY, COL_ROLE],
+            2,
+            |rid, cols| got.push((rid, cols)),
+        );
 
-        let expected_and: HashSet<u64> = [10, 50].iter().cloned().collect();
-        let got_and: HashSet<u64> = results_and.into_iter().collect();
-        assert_eq!(got_and, expected_and);
+        assert_eq!(got.len(), 3);
 
-        // --- Test 2: Union (OR) ---
-        // Find: anything in NYC (city 1) OR any Restaurant (category 10)
-        let expr_or = Expr::Or(vec![
-            Expr::Pred(Filter {
-                field_id: 1,
-                op: Operator::Equals(&city_nyc),
-            }),
-            Expr::Pred(Filter {
-                field_id: 2,
-                op: Operator::Equals(&cat_restaurant),
-            }),
-        ]);
+        let to_s = |o: &Option<Vec<u8>>| -> String {
+            String::from_utf8(o.as_ref().unwrap().clone()).unwrap()
+        };
 
-        let mut results_or = Vec::new();
-        table
-            .scan(&expr_or, &[], &mut |row_id, _| {
-                results_or.push(row_id);
-            })
-            .unwrap();
+        assert_eq!(got[0].0, 1);
+        assert_eq!(to_s(&got[0].1[0]), "alice");
+        assert_eq!(to_s(&got[0].1[1]), "austin");
+        assert_eq!(to_s(&got[0].1[2]), "dev");
 
-        let expected_or: HashSet<u64> = [10, 20, 30, 50].iter().cloned().collect();
-        let got_or: HashSet<u64> = results_or.into_iter().collect();
-        assert_eq!(got_or, expected_or);
+        assert_eq!(got[1].0, 2);
+        assert_eq!(to_s(&got[1].1[0]), "bob");
+        assert_eq!(to_s(&got[1].1[1]), "boston");
+        assert_eq!(to_s(&got[1].1[2]), "pm");
+
+        assert_eq!(got[2].0, 3);
+        assert_eq!(to_s(&got[2].1[0]), "carol");
+        assert_eq!(to_s(&got[2].1[1]), "chicago");
+        assert_eq!(to_s(&got[2].1[2]), "qa");
     }
 
     #[test]
-    fn it_works_large_scale_intersections_and_unions() {
-        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
+    fn insert_many_u64_readable() {
+        let table = Table::new(TableCfg::default());
 
-        // --- Setup: 10 columns, 3 with indexes ---
-        for i in 1..=10 {
-            table.add_column(i);
-        }
-        table.add_index(1); // Country ID (10 values)
-        table.add_index(2); // Status ID (5 values)
-        table.add_index(3); // Category ID (100 values)
+        const COL_A: FieldId = 21; // driver
+        const COL_B: FieldId = 22; // numeric payload
+        const COL_C: FieldId = 23; // numeric payload (sparse)
 
-        // --- Insert 15,000 rows ---
-        let num_rows = 15_000;
-        let mut rows_to_insert = Vec::with_capacity(num_rows);
-        for i in 0..num_rows {
-            let row_id = i as RowId;
-            let mut row_data = HashMap::new();
-            row_data.insert(1, (row_id % 10, EMPTY_COL));
-            row_data.insert(2, (row_id % 5, EMPTY_COL));
-            row_data.insert(3, (row_id % 100, EMPTY_COL));
-            for j in 4..=10 {
-                row_data.insert(j, (0, EMPTY_COL));
+        let rows: Vec<RowPatch> = (1..=5)
+            .map(|rid| {
+                let mut cols = vec![
+                    (COL_A, be64_bytes(10 + rid)),
+                    (COL_B, be64_bytes(100 + rid)),
+                ];
+                if rid % 2 == 1 {
+                    cols.push((COL_C, be64_bytes(1000 + rid)));
+                }
+                mk_row(rid, &cols)
+            })
+            .collect();
+
+        table.insert_many(&rows);
+
+        let mut got: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
+        table.scan_by_row_id_range(
+            COL_A,
+            Bound::Excluded(0),
+            Bound::Included(5),
+            &[COL_A, COL_B, COL_C],
+            3,
+            |rid, cols| got.push((rid, cols)),
+        );
+
+        assert_eq!(got.len(), 5);
+        for i in 0..5 {
+            let (rid, cols) = &got[i];
+            let expect = (i as u64) + 1;
+            assert_eq!(*rid, expect);
+
+            let a = from_be_u64(cols[0].as_ref().unwrap());
+            let b = from_be_u64(cols[1].as_ref().unwrap());
+            assert_eq!(a, 10 + expect);
+            assert_eq!(b, 100 + expect);
+
+            if expect % 2 == 1 {
+                let c = from_be_u64(cols[2].as_ref().unwrap());
+                assert_eq!(c, 1000 + expect);
+            } else {
+                assert!(cols[2].is_none());
             }
-            rows_to_insert.push((row_id, row_data));
         }
-        table.insert_many(&rows_to_insert).unwrap();
+    }
 
-        // --- Test 1: Intersection (AND) ---
-        // Find rows where Country=7 AND Status=2.
-        let country_7 = 7u64.to_be_bytes();
-        let status_2 = 2u64.to_be_bytes();
+    #[test]
+    fn scan_unmatched_range_returns_no_rows_u64() {
+        let cfg = TableCfg::default();
+        let table = Table::new(cfg);
+
+        let fid_row: FieldId = 10;
+        let fid_d1: FieldId = 11;
+        let fid_d2: FieldId = 12;
+
+        let rows: Vec<RowPatch> = (1..=3)
+            .map(|rid| {
+                mk_rowpatch_u64(rid, &[(fid_row, rid), (fid_d1, rid + 7), (fid_d2, rid + 9)])
+            })
+            .collect();
+        table.insert_many(&rows);
+
+        let mut called = false;
+        table.scan_by_row_id_range(
+            fid_row,
+            Bound::Excluded(10),
+            Bound::Included(20),
+            &[fid_row, fid_d1, fid_d2],
+            8,
+            |_rid, _cols| {
+                called = true;
+            },
+        );
+        assert!(!called, "no rows should be returned");
+    }
+
+    #[test]
+    fn stream_value_order_multi_cols() {
+        let cfg = TableCfg::default();
+        let table = Table::new(cfg);
+
+        let fid_row: FieldId = 20; // driver
+        let fid_v1: FieldId = 21; // rid * 10
+        let fid_v2: FieldId = 22; // 500 - rid (reverse baseline)
+        let fid_sparse: FieldId = 23; // multiples of 3, 3000 + rid
+
+        let rows: Vec<RowPatch> = (1..=12)
+            .map(|rid| {
+                let mut pairs = vec![(fid_row, rid), (fid_v1, rid * 10), (fid_v2, 500 - rid)];
+                if rid % 3 == 0 {
+                    pairs.push((fid_sparse, 3000 + rid));
+                }
+                mk_rowpatch_u64(rid, &pairs)
+            })
+            .collect();
+        table.insert_many(&rows);
+
+        // Stream v1 forward: strictly increasing.
+        let mut v1_f: Vec<(RowId, u64)> = Vec::new();
+        table.stream_column_values(fid_v1, Direction::Forward, 4, |rid, v| {
+            v1_f.push((rid, from_be_u64(&v)));
+        });
+        assert_eq!(v1_f.len(), 12);
+        for w in v1_f.windows(2) {
+            assert!(w[0].1 < w[1].1, "v1 must increase forward");
+        }
+
+        // Stream v2 reverse: strictly decreasing.
+        let mut v2_r: Vec<(RowId, u64)> = Vec::new();
+        table.stream_column_values(fid_v2, Direction::Reverse, 5, |rid, v| {
+            v2_r.push((rid, from_be_u64(&v)));
+        });
+        assert_eq!(v2_r.len(), 12);
+        for w in v2_r.windows(2) {
+            assert!(w[0].1 > w[1].1, "v2 must decrease reverse");
+        }
+
+        // Stream sparse forward: only rid % 3 == 0.
+        let mut sp_f: Vec<(RowId, u64)> = Vec::new();
+        table.stream_column_values(fid_sparse, Direction::Forward, 3, |rid, v| {
+            sp_f.push((rid, from_be_u64(&v)));
+        });
+        assert_eq!(sp_f.len(), 4);
+        assert_eq!(
+            sp_f.iter().map(|x| x.0).collect::<Vec<_>>(),
+            vec![3, 6, 9, 12]
+        );
+        for (i, (_rid, val)) in sp_f.iter().enumerate() {
+            assert_eq!(*val, 3000 + ((i as u64 + 1) * 3));
+        }
+    }
+
+    #[test]
+    fn pagination_chunks_are_consistent_u64_multi_proj() {
+        let cfg = TableCfg::default();
+        let table = Table::new(cfg);
+
+        let fid_row: FieldId = 30; // driver
+        let fid_d1: FieldId = 31;
+        let fid_d2: FieldId = 32;
+
+        let rows: Vec<RowPatch> = (1..=50)
+            .map(|rid| {
+                mk_rowpatch_u64(
+                    rid,
+                    &[(fid_row, rid), (fid_d1, 1000 + rid), (fid_d2, 2000 + rid)],
+                )
+            })
+            .collect();
+        table.insert_many(&rows);
+
+        let mut got: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
+        table.scan_by_row_id_range(
+            fid_row,
+            Bound::Excluded(0),
+            Bound::Included(50),
+            &[fid_row, fid_d1, fid_d2],
+            7,
+            |rid, cols| got.push((rid, cols)),
+        );
+
+        assert_eq!(got.len(), 50);
+        for (i, (rid, cols)) in got.into_iter().enumerate() {
+            let expect = (i as u64) + 1;
+            assert_eq!(rid, expect);
+            assert_eq!(from_be_u64(cols[0].as_ref().unwrap()), expect);
+            assert_eq!(from_be_u64(cols[1].as_ref().unwrap()), 1000 + expect);
+            assert_eq!(from_be_u64(cols[2].as_ref().unwrap()), 2000 + expect);
+        }
+    }
+
+    use crate::expr::{Expr, Filter, Operator};
+
+    #[test]
+    fn expr_equals_and_range_scan_projects_values() {
+        let table = Table::new(TableCfg::default());
+
+        const COL_NAME: FieldId = 101;
+        const COL_CITY: FieldId = 102;
+        const COL_SCORE: FieldId = 103;
+
+        let rows: Vec<RowPatch> = vec![
+            mk_row(
+                1,
+                &[
+                    (COL_NAME, s("alice")),
+                    (COL_CITY, s("austin")),
+                    (COL_SCORE, be64_bytes(10)),
+                ],
+            ),
+            mk_row(
+                2,
+                &[
+                    (COL_NAME, s("bob")),
+                    (COL_CITY, s("boston")),
+                    (COL_SCORE, be64_bytes(20)),
+                ],
+            ),
+            mk_row(
+                3,
+                &[
+                    (COL_NAME, s("carol")),
+                    (COL_CITY, s("chicago")),
+                    (COL_SCORE, be64_bytes(30)),
+                ],
+            ),
+            mk_row(
+                4,
+                &[
+                    (COL_NAME, s("dave")),
+                    (COL_CITY, s("dallas")),
+                    (COL_SCORE, be64_bytes(40)),
+                ],
+            ),
+            mk_row(
+                5,
+                &[
+                    (COL_NAME, s("erin")),
+                    (COL_CITY, s("el paso")),
+                    (COL_SCORE, be64_bytes(50)),
+                ],
+            ),
+            mk_row(
+                6,
+                &[
+                    (COL_NAME, s("frank")),
+                    (COL_CITY, s("fresno")),
+                    (COL_SCORE, be64_bytes(60)),
+                ],
+            ),
+        ];
+        table.insert_many(&rows);
+
+        // WHERE score = 30
+        let key_eq = 30u64.to_be_bytes();
+        let expr_eq = Expr::Pred(Filter {
+            field_id: COL_SCORE,
+            op: Operator::Equals(&key_eq),
+        });
+        let mut got_eq: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
+        table
+            .scan_expr(&expr_eq, &[COL_NAME, COL_CITY], |rid, cols| {
+                got_eq.push((rid, cols));
+            })
+            .unwrap();
+        assert_eq!(got_eq.len(), 1);
+        assert_eq!(got_eq[0].0, 3);
+
+        // WHERE 20 <= score < 50
+        let lo = 20u64.to_be_bytes();
+        let hi = 50u64.to_be_bytes();
+        let expr_rng = Expr::Pred(Filter {
+            field_id: COL_SCORE,
+            op: Operator::Range {
+                lower: Bound::Included(&lo),
+                upper: Bound::Excluded(&hi),
+            },
+        });
+        let mut got_rng: Vec<RowId> = Vec::new();
+        table
+            .scan_expr(&expr_rng, &[], |rid, _| {
+                got_rng.push(rid);
+            })
+            .unwrap();
+        got_rng.sort_unstable();
+        assert_eq!(got_rng, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn expr_intersection_and_union() {
+        let table = Table::new(TableCfg::default());
+
+        const COL_COUNTRY: FieldId = 201;
+        const COL_STATUS: FieldId = 202;
+        const COL_PAYLOAD: FieldId = 203;
+
+        let rows: Vec<RowPatch> = (1..=20)
+            .map(|rid| {
+                mk_row(
+                    rid,
+                    &[
+                        (COL_COUNTRY, be64_bytes((rid % 5) as u64)),
+                        (COL_STATUS, be64_bytes((rid % 4) as u64)),
+                        (COL_PAYLOAD, s("x")),
+                    ],
+                )
+            })
+            .collect();
+        table.insert_many(&rows);
+
+        // country=3 AND status=2
+        let c3 = (3u64).to_be_bytes();
+        let s2 = (2u64).to_be_bytes();
         let expr_and = Expr::And(vec![
             Expr::Pred(Filter {
-                field_id: 1,
-                op: Operator::Equals(&country_7),
+                field_id: COL_COUNTRY,
+                op: Operator::Equals(&c3),
             }),
             Expr::Pred(Filter {
-                field_id: 2,
-                op: Operator::Equals(&status_2),
+                field_id: COL_STATUS,
+                op: Operator::Equals(&s2),
             }),
         ]);
-        let mut results_and = Vec::new();
+
+        let mut and_rows: Vec<RowId> = Vec::new();
         table
-            .scan(&expr_and, &[], &mut |row_id, _| {
-                results_and.push(row_id);
-            })
+            .scan_expr(&expr_and, &[], |rid, _| and_rows.push(rid))
             .unwrap();
+        and_rows.sort_unstable();
+        assert_eq!(and_rows, vec![18]);
 
-        let mut expected_and = HashSet::new();
-        for i in 0..num_rows {
-            if i % 10 == 7 && i % 5 == 2 {
-                expected_and.insert(i as u64);
-            }
-        }
-        assert_eq!(
-            results_and.into_iter().collect::<HashSet<u64>>(),
-            expected_and
-        );
-        assert_eq!(expected_and.len(), 1500);
-
-        // --- Test 2: Union (OR) ---
-        // Find rows where Status=1 OR Status=3
-        let status_1 = 1u64.to_be_bytes();
-        let status_3 = 3u64.to_be_bytes();
+        // country=1 OR status=0
+        let c1 = (1u64).to_be_bytes();
+        let s0 = (0u64).to_be_bytes();
         let expr_or = Expr::Or(vec![
             Expr::Pred(Filter {
-                field_id: 2,
-                op: Operator::Equals(&status_1),
+                field_id: COL_COUNTRY,
+                op: Operator::Equals(&c1),
             }),
             Expr::Pred(Filter {
-                field_id: 2,
-                op: Operator::Equals(&status_3),
+                field_id: COL_STATUS,
+                op: Operator::Equals(&s0),
             }),
         ]);
 
-        let mut results_or = Vec::new();
+        let mut or_rows: Vec<RowId> = Vec::new();
         table
-            .scan(&expr_or, &[], &mut |row_id, _| {
-                results_or.push(row_id);
-            })
+            .scan_expr(&expr_or, &[], |rid, _| or_rows.push(rid))
             .unwrap();
-
-        let mut expected_or = HashSet::new();
-        for i in 0..num_rows {
-            if i % 5 == 1 || i % 5 == 3 {
-                expected_or.insert(i as u64);
-            }
-        }
-        assert_eq!(
-            results_or.into_iter().collect::<HashSet<u64>>(),
-            expected_or
-        );
-        assert_eq!(expected_or.len(), 15000 * 2 / 5); // 6000
+        or_rows.sort_unstable();
+        assert_eq!(or_rows, vec![1, 4, 6, 8, 11, 12, 16, 20]);
     }
 }
