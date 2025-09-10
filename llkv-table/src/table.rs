@@ -4,9 +4,6 @@
 //! - No B+Tree, no rayon.
 //! - Row-based inserts -> column_map append_many.
 //! - Scans delegate to column_map read_scan utilities.
-//!
-//! NOTE: This lives alongside your current Table so nothing breaks until
-//! you decide to switch. No indexes here yet by design.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -23,6 +20,9 @@ use llkv_column_map::views::ValueSlice;
 use crate::expr::{Expr, Filter, Operator};
 use crate::types::{FieldId, RowId, RowPatch};
 
+// ----- sys_catalog wiring -----
+use crate::sys_catalog::{ColMeta, Schema, SysCatalog, TableMeta};
+
 /// Compose a 64-bit logical field id from a 32-bit table id and a 32-bit column id.
 /// Layout: [ table_id: u32 | column_id: u32 ]
 #[inline]
@@ -31,6 +31,7 @@ fn lfid_for(table_id: u32, column_id: FieldId) -> LogicalFieldId {
 }
 
 /// Reserved column id for per-table presence. Clients should not use this id.
+/// (Catalog can use a different presence id; presence is namespaced per table id.)
 const PRESENCE_COL_ID: FieldId = u32::MAX;
 
 /// Encode row id as big-endian bytes so lexicographic order == numeric.
@@ -138,6 +139,47 @@ impl Table {
     fn lfid(&self, fid: FieldId) -> LogicalFieldId {
         lfid_for(self.table_id, fid)
     }
+
+    // ---------- sys_catalog: wiring ----------
+
+    /// Return a lightweight SysCatalog handle bound to this table's ColumnStore.
+    #[inline]
+    pub fn catalog(&self) -> SysCatalog<'_> {
+        SysCatalog::new(&self.store)
+    }
+
+    /// Convenience: write this table's meta into the system catalog.
+    #[inline]
+    pub fn put_table_meta(&self, meta: &TableMeta) {
+        debug_assert_eq!(meta.table_id, self.table_id);
+        self.catalog().put_table_meta(meta);
+    }
+
+    /// Convenience: read this table’s meta from the catalog.
+    #[inline]
+    pub fn get_table_meta(&self) -> Option<TableMeta> {
+        self.catalog().get_table_meta(self.table_id)
+    }
+
+    /// Convenience: add/update a column’s metadata in the catalog for this table.
+    #[inline]
+    pub fn put_col_meta(&self, meta: &ColMeta) {
+        self.catalog().put_col_meta(self.table_id, meta);
+    }
+
+    /// Convenience: batch fetch column metadata for this table.
+    #[inline]
+    pub fn get_cols_meta(&self, col_ids: &[u32]) -> Vec<Option<ColMeta>> {
+        self.catalog().get_cols_meta(self.table_id, col_ids)
+    }
+
+    /// Arrow-ish schema for this table (from the catalog).
+    #[inline]
+    pub fn schema(&self) -> Option<Schema> {
+        self.catalog().schema(self.table_id)
+    }
+
+    // ---------- ingest / scans ----------
 
     /// Row-based ingest. Each row contains (field_id -> value).
     /// We map to per-column `Put` batches and call append_many.

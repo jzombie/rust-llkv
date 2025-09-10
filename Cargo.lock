@@ -887,6 +887,7 @@ dependencies = [
 name = "llkv-table"
 version = "0.1.0-alpha"
 dependencies = [
+ "bitcode",
  "crossbeam-channel",
  "llkv-column-map",
  "llkv-expr",
