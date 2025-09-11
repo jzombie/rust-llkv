@@ -61,6 +61,37 @@ pub trait Codec {
 
     /// Decode one value from `src` into the native owned type.
     fn decode(src: &[u8]) -> Self::Owned;
+
+    // TODO: Wire up
+    // // Decode many items from an iterator of byte slices, appending to `out`.
+    // #[inline]
+    // fn decode_many_into<'a, I>(inputs: I, out: &mut Vec<Self::Owned>) -> usize
+    // where
+    //     I: IntoIterator<Item = &'a [u8]>,
+    //     Self: Sized,
+    // {
+    //     let mut n = 0;
+    //     for s in inputs {
+    //         out.push(Self::decode(s));
+    //         n += 1;
+    //     }
+    //     n
+    // }
+
+    // TODO: Scalar example of above TODO; could be replaced by more efficient SIMD versions
+    // Scalar reference path. Always available.
+    // #[inline]
+    // pub fn decode_be_u64_page(src: &[u8], out: &mut [u64]) -> usize {
+    //     let n = core::cmp::min(src.len() / 8, out.len());
+    //     let mut i = 0;
+    //     while i < n {
+    //         let off = i * 8;
+    //         let a: [u8; 8] = src[off..off + 8].try_into().unwrap();
+    //         out[i] = u64::from_be_bytes(a);
+    //         i += 1;
+    //     }
+    //     n
+    // }
 }
 
 /* ----------------------- Text: case-insensitive UTF-8 ------------------- */
