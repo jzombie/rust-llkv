@@ -932,12 +932,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
 
 [[package]]
-name = "line-ending"
-version = "1.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "834e592123b39b7b3ba3fdc4b7e4822fad3ced449010f8229f843fe6dd1a33f1"
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -960,20 +954,6 @@ dependencies = [
  "arrow-schema",
  "criterion",
  "llkv-column-map",
-]
-
-[[package]]
-name = "llkv-btree"
-version = "0.1.0-alpha"
-dependencies = [
- "criterion",
- "crossbeam-channel",
- "line-ending",
- "llkv-btree",
- "rand",
- "rayon",
- "rustc-hash",
- "xxhash-rust",
 ]
 
 [[package]]

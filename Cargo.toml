@@ -7,7 +7,7 @@ repository = "https://github.com/jzombie/rust-llkv"
 publish = true
 
 [workspace.dependencies]
-llkv-btree = { path = "./llkv-btree", version = "0.1.0-alpha" }
+llkv-arrowhead = { path = "./llkv-arrowhead", version = "0.1.0-alpha" }
 llkv-column-map = { path = "./llkv-column-map", version = "0.1.0-alpha" }
 llkv-csv = { path = "./llkv-csv", version = "0.1.0-alpha" }
 llkv-data-types = { path = "./llkv-data-types", version = "0.1.0-alpha" }
@@ -33,7 +33,6 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 [workspace]
 members = [
     "llkv-arrowhead",
-    "llkv-btree",
     "llkv-column-map",
     "llkv-csv",
     "llkv-data-types",
