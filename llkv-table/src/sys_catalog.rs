@@ -102,6 +102,7 @@ pub struct TableMeta {
     pub epoch: u64,
 }
 
+// TODO: Replace with `llkv-types`
 #[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
 pub enum ColType {
     Bytes,
