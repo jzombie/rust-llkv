@@ -10,7 +10,7 @@ use llkv_types::internal::Codec;
 use llkv_types::internal::Utf8CaseFold;
 
 #[test]
-fn utf8_casefold_orders_case_insensitively_and_preserves_original() {
+fn test_utf8_casefold_orders_case_insensitively_and_preserves_original() {
     // Set up a fresh in-memory ColumnStore.
     let pager = MemPager::default();
     let store = ColumnStore::init_empty(&pager);
