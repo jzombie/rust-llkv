@@ -20,6 +20,9 @@ pub enum DataType {
     U64,
     /// Indicates the data is a boolean value (0 for false, 1 for true).
     Bool,
+    //
+    /// Indicates the data is a collection of bytes.
+    Bytes,
 }
 
 /// A generic enum to hold any possible value decoded from storage.
@@ -31,6 +34,7 @@ pub enum DecodedValue<'a> {
     Str(&'a str),
     U64(u64),
     Bool(bool),
+    Bytes(&'a [u8]),
 }
 
 /// Encode `value` into `out` using `dtype`.
@@ -46,25 +50,34 @@ pub fn encode_value<'a>(
             s.encode_into(out);
             Ok(())
         }
-        (DataType::U64, DecodedValue::U64(x)) => {
-            x.encode_into(out);
-            Ok(())
-        }
-        (DataType::Bool, DecodedValue::Bool(b)) => {
-            b.encode_into(out);
-            Ok(())
-        }
         (expected, DecodedValue::Str(_)) => Err(EncodeError::TypeMismatch {
             expected: *expected,
             got: "Str",
         }),
+        (DataType::U64, DecodedValue::U64(x)) => {
+            x.encode_into(out);
+            Ok(())
+        }
         (expected, DecodedValue::U64(_)) => Err(EncodeError::TypeMismatch {
             expected: *expected,
             got: "U64",
         }),
+        (DataType::Bool, DecodedValue::Bool(b)) => {
+            b.encode_into(out);
+            Ok(())
+        }
+
         (expected, DecodedValue::Bool(_)) => Err(EncodeError::TypeMismatch {
             expected: *expected,
             got: "Bool",
+        }),
+        (DataType::Bytes, DecodedValue::Bytes(b)) => {
+            b.encode_into(out);
+            Ok(())
+        }
+        (expected, DecodedValue::Bytes(_)) => Err(EncodeError::TypeMismatch {
+            expected: *expected,
+            got: "Bytes",
         }),
     }
 }
@@ -89,6 +102,7 @@ pub fn decode_value<'a>(bytes: &'a [u8], dtype: &DataType) -> Option<DecodedValu
         DataType::Utf8 => Utf8CaseFold::decode_borrowed(bytes).map(DecodedValue::Str),
         DataType::U64 => BeU64::decode(bytes).ok().map(DecodedValue::U64),
         DataType::Bool => Bool::decode(bytes).ok().map(DecodedValue::Bool),
+        DataType::Bytes => internal::Bytes::decode_borrowed(bytes).map(DecodedValue::Bytes),
     }
 }
 
@@ -128,6 +142,13 @@ where
             for b in inputs {
                 let x = Bool::decode(b)?;
                 acc = f(acc, DecodedValue::Bool(x));
+                n += 1;
+            }
+        }
+        DataType::Bytes => {
+            for b in inputs {
+                let x = internal::Bytes::decode_borrowed(b).ok_or(DecodeError::InvalidFormat)?;
+                acc = f(acc, DecodedValue::Bytes(x));
                 n += 1;
             }
         }
@@ -222,5 +243,43 @@ mod tests {
                 DecodedValue::U64(30)
             ]
         );
+    }
+
+    #[test]
+    fn test_bytes_public_api() {
+        let dtype = DataType::Bytes;
+
+        // 1) Encode
+        let payload = vec![0x00u8, 0x7E, 0x00, 0xFF];
+        let mut buf = Vec::new();
+        // Use the public enum-driven encoder:
+        encode_value(DecodedValue::Bytes(&payload), &dtype, &mut buf).unwrap();
+        // Alternatively, value-side convenience also works:
+        // (&payload[..]).encode_into(&mut buf);
+
+        // 2) Decode via public bridge
+        let dv = decode_value(&buf, &dtype).unwrap();
+        match dv {
+            DecodedValue::Bytes(b) => assert_eq!(b, &payload[..]),
+            _ => panic!("expected Bytes"),
+        }
+
+        // 3) Reduce: collect three copies and count
+        let slices = vec![buf.as_slice(), buf.as_slice(), buf.as_slice()];
+        let (collected, count): (Vec<DecodedValue<'_>>, usize) =
+            decode_reduce(slices.iter().copied(), &dtype, Vec::new(), |mut acc, dv| {
+                acc.push(dv);
+                acc
+            })
+            .unwrap();
+
+        assert_eq!(count, 3);
+        assert_eq!(collected.len(), 3);
+        for dv in collected {
+            match dv {
+                DecodedValue::Bytes(b) => assert_eq!(b, &payload[..]),
+                _ => panic!("expected Bytes"),
+            }
+        }
     }
 }

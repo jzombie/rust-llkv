@@ -53,6 +53,9 @@
 //!
 //! for that native type (String/&str → Utf8CaseFold, u64 → BeU64).
 
+pub mod bytes;
+pub use bytes::*;
+
 pub mod codec;
 pub use codec::*;
 
@@ -104,5 +107,19 @@ impl EncodeInto for bool {
     #[inline]
     fn encode_into(&self, dst: &mut Vec<u8>) {
         Bool::encode_into(dst, self).unwrap();
+    }
+}
+
+// [u8] / Vec<u8] -> Bytes
+impl EncodeInto for [u8] {
+    #[inline]
+    fn encode_into(&self, dst: &mut Vec<u8>) {
+        Bytes::encode_into(dst, self).unwrap();
+    }
+}
+impl EncodeInto for Vec<u8> {
+    #[inline]
+    fn encode_into(&self, dst: &mut Vec<u8>) {
+        Bytes::encode_into(dst, self.as_slice()).unwrap();
     }
 }
