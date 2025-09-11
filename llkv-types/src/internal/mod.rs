@@ -79,6 +79,8 @@ pub trait Codec {
     // }
 
     // TODO: Scalar example of above TODO; could be replaced by more efficient SIMD versions
+    // Also: For endian flips check out: https://docs.rs/zerocopy/latest/zerocopy/byteorder/big_endian/index.html
+    //
     // Scalar reference path. Always available.
     // #[inline]
     // pub fn decode_be_u64_page(src: &[u8], out: &mut [u64]) -> usize {
