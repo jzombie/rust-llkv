@@ -1,5 +1,5 @@
-//! A dedicated benchmark to prove the performance of batch vs. single decoding
-//! for a realistic math kernel (summing u64s).
+//! A dedicated benchmark to prove the performance of batch vs. single
+//! decoding for a realistic math kernel (summing u64s).
 
 #![forbid(unsafe_code)]
 
@@ -8,7 +8,7 @@ use std::hint::black_box;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-use llkv_types::{DataType, DecodedValue, decode_many_into, decode_value};
+use llkv_types::{DataType, DecodedValue, decode_for_each, decode_value};
 
 const N: usize = 1_000_000;
 
@@ -53,27 +53,22 @@ fn bench_math_kernels(c: &mut Criterion) {
         );
     });
 
-    // --- BENCHMARK 2: Using the `decode_many_into` function ---
-    // This benchmark does the exact same work as the one above, but uses
-    // the dedicated batch function.
+    // --- BENCHMARK 2: Using the `decode_for_each` function ---
+    // This benchmark does the same work, but streams decoding and sums
+    // immediately (no intermediate Vec<DecodedValue> allocation).
     c.bench_function("math_kernel/decode_many_sum", |b| {
-        b.iter_batched(
-            || Vec::with_capacity(N),
-            |mut out_vec| {
-                // --- Part 1: Decode and Collect ---
-                decode_many_into(enc_u64_slices.iter().copied(), &u64_dtype, &mut out_vec).unwrap();
-
-                // --- Part 2: The Math Kernel ---
-                let mut sum = 0u64;
-                for val in out_vec {
-                    if let DecodedValue::U64(x) = val {
-                        sum = sum.wrapping_add(x);
-                    }
+        b.iter(|| {
+            // --- Part 1: Decode (streamed) ---
+            // --- Part 2: The Math Kernel (combined while decoding) ---
+            let mut sum = 0u64;
+            decode_for_each(enc_u64_slices.iter().copied(), &u64_dtype, |dv| {
+                if let DecodedValue::U64(x) = dv {
+                    sum = sum.wrapping_add(x);
                 }
-                black_box(sum);
-            },
-            BatchSize::PerIteration,
-        );
+            })
+            .unwrap();
+            black_box(sum);
+        });
     });
 }
 

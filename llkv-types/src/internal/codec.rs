@@ -1,33 +1,40 @@
 pub use crate::{DecodeError, EncodeError};
 
+/// A marker trait for codecs that operate on fixed-size types.
+/// This allows for specialized, high-performance slice-based operations and
+/// compile-time checks.
+pub trait FixedSizeCodec: Codec {
+    /// The exact number of bytes for one encoded item.
+    const ENCODED_SIZE: usize;
+}
+
 /// A zero-overhead codec API for a single logical type.
-///
-/// - `Borrowed<'a>` is the borrowed view accepted by `encode_into`,
-///   e.g. `&'a str` for text, `&'a u64` for u64.
-/// - `Owned` is the type `decode` returns (e.g., `String`, `u64`).
 pub trait Codec {
     type Borrowed<'a>: ?Sized
     where
         Self: 'a;
     type Owned;
 
-    /// Append the encoded bytes for `v` into `dst`.
     fn encode_into(dst: &mut Vec<u8>, v: Self::Borrowed<'_>) -> Result<(), EncodeError>;
 
-    /// Decode one value from `src` into the native owned type.
     fn decode(src: &[u8]) -> Result<Self::Owned, DecodeError>;
 
-    /// Decode many items from an iterator of byte slices, appending to `out`.
-    #[inline]
-    fn decode_many_into<'a, I>(inputs: I, out: &mut Vec<Self::Owned>) -> Result<usize, DecodeError>
+    /// Decodes a source byte slice directly into a destination slice of owned types.
+    ///
+    /// This is the high-performance path for preparing data for math kernels.
+    /// The compiler will prevent this from being called on variable-size types
+    /// that do not implement `FixedSizeCodec`.
+    fn decode_slice(src: &[u8], dst: &mut [Self::Owned]) -> Result<usize, DecodeError>
     where
-        I: IntoIterator<Item = &'a [u8]>,
-        Self: Sized,
+        Self: Sized + FixedSizeCodec,
     {
-        let mut n = 0;
-        for s in inputs {
-            out.push(Self::decode(s)?);
-            n += 1;
+        // A generic, correct default implementation.
+        // Individual codecs can provide a faster, specialized version.
+        let n = core::cmp::min(src.len() / Self::ENCODED_SIZE, dst.len());
+        for i in 0..n {
+            let offset = i * Self::ENCODED_SIZE;
+            let chunk = &src[offset..offset + Self::ENCODED_SIZE];
+            dst[i] = Self::decode(chunk)?;
         }
         Ok(n)
     }

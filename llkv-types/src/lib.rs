@@ -1,5 +1,5 @@
 pub mod internal;
-use crate::internal::{Codec, EncodeInto};
+use crate::internal::{BeU64, Bool, Codec, EncodeInto, Utf8CaseFold};
 
 pub mod errors;
 pub use errors::*;
@@ -86,58 +86,44 @@ pub fn encode_value_to_vec<'a>(
 /// then calls the specific, hyper-optimized function for that type.
 pub fn decode_value<'a>(bytes: &'a [u8], dtype: &DataType) -> Option<DecodedValue<'a>> {
     match dtype {
-        DataType::Utf8 => {
-            // Statically calls the allocation-free borrowed decode.
-            internal::Utf8CaseFold::decode_borrowed(bytes).map(DecodedValue::Str)
-        }
-        DataType::U64 => {
-            // Statically calls the optimized integer decode.
-            internal::BeU64::decode(bytes).ok().map(DecodedValue::U64)
-        }
-        DataType::Bool => {
-            // Statically calls the boolean decode.
-            internal::Bool::decode(bytes).ok().map(DecodedValue::Bool)
-        }
+        DataType::Utf8 => Utf8CaseFold::decode_borrowed(bytes).map(DecodedValue::Str),
+        DataType::U64 => BeU64::decode(bytes).ok().map(DecodedValue::U64),
+        DataType::Bool => Bool::decode(bytes).ok().map(DecodedValue::Bool),
     }
 }
 
-/// Decodes an iterator of byte slices into a vector of `DecodedValue`s.
-///
-/// This function is a batch-oriented version of `decode_value`. It reuses the
-/// same statically-dispatched codec for all items in the iterator, which is
-/// highly efficient.
-pub fn decode_many_into<'a, I>(
-    bytes_iter: I,
+// Public streaming helper. Avoids collecting and enum Vec overhead.
+#[inline]
+pub fn decode_for_each<'a, I, F>(
+    inputs: I,
     dtype: &DataType,
-    out: &mut Vec<DecodedValue<'a>>,
+    mut f: F,
 ) -> Result<usize, DecodeError>
 where
     I: IntoIterator<Item = &'a [u8]>,
+    F: FnMut(DecodedValue<'a>),
 {
-    let bytes_iter = bytes_iter.into_iter();
-    out.reserve(bytes_iter.size_hint().0);
-    let mut n = 0;
-
+    let mut n = 0usize;
     match dtype {
         DataType::Utf8 => {
-            for bytes in bytes_iter {
-                let s = internal::Utf8CaseFold::decode_borrowed(bytes)
-                    .ok_or(DecodeError::InvalidFormat)?;
-                out.push(DecodedValue::Str(s));
+            for b in inputs {
+                let s =
+                    internal::Utf8CaseFold::decode_borrowed(b).ok_or(DecodeError::InvalidFormat)?;
+                f(DecodedValue::Str(s));
                 n += 1;
             }
         }
         DataType::U64 => {
-            for bytes in bytes_iter {
-                let x = internal::BeU64::decode(bytes)?;
-                out.push(DecodedValue::U64(x));
+            for b in inputs {
+                let x = internal::BeU64::decode(b)?;
+                f(DecodedValue::U64(x));
                 n += 1;
             }
         }
         DataType::Bool => {
-            for bytes in bytes_iter {
-                let b = internal::Bool::decode(bytes)?;
-                out.push(DecodedValue::Bool(b));
+            for b in inputs {
+                let x = internal::Bool::decode(b)?;
+                f(DecodedValue::Bool(x));
                 n += 1;
             }
         }
@@ -193,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_many() {
+    fn test_decode_for_each() {
         let u64_dtype = DataType::U64;
         let values_in = vec![10u64, 20, 30];
 
@@ -207,10 +193,14 @@ mod tests {
             })
             .collect();
 
-        // 2. Decode them in a batch
+        // 2. Decode them in a batch (streaming, then collect)
         let mut decoded_out = Vec::new();
         let encoded_slices: Vec<&[u8]> = encoded_values.iter().map(|v| v.as_slice()).collect();
-        let count = decode_many_into(encoded_slices, &u64_dtype, &mut decoded_out).unwrap();
+
+        let count = decode_for_each(encoded_slices, &u64_dtype, |dv| {
+            decoded_out.push(dv);
+        })
+        .unwrap();
 
         // 3. Assert results
         assert_eq!(count, 3);

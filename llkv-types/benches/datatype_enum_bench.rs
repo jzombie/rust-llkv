@@ -10,7 +10,7 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use llkv_types::{DataType, DecodedValue};
-use llkv_types::{decode_many_into, decode_value, encode_value, encode_value_to_vec};
+use llkv_types::{decode_for_each, decode_value, encode_value, encode_value_to_vec};
 
 const N: usize = 1_000_000;
 
@@ -82,7 +82,8 @@ fn bench_datatype_enum(c: &mut Criterion) {
     let vals_str_nonascii = make_strings_nonascii(N);
 
     // Pre-encode inputs for decode benches.
-    // By encoding directly, we avoid millions of tiny, unnecessary allocations.
+    // By encoding directly, we avoid millions of tiny, unnecessary
+    // allocations.
     let mut enc_u64: Vec<[u8; 8]> = Vec::with_capacity(N);
     for &x in &vals_u64 {
         enc_u64.push(x.to_be_bytes());
@@ -94,7 +95,8 @@ fn bench_datatype_enum(c: &mut Criterion) {
         enc_bool.push([if b { 1 } else { 0 }]);
     }
 
-    // strings (ASCII): per-item Vec<u8> is necessary due to variable length.
+    // strings (ASCII): per-item Vec<u8> is necessary due to variable
+    // length.
     let mut enc_str_ascii: Vec<Vec<u8>> = Vec::with_capacity(N);
     for s in &vals_str_ascii {
         let v = encode_value_to_vec(DecodedValue::Str(s.as_str()), &DataType::Utf8)
@@ -259,10 +261,15 @@ fn bench_datatype_enum(c: &mut Criterion) {
         b.iter_batched(
             || Vec::with_capacity(N),
             |mut out| {
-                let n = decode_many_into(
+                // Use decode_for_each to stream into `out`.
+                let mut n = 0usize;
+                decode_for_each(
                     enc_str_ascii_slices.iter().copied(),
                     &DataType::Utf8,
-                    &mut out,
+                    |dv| {
+                        out.push(dv);
+                        n += 1;
+                    },
                 )
                 .unwrap();
                 black_box(n);
@@ -275,10 +282,15 @@ fn bench_datatype_enum(c: &mut Criterion) {
         b.iter_batched(
             || Vec::with_capacity(N),
             |mut out| {
-                let n = decode_many_into(
+                // Use decode_for_each to stream into `out`.
+                let mut n = 0usize;
+                decode_for_each(
                     enc_str_nonascii_slices.iter().copied(),
                     &DataType::Utf8,
-                    &mut out,
+                    |dv| {
+                        out.push(dv);
+                        n += 1;
+                    },
                 )
                 .unwrap();
                 black_box(n);
@@ -291,8 +303,13 @@ fn bench_datatype_enum(c: &mut Criterion) {
         b.iter_batched(
             || Vec::with_capacity(N),
             |mut out| {
-                let n = decode_many_into(enc_u64_slices.iter().copied(), &DataType::U64, &mut out)
-                    .unwrap();
+                // Use decode_for_each to stream into `out`.
+                let mut n = 0usize;
+                decode_for_each(enc_u64_slices.iter().copied(), &DataType::U64, |dv| {
+                    out.push(dv);
+                    n += 1;
+                })
+                .unwrap();
                 black_box(n);
             },
             BatchSize::PerIteration,
@@ -303,9 +320,13 @@ fn bench_datatype_enum(c: &mut Criterion) {
         b.iter_batched(
             || Vec::with_capacity(N),
             |mut out| {
-                let n =
-                    decode_many_into(enc_bool_slices.iter().copied(), &DataType::Bool, &mut out)
-                        .unwrap();
+                // Use decode_for_each to stream into `out`.
+                let mut n = 0usize;
+                decode_for_each(enc_bool_slices.iter().copied(), &DataType::Bool, |dv| {
+                    out.push(dv);
+                    n += 1;
+                })
+                .unwrap();
                 black_box(n);
             },
             BatchSize::PerIteration,
