@@ -6,8 +6,8 @@ use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ValueScanOpts
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, ValueMode};
 
-use llkv_types::internal::Codec;
-use llkv_types::internal::{Bytes, Utf8CaseFold};
+use llkv_data_types::internal::Codec;
+use llkv_data_types::internal::{Bytes, Utf8CaseFold};
 
 /* --------------------------- Shared helpers ---------------------------- */
 

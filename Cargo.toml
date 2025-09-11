@@ -9,10 +9,11 @@ publish = true
 [workspace.dependencies]
 llkv-btree = { path = "./llkv-btree", version = "0.1.0-alpha" }
 llkv-column-map = { path = "./llkv-column-map", version = "0.1.0-alpha" }
+llkv-csv = { path = "./llkv-csv", version = "0.1.0-alpha" }
+llkv-data-types = { path = "./llkv-data-types", version = "0.1.0-alpha" }
 llkv-expr = { path = "./llkv-expr", version = "0.1.0-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.1.0-alpha" }
 llkv-table = { path = "./llkv-table", version = "0.1.0-alpha" }
-llkv-types = { path = "./llkv-types", version = "0.1.0-alpha" }
 simd-r-drive = "0.12.0-alpha"
 simd-r-drive-entry-handle = "0.12.0-alpha"
 
@@ -35,9 +36,9 @@ members = [
     "llkv-btree",
     "llkv-column-map",
     "llkv-csv",
+    "llkv-data-types",
     "llkv-expr",
     "llkv-storage",
-    "llkv-table",
-    "llkv-types"
+    "llkv-table"
 ]
 resolver = "2"

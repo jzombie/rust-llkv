@@ -9,8 +9,8 @@ use std::hint::black_box;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-use llkv_types::{DataType, DecodedValue};
-use llkv_types::{decode_reduce, decode_value, encode_value, encode_value_to_vec};
+use llkv_data_types::{DataType, DecodedValue};
+use llkv_data_types::{decode_reduce, decode_value, encode_value, encode_value_to_vec};
 
 const N: usize = 1_000_000;
 

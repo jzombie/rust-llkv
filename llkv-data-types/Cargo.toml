@@ -1,5 +1,5 @@
 [package]
-name = "llkv-types"
+name = "llkv-data-types"
 authors.workspace = true
 version.workspace = true
 edition.workspace = true

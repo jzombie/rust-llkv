@@ -996,6 +996,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-data-types"
+version = "0.1.0-alpha"
+dependencies = [
+ "bitcode",
+ "criterion",
+ "icu_casemap",
+ "icu_normalizer",
+ "llkv-column-map",
+ "rand",
+]
+
+[[package]]
 name = "llkv-expr"
 version = "0.1.0-alpha"
 
@@ -1023,18 +1035,6 @@ dependencies = [
  "llkv-storage",
  "rayon",
  "rustc-hash",
-]
-
-[[package]]
-name = "llkv-types"
-version = "0.1.0-alpha"
-dependencies = [
- "bitcode",
- "criterion",
- "icu_casemap",
- "icu_normalizer",
- "llkv-column-map",
- "rand",
 ]
 
 [[package]]
