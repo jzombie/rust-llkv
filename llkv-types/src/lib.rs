@@ -1,5 +1,8 @@
 pub mod internal;
-use crate::internal::Codec;
+use crate::internal::{Codec, EncodeInto};
+
+pub mod errors;
+pub use errors::*;
 
 // TODO: Add category type
 
@@ -12,9 +15,9 @@ use crate::internal::Codec;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     /// Indicates the data is a case-insensitive, order-preserving string.
-    Utf8CaseFold,
+    Utf8,
     /// Indicates the data is a big-endian 64-bit unsigned integer.
-    BeU64,
+    U64,
     /// Indicates the data is a boolean value (0 for false, 1 for true).
     Bool,
 }
@@ -30,6 +33,51 @@ pub enum DecodedValue<'a> {
     Bool(bool),
 }
 
+/// Encode `value` into `out` using `dtype`. Appends to `out`.
+#[inline]
+pub fn encode_value<'a>(
+    value: DecodedValue<'a>,
+    dtype: &DataType,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
+    match (dtype, value) {
+        (DataType::Utf8, DecodedValue::Str(s)) => {
+            s.encode_into(out);
+            Ok(())
+        }
+        (DataType::U64, DecodedValue::U64(x)) => {
+            x.encode_into(out);
+            Ok(())
+        }
+        (DataType::Bool, DecodedValue::Bool(b)) => {
+            b.encode_into(out);
+            Ok(())
+        }
+        (expected, DecodedValue::Str(_)) => Err(EncodeError::TypeMismatch {
+            expected: *expected,
+            got: "Str",
+        }),
+        (expected, DecodedValue::U64(_)) => Err(EncodeError::TypeMismatch {
+            expected: *expected,
+            got: "U64",
+        }),
+        (expected, DecodedValue::Bool(_)) => Err(EncodeError::TypeMismatch {
+            expected: *expected,
+            got: "Bool",
+        }),
+    }
+}
+
+#[inline]
+pub fn encode_value_to_vec<'a>(
+    value: DecodedValue<'a>,
+    dtype: &DataType,
+) -> Result<Vec<u8>, EncodeError> {
+    let mut out = Vec::new();
+    encode_value(value, dtype, &mut out)?;
+    Ok(out)
+}
+
 /// Bridges the runtime metadata (`DataType`) to the high-performance,
 /// statically-dispatched codec functions from the `internal` module.
 ///
@@ -37,11 +85,11 @@ pub enum DecodedValue<'a> {
 /// then calls the specific, hyper-optimized function for that type.
 pub fn decode_value<'a>(bytes: &'a [u8], dtype: &DataType) -> Option<DecodedValue<'a>> {
     match dtype {
-        DataType::Utf8CaseFold => {
+        DataType::Utf8 => {
             // Statically calls the allocation-free borrowed decode.
             internal::Utf8CaseFold::decode_borrowed(bytes).map(DecodedValue::Str)
         }
-        DataType::BeU64 => {
+        DataType::U64 => {
             // Statically calls the optimized integer decode.
             Some(DecodedValue::U64(internal::BeU64::decode(bytes)))
         }
@@ -61,8 +109,8 @@ mod tests {
     #[test]
     fn test_catalog_decoding() {
         // 1. Define the data types for our system directly.
-        let user_name_dtype = DataType::Utf8CaseFold;
-        let user_id_dtype = DataType::BeU64;
+        let user_name_dtype = DataType::Utf8;
+        let user_id_dtype = DataType::U64;
         let is_active_dtype = DataType::Bool;
 
         // 2. Create some raw encoded data.

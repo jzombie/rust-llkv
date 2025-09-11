@@ -10,9 +10,11 @@ pub trait Codec {
 
     type Owned;
 
+    // TODO: Use `Result` type
     /// Append the encoded bytes for `v` into `dst`.
     fn encode_into(dst: &mut Vec<u8>, v: Self::Borrowed<'_>);
 
+    // TODO: Use `Result` type
     /// Decode one value from `src` into the native owned type.
     fn decode(src: &[u8]) -> Self::Owned;
 
