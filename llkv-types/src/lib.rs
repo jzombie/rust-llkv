@@ -131,6 +131,50 @@ where
     Ok(n)
 }
 
+/// Value-returning reducer over decoded values.
+/// Streams items, calling `f(acc, item)` each step.
+/// Returns `(accumulator, count)`.
+#[inline]
+pub fn decode_reduce<'a, I, T, F>(
+    inputs: I,
+    dtype: &DataType,
+    init: T,
+    mut f: F,
+) -> Result<(T, usize), DecodeError>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+    F: FnMut(T, DecodedValue<'a>) -> T,
+{
+    let mut acc = init;
+    let mut n = 0usize;
+
+    match dtype {
+        DataType::Utf8 => {
+            for b in inputs {
+                let s = Utf8CaseFold::decode_borrowed(b).ok_or(DecodeError::InvalidFormat)?;
+                acc = f(acc, DecodedValue::Str(s));
+                n += 1;
+            }
+        }
+        DataType::U64 => {
+            for b in inputs {
+                let x = BeU64::decode(b)?;
+                acc = f(acc, DecodedValue::U64(x));
+                n += 1;
+            }
+        }
+        DataType::Bool => {
+            for b in inputs {
+                let x = Bool::decode(b)?;
+                acc = f(acc, DecodedValue::Bool(x));
+                n += 1;
+            }
+        }
+    }
+
+    Ok((acc, n))
+}
+
 /// Generic reducer over decoded values. Streams items and calls `f`
 /// with a mutable accumulator (avoids moves/copies of `acc`).
 /// Returns the number of items processed.

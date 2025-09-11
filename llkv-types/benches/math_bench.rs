@@ -9,7 +9,7 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use llkv_types::{
-    DataType, DecodedValue, decode_for_each, decode_for_each_reduce, decode_value,
+    DataType, DecodedValue, decode_for_each, decode_for_each_reduce, decode_reduce, decode_value,
     reduce_u64_for_each,
 };
 
@@ -102,6 +102,26 @@ fn bench_math_kernels(c: &mut Criterion) {
             let sum = reduce_u64_for_each(enc_u64_slices.iter().copied(), 0u64, |acc, x| {
                 acc.wrapping_add(x)
             })
+            .unwrap();
+            black_box(sum);
+        });
+    });
+
+    // --- BENCHMARK 5: Value-returning reducer over DecodedValue ---
+    c.bench_function("math_kernel/value_reducer_sum", |b| {
+        b.iter(|| {
+            let (sum, _n) = decode_reduce(
+                enc_u64_slices.iter().copied(),
+                &u64_dtype,
+                0u64,
+                |acc, dv| {
+                    if let DecodedValue::U64(x) = dv {
+                        acc.wrapping_add(x)
+                    } else {
+                        acc
+                    }
+                },
+            )
             .unwrap();
             black_box(sum);
         });
