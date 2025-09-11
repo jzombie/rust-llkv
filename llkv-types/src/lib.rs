@@ -1,6 +1,8 @@
 pub mod internal;
 use crate::internal::Codec;
 
+// TODO: Add category type
+
 // --- Public-Facing Metadata Enums ---
 
 /// A tag representing the physical data type for a piece of metadata.
