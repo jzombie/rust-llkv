@@ -8,10 +8,7 @@ use std::hint::black_box;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-use llkv_types::{
-    DataType, DecodedValue, decode_for_each, decode_for_each_reduce, decode_reduce, decode_value,
-    reduce_u64_for_each,
-};
+use llkv_types::{DataType, DecodedValue, decode_reduce, decode_value};
 
 const N: usize = 1_000_000;
 
@@ -56,59 +53,8 @@ fn bench_math_kernels(c: &mut Criterion) {
         );
     });
 
-    // --- BENCHMARK 2: Using the `decode_for_each` function ---
-    // This benchmark does the same work, but streams decoding and sums
-    // immediately (no intermediate Vec<DecodedValue> allocation).
-    c.bench_function("math_kernel/decode_many_sum", |b| {
-        b.iter(|| {
-            // --- Part 1: Decode (streamed) ---
-            // --- Part 2: The Math Kernel (combined while decoding) ---
-            let mut sum = 0u64;
-            decode_for_each(enc_u64_slices.iter().copied(), &u64_dtype, |dv| {
-                if let DecodedValue::U64(x) = dv {
-                    sum = sum.wrapping_add(x);
-                }
-            })
-            .unwrap();
-            black_box(sum);
-        });
-    });
-
-    // --- BENCHMARK 3: Non-typed reducer over DecodedValue ---
-    // Same as BENCHMARK 2, but via a reducer-style helper that takes an
-    // accumulator and returns it. Keeps DecodedValue in the API.
-    c.bench_function("math_kernel/reducer_sum", |b| {
-        b.iter(|| {
-            let mut sum = 0u64;
-            let _n = decode_for_each_reduce(
-                enc_u64_slices.iter().copied(),
-                &u64_dtype,
-                &mut sum,
-                |acc, dv| {
-                    if let DecodedValue::U64(x) = dv {
-                        *acc = (*acc).wrapping_add(x);
-                    }
-                },
-            )
-            .unwrap();
-            black_box(sum);
-        });
-    });
-
-    // --- BENCHMARK 4: Typed reducer (u64) ---
-    // Streams decoding as native u64 and reduces without enum or match.
-    c.bench_function("math_kernel/typed_reducer_sum", |b| {
-        b.iter(|| {
-            let sum = reduce_u64_for_each(enc_u64_slices.iter().copied(), 0u64, |acc, x| {
-                acc.wrapping_add(x)
-            })
-            .unwrap();
-            black_box(sum);
-        });
-    });
-
-    // --- BENCHMARK 5: Value-returning reducer over DecodedValue ---
-    c.bench_function("math_kernel/value_reducer_sum", |b| {
+    // --- BENCHMARK 2: Value-returning reducer over DecodedValue ---
+    c.bench_function("math_kernel/decode_reduce_sum", |b| {
         b.iter(|| {
             let (sum, _n) = decode_reduce(
                 enc_u64_slices.iter().copied(),

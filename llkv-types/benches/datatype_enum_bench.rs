@@ -10,7 +10,7 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use llkv_types::{DataType, DecodedValue};
-use llkv_types::{decode_for_each, decode_value, encode_value, encode_value_to_vec};
+use llkv_types::{decode_reduce, decode_value, encode_value, encode_value_to_vec};
 
 const N: usize = 1_000_000;
 
@@ -249,7 +249,7 @@ fn bench_datatype_enum(c: &mut Criterion) {
     });
 
     // ------------------------------------
-    // Decode Many Benches
+    // Decode Reduce Benches
     // ------------------------------------
     let enc_str_ascii_slices: Vec<&[u8]> = enc_str_ascii.iter().map(|v| v.as_slice()).collect();
     let enc_str_nonascii_slices: Vec<&[u8]> =
@@ -257,77 +257,89 @@ fn bench_datatype_enum(c: &mut Criterion) {
     let enc_u64_slices: Vec<&[u8]> = enc_u64.iter().map(|a| a.as_slice()).collect();
     let enc_bool_slices: Vec<&[u8]> = enc_bool.iter().map(|a| a.as_slice()).collect();
 
-    c.bench_function("DataType::Utf8/decode_many_ascii", |b| {
+    c.bench_function("DataType::Utf8/decode_reduce_ascii", |b| {
         b.iter_batched(
             || Vec::with_capacity(N),
-            |mut out| {
-                // Use decode_for_each to stream into `out`.
-                let mut n = 0usize;
-                decode_for_each(
+            |out_init| {
+                // Use decode_reduce to stream into `out`.
+                let (out, n) = decode_reduce(
                     enc_str_ascii_slices.iter().copied(),
                     &DataType::Utf8,
-                    |dv| {
-                        out.push(dv);
-                        n += 1;
+                    out_init,
+                    |mut acc, dv| {
+                        acc.push(dv);
+                        acc
                     },
                 )
                 .unwrap();
                 black_box(n);
+                black_box(out.len());
             },
             BatchSize::PerIteration,
         );
     });
 
-    c.bench_function("DataType::Utf8/decode_many_non_ascii", |b| {
+    c.bench_function("DataType::Utf8/decode_reduce_non_ascii", |b| {
         b.iter_batched(
             || Vec::with_capacity(N),
-            |mut out| {
-                // Use decode_for_each to stream into `out`.
-                let mut n = 0usize;
-                decode_for_each(
+            |out_init| {
+                // Use decode_reduce to stream into `out`.
+                let (out, n) = decode_reduce(
                     enc_str_nonascii_slices.iter().copied(),
                     &DataType::Utf8,
-                    |dv| {
-                        out.push(dv);
-                        n += 1;
+                    out_init,
+                    |mut acc, dv| {
+                        acc.push(dv);
+                        acc
                     },
                 )
                 .unwrap();
                 black_box(n);
+                black_box(out.len());
             },
             BatchSize::PerIteration,
         );
     });
 
-    c.bench_function("DataType::U64/decode_many", |b| {
+    c.bench_function("DataType::U64/decode_reduce", |b| {
         b.iter_batched(
             || Vec::with_capacity(N),
-            |mut out| {
-                // Use decode_for_each to stream into `out`.
-                let mut n = 0usize;
-                decode_for_each(enc_u64_slices.iter().copied(), &DataType::U64, |dv| {
-                    out.push(dv);
-                    n += 1;
-                })
+            |out_init| {
+                // Use decode_reduce to stream into `out`.
+                let (out, n) = decode_reduce(
+                    enc_u64_slices.iter().copied(),
+                    &DataType::U64,
+                    out_init,
+                    |mut acc, dv| {
+                        acc.push(dv);
+                        acc
+                    },
+                )
                 .unwrap();
                 black_box(n);
+                black_box(out.len());
             },
             BatchSize::PerIteration,
         );
     });
 
-    c.bench_function("DataType::Bool/decode_many", |b| {
+    c.bench_function("DataType::Bool/decode_reduce", |b| {
         b.iter_batched(
             || Vec::with_capacity(N),
-            |mut out| {
-                // Use decode_for_each to stream into `out`.
-                let mut n = 0usize;
-                decode_for_each(enc_bool_slices.iter().copied(), &DataType::Bool, |dv| {
-                    out.push(dv);
-                    n += 1;
-                })
+            |out_init| {
+                // Use decode_reduce to stream into `out`.
+                let (out, n) = decode_reduce(
+                    enc_bool_slices.iter().copied(),
+                    &DataType::Bool,
+                    out_init,
+                    |mut acc, dv| {
+                        acc.push(dv);
+                        acc
+                    },
+                )
                 .unwrap();
                 black_box(n);
+                black_box(out.len());
             },
             BatchSize::PerIteration,
         );

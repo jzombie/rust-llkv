@@ -92,45 +92,6 @@ pub fn decode_value<'a>(bytes: &'a [u8], dtype: &DataType) -> Option<DecodedValu
     }
 }
 
-// Public streaming helper. Avoids collecting and enum Vec overhead.
-#[inline]
-pub fn decode_for_each<'a, I, F>(
-    inputs: I,
-    dtype: &DataType,
-    mut f: F,
-) -> Result<usize, DecodeError>
-where
-    I: IntoIterator<Item = &'a [u8]>,
-    F: FnMut(DecodedValue<'a>),
-{
-    let mut n = 0usize;
-    match dtype {
-        DataType::Utf8 => {
-            for b in inputs {
-                let s =
-                    internal::Utf8CaseFold::decode_borrowed(b).ok_or(DecodeError::InvalidFormat)?;
-                f(DecodedValue::Str(s));
-                n += 1;
-            }
-        }
-        DataType::U64 => {
-            for b in inputs {
-                let x = internal::BeU64::decode(b)?;
-                f(DecodedValue::U64(x));
-                n += 1;
-            }
-        }
-        DataType::Bool => {
-            for b in inputs {
-                let x = internal::Bool::decode(b)?;
-                f(DecodedValue::Bool(x));
-                n += 1;
-            }
-        }
-    }
-    Ok(n)
-}
-
 /// Value-returning reducer over decoded values.
 /// Streams items, calling `f(acc, item)` each step.
 /// Returns `(accumulator, count)`.
@@ -173,66 +134,6 @@ where
     }
 
     Ok((acc, n))
-}
-
-/// Generic reducer over decoded values. Streams items and calls `f`
-/// with a mutable accumulator (avoids moves/copies of `acc`).
-/// Returns the number of items processed.
-#[inline]
-pub fn decode_for_each_reduce<'a, I, T, F>(
-    inputs: I,
-    dtype: &DataType,
-    acc: &mut T,
-    mut f: F,
-) -> Result<usize, DecodeError>
-where
-    I: IntoIterator<Item = &'a [u8]>,
-    F: FnMut(&mut T, DecodedValue<'a>),
-{
-    let mut n = 0usize;
-    match dtype {
-        DataType::Utf8 => {
-            for b in inputs {
-                let s = Utf8CaseFold::decode_borrowed(b).ok_or(DecodeError::InvalidFormat)?;
-                f(acc, DecodedValue::Str(s));
-                n += 1;
-            }
-        }
-        DataType::U64 => {
-            for b in inputs {
-                let x = BeU64::decode(b)?;
-                f(acc, DecodedValue::U64(x));
-                n += 1;
-            }
-        }
-        DataType::Bool => {
-            for b in inputs {
-                let x = Bool::decode(b)?;
-                f(acc, DecodedValue::Bool(x));
-                n += 1;
-            }
-        }
-    }
-    Ok(n)
-}
-
-/// Typed reducer for u64 that streams decode and accumulates without
-/// building intermediate DecodedValue. This is specialized for u64 to
-/// avoid enum overhead in hot loops.
-/// TODO: If this consistently beats the generic path, move an equivalent
-/// API onto the codec trait so BeU64 can provide its own reducer.
-#[inline]
-pub fn reduce_u64_for_each<'a, I, T, F>(inputs: I, init: T, mut f: F) -> Result<T, DecodeError>
-where
-    I: IntoIterator<Item = &'a [u8]>,
-    F: FnMut(T, u64) -> T,
-{
-    let mut acc = init;
-    for b in inputs {
-        let x = BeU64::decode(b)?;
-        acc = f(acc, x);
-    }
-    Ok(acc)
 }
 
 // --- Example Test ---
@@ -298,12 +199,17 @@ mod tests {
             .collect();
 
         // 2. Decode them in a batch (streaming, then collect)
-        let mut decoded_out = Vec::new();
         let encoded_slices: Vec<&[u8]> = encoded_values.iter().map(|v| v.as_slice()).collect();
 
-        let count = decode_for_each(encoded_slices, &u64_dtype, |dv| {
-            decoded_out.push(dv);
-        })
+        let (decoded_out, count): (Vec<DecodedValue<'_>>, usize) = decode_reduce(
+            encoded_slices.iter().copied(),
+            &u64_dtype,
+            Vec::new(),
+            |mut acc, dv| {
+                acc.push(dv);
+                acc
+            },
+        )
         .unwrap();
 
         // 3. Assert results
