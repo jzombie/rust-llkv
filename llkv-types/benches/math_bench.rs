@@ -8,7 +8,7 @@ use std::hint::black_box;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-use llkv_types::{DataType, DecodedValue, decode_for_each, decode_value};
+use llkv_types::{DataType, DecodedValue, decode_for_each, decode_value, reduce_u64_for_each};
 
 const N: usize = 1_000_000;
 
@@ -20,23 +20,6 @@ fn make_u64s_encoded(n: usize) -> Vec<[u8; 8]> {
         v.push((i ^ rng.random::<u64>()).to_be_bytes());
     }
     v
-}
-
-// Non-typed reducer helper (keeps DecodedValue).
-// Wraps decode_for_each and accumulates via a closure.
-#[inline]
-fn reduce_decode_stream<'a, I, T, F>(inputs: I, dtype: &DataType, init: T, mut f: F) -> T
-where
-    I: IntoIterator<Item = &'a [u8]>,
-    F: FnMut(T, DecodedValue<'a>) -> T,
-    T: Copy, // make accumulator copyable to avoid move-from-capture
-{
-    let mut acc = init;
-    decode_for_each(inputs, dtype, |dv| {
-        acc = f(acc, dv);
-    })
-    .expect("decode_for_each failed");
-    acc
 }
 
 fn bench_math_kernels(c: &mut Criterion) {
@@ -92,6 +75,22 @@ fn bench_math_kernels(c: &mut Criterion) {
     // Same as BENCHMARK 2, but via a reducer-style helper that takes an
     // accumulator and returns it. Keeps DecodedValue in the API.
     c.bench_function("math_kernel/reducer_sum", |b| {
+        // Local helper stays as-is from your previous version.
+        #[inline]
+        fn reduce_decode_stream<'a, I, T, F>(inputs: I, dtype: &DataType, init: T, mut f: F) -> T
+        where
+            I: IntoIterator<Item = &'a [u8]>,
+            F: FnMut(T, DecodedValue<'a>) -> T,
+            T: Copy,
+        {
+            let mut acc = init;
+            decode_for_each(inputs, dtype, |dv| {
+                acc = f(acc, dv);
+            })
+            .expect("decode_for_each failed");
+            acc
+        }
+
         b.iter(|| {
             let sum = reduce_decode_stream(
                 enc_u64_slices.iter().copied(),
@@ -105,6 +104,18 @@ fn bench_math_kernels(c: &mut Criterion) {
                     }
                 },
             );
+            black_box(sum);
+        });
+    });
+
+    // --- BENCHMARK 4: Typed reducer (u64) ---
+    // Streams decoding as native u64 and reduces without enum or match.
+    c.bench_function("math_kernel/typed_reducer_sum", |b| {
+        b.iter(|| {
+            let sum = reduce_u64_for_each(enc_u64_slices.iter().copied(), 0u64, |acc, x| {
+                acc.wrapping_add(x)
+            })
+            .unwrap();
             black_box(sum);
         });
     });

@@ -167,6 +167,25 @@ where
     Ok(acc)
 }
 
+/// Typed reducer for u64 that streams decode and accumulates without
+/// building intermediate DecodedValue. This is specialized for u64 to
+/// avoid enum overhead in hot loops.
+/// TODO: If this consistently beats the generic path, move an equivalent
+/// API onto the codec trait so BeU64 can provide its own reducer.
+#[inline]
+pub fn reduce_u64_for_each<'a, I, T, F>(inputs: I, init: T, mut f: F) -> Result<T, DecodeError>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+    F: FnMut(T, u64) -> T,
+{
+    let mut acc = init;
+    for b in inputs {
+        let x = BeU64::decode(b)?;
+        acc = f(acc, x);
+    }
+    Ok(acc)
+}
+
 // --- Example Test ---
 #[cfg(test)]
 mod tests {
