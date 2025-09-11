@@ -94,10 +94,10 @@ where
 
 /* ------------------------------ Tests ---------------------------------- */
 
-/// Intentionally mixed case and spacing; ensure "Large Words" and
-/// "lower words" sort together.
+/// `Utf8CaseFold` should order case-insensitively (with tie-breaks on
+/// original bytes) and round-trip back to the original strings.
 #[test]
-fn test_utf8_casefold_orders_case_insensitively_and_preserves_original() {
+fn test_utf8_order_roundtrip() {
     // Set up a fresh in-memory ColumnStore.
     let (store, fid) = setup_store();
 
@@ -148,10 +148,10 @@ fn test_utf8_casefold_orders_case_insensitively_and_preserves_original() {
     assert_eq!(got, expect);
 }
 
-/// Bytes should order by raw bytewise lex of the leading payload and
+/// `Bytes` should order by raw bytewise lex of the leading payload and
 /// round-trip losslessly.
 #[test]
-fn test_bytes_orders_lex_and_roundtrips() {
+fn test_bytes_order_roundtrip() {
     // Set up a fresh in-memory ColumnStore.
     let (store, fid) = setup_store();
 
