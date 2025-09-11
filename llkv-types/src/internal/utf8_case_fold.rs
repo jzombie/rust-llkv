@@ -92,17 +92,18 @@ impl Codec for Utf8CaseFold {
     type Owned = String;
 
     #[inline]
-    fn encode_into(dst: &mut Vec<u8>, s: &str) {
-        Self::encode_impl(dst, s)
+    fn encode_into(dst: &mut Vec<u8>, s: &str) -> Result<(), EncodeError> {
+        Self::encode_impl(dst, s);
+        Ok(())
     }
 
     /// Decode the original (post-fold) segment.
     /// This now calls the allocation-free `decode_borrowed` for max performance.
     #[inline]
-    fn decode(src: &[u8]) -> String {
+    fn decode(src: &[u8]) -> Result<String, DecodeError> {
         Self::decode_borrowed(src)
             .map(|s| s.to_owned())
-            .unwrap_or_default()
+            .ok_or(DecodeError::InvalidFormat)
     }
 }
 
@@ -120,8 +121,8 @@ mod tests {
         "lower words".encode_into(&mut b);
 
         // Round-trip original
-        assert_eq!(Utf8CaseFold::decode(&a), "Large Words");
-        assert_eq!(Utf8CaseFold::decode(&b), "lower words");
+        assert_eq!(Utf8CaseFold::decode(&a).unwrap(), "Large Words");
+        assert_eq!(Utf8CaseFold::decode(&b).unwrap(), "lower words");
 
         // Compare folded prefixes
         assert!(Utf8CaseFold::folded_key(&a) < Utf8CaseFold::folded_key(&b));
@@ -129,7 +130,8 @@ mod tests {
 
     #[test]
     fn utf8_unicode_nfkc_and_casefold() {
-        // Å (U+212B) → Å → å ; K (U+212A) → K → k
+        // Å (U+212B) → Å → å ;
+        // K (U+212A) → K → k
         let s1 = "Å";
         let s2 = "K";
         let mut a = Vec::new();
@@ -137,8 +139,8 @@ mod tests {
         s1.encode_into(&mut a);
         s2.encode_into(&mut b);
 
-        assert_eq!(Utf8CaseFold::decode(&a), s1);
-        assert_eq!(Utf8CaseFold::decode(&b), s2);
+        assert_eq!(Utf8CaseFold::decode(&a).unwrap(), s1);
+        assert_eq!(Utf8CaseFold::decode(&b).unwrap(), s2);
 
         let fa = std::str::from_utf8(Utf8CaseFold::folded_key(&a)).unwrap();
         let fb = std::str::from_utf8(Utf8CaseFold::folded_key(&b)).unwrap();
@@ -157,23 +159,24 @@ mod tests {
             "Straße",        // German character that case-folds
             "",              // Empty string
         ];
-
         for original in cases {
             let mut encoded = Vec::new();
             original.encode_into(&mut encoded);
-            let decoded = Utf8CaseFold::decode(&encoded);
+            let decoded = Utf8CaseFold::decode(&encoded).unwrap();
             assert_eq!(original, decoded, "Failed roundtrip for: {}", original);
         }
     }
 
     #[test]
     fn utf8_embedded_nul_safe_with_trailer_len() {
-        // Embedded NUL is fine; we don't need a sentinel.
+        // Embedded NUL is fine;
+        // we don't need a sentinel.
         let s = "A\0B";
         let mut buf = Vec::new();
         s.encode_into(&mut buf);
 
-        assert_eq!(Utf8CaseFold::decode(&buf), s);
+        assert_eq!(Utf8CaseFold::decode(&buf).unwrap(), s);
+
         // Folded starts with "a\0b" (ASCII lowercased)
         let fk = Utf8CaseFold::folded_key(&buf);
         assert_eq!(fk, b"a\0b");

@@ -8,3 +8,12 @@ pub enum EncodeError {
         got: &'static str,
     },
 }
+
+/// Error type for decoding operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeError {
+    /// The input slice does not contain enough bytes to decode a value.
+    NotEnoughData,
+    /// The byte format is invalid for the target type (e.g., invalid UTF-8).
+    InvalidFormat,
+}

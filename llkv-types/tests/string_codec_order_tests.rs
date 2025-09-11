@@ -37,7 +37,7 @@ fn utf8_casefold_orders_case_insensitively_and_preserves_original() {
     for (i, s) in words.iter().enumerate() {
         let key = (i as u64 + 1).to_be_bytes().to_vec(); // lex==numeric
         let mut val = Vec::new();
-        Utf8CaseFold::encode_into(&mut val, s);
+        Utf8CaseFold::encode_into(&mut val, s).expect("encoding must succeed");
         items.push((Cow::Owned(key), Cow::Owned(val)));
     }
 
@@ -77,7 +77,7 @@ fn utf8_casefold_orders_case_insensitively_and_preserves_original() {
         let b = item.value.end() as usize;
         let arc = item.value.data();
         let bytes = &arc.as_ref()[a..b];
-        got.push(Utf8CaseFold::decode(bytes));
+        got.push(Utf8CaseFold::decode(bytes).expect("decoding must succeed"));
     }
 
     // Expected order (case-insensitive collation), tie-broken by original bytes:

@@ -8,13 +8,17 @@ impl Codec for Bool {
     type Owned = bool;
 
     #[inline]
-    fn encode_into(dst: &mut Vec<u8>, v: &bool) {
+    fn encode_into(dst: &mut Vec<u8>, v: &bool) -> Result<(), EncodeError> {
         dst.push(if *v { 1 } else { 0 });
+        Ok(())
     }
 
     #[inline]
-    fn decode(src: &[u8]) -> bool {
-        src[0] != 0
+    fn decode(src: &[u8]) -> Result<bool, DecodeError> {
+        if src.is_empty() {
+            return Err(DecodeError::NotEnoughData);
+        }
+        Ok(src[0] != 0)
     }
 }
 
@@ -38,7 +42,7 @@ mod tests {
         assert!(f_bytes < t_bytes);
 
         // Round-trip
-        assert!(!Bool::decode(&f_bytes));
-        assert!(Bool::decode(&t_bytes));
+        assert!(!Bool::decode(&f_bytes).unwrap());
+        assert!(Bool::decode(&t_bytes).unwrap());
     }
 }

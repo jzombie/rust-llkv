@@ -10,8 +10,8 @@ pub use errors::*;
 
 /// A tag representing the physical data type for a piece of metadata.
 ///
-/// This is a simple, C-like enum that is cheap to store and copy. Its only
-/// purpose is to act as a label for the underlying storage format.
+/// This is a simple, C-like enum that is cheap to store and copy.
+/// Its only purpose is to act as a label for the underlying storage format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     /// Indicates the data is a case-insensitive, order-preserving string.
@@ -33,7 +33,8 @@ pub enum DecodedValue<'a> {
     Bool(bool),
 }
 
-/// Encode `value` into `out` using `dtype`. Appends to `out`.
+/// Encode `value` into `out` using `dtype`.
+/// Appends to `out`.
 #[inline]
 pub fn encode_value<'a>(
     value: DecodedValue<'a>,
@@ -91,11 +92,11 @@ pub fn decode_value<'a>(bytes: &'a [u8], dtype: &DataType) -> Option<DecodedValu
         }
         DataType::U64 => {
             // Statically calls the optimized integer decode.
-            Some(DecodedValue::U64(internal::BeU64::decode(bytes)))
+            internal::BeU64::decode(bytes).ok().map(DecodedValue::U64)
         }
         DataType::Bool => {
             // Statically calls the boolean decode.
-            Some(DecodedValue::Bool(internal::Bool::decode(bytes)))
+            internal::Bool::decode(bytes).ok().map(DecodedValue::Bool)
         }
     }
 }
