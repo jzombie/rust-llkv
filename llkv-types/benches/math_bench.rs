@@ -22,6 +22,23 @@ fn make_u64s_encoded(n: usize) -> Vec<[u8; 8]> {
     v
 }
 
+// Non-typed reducer helper (keeps DecodedValue).
+// Wraps decode_for_each and accumulates via a closure.
+#[inline]
+fn reduce_decode_stream<'a, I, T, F>(inputs: I, dtype: &DataType, init: T, mut f: F) -> T
+where
+    I: IntoIterator<Item = &'a [u8]>,
+    F: FnMut(T, DecodedValue<'a>) -> T,
+    T: Copy, // make accumulator copyable to avoid move-from-capture
+{
+    let mut acc = init;
+    decode_for_each(inputs, dtype, |dv| {
+        acc = f(acc, dv);
+    })
+    .expect("decode_for_each failed");
+    acc
+}
+
 fn bench_math_kernels(c: &mut Criterion) {
     // Fixtures (built once).
     let enc_u64 = make_u64s_encoded(N);
@@ -67,6 +84,27 @@ fn bench_math_kernels(c: &mut Criterion) {
                 }
             })
             .unwrap();
+            black_box(sum);
+        });
+    });
+
+    // --- BENCHMARK 3: Non-typed reducer over DecodedValue ---
+    // Same as BENCHMARK 2, but via a reducer-style helper that takes an
+    // accumulator and returns it. Keeps DecodedValue in the API.
+    c.bench_function("math_kernel/reducer_sum", |b| {
+        b.iter(|| {
+            let sum = reduce_decode_stream(
+                enc_u64_slices.iter().copied(),
+                &u64_dtype,
+                0u64,
+                |acc, dv| {
+                    if let DecodedValue::U64(x) = dv {
+                        acc.wrapping_add(x)
+                    } else {
+                        acc
+                    }
+                },
+            );
             black_box(sum);
         });
     });

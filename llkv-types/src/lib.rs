@@ -131,6 +131,42 @@ where
     Ok(n)
 }
 
+// 1) Generic reducer: ergonomic, about the same perf as your closure.
+//    Keeps DecodedValue, so still pays enum+match per item.
+#[inline]
+pub fn decode_for_each_reduce<'a, I, T, F>(
+    inputs: I,
+    dtype: &DataType,
+    mut acc: T,
+    mut f: F,
+) -> Result<T, DecodeError>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+    F: FnMut(T, DecodedValue<'a>) -> T,
+{
+    match dtype {
+        DataType::Utf8 => {
+            for b in inputs {
+                let s = Utf8CaseFold::decode_borrowed(b).ok_or(DecodeError::InvalidFormat)?;
+                acc = f(acc, DecodedValue::Str(s));
+            }
+        }
+        DataType::U64 => {
+            for b in inputs {
+                let x = BeU64::decode(b)?;
+                acc = f(acc, DecodedValue::U64(x));
+            }
+        }
+        DataType::Bool => {
+            for b in inputs {
+                let x = Bool::decode(b)?;
+                acc = f(acc, DecodedValue::Bool(x));
+            }
+        }
+    }
+    Ok(acc)
+}
+
 // --- Example Test ---
 #[cfg(test)]
 mod tests {
