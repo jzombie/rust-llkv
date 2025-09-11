@@ -10,7 +10,7 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use llkv_types::{DataType, DecodedValue};
-use llkv_types::{decode_value, encode_value, encode_value_to_vec};
+use llkv_types::{decode_many_into, decode_value, encode_value, encode_value_to_vec};
 
 const N: usize = 1_000_000;
 
@@ -82,25 +82,19 @@ fn bench_datatype_enum(c: &mut Criterion) {
     let vals_str_nonascii = make_strings_nonascii(N);
 
     // Pre-encode inputs for decode benches.
-    // u64: fixed arrays to avoid tiny Vecs.
+    // By encoding directly, we avoid millions of tiny, unnecessary allocations.
     let mut enc_u64: Vec<[u8; 8]> = Vec::with_capacity(N);
     for &x in &vals_u64 {
-        let b = encode_value_to_vec(DecodedValue::U64(x), &DataType::U64).expect("encode u64");
-        debug_assert_eq!(b.len(), 8);
-        let mut a = [0u8; 8];
-        a.copy_from_slice(&b);
-        enc_u64.push(a);
+        enc_u64.push(x.to_be_bytes());
     }
 
-    // bool: single byte each.
-    let mut enc_bool: Vec<u8> = Vec::with_capacity(N);
+    // Store bools in single-byte arrays for easier slicing later.
+    let mut enc_bool: Vec<[u8; 1]> = Vec::with_capacity(N);
     for &b in &vals_bool {
-        let v = encode_value_to_vec(DecodedValue::Bool(b), &DataType::Bool).expect("encode bool");
-        debug_assert_eq!(v.len(), 1);
-        enc_bool.push(v[0]);
+        enc_bool.push([if b { 1 } else { 0 }]);
     }
 
-    // strings (ASCII): per-item Vec<u8>.
+    // strings (ASCII): per-item Vec<u8> is necessary due to variable length.
     let mut enc_str_ascii: Vec<Vec<u8>> = Vec::with_capacity(N);
     for s in &vals_str_ascii {
         let v = encode_value_to_vec(DecodedValue::Str(s.as_str()), &DataType::Utf8)
@@ -240,9 +234,8 @@ fn bench_datatype_enum(c: &mut Criterion) {
     c.bench_function("DataType::Bool/decode", |b| {
         b.iter(|| {
             let mut acc = 0u64;
-            for &b1 in &enc_bool {
-                let dv =
-                    decode_value(core::slice::from_ref(&b1), &DataType::Bool).expect("decode bool");
+            for a in &enc_bool {
+                let dv = decode_value(a, &DataType::Bool).expect("decode bool");
                 if let DecodedValue::Bool(x) = dv {
                     acc ^= x as u64;
                 } else {
@@ -251,6 +244,72 @@ fn bench_datatype_enum(c: &mut Criterion) {
             }
             black_box(acc);
         });
+    });
+
+    // ------------------------------------
+    // Decode Many Benches
+    // ------------------------------------
+    let enc_str_ascii_slices: Vec<&[u8]> = enc_str_ascii.iter().map(|v| v.as_slice()).collect();
+    let enc_str_nonascii_slices: Vec<&[u8]> =
+        enc_str_nonascii.iter().map(|v| v.as_slice()).collect();
+    let enc_u64_slices: Vec<&[u8]> = enc_u64.iter().map(|a| a.as_slice()).collect();
+    let enc_bool_slices: Vec<&[u8]> = enc_bool.iter().map(|a| a.as_slice()).collect();
+
+    c.bench_function("DataType::Utf8/decode_many_ascii", |b| {
+        b.iter_batched(
+            || Vec::with_capacity(N),
+            |mut out| {
+                let n = decode_many_into(
+                    enc_str_ascii_slices.iter().copied(),
+                    &DataType::Utf8,
+                    &mut out,
+                )
+                .unwrap();
+                black_box(n);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    c.bench_function("DataType::Utf8/decode_many_non_ascii", |b| {
+        b.iter_batched(
+            || Vec::with_capacity(N),
+            |mut out| {
+                let n = decode_many_into(
+                    enc_str_nonascii_slices.iter().copied(),
+                    &DataType::Utf8,
+                    &mut out,
+                )
+                .unwrap();
+                black_box(n);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    c.bench_function("DataType::U64/decode_many", |b| {
+        b.iter_batched(
+            || Vec::with_capacity(N),
+            |mut out| {
+                let n = decode_many_into(enc_u64_slices.iter().copied(), &DataType::U64, &mut out)
+                    .unwrap();
+                black_box(n);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    c.bench_function("DataType::Bool/decode_many", |b| {
+        b.iter_batched(
+            || Vec::with_capacity(N),
+            |mut out| {
+                let n =
+                    decode_many_into(enc_bool_slices.iter().copied(), &DataType::Bool, &mut out)
+                        .unwrap();
+                black_box(n);
+            },
+            BatchSize::PerIteration,
+        );
     });
 }
 

@@ -101,6 +101,50 @@ pub fn decode_value<'a>(bytes: &'a [u8], dtype: &DataType) -> Option<DecodedValu
     }
 }
 
+/// Decodes an iterator of byte slices into a vector of `DecodedValue`s.
+///
+/// This function is a batch-oriented version of `decode_value`. It reuses the
+/// same statically-dispatched codec for all items in the iterator, which is
+/// highly efficient.
+pub fn decode_many_into<'a, I>(
+    bytes_iter: I,
+    dtype: &DataType,
+    out: &mut Vec<DecodedValue<'a>>,
+) -> Result<usize, DecodeError>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let bytes_iter = bytes_iter.into_iter();
+    out.reserve(bytes_iter.size_hint().0);
+    let mut n = 0;
+
+    match dtype {
+        DataType::Utf8 => {
+            for bytes in bytes_iter {
+                let s = internal::Utf8CaseFold::decode_borrowed(bytes)
+                    .ok_or(DecodeError::InvalidFormat)?;
+                out.push(DecodedValue::Str(s));
+                n += 1;
+            }
+        }
+        DataType::U64 => {
+            for bytes in bytes_iter {
+                let x = internal::BeU64::decode(bytes)?;
+                out.push(DecodedValue::U64(x));
+                n += 1;
+            }
+        }
+        DataType::Bool => {
+            for bytes in bytes_iter {
+                let b = internal::Bool::decode(bytes)?;
+                out.push(DecodedValue::Bool(b));
+                n += 1;
+            }
+        }
+    }
+    Ok(n)
+}
+
 // --- Example Test ---
 #[cfg(test)]
 mod tests {
@@ -146,5 +190,37 @@ mod tests {
         } else {
             panic!("Expected a bool!");
         }
+    }
+
+    #[test]
+    fn test_decode_many() {
+        let u64_dtype = DataType::U64;
+        let values_in = vec![10u64, 20, 30];
+
+        // 1. Encode multiple values
+        let encoded_values: Vec<Vec<u8>> = values_in
+            .iter()
+            .map(|v| {
+                let mut buf = Vec::new();
+                v.encode_into(&mut buf);
+                buf
+            })
+            .collect();
+
+        // 2. Decode them in a batch
+        let mut decoded_out = Vec::new();
+        let encoded_slices: Vec<&[u8]> = encoded_values.iter().map(|v| v.as_slice()).collect();
+        let count = decode_many_into(encoded_slices, &u64_dtype, &mut decoded_out).unwrap();
+
+        // 3. Assert results
+        assert_eq!(count, 3);
+        assert_eq!(
+            decoded_out,
+            vec![
+                DecodedValue::U64(10),
+                DecodedValue::U64(20),
+                DecodedValue::U64(30)
+            ]
+        );
     }
 }
