@@ -13,6 +13,8 @@ pub enum DataType {
     Utf8CaseFold,
     /// Indicates the data is a big-endian 64-bit unsigned integer.
     BeU64,
+    /// Indicates the data is a boolean value (0 for false, 1 for true).
+    Bool,
 }
 
 /// A generic enum to hold any possible value decoded from storage.
@@ -23,6 +25,7 @@ pub enum DataType {
 pub enum DecodedValue<'a> {
     Str(&'a str),
     U64(u64),
+    Bool(bool),
 }
 
 /// Bridges the runtime metadata (`DataType`) to the high-performance,
@@ -40,6 +43,10 @@ pub fn decode_value<'a>(bytes: &'a [u8], dtype: &DataType) -> Option<DecodedValu
             // Statically calls the optimized integer decode.
             Some(DecodedValue::U64(internal::BeU64::decode(bytes)))
         }
+        DataType::Bool => {
+            // Statically calls the boolean decode.
+            Some(DecodedValue::Bool(internal::Bool::decode(bytes)))
+        }
     }
 }
 
@@ -54,6 +61,7 @@ mod tests {
         // 1. Define the data types for our system directly.
         let user_name_dtype = DataType::Utf8CaseFold;
         let user_id_dtype = DataType::BeU64;
+        let is_active_dtype = DataType::Bool;
 
         // 2. Create some raw encoded data.
         let mut name_bytes = Vec::new();
@@ -62,19 +70,30 @@ mod tests {
         let mut id_bytes = Vec::new();
         12345u64.encode_into(&mut id_bytes);
 
+        let mut is_active_bytes = Vec::new();
+        true.encode_into(&mut is_active_bytes);
+
         // 3. Use the bridge function to decode the data based on the data type.
         let decoded_name = decode_value(&name_bytes, &user_name_dtype).unwrap();
         let decoded_id = decode_value(&id_bytes, &user_id_dtype).unwrap();
+        let decoded_is_active = decode_value(&is_active_bytes, &is_active_dtype).unwrap();
 
         // 4. Assert that we got the correct types and values back.
         assert_eq!(decoded_name, DecodedValue::Str("Jeremy"));
         assert_eq!(decoded_id, DecodedValue::U64(12345));
+        assert_eq!(decoded_is_active, DecodedValue::Bool(true));
 
         // 5. Use the decoded values in a type-safe way.
         if let DecodedValue::Str(s) = decoded_name {
             assert!(s.starts_with('J'));
         } else {
             panic!("Expected a string!");
+        }
+
+        if let DecodedValue::Bool(b) = decoded_is_active {
+            assert!(b);
+        } else {
+            panic!("Expected a bool!");
         }
     }
 }

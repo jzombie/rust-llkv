@@ -23,7 +23,7 @@ use icu_normalizer::{ComposingNormalizer, ComposingNormalizerBorrowed};
 ///
 /// - `Borrowed<'a>` is the borrowed view accepted by `encode_into`,
 ///    e.g. `&'a str` for text, `&'a u64` for u64.
-/// - `Owned` is the type `decode` returns (e.g. `String`, `u64`).
+/// - `Owned` is the type `decode` returns (e.g., `String`, `u64`).
 pub trait Codec {
     type Borrowed<'a>: ?Sized
     where
@@ -166,6 +166,26 @@ impl Codec for BeU64 {
     }
 }
 
+/* ----------------------------- Bool --------------------------------- */
+
+/// Codec for bool. `false` -> `0u8`, `true` -> `1u8`.
+pub struct Bool;
+
+impl Codec for Bool {
+    type Borrowed<'a> = &'a bool;
+    type Owned = bool;
+
+    #[inline]
+    fn encode_into(dst: &mut Vec<u8>, v: &bool) {
+        dst.push(if *v { 1 } else { 0 });
+    }
+
+    #[inline]
+    fn decode(src: &[u8]) -> bool {
+        src[0] != 0
+    }
+}
+
 /* ---------------------- Value-side encode convenience ------------------- */
 
 /// Default, value-side encoding: `v.encode_into(&mut buf)`.
@@ -195,6 +215,14 @@ impl EncodeInto for u64 {
     #[inline]
     fn encode_into(&self, dst: &mut Vec<u8>) {
         BeU64::encode_into(dst, self)
+    }
+}
+
+// bool → Bool
+impl EncodeInto for bool {
+    #[inline]
+    fn encode_into(&self, dst: &mut Vec<u8>) {
+        Bool::encode_into(dst, self)
     }
 }
 
@@ -317,5 +345,25 @@ mod tests {
         assert_eq!(BeU64::decode(&a), 1);
         assert_eq!(BeU64::decode(&b), 2);
         assert_eq!(BeU64::decode(&c), 10);
+    }
+
+    #[test]
+    fn bool_roundtrip_and_order() {
+        let mut f_bytes = Vec::new();
+        let mut t_bytes = Vec::new();
+
+        false.encode_into(&mut f_bytes);
+        true.encode_into(&mut t_bytes);
+
+        // Check byte representation
+        assert_eq!(f_bytes, &[0]);
+        assert_eq!(t_bytes, &[1]);
+
+        // Lex order: false < true
+        assert!(f_bytes < t_bytes);
+
+        // Round-trip
+        assert_eq!(Bool::decode(&f_bytes), false);
+        assert_eq!(Bool::decode(&t_bytes), true);
     }
 }
