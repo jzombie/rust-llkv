@@ -19,7 +19,7 @@ fn utf8_casefold_orders_case_insensitively_and_preserves_original() {
     let fid: LogicalFieldId = 42;
 
     // Intentionally mixed case and spacing; ensure “Large Words” and “lower words” sort together.
-    let words = vec![
+    let words = [
         "zeta",
         "Apple",
         "alpha",
@@ -32,6 +32,7 @@ fn utf8_casefold_orders_case_insensitively_and_preserves_original() {
     ];
 
     // Prepare a single Put batch: (key=row-id BE, val=encoded).
+    #[allow(clippy::type_complexity)] // TODO: Alias complex type
     let mut items: Vec<(Cow<[u8]>, Cow<[u8]>)> = Vec::new();
     for (i, s) in words.iter().enumerate() {
         let key = (i as u64 + 1).to_be_bytes().to_vec(); // lex==numeric

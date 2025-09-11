@@ -32,7 +32,7 @@ const COLS: &[LogicalFieldId] = &[10, 11, 20, 21, 30, 31];
 #[inline]
 fn fixed_value(width: usize, row: u64, fid: LogicalFieldId) -> Vec<u8> {
     // deterministic but cheap content
-    let seed = (row ^ (fid as u64)).to_le_bytes();
+    let seed = (row ^ (fid)).to_le_bytes();
     if width <= 8 {
         seed[..width].to_vec()
     } else {
@@ -48,7 +48,7 @@ fn fixed_value(width: usize, row: u64, fid: LogicalFieldId) -> Vec<u8> {
 #[inline]
 fn var_value(row: u64, fid: LogicalFieldId, min_len: usize, max_len: usize) -> Vec<u8> {
     let span = (max_len - min_len + 1) as u64;
-    let len = min_len as u64 + ((row.wrapping_mul(1103515245) ^ fid as u64) % span);
+    let len = min_len as u64 + ((row.wrapping_mul(1103515245) ^ fid) % span);
     let byte = (((row as LogicalFieldId).wrapping_add(fid)) & 0xFF) as u8;
     vec![byte; len as usize]
 }

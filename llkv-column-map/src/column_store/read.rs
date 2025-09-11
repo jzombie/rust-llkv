@@ -85,10 +85,10 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     // TODO: Return `Result` type
     /// Core: single codepath that executes a batched point-lookup for
     /// a set of columns (`fids`) over a single shared keyset (`keys`).
-    fn get_many_core<'a>(
+    fn get_many_core(
         &self,
         fids: &[LogicalFieldId],
-        keys: &[&'a [u8]],
+        keys: &[&[u8]],
     ) -> Vec<Vec<Option<ValueSlice<P::Blob>>>> {
         if fids.is_empty() || keys.is_empty() {
             return (0..fids.len()).map(|_| Vec::new()).collect();

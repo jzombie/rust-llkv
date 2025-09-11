@@ -28,7 +28,7 @@ use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ScanError, Va
 use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, ValueMode};
 use llkv_column_map::views::ValueSlice;
 
-/// ----- Namespacing helpers -----
+// ----- Namespacing helpers -----
 
 #[inline]
 pub fn lfid(table_id: u32, col_id: u32) -> LogicalFieldId {
@@ -38,7 +38,7 @@ pub fn lfid(table_id: u32, col_id: u32) -> LogicalFieldId {
 #[inline]
 fn rid_table(table_id: u32) -> u64 {
     // Choose (tid << 32) | 0 so table rows and column rows share sort locality.
-    ((table_id as u64) << 32) | 0
+    (table_id as u64) << 32
 }
 
 #[inline]
@@ -62,6 +62,7 @@ fn slice_to_owned(v: &ValueSlice<Arc<[u8]>>) -> Vec<u8> {
 
 /// Compute the tight upper bound for a prefix range ([prefix, upper)) in byte space.
 #[inline]
+#[allow(dead_code)] // TODO: Clean up or wire up
 fn next_prefix_upper(prefix: &[u8]) -> Option<Vec<u8>> {
     if prefix.is_empty() {
         return None;
@@ -77,7 +78,7 @@ fn next_prefix_upper(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// ----- Catalog constants -----
+// ----- Catalog constants -----
 
 /// Reserved catalog table id.
 pub const CATALOG_TID: u32 = 0;
@@ -163,7 +164,7 @@ fn map_coltype_to_dtype(t: &ColType) -> DataType {
     }
 }
 
-/// ----- SysCatalog -----
+// ----- SysCatalog -----
 
 pub struct SysCatalog<'a> {
     store: &'a ColumnStore<'static, llkv_column_map::storage::pager::MemPager>,

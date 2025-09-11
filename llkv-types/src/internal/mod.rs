@@ -3,7 +3,7 @@
 //! Minimal, fast codecs + value-side `encode_into`.
 //!
 //! - `Utf8CaseFold`: true Unicode case-insensitive, order-preserving UTF-8.
-//!   Layout: [folded_utf8][original_utf8][be32(len_folded)]
+//!   Layout: \[folded_utf8\]\[original_utf8\]\[be32(len_folded)\]
 //!   * Value-ordered stores compare the folded prefix first (CI), then original.
 //!   * Decode is lossless; embedded NULs are fine.
 //!
@@ -22,7 +22,7 @@ use icu_normalizer::{ComposingNormalizer, ComposingNormalizerBorrowed};
 /// A zero-overhead codec API for a single logical type.
 ///
 /// - `Borrowed<'a>` is the borrowed view accepted by `encode_into`,
-///    e.g. `&'a str` for text, `&'a u64` for u64.
+///   e.g. `&'a str` for text, `&'a u64` for u64.
 /// - `Owned` is the type `decode` returns (e.g., `String`, `u64`).
 pub trait Codec {
     type Borrowed<'a>: ?Sized
@@ -65,7 +65,7 @@ impl Utf8CaseFold {
     }
 
     /// Encode layout:
-    ///   [folded_utf8][original_utf8][be32(len_folded)]
+    ///   \[folded_utf8\]\[original_utf8\]\[be32(len_folded)\]
     /// This keeps lex order correct while making decode trivial and NUL-safe.
     #[inline]
     fn encode_impl(dst: &mut Vec<u8>, s: &str) {
@@ -363,7 +363,7 @@ mod tests {
         assert!(f_bytes < t_bytes);
 
         // Round-trip
-        assert_eq!(Bool::decode(&f_bytes), false);
-        assert_eq!(Bool::decode(&t_bytes), true);
+        assert!(!Bool::decode(&f_bytes));
+        assert!(Bool::decode(&t_bytes));
     }
 }

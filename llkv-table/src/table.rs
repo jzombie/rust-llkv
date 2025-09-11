@@ -5,6 +5,8 @@
 //! - Row-based inserts -> column_map append_many.
 //! - Scans delegate to column_map read_scan utilities.
 
+// TODO: Replace internal `HashMap` and `HashSet` with `Fx` equivalents
+
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
@@ -103,7 +105,6 @@ pub enum CmError {
 pub struct Table {
     /// Leaked pager to satisfy ColumnStore's lifetime without
     /// gymnastics.
-    pager: &'static MemPager,
     store: ColumnStore<'static, MemPager>,
     cfg: TableCfg,
     /// 32-bit table id used to namespace logical field ids.
@@ -119,7 +120,6 @@ impl Table {
         let pager = Box::leak(Box::new(MemPager::default()));
         let store = ColumnStore::init_empty(pager);
         Self {
-            pager,
             store,
             cfg,
             table_id,
@@ -193,6 +193,7 @@ impl Table {
         }
 
         // FieldId -> Vec<(key, val)>
+        #[allow(clippy::type_complexity)] // TODO: Alias type
         let mut by_col: HashMap<LogicalFieldId, Vec<(Cow<[u8]>, Cow<[u8]>)>> = HashMap::new();
 
         for (row_id, cols) in rows.iter() {
@@ -258,7 +259,13 @@ impl Table {
 
         loop {
             // Backing storage for &[u8] bounds.
+
+            // TODO: Clean up or wire up
+            #[allow(unused_assignments)]
             let mut lo_buf: Option<Vec<u8>> = None;
+
+            // TODO: Clean up or wire up
+            #[allow(unused_assignments)]
             let mut hi_buf: Option<Vec<u8>> = None;
 
             let lo_bound: Bound<&[u8]> = match (&after, lo) {
@@ -331,11 +338,12 @@ impl Table {
             for (i, key) in keys.iter().enumerate() {
                 let rid = parse_row_id(key);
                 let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(project.len());
-                for col in 0..project.len() {
-                    let cell = &results[col][i];
-                    let owned = cell.as_ref().map(|s| value_slice_bytes(s));
+
+                for col_cells in results.iter().take(project.len()) {
+                    let owned = col_cells[i].as_ref().map(value_slice_bytes);
                     row.push(owned);
                 }
+
                 on_row(rid, row);
             }
 
@@ -356,7 +364,12 @@ impl Table {
         let mut cursor_v: Option<Vec<u8>> = None;
 
         loop {
+            // TODO: Clean up or wire up
+            #[allow(unused_assignments)]
             let mut lo_buf: Option<Vec<u8>> = None;
+
+            // TODO: Clean up or wire up
+            #[allow(unused_assignments)]
             let mut hi_buf: Option<Vec<u8>> = None;
 
             let (lo_bound, hi_bound): (Bound<&[u8]>, Bound<&[u8]>) = match dir {
@@ -490,11 +503,12 @@ impl Table {
         // Emit per-row, preserving rids order.
         for (i, rid) in rids.into_iter().enumerate() {
             let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(projection.len());
-            for col in 0..projection.len() {
-                let cell = &results[col][i];
-                let owned = cell.as_ref().map(|s| value_slice_bytes(s));
+
+            for col_cells in results.iter().take(projection.len()) {
+                let owned = col_cells[i].as_ref().map(value_slice_bytes);
                 row.push(owned);
             }
+
             on_row(rid, row);
         }
         Ok(())
@@ -583,10 +597,8 @@ impl Table {
                 let (tx, rx) = xchan::unbounded();
                 std::thread::spawn(move || {
                     for rid in universe_rx {
-                        if !inner_set.contains(&rid) {
-                            if tx.send(rid).is_err() {
-                                break;
-                            }
+                        if !inner_set.contains(&rid) && tx.send(rid).is_err() {
+                            break;
                         }
                     }
                 });
@@ -601,6 +613,7 @@ impl Table {
         filter: &Filter<'b, FieldId>,
     ) -> Result<Option<xchan::Receiver<RowId>>, CmError> {
         // Helper that runs a scan with lo/hi bounds and an optional value predicate.
+        #[allow(clippy::type_complexity)] // TODO: Alias complex type
         let scan_stream = |fid: LogicalFieldId,
                            lo: Bound<&[u8]>,
                            hi: Bound<&[u8]>,
@@ -732,10 +745,8 @@ impl Table {
                     let mut seen: HashSet<RowId> = HashSet::new();
                     for s in streams {
                         for rid in s {
-                            if seen.insert(rid) {
-                                if tx.send(rid).is_err() {
-                                    break;
-                                }
+                            if seen.insert(rid) && tx.send(rid).is_err() {
+                                break;
                             }
                         }
                     }
@@ -751,6 +762,7 @@ impl Table {
                     None => Bound::Unbounded,
                 };
                 // If hi is Unbounded (all 0xFF), add a predicate to short-circuit once we pass.
+                #[allow(clippy::type_complexity)] // TODO: Alias complex type
                 let pred: Option<Box<dyn FnMut(&[u8]) -> bool + 'b>> = if upper_buf.is_none() {
                     let p = *prefix;
                     Some(Box::new(move |v: &[u8]| v.starts_with(p)))
@@ -954,7 +966,7 @@ mod tests {
         );
 
         assert_eq!(got.len(), 5);
-        for i in 0..5 {
+        for (i, _) in got.iter().enumerate().take(5) {
             let (rid, cols) = &got[i];
             let expect = (i as u64) + 1;
             assert_eq!(*rid, expect);
@@ -1298,8 +1310,8 @@ mod tests {
                 mk_row(
                     rid,
                     &[
-                        (COL_COUNTRY, be64_bytes((rid % 5) as u64)),
-                        (COL_STATUS, be64_bytes((rid % 4) as u64)),
+                        (COL_COUNTRY, be64_bytes(rid % 5)),
+                        (COL_STATUS, be64_bytes(rid % 4)),
                         (COL_PAYLOAD, s("x")),
                     ],
                 )

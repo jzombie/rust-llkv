@@ -23,7 +23,7 @@ use llkv_column_map::{
 
 fn fixed_value(row: u64, field: LogicalFieldId, width: usize) -> Vec<u8> {
     // Stable 8-byte seed then repeat/truncate to requested width
-    let seed = (row ^ field as u64).to_le_bytes();
+    let seed = (row ^ field).to_le_bytes();
     if width <= 8 {
         seed[..width].to_vec()
     } else {
@@ -57,7 +57,7 @@ fn build_put_var(
         let span = (max - min + 1) as u64;
         let mix = r
             .wrapping_mul(1103515245)
-            .wrapping_add(field_id as u64)
+            .wrapping_add(field_id)
             .rotate_left(13);
         let len = (min as u64 + (mix % span)) as usize;
         let byte = (((r as LogicalFieldId).wrapping_add(field_id)) & 0xFF) as u8;

@@ -16,7 +16,6 @@ use std::time::Instant;
 
 use csv::{ReaderBuilder, StringRecord};
 use llkv_csv::{CsvConfig, load_into_table};
-use llkv_table::expr::{Expr, Filter, Operator};
 use llkv_table::types::{ColumnInput, FieldId, IndexKey, RowId};
 use llkv_table::{Table, TableCfg};
 

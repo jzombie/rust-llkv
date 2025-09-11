@@ -94,7 +94,7 @@ fn var_len_for(row: u64, field: LogicalFieldId, min: usize, max: usize) -> usize
     let span = (max - min + 1) as u64;
     let mix = row
         .wrapping_mul(1103515245)
-        .wrapping_add(field as u64)
+        .wrapping_add(field)
         .rotate_left(13);
     (min as u64 + (mix % span)) as usize
 }
@@ -114,7 +114,7 @@ fn build_puts_for_range<'a>(
                 ColKind::Fixed(w) => {
                     let w = w as usize;
                     // derive a stable 8-byte seed from row & field, then repeat/truncate to w bytes
-                    let seed = (r ^ field_id as u64).to_le_bytes();
+                    let seed = (r ^ field_id).to_le_bytes();
                     if w <= 8 {
                         seed[..w].to_vec()
                     } else {
