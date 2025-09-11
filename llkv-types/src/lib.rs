@@ -131,40 +131,45 @@ where
     Ok(n)
 }
 
-// 1) Generic reducer: ergonomic, about the same perf as your closure.
-//    Keeps DecodedValue, so still pays enum+match per item.
+/// Generic reducer over decoded values. Streams items and calls `f`
+/// with a mutable accumulator (avoids moves/copies of `acc`).
+/// Returns the number of items processed.
 #[inline]
 pub fn decode_for_each_reduce<'a, I, T, F>(
     inputs: I,
     dtype: &DataType,
-    mut acc: T,
+    acc: &mut T,
     mut f: F,
-) -> Result<T, DecodeError>
+) -> Result<usize, DecodeError>
 where
     I: IntoIterator<Item = &'a [u8]>,
-    F: FnMut(T, DecodedValue<'a>) -> T,
+    F: FnMut(&mut T, DecodedValue<'a>),
 {
+    let mut n = 0usize;
     match dtype {
         DataType::Utf8 => {
             for b in inputs {
                 let s = Utf8CaseFold::decode_borrowed(b).ok_or(DecodeError::InvalidFormat)?;
-                acc = f(acc, DecodedValue::Str(s));
+                f(acc, DecodedValue::Str(s));
+                n += 1;
             }
         }
         DataType::U64 => {
             for b in inputs {
                 let x = BeU64::decode(b)?;
-                acc = f(acc, DecodedValue::U64(x));
+                f(acc, DecodedValue::U64(x));
+                n += 1;
             }
         }
         DataType::Bool => {
             for b in inputs {
                 let x = Bool::decode(b)?;
-                acc = f(acc, DecodedValue::Bool(x));
+                f(acc, DecodedValue::Bool(x));
+                n += 1;
             }
         }
     }
-    Ok(acc)
+    Ok(n)
 }
 
 /// Typed reducer for u64 that streams decode and accumulates without
