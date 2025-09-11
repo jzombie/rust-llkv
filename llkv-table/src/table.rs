@@ -6,6 +6,7 @@
 //! - Scans delegate to column_map read_scan utilities.
 
 // TODO: Replace internal `HashMap` and `HashSet` with `Fx` equivalents
+// TODO: Implement `Display` trait for CLI views
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
