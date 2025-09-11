@@ -1,3 +1,28 @@
+//! Defines the core, low-level types used throughout the storage engine.
+//!
+//! This module provides type aliases for fundamental concepts like physical keys,
+//! logical field IDs, and various byte-level measurements.
+//!
+//! ## A Note on Endianness and Sort Order
+//!
+//! You will notice that this system consistently uses **big-endian** encoding for
+//! all numeric types that are part of a `LogicalKeyBytes` payload. This is a
+//! deliberate and critical design choice.
+//!
+//! The storage engine's core is built on a simple, fast, and generic
+//! **lexicographical (byte-wise) sort**. To function correctly, all data types—strings,
+//! numbers, and composites—must sort correctly using the same universal rule.
+//!
+//! - **Strings** naturally sort lexicographically.
+//! - **Little-Endian** numbers (the native format for most CPUs) **do not**. For example,
+//!   as bytes, `256` would sort before `1`.
+//! - **Big-Endian** numbers **do**. Their byte order matches their numeric order, allowing
+//!   them to be sorted correctly with the same logic as strings.
+//!
+//! This requires a fast byte-swap when decoding numbers for computation, but this
+//! small, one-time cost is far outweighed by the massive simplification and
+//! performance gain of a unified, type-agnostic sorting and searching core.
+
 pub mod internal;
 use crate::internal::Codec;
 
