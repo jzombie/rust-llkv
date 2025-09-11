@@ -31,10 +31,10 @@ pub trait Codec {
         // A generic, correct default implementation.
         // Individual codecs can provide a faster, specialized version.
         let n = core::cmp::min(src.len() / Self::ENCODED_SIZE, dst.len());
-        for i in 0..n {
+        for (i, out) in dst.iter_mut().take(n).enumerate() {
             let offset = i * Self::ENCODED_SIZE;
             let chunk = &src[offset..offset + Self::ENCODED_SIZE];
-            dst[i] = Self::decode(chunk)?;
+            *out = Self::decode(chunk)?;
         }
         Ok(n)
     }

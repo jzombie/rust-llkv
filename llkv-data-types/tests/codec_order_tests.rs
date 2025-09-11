@@ -24,6 +24,7 @@ fn setup_store() -> (ColumnStore<'static, MemPager>, LogicalFieldId) {
 
 /// Append a single Put batch to the given field id.
 #[inline]
+#[allow(clippy::type_complexity)] // TODO: Alias type
 fn append_one_put(
     store: &ColumnStore<'static, MemPager>,
     fid: LogicalFieldId,
@@ -76,6 +77,7 @@ fn scan_value_frames(store: &ColumnStore<'static, MemPager>, fid: LogicalFieldId
 /// codec-borrowed values (e.g., `&[&str]` for `Utf8CaseFold`,
 /// `&[&[u8]]` for `Bytes`).
 #[inline]
+#[allow(clippy::type_complexity)] // TODO: Alias type
 fn build_items<'a, C>(vals: &[C::Borrowed<'a>]) -> Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)>
 where
     C: Codec,

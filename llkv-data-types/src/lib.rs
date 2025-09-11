@@ -264,7 +264,7 @@ mod tests {
 
         let mut buf = Vec::new();
         encode_value(DecodedValue::Bytes(&payload), &dtype, &mut buf).unwrap();
-        let slices = vec![buf.as_slice(), buf.as_slice(), buf.as_slice()];
+        let slices = [buf.as_slice(), buf.as_slice(), buf.as_slice()];
 
         let (collected, count): (Vec<DecodedValue<'_>>, usize) =
             decode_reduce(slices.iter().copied(), &dtype, Vec::new(), |mut acc, dv| {
