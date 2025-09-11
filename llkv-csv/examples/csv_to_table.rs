@@ -1,8 +1,7 @@
 //! Load a CSV into a Table using filename, headers flag, and delimiter.
 //!
 //! Usage:
-//!   cargo run --release --example csv_to_table -- \
-//!     <file.csv> <has_headers:0|1> <delimiter>
+//!   cargo run --release --example csv_to_table <file.csv> <has_headers:0|1> <delimiter>
 
 #![forbid(unsafe_code)]
 
