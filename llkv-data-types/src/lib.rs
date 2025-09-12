@@ -57,6 +57,7 @@ pub fn encode_value<'a>(
             expected: *expected,
             got: "Str",
         }),
+        //
         (DataType::U8, DecodedValue::U8(x)) => {
             x.encode_into(out);
             Ok(())
@@ -65,6 +66,7 @@ pub fn encode_value<'a>(
             expected: *expected,
             got: "U8",
         }),
+        //
         (DataType::U16, DecodedValue::U16(x)) => {
             x.encode_into(out);
             Ok(())
@@ -73,6 +75,7 @@ pub fn encode_value<'a>(
             expected: *expected,
             got: "U16",
         }),
+        //
         (DataType::U32, DecodedValue::U32(x)) => {
             x.encode_into(out);
             Ok(())
@@ -81,6 +84,7 @@ pub fn encode_value<'a>(
             expected: *expected,
             got: "U32",
         }),
+        //
         (DataType::U64, DecodedValue::U64(x)) => {
             x.encode_into(out);
             Ok(())
@@ -89,6 +93,7 @@ pub fn encode_value<'a>(
             expected: *expected,
             got: "U64",
         }),
+        //
         (DataType::I64, DecodedValue::I64(x)) => {
             x.encode_into(out);
             Ok(())
@@ -97,6 +102,7 @@ pub fn encode_value<'a>(
             expected: *expected,
             got: "I64",
         }),
+        //
         (DataType::Bool, DecodedValue::Bool(b)) => {
             b.encode_into(out);
             Ok(())
@@ -105,6 +111,7 @@ pub fn encode_value<'a>(
             expected: *expected,
             got: "Bool",
         }),
+        //
         (DataType::Bytes, DecodedValue::Bytes(b)) => {
             b.encode_into(out);
             Ok(())
