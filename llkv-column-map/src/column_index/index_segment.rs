@@ -116,4 +116,23 @@ pub struct ValueIndex {
     pub value_order: Vec<IndexEntryCount>,
     pub l1_dir: Vec<IndexEntryCount>,
     pub l2_dirs: Vec<ValueDirL2>,
+    /// Order-defining sort keys stored in the index, so the read path never
+    /// needs to touch payload bytes for ordering decisions.
+    pub sort_keys: ValueSortKeys,
+}
+
+/// Per-entry sort keys used for value-ordered scans.
+///
+/// - Fixed: `bytes` is a tight concatenation, `width` is per-entry width.
+/// - Variable: offsets is prefix-sum; slice i is [offs[i], offs[i+1]).
+#[derive(Debug, Clone, Encode, Decode)]
+pub enum ValueSortKeys {
+    Fixed {
+        width: ByteWidth,
+        bytes: Vec<u8>,
+    },
+    Variable {
+        offsets: Vec<IndexEntryCount>,
+        bytes: Vec<u8>,
+    },
 }

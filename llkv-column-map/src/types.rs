@@ -159,6 +159,10 @@ pub struct AppendOptions {
     pub segment_max_entries: usize,
     pub segment_max_bytes: usize, // data payload budget per segment
     pub last_write_wins_in_batch: bool,
+    /// Optional sort-key encoding policy applied to this append call.
+    /// If set, the writer builds index-only sort keys using this encoding
+    /// (payload bytes remain unchanged, typically LE). If None, raw bytes are used.
+    pub sort_key: Option<SortKeyEncoding>,
 }
 
 impl Default for AppendOptions {
@@ -168,6 +172,26 @@ impl Default for AppendOptions {
             segment_max_entries: u16::MAX as usize,
             segment_max_bytes: 8 * 1024 * 1024,
             last_write_wins_in_batch: true,
+            sort_key: None,
         }
     }
+}
+
+/// How to encode per-row order-defining sort keys in the index.
+#[derive(Clone, Copy, Debug)]
+pub enum SortKeyEncoding {
+    /// Use raw value bytes.
+    Raw,
+    /// Fixed-width unsigned integer in LE payload; build BE-ordered 1/2/4/8B keys.
+    UFixedLe,
+    /// Fixed-width signed integer in LE payload; bias sign and build 1/2/4/8B keys.
+    IFixedLe,
+    /// f32 in LE payload; total-order mapping to BE-lex keys.
+    F32Le,
+    /// f64 in LE payload; total-order mapping to BE-lex keys.
+    F64Le,
+    /// Variable UTF-8 bytes (raw).
+    VarUtf8,
+    /// Variable binary bytes (raw).
+    VarBinary,
 }

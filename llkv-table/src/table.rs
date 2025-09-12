@@ -222,6 +222,7 @@ impl Table {
             segment_max_entries: self.cfg.segment_max_entries,
             segment_max_bytes: self.cfg.segment_max_bytes,
             last_write_wins_in_batch: self.cfg.last_write_wins_in_batch,
+            sort_key: None,
         };
 
         self.store.append_many(puts, opts);

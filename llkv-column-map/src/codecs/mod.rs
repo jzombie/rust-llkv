@@ -1,6 +1,7 @@
 use crate::types::{TypedKind, TypedValue};
 use std::io;
 pub mod big_endian;
+pub mod orderkey;
 
 pub fn encode_typed(v: &TypedValue) -> Vec<u8> {
     match v {

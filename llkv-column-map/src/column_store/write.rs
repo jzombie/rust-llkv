@@ -2,12 +2,14 @@ use super::ColumnStore;
 use crate::bounds::ValueBound;
 use crate::column_index::{
     ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, ValueDirL2, ValueIndex,
+    ValueSortKeys,
 };
 use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::types::{
     AppendOptions, ByteLen, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes,
-    PhysicalKey, Put, TypedKind, TypedValue, ValueMode,
+    PhysicalKey, Put, SortKeyEncoding, TypedKind, TypedValue, ValueMode,
 };
+use crate::codecs::orderkey;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 
@@ -256,9 +258,6 @@ impl<P: Pager> ColumnStore<P> {
             let data_pkey = data_keys[i];
             let index_pkey = index_keys[i];
 
-            // compute value bounds once per segment
-            let (vmin, vmax) = ValueBound::min_max_bounds(&chunk.values);
-
             // build data blob (+ value offsets for variable)
             let (data_blob, mut seg, n_entries) = match chunk.layout {
                 PlannedWriteLayout::Fixed { width } => {
@@ -282,31 +281,204 @@ impl<P: Pager> ColumnStore<P> {
                 }
             };
 
-            // Compute value index from the in-memory values for this segment.
-            let hot_threshold = 4096; // tune later; promotes big L1 buckets
-            let built_value_dirs =
-                Self::build_value_index_from_values(&chunk.values, hot_threshold);
-            let value_index = ValueIndex {
-                value_order: built_value_dirs
-                    .value_order
-                    .into_iter()
-                    .map(|v| v as IndexEntryCount)
-                    .collect(),
-                l1_dir: built_value_dirs
-                    .l1_dir
-                    .into_iter()
-                    .map(|v| v as IndexEntryCount)
-                    .collect(),
-                l2_dirs: built_value_dirs
-                    .l2_dirs
-                    .into_iter()
-                    .map(|(first_byte, dir257)| ValueDirL2 {
-                        first_byte,
-                        dir257: dir257.into_iter().map(|v| v as IndexEntryCount).collect(),
-                    })
-                    .collect(),
+            // Compute min/max bounds from original values (not sort-keys),
+            // so we can safely skip value_index if it would exceed budget.
+            let (vmin, vmax) = ValueBound::min_max_bounds(&chunk.values);
+
+            // Compute sort keys + value index from the in-memory values for this segment.
+            // Baseline: sort keys are equal to value bytes (payload-cold ordering ready).
+            let (sort_keys_opt, built_value_dirs_opt) = match &chunk.layout {
+                PlannedWriteLayout::Fixed { width } => {
+                    let width = *width as usize;
+                    // Build per-row sort-key bytes according to opts.sort_key
+                    let mut sk_bytes = Vec::with_capacity(chunk.values.len() * width);
+                    match opts.sort_key.unwrap_or(SortKeyEncoding::Raw) {
+                        SortKeyEncoding::Raw => {
+                            for v in &chunk.values {
+                                sk_bytes.extend_from_slice(v);
+                            }
+                        }
+                        SortKeyEncoding::UFixedLe => match width {
+                            1 => {
+                                for v in &chunk.values {
+                                    sk_bytes.extend_from_slice(&orderkey::u8_to_sort1(v[0]));
+                                }
+                            }
+                            2 => {
+                                for v in &chunk.values {
+                                    let mut a = [0u8; 2];
+                                    a.copy_from_slice(&v[..2]);
+                                    sk_bytes.extend_from_slice(&orderkey::u16_le_to_sort2(a));
+                                }
+                            }
+                            4 => {
+                                for v in &chunk.values {
+                                    let mut a = [0u8; 4];
+                                    a.copy_from_slice(&v[..4]);
+                                    sk_bytes.extend_from_slice(&orderkey::u32_le_to_sort4(a));
+                                }
+                            }
+                            8 => {
+                                for v in &chunk.values {
+                                    let mut a = [0u8; 8];
+                                    a.copy_from_slice(&v[..8]);
+                                    sk_bytes.extend_from_slice(&orderkey::u64_le_to_sort8(a));
+                                }
+                            }
+                            _ => {
+                                // Fallback: raw bytes when width is unusual
+                                for v in &chunk.values {
+                                    sk_bytes.extend_from_slice(v);
+                                }
+                            }
+                        },
+                        SortKeyEncoding::IFixedLe => match width {
+                            1 => {
+                                for v in &chunk.values {
+                                    sk_bytes.extend_from_slice(&orderkey::i8_to_sort1(v[0] as i8));
+                                }
+                            }
+                            2 => {
+                                for v in &chunk.values {
+                                    let mut a = [0u8; 2];
+                                    a.copy_from_slice(&v[..2]);
+                                    sk_bytes.extend_from_slice(&orderkey::i16_le_to_sort2(a));
+                                }
+                            }
+                            4 => {
+                                for v in &chunk.values {
+                                    let mut a = [0u8; 4];
+                                    a.copy_from_slice(&v[..4]);
+                                    sk_bytes.extend_from_slice(&orderkey::i32_le_to_sort4(a));
+                                }
+                            }
+                            8 => {
+                                for v in &chunk.values {
+                                    let mut a = [0u8; 8];
+                                    a.copy_from_slice(&v[..8]);
+                                    sk_bytes.extend_from_slice(&orderkey::i64_le_to_sort8(a));
+                                }
+                            }
+                            _ => {
+                                for v in &chunk.values {
+                                    sk_bytes.extend_from_slice(v);
+                                }
+                            }
+                        },
+                        SortKeyEncoding::F32Le => {
+                            if width == 4 {
+                                for v in &chunk.values {
+                                    let mut a = [0u8; 4];
+                                    a.copy_from_slice(&v[..4]);
+                                    sk_bytes.extend_from_slice(&orderkey::f32_le_to_sort4(a));
+                                }
+                            } else {
+                                for v in &chunk.values {
+                                    sk_bytes.extend_from_slice(v);
+                                }
+                            }
+                        }
+                        SortKeyEncoding::F64Le => {
+                            if width == 8 {
+                                for v in &chunk.values {
+                                    let mut a = [0u8; 8];
+                                    a.copy_from_slice(&v[..8]);
+                                    sk_bytes.extend_from_slice(&orderkey::f64_le_to_sort8(a));
+                                }
+                            } else {
+                                for v in &chunk.values {
+                                    sk_bytes.extend_from_slice(v);
+                                }
+                            }
+                        }
+                        // Variable encodings are not applicable to fixed layout.
+                        SortKeyEncoding::VarUtf8 | SortKeyEncoding::VarBinary => {
+                            for v in &chunk.values {
+                                sk_bytes.extend_from_slice(v);
+                            }
+                        }
+                    }
+                    let width_bw = width as ByteWidth;
+                    let vsk = ValueSortKeys::Fixed {
+                        width: width_bw,
+                        bytes: sk_bytes.clone(),
+                    };
+                    let hot_threshold = 4096;
+                    let b = Self::build_value_index_from_slices(
+                        |i| {
+                            let a = i * width;
+                            &sk_bytes[a..a + width]
+                        },
+                        chunk.values.len(),
+                        hot_threshold,
+                    );
+                    (Some(vsk), Some(b))
+                }
+                PlannedWriteLayout::Variable => {
+                    // Build var offsets once for sort-key storage
+                    let mut sk_bytes = Vec::new();
+                    let mut offsets: Vec<u32> = Vec::with_capacity(chunk.values.len() + 1);
+                    let mut acc = 0u32;
+                    offsets.push(acc);
+                    for v in &chunk.values {
+                        acc += v.len() as u32;
+                        sk_bytes.extend_from_slice(v);
+                        offsets.push(acc);
+                    }
+                    // Budget guard: avoid duplicating pathologically large single values.
+                    // If any single value exceeds this threshold, skip building value_index
+                    // for this segment to keep the index blob small.
+                    const MAX_VAR_SORTKEY_ENTRY: usize = 64 * 1024; // 64 KiB per entry
+                    if chunk.values.iter().any(|v| v.len() > MAX_VAR_SORTKEY_ENTRY) {
+                        // Skip building value_index for this segment.
+                        (None, None)
+                    } else {
+                        let vsk = ValueSortKeys::Variable {
+                            offsets: offsets.clone(),
+                            bytes: sk_bytes.clone(),
+                        };
+                        let hot_threshold = 4096; // tune later
+                        let b = Self::build_value_index_from_slices(
+                            |i| {
+                                let a = offsets[i] as usize;
+                                let b = offsets[i + 1] as usize;
+                                &sk_bytes[a..b]
+                            },
+                            chunk.values.len(),
+                            hot_threshold,
+                        );
+                        (Some(vsk), Some(b))
+                    }
+                }
             };
-            seg.value_index = Some(value_index);
+            if let (Some(sort_keys), Some(built_value_dirs)) = (sort_keys_opt, built_value_dirs_opt)
+            {
+                let value_index = ValueIndex {
+                    value_order: built_value_dirs
+                        .value_order
+                        .iter()
+                        .copied()
+                        .map(|v| v as IndexEntryCount)
+                        .collect(),
+                    l1_dir: built_value_dirs
+                        .l1_dir
+                        .iter()
+                        .copied()
+                        .map(|v| v as IndexEntryCount)
+                        .collect(),
+                    l2_dirs: built_value_dirs
+                        .l2_dirs
+                        .iter()
+                        .cloned()
+                        .map(|(first_byte, dir257)| ValueDirL2 {
+                            first_byte,
+                            dir257: dir257.into_iter().map(|v| v as IndexEntryCount).collect(),
+                        })
+                        .collect(),
+                    sort_keys,
+                };
+                seg.value_index = Some(value_index);
+            }
 
             // queue writes
             data_puts.push((data_pkey, data_blob));
@@ -323,6 +495,8 @@ impl<P: Pager> ColumnStore<P> {
                 .last()
                 .cloned()
                 .expect("non-empty segment");
+
+            // vmin/vmax already computed from original values above
 
             // update ColumnIndex (newest-first: push_front semantics)
             {
@@ -428,25 +602,29 @@ impl<P: Pager> ColumnStore<P> {
         self.append_many(puts, opts);
     }
 
-    /// Build value_order + l1/l2 directories from in-memory `values`.
+    /// Build value_order + l1/l2 directories from in-memory virtual slices.
+    /// Caller supplies a function that yields the i-th slice (sort key bytes).
     /// `hot_threshold`: promote a first-byte bucket to L2 if its span >= this.
-    fn build_value_index_from_values(
-        values: &[Vec<u8>], // TODO: More efficient input?
+    fn build_value_index_from_slices<'a, F>(
+        slice_at: F,
+        n: usize,
         hot_threshold: usize,
-    ) -> BuiltValueDirs {
-        let n = values.len();
+    ) -> BuiltValueDirs
+    where
+        F: Fn(usize) -> &'a [u8],
+    {
         let mut idx: Vec<u32> = (0..n as u32).collect();
 
-        // Stable sort by raw bytes (lexicographic).
-        idx.sort_by(|&a, &b| values[a as usize].cmp(&values[b as usize]));
+        // Stable sort by provided slice bytes (lexicographic).
+        idx.sort_by(|&a, &b| slice_at(a as usize).cmp(slice_at(b as usize)));
 
         // L1: 257 absolute offsets.
         let mut l1 = vec![0u32; 257];
         let mut cur = 0usize;
         for b0 in 0..256usize {
             while cur < n {
-                let idx_cur = idx[cur] as usize;
-                let v0 = values[idx_cur].first().copied().unwrap_or(0) as usize;
+                let s = slice_at(idx[cur] as usize);
+                let v0 = s.first().copied().unwrap_or(0) as usize;
                 if v0 != b0 {
                     break;
                 }
@@ -466,7 +644,7 @@ impl<P: Pager> ColumnStore<P> {
                 let mut cur2 = start;
                 for b1 in 0..256usize {
                     while cur2 < end {
-                        let s = &values[idx[cur2] as usize];
+                        let s = slice_at(idx[cur2] as usize);
                         let v1 = if s.len() >= 2 { s[1] as usize } else { 0 };
                         if v1 != b1 {
                             break;

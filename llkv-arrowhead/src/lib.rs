@@ -258,10 +258,32 @@ pub fn append_batch<P: llkv_column_map::storage::pager::Pager>(
     map: &ColumnMap,
     mut opts: AppendOptions,
 ) {
+    // Previous behavior appended all columns in one call. To support per-column
+    // sort-key policies, we now append one column at a time, choosing an
+    // appropriate SortKeyEncoding based on Arrow dtype.
     opts.mode = ValueMode::Auto;
-    let puts = batch_to_puts(batch, keys, map);
-    if !puts.is_empty() {
-        store.append_many(puts, opts);
+    for &(col_idx, fid) in &map.cols {
+        let col = &batch.columns()[col_idx];
+        // Determine sort-key encoding
+        let mut col_opts = opts.clone();
+        col_opts.sort_key = match col.data_type() {
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                Some(llkv_column_map::types::SortKeyEncoding::UFixedLe)
+            }
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                Some(llkv_column_map::types::SortKeyEncoding::IFixedLe)
+            }
+            DataType::Float32 => Some(llkv_column_map::types::SortKeyEncoding::F32Le),
+            DataType::Float64 => Some(llkv_column_map::types::SortKeyEncoding::F64Le),
+            DataType::Utf8 | DataType::LargeUtf8 => Some(llkv_column_map::types::SortKeyEncoding::VarUtf8),
+            DataType::Binary | DataType::LargeBinary => Some(llkv_column_map::types::SortKeyEncoding::VarBinary),
+            _ => None,
+        };
+
+        let puts = batch_to_puts(batch, keys, &ColumnMap { cols: vec![(col_idx, fid)] });
+        if !puts.is_empty() {
+            store.append_many(puts, col_opts);
+        }
     }
 }
 

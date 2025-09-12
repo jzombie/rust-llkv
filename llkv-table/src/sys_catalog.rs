@@ -184,6 +184,7 @@ impl<'a> SysCatalog<'a> {
             segment_max_entries: 128_000,
             segment_max_bytes: 16 << 20,
             last_write_wins_in_batch: true,
+            sort_key: None,
         }
     }
 

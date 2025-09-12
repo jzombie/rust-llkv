@@ -7,7 +7,7 @@
 //!
 //! Modes:
 //! - OrderBy::Value  (default): preserves the previous behavior (value-ordered).
-//! - OrderBy::Key               : “natural” logical key order (segment key order).
+//! - OrderBy::Key               : "natural" logical key order (segment key order).
 //!
 //! - Newer/older segments for shadow checks are batch-loaded as IndexSegment
 //!   (no data blobs).
@@ -16,7 +16,7 @@
 //!   of the chosen ordering (value/key).
 
 use crate::bounds::ValueBound;
-use crate::column_index::{IndexSegment, ValueIndex};
+use crate::column_index::{IndexSegment, ValueIndex, ValueSortKeys};
 use crate::layout::{KeyLayout, ValueLayout};
 use crate::storage::pager::{BatchGet, GetResult, Pager};
 use crate::types::{LogicalFieldId, LogicalKeyBytes, PhysicalKey, TypedKind, TypedValue};
@@ -40,7 +40,7 @@ pub enum Direction {
 pub enum OrderBy {
     /// Order by encoded VALUE bytes (old behavior).
     Value,
-    /// Order by LOGICAL KEY bytes (segment’s natural key order).
+    /// Order by LOGICAL KEY bytes (segment's natural key order).
     Key,
 }
 
@@ -382,19 +382,15 @@ struct Node<P: Pager> {
     pos: usize,
     /// Zero-copy value slice (for returning and for frame predicate).
     val: ValueSlice<P::Blob>,
-    /// When present, ordering is by KEY bytes; otherwise by VALUE bytes.
-    key_ord: Option<KeyRef>,
+    /// Ordering bytes (KEY for key-ordered scans; SORT-KEY for value-ordered scans).
+    ord: KeyRef,
     reverse: bool,
 }
 
 impl<P: Pager> Node<P> {
     #[inline(always)]
     fn bytes(&self) -> &[u8] {
-        if let Some(kref) = self.key_ord {
-            kref.as_slice()
-        } else {
-            &self.val.data.as_ref()[self.val.start as usize..self.val.end as usize]
-        }
+        self.ord.as_slice()
     }
 }
 
@@ -425,7 +421,7 @@ impl<P: Pager> Ord for Node<P> {
             return ord;
         }
 
-        // 16-byte tag (hi then lo) — already left-aligned BE so lexicographic
+        // 16-byte tag (hi then lo) -- already left-aligned BE so lexicographic
         ord = if !self.reverse {
             (self.head_tag_hi, self.head_tag_lo).cmp(&(other.head_tag_hi, other.head_tag_lo))
         } else {
@@ -460,17 +456,6 @@ impl<P: Pager> PartialOrd for Node<P> {
     }
 }
 
-/// Build (bucket, 16B tag) from VALUE bytes.
-#[inline(always)]
-fn bucket_and_tag128_from_value_slice<P: Pager>(
-    v: &ValueSlice<P::Blob>,
-    bucket_prefix_len: usize,
-    head_tag_len: usize, // ≤ 16 in current design
-) -> (u16, u64, u64) {
-    let bytes = &v.data.as_ref()[v.start as usize..v.end as usize];
-    bucket_and_tag128_from_bytes(bytes, bucket_prefix_len, head_tag_len)
-}
-
 /// Build (bucket, 16B tag) from KEY bytes with a fast path.
 #[inline(always)]
 fn bucket_and_tag128_bytes_fast(
@@ -485,7 +470,7 @@ fn bucket_and_tag128_bytes_fast(
 fn bucket_and_tag128_from_bytes(
     bytes: &[u8],
     bucket_prefix_len: usize,
-    head_tag_len: usize, // ≤ 16
+    head_tag_len: usize, // <= 16
 ) -> (u16, u64, u64) {
     // bucket = first 2 bytes big-endian; zeros if missing
     let b0 = *bytes.first().unwrap_or(&0) as u16;
@@ -789,17 +774,13 @@ impl<P: Pager> ValueScan<P> {
                 let d = &segs[seg_idx].data;
                 (s, d)
             };
-            let head_row = if by_value {
-                row_pos_at(seg_ref, head_pos)
-            } else {
-                head_pos
-            };
+            let head_row = if by_value { row_pos_at(seg_ref, head_pos) } else { head_pos };
             let val = slice_value::<P>(seg_ref, data_ref, head_row);
 
-            // Ordering fields (bucket/tag) + optional key bytes.
             if by_value {
-                let (bkt, hi, lo) = bucket_and_tag128_from_value_slice::<P>(
-                    &val,
+                let ord_bytes = slice_sort_key(seg_ref, head_row);
+                let (bkt, hi, lo) = bucket_and_tag128_bytes_fast(
+                    ord_bytes,
                     opts.bucket_prefix_len,
                     opts.head_tag_len,
                 );
@@ -811,7 +792,7 @@ impl<P: Pager> ValueScan<P> {
                     seg_idx,
                     pos: head_pos,
                     val,
-                    key_ord: None,
+                    ord: KeyRef::from_slice(ord_bytes),
                     reverse: matches!(opts.dir, Direction::Reverse),
                 });
             } else {
@@ -833,7 +814,7 @@ impl<P: Pager> ValueScan<P> {
                     seg_idx,
                     pos: head_pos,
                     val,
-                    key_ord: Some(KeyRef::from_slice(key_slice)),
+                    ord: KeyRef::from_slice(key_slice),
                     reverse: matches!(opts.dir, Direction::Reverse),
                 });
             }
@@ -1056,11 +1037,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
             ) = {
                 let sc = &self.segs[seg_idx];
 
-                let row_pos = if self.by_value {
-                    row_pos_at(&sc.seg, node.pos)
-                } else {
-                    node.pos
-                };
+                let row_pos = if self.by_value { row_pos_at(&sc.seg, node.pos) } else { node.pos };
 
                 // Borrowed key slice for membership check + eventual emission.
                 let key_slice = KeyLayout::slice_key_by_layout(
@@ -1080,7 +1057,9 @@ impl<P: Pager> Iterator for ValueScan<P> {
                     };
                     let sval = slice_value::<P>(&sc.seg, &sc.data, next_row);
                     let skey_ref = if self.by_value {
-                        None
+                        // for value-ordered, ord bytes are the sort key from the index
+                        let ok = slice_sort_key(&sc.seg, next_row);
+                        Some(KeyRef::from_slice(ok))
                     } else {
                         let ks = KeyLayout::slice_key_by_layout(
                             &sc.seg.logical_key_bytes,
@@ -1114,8 +1093,9 @@ impl<P: Pager> Iterator for ValueScan<P> {
             // Helper to push the next head if present.
             let mut push_next = |np: usize, val: ValueSlice<P::Blob>| {
                 if self.by_value {
-                    let (bkt, hi, lo) = bucket_and_tag128_from_value_slice::<P>(
-                        &val,
+                    let kb = next_key_for_order.expect("prepared sort-key for value-ordered reseed");
+                    let (bkt, hi, lo) = bucket_and_tag128_bytes_fast(
+                        kb.as_slice(),
                         self.bucket_prefix_len,
                         self.head_tag_len,
                     );
@@ -1127,7 +1107,7 @@ impl<P: Pager> Iterator for ValueScan<P> {
                         seg_idx,
                         pos: np,
                         val,
-                        key_ord: None,
+                        ord: kb,
                         reverse: self.reverse,
                     });
                 } else {
@@ -1328,14 +1308,14 @@ fn key_upper_bound(seg: &IndexSegment, probe: &[u8], include_equal: bool) -> usi
 fn lower_bound_by_value<P: Pager>(
     seg: &IndexSegment,
     vix: &ValueIndex,
-    data: &P::Blob,
+    _data: &P::Blob,
     probe: &[u8],
 ) -> usize {
     let (mut lo, mut hi) = l1_l2_window(vix, probe);
     while lo < hi {
         let mid = (lo + hi) >> 1;
         let pos = row_pos_at(seg, mid);
-        let cmp = cmp_value_at::<P>(seg, data, pos, probe);
+        let cmp = cmp_sortkey_at(seg, pos, probe);
         if cmp == Ordering::Less {
             lo = mid + 1;
         } else {
@@ -1349,7 +1329,7 @@ fn lower_bound_by_value<P: Pager>(
 fn upper_bound_by_value<P: Pager>(
     seg: &IndexSegment,
     vix: &ValueIndex,
-    data: &P::Blob,
+    _data: &P::Blob,
     probe: &[u8],
     include_equal: bool,
 ) -> usize {
@@ -1357,7 +1337,7 @@ fn upper_bound_by_value<P: Pager>(
     while lo < hi {
         let mid = (lo + hi) >> 1;
         let pos = row_pos_at(seg, mid);
-        let cmp = cmp_value_at::<P>(seg, data, pos, probe);
+        let cmp = cmp_sortkey_at(seg, pos, probe);
         let go_right = if include_equal {
             cmp != Ordering::Greater
         } else {
@@ -1423,16 +1403,25 @@ fn slice_value<P: Pager>(seg: &IndexSegment, data: &P::Blob, pos: usize) -> Valu
 }
 
 #[inline(always)]
-fn cmp_value_at<P: Pager>(
-    seg: &IndexSegment,
-    data: &P::Blob,
-    pos: usize,
-    probe: &[u8],
-) -> Ordering {
-    let s = slice_value::<P>(seg, data, pos);
-    let a = s.start as usize;
-    let b = s.end as usize;
-    let bytes = &s.data.as_ref()[a..b];
+fn slice_sort_key<'a>(seg: &'a IndexSegment, row_pos: usize) -> &'a [u8] {
+    let vix = seg.value_index.as_ref().expect("value_index required");
+    match &vix.sort_keys {
+        ValueSortKeys::Fixed { width, bytes } => {
+            let w = *width as usize;
+            let a = row_pos * w;
+            &bytes[a..a + w]
+        }
+        ValueSortKeys::Variable { offsets, bytes } => {
+            let a = offsets[row_pos] as usize;
+            let b = offsets[row_pos + 1] as usize;
+            &bytes[a..b]
+        }
+    }
+}
+
+#[inline(always)]
+fn cmp_sortkey_at(seg: &IndexSegment, row_pos: usize, probe: &[u8]) -> Ordering {
+    let bytes = slice_sort_key(seg, row_pos);
     bytes.cmp(probe)
 }
 
@@ -1463,7 +1452,7 @@ fn push_next_keyordered<P: Pager>(
         seg_idx,
         pos,
         val,
-        key_ord: Some(kb),
+        ord: kb,
         reverse,
     });
 }
@@ -1706,6 +1695,7 @@ mod value_scan_tests {
             segment_max_entries: 128,
             segment_max_bytes: 1 << 14,
             last_write_wins_in_batch: true,
+            sort_key: None,
         };
 
         // gen1
@@ -2132,7 +2122,7 @@ mod value_scan_tests {
         let fid: LogicalFieldId = 103;
         seed_three_generations(&store, fid);
 
-        // Window fully inside gen2’s value band (i = 250..260).
+        // Window fully inside gen2's value band (i = 250..260).
         // Under strict FWW, the winners for those keys are in gen1,
         // whose values (1000+i) lie OUTSIDE this window -> expect empty.
         let lo = be64_vec(200_250);

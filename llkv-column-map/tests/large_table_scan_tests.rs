@@ -80,6 +80,7 @@ fn large_table_end_to_end_scans() {
         segment_max_entries: SEGMENT_MAX_ENTRIES,
         segment_max_bytes: SEGMENT_MAX_BYTES,
         last_write_wins_in_batch: true,
+        sort_key: None,
     };
 
     // -------------------------- Build 10 columns --------------------------

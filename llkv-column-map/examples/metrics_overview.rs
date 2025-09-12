@@ -252,6 +252,7 @@ fn main() {
         segment_max_entries: 16_384,
         segment_max_bytes: 2 * 1024 * 1024,
         last_write_wins_in_batch: true,
+        sort_key: None,
     };
 
     // ---------------- Phase 1: fixed-width cols 100 & 101 -------------------

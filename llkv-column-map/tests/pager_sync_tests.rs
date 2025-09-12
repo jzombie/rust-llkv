@@ -72,6 +72,7 @@ fn test_pager_persistence_on_reopen_column_map() {
                 segment_max_entries: 100_000,
                 segment_max_bytes: 32 << 20,
                 last_write_wins_in_batch: true,
+                sort_key: None,
             },
         );
         // store drops here (end of scope)
@@ -125,6 +126,7 @@ fn test_pager_persistence_on_reopen_column_map() {
                 segment_max_entries: 100_000,
                 segment_max_bytes: 32 << 20,
                 last_write_wins_in_batch: true,
+                sort_key: None,
             },
         );
         // store drops here
