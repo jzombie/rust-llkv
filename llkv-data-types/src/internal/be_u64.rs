@@ -27,6 +27,9 @@ impl Codec for BeU64 {
 impl BeU64 {
     /// Decode `src` (concatenated big-endian u64) into `dst` in one pass.
     /// Length must match exactly: `src.len() == dst.len() * 8`.
+    ///
+    /// TODO: Experimental bulk decoder; consider moving into a generic
+    /// codec trait extension and sharing impl across integer codecs.
     #[inline]
     pub fn decode_many_into(dst: &mut [u64], src: &[u8]) -> Result<(), DecodeError> {
         let n = dst.len();
