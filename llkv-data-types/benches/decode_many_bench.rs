@@ -13,6 +13,12 @@ use llkv_data_types::{
     decode_reduce,
 };
 use rand::{Rng, SeedableRng, rngs::StdRng};
+// TODO: Experimental end-to-end bench using column-map scan + decode_reduce.
+use llkv_column_map::ColumnStore;
+use llkv_column_map::storage::pager::MemPager;
+use llkv_column_map::types::{AppendOptions, Put, ValueMode, LogicalFieldId};
+use llkv_column_map::column_store::read_scan::{ValueScanOpts, OrderBy};
+use std::borrow::Cow;
 
 fn make_be_bytes(n: usize, seed: u64) -> (Vec<u8>, Vec<u64>) {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -124,5 +130,66 @@ fn bench_reduce_many_u64(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_reduce_many_u64);
+// TODO: Experimental: seed a column-map store, scan 1,000,000 fixed-width
+// u64 values, and reduce via decode_reduce to validate correctness and gauge
+// end-to-end throughput. Keep sample size small to avoid long runs.
+fn bench_column_map_scan_reduce(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cm_scan_reduce_1M");
+    group.sample_size(10);
+
+    // Build store and seed once (outside the measured loop).
+    let pager = std::sync::Arc::new(MemPager::default());
+    let store = ColumnStore::open(pager);
+    let fid: LogicalFieldId = 4242;
+
+    // Seed 1,000,000 entries: key=u64_be(i), value=u64_be(i)
+    {
+        let mut items: Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)> = Vec::with_capacity(1_000_000);
+        for i in 0u64..1_000_000u64 {
+            let k = i.to_be_bytes().to_vec();
+            let v = i.to_be_bytes().to_vec();
+            items.push((Cow::Owned(k), Cow::Owned(v)));
+        }
+        store.append_many(
+            vec![Put { field_id: fid, items }],
+            AppendOptions { mode: ValueMode::ForceFixed(8), ..Default::default() },
+        );
+    }
+
+    // Expected sum: sum 0..1_000_000-1
+    let expected_sum: u128 = (0u128..1_000_000u128).sum();
+
+    // Bench: scan full range and decode_reduce to sum.
+    group.bench_function("scan_sum_decode_reduce", |b| {
+        // Create a fresh iterator in the setup (not measured), then consume it inside the timing closure.
+        b.iter_batched(
+            || {
+                store
+                    .scan_values_lww(
+                        fid,
+                        ValueScanOpts { order_by: OrderBy::Key, ..Default::default() },
+                    )
+                    .expect("scan iterator")
+            },
+            |it| {
+                // Hold ValueSlices to keep blobs alive; then feed &[u8] slices.
+                let vals: Vec<_> = it.map(|x| x.value).collect();
+                let inputs = vals.iter().map(|v| v.as_slice());
+                let (sum, cnt) = decode_reduce(inputs, &DataType::U64, 0u128, |acc, v| match v {
+                    DecodedValue::U64(x) => acc + (x as u128),
+                    _ => unreachable!(),
+                })
+                .expect("reduce");
+                assert_eq!(cnt, 1_000_000);
+                assert_eq!(sum, expected_sum);
+                black_box(sum)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_reduce_many_u64, bench_column_map_scan_reduce);
 criterion_main!(benches);
