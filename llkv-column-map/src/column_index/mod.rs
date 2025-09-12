@@ -38,6 +38,8 @@ pub use manifest::*;
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct ColumnIndex {
     pub field_id: LogicalFieldId,
+    /// Per-column value ordering policy for building sort keys.
+    pub value_order: crate::types::ValueOrderPolicy,
     pub segments: Vec<index_segment::IndexSegmentRef>, // newest-first
 }
 
@@ -110,6 +112,7 @@ mod tests {
         // ----- ColumnIndex blobs (newest-first segments) -----
         let col_100_index = ColumnIndex {
             field_id: 100,
+            value_order: crate::types::ValueOrderPolicy::Raw,
             segments: vec![IndexSegmentRef {
                 index_physical_key: idx_100,
                 data_physical_key: data_100,
@@ -122,6 +125,7 @@ mod tests {
         };
         let col_200_index = ColumnIndex {
             field_id: 200,
+            value_order: crate::types::ValueOrderPolicy::Raw,
             segments: vec![IndexSegmentRef {
                 index_physical_key: idx_200,
                 data_physical_key: data_200,
@@ -349,6 +353,7 @@ mod tests {
         // ColumnIndex in-memory (no IO needed) — populate logical bounds here
         let col = ColumnIndex {
             field_id: 7,
+            value_order: crate::types::ValueOrderPolicy::Raw,
             segments: vec![
                 IndexSegmentRef {
                     index_physical_key: p_c,

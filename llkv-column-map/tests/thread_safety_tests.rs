@@ -59,7 +59,7 @@ fn concurrent_appends_are_thread_safe() {
                 segment_max_entries: 64,
                 segment_max_bytes: 8 * 1024,
                 last_write_wins_in_batch: true,
-                sort_key: None,
+                value_order: None,
             };
 
             store_cloned.append_many(

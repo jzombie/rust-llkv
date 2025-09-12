@@ -84,7 +84,7 @@ fn seed_strings_as_keys(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n: u
         segment_max_entries: 8192,
         segment_max_bytes: 1 << 20,
         last_write_wins_in_batch: true,
-        sort_key: None,
+        value_order: None,
     };
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -184,7 +184,7 @@ fn seed_strings_as_values(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n:
         segment_max_entries: 8192,
         segment_max_bytes: 1 << 20,
         last_write_wins_in_batch: true,
-        sort_key: None,
+        value_order: None,
     };
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -292,7 +292,7 @@ fn seed_keys_varlen_max_total(
         segment_max_entries: 8192,
         segment_max_bytes: 1 << 20,
         last_write_wins_in_batch: true,
-        sort_key: None,
+        value_order: None,
     };
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -398,7 +398,7 @@ fn seed_vals_varlen_max_total(
         segment_max_entries: 8192,
         segment_max_bytes: 1 << 20,
         last_write_wins_in_batch: true,
-        sort_key: None,
+        value_order: None,
     };
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -832,7 +832,7 @@ fn seed_ints_as_keys_fixed(
         segment_max_entries: 8192,
         segment_max_bytes: 1 << 20,
         last_write_wins_in_batch: true,
-        sort_key: None,
+        value_order: None,
     };
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -936,7 +936,7 @@ fn seed_ints_as_values_fixed(
         segment_max_entries: 8192,
         segment_max_bytes: 1 << 20,
         last_write_wins_in_batch: true,
-        sort_key: None,
+        value_order: None,
     };
 
     let mut rng = StdRng::seed_from_u64(seed);

@@ -1695,7 +1695,7 @@ mod value_scan_tests {
             segment_max_entries: 128,
             segment_max_bytes: 1 << 14,
             last_write_wins_in_batch: true,
-            sort_key: None,
+            value_order: None,
         };
 
         // gen1

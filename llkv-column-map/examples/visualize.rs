@@ -281,7 +281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 segment_max_entries: 512,
                 segment_max_bytes: 64 * 1024,
                 last_write_wins_in_batch: true,
-                sort_key: None,
+                value_order: None,
             },
         );
         let dt = t_batch.elapsed();

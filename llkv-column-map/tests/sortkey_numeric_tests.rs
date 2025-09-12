@@ -5,7 +5,7 @@ use std::sync::Arc;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ValueScanOpts};
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, SortKeyEncoding, ValueMode};
+use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, ValueMode, ValueOrderPolicy};
 
 fn le64(v: u64) -> Vec<u8> { v.to_le_bytes().to_vec() }
 fn lei64(v: i64) -> Vec<u8> { v.to_le_bytes().to_vec() }
@@ -20,7 +20,7 @@ fn value_sorted_u64_le_with_sort_keys() {
     let fid: LogicalFieldId = 42_001;
 
     // Two segments with overlapping ranges
-    let opts = AppendOptions { mode: ValueMode::ForceFixed(8), sort_key: Some(SortKeyEncoding::UFixedLe), ..Default::default() };
+    let opts = AppendOptions { mode: ValueMode::ForceFixed(8), value_order: Some(ValueOrderPolicy::UnsignedLe), ..Default::default() };
     let mut items = Vec::new();
     for i in 0..100u64 { items.push((Cow::Owned(key_bytes(i)), Cow::Owned(le64(1000 - i)))); }
     store.append_many(vec![Put { field_id: fid, items }], opts.clone());
@@ -49,7 +49,7 @@ fn value_sorted_i64_le_with_sort_keys() {
     let p = Arc::new(MemPager::default());
     let store = ColumnStore::open(p);
     let fid: LogicalFieldId = 42_002;
-    let opts = AppendOptions { mode: ValueMode::ForceFixed(8), sort_key: Some(SortKeyEncoding::IFixedLe), ..Default::default() };
+    let opts = AppendOptions { mode: ValueMode::ForceFixed(8), value_order: Some(ValueOrderPolicy::SignedLe), ..Default::default() };
     let vals = [-5i64, -1, 0, 1, 100, -1000, i64::MIN+1, i64::MAX];
     let mut items = Vec::new();
     for (i, v) in vals.iter().enumerate() { items.push((Cow::Owned(key_bytes(i as u64)), Cow::Owned(lei64(*v)))); }
@@ -67,7 +67,7 @@ fn value_sorted_f64_le_with_sort_keys_monotonic() {
     let p = Arc::new(MemPager::default());
     let store = ColumnStore::open(p);
     let fid: LogicalFieldId = 42_003;
-    let opts = AppendOptions { mode: ValueMode::ForceFixed(8), sort_key: Some(SortKeyEncoding::F64Le), ..Default::default() };
+    let opts = AppendOptions { mode: ValueMode::ForceFixed(8), value_order: Some(ValueOrderPolicy::F64Le), ..Default::default() };
     let vals = [f64::NAN, -f64::INFINITY, -0.0, 0.0, 1.5, f64::INFINITY];
     let mut items = Vec::new();
     for (i, v) in vals.iter().enumerate() { items.push((Cow::Owned(key_bytes(i as u64)), Cow::Owned(lef64(*v)))); }

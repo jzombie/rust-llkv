@@ -266,17 +266,18 @@ pub fn append_batch<P: llkv_column_map::storage::pager::Pager>(
         let col = &batch.columns()[col_idx];
         // Determine sort-key encoding
         let mut col_opts = opts.clone();
-        col_opts.sort_key = match col.data_type() {
+        col_opts.value_order = match col.data_type() {
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                Some(llkv_column_map::types::SortKeyEncoding::UFixedLe)
+                Some(llkv_column_map::types::ValueOrderPolicy::UnsignedLe)
             }
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                Some(llkv_column_map::types::SortKeyEncoding::IFixedLe)
+                Some(llkv_column_map::types::ValueOrderPolicy::SignedLe)
             }
-            DataType::Float32 => Some(llkv_column_map::types::SortKeyEncoding::F32Le),
-            DataType::Float64 => Some(llkv_column_map::types::SortKeyEncoding::F64Le),
-            DataType::Utf8 | DataType::LargeUtf8 => Some(llkv_column_map::types::SortKeyEncoding::VarUtf8),
-            DataType::Binary | DataType::LargeBinary => Some(llkv_column_map::types::SortKeyEncoding::VarBinary),
+            DataType::Float32 => Some(llkv_column_map::types::ValueOrderPolicy::F32Le),
+            DataType::Float64 => Some(llkv_column_map::types::ValueOrderPolicy::F64Le),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+                Some(llkv_column_map::types::ValueOrderPolicy::Raw)
+            }
             _ => None,
         };
 

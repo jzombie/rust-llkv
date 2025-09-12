@@ -263,7 +263,7 @@ mod tests {
             segment_max_entries: 200, // small to force multiple segments
             segment_max_bytes: 2_000, // also keep segments small
             last_write_wins_in_batch: true,
-            sort_key: None,
+            value_order: None,
         };
 
         store.append_many(
@@ -455,7 +455,7 @@ mod tests {
                 segment_max_entries: 10_000,
                 segment_max_bytes: 1_000_000,
                 last_write_wins_in_batch: true,
-                sort_key: None,
+                value_order: None,
             },
         );
 
@@ -478,7 +478,7 @@ mod tests {
                 segment_max_entries: 10_000,
                 segment_max_bytes: 1_000_000,
                 last_write_wins_in_batch: true,
-                sort_key: None,
+                value_order: None,
             },
         );
 
@@ -606,7 +606,7 @@ mod tests {
                 segment_max_entries: 1_000_000,
                 segment_max_bytes: usize::MAX,
                 last_write_wins_in_batch: true,
-                sort_key: None,
+                value_order: None,
             },
         );
 

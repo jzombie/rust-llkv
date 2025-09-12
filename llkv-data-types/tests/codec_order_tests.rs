@@ -37,7 +37,7 @@ fn append_one_put(
         segment_max_entries: 100_000,
         segment_max_bytes: 32 << 20,
         last_write_wins_in_batch: true,
-        sort_key: None,
+        value_order: None,
     };
     store.append_many(puts, opts);
 }

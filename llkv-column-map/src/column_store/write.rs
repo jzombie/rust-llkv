@@ -7,7 +7,7 @@ use crate::column_index::{
 use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::types::{
     AppendOptions, ByteLen, ByteWidth, IndexEntryCount, LogicalFieldId, LogicalKeyBytes,
-    PhysicalKey, Put, SortKeyEncoding, TypedKind, TypedValue, ValueMode,
+    PhysicalKey, Put, TypedKind, TypedValue, ValueMode, ValueOrderPolicy,
 };
 use crate::codecs::orderkey;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -240,6 +240,7 @@ impl<P: Pager> ColumnStore<P> {
                     let col_index_pkey = self.pager.alloc_many(1).unwrap()[0];
                     let col_index = ColumnIndex {
                         field_id: *fid,
+                        value_order: opts.value_order.unwrap_or(ValueOrderPolicy::Raw),
                         segments: Vec::new(),
                     };
                     cache.insert(*fid, (col_index_pkey, col_index));
@@ -248,6 +249,21 @@ impl<P: Pager> ColumnStore<P> {
                         column_index_physical_key: col_index_pkey,
                     });
                     need_manifest_update = true;
+                }
+            }
+        }
+
+        // Enforce per-column policy consistency for columns already present.
+        if let Some(policy_new) = opts.value_order {
+            let cache = self.colindex_cache.read().unwrap();
+            for chunk in &planned_chunks {
+                if let Some((_, ci)) = cache.get(&chunk.field_id) {
+                    if ci.value_order != policy_new {
+                        panic!(
+                            "AppendOptions.value_order mismatch for field {}: existing={:?}, new={:?}",
+                            chunk.field_id, ci.value_order, policy_new
+                        );
+                    }
                 }
             }
         }
@@ -286,19 +302,23 @@ impl<P: Pager> ColumnStore<P> {
             let (vmin, vmax) = ValueBound::min_max_bounds(&chunk.values);
 
             // Compute sort keys + value index from the in-memory values for this segment.
-            // Baseline: sort keys are equal to value bytes (payload-cold ordering ready).
+            // Determine per-column policy from ColumnIndex.
+            let col_policy = {
+                let cache = self.colindex_cache.read().unwrap();
+                let (_, ci) = cache.get(&chunk.field_id).expect("column index present");
+                ci.value_order
+            };
             let (sort_keys_opt, built_value_dirs_opt) = match &chunk.layout {
                 PlannedWriteLayout::Fixed { width } => {
                     let width = *width as usize;
-                    // Build per-row sort-key bytes according to opts.sort_key
                     let mut sk_bytes = Vec::with_capacity(chunk.values.len() * width);
-                    match opts.sort_key.unwrap_or(SortKeyEncoding::Raw) {
-                        SortKeyEncoding::Raw => {
+                    match col_policy {
+                        ValueOrderPolicy::Raw => {
                             for v in &chunk.values {
                                 sk_bytes.extend_from_slice(v);
                             }
                         }
-                        SortKeyEncoding::UFixedLe => match width {
+                        ValueOrderPolicy::UnsignedLe => match width {
                             1 => {
                                 for v in &chunk.values {
                                     sk_bytes.extend_from_slice(&orderkey::u8_to_sort1(v[0]));
@@ -332,7 +352,7 @@ impl<P: Pager> ColumnStore<P> {
                                 }
                             }
                         },
-                        SortKeyEncoding::IFixedLe => match width {
+                        ValueOrderPolicy::SignedLe => match width {
                             1 => {
                                 for v in &chunk.values {
                                     sk_bytes.extend_from_slice(&orderkey::i8_to_sort1(v[0] as i8));
@@ -365,7 +385,7 @@ impl<P: Pager> ColumnStore<P> {
                                 }
                             }
                         },
-                        SortKeyEncoding::F32Le => {
+                        ValueOrderPolicy::F32Le => {
                             if width == 4 {
                                 for v in &chunk.values {
                                     let mut a = [0u8; 4];
@@ -378,7 +398,7 @@ impl<P: Pager> ColumnStore<P> {
                                 }
                             }
                         }
-                        SortKeyEncoding::F64Le => {
+                        ValueOrderPolicy::F64Le => {
                             if width == 8 {
                                 for v in &chunk.values {
                                     let mut a = [0u8; 8];
@@ -389,12 +409,6 @@ impl<P: Pager> ColumnStore<P> {
                                 for v in &chunk.values {
                                     sk_bytes.extend_from_slice(v);
                                 }
-                            }
-                        }
-                        // Variable encodings are not applicable to fixed layout.
-                        SortKeyEncoding::VarUtf8 | SortKeyEncoding::VarBinary => {
-                            for v in &chunk.values {
-                                sk_bytes.extend_from_slice(v);
                             }
                         }
                     }

@@ -159,10 +159,10 @@ pub struct AppendOptions {
     pub segment_max_entries: usize,
     pub segment_max_bytes: usize, // data payload budget per segment
     pub last_write_wins_in_batch: bool,
-    /// Optional sort-key encoding policy applied to this append call.
-    /// If set, the writer builds index-only sort keys using this encoding
-    /// (payload bytes remain unchanged, typically LE). If None, raw bytes are used.
-    pub sort_key: Option<SortKeyEncoding>,
+    /// Optional per-column value ordering policy for this append.
+    /// If the column exists, this must match its stored policy or the append panics.
+    /// If the column is created by this append, this sets the policy; default is Raw.
+    pub value_order: Option<ValueOrderPolicy>,
 }
 
 impl Default for AppendOptions {
@@ -172,26 +172,22 @@ impl Default for AppendOptions {
             segment_max_entries: u16::MAX as usize,
             segment_max_bytes: 8 * 1024 * 1024,
             last_write_wins_in_batch: true,
-            sort_key: None,
+            value_order: None,
         }
     }
 }
 
-/// How to encode per-row order-defining sort keys in the index.
-#[derive(Clone, Copy, Debug)]
-pub enum SortKeyEncoding {
-    /// Use raw value bytes.
+/// Per-column value ordering policy used to build index-only sort keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub enum ValueOrderPolicy {
+    /// Raw bytewise lex order (variable-width, or unspecified).
     Raw,
-    /// Fixed-width unsigned integer in LE payload; build BE-ordered 1/2/4/8B keys.
-    UFixedLe,
-    /// Fixed-width signed integer in LE payload; bias sign and build 1/2/4/8B keys.
-    IFixedLe,
-    /// f32 in LE payload; total-order mapping to BE-lex keys.
+    /// Unsigned integers in little-endian payload (1/2/4/8 bytes).
+    UnsignedLe,
+    /// Signed two's-complement integers in little-endian payload (1/2/4/8 bytes).
+    SignedLe,
+    /// 32-bit float in little-endian payload.
     F32Le,
-    /// f64 in LE payload; total-order mapping to BE-lex keys.
+    /// 64-bit float in little-endian payload.
     F64Le,
-    /// Variable UTF-8 bytes (raw).
-    VarUtf8,
-    /// Variable binary bytes (raw).
-    VarBinary,
 }

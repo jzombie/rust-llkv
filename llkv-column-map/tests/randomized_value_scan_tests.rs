@@ -69,7 +69,7 @@ fn append_random_column(
         segment_max_entries,
         segment_max_bytes: 32 << 20,
         last_write_wins_in_batch: true,
-        sort_key: None,
+        value_order: None,
     };
 
     let mut rng = Xs::new(seed);
@@ -225,7 +225,7 @@ fn randomized_two_generation_lww_correctness() {
         segment_max_entries,
         segment_max_bytes: 32 << 20,
         last_write_wins_in_batch: true,
-        sort_key: None,
+        value_order: None,
     };
 
     let mut winners = base.clone(); // start with base, then overwrite keys we touch
