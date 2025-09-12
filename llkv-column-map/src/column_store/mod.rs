@@ -1,5 +1,6 @@
 // High-level append/query API on top of pager + index modules.
 use crate::column_index::{Bootstrap, ColumnIndex, IndexSegment, Manifest};
+use crate::constants::BOOTSTRAP_PKEY;
 use crate::layout::{IndexLayoutInfo, KeyLayout, ValueLayout};
 use crate::storage::{
     StorageKind, StorageNode,
@@ -9,7 +10,7 @@ use crate::types::{ByteOffset, ByteWidth, LogicalFieldId, PhysicalKey, TypedKind
 use rustc_hash::FxHashMap;
 use std::fmt::Write;
 use std::sync::{
-    RwLock,
+    Arc, Mutex, RwLock,
     atomic::{AtomicUsize, Ordering},
 };
 pub mod introspect;
@@ -18,14 +19,18 @@ pub mod read;
 pub mod read_scan;
 pub mod write;
 
-pub struct ColumnStore<'p, P: Pager> {
-    pager: &'p P,
+pub struct ColumnStore<P: Pager> {
+    pager: Arc<P>,
     bootstrap_key: PhysicalKey,
     manifest_key: PhysicalKey,
     // Interior mutability for concurrent reads/writes.
     manifest: RwLock<Manifest>,
     // field_id -> (column_index_pkey, decoded)
     colindex_cache: RwLock<FxHashMap<LogicalFieldId, (PhysicalKey, ColumnIndex)>>,
+
+    // serialize writers to keep ColumnIndex/Manifest consistent
+    append_lock: Mutex<()>,
+
     // pager-hit metrics (counts only) via atomics
     io_batches: AtomicUsize,
     io_get_raw_ops: AtomicUsize,
@@ -35,87 +40,80 @@ pub struct ColumnStore<'p, P: Pager> {
     io_free_ops: AtomicUsize,
 }
 
-impl<'p, P: Pager> ColumnStore<'p, P> {
-    // TODO: Don't expose publicly; use common `open` interface linked to pager`
-    // Create fresh store (bootstrap->manifest, empty manifest).
-    pub fn init_empty(pager: &'p P) -> Self {
-        let bootstrap_key: PhysicalKey = 0;
-        let manifest_key = pager.alloc_many(1).unwrap()[0];
-        let manifest = Manifest {
-            columns: Vec::new(),
+impl<P: Pager> ColumnStore<P> {
+    /// Idempotent: open an existing store, or create bootstrap + empty manifest.
+    /// Safe to call from multiple threads/processes that share the same Pager.
+    pub fn open(pager: Arc<P>) -> Self {
+        let manifest_key = {
+            let resp = pager
+                .batch_get(&[BatchGet::Typed {
+                    key: BOOTSTRAP_PKEY,
+                    kind: TypedKind::Bootstrap,
+                }])
+                .expect("pager get bootstrap");
+
+            match &resp[0] {
+                // Existing store
+                GetResult::Typed {
+                    value: TypedValue::Bootstrap(b),
+                    ..
+                } => b.manifest_physical_key,
+
+                // Fresh store
+                GetResult::Missing { .. } => {
+                    // Ask the pager for a fresh Manifest key.
+                    let mani = pager.alloc_many(1).expect("alloc manifest key")[0];
+
+                    let empty = Manifest {
+                        columns: Vec::new(),
+                    };
+
+                    // Write Manifest first, then Bootstrap pointing to it.
+                    pager
+                        .batch_put(&[
+                            BatchPut::Typed {
+                                key: mani,
+                                value: TypedValue::Manifest(empty.clone()),
+                            },
+                            BatchPut::Typed {
+                                key: BOOTSTRAP_PKEY, // 0
+                                value: TypedValue::Bootstrap(Bootstrap {
+                                    manifest_physical_key: mani,
+                                }),
+                            },
+                        ])
+                        .expect("write bootstrap+manifest");
+
+                    mani
+                }
+
+                _ => panic!("corrupted bootstrap at key {}", BOOTSTRAP_PKEY),
+            }
         };
 
-        // Write Manifest and Bootstrap in a single batch.
-        // (Not counted in ColumnStore metrics since the store isn't constructed yet.)
-        let _ = pager.batch_put(&[
-            BatchPut::Typed {
-                key: manifest_key,
-                value: TypedValue::Manifest(manifest.clone()),
-            },
-            BatchPut::Typed {
-                key: bootstrap_key,
-                value: TypedValue::Bootstrap(Bootstrap {
-                    manifest_physical_key: manifest_key,
-                }),
-            },
-        ]);
-
-        ColumnStore {
-            pager,
-            bootstrap_key,
-            manifest_key,
-            manifest: RwLock::new(manifest),
-            colindex_cache: RwLock::new(FxHashMap::with_hasher(Default::default())),
-            io_batches: AtomicUsize::new(0),
-            io_get_raw_ops: AtomicUsize::new(0),
-            io_get_typed_ops: AtomicUsize::new(0),
-            io_put_raw_ops: AtomicUsize::new(0),
-            io_put_typed_ops: AtomicUsize::new(0),
-            io_free_ops: AtomicUsize::new(0),
-        }
-    }
-
-    // Open existing store (bootstrap(0) -> manifest).
-    pub fn open(pager: &'p P) -> Self {
-        let bootstrap_key: PhysicalKey = 0;
-
-        // Get Bootstrap (not counted; ColumnStore not constructed yet)
-        let resp = pager
-            .batch_get(&[BatchGet::Typed {
-                key: bootstrap_key,
-                kind: TypedKind::Bootstrap,
-            }])
-            .unwrap_or_default();
-        let boot = match &resp[0] {
-            GetResult::Typed {
-                value: TypedValue::Bootstrap(b),
-                ..
-            } => b.clone(),
-            _ => panic!("missing bootstrap at key 0"),
-        };
-        let manifest_key = boot.manifest_physical_key;
-
-        // Get Manifest (not counted; ColumnStore not constructed yet)
+        // Load manifest as you already do…
         let resp = pager
             .batch_get(&[BatchGet::Typed {
                 key: manifest_key,
                 kind: TypedKind::Manifest,
             }])
-            .unwrap_or_default();
+            .expect("pager get manifest");
         let manifest = match &resp[0] {
             GetResult::Typed {
                 value: TypedValue::Manifest(m),
                 ..
             } => m.clone(),
-            _ => panic!("missing manifest"),
+            GetResult::Missing { .. } => panic!("manifest missing at {}", manifest_key),
+            _ => panic!("invalid manifest at {}", manifest_key),
         };
 
         ColumnStore {
             pager,
-            bootstrap_key,
+            bootstrap_key: BOOTSTRAP_PKEY,
             manifest_key,
             manifest: RwLock::new(manifest),
-            colindex_cache: RwLock::new(FxHashMap::with_hasher(Default::default())),
+            colindex_cache: RwLock::new(FxHashMap::default()),
+            append_lock: Mutex::new(()),
             io_batches: AtomicUsize::new(0),
             io_get_raw_ops: AtomicUsize::new(0),
             io_get_typed_ops: AtomicUsize::new(0),
@@ -216,8 +214,8 @@ mod tests {
 
     #[test]
     fn put_get_fixed_auto() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
 
         let put = Put {
             field_id: 10,
@@ -249,8 +247,8 @@ mod tests {
 
     #[test]
     fn put_get_variable_auto_with_chunking() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
 
         // Values of different sizes force variable layout.
         let mut items = Vec::new();
@@ -310,8 +308,8 @@ mod tests {
 
     #[test]
     fn force_fixed_validation() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let items = vec![
             (b"a".into(), vec![1u8; 4].into()),
             (b"b".into(), vec![2u8; 4].into()),
@@ -331,8 +329,8 @@ mod tests {
     }
     #[test]
     fn last_write_wins_true_dedups_within_batch() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
 
         // Three items, with a duplicate for key "k": last is "ZZ".
         let fid = 42;
@@ -377,8 +375,8 @@ mod tests {
 
     #[test]
     fn last_write_wins_false_keeps_dups_within_batch() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
 
         // Same three items; duplicates for "k" are KEPT.
         let fid = 43;
@@ -429,8 +427,8 @@ mod tests {
 
     #[test]
     fn key_based_segment_pruning_uses_min_max_and_is_inclusive() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid = 1234;
 
         // Two disjoint segments for same column:
@@ -514,8 +512,8 @@ mod tests {
 
     #[test]
     fn value_min_max_recorded_fixed() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid = 5050;
 
         // fixed 4B values with easy min/max
@@ -552,8 +550,8 @@ mod tests {
 
     #[test]
     fn value_min_max_recorded_variable() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid = 6060;
 
         // variable-length values; lexicographic min/max over raw bytes
@@ -589,8 +587,8 @@ mod tests {
     fn value_bounds_do_not_duplicate_huge_value() {
         use crate::constants::VALUE_BOUND_MAX;
 
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid = 7070;
 
         // Single huge value (1 MiB)
@@ -645,8 +643,8 @@ mod tests {
 
     #[test]
     fn delete_many_and_get() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid = 101;
 
         // 1. Write some initial data

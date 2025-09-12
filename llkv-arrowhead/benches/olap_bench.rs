@@ -50,12 +50,12 @@ fn create_test_batch(num_rows: usize) -> (RecordBatch, Arc<Schema>) {
 }
 
 /// Sets up the store and ingests the test data.
-fn setup_store_with_data(num_rows: usize) -> (ColumnStore<'static, MemPager>, RecordBatch) {
+fn setup_store_with_data(num_rows: usize) -> (ColumnStore<MemPager>, RecordBatch) {
     let (batch, _) = create_test_batch(num_rows);
 
     // Use 'static lifetime for the pager in the benchmark context.
-    let pager = Box::leak(Box::new(MemPager::new()));
-    let store = ColumnStore::init_empty(pager);
+    let pager = Arc::new(MemPager::new());
+    let store = ColumnStore::open(pager);
 
     let key_spec = KeySpec::U64Be { col_idx: 0 };
     let column_map = ColumnMap {
@@ -91,8 +91,8 @@ fn bench_ingest(c: &mut Criterion) {
         .sample_size(10) // Set the number of samples to 10
         .bench_function("1_ingest_1m_rows", |b| {
             b.iter(|| {
-                let pager = MemPager::new();
-                let store = ColumnStore::init_empty(&pager);
+                let pager = Arc::new(MemPager::new());
+                let store = ColumnStore::open(pager);
                 let puts = batch_to_puts(black_box(&batch), &key_spec, &column_map);
                 store.append_many(black_box(puts), Default::default());
             })

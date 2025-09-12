@@ -10,7 +10,7 @@ use std::collections::hash_map::Entry;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-impl<'p, P: Pager> ColumnStore<'p, P> {
+impl<P: Pager> ColumnStore<P> {
     // TODO: Return `Result` type
     /// Convenience: shared-keyset API that uses the single core.
     pub fn get_many_projected<'a>(

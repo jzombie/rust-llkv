@@ -11,6 +11,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
+use std::sync::Arc;
 
 use crossbeam_channel as xchan;
 
@@ -106,20 +107,16 @@ pub enum CmError {
 pub struct Table {
     /// Leaked pager to satisfy ColumnStore's lifetime without
     /// gymnastics.
-    store: ColumnStore<'static, MemPager>,
+    store: ColumnStore<MemPager>,
     cfg: TableCfg,
     /// 32-bit table id used to namespace logical field ids.
     table_id: u32,
 }
 
 impl Table {
-    /// Create a new in-memory table.
-    ///
-    /// `table_id` namespaces logical field ids as (table_id << 32) | column_id.
     pub fn new(table_id: u32, cfg: TableCfg) -> Self {
-        // TODO: Don't box leak
-        let pager = Box::leak(Box::new(MemPager::default()));
-        let store = ColumnStore::init_empty(pager);
+        let pager = Arc::new(MemPager::default());
+        let store = ColumnStore::open(pager);
         Self {
             store,
             cfg,
@@ -803,7 +800,7 @@ impl Table {
     }
 
     /// Access to the underlying store for power users.
-    pub fn store(&self) -> &ColumnStore<'_, MemPager> {
+    pub fn store(&self) -> &ColumnStore<MemPager> {
         &self.store
     }
 }

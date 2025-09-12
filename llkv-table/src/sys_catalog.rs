@@ -166,12 +166,13 @@ fn map_coltype_to_dtype(t: &ColType) -> DataType {
 
 // ----- SysCatalog -----
 
+// TODO: Use generic pager, not MemPager!
 pub struct SysCatalog<'a> {
-    store: &'a ColumnStore<'static, llkv_column_map::storage::pager::MemPager>,
+    store: &'a ColumnStore<llkv_column_map::storage::pager::MemPager>,
 }
 
 impl<'a> SysCatalog<'a> {
-    pub fn new(store: &'a ColumnStore<'static, llkv_column_map::storage::pager::MemPager>) -> Self {
+    pub fn new(store: &'a ColumnStore<llkv_column_map::storage::pager::MemPager>) -> Self {
         Self { store }
     }
 

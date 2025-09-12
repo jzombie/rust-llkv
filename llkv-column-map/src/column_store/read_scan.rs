@@ -513,7 +513,7 @@ fn bucket_and_tag128_from_bytes(
 }
 
 // TODO: Rename * from `scan_values_*` to `scan_*` since this can do key or value based scanning
-impl<P: Pager> super::ColumnStore<'_, P> {
+impl<P: Pager> super::ColumnStore<P> {
     /// LWW-enforced scan over [lo, hi) in the chosen domain (value/key).
     pub fn scan_values_lww(
         &self,
@@ -553,7 +553,7 @@ pub enum ScanError {
 
 impl<P: Pager> ValueScan<P> {
     pub fn new(
-        col: &super::ColumnStore<'_, P>,
+        col: &super::ColumnStore<P>,
         field_id: LogicalFieldId,
         opts: ValueScanOpts<'_>,
         policy: ConflictPolicy,
@@ -1565,7 +1565,7 @@ fn upper_bound_min<'a>(a: Bound<&'a [u8]>, b: Bound<&'a [u8]>) -> Bound<&'a [u8]
 
 // =================== pagination: opts-driven entry points =================
 
-impl<P: Pager> super::ColumnStore<'_, P> {
+impl<P: Pager> super::ColumnStore<P> {
     /// Keyset pagination with LWW over key or value order, designed for stateless API calls.
     ///
     /// This helper function creates a new scan iterator on every call, making it suitable for
@@ -1751,8 +1751,8 @@ mod value_scan_tests {
     /// End-to-end: forward scan over full range, assert LWW winners and uniqueness.
     #[test]
     fn scan_values_lww_forward_big_multi_segment() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p); // bootstrap+manifest, empty store
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p); // bootstrap+manifest, empty store
         let fid: LogicalFieldId = 42;
 
         seed_three_generations(&store, fid);
@@ -1803,8 +1803,8 @@ mod value_scan_tests {
     /// Narrow value window: ensure [lo, hi) (value-space) is honored.
     #[test]
     fn scan_values_lww_value_window_slice() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid: LogicalFieldId = 7;
         seed_three_generations(&store, fid);
 
@@ -1855,8 +1855,8 @@ mod value_scan_tests {
     /// Reverse scan order contract (LWW).
     #[test]
     fn scan_values_lww_reverse_order_contract() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid: LogicalFieldId = 99;
         seed_three_generations(&store, fid);
 
@@ -1891,8 +1891,8 @@ mod value_scan_tests {
     /// FWW semantics: oldest wins.
     #[test]
     fn scan_values_fww_forward_contract() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid: LogicalFieldId = 5;
         seed_three_generations(&store, fid);
 
@@ -1934,8 +1934,8 @@ mod value_scan_tests {
     /// Frame predicate/windowing contract (on values).
     #[test]
     fn scan_values_lww_frame_predicate_contract() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid: LogicalFieldId = 12;
         seed_three_generations(&store, fid);
 
@@ -1976,8 +1976,8 @@ mod value_scan_tests {
 
     #[test]
     fn scan_values_fww_reverse_order_contract() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid: LogicalFieldId = 77;
         seed_three_generations(&store, fid);
 
@@ -2034,8 +2034,8 @@ mod value_scan_tests {
 
     #[test]
     fn scan_values_lww_reverse_windowed_gen3() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid: LogicalFieldId = 101;
         seed_three_generations(&store, fid);
 
@@ -2083,8 +2083,8 @@ mod value_scan_tests {
 
     #[test]
     fn scan_values_fww_forward_windowed_gen1_positive() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid: LogicalFieldId = 102;
         seed_three_generations(&store, fid);
 
@@ -2127,8 +2127,8 @@ mod value_scan_tests {
 
     #[test]
     fn scan_values_fww_forward_windowed_gen2_strict_suppression() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid: LogicalFieldId = 103;
         seed_three_generations(&store, fid);
 
@@ -2163,8 +2163,8 @@ mod value_scan_tests {
 
     #[test]
     fn scan_values_fww_reverse_windowed_gen1() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid: LogicalFieldId = 104;
         seed_three_generations(&store, fid);
 
@@ -2211,8 +2211,8 @@ mod value_scan_tests {
     /// LWW + key-ordered, reverse: keys must be descending.
     #[test]
     fn scan_values_lww_key_order_reverse() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid: LogicalFieldId = 4343;
 
         seed_three_generations(&store, fid);
@@ -2260,8 +2260,8 @@ mod value_scan_tests {
     // Uses last key of each page as the cursor for the next page.
     #[test]
     fn scan_values_lww_pagination_key_forward() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid: LogicalFieldId = 551;
 
         seed_three_generations(&store, fid);
@@ -2314,8 +2314,8 @@ mod value_scan_tests {
     // Uses last key of each page as the upper bound for the next page.
     #[test]
     fn scan_values_lww_pagination_key_reverse() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid: LogicalFieldId = 552;
 
         seed_three_generations(&store, fid);
@@ -2368,8 +2368,8 @@ mod value_scan_tests {
     // Cursor is the last VALUE bytes of each page.
     #[test]
     fn scan_values_lww_pagination_value_forward() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid: LogicalFieldId = 661;
 
         seed_three_generations(&store, fid);
@@ -2426,8 +2426,8 @@ mod value_scan_tests {
     // Cursor is the last VALUE bytes of each page.
     #[test]
     fn scan_values_lww_pagination_value_reverse() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
         let fid: LogicalFieldId = 662;
 
         seed_three_generations(&store, fid);
