@@ -1,5 +1,10 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
-use llkv_data_types::{be_u64_decode_many_into, be_u64_reduce_many_concat};
+use llkv_data_types::{
+    be_u64_decode_many_into,
+    be_u64_reduce_many_concat,
+    be_u64_reduce_streaming,
+    be_u64_reduce_chunked_with_buf,
+};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 fn make_be_bytes(n: usize, seed: u64) -> (Vec<u8>, Vec<u64>) {
@@ -75,6 +80,10 @@ fn bench_reduce_many_u64(c: &mut Criterion) {
         let (sum_many, cnt) = be_u64_reduce_many_concat(&src, 0u128, |acc, x| acc + (x as u128)).unwrap();
         assert_eq!(cnt, n);
         assert_eq!(sum_many, sum_one, "reduce_many must match one_by_one");
+        // streaming correctness
+        let (sum_stream, cnt2) = be_u64_reduce_streaming(&src, 0u128, |acc, x| acc + (x as u128)).unwrap();
+        assert_eq!(cnt2, n);
+        assert_eq!(sum_stream, sum_one, "streaming reduce must match one_by_one");
 
         group.bench_with_input(BenchmarkId::new("sum_one_by_one", n), &n, |b, &_n| {
             b.iter(|| {
@@ -98,6 +107,24 @@ fn bench_reduce_many_u64(c: &mut Criterion) {
                     black_box(acc)
                 },
                 BatchSize::SmallInput,
+            );
+        });
+
+        group.bench_with_input(BenchmarkId::new("sum_streaming", n), &n, |b, &_n| {
+            b.iter(|| {
+                let (acc, _cnt) = be_u64_reduce_streaming(&src, 0u128, |acc, x| acc + (x as u128)).unwrap();
+                black_box(acc)
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("sum_chunked_8192", n), &n, |b, &_n| {
+            b.iter_batched(
+                || vec![0u64; 8192],
+                |mut buf| {
+                    let (acc, _cnt) = be_u64_reduce_chunked_with_buf(&src, 0u128, |acc, x| acc + (x as u128), &mut buf).unwrap();
+                    black_box(acc)
+                },
+                BatchSize::LargeInput,
             );
         });
     }

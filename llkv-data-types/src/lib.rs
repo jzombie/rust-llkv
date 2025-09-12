@@ -190,6 +190,64 @@ where
     Ok((acc, n))
 }
 
+/// Stream a reduce over concatenated BE u64 bytes without an intermediate buffer.
+/// Returns (accumulator, count). `src.len()` must be a multiple of 8.
+///
+/// TODO: Experimental; if useful, consider exposing a generic streaming
+/// decoder-reducer for fixed-width integers.
+pub fn be_u64_reduce_streaming<T, F>(src: &[u8], init: T, mut f: F) -> Result<(T, usize), DecodeError>
+where
+    F: FnMut(T, u64) -> T,
+{
+    if src.len() % 8 != 0 { return Err(DecodeError::NotEnoughData); }
+    let n = src.len() / 8;
+    let mut acc = init;
+    let mut off = 0usize;
+    for _ in 0..n {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&src[off..off+8]);
+        let x = u64::from_be_bytes(bytes);
+        acc = f(acc, x);
+        off += 8;
+    }
+    Ok((acc, n))
+}
+
+/// Chunked reduce over concatenated BE u64 using a reusable decode buffer.
+/// Decodes up to `buf.len()` elements at a time, then folds them.
+/// Returns (accumulator, count). `src.len()` must be a multiple of 8.
+///
+/// TODO: Experimental; evaluate against streaming for various cache sizes and
+/// consider a single-pass fused variant if mapping stores into an output column.
+pub fn be_u64_reduce_chunked_with_buf<T, F>(
+    src: &[u8],
+    init: T,
+    mut f: F,
+    buf: &mut [u64],
+) -> Result<(T, usize), DecodeError>
+where
+    F: FnMut(T, u64) -> T,
+{
+    if src.len() % 8 != 0 { return Err(DecodeError::NotEnoughData); }
+    if buf.is_empty() { return Ok((init, 0)); }
+    let total = src.len() / 8;
+    let mut acc = init;
+    let mut done = 0usize;
+    let mut off_bytes = 0usize;
+    while done < total {
+        let take = core::cmp::min(buf.len(), total - done);
+        let bytes_len = take * 8;
+        let chunk = &src[off_bytes..off_bytes + bytes_len];
+        be_u64_decode_many_into(&mut buf[..take], chunk)?;
+        for &x in &buf[..take] {
+            acc = f(acc, x);
+        }
+        done += take;
+        off_bytes += bytes_len;
+    }
+    Ok((acc, total))
+}
+
 /// Value-returning reducer over decoded values.
 /// Streams items, calling `f(acc, item)` each step.
 /// Returns `(accumulator, count)`.
