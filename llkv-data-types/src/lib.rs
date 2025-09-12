@@ -195,6 +195,7 @@ where
 ///
 /// TODO: Experimental; if useful, consider exposing a generic streaming
 /// decoder-reducer for fixed-width integers.
+#[inline(always)]
 pub fn be_u64_reduce_streaming<T, F>(src: &[u8], init: T, mut f: F) -> Result<(T, usize), DecodeError>
 where
     F: FnMut(T, u64) -> T,
@@ -246,6 +247,38 @@ where
         off_bytes += bytes_len;
     }
     Ok((acc, total))
+}
+
+/// Streaming reduce with unsafe unaligned reads (fast path).
+/// Decodes using `read_unaligned` and `u64::from_be` to avoid per-item copies.
+/// Returns (accumulator, count). `src.len()` must be a multiple of 8.
+///
+/// TODO: Experimental fast path. Guard with a feature if kept; add similar
+/// implementations for other integer widths.
+#[inline(always)]
+pub fn be_u64_reduce_streaming_unaligned<T, F>(
+    src: &[u8],
+    init: T,
+    mut f: F,
+) -> Result<(T, usize), DecodeError>
+where
+    F: FnMut(T, u64) -> T,
+{
+    if src.len() % 8 != 0 {
+        return Err(DecodeError::NotEnoughData);
+    }
+    let n = src.len() / 8;
+    let mut acc = init;
+    let mut p = src.as_ptr();
+    for _ in 0..n {
+        // SAFETY: We only advance within bounds in 8-byte steps; alignment is not required.
+        let word = unsafe { (p as *const u64).read_unaligned() };
+        let x = u64::from_be(word);
+        acc = f(acc, x);
+        // SAFETY: pointer arithmetic within checked bounds above.
+        p = unsafe { p.add(8) };
+    }
+    Ok((acc, n))
 }
 
 /// Value-returning reducer over decoded values.
