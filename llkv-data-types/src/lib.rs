@@ -1,5 +1,5 @@
 mod internal;
-use crate::internal::{BeU8, BeU16, BeU32, BeU64, Bool, Codec, EncodeInto, Utf8CaseFold};
+use crate::internal::{BeI64, BeU8, BeU16, BeU32, BeU64, Bool, Codec, EncodeInto, Utf8CaseFold};
 
 pub mod errors;
 pub use errors::*;
@@ -19,6 +19,7 @@ pub enum DataType {
     U16,
     U32,
     U64,
+    I64,
     Bool,
     Bytes,
 }
@@ -34,6 +35,7 @@ pub enum DecodedValue<'a> {
     U16(u16),
     U32(u32),
     U64(u64),
+    I64(i64),
     Bool(bool),
     Bytes(&'a [u8]),
 }
@@ -87,6 +89,14 @@ pub fn encode_value<'a>(
             expected: *expected,
             got: "U64",
         }),
+        (DataType::I64, DecodedValue::I64(x)) => {
+            x.encode_into(out);
+            Ok(())
+        }
+        (expected, DecodedValue::I64(_)) => Err(EncodeError::TypeMismatch {
+            expected: *expected,
+            got: "I64",
+        }),
         (DataType::Bool, DecodedValue::Bool(b)) => {
             b.encode_into(out);
             Ok(())
@@ -128,6 +138,7 @@ pub fn decode_value<'a>(bytes: &'a [u8], dtype: &DataType) -> Option<DecodedValu
         DataType::U16 => BeU16::decode(bytes).ok().map(DecodedValue::U16),
         DataType::U32 => BeU32::decode(bytes).ok().map(DecodedValue::U32),
         DataType::U64 => BeU64::decode(bytes).ok().map(DecodedValue::U64),
+        DataType::I64 => BeI64::decode(bytes).ok().map(DecodedValue::I64),
         DataType::Bool => Bool::decode(bytes).ok().map(DecodedValue::Bool),
         DataType::Bytes => internal::Bytes::decode_borrowed(bytes).map(DecodedValue::Bytes),
     }
@@ -183,6 +194,13 @@ where
             for b in inputs {
                 let x = BeU64::decode(b)?;
                 acc = f(acc, DecodedValue::U64(x));
+                n += 1;
+            }
+        }
+        DataType::I64 => {
+            for b in inputs {
+                let x = BeI64::decode(b)?;
+                acc = f(acc, DecodedValue::I64(x));
                 n += 1;
             }
         }
@@ -411,6 +429,69 @@ mod tests {
                 DecodedValue::U64(30)
             ]
         );
+    }
+
+    /* ---------------- I64 tests ---------------- */
+
+    #[test]
+    fn test_i64_encode_decode_roundtrip() {
+        let dtype = DataType::I64;
+
+        let mut buf = Vec::new();
+        (-12345i64).encode_into(&mut buf);
+
+        let dv = decode_value(&buf, &dtype).unwrap();
+        assert_eq!(dv, DecodedValue::I64(-12345));
+    }
+
+    #[test]
+    fn test_decode_reduce_i64_collects_values_and_order() {
+        let dtype = DataType::I64;
+        // Include negatives, zero, positives, and some wide-range values
+        let values = [i64::MIN + 1, -10, -1, 0, 1, 10, 123456789, i64::MAX];
+
+        let encoded: Vec<Vec<u8>> = values
+            .iter()
+            .map(|v| {
+                let mut buf = Vec::new();
+                v.encode_into(&mut buf);
+                buf
+            })
+            .collect();
+
+        // Check decode_reduce path
+        let slices: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
+        let (decoded, count): (Vec<DecodedValue<'_>>, usize) =
+            decode_reduce(slices.iter().copied(), &dtype, Vec::new(), |mut acc, dv| {
+                acc.push(dv);
+                acc
+            })
+            .unwrap();
+
+        assert_eq!(count, values.len());
+        assert_eq!(
+            decoded,
+            values
+                .iter()
+                .copied()
+                .map(DecodedValue::I64)
+                .collect::<Vec<_>>()
+        );
+
+        // Also verify lex order == numeric order for the encoded bytes
+        let mut bytes_sorted = encoded.clone();
+        bytes_sorted.sort(); // bytewise lex
+        let decoded_sorted: Vec<i64> = bytes_sorted
+            .iter()
+            .map(|b| match decode_value(b, &dtype).unwrap() {
+                DecodedValue::I64(x) => x,
+                _ => unreachable!(),
+            })
+            .collect();
+
+        let mut numeric_sorted = values.to_vec();
+        numeric_sorted.sort();
+        assert_eq!(decoded_sorted, numeric_sorted);
     }
 
     /* ---------------- Bool tests ---------------- */

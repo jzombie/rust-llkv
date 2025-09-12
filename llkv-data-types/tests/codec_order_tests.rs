@@ -194,3 +194,61 @@ fn test_bytes_order_roundtrip() {
     ];
     assert_eq!(got, expect);
 }
+
+/// `I64` should order by numeric value (including negatives) and round-trip
+/// using the public API only. Encoded bytes must compare lexicographically
+/// in the same order as the numeric order.
+/// NOTE: The seed order below is intentionally *not* the expected order.
+#[test]
+fn test_i64_order_roundtrip() {
+    let (store, fid) = setup_store();
+
+    // Deliberately scrambled: negatives, zero, positives, extremes.
+    let nums: [i64; 9] = [
+        42,
+        -1,
+        i64::MAX,
+        -10,
+        0,
+        i64::MIN + 1, // avoid MIN overflow in abs
+        123_456_789,
+        -1_000_000,
+        1,
+    ];
+
+    // Build DecodedValue<'static> list.
+    let vals: Vec<DecodedValue<'static>> = nums.iter().copied().map(DecodedValue::I64).collect();
+
+    // Sanity: explicit expected numeric ascending order; assert seed != expect.
+    let expect: Vec<i64> = vec![
+        i64::MIN + 1,
+        -1_000_000,
+        -10,
+        -1,
+        0,
+        1,
+        42,
+        123_456_789,
+        i64::MAX,
+    ];
+    assert_ne!(nums.to_vec(), expect, "seed order must differ");
+
+    let items = build_items_from_decoded(DataType::I64, &vals);
+    append_one_put(&store, fid, items);
+
+    // Value-ordered scan (ascending)
+    let frames = scan_value_frames(&store, fid);
+
+    // Decode via public API.
+    let mut got: Vec<i64> = Vec::new();
+    for bytes in frames {
+        let dv = decode_value(bytes.as_slice(), &DataType::I64).expect("decode i64");
+        if let DecodedValue::I64(x) = dv {
+            got.push(x);
+        } else {
+            panic!("expected DecodedValue::I64");
+        }
+    }
+
+    assert_eq!(got, expect);
+}

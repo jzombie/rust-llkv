@@ -50,6 +50,9 @@ pub use bytes::*;
 pub mod codec;
 pub use codec::*;
 
+pub mod be_i64;
+pub use be_i64::*;
+
 pub mod be_u8;
 pub use be_u8::*;
 
@@ -91,6 +94,14 @@ impl EncodeInto for String {
     #[inline]
     fn encode_into(&self, dst: &mut Vec<u8>) {
         Utf8CaseFold::encode_into(dst, self.as_str()).unwrap();
+    }
+}
+
+// i64 → BeI64
+impl EncodeInto for i64 {
+    #[inline]
+    fn encode_into(&self, dst: &mut Vec<u8>) {
+        BeI64::encode_into(dst, self).unwrap();
     }
 }
 
