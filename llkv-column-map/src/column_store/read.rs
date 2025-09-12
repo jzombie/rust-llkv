@@ -192,12 +192,18 @@ impl<P: Pager> ColumnStore<P> {
         seg_order.sort_by_key(|pk| *seg_rank.get(pk).unwrap_or(&usize::MAX));
 
         // -------- single batched load for segments AND data blobs -------------
+        // Use decoded-segment cache first; only fetch misses.
+        let mut seg_map: FxHashMap<PhysicalKey, IndexSegment> = FxHashMap::default();
         let mut gets: Vec<BatchGet> = Vec::with_capacity(seg_order.len() * 2);
         for pk in &seg_order {
-            gets.push(BatchGet::Typed {
-                key: *pk,
-                kind: TypedKind::IndexSegment,
-            });
+            if let Some(seg_arc) = self.seg_cache_get(*pk) {
+                seg_map.insert(*pk, seg_arc.as_ref().clone());
+            } else {
+                gets.push(BatchGet::Typed {
+                    key: *pk,
+                    kind: TypedKind::IndexSegment,
+                });
+            }
         }
         let mut seen_data: FxHashSet<PhysicalKey> = FxHashSet::default();
         for pk in &seg_order {
@@ -207,8 +213,6 @@ impl<P: Pager> ColumnStore<P> {
             }
         }
         let resp = self.do_gets(gets);
-
-        let mut seg_map: FxHashMap<PhysicalKey, IndexSegment> = FxHashMap::default();
         let mut data_map: FxHashMap<PhysicalKey, P::Blob> = FxHashMap::default();
         for gr in resp {
             match gr {
@@ -216,6 +220,8 @@ impl<P: Pager> ColumnStore<P> {
                     key,
                     value: TypedValue::IndexSegment(seg),
                 } => {
+                    // Insert into map and populate cache for reuse across calls.
+                    self.seg_cache_put(key, &seg);
                     seg_map.insert(key, seg);
                 }
                 GetResult::Raw { key, bytes } => {

@@ -663,29 +663,44 @@ impl<P: Pager> ValueScan<P> {
         }
 
         // ---- build gets: active (index+data) + shadow (index-only) ----
+        // Use segment cache to satisfy any decoded IndexSegments we already have.
         let mut gets: Vec<BatchGet> =
             Vec::with_capacity(act_refs.len() * 2 + shadow_refs_all.len());
         let mut active_index_pks = FxHashSet::default();
         let mut active_data_pks = FxHashSet::default();
+        let mut seg_map: FxHashMap<PhysicalKey, IndexSegment> = FxHashMap::default();
+        let mut shadow_seg_map: FxHashMap<PhysicalKey, IndexSegment> = FxHashMap::default();
+
+        // Active segments: try cache first for index segment; always fetch data blob.
         for r in &act_refs {
             active_index_pks.insert(r.index_physical_key);
             active_data_pks.insert(r.data_physical_key);
-            gets.push(BatchGet::Typed {
-                key: r.index_physical_key,
-                kind: TypedKind::IndexSegment,
-            });
+
+            if let Some(seg_arc) = col.seg_cache_get(r.index_physical_key) {
+                seg_map.insert(r.index_physical_key, seg_arc.as_ref().clone());
+            } else {
+                gets.push(BatchGet::Typed {
+                    key: r.index_physical_key,
+                    kind: TypedKind::IndexSegment,
+                });
+            }
             gets.push(BatchGet::Raw {
                 key: r.data_physical_key,
             });
         }
+        // Shadow segments: only index, skip actives, and try cache first.
         {
             let mut seen = FxHashSet::default();
             for rf in &shadow_refs_all {
                 if seen.insert(rf.pk) && !active_index_pks.contains(&rf.pk) {
-                    gets.push(BatchGet::Typed {
-                        key: rf.pk,
-                        kind: TypedKind::IndexSegment,
-                    });
+                    if let Some(seg_arc) = col.seg_cache_get(rf.pk) {
+                        shadow_seg_map.insert(rf.pk, seg_arc.as_ref().clone());
+                    } else {
+                        gets.push(BatchGet::Typed {
+                            key: rf.pk,
+                            kind: TypedKind::IndexSegment,
+                        });
+                    }
                 }
             }
         }
@@ -693,9 +708,7 @@ impl<P: Pager> ValueScan<P> {
         // ---- fetch everything in one go ----
         let mut resp = col.do_gets(gets);
 
-        let mut seg_map: FxHashMap<PhysicalKey, IndexSegment> = FxHashMap::default();
         let mut data_map: FxHashMap<PhysicalKey, P::Blob> = FxHashMap::default();
-        let mut shadow_seg_map: FxHashMap<PhysicalKey, IndexSegment> = FxHashMap::default();
 
         for gr in resp.drain(..) {
             match gr {
@@ -704,8 +717,11 @@ impl<P: Pager> ValueScan<P> {
                     value: TypedValue::IndexSegment(seg),
                 } => {
                     if active_index_pks.contains(&key) {
+                        // Populate cache and local map for active.
+                        col.seg_cache_put(key, &seg);
                         seg_map.insert(key, seg);
                     } else {
+                        col.seg_cache_put(key, &seg);
                         shadow_seg_map.insert(key, seg);
                     }
                 }

@@ -17,6 +17,7 @@ pub mod introspect;
 pub mod metrics;
 pub mod read;
 pub mod read_scan;
+mod seg_cache;
 pub mod write;
 
 pub struct ColumnStore<P: Pager> {
@@ -38,9 +39,15 @@ pub struct ColumnStore<P: Pager> {
     io_put_raw_ops: AtomicUsize,
     io_put_typed_ops: AtomicUsize,
     io_free_ops: AtomicUsize,
+
+    // Tiny decoded-segment LRU (typed IndexSegment blobs only; data blobs not cached here).
+    // Disabled by default; enabled via SEG_CACHE_ENABLED const below.
+    seg_cache: RwLock<Option<seg_cache::SegLru>>,
 }
 
 impl<P: Pager> ColumnStore<P> {
+    // Toggle for the decoded IndexSegment cache. Set to true to enable.
+    const SEG_CACHE_ENABLED: bool = false;
     /// Idempotent: open an existing store, or create bootstrap + empty manifest.
     /// Safe to call from multiple threads/processes that share the same Pager.
     pub fn open(pager: Arc<P>) -> Self {
@@ -120,6 +127,12 @@ impl<P: Pager> ColumnStore<P> {
             io_put_raw_ops: AtomicUsize::new(0),
             io_put_typed_ops: AtomicUsize::new(0),
             io_free_ops: AtomicUsize::new(0),
+            // Only construct when enabled (None keeps it off the hot path).
+            seg_cache: RwLock::new(if Self::SEG_CACHE_ENABLED {
+                Some(seg_cache::SegLru::new(256))
+            } else {
+                None
+            }),
         }
     }
 
@@ -162,6 +175,37 @@ impl<P: Pager> ColumnStore<P> {
         }
 
         self.pager.batch_get(&gets).unwrap_or_default()
+    }
+
+    // ------- decoded segment cache helpers (typed IndexSegment only) --------
+    #[inline]
+    fn seg_cache_get(&self, key: PhysicalKey) -> Option<Arc<crate::column_index::IndexSegment>> {
+        if !Self::SEG_CACHE_ENABLED {
+            return None;
+        }
+        // Write lock because our SegLru.get mutates MRU order.
+        let mut guard = self.seg_cache.write().unwrap();
+        if let Some(cache) = guard.as_mut() {
+            let hit = cache.get(&key);
+            if hit.is_some() {
+                // Treat a cache hit as a logical typed access for metrics parity.
+                self.io_get_typed_ops.fetch_add(1, Ordering::Relaxed);
+            }
+            hit
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn seg_cache_put(&self, key: PhysicalKey, seg: &crate::column_index::IndexSegment) {
+        if !Self::SEG_CACHE_ENABLED {
+            return;
+        }
+        let mut guard = self.seg_cache.write().unwrap();
+        if let Some(cache) = guard.as_mut() {
+            cache.put(key, Arc::new(seg.clone()));
+        }
     }
 
     // TODO: Implement with GC
