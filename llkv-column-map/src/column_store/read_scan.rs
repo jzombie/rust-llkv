@@ -120,8 +120,8 @@ struct SegCtx<P: Pager> {
     // prefiltered domination candidates
     /// Indices into `self.segs` that dominate this segment (active, index+data loaded).
     dominators_active: Vec<usize>,
-    /// Shadow (index-only) segments that dominate this segment (physical keys).
-    dominators_shadow: Vec<PhysicalKey>,
+    /// Shadow (index-only) segments that dominate this segment, with cached bounds.
+    dominators_shadow: Vec<ShadowBound>,
 }
 
 #[inline]
@@ -162,6 +162,13 @@ impl KeyRef {
 struct ShadowRef {
     pk: PhysicalKey,
     rank: usize,
+}
+
+/// Precomputed shadow segment bounds for fast per-iteration pruning.
+struct ShadowBound {
+    pk: PhysicalKey,
+    min: KeyRef,
+    max: KeyRef,
 }
 
 // TODO: Rename to `ColumnScan`?
@@ -912,7 +919,7 @@ impl<P: Pager> ValueScan<P> {
                 self.segs[i].min_key.as_slice(),
                 self.segs[i].max_key.as_slice(),
             );
-            let mut acc: Vec<PhysicalKey> = Vec::new();
+            let mut acc: Vec<ShadowBound> = Vec::new();
 
             let rank_iter: Box<dyn Iterator<Item = usize>> = match self.policy {
                 ConflictPolicy::LWW => Box::new(0..ri), // newer ranks only
@@ -922,7 +929,7 @@ impl<P: Pager> ValueScan<P> {
             for r in rank_iter {
                 for rf in &self.shadow_by_rank[r] {
                     if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
-                        // Compute shadow key span once here (cheap).
+                        // Compute shadow key span once here (cheap) and cache.
                         let min_j = KeyLayout::slice_key_by_layout(
                             &seg.logical_key_bytes,
                             &seg.key_layout,
@@ -934,7 +941,11 @@ impl<P: Pager> ValueScan<P> {
                             seg.n_entries as usize - 1,
                         );
                         if !(max_i < min_j || min_i > max_j) {
-                            acc.push(rf.pk);
+                            acc.push(ShadowBound {
+                                pk: rf.pk,
+                                min: KeyRef::from_slice(min_j),
+                                max: KeyRef::from_slice(max_j),
+                            });
                         }
                     }
                 }
@@ -968,19 +979,16 @@ impl<P: Pager> ValueScan<P> {
             }
         }
 
-        // 2) Shadow dominators (index-only, preloaded).
-        for pk in &sc.dominators_shadow {
-            if let Some(seg) = self.shadow_seg_map.get(pk) {
-                if !Self::key_within_seg_bounds(seg, key) {
-                    continue;
-                }
-
-                // persisted Bloom prefilter
+        // 2) Shadow dominators (index-only, preloaded): bounds -> bloom -> probe.
+        for sb in &sc.dominators_shadow {
+            // Fast bounds with cached min/max.
+            if key < sb.min.as_slice() || key > sb.max.as_slice() {
+                continue;
+            }
+            if let Some(seg) = self.shadow_seg_map.get(&sb.pk) {
                 if !seg.key_bloom.check(key) {
                     continue;
                 }
-
-                // precise probe
                 if Self::key_in_index(seg, key) {
                     return true;
                 }
@@ -1000,18 +1008,6 @@ impl<P: Pager> ValueScan<P> {
         )
         .is_some()
     }
-
-    /// Fast bound check using borrowed min/max from the segment.
-    #[inline]
-    fn key_within_seg_bounds(seg: &IndexSegment, key: &[u8]) -> bool {
-        let min = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);
-        let max = KeyLayout::slice_key_by_layout(
-            &seg.logical_key_bytes,
-            &seg.key_layout,
-            seg.n_entries as usize - 1,
-        );
-        !(key < min || key > max)
-    }
 }
 
 impl<P: Pager> Iterator for ValueScan<P> {
@@ -1021,7 +1017,10 @@ impl<P: Pager> Iterator for ValueScan<P> {
         if self.halted {
             return None;
         }
-
+        // Pop the best head from the radix-PQ, check frame predicate, apply
+        // conflict policy (shadow checks), reseed the segment head, and either
+        // yield the current row or skip it and continue. Loop until a row is
+        // accepted or PQ is exhausted.
         loop {
             let node = self.pq.pop(self.reverse)?;
             let seg_idx = node.seg_idx;
@@ -1429,11 +1428,21 @@ fn cmp_value_at<P: Pager>(
     pos: usize,
     probe: &[u8],
 ) -> Ordering {
-    let s = slice_value::<P>(seg, data, pos);
-    let a = s.start as usize;
-    let b = s.end as usize;
-    let bytes = &s.data.as_ref()[a..b];
-    bytes.cmp(probe)
+    match &seg.value_layout {
+        ValueLayout::FixedWidth { width } => {
+            let w = *width as usize;
+            let a = pos * w;
+            let b = a + w;
+            let bytes = &data.as_ref()[a..b];
+            bytes.cmp(probe)
+        }
+        ValueLayout::Variable { value_offsets } => {
+            let a = value_offsets[pos] as usize;
+            let b = value_offsets[pos + 1] as usize;
+            let bytes = &data.as_ref()[a..b];
+            bytes.cmp(probe)
+        }
+    }
 }
 
 // --------- hot-path specializations & cold helper ----------
