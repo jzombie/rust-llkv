@@ -24,3 +24,7 @@ harness = false
 [[bench]]
 name = "math_bench"
 harness = false
+
+[[bench]]
+name = "decode_many_bench"
+harness = false

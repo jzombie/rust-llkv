@@ -160,6 +160,15 @@ pub fn decode_value<'a>(bytes: &'a [u8], dtype: &DataType) -> Option<DecodedValu
     }
 }
 
+// -------------------- Public batch helpers for benches/consumers --------------------
+
+/// Decode concatenated big-endian u64 values into `dst` in a single pass.
+/// `src.len()` must equal `dst.len() * 8`.
+#[inline]
+pub fn be_u64_decode_many_into(dst: &mut [u64], src: &[u8]) -> Result<(), DecodeError> {
+    internal::BeU64::decode_many_into(dst, src)
+}
+
 /// Value-returning reducer over decoded values.
 /// Streams items, calling `f(acc, item)` each step.
 /// Returns `(accumulator, count)`.

@@ -24,6 +24,27 @@ impl Codec for BeU64 {
     }
 }
 
+impl BeU64 {
+    /// Decode `src` (concatenated big-endian u64) into `dst` in one pass.
+    /// Length must match exactly: `src.len() == dst.len() * 8`.
+    #[inline]
+    pub fn decode_many_into(dst: &mut [u64], src: &[u8]) -> Result<(), DecodeError> {
+        let n = dst.len();
+        if src.len() != n.saturating_mul(8) {
+            return Err(DecodeError::NotEnoughData);
+        }
+        let mut off = 0usize;
+        for out in dst.iter_mut() {
+            // Safe: we checked bounds above.
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&src[off..off + 8]);
+            *out = u64::from_be_bytes(bytes);
+            off += 8;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
