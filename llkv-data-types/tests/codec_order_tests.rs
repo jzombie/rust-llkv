@@ -251,3 +251,42 @@ fn test_i64_order_roundtrip() {
 
     assert_eq!(got, expect);
 }
+
+/// `CategoryId` should order by numeric value (u32) and round-trip
+/// using the public API only. Encoded bytes must compare lexicographically
+/// in the same order as numeric order.
+/// NOTE: The seed order below is intentionally *not* the expected order.
+#[test]
+fn test_categoryid_order_roundtrip() {
+    let (store, fid) = setup_store();
+
+    // Deliberately scrambled
+    let cats: [u32; 7] = [42, 0, u32::MAX, 7, 1, 999_999, 100];
+
+    // Build DecodedValue<'static> list.
+    let vals: Vec<DecodedValue<'static>> =
+        cats.iter().copied().map(DecodedValue::CategoryId).collect();
+
+    // Sanity: explicit expected numeric ascending order; assert seed != expect.
+    let expect: Vec<u32> = vec![0, 1, 7, 42, 100, 999_999, u32::MAX];
+    assert_ne!(cats.to_vec(), expect, "seed order must differ");
+
+    let items = build_items_from_decoded(DataType::CategoryId, &vals);
+    append_one_put(&store, fid, items);
+
+    // Value-ordered scan (ascending)
+    let frames = scan_value_frames(&store, fid);
+
+    // Decode via public API.
+    let mut got: Vec<u32> = Vec::new();
+    for bytes in frames {
+        let dv = decode_value(bytes.as_slice(), &DataType::CategoryId).expect("decode categoryid");
+        if let DecodedValue::CategoryId(x) = dv {
+            got.push(x);
+        } else {
+            panic!("expected DecodedValue::CategoryId");
+        }
+    }
+
+    assert_eq!(got, expect);
+}

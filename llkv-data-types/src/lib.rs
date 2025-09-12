@@ -4,8 +4,6 @@ use crate::internal::{BeI64, BeU8, BeU16, BeU32, BeU64, Bool, Codec, EncodeInto,
 pub mod errors;
 pub use errors::*;
 
-// TODO: Add category type
-
 // --- Public-Facing Metadata Enums ---
 
 /// A tag representing the physical data type for a piece of metadata.
@@ -22,6 +20,7 @@ pub enum DataType {
     I64,
     Bool,
     Bytes,
+    CategoryId,
 }
 
 /// A generic enum to hold any possible value decoded from storage.
@@ -38,6 +37,7 @@ pub enum DecodedValue<'a> {
     I64(i64),
     Bool(bool),
     Bytes(&'a [u8]),
+    CategoryId(u32),
 }
 
 /// Encode `value` into `out` using `dtype`.
@@ -120,6 +120,14 @@ pub fn encode_value<'a>(
             expected: *expected,
             got: "Bytes",
         }),
+        (DataType::CategoryId, DecodedValue::CategoryId(x)) => {
+            BeU32::encode_into(out, &x).ok();
+            Ok(())
+        }
+        (expected, DecodedValue::CategoryId(_)) => Err(EncodeError::TypeMismatch {
+            expected: *expected,
+            got: "CategoryId",
+        }),
     }
 }
 
@@ -148,6 +156,7 @@ pub fn decode_value<'a>(bytes: &'a [u8], dtype: &DataType) -> Option<DecodedValu
         DataType::I64 => BeI64::decode(bytes).ok().map(DecodedValue::I64),
         DataType::Bool => Bool::decode(bytes).ok().map(DecodedValue::Bool),
         DataType::Bytes => internal::Bytes::decode_borrowed(bytes).map(DecodedValue::Bytes),
+        DataType::CategoryId => BeU32::decode(bytes).ok().map(DecodedValue::CategoryId),
     }
 }
 
@@ -222,6 +231,13 @@ where
             for b in inputs {
                 let x = internal::Bytes::decode_borrowed(b).ok_or(DecodeError::InvalidFormat)?;
                 acc = f(acc, DecodedValue::Bytes(x));
+                n += 1;
+            }
+        }
+        DataType::CategoryId => {
+            for b in inputs {
+                let x = BeU32::decode(b)?;
+                acc = f(acc, DecodedValue::CategoryId(x));
                 n += 1;
             }
         }
@@ -552,5 +568,18 @@ mod tests {
         for dv in collected {
             assert_eq!(dv, DecodedValue::Bytes(&payload[..]));
         }
+    }
+
+    /* ---------------- CategoryId tests ---------------- */
+
+    #[test]
+    fn test_categoryid_encode_decode_roundtrip() {
+        let dtype = DataType::CategoryId;
+
+        let mut buf = Vec::new();
+        encode_value(DecodedValue::CategoryId(42), &dtype, &mut buf).unwrap();
+
+        let dv = decode_value(&buf, &dtype).unwrap();
+        assert_eq!(dv, DecodedValue::CategoryId(42));
     }
 }
