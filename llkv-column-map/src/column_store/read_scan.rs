@@ -1255,48 +1255,78 @@ impl<P: Pager> Iterator for ValueScan<P> {
             let mut push_next = |np: usize, val: ValueSlice<P::Blob>| {
                 if self.by_value {
                     // Compute ord bytes for next head: tags if present, else mapped LE payload per policy.
-                    let use_tags = self.segs[seg_idx]
-                        .seg
+                    let seg = &self.segs[seg_idx].seg;
+                    let use_tags = seg
                         .value_index
                         .as_ref()
                         .map(|v| v.tag_len > 0)
                         .unwrap_or(false);
-                    let ord_bytes: Option<Vec<u8>> = {
-                        let seg = &self.segs[seg_idx].seg;
-                        let row = row_pos_at(seg, np);
-                        if use_tags {
-                            Some(slice_tag_for_row(seg, row).to_vec())
-                        } else {
-                            let a = val.start as usize;
-                            let b = val.end as usize;
-                            let payload = &val.data.as_ref()[a..b];
-                            // For fixed-width, ord bytes for PQ are mapped, but Node.ord is not used.
-                            // We still compute mapped bytes here only for bucket/tag.
-                            let mapped: Vec<u8> = match (self.segs[seg_idx].policy, &seg.value_layout) {
-                                (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 1 => payload[..1].to_vec(),
-                                (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 2 => crate::codecs::orderkey::u16_le_to_sort2(payload[..2].try_into().unwrap()).to_vec(),
-                                (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 4 => crate::codecs::orderkey::u32_le_to_sort4(payload[..4].try_into().unwrap()).to_vec(),
-                                (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 8 => crate::codecs::orderkey::u64_le_to_sort8(payload[..8].try_into().unwrap()).to_vec(),
-                                (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 1 => crate::codecs::orderkey::i8_to_sort1(payload[0] as i8).to_vec(),
-                                (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 2 => crate::codecs::orderkey::i16_le_to_sort2(payload[..2].try_into().unwrap()).to_vec(),
-                                (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 4 => crate::codecs::orderkey::i32_le_to_sort4(payload[..4].try_into().unwrap()).to_vec(),
-                                (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 8 => crate::codecs::orderkey::i64_le_to_sort8(payload[..8].try_into().unwrap()).to_vec(),
-                                (ValueOrderPolicy::F32Le, ValueLayout::FixedWidth { width }) if *width == 4 => crate::codecs::orderkey::f32_le_to_sort4(payload[..4].try_into().unwrap()).to_vec(),
-                                (ValueOrderPolicy::F64Le, ValueLayout::FixedWidth { width }) if *width == 8 => crate::codecs::orderkey::f64_le_to_sort8(payload[..8].try_into().unwrap()).to_vec(),
-                                _ => payload.to_vec(),
-                            };
-                            Some(mapped)
+                    let row = row_pos_at(seg, np);
+                    // Stack buffer up to 8 bytes; fill based on width/policy.
+                    let mut buf8 = [0u8; 8];
+                    let (ord_ptr, ord_len): (*const u8, usize) = if use_tags {
+                        let tag = slice_tag_for_row(seg, row);
+                        (tag.as_ptr(), tag.len())
+                    } else {
+                        let a = val.start as usize;
+                        let b = val.end as usize;
+                        let payload = &val.data.as_ref()[a..b];
+                        match (self.segs[seg_idx].policy, &seg.value_layout) {
+                            (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 1 => {
+                                buf8[0] = payload[0];
+                                (buf8.as_ptr(), 1)
+                            }
+                            (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 2 => {
+                                buf8[..2].copy_from_slice(&crate::codecs::orderkey::u16_le_to_sort2(payload[..2].try_into().unwrap()));
+                                (buf8.as_ptr(), 2)
+                            }
+                            (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 4 => {
+                                buf8[..4].copy_from_slice(&crate::codecs::orderkey::u32_le_to_sort4(payload[..4].try_into().unwrap()));
+                                (buf8.as_ptr(), 4)
+                            }
+                            (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 8 => {
+                                buf8.copy_from_slice(&crate::codecs::orderkey::u64_le_to_sort8(payload[..8].try_into().unwrap()));
+                                (buf8.as_ptr(), 8)
+                            }
+                            (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 1 => {
+                                buf8[0] = crate::codecs::orderkey::i8_to_sort1(payload[0] as i8)[0];
+                                (buf8.as_ptr(), 1)
+                            }
+                            (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 2 => {
+                                buf8[..2].copy_from_slice(&crate::codecs::orderkey::i16_le_to_sort2(payload[..2].try_into().unwrap()));
+                                (buf8.as_ptr(), 2)
+                            }
+                            (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 4 => {
+                                buf8[..4].copy_from_slice(&crate::codecs::orderkey::i32_le_to_sort4(payload[..4].try_into().unwrap()));
+                                (buf8.as_ptr(), 4)
+                            }
+                            (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 8 => {
+                                buf8.copy_from_slice(&crate::codecs::orderkey::i64_le_to_sort8(payload[..8].try_into().unwrap()));
+                                (buf8.as_ptr(), 8)
+                            }
+                            (ValueOrderPolicy::F32Le, ValueLayout::FixedWidth { width }) if *width == 4 => {
+                                buf8[..4].copy_from_slice(&crate::codecs::orderkey::f32_le_to_sort4(payload[..4].try_into().unwrap()));
+                                (buf8.as_ptr(), 4)
+                            }
+                            (ValueOrderPolicy::F64Le, ValueLayout::FixedWidth { width }) if *width == 8 => {
+                                buf8.copy_from_slice(&crate::codecs::orderkey::f64_le_to_sort8(payload[..8].try_into().unwrap()));
+                                (buf8.as_ptr(), 8)
+                            }
+                            _ => {
+                                // Fall back: use payload bytes directly
+                                (payload.as_ptr(), payload.len())
+                            }
                         }
                     };
-                    let ord_ref = ord_bytes.as_deref().unwrap_or(&[]);
+                    let ord_slice = unsafe { std::slice::from_raw_parts(ord_ptr, ord_len) };
                     let (bkt, hi, lo) = bucket_and_tag128_bytes_fast(
-                        ord_ref,
+                        ord_slice,
                         self.bucket_prefix_len,
                         self.head_tag_len,
                     );
                     // Prepare KeyRef before moving `val`.
                     let ord_kref = if use_tags {
-                        KeyRef::from_slice(ord_ref)
+                        KeyRef::from_slice(ord_slice)
                     } else {
                         let a = val.start as usize;
                         let b = val.end as usize;

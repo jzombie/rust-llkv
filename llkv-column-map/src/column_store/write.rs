@@ -472,19 +472,35 @@ impl<P: Pager> ColumnStore<P> {
                 let (_, ci) = cache.get(&chunk.field_id).expect("column index present");
                 ci.value_order
             };
+            // Build value index:
+            // - Variable-width: always build tags + dirs (needed for value scans).
+            // - Fixed-width: build only if per-column policy != Raw (i.e., numeric/IEEE order).
             let (tag_len, tags, built_value_dirs_opt) = match &chunk.layout {
-                PlannedWriteLayout::Fixed { width } => {
-                    let width = *width as usize;
-                    let hot_threshold = 4096;
-                    let b = build_value_index_fixed_with_policy(&chunk.values, width, col_policy, hot_threshold);
-                    (0u8, Vec::new(), Some(b))
-                }
                 PlannedWriteLayout::Variable => {
                     const TAG_LEN: u8 = 16;
                     let tags = build_tags_from_values(&chunk.values, TAG_LEN);
                     let hot_threshold = 4096; // tune later
-                    let b = build_value_index_from_values_with_tags(&chunk.values, TAG_LEN, hot_threshold);
+                    let b = build_value_index_from_values_with_tags(
+                        &chunk.values,
+                        TAG_LEN,
+                        hot_threshold,
+                    );
                     (TAG_LEN, tags, Some(b))
+                }
+                PlannedWriteLayout::Fixed { width } => {
+                    if matches!(col_policy, ValueOrderPolicy::Raw) {
+                        (0u8, Vec::new(), None)
+                    } else {
+                        let width = *width as usize;
+                        let hot_threshold = 4096;
+                        let b = build_value_index_fixed_with_policy(
+                            &chunk.values,
+                            width,
+                            col_policy,
+                            hot_threshold,
+                        );
+                        (0u8, Vec::new(), Some(b))
+                    }
                 }
             };
             if let Some(built_value_dirs) = built_value_dirs_opt
