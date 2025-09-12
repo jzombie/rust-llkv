@@ -91,8 +91,8 @@ fn bench_ingest(c: &mut Criterion) {
         .sample_size(10) // Set the number of samples to 10
         .bench_function("1_ingest_1m_rows", |b| {
             b.iter(|| {
-                let pager = MemPager::new();
-                let store = ColumnStore::init_empty(&pager);
+                let pager = Arc::new(MemPager::new());
+                let store = ColumnStore::open(pager);
                 let puts = batch_to_puts(black_box(&batch), &key_spec, &column_map);
                 store.append_many(black_box(puts), Default::default());
             })

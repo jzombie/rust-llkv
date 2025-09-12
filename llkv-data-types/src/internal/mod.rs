@@ -12,15 +12,15 @@
 //!
 //! The storage engine's core is built on a simple, fast, and generic
 //! **lexicographical (byte-wise) sort**.
-//! To function correctly, all data types—strings,
-//! numbers, and composites—must sort correctly using the same universal rule.
+//!
+//! To function correctly, all data types—strings, numbers, and composites—must
+//! sort correctly using the same universal rule.
 //!
 //! - **Strings** naturally sort lexicographically.
 //! - **Little-Endian** numbers (the native format for most CPUs) **do not**. For example,
-//!
-//! as bytes, `256` would sort before `1`.
+//!   as bytes, `256` would sort before `1`.
 //! - **Big-Endian** numbers **do**. Their byte order matches their numeric order, allowing
-//! them to be sorted correctly with the same logic as strings.
+//!   them to be sorted correctly with the same logic as strings.
 //!
 //! This requires a fast byte-swap when decoding numbers for computation, but this
 //! small, one-time cost is far outweighed by the massive simplification and

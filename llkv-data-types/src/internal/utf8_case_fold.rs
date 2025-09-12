@@ -62,23 +62,34 @@ impl Utf8CaseFold {
         if bytes.len() < 4 {
             return &[];
         }
-        let len_bytes: [u8; 4] = bytes[bytes.len() - 4..].try_into().unwrap();
-        let len = u32::from_be_bytes(len_bytes) as usize;
-
-        // Bounds check to prevent panics on malformed input.
-        bytes.get(..len).unwrap_or(&[])
+        let len_bytes: [u8; 4] = match bytes[bytes.len() - 4..].try_into() {
+            Ok(b) => b,
+            Err(_) => return &[],
+        };
+        let folded_len = u32::from_be_bytes(len_bytes) as usize;
+        if folded_len + 4 > bytes.len() {
+            return &[];
+        }
+        &bytes[..folded_len]
     }
 
-    /// Decode the original string segment without allocating a new String.
+    /// Decode the original string segment without allocating a new `String`.
+    /// Uses `folded_key` so it is exercised in non-test builds (avoids dead-code).
     #[inline]
     pub fn decode_borrowed(src: &[u8]) -> Option<&str> {
         if src.len() < 4 {
             return None;
         }
+        // Use folded_key so it’s considered "used" in normal builds.
+        let folded = Self::folded_key(src);
+
+        // Re-read the trailer to validate length & frame integrity.
         let len_bytes: [u8; 4] = src[src.len() - 4..].try_into().ok()?;
         let folded_len = u32::from_be_bytes(len_bytes) as usize;
 
-        if folded_len + 4 > src.len() {
+        // If `folded_key` failed (returns []), this check will fail unless the
+        // frame legitimately has a 0-length folded key (empty string).
+        if folded.len() != folded_len || folded_len + 4 > src.len() {
             return None;
         }
 

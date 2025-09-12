@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::types::{BlobLike, PhysicalKey, TypedKind, TypedValue};
+use crate::types::{PhysicalKey, TypedKind, TypedValue};
 
 pub mod mem_pager;
 pub use mem_pager::*;
