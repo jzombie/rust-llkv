@@ -54,8 +54,8 @@ fn arrow_recordbatch_roundtrip() {
     let keys = KeySpec::U64Be { col_idx: 0 };
 
     // ---------- create store and append ----------
-    let p = MemPager::default();
-    let store = ColumnStore::init_empty(&p);
+    let p = Arc::new(MemPager::default());
+    let store = ColumnStore::open(p);
     let opts = AppendOptions {
         // keep segments comfortably large for the test
         segment_max_entries: 1_000,

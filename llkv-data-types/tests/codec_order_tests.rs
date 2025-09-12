@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::ops::Bound;
+use std::sync::Arc;
 
 use llkv_column_map::ColumnStore;
 use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ValueScanOpts};
@@ -12,11 +13,9 @@ use llkv_data_types::{DataType, DecodedValue, decode_value, encode_value};
 
 /// Set up a fresh in-memory ColumnStore and return (store, new fid).
 #[inline]
-fn setup_store() -> (ColumnStore<'static, MemPager>, LogicalFieldId) {
-    // Leak the pager for 'static lifetime in tests. Simpler than threading
-    // lifetimes through helpers and perfectly fine for unit tests.
-    let pager: &'static MemPager = Box::leak(Box::new(MemPager::default()));
-    let store = ColumnStore::init_empty(pager);
+fn setup_store() -> (ColumnStore<MemPager>, LogicalFieldId) {
+    let pager = Arc::new(MemPager::default());
+    let store = ColumnStore::open(pager);
     let fid: LogicalFieldId = 42;
     (store, fid)
 }
@@ -25,7 +24,7 @@ fn setup_store() -> (ColumnStore<'static, MemPager>, LogicalFieldId) {
 #[inline]
 #[allow(clippy::type_complexity)] // TODO: Alias type
 fn append_one_put(
-    store: &ColumnStore<'static, MemPager>,
+    store: &ColumnStore<MemPager>,
     fid: LogicalFieldId,
     items: Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)>,
 ) {
@@ -45,7 +44,7 @@ fn append_one_put(
 /// Run a value-ordered scan (ascending) over `fid` and return the raw
 /// encoded value frames as owned Vec<u8> (avoid lifetime issues).
 #[inline]
-fn scan_value_frames(store: &ColumnStore<'static, MemPager>, fid: LogicalFieldId) -> Vec<Vec<u8>> {
+fn scan_value_frames(store: &ColumnStore<MemPager>, fid: LogicalFieldId) -> Vec<Vec<u8>> {
     let it = store
         .scan_values_lww(
             fid,
