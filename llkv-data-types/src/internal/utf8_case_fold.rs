@@ -74,7 +74,6 @@ impl Utf8CaseFold {
     }
 
     /// Decode the original string segment without allocating a new `String`.
-    /// Uses `folded_key` so it is exercised in non-test builds (avoids dead-code).
     #[inline]
     pub fn decode_borrowed(src: &[u8]) -> Option<&str> {
         if src.len() < 4 {
