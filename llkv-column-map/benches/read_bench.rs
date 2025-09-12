@@ -16,10 +16,12 @@ use llkv_column_map::{
     storage::pager::MemPager,
     types::{AppendOptions, LogicalFieldId, Put, ValueMode},
 };
+
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::borrow::Cow;
 use std::cmp::min;
 use std::hint::black_box;
+use std::sync::Arc;
 
 // --------------------------- config ---------------------------
 
@@ -32,7 +34,7 @@ const COLS: &[LogicalFieldId] = &[10, 11, 20, 21, 30, 31];
 #[inline]
 fn fixed_value(width: usize, row: u64, fid: LogicalFieldId) -> Vec<u8> {
     // deterministic but cheap content
-    let seed = (row ^ (fid as u64)).to_le_bytes();
+    let seed = (row ^ (fid)).to_le_bytes();
     if width <= 8 {
         seed[..width].to_vec()
     } else {
@@ -48,14 +50,14 @@ fn fixed_value(width: usize, row: u64, fid: LogicalFieldId) -> Vec<u8> {
 #[inline]
 fn var_value(row: u64, fid: LogicalFieldId, min_len: usize, max_len: usize) -> Vec<u8> {
     let span = (max_len - min_len + 1) as u64;
-    let len = min_len as u64 + ((row.wrapping_mul(1103515245) ^ fid as u64) % span);
-    let byte = (((row as u32).wrapping_add(fid)) & 0xFF) as u8;
+    let len = min_len as u64 + ((row.wrapping_mul(1103515245) ^ fid) % span);
+    let byte = (((row as LogicalFieldId).wrapping_add(fid)) & 0xFF) as u8;
     vec![byte; len as usize]
 }
 
 // ------------------------- ingest -----------------------------
 
-fn ingest_1m_rows(store: &ColumnStore<'static, MemPager>) {
+fn ingest_1m_rows(store: &ColumnStore<MemPager>) {
     // Reasonable segment knobs; adjust to taste.
     let opts = AppendOptions {
         mode: ValueMode::Auto,       // per-column auto fixed/variable
@@ -129,9 +131,8 @@ fn ingest_1m_rows(store: &ColumnStore<'static, MemPager>) {
 // ------------------------- bench ------------------------------
 
 fn bench_query_uniform(c: &mut Criterion) {
-    // Leak the pager to give the store a 'static lifetime (so we can move it into the closure).
-    let pager: &'static MemPager = Box::leak(Box::new(MemPager::default()));
-    let store: ColumnStore<'static, MemPager> = ColumnStore::init_empty(pager);
+    let pager = Arc::new(MemPager::default());
+    let store: ColumnStore<MemPager> = ColumnStore::open(pager);
 
     // Ingest once (not timed).
     ingest_1m_rows(&store);

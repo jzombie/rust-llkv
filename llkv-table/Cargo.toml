@@ -9,8 +9,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+bitcode.workspace = true
 crossbeam-channel.workspace = true
-llkv-btree.workspace = true
+llkv-column-map.workspace = true
 llkv-expr.workspace = true
 llkv-storage.workspace = true
 rayon.workspace = true

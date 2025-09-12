@@ -51,8 +51,8 @@ fn upsert_then_fetch_recordbatch() {
     };
     let keyspec = KeySpec::U64Be { col_idx: 0 };
 
-    let p = MemPager::default();
-    let store = ColumnStore::init_empty(&p);
+    let p = Arc::new(MemPager::default());
+    let store = ColumnStore::open(p);
 
     let opts = AppendOptions {
         segment_max_entries: 1_000,

@@ -20,6 +20,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
+use std::sync::Arc;
 
 use llkv_column_map::codecs::big_endian::u64_be_array;
 use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ValueScanOpts};
@@ -70,8 +71,8 @@ fn base_value(col: usize, i: u32) -> u64 {
 #[test]
 #[ignore = "CPU intensive test"]
 fn large_table_end_to_end_scans() {
-    let pager = MemPager::default();
-    let store = ColumnStore::init_empty(&pager);
+    let pager = Arc::new(MemPager::default());
+    let store = ColumnStore::open(pager);
 
     // Common append options: fixed 8B values, coalesce into large segments.
     let opts = AppendOptions {
@@ -84,7 +85,7 @@ fn large_table_end_to_end_scans() {
     // -------------------------- Build 10 columns --------------------------
     // Single append per column (one big segment per column is allowed by limits).
     for col in 0..COLS {
-        let fid = BASE_FID + col as u32;
+        let fid = BASE_FID + col as LogicalFieldId;
         let mut items = Vec::with_capacity(ROWS as usize);
         for i in 0..ROWS {
             items.push((
@@ -143,7 +144,7 @@ fn large_table_end_to_end_scans() {
 
     let mut queries = Vec::with_capacity(COLS);
     for col in 0..COLS {
-        let fid = BASE_FID + col as u32;
+        let fid = BASE_FID + col as LogicalFieldId;
         queries.push((fid, sample_keys.clone()));
     }
     let got = store.get_many(queries);

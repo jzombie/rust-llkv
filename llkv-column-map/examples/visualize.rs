@@ -29,6 +29,7 @@
 //!      - SVG:  `dot -Tsvg storage_layout.dot -o storage_layout.svg`
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use llkv_column_map::{
@@ -109,7 +110,7 @@ fn color_for_batch(b: usize) -> &'static str {
 
 // TODO: Migrate to lib?
 fn render_one_colored_dot(
-    store: &ColumnStore<'_, MemPager>,
+    store: &ColumnStore<MemPager>,
     created_in_batch: &HashMap<PhysicalKey, usize>,
 ) -> String {
     use std::fmt::Write;
@@ -236,8 +237,8 @@ fn render_one_colored_dot(
 // ---------------- Main: multi-batch ingest then ONE colored DOT -------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let pager = MemPager::default();
-    let store = ColumnStore::init_empty(&pager);
+    let pager = Arc::new(MemPager::default());
+    let store = ColumnStore::open(pager);
 
     // record creation batch for each physical key we ever see
     // batch 0 = pre-existing (bootstrap, manifest)

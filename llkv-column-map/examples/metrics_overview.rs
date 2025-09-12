@@ -18,12 +18,13 @@ use llkv_column_map::{
     types::{AppendOptions, BlobLike, LogicalFieldId, Put, ValueMode},
     views::ValueSlice,
 };
+use std::sync::Arc;
 
 // -------- simple key/value generators ---------------------------------------
 
-fn fixed_value(row: u64, field: u32, width: usize) -> Vec<u8> {
+fn fixed_value(row: u64, field: LogicalFieldId, width: usize) -> Vec<u8> {
     // Stable 8-byte seed then repeat/truncate to requested width
-    let seed = (row ^ field as u64).to_le_bytes();
+    let seed = (row ^ field).to_le_bytes();
     if width <= 8 {
         seed[..width].to_vec()
     } else {
@@ -57,10 +58,10 @@ fn build_put_var(
         let span = (max - min + 1) as u64;
         let mix = r
             .wrapping_mul(1103515245)
-            .wrapping_add(field_id as u64)
+            .wrapping_add(field_id)
             .rotate_left(13);
         let len = (min as u64 + (mix % span)) as usize;
-        let byte = (((r as u32).wrapping_add(field_id)) & 0xFF) as u8;
+        let byte = (((r as LogicalFieldId).wrapping_add(field_id)) & 0xFF) as u8;
         items.push((u64_be_vec(r).into(), vec![byte; len].into()));
     }
     Put { field_id, items }
@@ -94,7 +95,7 @@ impl core::ops::Sub for Counts {
 }
 
 // Uses your actual IoStats field names.
-fn read_counts<P: llkv_column_map::storage::pager::Pager>(store: &ColumnStore<'_, P>) -> Counts {
+fn read_counts<P: llkv_column_map::storage::pager::Pager>(store: &ColumnStore<P>) -> Counts {
     let s = store.io_stats(); // cumulative since process start
     Counts {
         batches: s.batches as u64,
@@ -161,7 +162,7 @@ fn print_data_summary(label: &str, a: &AppendSummary) {
 // Prints the phase’s data summary and then the per-phase I/O deltas.
 fn show_phase_with_data<P: llkv_column_map::storage::pager::Pager>(
     label: &str,
-    store: &ColumnStore<'_, P>,
+    store: &ColumnStore<P>,
     prev: &mut Counts,
     summary: &AppendSummary,
 ) {
@@ -179,7 +180,7 @@ fn show_phase_with_data<P: llkv_column_map::storage::pager::Pager>(
 // Simple version (no data line), used for phases that don’t write (e.g. init, describe)
 fn show_phase<P: llkv_column_map::storage::pager::Pager>(
     label: &str,
-    store: &ColumnStore<'_, P>,
+    store: &ColumnStore<P>,
     prev: &mut Counts,
 ) {
     println!("== {} ==", label);
@@ -237,8 +238,8 @@ fn print_read_report<B>(
 // -------- main walkthrough ---------------------------------------------------
 
 fn main() {
-    let pager = MemPager::default();
-    let store = ColumnStore::init_empty(&pager);
+    let pager = Arc::new(MemPager::default());
+    let store = ColumnStore::open(pager);
 
     // We'll accumulate a previous snapshot here and compute deltas per phase.
     let mut prev = read_counts(&store);

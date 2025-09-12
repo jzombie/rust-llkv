@@ -16,8 +16,7 @@ pub type PhysicalKey = u64;
 /// - Used to group rows into a “column” in the manifest and to locate that
 ///   column’s current `ColumnIndex`.
 /// - Does not need to be dense or sequential; it only needs to be unique per column.
-/// - 32-bit keeps on-disk headers compact while allowing plenty of columns.
-pub type LogicalFieldId = u32;
+pub type LogicalFieldId = u64;
 
 /// Already-encoded **logical key bytes** (application format).
 ///

@@ -55,10 +55,12 @@ use llkv_column_map::{
     ColumnStore,
     codecs::big_endian::u64_be_vec,
     storage::pager::MemPager,
-    types::{AppendOptions, Put, ValueMode},
+    types::{AppendOptions, LogicalFieldId, Put, ValueMode},
 };
+
 use std::borrow::Cow;
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::Duration;
 // ----------------- dataset shape: 21 columns x 150_000 rows ---------------
 #[derive(Clone, Copy)]
@@ -67,7 +69,7 @@ enum ColKind {
     Var { min: usize, max: usize },
 }
 
-fn col_spec_21() -> Vec<(u32, ColKind)> {
+fn col_spec_21() -> Vec<(LogicalFieldId, ColKind)> {
     let mut spec = Vec::new();
     for i in 0..8 {
         spec.push((100 + i, ColKind::Fixed(8)));
@@ -90,16 +92,20 @@ fn row_key(row: u64) -> Vec<u8> {
 }
 
 #[inline]
-fn var_len_for(row: u64, field: u32, min: usize, max: usize) -> usize {
+fn var_len_for(row: u64, field: LogicalFieldId, min: usize, max: usize) -> usize {
     let span = (max - min + 1) as u64;
     let mix = row
         .wrapping_mul(1103515245)
-        .wrapping_add(field as u64)
+        .wrapping_add(field)
         .rotate_left(13);
     (min as u64 + (mix % span)) as usize
 }
 
-fn build_puts_for_range<'a>(start: u64, end: u64, spec: &[(u32, ColKind)]) -> Vec<Put<'a>> {
+fn build_puts_for_range<'a>(
+    start: u64,
+    end: u64,
+    spec: &[(LogicalFieldId, ColKind)],
+) -> Vec<Put<'a>> {
     let mut puts = Vec::with_capacity(spec.len());
     for (field_id, kind) in spec.iter().copied() {
         let mut items = Vec::with_capacity((end - start) as usize);
@@ -110,7 +116,7 @@ fn build_puts_for_range<'a>(start: u64, end: u64, spec: &[(u32, ColKind)]) -> Ve
                 ColKind::Fixed(w) => {
                     let w = w as usize;
                     // derive a stable 8-byte seed from row & field, then repeat/truncate to w bytes
-                    let seed = (r ^ field_id as u64).to_le_bytes();
+                    let seed = (r ^ field_id).to_le_bytes();
                     if w <= 8 {
                         seed[..w].to_vec()
                     } else {
@@ -124,7 +130,7 @@ fn build_puts_for_range<'a>(start: u64, end: u64, spec: &[(u32, ColKind)]) -> Ve
                 }
                 ColKind::Var { min, max } => {
                     let len = var_len_for(r, field_id, min, max);
-                    let byte = (((r as u32).wrapping_add(field_id)) & 0xFF) as u8;
+                    let byte = (((r as LogicalFieldId).wrapping_add(field_id)) & 0xFF) as u8;
                     vec![byte; len]
                 }
             };
@@ -161,8 +167,8 @@ fn bench_ingest_by_batches(c: &mut Criterion) {
         );
         group.bench_function(BenchmarkId::from_parameter(label), |b| {
             b.iter(|| {
-                let pager = MemPager::default();
-                let store = ColumnStore::init_empty(&pager);
+                let pager = Arc::new(MemPager::default());
+                let store = ColumnStore::open(pager);
 
                 let mut start = 0u64;
                 for _ in 0..batches {
@@ -205,8 +211,8 @@ fn bench_ingest_by_rows_per_batch(c: &mut Criterion) {
         let label = format!("rows_per_batch={}", rows_per_batch);
         group.bench_function(BenchmarkId::from_parameter(label), |b| {
             b.iter(|| {
-                let pager = MemPager::default();
-                let store = ColumnStore::init_empty(&pager);
+                let pager = Arc::new(MemPager::default());
+                let store = ColumnStore::open(pager);
 
                 let mut start = 0u64;
                 while start < total_rows {

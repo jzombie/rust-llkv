@@ -120,8 +120,8 @@ struct SegCtx<P: Pager> {
     // prefiltered domination candidates
     /// Indices into `self.segs` that dominate this segment (active, index+data loaded).
     dominators_active: Vec<usize>,
-    /// Shadow (index-only) segments that dominate this segment (physical keys).
-    dominators_shadow: Vec<PhysicalKey>,
+    /// Shadow (index-only) segments that dominate this segment, with cached bounds.
+    dominators_shadow: Vec<ShadowBound>,
 }
 
 #[inline]
@@ -162,6 +162,13 @@ impl KeyRef {
 struct ShadowRef {
     pk: PhysicalKey,
     rank: usize,
+}
+
+/// Precomputed shadow segment bounds for fast per-iteration pruning.
+struct ShadowBound {
+    pk: PhysicalKey,
+    min: KeyRef,
+    max: KeyRef,
 }
 
 // TODO: Rename to `ColumnScan`?
@@ -513,7 +520,7 @@ fn bucket_and_tag128_from_bytes(
 }
 
 // TODO: Rename * from `scan_values_*` to `scan_*` since this can do key or value based scanning
-impl<P: Pager> super::ColumnStore<'_, P> {
+impl<P: Pager> super::ColumnStore<P> {
     /// LWW-enforced scan over [lo, hi) in the chosen domain (value/key).
     pub fn scan_values_lww(
         &self,
@@ -553,7 +560,7 @@ pub enum ScanError {
 
 impl<P: Pager> ValueScan<P> {
     pub fn new(
-        col: &super::ColumnStore<'_, P>,
+        col: &super::ColumnStore<P>,
         field_id: LogicalFieldId,
         opts: ValueScanOpts<'_>,
         policy: ConflictPolicy,
@@ -912,7 +919,7 @@ impl<P: Pager> ValueScan<P> {
                 self.segs[i].min_key.as_slice(),
                 self.segs[i].max_key.as_slice(),
             );
-            let mut acc: Vec<PhysicalKey> = Vec::new();
+            let mut acc: Vec<ShadowBound> = Vec::new();
 
             let rank_iter: Box<dyn Iterator<Item = usize>> = match self.policy {
                 ConflictPolicy::LWW => Box::new(0..ri), // newer ranks only
@@ -922,7 +929,7 @@ impl<P: Pager> ValueScan<P> {
             for r in rank_iter {
                 for rf in &self.shadow_by_rank[r] {
                     if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
-                        // Compute shadow key span once here (cheap).
+                        // Compute shadow key span once here (cheap) and cache.
                         let min_j = KeyLayout::slice_key_by_layout(
                             &seg.logical_key_bytes,
                             &seg.key_layout,
@@ -934,7 +941,11 @@ impl<P: Pager> ValueScan<P> {
                             seg.n_entries as usize - 1,
                         );
                         if !(max_i < min_j || min_i > max_j) {
-                            acc.push(rf.pk);
+                            acc.push(ShadowBound {
+                                pk: rf.pk,
+                                min: KeyRef::from_slice(min_j),
+                                max: KeyRef::from_slice(max_j),
+                            });
                         }
                     }
                 }
@@ -968,19 +979,16 @@ impl<P: Pager> ValueScan<P> {
             }
         }
 
-        // 2) Shadow dominators (index-only, preloaded).
-        for pk in &sc.dominators_shadow {
-            if let Some(seg) = self.shadow_seg_map.get(pk) {
-                if !Self::key_within_seg_bounds(seg, key) {
-                    continue;
-                }
-
-                // persisted Bloom prefilter
+        // 2) Shadow dominators (index-only, preloaded): bounds -> bloom -> probe.
+        for sb in &sc.dominators_shadow {
+            // Fast bounds with cached min/max.
+            if key < sb.min.as_slice() || key > sb.max.as_slice() {
+                continue;
+            }
+            if let Some(seg) = self.shadow_seg_map.get(&sb.pk) {
                 if !seg.key_bloom.check(key) {
                     continue;
                 }
-
-                // precise probe
                 if Self::key_in_index(seg, key) {
                     return true;
                 }
@@ -1000,18 +1008,6 @@ impl<P: Pager> ValueScan<P> {
         )
         .is_some()
     }
-
-    /// Fast bound check using borrowed min/max from the segment.
-    #[inline]
-    fn key_within_seg_bounds(seg: &IndexSegment, key: &[u8]) -> bool {
-        let min = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);
-        let max = KeyLayout::slice_key_by_layout(
-            &seg.logical_key_bytes,
-            &seg.key_layout,
-            seg.n_entries as usize - 1,
-        );
-        !(key < min || key > max)
-    }
 }
 
 impl<P: Pager> Iterator for ValueScan<P> {
@@ -1021,7 +1017,10 @@ impl<P: Pager> Iterator for ValueScan<P> {
         if self.halted {
             return None;
         }
-
+        // Pop the best head from the radix-PQ, check frame predicate, apply
+        // conflict policy (shadow checks), reseed the segment head, and either
+        // yield the current row or skip it and continue. Loop until a row is
+        // accepted or PQ is exhausted.
         loop {
             let node = self.pq.pop(self.reverse)?;
             let seg_idx = node.seg_idx;
@@ -1429,11 +1428,21 @@ fn cmp_value_at<P: Pager>(
     pos: usize,
     probe: &[u8],
 ) -> Ordering {
-    let s = slice_value::<P>(seg, data, pos);
-    let a = s.start as usize;
-    let b = s.end as usize;
-    let bytes = &s.data.as_ref()[a..b];
-    bytes.cmp(probe)
+    match &seg.value_layout {
+        ValueLayout::FixedWidth { width } => {
+            let w = *width as usize;
+            let a = pos * w;
+            let b = a + w;
+            let bytes = &data.as_ref()[a..b];
+            bytes.cmp(probe)
+        }
+        ValueLayout::Variable { value_offsets } => {
+            let a = value_offsets[pos] as usize;
+            let b = value_offsets[pos + 1] as usize;
+            let bytes = &data.as_ref()[a..b];
+            bytes.cmp(probe)
+        }
+    }
 }
 
 // --------- hot-path specializations & cold helper ----------
@@ -1565,7 +1574,7 @@ fn upper_bound_min<'a>(a: Bound<&'a [u8]>, b: Bound<&'a [u8]>) -> Bound<&'a [u8]
 
 // =================== pagination: opts-driven entry points =================
 
-impl<P: Pager> super::ColumnStore<'_, P> {
+impl<P: Pager> super::ColumnStore<P> {
     /// Keyset pagination with LWW over key or value order, designed for stateless API calls.
     ///
     /// This helper function creates a new scan iterator on every call, making it suitable for
@@ -1751,9 +1760,9 @@ mod value_scan_tests {
     /// End-to-end: forward scan over full range, assert LWW winners and uniqueness.
     #[test]
     fn scan_values_lww_forward_big_multi_segment() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p); // bootstrap+manifest, empty store
-        let fid = 42u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p); // bootstrap+manifest, empty store
+        let fid: LogicalFieldId = 42;
 
         seed_three_generations(&store, fid);
 
@@ -1803,9 +1812,9 @@ mod value_scan_tests {
     /// Narrow value window: ensure [lo, hi) (value-space) is honored.
     #[test]
     fn scan_values_lww_value_window_slice() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
-        let fid = 7u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 7;
         seed_three_generations(&store, fid);
 
         // Choose a window that lands entirely in gen2's value band.
@@ -1855,9 +1864,9 @@ mod value_scan_tests {
     /// Reverse scan order contract (LWW).
     #[test]
     fn scan_values_lww_reverse_order_contract() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
-        let fid = 99u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 99;
         seed_three_generations(&store, fid);
 
         let it = store
@@ -1891,9 +1900,9 @@ mod value_scan_tests {
     /// FWW semantics: oldest wins.
     #[test]
     fn scan_values_fww_forward_contract() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
-        let fid = 5u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 5;
         seed_three_generations(&store, fid);
 
         let it = store
@@ -1934,9 +1943,9 @@ mod value_scan_tests {
     /// Frame predicate/windowing contract (on values).
     #[test]
     fn scan_values_lww_frame_predicate_contract() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
-        let fid = 12u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 12;
         seed_three_generations(&store, fid);
 
         let cap = 64u64;
@@ -1976,9 +1985,9 @@ mod value_scan_tests {
 
     #[test]
     fn scan_values_fww_reverse_order_contract() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
-        let fid = 77u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 77;
         seed_three_generations(&store, fid);
 
         let it = store
@@ -2034,9 +2043,9 @@ mod value_scan_tests {
 
     #[test]
     fn scan_values_lww_reverse_windowed_gen3() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
-        let fid = 101u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 101;
         seed_three_generations(&store, fid);
 
         // Window fully inside gen3 (i = 700..710)
@@ -2083,9 +2092,9 @@ mod value_scan_tests {
 
     #[test]
     fn scan_values_fww_forward_windowed_gen1_positive() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
-        let fid = 102u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 102;
         seed_three_generations(&store, fid);
 
         // Window fully inside gen1 (i = 250..260) -> winners are gen1 under FWW
@@ -2127,9 +2136,9 @@ mod value_scan_tests {
 
     #[test]
     fn scan_values_fww_forward_windowed_gen2_strict_suppression() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
-        let fid = 103u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 103;
         seed_three_generations(&store, fid);
 
         // Window fully inside gen2’s value band (i = 250..260).
@@ -2163,9 +2172,9 @@ mod value_scan_tests {
 
     #[test]
     fn scan_values_fww_reverse_windowed_gen1() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
-        let fid = 104u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 104;
         seed_three_generations(&store, fid);
 
         // Window at the high end of gen1 (i = 990..1000)
@@ -2211,9 +2220,9 @@ mod value_scan_tests {
     /// LWW + key-ordered, reverse: keys must be descending.
     #[test]
     fn scan_values_lww_key_order_reverse() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
-        let fid = 4343u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 4343;
 
         seed_three_generations(&store, fid);
 
@@ -2260,9 +2269,9 @@ mod value_scan_tests {
     // Uses last key of each page as the cursor for the next page.
     #[test]
     fn scan_values_lww_pagination_key_forward() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
-        let fid = 551u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 551;
 
         seed_three_generations(&store, fid);
 
@@ -2314,9 +2323,9 @@ mod value_scan_tests {
     // Uses last key of each page as the upper bound for the next page.
     #[test]
     fn scan_values_lww_pagination_key_reverse() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
-        let fid = 552u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 552;
 
         seed_three_generations(&store, fid);
 
@@ -2368,9 +2377,9 @@ mod value_scan_tests {
     // Cursor is the last VALUE bytes of each page.
     #[test]
     fn scan_values_lww_pagination_value_forward() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
-        let fid = 661u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 661;
 
         seed_three_generations(&store, fid);
 
@@ -2426,9 +2435,9 @@ mod value_scan_tests {
     // Cursor is the last VALUE bytes of each page.
     #[test]
     fn scan_values_lww_pagination_value_reverse() {
-        let p = MemPager::default();
-        let store = ColumnStore::init_empty(&p);
-        let fid = 662u32;
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 662;
 
         seed_three_generations(&store, fid);
 

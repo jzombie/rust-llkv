@@ -31,7 +31,7 @@ pub(crate) struct BuiltValueDirs {
     pub l2_dirs: Vec<(u8, Vec<u32>)>,
 }
 
-impl<'p, P: Pager> ColumnStore<'p, P> {
+impl<P: Pager> ColumnStore<P> {
     // TODO: Return `Result` type
     // Single entrypoint for writing. Many columns, each with unordered items.
     // Auto-chooses fixed vs variable, chunks to segments, writes everything in batches.
@@ -39,6 +39,8 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
     /// Auto-chooses fixed vs variable, chunks to segments, writes everything
     /// in batches.
     pub fn append_many(&self, puts: Vec<Put>, opts: AppendOptions) {
+        let _guard = self.append_lock.lock().unwrap();
+
         if puts.is_empty() {
             return;
         }

@@ -3,7 +3,6 @@
 #![forbid(unsafe_code)]
 
 use core::cmp::Ordering;
-use llkv_btree::{pager::Pager as BTreePager, views::value_view::ValueRef};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -32,23 +31,6 @@ pub type ColumnValue<'a> = &'a [u8];
 /// This uses a Cow (Copy-on-Write) to allow for either borrowed (zero-copy)
 /// or owned data to be passed to the table.
 pub type ColumnInput<'a> = Cow<'a, [u8]>;
-
-// /// Callback: (row_id, iterator over projected value refs)
-pub type PageOf<P> = <P as BTreePager>::Page;
-pub type VRefOf<P> = ValueRef<PageOf<P>>;
-pub type VIterOf<'a, P> = dyn Iterator<Item = VRefOf<P>> + 'a;
-pub type OnRowOf<'a, P> = dyn FnMut(RowId, &mut VIterOf<'a, P>) + 'a;
-
-// Codec aliases
-pub type RowIdKeyCodec = llkv_btree::codecs::BigEndianKeyCodec<RowId>;
-pub type IndexKeyCodec = llkv_btree::codecs::BigEndianKeyCodec<IndexKey>;
-pub type RootIdIdCodec = llkv_btree::codecs::BigEndianIdCodec<RootId>;
-
-// Tree aliases
-pub type ColumnTree<P> = llkv_btree::bplus_tree::SharedBPlusTree<P, RowIdKeyCodec, RootIdIdCodec>;
-pub type PrimaryIndexTree<P> =
-    llkv_btree::bplus_tree::SharedBPlusTree<P, IndexKeyCodec, RootIdIdCodec>;
-pub type RowIdSetTree<P> = llkv_btree::bplus_tree::SharedBPlusTree<P, RowIdKeyCodec, RootIdIdCodec>;
 
 pub type RowPatch<'a> = (RowId, HashMap<FieldId, (IndexKey, ColumnInput<'a>)>);
 

@@ -34,6 +34,7 @@ use std::borrow::Cow;
 use std::env;
 use std::hint::black_box;
 use std::ops::Bound;
+use std::sync::Arc;
 
 // ------------------------- config helpers -------------------------
 
@@ -86,7 +87,7 @@ fn value_for_generation(generation_idx: usize, i: u64) -> u64 {
 
 // Seed a single column into an existing store (no borrowed returns).
 fn seed_column_into(
-    store: &ColumnStore<'_, MemPager>,
+    store: &ColumnStore<MemPager>,
     field_id: LogicalFieldId,
     rows: u64,
     segment_max_entries: usize,
@@ -135,7 +136,7 @@ fn seed_column_into(
     }
 }
 
-fn scan_full_count_forward(store: &ColumnStore<'_, MemPager>, fid: LogicalFieldId) -> usize {
+fn scan_full_count_forward(store: &ColumnStore<MemPager>, fid: LogicalFieldId) -> usize {
     let it = store
         .scan_values_lww(
             fid,
@@ -159,7 +160,7 @@ fn scan_full_count_forward(store: &ColumnStore<'_, MemPager>, fid: LogicalFieldI
     c
 }
 
-fn scan_full_count_reverse(store: &ColumnStore<'_, MemPager>, fid: LogicalFieldId) -> usize {
+fn scan_full_count_reverse(store: &ColumnStore<MemPager>, fid: LogicalFieldId) -> usize {
     let it = store
         .scan_values_lww(
             fid,
@@ -200,8 +201,8 @@ pub fn segment_scan_read_bench(c: &mut Criterion) {
 
     for seg in seg_sizes {
         // ---------- CLEAN dataset (1 generation, no in-batch dups) ----------
-        let pager_clean = MemPager::default();
-        let store_clean = ColumnStore::init_empty(&pager_clean);
+        let pager_clean = Arc::new(MemPager::default());
+        let store_clean = ColumnStore::open(pager_clean);
         let fid_clean: LogicalFieldId = 777;
         seed_column_into(&store_clean, fid_clean, rows, seg, 1, false);
 
@@ -227,8 +228,8 @@ pub fn segment_scan_read_bench(c: &mut Criterion) {
         });
 
         // ------ FRAGMENTED dataset (G gens + optional in-batch dups) -------
-        let pager_frag = MemPager::default();
-        let store_frag = ColumnStore::init_empty(&pager_frag);
+        let pager_frag = Arc::new(MemPager::default());
+        let store_frag = ColumnStore::open(pager_frag);
         let fid_frag: LogicalFieldId = 778;
         seed_column_into(
             &store_frag,

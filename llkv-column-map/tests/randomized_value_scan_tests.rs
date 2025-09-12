@@ -10,6 +10,7 @@
 use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::ops::Bound;
+use std::sync::Arc;
 
 use llkv_column_map::ColumnStore;
 use llkv_column_map::codecs::big_endian::u64_be_array;
@@ -57,7 +58,7 @@ impl Xs {
 }
 
 fn append_random_column(
-    store: &ColumnStore<'_, MemPager>,
+    store: &ColumnStore<MemPager>,
     fid: LogicalFieldId,
     n_rows: u64,
     segment_max_entries: usize,
@@ -103,8 +104,8 @@ fn append_random_column(
 #[test]
 #[ignore = "CPU intensive test"]
 fn randomized_single_generation_forward_and_reverse() {
-    let pager = MemPager::default();
-    let store = ColumnStore::init_empty(&pager);
+    let pager = Arc::new(MemPager::default());
+    let store = ColumnStore::open(pager);
     let fid: LogicalFieldId = 10_000;
 
     // Tune as desired — small-ish by default for CI friendliness.
@@ -206,8 +207,8 @@ fn randomized_single_generation_forward_and_reverse() {
 #[test]
 #[ignore = "CPU intensive test"]
 fn randomized_two_generation_lww_correctness() {
-    let pager = MemPager::default();
-    let store = ColumnStore::init_empty(&pager);
+    let pager = Arc::new(MemPager::default());
+    let store = ColumnStore::open(pager);
     let fid: LogicalFieldId = 20_000;
 
     let n_rows: u64 = 150_000;

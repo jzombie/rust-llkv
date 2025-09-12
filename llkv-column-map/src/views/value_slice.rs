@@ -2,7 +2,7 @@ use crate::types::ByteOffset;
 
 /// Zero-copy view into a subrange of an Arc-backed data blob.
 /// Holds the Arc and byte offsets; derefs to `[u8]` without copying.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ValueSlice<B> {
     pub(crate) data: B,
     pub(crate) start: ByteOffset,
