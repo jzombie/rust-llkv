@@ -5,26 +5,10 @@
 //!
 //! ## A Note on Endianness and Sort Order
 //!
-//! You will notice that this system consistently uses **big-endian** encoding for
-//!
-//! all numeric types that are part of a `LogicalKeyBytes` payload. This is a
-//! deliberate and critical design choice.
-//!
-//! The storage engine's core is built on a simple, fast, and generic
-//! **lexicographical (byte-wise) sort**.
-//!
-//! To function correctly, all data types—strings, numbers, and composites—must
-//! sort correctly using the same universal rule.
-//!
-//! - **Strings** naturally sort lexicographically.
-//! - **Little-Endian** numbers (the native format for most CPUs) **do not**. For example,
-//!   as bytes, `256` would sort before `1`.
-//! - **Big-Endian** numbers **do**. Their byte order matches their numeric order, allowing
-//!   them to be sorted correctly with the same logic as strings.
-//!
-//! This requires a fast byte-swap when decoding numbers for computation, but this
-//! small, one-time cost is far outweighed by the massive simplification and
-//! performance gain of a unified, type-agnostic sorting and searching core.
+//! Payloads for all numerics/floats are stored in **little-endian (LE)**.
+//! The column store builds value-order using a per-column `ValueOrderPolicy`
+//! that maps LE bytes to numeric/IEEE order in registers; we never store
+//! big-endian payloads or duplicate sort-key blobs in the index.
 
 #![forbid(unsafe_code)]
 
@@ -50,20 +34,20 @@ pub use bytes::*;
 pub mod codec;
 pub use codec::*;
 
-pub mod be_i64;
-pub use be_i64::*;
+pub mod le_i64;
+pub use le_i64::*;
 
-pub mod be_u8;
-pub use be_u8::*;
+pub mod le_u8;
+pub use le_u8::*;
 
-pub mod be_u16;
-pub use be_u16::*;
+pub mod le_u16;
+pub use le_u16::*;
 
-pub mod be_u32;
-pub use be_u32::*;
+pub mod le_u32;
+pub use le_u32::*;
 
-pub mod be_u64;
-pub use be_u64::*;
+pub mod le_u64;
+pub use le_u64::*;
 
 pub mod bool;
 pub use bool::*;
@@ -97,43 +81,43 @@ impl EncodeInto for String {
     }
 }
 
-// i64 → BeI64
+// i64 → LeI64
 impl EncodeInto for i64 {
     #[inline]
     fn encode_into(&self, dst: &mut Vec<u8>) {
-        BeI64::encode_into(dst, self).unwrap();
+        LeI64::encode_into(dst, self).unwrap();
     }
 }
 
-// u8 → BeU8
+// u8 → LeU8
 impl EncodeInto for u8 {
     #[inline]
     fn encode_into(&self, dst: &mut Vec<u8>) {
-        BeU8::encode_into(dst, self).unwrap();
+        LeU8::encode_into(dst, self).unwrap();
     }
 }
 
-// u16 → BeU16
+// u16 → LeU16
 impl EncodeInto for u16 {
     #[inline]
     fn encode_into(&self, dst: &mut Vec<u8>) {
-        BeU16::encode_into(dst, self).unwrap();
+        LeU16::encode_into(dst, self).unwrap();
     }
 }
 
-// u32 → BeU32
+// u32 → LeU32
 impl EncodeInto for u32 {
     #[inline]
     fn encode_into(&self, dst: &mut Vec<u8>) {
-        BeU32::encode_into(dst, self).unwrap();
+        LeU32::encode_into(dst, self).unwrap();
     }
 }
 
-// u64 → BeU64
+// u64 → LeU64
 impl EncodeInto for u64 {
     #[inline]
     fn encode_into(&self, dst: &mut Vec<u8>) {
-        BeU64::encode_into(dst, self).unwrap();
+        LeU64::encode_into(dst, self).unwrap();
     }
 }
 

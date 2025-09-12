@@ -42,6 +42,27 @@ fn append_one_put(
     store.append_many(puts, opts);
 }
 
+#[inline]
+fn append_one_put_with_policy(
+    store: &ColumnStore<MemPager>,
+    fid: LogicalFieldId,
+    items: Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)>,
+    policy: llkv_column_map::types::ValueOrderPolicy,
+) {
+    let puts = vec![Put {
+        field_id: fid,
+        items,
+    }];
+    let opts = AppendOptions {
+        mode: ValueMode::Auto,
+        segment_max_entries: 100_000,
+        segment_max_bytes: 32 << 20,
+        last_write_wins_in_batch: true,
+        value_order: Some(policy),
+    };
+    store.append_many(puts, opts);
+}
+
 /// Run a value-ordered scan (ascending) over `fid` and return the raw
 /// encoded value frames as owned Vec<u8> (avoid lifetime issues).
 #[inline]
@@ -234,7 +255,12 @@ fn test_i64_order_roundtrip() {
     assert_ne!(nums.to_vec(), expect, "seed order must differ");
 
     let items = build_items_from_decoded(DataType::I64, &vals);
-    append_one_put(&store, fid, items);
+    append_one_put_with_policy(
+        &store,
+        fid,
+        items,
+        llkv_column_map::types::ValueOrderPolicy::SignedLe,
+    );
 
     // Value-ordered scan (ascending)
     let frames = scan_value_frames(&store, fid);
@@ -273,7 +299,12 @@ fn test_categoryid_order_roundtrip() {
     assert_ne!(cats.to_vec(), expect, "seed order must differ");
 
     let items = build_items_from_decoded(DataType::CategoryId, &vals);
-    append_one_put(&store, fid, items);
+    append_one_put_with_policy(
+        &store,
+        fid,
+        items,
+        llkv_column_map::types::ValueOrderPolicy::UnsignedLe,
+    );
 
     // Value-ordered scan (ascending)
     let frames = scan_value_frames(&store, fid);

@@ -2,7 +2,6 @@ use super::ColumnStore;
 use crate::bounds::ValueBound;
 use crate::column_index::{
     ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, ValueDirL2, ValueIndex,
-    ValueSortKeys,
 };
 use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::types::{
@@ -19,6 +18,171 @@ use std::borrow::Cow;
 enum PlannedWriteLayout {
     Fixed { width: ByteWidth },
     Variable, // offsets will be computed per segment
+}
+
+// -------- helpers for building value index without duplicating payloads --------
+
+fn build_tags_from_values(values: &[Vec<u8>], tag_len: u8) -> Vec<u8> {
+    let tlen = tag_len as usize;
+    let mut tags = Vec::with_capacity(values.len() * tlen);
+    for v in values {
+        let mut buf = [0u8; 16];
+        let take = core::cmp::min(tlen, v.len());
+        buf[..take].copy_from_slice(&v[..take]);
+        tags.extend_from_slice(&buf[..tlen]);
+    }
+    tags
+}
+
+fn prefix_tag(v: &Vec<u8>, tag_len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; tag_len];
+    let take = core::cmp::min(tag_len, v.len());
+    out[..take].copy_from_slice(&v[..take]);
+    out
+}
+
+fn first_mapped_byte(v: &Vec<u8>, width: usize, policy: ValueOrderPolicy) -> u8 {
+    use crate::codecs::orderkey;
+    match (policy, width) {
+        (ValueOrderPolicy::UnsignedLe, 1) => v[0],
+        (ValueOrderPolicy::UnsignedLe, 2) => orderkey::u16_le_to_sort2(<[u8;2]>::try_from(&v[..2]).unwrap())[0],
+        (ValueOrderPolicy::UnsignedLe, 4) => orderkey::u32_le_to_sort4(<[u8;4]>::try_from(&v[..4]).unwrap())[0],
+        (ValueOrderPolicy::UnsignedLe, 8) => orderkey::u64_le_to_sort8(<[u8;8]>::try_from(&v[..8]).unwrap())[0],
+        (ValueOrderPolicy::SignedLe, 1) => orderkey::i8_to_sort1(v[0] as i8)[0],
+        (ValueOrderPolicy::SignedLe, 2) => orderkey::i16_le_to_sort2(<[u8;2]>::try_from(&v[..2]).unwrap())[0],
+        (ValueOrderPolicy::SignedLe, 4) => orderkey::i32_le_to_sort4(<[u8;4]>::try_from(&v[..4]).unwrap())[0],
+        (ValueOrderPolicy::SignedLe, 8) => orderkey::i64_le_to_sort8(<[u8;8]>::try_from(&v[..8]).unwrap())[0],
+        (ValueOrderPolicy::F32Le, 4) => orderkey::f32_le_to_sort4(<[u8;4]>::try_from(&v[..4]).unwrap())[0],
+        (ValueOrderPolicy::F64Le, 8) => orderkey::f64_le_to_sort8(<[u8;8]>::try_from(&v[..8]).unwrap())[0],
+        _ => *v.get(0).unwrap_or(&0),
+    }
+}
+
+fn second_mapped_byte(v: &Vec<u8>, width: usize, policy: ValueOrderPolicy) -> u8 {
+    use crate::codecs::orderkey;
+    match (policy, width) {
+        (ValueOrderPolicy::UnsignedLe, 2) => orderkey::u16_le_to_sort2(<[u8;2]>::try_from(&v[..2]).unwrap())[1],
+        (ValueOrderPolicy::UnsignedLe, 4) => orderkey::u32_le_to_sort4(<[u8;4]>::try_from(&v[..4]).unwrap())[1],
+        (ValueOrderPolicy::UnsignedLe, 8) => orderkey::u64_le_to_sort8(<[u8;8]>::try_from(&v[..8]).unwrap())[1],
+        (ValueOrderPolicy::SignedLe, 2) => orderkey::i16_le_to_sort2(<[u8;2]>::try_from(&v[..2]).unwrap())[1],
+        (ValueOrderPolicy::SignedLe, 4) => orderkey::i32_le_to_sort4(<[u8;4]>::try_from(&v[..4]).unwrap())[1],
+        (ValueOrderPolicy::SignedLe, 8) => orderkey::i64_le_to_sort8(<[u8;8]>::try_from(&v[..8]).unwrap())[1],
+        (ValueOrderPolicy::F32Le, 4) => orderkey::f32_le_to_sort4(<[u8;4]>::try_from(&v[..4]).unwrap())[1],
+        (ValueOrderPolicy::F64Le, 8) => orderkey::f64_le_to_sort8(<[u8;8]>::try_from(&v[..8]).unwrap())[1],
+        _ => *v.get(1).unwrap_or(&0),
+    }
+}
+
+fn cmp_fixed_policy(a: &Vec<u8>, b: &Vec<u8>, width: usize, policy: ValueOrderPolicy) -> std::cmp::Ordering {
+    match (policy, width) {
+        (ValueOrderPolicy::UnsignedLe, 1) => a[0].cmp(&b[0]),
+        (ValueOrderPolicy::UnsignedLe, 2) => u16::from_le_bytes(<[u8;2]>::try_from(&a[..2]).unwrap()).cmp(&u16::from_le_bytes(<[u8;2]>::try_from(&b[..2]).unwrap())),
+        (ValueOrderPolicy::UnsignedLe, 4) => u32::from_le_bytes(<[u8;4]>::try_from(&a[..4]).unwrap()).cmp(&u32::from_le_bytes(<[u8;4]>::try_from(&b[..4]).unwrap())),
+        (ValueOrderPolicy::UnsignedLe, 8) => u64::from_le_bytes(<[u8;8]>::try_from(&a[..8]).unwrap()).cmp(&u64::from_le_bytes(<[u8;8]>::try_from(&b[..8]).unwrap())),
+        (ValueOrderPolicy::SignedLe, 1) => (a[0] as i8).cmp(&(b[0] as i8)),
+        (ValueOrderPolicy::SignedLe, 2) => i16::from_le_bytes(<[u8;2]>::try_from(&a[..2]).unwrap()).cmp(&i16::from_le_bytes(<[u8;2]>::try_from(&b[..2]).unwrap())),
+        (ValueOrderPolicy::SignedLe, 4) => i32::from_le_bytes(<[u8;4]>::try_from(&a[..4]).unwrap()).cmp(&i32::from_le_bytes(<[u8;4]>::try_from(&b[..4]).unwrap())),
+        (ValueOrderPolicy::SignedLe, 8) => i64::from_le_bytes(<[u8;8]>::try_from(&a[..8]).unwrap()).cmp(&i64::from_le_bytes(<[u8;8]>::try_from(&b[..8]).unwrap())),
+        (ValueOrderPolicy::F32Le, 4) => {
+            use crate::codecs::orderkey;
+            orderkey::f32_le_to_sort4(<[u8;4]>::try_from(&a[..4]).unwrap()).cmp(&orderkey::f32_le_to_sort4(<[u8;4]>::try_from(&b[..4]).unwrap()))
+        }
+        (ValueOrderPolicy::F64Le, 8) => {
+            use crate::codecs::orderkey;
+            orderkey::f64_le_to_sort8(<[u8;8]>::try_from(&a[..8]).unwrap()).cmp(&orderkey::f64_le_to_sort8(<[u8;8]>::try_from(&b[..8]).unwrap()))
+        }
+        _ => a.cmp(b),
+    }
+}
+
+fn build_value_index_fixed_with_policy(
+    values: &[Vec<u8>],
+    width: usize,
+    policy: ValueOrderPolicy,
+    hot_threshold: usize,
+) -> BuiltValueDirs {
+    let n = values.len();
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    idx.sort_by(|&a, &b| {
+        let aa = a as usize; let bb = b as usize;
+        cmp_fixed_policy(&values[aa], &values[bb], width, policy)
+    });
+    // L1
+    let mut l1 = vec![0u32; 257];
+    let mut cur = 0usize;
+    for b0 in 0..256usize {
+        while cur < n {
+            let fb = first_mapped_byte(&values[idx[cur] as usize], width, policy);
+            if (fb as usize) != b0 { break; }
+            cur += 1;
+        }
+        l1[b0 + 1] = cur as u32;
+    }
+    // L2
+    let mut l2: Vec<(u8, Vec<u32>)> = Vec::new();
+    for b0 in 0..256usize {
+        let start = l1[b0] as usize; let end = l1[b0+1] as usize; let len = end-start;
+        if len >= hot_threshold {
+            let mut dir = vec![0u32; 257];
+            let mut cur2 = start;
+            for b1 in 0..256usize {
+                while cur2 < end {
+                    let sb = second_mapped_byte(&values[idx[cur2] as usize], width, policy);
+                    if (sb as usize) != b1 { break; }
+                    cur2 += 1;
+                }
+                dir[b1 + 1] = (cur2 - start) as u32;
+            }
+            l2.push((b0 as u8, dir));
+        }
+    }
+    BuiltValueDirs { l1_dir: l1, value_order: idx, l2_dirs: l2 }
+}
+
+fn build_value_index_from_values_with_tags(
+    values: &[Vec<u8>],
+    tag_len: u8,
+    hot_threshold: usize,
+) -> BuiltValueDirs {
+    let n = values.len();
+    let tlen = tag_len as usize;
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    idx.sort_by(|&a, &b| {
+        let aa = a as usize; let bb = b as usize;
+        let ta = prefix_tag(&values[aa], tlen);
+        let tb = prefix_tag(&values[bb], tlen);
+        let c = ta.cmp(&tb);
+        if c != std::cmp::Ordering::Equal { c } else { values[aa].cmp(&values[bb]) }
+    });
+    // L1/L2 on tags
+    let mut l1 = vec![0u32; 257];
+    let mut cur = 0usize;
+    for b0 in 0..256usize {
+        while cur < n {
+            let b = *prefix_tag(&values[idx[cur] as usize], tlen).get(0).unwrap_or(&0);
+            if (b as usize) != b0 { break; }
+            cur += 1;
+        }
+        l1[b0 + 1] = cur as u32;
+    }
+    let mut l2: Vec<(u8, Vec<u32>)> = Vec::new();
+    for b0 in 0..256usize {
+        let start = l1[b0] as usize; let end = l1[b0+1] as usize; let len = end - start;
+        if len >= hot_threshold {
+            let mut dir = vec![0u32; 257];
+            let mut cur2 = start;
+            for b1 in 0..256usize {
+                while cur2 < end {
+                    let b = *prefix_tag(&values[idx[cur2] as usize], tlen).get(1).unwrap_or(&0);
+                    if (b as usize) != b1 { break; }
+                    cur2 += 1;
+                }
+                dir[b1 + 1] = (cur2 - start) as u32;
+            }
+            l2.push((b0 as u8, dir));
+        }
+    }
+    BuiltValueDirs { l1_dir: l1, value_order: idx, l2_dirs: l2 }
 }
 struct PlannedWriteChunk {
     field_id: LogicalFieldId,
@@ -308,164 +472,22 @@ impl<P: Pager> ColumnStore<P> {
                 let (_, ci) = cache.get(&chunk.field_id).expect("column index present");
                 ci.value_order
             };
-            let (sort_keys_opt, built_value_dirs_opt) = match &chunk.layout {
+            let (tag_len, tags, built_value_dirs_opt) = match &chunk.layout {
                 PlannedWriteLayout::Fixed { width } => {
                     let width = *width as usize;
-                    let mut sk_bytes = Vec::with_capacity(chunk.values.len() * width);
-                    match col_policy {
-                        ValueOrderPolicy::Raw => {
-                            for v in &chunk.values {
-                                sk_bytes.extend_from_slice(v);
-                            }
-                        }
-                        ValueOrderPolicy::UnsignedLe => match width {
-                            1 => {
-                                for v in &chunk.values {
-                                    sk_bytes.extend_from_slice(&orderkey::u8_to_sort1(v[0]));
-                                }
-                            }
-                            2 => {
-                                for v in &chunk.values {
-                                    let mut a = [0u8; 2];
-                                    a.copy_from_slice(&v[..2]);
-                                    sk_bytes.extend_from_slice(&orderkey::u16_le_to_sort2(a));
-                                }
-                            }
-                            4 => {
-                                for v in &chunk.values {
-                                    let mut a = [0u8; 4];
-                                    a.copy_from_slice(&v[..4]);
-                                    sk_bytes.extend_from_slice(&orderkey::u32_le_to_sort4(a));
-                                }
-                            }
-                            8 => {
-                                for v in &chunk.values {
-                                    let mut a = [0u8; 8];
-                                    a.copy_from_slice(&v[..8]);
-                                    sk_bytes.extend_from_slice(&orderkey::u64_le_to_sort8(a));
-                                }
-                            }
-                            _ => {
-                                // Fallback: raw bytes when width is unusual
-                                for v in &chunk.values {
-                                    sk_bytes.extend_from_slice(v);
-                                }
-                            }
-                        },
-                        ValueOrderPolicy::SignedLe => match width {
-                            1 => {
-                                for v in &chunk.values {
-                                    sk_bytes.extend_from_slice(&orderkey::i8_to_sort1(v[0] as i8));
-                                }
-                            }
-                            2 => {
-                                for v in &chunk.values {
-                                    let mut a = [0u8; 2];
-                                    a.copy_from_slice(&v[..2]);
-                                    sk_bytes.extend_from_slice(&orderkey::i16_le_to_sort2(a));
-                                }
-                            }
-                            4 => {
-                                for v in &chunk.values {
-                                    let mut a = [0u8; 4];
-                                    a.copy_from_slice(&v[..4]);
-                                    sk_bytes.extend_from_slice(&orderkey::i32_le_to_sort4(a));
-                                }
-                            }
-                            8 => {
-                                for v in &chunk.values {
-                                    let mut a = [0u8; 8];
-                                    a.copy_from_slice(&v[..8]);
-                                    sk_bytes.extend_from_slice(&orderkey::i64_le_to_sort8(a));
-                                }
-                            }
-                            _ => {
-                                for v in &chunk.values {
-                                    sk_bytes.extend_from_slice(v);
-                                }
-                            }
-                        },
-                        ValueOrderPolicy::F32Le => {
-                            if width == 4 {
-                                for v in &chunk.values {
-                                    let mut a = [0u8; 4];
-                                    a.copy_from_slice(&v[..4]);
-                                    sk_bytes.extend_from_slice(&orderkey::f32_le_to_sort4(a));
-                                }
-                            } else {
-                                for v in &chunk.values {
-                                    sk_bytes.extend_from_slice(v);
-                                }
-                            }
-                        }
-                        ValueOrderPolicy::F64Le => {
-                            if width == 8 {
-                                for v in &chunk.values {
-                                    let mut a = [0u8; 8];
-                                    a.copy_from_slice(&v[..8]);
-                                    sk_bytes.extend_from_slice(&orderkey::f64_le_to_sort8(a));
-                                }
-                            } else {
-                                for v in &chunk.values {
-                                    sk_bytes.extend_from_slice(v);
-                                }
-                            }
-                        }
-                    }
-                    let width_bw = width as ByteWidth;
-                    let vsk = ValueSortKeys::Fixed {
-                        width: width_bw,
-                        bytes: sk_bytes.clone(),
-                    };
                     let hot_threshold = 4096;
-                    let b = Self::build_value_index_from_slices(
-                        |i| {
-                            let a = i * width;
-                            &sk_bytes[a..a + width]
-                        },
-                        chunk.values.len(),
-                        hot_threshold,
-                    );
-                    (Some(vsk), Some(b))
+                    let b = build_value_index_fixed_with_policy(&chunk.values, width, col_policy, hot_threshold);
+                    (0u8, Vec::new(), Some(b))
                 }
                 PlannedWriteLayout::Variable => {
-                    // Build var offsets once for sort-key storage
-                    let mut sk_bytes = Vec::new();
-                    let mut offsets: Vec<u32> = Vec::with_capacity(chunk.values.len() + 1);
-                    let mut acc = 0u32;
-                    offsets.push(acc);
-                    for v in &chunk.values {
-                        acc += v.len() as u32;
-                        sk_bytes.extend_from_slice(v);
-                        offsets.push(acc);
-                    }
-                    // Budget guard: avoid duplicating pathologically large single values.
-                    // If any single value exceeds this threshold, skip building value_index
-                    // for this segment to keep the index blob small.
-                    const MAX_VAR_SORTKEY_ENTRY: usize = 64 * 1024; // 64 KiB per entry
-                    if chunk.values.iter().any(|v| v.len() > MAX_VAR_SORTKEY_ENTRY) {
-                        // Skip building value_index for this segment.
-                        (None, None)
-                    } else {
-                        let vsk = ValueSortKeys::Variable {
-                            offsets: offsets.clone(),
-                            bytes: sk_bytes.clone(),
-                        };
-                        let hot_threshold = 4096; // tune later
-                        let b = Self::build_value_index_from_slices(
-                            |i| {
-                                let a = offsets[i] as usize;
-                                let b = offsets[i + 1] as usize;
-                                &sk_bytes[a..b]
-                            },
-                            chunk.values.len(),
-                            hot_threshold,
-                        );
-                        (Some(vsk), Some(b))
-                    }
+                    const TAG_LEN: u8 = 16;
+                    let tags = build_tags_from_values(&chunk.values, TAG_LEN);
+                    let hot_threshold = 4096; // tune later
+                    let b = build_value_index_from_values_with_tags(&chunk.values, TAG_LEN, hot_threshold);
+                    (TAG_LEN, tags, Some(b))
                 }
             };
-            if let (Some(sort_keys), Some(built_value_dirs)) = (sort_keys_opt, built_value_dirs_opt)
+            if let Some(built_value_dirs) = built_value_dirs_opt
             {
                 let value_index = ValueIndex {
                     value_order: built_value_dirs
@@ -489,7 +511,8 @@ impl<P: Pager> ColumnStore<P> {
                             dir257: dir257.into_iter().map(|v| v as IndexEntryCount).collect(),
                         })
                         .collect(),
-                    sort_keys,
+                    tag_len,
+                    tags,
                 };
                 seg.value_index = Some(value_index);
             }

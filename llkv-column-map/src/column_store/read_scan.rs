@@ -16,10 +16,10 @@
 //!   of the chosen ordering (value/key).
 
 use crate::bounds::ValueBound;
-use crate::column_index::{IndexSegment, ValueIndex, ValueSortKeys};
+use crate::column_index::{IndexSegment, ValueIndex};
 use crate::layout::{KeyLayout, ValueLayout};
 use crate::storage::pager::{BatchGet, GetResult, Pager};
-use crate::types::{LogicalFieldId, LogicalKeyBytes, PhysicalKey, TypedKind, TypedValue};
+use crate::types::{LogicalFieldId, LogicalKeyBytes, PhysicalKey, TypedKind, TypedValue, ValueOrderPolicy};
 use crate::views::ValueSlice;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -122,6 +122,7 @@ struct SegCtx<P: Pager> {
     dominators_active: Vec<usize>,
     /// Shadow (index-only) segments that dominate this segment (physical keys).
     dominators_shadow: Vec<PhysicalKey>,
+    policy: ValueOrderPolicy,
 }
 
 #[inline]
@@ -385,6 +386,11 @@ struct Node<P: Pager> {
     /// Ordering bytes (KEY for key-ordered scans; SORT-KEY for value-ordered scans).
     ord: KeyRef,
     reverse: bool,
+    /// Value-order context
+    by_value: bool,
+    is_var: bool,
+    value_width: usize, // 0 if var
+    policy: ValueOrderPolicy,
 }
 
 impl<P: Pager> Node<P> {
@@ -392,6 +398,39 @@ impl<P: Pager> Node<P> {
     fn bytes(&self) -> &[u8] {
         self.ord.as_slice()
     }
+}
+
+#[inline(always)]
+fn cmp_fixed_le_policy_bytes(
+    a: &[u8],
+    b: &[u8],
+    width: usize,
+    policy: ValueOrderPolicy,
+    reverse: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    let ord = match (policy, width) {
+        (ValueOrderPolicy::UnsignedLe, 1) => a[0].cmp(&b[0]),
+        (ValueOrderPolicy::UnsignedLe, 2) => u16::from_le_bytes(a[..2].try_into().unwrap()).cmp(&u16::from_le_bytes(b[..2].try_into().unwrap())),
+        (ValueOrderPolicy::UnsignedLe, 4) => u32::from_le_bytes(a[..4].try_into().unwrap()).cmp(&u32::from_le_bytes(b[..4].try_into().unwrap())),
+        (ValueOrderPolicy::UnsignedLe, 8) => u64::from_le_bytes(a[..8].try_into().unwrap()).cmp(&u64::from_le_bytes(b[..8].try_into().unwrap())),
+        (ValueOrderPolicy::SignedLe, 1) => (a[0] as i8).cmp(&(b[0] as i8)),
+        (ValueOrderPolicy::SignedLe, 2) => i16::from_le_bytes(a[..2].try_into().unwrap()).cmp(&i16::from_le_bytes(b[..2].try_into().unwrap())),
+        (ValueOrderPolicy::SignedLe, 4) => i32::from_le_bytes(a[..4].try_into().unwrap()).cmp(&i32::from_le_bytes(b[..4].try_into().unwrap())),
+        (ValueOrderPolicy::SignedLe, 8) => i64::from_le_bytes(a[..8].try_into().unwrap()).cmp(&i64::from_le_bytes(b[..8].try_into().unwrap())),
+        (ValueOrderPolicy::F32Le, 4) => {
+            let ma = crate::codecs::orderkey::f32_le_to_sort4(a[..4].try_into().unwrap());
+            let mb = crate::codecs::orderkey::f32_le_to_sort4(b[..4].try_into().unwrap());
+            ma.cmp(&mb)
+        }
+        (ValueOrderPolicy::F64Le, 8) => {
+            let ma = crate::codecs::orderkey::f64_le_to_sort8(a[..8].try_into().unwrap());
+            let mb = crate::codecs::orderkey::f64_le_to_sort8(b[..8].try_into().unwrap());
+            ma.cmp(&mb)
+        }
+        _ => a.cmp(b),
+    };
+    if !reverse { ord } else { ord.reverse() }
 }
 
 impl<P: Pager> Eq for Node<P> {}
@@ -431,12 +470,31 @@ impl<P: Pager> Ord for Node<P> {
             return ord;
         }
 
-        // Full bytes comparison only on ties inside the same 16-byte tag bucket
-        ord = if !self.reverse {
-            self.bytes().cmp(other.bytes())
+        // Full comparison on ties: policy-aware if by-value
+        if self.by_value {
+            if self.is_var {
+                // Compare tags already equal; fall back to payload slices
+                let a = &self.val.data.as_ref()[self.val.start as usize..self.val.end as usize];
+                let b = &other.val.data.as_ref()[other.val.start as usize..other.val.end as usize];
+                ord = if !self.reverse { a.cmp(b) } else { b.cmp(a) };
+            } else {
+                // Fixed-width numeric/float compare using policy
+                ord = cmp_fixed_le_policy_bytes(
+                    &self.val.data.as_ref()[self.val.start as usize..self.val.end as usize],
+                    &other.val.data.as_ref()[other.val.start as usize..other.val.end as usize],
+                    self.value_width,
+                    self.policy,
+                    self.reverse,
+                );
+            }
         } else {
-            other.bytes().cmp(self.bytes())
-        };
+            // Key-ordered: compare ord bytes
+            ord = if !self.reverse {
+                self.bytes().cmp(other.bytes())
+            } else {
+                other.bytes().cmp(self.bytes())
+            };
+        }
         if ord != Equal {
             return ord;
         }
@@ -490,11 +548,23 @@ fn bucket_and_tag128_from_bytes(
     }
     // Left-pad: place the taken bytes at the MSB side of the 16-byte lane.
     let pad_bytes = 16usize.saturating_sub(take);
-    acc <<= (pad_bytes * 8) as u32;
+    let shift_bits = (pad_bytes * 8) as u32;
+    if shift_bits < 128 {
+        acc <<= shift_bits;
+    }
 
     let hi = (acc >> 64) as u64;
     let lo = acc as u64;
     (bucket, hi, lo)
+}
+
+#[inline(always)]
+fn slice_tag_for_row<'a>(seg: &'a IndexSegment, row_pos: usize) -> &'a [u8] {
+    let vix = seg.value_index.as_ref().expect("value_index required");
+    if vix.tag_len == 0 { return &[]; }
+    let tlen = vix.tag_len as usize;
+    let a = row_pos * tlen;
+    &vix.tags[a..a + tlen]
 }
 
 // TODO: Rename * from `scan_values_*` to `scan_*` since this can do key or value based scanning
@@ -585,12 +655,9 @@ impl<P: Pager> ValueScan<P> {
             let mut ranks = FxHashMap::default();
             for (rank, r) in colindex.segments.iter().enumerate() {
                 let keep = if by_value {
-                    overlap_bounds(
-                        &opts.lo,
-                        &opts.hi,
-                        r.value_min.as_ref(),
-                        r.value_max.as_ref(),
-                    )
+                    // LE policy-aware value pruning requires policy + width, which we
+                    // don't have at IndexSegmentRef time. Be conservative: keep.
+                    true
                 } else {
                     overlap_bounds_key(
                         &opts.lo,
@@ -727,11 +794,17 @@ impl<P: Pager> ValueScan<P> {
                     Some(v) => v,
                     None => return Err(ScanError::ValueIndexMissing(r.index_physical_key)),
                 };
-                range_in_value_index::<P>(&seg, vix, &data, &opts.lo, &opts.hi)
+                let policy = colindex.value_order; // per-column
+                range_in_value_index::<P>(&seg, vix, &data, &opts.lo, &opts.hi, policy)
             } else {
                 range_in_key_index(&seg, &opts.lo, &opts.hi)
             };
             if begin >= end {
+                // This segment has no rows in the current value/key window.
+                // However, it may still be needed for shadow (conflict) checks.
+                // Move its IndexSegment into the shadow map so `is_shadowed_for_seg`
+                // can probe membership by key.
+                shadow_seg_map.insert(r.index_physical_key, seg);
                 continue;
             }
 
@@ -760,6 +833,7 @@ impl<P: Pager> ValueScan<P> {
                 max_key,
                 dominators_active: Vec::new(),
                 dominators_shadow: Vec::new(),
+                policy: colindex.value_order,
             });
 
             // Head depends on direction.
@@ -778,23 +852,106 @@ impl<P: Pager> ValueScan<P> {
             let val = slice_value::<P>(seg_ref, data_ref, head_row);
 
             if by_value {
-                let ord_bytes = slice_sort_key(seg_ref, head_row);
-                let (bkt, hi, lo) = bucket_and_tag128_bytes_fast(
-                    ord_bytes,
-                    opts.bucket_prefix_len,
-                    opts.head_tag_len,
-                );
-                pq.push(Node {
-                    bucket: bkt,
-                    head_tag_hi: hi,
-                    head_tag_lo: lo,
-                    rank,
-                    seg_idx,
-                    pos: head_pos,
-                    val,
-                    ord: KeyRef::from_slice(ord_bytes),
-                    reverse: matches!(opts.dir, Direction::Reverse),
-                });
+                // Use tags when present (var-width); otherwise map LE payload to order-bytes.
+                let use_tags = seg_ref
+                    .value_index
+                    .as_ref()
+                    .map(|v| v.tag_len > 0)
+                    .unwrap_or(false);
+                if use_tags {
+                    let ord_bytes = slice_tag_for_row(seg_ref, head_row);
+                    let (bkt, hi, lo) = bucket_and_tag128_bytes_fast(
+                        ord_bytes,
+                        opts.bucket_prefix_len,
+                        opts.head_tag_len,
+                    );
+                    pq.push(Node {
+                        bucket: bkt,
+                        head_tag_hi: hi,
+                        head_tag_lo: lo,
+                        rank,
+                        seg_idx,
+                        pos: head_pos,
+                        val,
+                        ord: KeyRef::from_slice(ord_bytes),
+                        reverse: matches!(opts.dir, Direction::Reverse),
+                        by_value: true,
+                        is_var: true,
+                        value_width: 0,
+                        policy: colindex.value_order,
+                    });
+                } else {
+                    // Fixed width: build order-bytes from LE payload per policy for bucket/tag.
+                    let payload = &data_ref.as_ref()[val.start as usize..val.end as usize];
+                    let ord_tmp1;
+                    let ord_tmp2;
+                    let ord_tmp4;
+                    let ord_tmp8;
+                    let ord_bytes: &[u8] = match (colindex.value_order, &seg_ref.value_layout) {
+                        (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 4 => {
+                            ord_tmp4 = crate::codecs::orderkey::u32_le_to_sort4(payload[..4].try_into().unwrap());
+                            &ord_tmp4
+                        }
+                        (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 8 => {
+                            ord_tmp8 = crate::codecs::orderkey::u64_le_to_sort8(payload[..8].try_into().unwrap());
+                            &ord_tmp8
+                        }
+                        (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 2 => {
+                            ord_tmp2 = crate::codecs::orderkey::u16_le_to_sort2(payload[..2].try_into().unwrap());
+                            &ord_tmp2
+                        }
+                        (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 1 => {
+                            ord_tmp1 = [payload[0]];
+                            &ord_tmp1
+                        }
+                        (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 1 => {
+                            ord_tmp1 = crate::codecs::orderkey::i8_to_sort1(payload[0] as i8);
+                            &ord_tmp1
+                        }
+                        (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 2 => {
+                            ord_tmp2 = crate::codecs::orderkey::i16_le_to_sort2(payload[..2].try_into().unwrap());
+                            &ord_tmp2
+                        }
+                        (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 4 => {
+                            ord_tmp4 = crate::codecs::orderkey::i32_le_to_sort4(payload[..4].try_into().unwrap());
+                            &ord_tmp4
+                        }
+                        (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 8 => {
+                            ord_tmp8 = crate::codecs::orderkey::i64_le_to_sort8(payload[..8].try_into().unwrap());
+                            &ord_tmp8
+                        }
+                        (ValueOrderPolicy::F32Le, ValueLayout::FixedWidth { width }) if *width == 4 => {
+                            ord_tmp4 = crate::codecs::orderkey::f32_le_to_sort4(payload[..4].try_into().unwrap());
+                            &ord_tmp4
+                        }
+                        (ValueOrderPolicy::F64Le, ValueLayout::FixedWidth { width }) if *width == 8 => {
+                            ord_tmp8 = crate::codecs::orderkey::f64_le_to_sort8(payload[..8].try_into().unwrap());
+                            &ord_tmp8
+                        }
+                        _ => payload,
+                    };
+                    let (bkt, hi, lo) = bucket_and_tag128_bytes_fast(
+                        ord_bytes,
+                        opts.bucket_prefix_len,
+                        opts.head_tag_len,
+                    );
+                    let vw = match seg_ref.value_layout { ValueLayout::FixedWidth{width} => width as usize, _ => 0 };
+                    pq.push(Node {
+                        bucket: bkt,
+                        head_tag_hi: hi,
+                        head_tag_lo: lo,
+                        rank,
+                        seg_idx,
+                        pos: head_pos,
+                        val,
+                        ord: KeyRef::from_slice(payload),
+                        reverse: matches!(opts.dir, Direction::Reverse),
+                        by_value: true,
+                        is_var: false,
+                        value_width: vw,
+                        policy: colindex.value_order,
+                    });
+                }
             } else {
                 let key_slice = KeyLayout::slice_key_by_layout(
                     &seg_ref.logical_key_bytes,
@@ -816,6 +973,10 @@ impl<P: Pager> ValueScan<P> {
                     val,
                     ord: KeyRef::from_slice(key_slice),
                     reverse: matches!(opts.dir, Direction::Reverse),
+                    by_value: false,
+                    is_var: false,
+                    value_width: 0,
+                    policy: ValueOrderPolicy::Raw,
                 });
             }
         }
@@ -1093,12 +1254,54 @@ impl<P: Pager> Iterator for ValueScan<P> {
             // Helper to push the next head if present.
             let mut push_next = |np: usize, val: ValueSlice<P::Blob>| {
                 if self.by_value {
-                    let kb = next_key_for_order.expect("prepared sort-key for value-ordered reseed");
+                    // Compute ord bytes for next head: tags if present, else mapped LE payload per policy.
+                    let use_tags = self.segs[seg_idx]
+                        .seg
+                        .value_index
+                        .as_ref()
+                        .map(|v| v.tag_len > 0)
+                        .unwrap_or(false);
+                    let ord_bytes: Option<Vec<u8>> = {
+                        let seg = &self.segs[seg_idx].seg;
+                        let row = row_pos_at(seg, np);
+                        if use_tags {
+                            Some(slice_tag_for_row(seg, row).to_vec())
+                        } else {
+                            let a = val.start as usize;
+                            let b = val.end as usize;
+                            let payload = &val.data.as_ref()[a..b];
+                            // For fixed-width, ord bytes for PQ are mapped, but Node.ord is not used.
+                            // We still compute mapped bytes here only for bucket/tag.
+                            let mapped: Vec<u8> = match (self.segs[seg_idx].policy, &seg.value_layout) {
+                                (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 1 => payload[..1].to_vec(),
+                                (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 2 => crate::codecs::orderkey::u16_le_to_sort2(payload[..2].try_into().unwrap()).to_vec(),
+                                (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 4 => crate::codecs::orderkey::u32_le_to_sort4(payload[..4].try_into().unwrap()).to_vec(),
+                                (ValueOrderPolicy::UnsignedLe, ValueLayout::FixedWidth { width }) if *width == 8 => crate::codecs::orderkey::u64_le_to_sort8(payload[..8].try_into().unwrap()).to_vec(),
+                                (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 1 => crate::codecs::orderkey::i8_to_sort1(payload[0] as i8).to_vec(),
+                                (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 2 => crate::codecs::orderkey::i16_le_to_sort2(payload[..2].try_into().unwrap()).to_vec(),
+                                (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 4 => crate::codecs::orderkey::i32_le_to_sort4(payload[..4].try_into().unwrap()).to_vec(),
+                                (ValueOrderPolicy::SignedLe, ValueLayout::FixedWidth { width }) if *width == 8 => crate::codecs::orderkey::i64_le_to_sort8(payload[..8].try_into().unwrap()).to_vec(),
+                                (ValueOrderPolicy::F32Le, ValueLayout::FixedWidth { width }) if *width == 4 => crate::codecs::orderkey::f32_le_to_sort4(payload[..4].try_into().unwrap()).to_vec(),
+                                (ValueOrderPolicy::F64Le, ValueLayout::FixedWidth { width }) if *width == 8 => crate::codecs::orderkey::f64_le_to_sort8(payload[..8].try_into().unwrap()).to_vec(),
+                                _ => payload.to_vec(),
+                            };
+                            Some(mapped)
+                        }
+                    };
+                    let ord_ref = ord_bytes.as_deref().unwrap_or(&[]);
                     let (bkt, hi, lo) = bucket_and_tag128_bytes_fast(
-                        kb.as_slice(),
+                        ord_ref,
                         self.bucket_prefix_len,
                         self.head_tag_len,
                     );
+                    // Prepare KeyRef before moving `val`.
+                    let ord_kref = if use_tags {
+                        KeyRef::from_slice(ord_ref)
+                    } else {
+                        let a = val.start as usize;
+                        let b = val.end as usize;
+                        KeyRef::from_slice(&val.data.as_ref()[a..b])
+                    };
                     self.pq.push(Node {
                         bucket: bkt,
                         head_tag_hi: hi,
@@ -1107,8 +1310,20 @@ impl<P: Pager> Iterator for ValueScan<P> {
                         seg_idx,
                         pos: np,
                         val,
-                        ord: kb,
+                        ord: ord_kref,
                         reverse: self.reverse,
+                        by_value: true,
+                        is_var: self.segs[seg_idx]
+                            .seg
+                            .value_index
+                            .as_ref()
+                            .map(|v| v.tag_len > 0)
+                            .unwrap_or(false),
+                        value_width: match self.segs[seg_idx].seg.value_layout {
+                            ValueLayout::FixedWidth { width } => width as usize,
+                            _ => 0,
+                        },
+                        policy: self.segs[seg_idx].policy,
                     });
                 } else {
                     let kb = next_key_for_order.expect("prepared KeyRef for key-ordered reseed");
@@ -1234,6 +1449,7 @@ fn range_in_value_index<P: Pager>(
     data: &P::Blob,
     lo: &Bound<&[u8]>,
     hi: &Bound<&[u8]>,
+    policy: ValueOrderPolicy,
 ) -> (usize, usize) {
     let n = seg.n_entries as usize;
     if n == 0 {
@@ -1245,8 +1461,8 @@ fn range_in_value_index<P: Pager>(
     //   Excluded(x) -> first k >  x
     let begin = match lo {
         Bound::Unbounded => 0usize,
-        Bound::Included(x) => lower_bound_by_value::<P>(seg, vix, data, x),
-        Bound::Excluded(x) => upper_bound_by_value::<P>(seg, vix, data, x, true),
+        Bound::Included(x) => lower_bound_by_value::<P>(seg, vix, data, x, policy),
+        Bound::Excluded(x) => upper_bound_by_value::<P>(seg, vix, data, x, true, policy),
     };
 
     // Upper bound (exclusive end):
@@ -1254,8 +1470,8 @@ fn range_in_value_index<P: Pager>(
     //   Excluded(x) -> first k >= x
     let end = match hi {
         Bound::Unbounded => n,
-        Bound::Included(x) => upper_bound_by_value::<P>(seg, vix, data, x, true),
-        Bound::Excluded(x) => upper_bound_by_value::<P>(seg, vix, data, x, false),
+        Bound::Included(x) => upper_bound_by_value::<P>(seg, vix, data, x, true, policy),
+        Bound::Excluded(x) => upper_bound_by_value::<P>(seg, vix, data, x, false, policy),
     };
 
     (begin.min(n), end.min(n))
@@ -1310,12 +1526,13 @@ fn lower_bound_by_value<P: Pager>(
     vix: &ValueIndex,
     _data: &P::Blob,
     probe: &[u8],
+    policy: ValueOrderPolicy,
 ) -> usize {
-    let (mut lo, mut hi) = l1_l2_window(vix, probe);
+    let (mut lo, mut hi) = l1_l2_window(seg, vix, probe, policy);
     while lo < hi {
         let mid = (lo + hi) >> 1;
         let pos = row_pos_at(seg, mid);
-        let cmp = cmp_sortkey_at(seg, pos, probe);
+        let cmp = cmp_value_policy_at::<P>(seg, _data, pos, probe, policy);
         if cmp == Ordering::Less {
             lo = mid + 1;
         } else {
@@ -1332,12 +1549,13 @@ fn upper_bound_by_value<P: Pager>(
     _data: &P::Blob,
     probe: &[u8],
     include_equal: bool,
+    policy: ValueOrderPolicy,
 ) -> usize {
-    let (mut lo, mut hi) = l1_l2_window(vix, probe);
+    let (mut lo, mut hi) = l1_l2_window(seg, vix, probe, policy);
     while lo < hi {
         let mid = (lo + hi) >> 1;
         let pos = row_pos_at(seg, mid);
-        let cmp = cmp_sortkey_at(seg, pos, probe);
+        let cmp = cmp_value_policy_at::<P>(seg, _data, pos, probe, policy);
         let go_right = if include_equal {
             cmp != Ordering::Greater
         } else {
@@ -1353,15 +1571,61 @@ fn upper_bound_by_value<P: Pager>(
 }
 
 #[inline(always)]
-fn l1_l2_window(vix: &ValueIndex, probe: &[u8]) -> (usize, usize) {
-    let b0 = probe.first().copied().unwrap_or(0) as usize;
+fn l1_l2_window(seg: &IndexSegment, vix: &ValueIndex, probe: &[u8], policy: ValueOrderPolicy) -> (usize, usize) {
+    // Compute first two comparator bytes in the same domain as the index was built.
+    let (b0_u8, b1_u8) = match &seg.value_layout {
+        ValueLayout::Variable { .. } => {
+            (probe.first().copied().unwrap_or(0), probe.get(1).copied().unwrap_or(0))
+        }
+        ValueLayout::FixedWidth { width } => {
+            let w = *width as usize;
+            match (policy, w) {
+                (ValueOrderPolicy::UnsignedLe, 1) => (probe[0], 0),
+                (ValueOrderPolicy::UnsignedLe, 2) => {
+                    let s = crate::codecs::orderkey::u16_le_to_sort2(probe[..2].try_into().unwrap());
+                    (s[0], s[1])
+                }
+                (ValueOrderPolicy::UnsignedLe, 4) => {
+                    let s = crate::codecs::orderkey::u32_le_to_sort4(probe[..4].try_into().unwrap());
+                    (s[0], s[1])
+                }
+                (ValueOrderPolicy::UnsignedLe, 8) => {
+                    let s = crate::codecs::orderkey::u64_le_to_sort8(probe[..8].try_into().unwrap());
+                    (s[0], s[1])
+                }
+                (ValueOrderPolicy::SignedLe, 1) => (crate::codecs::orderkey::i8_to_sort1(probe[0] as i8)[0], 0),
+                (ValueOrderPolicy::SignedLe, 2) => {
+                    let s = crate::codecs::orderkey::i16_le_to_sort2(probe[..2].try_into().unwrap());
+                    (s[0], s[1])
+                }
+                (ValueOrderPolicy::SignedLe, 4) => {
+                    let s = crate::codecs::orderkey::i32_le_to_sort4(probe[..4].try_into().unwrap());
+                    (s[0], s[1])
+                }
+                (ValueOrderPolicy::SignedLe, 8) => {
+                    let s = crate::codecs::orderkey::i64_le_to_sort8(probe[..8].try_into().unwrap());
+                    (s[0], s[1])
+                }
+                (ValueOrderPolicy::F32Le, 4) => {
+                    let s = crate::codecs::orderkey::f32_le_to_sort4(probe[..4].try_into().unwrap());
+                    (s[0], s[1])
+                }
+                (ValueOrderPolicy::F64Le, 8) => {
+                    let s = crate::codecs::orderkey::f64_le_to_sort8(probe[..8].try_into().unwrap());
+                    (s[0], s[1])
+                }
+                _ => (probe.first().copied().unwrap_or(0), probe.get(1).copied().unwrap_or(0)),
+            }
+        }
+    };
+    let b0 = b0_u8 as usize;
     let start = vix.l1_dir[b0] as usize;
     let end = vix.l1_dir[b0 + 1] as usize;
     if start >= end {
         return (start, end);
     }
     if let Some(dir) = vix.l2_dirs.iter().find(|d| d.first_byte as usize == b0) {
-        let b1 = probe.get(1).copied().unwrap_or(0) as usize;
+        let b1 = b1_u8 as usize;
         let off0 = dir.dir257[b1] as usize;
         let off1 = dir.dir257[b1 + 1] as usize;
         return (start + off0, start + off1);
@@ -1403,20 +1667,68 @@ fn slice_value<P: Pager>(seg: &IndexSegment, data: &P::Blob, pos: usize) -> Valu
 }
 
 #[inline(always)]
-fn slice_sort_key<'a>(seg: &'a IndexSegment, row_pos: usize) -> &'a [u8] {
-    let vix = seg.value_index.as_ref().expect("value_index required");
-    match &vix.sort_keys {
-        ValueSortKeys::Fixed { width, bytes } => {
+fn cmp_value_at<P: Pager>(
+    seg: &IndexSegment,
+    data: &P::Blob,
+    pos: usize,
+    probe: &[u8],
+) -> Ordering {
+    let s = slice_value::<P>(seg, data, pos);
+    let a = s.start as usize;
+    let b = s.end as usize;
+    let bytes = &s.data.as_ref()[a..b];
+    bytes.cmp(probe)
+}
+
+#[inline(always)]
+fn cmp_value_policy_at<P: Pager>(
+    seg: &IndexSegment,
+    data: &P::Blob,
+    pos: usize,
+    probe: &[u8],
+    policy: ValueOrderPolicy,
+) -> Ordering {
+    match &seg.value_layout {
+        ValueLayout::FixedWidth { width } => {
             let w = *width as usize;
-            let a = row_pos * w;
-            &bytes[a..a + w]
+            let s = slice_value::<P>(seg, data, pos);
+            let a = s.start as usize;
+            let b = s.end as usize;
+            let bytes = &s.data.as_ref()[a..b];
+            match (policy, w) {
+                (ValueOrderPolicy::UnsignedLe, 1) => bytes[0].cmp(&probe[0]),
+                (ValueOrderPolicy::UnsignedLe, 2) => u16::from_le_bytes(bytes[..2].try_into().unwrap()).cmp(&u16::from_le_bytes(probe[..2].try_into().unwrap())),
+                (ValueOrderPolicy::UnsignedLe, 4) => u32::from_le_bytes(bytes[..4].try_into().unwrap()).cmp(&u32::from_le_bytes(probe[..4].try_into().unwrap())),
+                (ValueOrderPolicy::UnsignedLe, 8) => u64::from_le_bytes(bytes[..8].try_into().unwrap()).cmp(&u64::from_le_bytes(probe[..8].try_into().unwrap())),
+                (ValueOrderPolicy::SignedLe, 1) => (bytes[0] as i8).cmp(&(probe[0] as i8)),
+                (ValueOrderPolicy::SignedLe, 2) => i16::from_le_bytes(bytes[..2].try_into().unwrap()).cmp(&i16::from_le_bytes(probe[..2].try_into().unwrap())),
+                (ValueOrderPolicy::SignedLe, 4) => i32::from_le_bytes(bytes[..4].try_into().unwrap()).cmp(&i32::from_le_bytes(probe[..4].try_into().unwrap())),
+                (ValueOrderPolicy::SignedLe, 8) => i64::from_le_bytes(bytes[..8].try_into().unwrap()).cmp(&i64::from_le_bytes(probe[..8].try_into().unwrap())),
+                (ValueOrderPolicy::F32Le, 4) => {
+                    let ma = crate::codecs::orderkey::f32_le_to_sort4(bytes[..4].try_into().unwrap());
+                    let mb = crate::codecs::orderkey::f32_le_to_sort4(probe[..4].try_into().unwrap());
+                    ma.cmp(&mb)
+                }
+                (ValueOrderPolicy::F64Le, 8) => {
+                    let ma = crate::codecs::orderkey::f64_le_to_sort8(bytes[..8].try_into().unwrap());
+                    let mb = crate::codecs::orderkey::f64_le_to_sort8(probe[..8].try_into().unwrap());
+                    ma.cmp(&mb)
+                }
+                _ => bytes.cmp(probe),
+            }
         }
-        ValueSortKeys::Variable { offsets, bytes } => {
-            let a = offsets[row_pos] as usize;
-            let b = offsets[row_pos + 1] as usize;
-            &bytes[a..b]
+        ValueLayout::Variable { .. } => {
+            // Tags were used for seeding; for bounds use full lex compare.
+            cmp_value_at::<P>(seg, data, pos, probe)
         }
     }
+}
+
+#[inline(always)]
+fn slice_sort_key<'a>(seg: &'a IndexSegment, row_pos: usize) -> &'a [u8] {
+    let vix = seg.value_index.as_ref().expect("value_index required");
+    // No stored sort-keys; this function is no longer used.
+    &[]
 }
 
 #[inline(always)]
@@ -1454,6 +1766,10 @@ fn push_next_keyordered<P: Pager>(
         val,
         ord: kb,
         reverse,
+        by_value: false,
+        is_var: false,
+        value_width: 0,
+        policy: ValueOrderPolicy::Raw,
     });
 }
 
@@ -1651,14 +1967,14 @@ impl<P: Pager> super::ColumnStore<P> {
 mod value_scan_tests {
     use super::*;
     use crate::ColumnStore;
-    use crate::codecs::big_endian::u64_be_array;
+    
     use crate::storage::pager::MemPager;
     use crate::types::{AppendOptions, Put, ValueMode};
     use std::collections::{BTreeMap, BTreeSet};
 
-    // TODO: Dedupe
-    fn be64_vec(x: u64) -> Vec<u8> {
-        u64_be_array(x).to_vec()
+    // TODO: Dedupe (LE encoding)
+    fn le64_vec(x: u64) -> Vec<u8> {
+        x.to_le_bytes().to_vec()
     }
     // TODO: Dedupe
     fn key_bytes(i: u32) -> Vec<u8> {
@@ -1673,10 +1989,10 @@ mod value_scan_tests {
             .expect("key parse")
     }
     // TODO: Dedupe
-    fn parse_be64(v: &[u8]) -> u64 {
+    fn parse_le64(v: &[u8]) -> u64 {
         let mut a = [0u8; 8];
         a.copy_from_slice(&v[..8]);
-        u64::from_be_bytes(a)
+        u64::from_le_bytes(a)
     }
 
     /// Build three overlapping generations of data for the same column:
@@ -1695,13 +2011,13 @@ mod value_scan_tests {
             segment_max_entries: 128,
             segment_max_bytes: 1 << 14,
             last_write_wins_in_batch: true,
-            value_order: None,
+            value_order: Some(ValueOrderPolicy::UnsignedLe),
         };
 
         // gen1
         let mut items = Vec::with_capacity(1000);
         for i in 0u32..1000 {
-            items.push((key_bytes(i).into(), be64_vec(1000 + i as u64).into()));
+            items.push((key_bytes(i).into(), le64_vec(1000 + i as u64).into()));
         }
         store.append_many(
             vec![Put {
@@ -1714,7 +2030,7 @@ mod value_scan_tests {
         // gen2
         let mut items = Vec::with_capacity(1000);
         for i in 200u32..1200 {
-            items.push((key_bytes(i).into(), be64_vec(200_000 + i as u64).into()));
+            items.push((key_bytes(i).into(), le64_vec(200_000 + i as u64).into()));
         }
         store.append_many(
             vec![Put {
@@ -1727,7 +2043,7 @@ mod value_scan_tests {
         // gen3
         let mut items = Vec::with_capacity(800);
         for i in 600u32..1400 {
-            items.push((key_bytes(i).into(), be64_vec(300_000 + i as u64).into()));
+            items.push((key_bytes(i).into(), le64_vec(300_000 + i as u64).into()));
         }
         store.append_many(
             vec![Put {
@@ -1770,7 +2086,7 @@ mod value_scan_tests {
             let k = parse_key_u32(&item.key);
             let a = item.value.start as usize;
             let b = item.value.end as usize;
-            let v = parse_be64(&item.value.data.as_ref()[a..b]);
+            let v = parse_le64(&item.value.data.as_ref()[a..b]);
             // Expect uniqueness (shadowing applied)
             assert!(by_key.insert(k, v).is_none(), "duplicate key {k} in scan");
         }
@@ -1801,8 +2117,8 @@ mod value_scan_tests {
         // Choose a window that lands entirely in gen2's value band.
         // gen2 encodes as 200_000 + i, i in [200,1200)
         // Grab values [200_250 .. 200_260) => i in [250..260)
-        let lo = be64_vec(200_250);
-        let hi = be64_vec(200_260);
+        let lo = le64_vec(200_250);
+        let hi = le64_vec(200_260);
 
         let it = store
             .scan_values_lww(
@@ -1827,7 +2143,7 @@ mod value_scan_tests {
             let k = parse_key_u32(&item.key);
             let a = item.value.start as usize;
             let b = item.value.end as usize;
-            let v = parse_be64(&item.value.data.as_ref()[a..b]);
+            let v = parse_le64(&item.value.data.as_ref()[a..b]);
             keys.insert(k);
             vals.insert(v);
         }
@@ -1870,7 +2186,7 @@ mod value_scan_tests {
         for item in it {
             let a = item.value.start as usize;
             let b = item.value.end as usize;
-            let v = parse_be64(&item.value.data.as_ref()[a..b]);
+            let v = parse_le64(&item.value.data.as_ref()[a..b]);
             if let Some(pv) = prev {
                 assert!(v <= pv, "reverse order expected: {} <= {}", v, pv);
             }
@@ -1907,7 +2223,7 @@ mod value_scan_tests {
             let k = parse_key_u32(&item.key);
             let a = item.value.start as usize;
             let b = item.value.end as usize;
-            let v = parse_be64(&item.value.data.as_ref()[a..b]);
+            let v = parse_le64(&item.value.data.as_ref()[a..b]);
             assert!(by_key.insert(k, v).is_none(), "duplicate key {}", k);
         }
 
@@ -1942,8 +2258,8 @@ mod value_scan_tests {
                     bucket_prefix_len: 2,
                     head_tag_len: 8,
                     frame_predicate: Some(Arc::new(move |head, cur| {
-                        let hv = parse_be64(head);
-                        let cv = parse_be64(cur);
+                        let hv = parse_le64(head);
+                        let cv = parse_le64(cur);
                         cv - hv <= cap
                     })),
                 },
@@ -1954,7 +2270,7 @@ mod value_scan_tests {
             .map(|x| {
                 let a = x.value.start as usize;
                 let b = x.value.end as usize;
-                parse_be64(&x.value.data.as_ref()[a..b])
+                parse_le64(&x.value.data.as_ref()[a..b])
             })
             .collect();
 
@@ -2000,7 +2316,7 @@ mod value_scan_tests {
             // values non-increasing in reverse
             let a = item.value.start as usize;
             let b = item.value.end as usize;
-            let v = parse_be64(&item.value.data.as_ref()[a..b]);
+            let v = parse_le64(&item.value.data.as_ref()[a..b]);
 
             if first.is_none() {
                 first = Some(v);
@@ -2030,8 +2346,8 @@ mod value_scan_tests {
         seed_three_generations(&store, fid);
 
         // Window fully inside gen3 (i = 700..710)
-        let lo = be64_vec(300_700);
-        let hi = be64_vec(300_710);
+        let lo = le64_vec(300_700);
+        let hi = le64_vec(300_710);
 
         let it = store
             .scan_values_lww(
@@ -2054,7 +2370,7 @@ mod value_scan_tests {
         for item in it {
             let a = item.value.start as usize;
             let b = item.value.end as usize;
-            vals.push(parse_be64(&item.value.data.as_ref()[a..b]));
+            vals.push(parse_le64(&item.value.data.as_ref()[a..b]));
             keys.insert(parse_key_u32(&item.key));
         }
 
@@ -2079,8 +2395,8 @@ mod value_scan_tests {
         seed_three_generations(&store, fid);
 
         // Window fully inside gen1 (i = 250..260) -> winners are gen1 under FWW
-        let lo = be64_vec(1000 + 250);
-        let hi = be64_vec(1000 + 260);
+        let lo = le64_vec(1000 + 250);
+        let hi = le64_vec(1000 + 260);
 
         let it = store
             .scan_values_fww(
@@ -2103,7 +2419,7 @@ mod value_scan_tests {
         for item in it {
             let a = item.value.start as usize;
             let b = item.value.end as usize;
-            vals.push(parse_be64(&item.value.data.as_ref()[a..b]));
+            vals.push(parse_le64(&item.value.data.as_ref()[a..b]));
             keys.insert(parse_key_u32(&item.key));
         }
 
@@ -2125,8 +2441,8 @@ mod value_scan_tests {
         // Window fully inside gen2's value band (i = 250..260).
         // Under strict FWW, the winners for those keys are in gen1,
         // whose values (1000+i) lie OUTSIDE this window -> expect empty.
-        let lo = be64_vec(200_250);
-        let hi = be64_vec(200_260);
+        let lo = le64_vec(200_250);
+        let hi = le64_vec(200_260);
 
         let it = store
             .scan_values_fww(
@@ -2159,8 +2475,8 @@ mod value_scan_tests {
         seed_three_generations(&store, fid);
 
         // Window at the high end of gen1 (i = 990..1000)
-        let lo = be64_vec(1000 + 990);
-        let hi = be64_vec(1000 + 1000);
+        let lo = le64_vec(1000 + 990);
+        let hi = le64_vec(1000 + 1000);
 
         let it = store
             .scan_values_fww(
@@ -2183,7 +2499,7 @@ mod value_scan_tests {
         for item in it {
             let a = item.value.start as usize;
             let b = item.value.end as usize;
-            vals.push(parse_be64(&item.value.data.as_ref()[a..b]));
+            vals.push(parse_le64(&item.value.data.as_ref()[a..b]));
             keys.push(parse_key_u32(&item.key));
         }
 
@@ -2392,7 +2708,7 @@ mod value_scan_tests {
             for it in page.items {
                 let a = it.value.start as usize;
                 let b = it.value.end as usize;
-                let v = parse_be64(&it.value.data.as_ref()[a..b]);
+                let v = parse_le64(&it.value.data.as_ref()[a..b]);
 
                 if let Some(pv) = last_val {
                     assert!(v > pv, "values must be strictly increasing");
@@ -2450,7 +2766,7 @@ mod value_scan_tests {
             for it in page.items {
                 let a = it.value.start as usize;
                 let b = it.value.end as usize;
-                let v = parse_be64(&it.value.data.as_ref()[a..b]);
+                let v = parse_le64(&it.value.data.as_ref()[a..b]);
 
                 if let Some(pv) = last_val {
                     assert!(v < pv, "values must be strictly decreasing");
