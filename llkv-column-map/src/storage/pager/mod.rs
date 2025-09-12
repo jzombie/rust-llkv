@@ -48,12 +48,12 @@ pub enum GetResult<B> {
 /// Implementations choose `type Blob`:
 /// - In-memory: `type Blob = Arc<[u8]>`
 /// - mmap-backed: `type Blob = EntryHandle` (your type that wraps `Arc<Mmap>`)
-pub trait Pager {
+pub trait Pager: Send + Sync + 'static {
     /// The blob handle type returned for raw reads. Must be:
     /// - `AsRef<[u8]>` so callers can view bytes without copying,
     /// - `Clone` so the handle can be duplicated cheaply (refcount bump),
     /// - `Send + Sync + 'static` for cross-thread safety.
-    type Blob: BlobLike;
+    type Blob: AsRef<[u8]> + Clone + Send + Sync + 'static;
 
     /// Key allocation can remain separate; typically needed ahead of
     /// a write batch.

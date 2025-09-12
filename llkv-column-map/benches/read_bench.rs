@@ -16,10 +16,12 @@ use llkv_column_map::{
     storage::pager::MemPager,
     types::{AppendOptions, LogicalFieldId, Put, ValueMode},
 };
+
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::borrow::Cow;
 use std::cmp::min;
 use std::hint::black_box;
+use std::sync::Arc;
 
 // --------------------------- config ---------------------------
 
@@ -55,7 +57,7 @@ fn var_value(row: u64, fid: LogicalFieldId, min_len: usize, max_len: usize) -> V
 
 // ------------------------- ingest -----------------------------
 
-fn ingest_1m_rows(store: &ColumnStore<'static, MemPager>) {
+fn ingest_1m_rows(store: &ColumnStore<MemPager>) {
     // Reasonable segment knobs; adjust to taste.
     let opts = AppendOptions {
         mode: ValueMode::Auto,       // per-column auto fixed/variable
@@ -129,10 +131,8 @@ fn ingest_1m_rows(store: &ColumnStore<'static, MemPager>) {
 // ------------------------- bench ------------------------------
 
 fn bench_query_uniform(c: &mut Criterion) {
-    // TODO: Rewire so this doesn't need leaking
-    // Leak the pager to give the store a 'static lifetime (so we can move it into the closure).
-    let pager: &'static MemPager = Box::leak(Box::new(MemPager::default()));
-    let store: ColumnStore<'static, MemPager> = ColumnStore::init_empty(pager);
+    let pager = Arc::new(MemPager::default());
+    let store: ColumnStore<MemPager> = ColumnStore::open(pager);
 
     // Ingest once (not timed).
     ingest_1m_rows(&store);

@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap;
 
 // TODO: Put behind feature flag?
 // TODO: Verify that per-node byte measurements are accurate despite schema changes
-impl<'p, P: Pager> ColumnStore<'p, P> {
+impl<P: Pager> ColumnStore<P> {
     /// Scans the manifest -> ColumnIndex -> IndexSegments -> Data blobs,
     /// returns one entry per physical key with sizes and relationships.
     /// Batch-only I/O.

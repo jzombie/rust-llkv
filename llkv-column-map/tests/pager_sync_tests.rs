@@ -10,6 +10,7 @@
 
 use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use llkv_column_map::ColumnStore;
 use llkv_column_map::storage::pager::MemPager;
@@ -40,7 +41,7 @@ fn test_pager_persistence_on_reopen_column_map() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000);
 
-    let pager = MemPager::default();
+    let pager = Arc::new(MemPager::default());
     let fid: LogicalFieldId = 42;
 
     // Generate & shuffle keys (outside scopes so we can reuse)
@@ -50,7 +51,7 @@ fn test_pager_persistence_on_reopen_column_map() {
 
     // 1) Create a store handle and write the initial batch (value = !k).
     {
-        let store = ColumnStore::init_empty(&pager);
+        let store = ColumnStore::open(Arc::clone(&pager));
 
         let items: Vec<_> = keys
             .iter()
@@ -78,7 +79,7 @@ fn test_pager_persistence_on_reopen_column_map() {
 
     // 2) Reopen and spot-check that initial data is visible.
     {
-        let store = ColumnStore::open(&pager);
+        let store = ColumnStore::open(Arc::clone(&pager));
 
         for k in (0..n).step_by(((n / 10).max(1)) as usize) {
             let key = k.to_be_bytes().to_vec();
@@ -103,7 +104,7 @@ fn test_pager_persistence_on_reopen_column_map() {
 
     // 3) Update a subset in a fresh handle (value = k ^ 0xDEADBEEF).
     {
-        let store = ColumnStore::open(&pager);
+        let store = ColumnStore::open(Arc::clone(&pager));
 
         let updates: Vec<_> = (0..n)
             .step_by(7)
@@ -131,7 +132,7 @@ fn test_pager_persistence_on_reopen_column_map() {
 
     // 4) Reopen and verify updated values persisted; non-updated keys still equal !k.
     {
-        let store = ColumnStore::open(&pager);
+        let store = ColumnStore::open(Arc::clone(&pager));
 
         for k in (0..n).step_by(((n / 20).max(1)) as usize) {
             let key = k.to_be_bytes().to_vec();

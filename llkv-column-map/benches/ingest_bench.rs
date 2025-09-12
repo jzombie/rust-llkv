@@ -57,8 +57,10 @@ use llkv_column_map::{
     storage::pager::MemPager,
     types::{AppendOptions, LogicalFieldId, Put, ValueMode},
 };
+
 use std::borrow::Cow;
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::Duration;
 // ----------------- dataset shape: 21 columns x 150_000 rows ---------------
 #[derive(Clone, Copy)]
@@ -165,8 +167,8 @@ fn bench_ingest_by_batches(c: &mut Criterion) {
         );
         group.bench_function(BenchmarkId::from_parameter(label), |b| {
             b.iter(|| {
-                let pager = MemPager::default();
-                let store = ColumnStore::init_empty(&pager);
+                let pager = Arc::new(MemPager::default());
+                let store = ColumnStore::open(pager);
 
                 let mut start = 0u64;
                 for _ in 0..batches {
@@ -209,8 +211,8 @@ fn bench_ingest_by_rows_per_batch(c: &mut Criterion) {
         let label = format!("rows_per_batch={}", rows_per_batch);
         group.bench_function(BenchmarkId::from_parameter(label), |b| {
             b.iter(|| {
-                let pager = MemPager::default();
-                let store = ColumnStore::init_empty(&pager);
+                let pager = Arc::new(MemPager::default());
+                let store = ColumnStore::open(pager);
 
                 let mut start = 0u64;
                 while start < total_rows {

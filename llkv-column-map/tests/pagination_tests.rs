@@ -29,6 +29,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng, seq::SliceRandom};
 
 use std::ops::Bound;
+use std::sync::Arc;
 use std::time::Instant;
 
 // ---------------------- random string helpers -----------------------
@@ -490,8 +491,8 @@ slow_ingests_gt8ms={}, seed_end_to_end={:.3} ms",
 /// Smoke: key-ordered forward pagination with random string keys.
 #[test]
 fn paginate_strings_as_keys_smoke() {
-    let p = MemPager::default();
-    let store = ColumnStore::init_empty(&p);
+    let p = Arc::new(MemPager::default());
+    let store = ColumnStore::open(p);
     let fid: LogicalFieldId = 9001;
     let n = 50_000usize;
     let page_size = 1009usize;
@@ -543,8 +544,8 @@ fn paginate_strings_as_keys_smoke() {
 /// Smoke: value-ordered forward pagination with random string values.
 #[test]
 fn paginate_strings_as_values_smoke() {
-    let p = MemPager::default();
-    let store = ColumnStore::init_empty(&p);
+    let p = Arc::new(MemPager::default());
+    let store = ColumnStore::open(p);
     let fid: LogicalFieldId = 9002;
     let n = 50_000usize;
     let page_size = 977usize;
@@ -597,8 +598,8 @@ fn paginate_strings_as_values_smoke() {
 /// Reverse scans: key- and value-ordered pagination, decreasing.
 #[test]
 fn paginate_strings_reverse_smoke() {
-    let p = MemPager::default();
-    let store = ColumnStore::init_empty(&p);
+    let p = Arc::new(MemPager::default());
+    let store = ColumnStore::open(p);
     let fid_k: LogicalFieldId = 9003;
     let fid_v: LogicalFieldId = 9004;
     let n = 30_000usize;
@@ -692,8 +693,8 @@ fn paginate_strings_reverse_smoke() {
 #[test]
 #[ignore = "CPU intensive test"]
 fn paginate_strings_heavy_keys_1kb_ignored() {
-    let p = MemPager::default();
-    let store = ColumnStore::init_empty(&p);
+    let p = Arc::new(MemPager::default());
+    let store = ColumnStore::open(p);
     let fid_k: LogicalFieldId = 9101;
 
     let n = std::env::var("N")
@@ -754,8 +755,8 @@ fn paginate_strings_heavy_keys_1kb_ignored() {
 #[test]
 #[ignore = "CPU intensive test"]
 fn paginate_strings_heavy_vals_1kb_ignored() {
-    let p = MemPager::default();
-    let store = ColumnStore::init_empty(&p);
+    let p = Arc::new(MemPager::default());
+    let store = ColumnStore::open(p);
     let fid_v: LogicalFieldId = 9102;
 
     let n = std::env::var("N")
@@ -1027,8 +1028,8 @@ slow_ingests_gt8ms={}, seed_end_to_end={:.3} ms",
 #[test]
 #[ignore = "CPU intensive test"]
 fn paginate_ints_heavy_keys_fixed_ignored() {
-    let p = MemPager::default();
-    let store = ColumnStore::init_empty(&p);
+    let p = Arc::new(MemPager::default());
+    let store = ColumnStore::open(p);
     let fid_k: LogicalFieldId = 9201;
 
     let n = std::env::var("N")
@@ -1085,8 +1086,8 @@ fn paginate_ints_heavy_keys_fixed_ignored() {
 #[test]
 #[ignore = "CPU intensive test"]
 fn paginate_ints_heavy_vals_fixed_ignored() {
-    let p = MemPager::default();
-    let store = ColumnStore::init_empty(&p);
+    let p = Arc::new(MemPager::default());
+    let store = ColumnStore::open(p);
     let fid_v: LogicalFieldId = 9202;
 
     let n = std::env::var("N")
