@@ -101,6 +101,7 @@ fn seed_column_into(
         segment_max_entries,
         segment_max_bytes: 64 << 20,
         last_write_wins_in_batch: !keep_dup_in_batch,
+        value_order: None,
     };
 
     // Use a moderate chunk; sealing is controlled by segment_max_entries.

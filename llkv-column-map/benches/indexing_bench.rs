@@ -121,6 +121,7 @@ fn build_many_columns_fixed_width(
             };
             let col_index = ColumnIndex {
                 field_id: next_field_id,
+                value_order: llkv_column_map::types::ValueOrderPolicy::Raw,
                 segments: vec![segref],
             };
             seg_puts.push((seg_pkey, seg));

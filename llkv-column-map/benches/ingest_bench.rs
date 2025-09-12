@@ -151,6 +151,7 @@ fn bench_ingest_by_batches(c: &mut Criterion) {
         segment_max_entries: 16_384,
         segment_max_bytes: 2 * 1024 * 1024,
         last_write_wins_in_batch: true,
+        value_order: None,
     };
     // num_batches: 1 means "ALL rows in ONE append_many call"
     let num_batches_options = [1usize, 2, 5, 10, 20, 50, 100];
@@ -199,6 +200,7 @@ fn bench_ingest_by_rows_per_batch(c: &mut Criterion) {
         segment_max_entries: 16_384,
         segment_max_bytes: 2 * 1024 * 1024,
         last_write_wins_in_batch: true,
+        value_order: None,
     };
     // Explicit rows-per-batch. 150_000 means ALL AT ONCE.
     let rows_per_batch_options = [150_000usize, 75_000, 50_000, 10_000, 2_000, 1_000];

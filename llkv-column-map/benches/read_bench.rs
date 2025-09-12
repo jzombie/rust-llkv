@@ -64,6 +64,7 @@ fn ingest_1m_rows(store: &ColumnStore<MemPager>) {
         segment_max_entries: 65_536, // roll segments by entry count
         segment_max_bytes: 8 * 1024 * 1024,
         last_write_wins_in_batch: true,
+        value_order: None,
     };
     // Ingest in chunks so we don't build a gigantic Vec per column.
     let ingest_chunk_rows: u64 = 100_000;
