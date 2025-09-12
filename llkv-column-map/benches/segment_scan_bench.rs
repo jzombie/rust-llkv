@@ -101,7 +101,9 @@ fn seed_column_into(
         segment_max_entries,
         segment_max_bytes: 64 << 20,
         last_write_wins_in_batch: !keep_dup_in_batch,
-        value_order: None,
+        // Fixed-width numeric value scans require a policy so the writer builds
+        // a value index; choose UnsignedLe to match the LE payload the bench writes.
+        value_order: Some(llkv_column_map::types::ValueOrderPolicy::UnsignedLe),
     };
 
     // Use a moderate chunk; sealing is controlled by segment_max_entries.
