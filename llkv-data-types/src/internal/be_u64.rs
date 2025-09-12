@@ -13,7 +13,6 @@ impl Codec for BeU64 {
         Ok(())
     }
 
-    /// This is more robust and can be faster than a separate copy.
     #[inline]
     fn decode(src: &[u8]) -> Result<u64, DecodeError> {
         if src.len() < 8 {

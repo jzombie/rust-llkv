@@ -6,8 +6,7 @@ use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ValueScanOpts
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, ValueMode};
 
-use llkv_data_types::internal::Codec;
-use llkv_data_types::internal::{Bytes, Utf8CaseFold};
+use llkv_data_types::{DataType, DecodedValue, decode_value, encode_value};
 
 /* --------------------------- Shared helpers ---------------------------- */
 
@@ -73,22 +72,22 @@ fn scan_value_frames(store: &ColumnStore<'static, MemPager>, fid: LogicalFieldId
     out
 }
 
-/// Build encoded items (key=row-id BE, val=encoded via `C`) from a slice of
-/// codec-borrowed values (e.g., `&[&str]` for `Utf8CaseFold`,
-/// `&[&[u8]]` for `Bytes`).
+/* --------------- Public-API generic item builder (no traits) ----------- */
+
+/// Build encoded items (key=row-id BE, val=encoded via public API).
+/// `dtype` must match the variants contained in `vals`; we `expect` on mismatch
+/// because tests should fail loudly if the input is inconsistent.
 #[inline]
-#[allow(clippy::type_complexity)] // TODO: Alias type
-fn build_items<'a, C>(vals: &[C::Borrowed<'a>]) -> Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)>
-where
-    C: Codec,
-    C::Borrowed<'a>: Clone, // <-- require Clone, fixes the move
-{
+#[allow(clippy::type_complexity)]
+fn build_items_from_decoded(
+    dtype: DataType,
+    vals: &[DecodedValue<'static>],
+) -> Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)> {
     let mut items = Vec::with_capacity(vals.len());
-    for (i, v) in vals.iter().enumerate() {
+    for (i, dv) in vals.iter().enumerate() {
         let key = (i as u64 + 1).to_be_bytes().to_vec(); // lex==numeric
         let mut val = Vec::new();
-        // Pass a clone instead of moving
-        C::encode_into(&mut val, v.clone()).expect("encoding must succeed");
+        encode_value(*dv, &dtype, &mut val).expect("encode");
         items.push((Cow::Owned(key), Cow::Owned(val)));
     }
     items
@@ -96,15 +95,13 @@ where
 
 /* ------------------------------ Tests ---------------------------------- */
 
-/// `Utf8CaseFold` should order case-insensitively (with tie-breaks on
-/// original bytes) and round-trip back to the original strings.
+/// `Utf8` should order case-insensitively (with tie-breaks on original bytes)
+/// and round-trip back to the original strings using the public API only.
 #[test]
 fn test_utf8_order_roundtrip() {
-    // Set up a fresh in-memory ColumnStore.
     let (store, fid) = setup_store();
 
-    // Any field id is fine for this test.
-    let words = [
+    let words: [&'static str; 9] = [
         "zeta",
         "Apple",
         "alpha",
@@ -116,25 +113,26 @@ fn test_utf8_order_roundtrip() {
         "aardvark",
     ];
 
-    // Prepare a single Put batch: (key=row-id BE, val=encoded).
-    #[allow(clippy::type_complexity)] // TODO: Alias complex type
-    let items = build_items::<Utf8CaseFold>(&words);
+    // Build DecodedValue<'static> list (string literals are 'static).
+    let vals: Vec<DecodedValue<'static>> = words.iter().map(|&s| DecodedValue::Str(s)).collect();
+
+    let items = build_items_from_decoded(DataType::Utf8, &vals);
     append_one_put(&store, fid, items);
 
     // Value-ordered scan (ascending)
     let frames = scan_value_frames(&store, fid);
 
-    // Pull back originals (not the folded key)
+    // Decode via public API.
     let mut got: Vec<String> = Vec::new();
     for bytes in frames {
-        got.push(Utf8CaseFold::decode(bytes.as_slice()).expect("decoding must succeed"));
+        let dv = decode_value(bytes.as_slice(), &DataType::Utf8).expect("decode utf8");
+        if let DecodedValue::Str(s) = dv {
+            got.push(s.to_string());
+        } else {
+            panic!("expected DecodedValue::Str");
+        }
     }
 
-    // Expected order (case-insensitive collation), tie-broken by original
-    // bytes:
-    // alpha < Apple (because fold(alpha)<fold(apple)), Banana < banana
-    // (original bytes tie-break) LARGE words < Large Words < lower words
-    // (all grouped under "l...")
     let expect = vec![
         "aardvark",
         "alpha",
@@ -146,20 +144,16 @@ fn test_utf8_order_roundtrip() {
         "lower words",
         "zeta",
     ];
-
     assert_eq!(got, expect);
 }
 
-/// `Bytes` should order by raw bytewise lex of the leading payload and
-/// round-trip losslessly.
+/// `Bytes` should order by raw bytewise lex of the payload and round-trip
+/// losslessly using the public API only.
 #[test]
 fn test_bytes_order_roundtrip() {
-    // Set up a fresh in-memory ColumnStore.
     let (store, fid) = setup_store();
 
-    // Same set of blobs, but deliberately shuffled so they aren't already
-    // in sorted order.
-    let blobs: [&[u8]; 7] = [
+    let blobs: [&'static [u8]; 7] = [
         b"zed",
         b"abd",
         b"\x00",
@@ -169,22 +163,26 @@ fn test_bytes_order_roundtrip() {
         b"\x00\x01",
     ];
 
-    // Prepare a single Put batch: (key=row-id BE, val=encoded).
-    #[allow(clippy::type_complexity)] // TODO: Alias complex type
-    let items = build_items::<Bytes>(&blobs);
+    // Build DecodedValue<'static> list (byte string literals are 'static).
+    let vals: Vec<DecodedValue<'static>> = blobs.iter().map(|&b| DecodedValue::Bytes(b)).collect();
+
+    let items = build_items_from_decoded(DataType::Bytes, &vals);
     append_one_put(&store, fid, items);
 
     // Value-ordered scan (ascending)
     let frames = scan_value_frames(&store, fid);
 
-    // Decode and collect owned copies to compare.
+    // Decode via public API.
     let mut got: Vec<Vec<u8>> = Vec::new();
     for bytes in frames {
-        let b = Bytes::decode(bytes.as_slice()).expect("decoding must succeed");
-        got.push(b);
+        let dv = decode_value(bytes.as_slice(), &DataType::Bytes).expect("decode bytes");
+        if let DecodedValue::Bytes(b) = dv {
+            got.push(b.to_vec());
+        } else {
+            panic!("expected DecodedValue::Bytes");
+        }
     }
 
-    // Explicit expected order: bytewise lex of the payloads.
     let expect: Vec<Vec<u8>> = vec![
         b"\x00".to_vec(),
         b"\x00\x01".to_vec(),
@@ -194,6 +192,5 @@ fn test_bytes_order_roundtrip() {
         b"abd".to_vec(),
         b"zed".to_vec(),
     ];
-
     assert_eq!(got, expect);
 }

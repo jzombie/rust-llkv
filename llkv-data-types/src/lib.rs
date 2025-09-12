@@ -1,5 +1,5 @@
-pub mod internal;
-use crate::internal::{BeU64, Bool, Codec, EncodeInto, Utf8CaseFold};
+mod internal;
+use crate::internal::{BeU8, BeU16, BeU32, BeU64, Bool, Codec, EncodeInto, Utf8CaseFold};
 
 pub mod errors;
 pub use errors::*;
@@ -14,14 +14,12 @@ pub use errors::*;
 /// Its only purpose is to act as a label for the underlying storage format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
-    /// Indicates the data is a case-insensitive, order-preserving string.
     Utf8,
-    /// Indicates the data is a big-endian 64-bit unsigned integer.
+    U8,
+    U16,
+    U32,
     U64,
-    /// Indicates the data is a boolean value (0 for false, 1 for true).
     Bool,
-    //
-    /// Indicates the data is a collection of bytes.
     Bytes,
 }
 
@@ -29,9 +27,12 @@ pub enum DataType {
 ///
 /// It uses a lifetime (`'a`) to allow for zero-allocation borrowing of strings,
 /// preserving the performance of the internal codecs.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum DecodedValue<'a> {
     Str(&'a str),
+    U8(u8),
+    U16(u16),
+    U32(u32),
     U64(u64),
     Bool(bool),
     Bytes(&'a [u8]),
@@ -54,6 +55,30 @@ pub fn encode_value<'a>(
             expected: *expected,
             got: "Str",
         }),
+        (DataType::U8, DecodedValue::U8(x)) => {
+            x.encode_into(out);
+            Ok(())
+        }
+        (expected, DecodedValue::U8(_)) => Err(EncodeError::TypeMismatch {
+            expected: *expected,
+            got: "U8",
+        }),
+        (DataType::U16, DecodedValue::U16(x)) => {
+            x.encode_into(out);
+            Ok(())
+        }
+        (expected, DecodedValue::U16(_)) => Err(EncodeError::TypeMismatch {
+            expected: *expected,
+            got: "U16",
+        }),
+        (DataType::U32, DecodedValue::U32(x)) => {
+            x.encode_into(out);
+            Ok(())
+        }
+        (expected, DecodedValue::U32(_)) => Err(EncodeError::TypeMismatch {
+            expected: *expected,
+            got: "U32",
+        }),
         (DataType::U64, DecodedValue::U64(x)) => {
             x.encode_into(out);
             Ok(())
@@ -66,7 +91,6 @@ pub fn encode_value<'a>(
             b.encode_into(out);
             Ok(())
         }
-
         (expected, DecodedValue::Bool(_)) => Err(EncodeError::TypeMismatch {
             expected: *expected,
             got: "Bool",
@@ -100,6 +124,9 @@ pub fn encode_value_to_vec<'a>(
 pub fn decode_value<'a>(bytes: &'a [u8], dtype: &DataType) -> Option<DecodedValue<'a>> {
     match dtype {
         DataType::Utf8 => Utf8CaseFold::decode_borrowed(bytes).map(DecodedValue::Str),
+        DataType::U8 => BeU8::decode(bytes).ok().map(DecodedValue::U8),
+        DataType::U16 => BeU16::decode(bytes).ok().map(DecodedValue::U16),
+        DataType::U32 => BeU32::decode(bytes).ok().map(DecodedValue::U32),
         DataType::U64 => BeU64::decode(bytes).ok().map(DecodedValue::U64),
         DataType::Bool => Bool::decode(bytes).ok().map(DecodedValue::Bool),
         DataType::Bytes => internal::Bytes::decode_borrowed(bytes).map(DecodedValue::Bytes),
@@ -128,6 +155,27 @@ where
             for b in inputs {
                 let s = Utf8CaseFold::decode_borrowed(b).ok_or(DecodeError::InvalidFormat)?;
                 acc = f(acc, DecodedValue::Str(s));
+                n += 1;
+            }
+        }
+        DataType::U8 => {
+            for b in inputs {
+                let x = BeU8::decode(b)?;
+                acc = f(acc, DecodedValue::U8(x));
+                n += 1;
+            }
+        }
+        DataType::U16 => {
+            for b in inputs {
+                let x = BeU16::decode(b)?;
+                acc = f(acc, DecodedValue::U16(x));
+                n += 1;
+            }
+        }
+        DataType::U32 => {
+            for b in inputs {
+                let x = BeU32::decode(b)?;
+                acc = f(acc, DecodedValue::U32(x));
                 n += 1;
             }
         }
@@ -179,6 +227,144 @@ mod tests {
         } else {
             panic!("expected Str");
         }
+    }
+
+    /* ---------------- U8 tests ---------------- */
+
+    #[test]
+    fn test_u8_encode_decode_roundtrip() {
+        let dtype = DataType::U8;
+
+        let mut buf = Vec::new();
+        200u8.encode_into(&mut buf);
+
+        let dv = decode_value(&buf, &dtype).unwrap();
+        assert_eq!(dv, DecodedValue::U8(200));
+    }
+
+    #[test]
+    fn test_decode_reduce_u8_collects_values() {
+        let dtype = DataType::U8;
+        let values = [0u8, 1, 127, 200, 255];
+
+        let encoded: Vec<Vec<u8>> = values
+            .iter()
+            .map(|v| {
+                let mut buf = Vec::new();
+                v.encode_into(&mut buf);
+                buf
+            })
+            .collect();
+        let slices: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
+
+        let (decoded, count): (Vec<DecodedValue<'_>>, usize) =
+            decode_reduce(slices.iter().copied(), &dtype, Vec::new(), |mut acc, dv| {
+                acc.push(dv);
+                acc
+            })
+            .unwrap();
+
+        assert_eq!(count, values.len());
+        assert_eq!(
+            decoded,
+            values
+                .iter()
+                .copied()
+                .map(DecodedValue::U8)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /* ---------------- U16 tests ---------------- */
+
+    #[test]
+    fn test_u16_encode_decode_roundtrip() {
+        let dtype = DataType::U16;
+
+        let mut buf = Vec::new();
+        0xABCDu16.encode_into(&mut buf);
+
+        let dv = decode_value(&buf, &dtype).unwrap();
+        assert_eq!(dv, DecodedValue::U16(0xABCD));
+    }
+
+    #[test]
+    fn test_decode_reduce_u16_collects_values() {
+        let dtype = DataType::U16;
+        let values = [0u16, 1, 256, 42_000, u16::MAX];
+
+        let encoded: Vec<Vec<u8>> = values
+            .iter()
+            .map(|v| {
+                let mut buf = Vec::new();
+                v.encode_into(&mut buf);
+                buf
+            })
+            .collect();
+        let slices: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
+
+        let (decoded, count): (Vec<DecodedValue<'_>>, usize) =
+            decode_reduce(slices.iter().copied(), &dtype, Vec::new(), |mut acc, dv| {
+                acc.push(dv);
+                acc
+            })
+            .unwrap();
+
+        assert_eq!(count, values.len());
+        assert_eq!(
+            decoded,
+            values
+                .iter()
+                .copied()
+                .map(DecodedValue::U16)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /* ---------------- U32 tests ---------------- */
+
+    #[test]
+    fn test_u32_encode_decode_roundtrip() {
+        let dtype = DataType::U32;
+
+        let mut buf = Vec::new();
+        0xDEADBEEFu32.encode_into(&mut buf);
+
+        let dv = decode_value(&buf, &dtype).unwrap();
+        assert_eq!(dv, DecodedValue::U32(0xDEADBEEF));
+    }
+
+    #[test]
+    fn test_decode_reduce_u32_collects_values() {
+        let dtype = DataType::U32;
+        let values = [0u32, 1, 256, 65_536, 0xDEADBEEF, u32::MAX];
+
+        let encoded: Vec<Vec<u8>> = values
+            .iter()
+            .map(|v| {
+                let mut buf = Vec::new();
+                v.encode_into(&mut buf);
+                buf
+            })
+            .collect();
+        let slices: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
+
+        let (decoded, count): (Vec<DecodedValue<'_>>, usize) =
+            decode_reduce(slices.iter().copied(), &dtype, Vec::new(), |mut acc, dv| {
+                acc.push(dv);
+                acc
+            })
+            .unwrap();
+
+        assert_eq!(count, values.len());
+        assert_eq!(
+            decoded,
+            values
+                .iter()
+                .copied()
+                .map(DecodedValue::U32)
+                .collect::<Vec<_>>()
+        );
     }
 
     /* ---------------- U64 tests ---------------- */

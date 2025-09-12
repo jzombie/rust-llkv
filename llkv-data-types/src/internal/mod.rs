@@ -59,6 +59,15 @@ pub use bytes::*;
 pub mod codec;
 pub use codec::*;
 
+pub mod be_u8;
+pub use be_u8::*;
+
+pub mod be_u16;
+pub use be_u16::*;
+
+pub mod be_u32;
+pub use be_u32::*;
+
 pub mod be_u64;
 pub use be_u64::*;
 
@@ -91,6 +100,30 @@ impl EncodeInto for String {
     #[inline]
     fn encode_into(&self, dst: &mut Vec<u8>) {
         Utf8CaseFold::encode_into(dst, self.as_str()).unwrap();
+    }
+}
+
+// u8 → BeU8
+impl EncodeInto for u8 {
+    #[inline]
+    fn encode_into(&self, dst: &mut Vec<u8>) {
+        BeU8::encode_into(dst, self).unwrap();
+    }
+}
+
+// u16 → BeU16
+impl EncodeInto for u16 {
+    #[inline]
+    fn encode_into(&self, dst: &mut Vec<u8>) {
+        BeU16::encode_into(dst, self).unwrap();
+    }
+}
+
+// u32 → BeU32
+impl EncodeInto for u32 {
+    #[inline]
+    fn encode_into(&self, dst: &mut Vec<u8>) {
+        BeU32::encode_into(dst, self).unwrap();
     }
 }
 
