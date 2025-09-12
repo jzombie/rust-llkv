@@ -36,80 +36,7 @@ pub struct ColumnStore<'p, P: Pager> {
 }
 
 impl<'p, P: Pager> ColumnStore<'p, P> {
-    // Helper to route batch PUTs through here to bump metrics in one place.
-    fn do_puts(&self, puts: Vec<BatchPut>) {
-        if puts.is_empty() {
-            return;
-        }
-        // update counters before the call
-        self.io_batches.fetch_add(1, Ordering::Relaxed);
-        for p in &puts {
-            match p {
-                BatchPut::Raw { .. } => {
-                    self.io_put_raw_ops.fetch_add(1, Ordering::Relaxed);
-                }
-                BatchPut::Typed { .. } => {
-                    self.io_put_typed_ops.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        // ignore IO errors here for brevity, mirroring previous behavior
-        let _ = self.pager.batch_put(&puts);
-    }
-
-    // Helper to route batch GETs through here to bump metrics in one place.
-    fn do_gets(&self, gets: Vec<BatchGet>) -> Vec<GetResult<P::Blob>> {
-        if gets.is_empty() {
-            return Vec::new();
-        }
-        self.io_batches.fetch_add(1, Ordering::Relaxed);
-        for g in &gets {
-            match g {
-                BatchGet::Raw { .. } => {
-                    self.io_get_raw_ops.fetch_add(1, Ordering::Relaxed);
-                }
-                BatchGet::Typed { .. } => {
-                    self.io_get_typed_ops.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-
-        self.pager.batch_get(&gets).unwrap_or_default()
-    }
-
-    // TODO: Implement with GC
-    // Helper to route batch Frees through here to bump metrics in one place.
-    // fn do_frees(&self, keys: &[PhysicalKey]) {
-    //     if keys.is_empty() {
-    //         return;
-    //     }
-    //     self.io_batches.fetch_add(1, Ordering::Relaxed);
-    //     self.io_free_ops.fetch_add(keys.len(), Ordering::Relaxed);
-    //     let _ = self.pager.free_many(keys);
-    // }
-
-    /// Access current metrics (counts of batch/ops).
-    pub fn io_stats(&self) -> metrics::IoStats {
-        metrics::IoStats {
-            batches: self.io_batches.load(Ordering::Relaxed),
-            get_raw_ops: self.io_get_raw_ops.load(Ordering::Relaxed),
-            get_typed_ops: self.io_get_typed_ops.load(Ordering::Relaxed),
-            put_raw_ops: self.io_put_raw_ops.load(Ordering::Relaxed),
-            put_typed_ops: self.io_put_typed_ops.load(Ordering::Relaxed),
-            free_ops: self.io_free_ops.load(Ordering::Relaxed),
-        }
-    }
-
-    /// Reset metrics to zero.
-    pub fn reset_io_stats(&self) {
-        self.io_batches.store(0, Ordering::Relaxed);
-        self.io_get_raw_ops.store(0, Ordering::Relaxed);
-        self.io_get_typed_ops.store(0, Ordering::Relaxed);
-        self.io_put_raw_ops.store(0, Ordering::Relaxed);
-        self.io_put_typed_ops.store(0, Ordering::Relaxed);
-        self.io_free_ops.store(0, Ordering::Relaxed);
-    }
-
+    // TODO: Don't expose publicly; use common `open` interface linked to pager`
     // Create fresh store (bootstrap->manifest, empty manifest).
     pub fn init_empty(pager: &'p P) -> Self {
         let bootstrap_key: PhysicalKey = 0;
@@ -196,6 +123,80 @@ impl<'p, P: Pager> ColumnStore<'p, P> {
             io_put_typed_ops: AtomicUsize::new(0),
             io_free_ops: AtomicUsize::new(0),
         }
+    }
+
+    // Helper to route batch PUTs through here to bump metrics in one place.
+    fn do_puts(&self, puts: Vec<BatchPut>) {
+        if puts.is_empty() {
+            return;
+        }
+        // update counters before the call
+        self.io_batches.fetch_add(1, Ordering::Relaxed);
+        for p in &puts {
+            match p {
+                BatchPut::Raw { .. } => {
+                    self.io_put_raw_ops.fetch_add(1, Ordering::Relaxed);
+                }
+                BatchPut::Typed { .. } => {
+                    self.io_put_typed_ops.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        // ignore IO errors here for brevity, mirroring previous behavior
+        let _ = self.pager.batch_put(&puts);
+    }
+
+    // Helper to route batch GETs through here to bump metrics in one place.
+    fn do_gets(&self, gets: Vec<BatchGet>) -> Vec<GetResult<P::Blob>> {
+        if gets.is_empty() {
+            return Vec::new();
+        }
+        self.io_batches.fetch_add(1, Ordering::Relaxed);
+        for g in &gets {
+            match g {
+                BatchGet::Raw { .. } => {
+                    self.io_get_raw_ops.fetch_add(1, Ordering::Relaxed);
+                }
+                BatchGet::Typed { .. } => {
+                    self.io_get_typed_ops.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        self.pager.batch_get(&gets).unwrap_or_default()
+    }
+
+    // TODO: Implement with GC
+    // Helper to route batch Frees through here to bump metrics in one place.
+    // fn do_frees(&self, keys: &[PhysicalKey]) {
+    //     if keys.is_empty() {
+    //         return;
+    //     }
+    //     self.io_batches.fetch_add(1, Ordering::Relaxed);
+    //     self.io_free_ops.fetch_add(keys.len(), Ordering::Relaxed);
+    //     let _ = self.pager.free_many(keys);
+    // }
+
+    /// Access current metrics (counts of batch/ops).
+    pub fn io_stats(&self) -> metrics::IoStats {
+        metrics::IoStats {
+            batches: self.io_batches.load(Ordering::Relaxed),
+            get_raw_ops: self.io_get_raw_ops.load(Ordering::Relaxed),
+            get_typed_ops: self.io_get_typed_ops.load(Ordering::Relaxed),
+            put_raw_ops: self.io_put_raw_ops.load(Ordering::Relaxed),
+            put_typed_ops: self.io_put_typed_ops.load(Ordering::Relaxed),
+            free_ops: self.io_free_ops.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset metrics to zero.
+    pub fn reset_io_stats(&self) {
+        self.io_batches.store(0, Ordering::Relaxed);
+        self.io_get_raw_ops.store(0, Ordering::Relaxed);
+        self.io_get_typed_ops.store(0, Ordering::Relaxed);
+        self.io_put_raw_ops.store(0, Ordering::Relaxed);
+        self.io_put_typed_ops.store(0, Ordering::Relaxed);
+        self.io_free_ops.store(0, Ordering::Relaxed);
     }
 }
 
