@@ -281,6 +281,43 @@ where
     Ok((acc, n))
 }
 
+/// Specialized streaming sum over concatenated BE u64 without intermediate buffer.
+/// Returns (sum_u128, count). `src.len()` must be a multiple of 8.
+///
+/// TODO: Experimental specialized op used for benchmarking; if kept, consider
+/// generating these via a macro for common reducers to avoid closure overhead.
+#[inline(always)]
+pub fn be_u64_sum_streaming_unaligned(src: &[u8]) -> Result<(u128, usize), DecodeError> {
+    if src.len() % 8 != 0 { return Err(DecodeError::NotEnoughData); }
+    let n = src.len() / 8;
+    let mut acc: u128 = 0;
+
+    // Unroll by 4 for better ILP and fewer loop branches.
+    let mut p = src.as_ptr();
+    let chunks4 = n / 4;
+    for _ in 0..chunks4 {
+        unsafe {
+            let w0 = (p as *const u64).read_unaligned();
+            let w1 = (p.add(8) as *const u64).read_unaligned();
+            let w2 = (p.add(16) as *const u64).read_unaligned();
+            let w3 = (p.add(24) as *const u64).read_unaligned();
+            acc += u64::from_be(w0) as u128
+                + u64::from_be(w1) as u128
+                + u64::from_be(w2) as u128
+                + u64::from_be(w3) as u128;
+            p = p.add(32);
+        }
+    }
+    let rem = n % 4;
+    for _ in 0..rem {
+        let w = unsafe { (p as *const u64).read_unaligned() };
+        acc += u64::from_be(w) as u128;
+        p = unsafe { p.add(8) };
+    }
+
+    Ok((acc, n))
+}
+
 /// Value-returning reducer over decoded values.
 /// Streams items, calling `f(acc, item)` each step.
 /// Returns `(accumulator, count)`.

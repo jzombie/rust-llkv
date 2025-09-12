@@ -4,6 +4,7 @@ use llkv_data_types::{
     be_u64_reduce_many_concat,
     be_u64_reduce_streaming,
     be_u64_reduce_streaming_unaligned,
+    be_u64_sum_streaming_unaligned,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -71,6 +72,14 @@ fn bench_reduce_many_u64(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("sum_streaming_unaligned", n), &n, |b, &_n| {
             b.iter(|| {
                 let (acc, _cnt) = be_u64_reduce_streaming_unaligned(&src, 0u128, |acc, x| acc + (x as u128)).unwrap();
+                black_box(acc)
+            });
+        });
+
+        // Specialized sum without closure overhead; should approach baseline.
+        group.bench_with_input(BenchmarkId::new("sum_streaming_unaligned_spec", n), &n, |b, &_n| {
+            b.iter(|| {
+                let (acc, _cnt) = be_u64_sum_streaming_unaligned(&src).unwrap();
                 black_box(acc)
             });
         });
