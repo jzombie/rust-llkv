@@ -1,7 +1,12 @@
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
-use llkv_data_types::{DataType, DecodedValue, decode_reduce, decode_reduce_as_ref, decode_reduce_concat_with_buf, decode_reduce_concat, reduce_concat_typed, BeU64};
+use llkv_data_types::{
+    DataType,
+    DecodedValue,
+    decode_reduce_as_ref,
+    reduce_stream_as_ref_u64_unaligned,
+};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 // TODO: Experimental end-to-end bench using column-map scan + decode_reduce.
 use llkv_column_map::ColumnStore;
@@ -10,34 +15,7 @@ use llkv_column_map::types::{AppendOptions, Put, ValueMode, LogicalFieldId};
 use llkv_column_map::column_store::read_scan::{ValueScanOpts, OrderBy};
 use std::borrow::Cow;
 
-// Specialized, bench-only reducer: streaming unaligned sum over BE u64.
-#[inline(always)]
-fn sum_streaming_unaligned_be_u64(src: &[u8]) -> (u128, usize) {
-    let n = src.len() / 8;
-    let mut acc: u128 = 0;
-    let mut p = src.as_ptr();
-    let chunks4 = n / 4;
-    for _ in 0..chunks4 {
-        unsafe {
-            let w0 = (p as *const u64).read_unaligned();
-            let w1 = (p.add(8) as *const u64).read_unaligned();
-            let w2 = (p.add(16) as *const u64).read_unaligned();
-            let w3 = (p.add(24) as *const u64).read_unaligned();
-            acc += u64::from_be(w0) as u128
-                + u64::from_be(w1) as u128
-                + u64::from_be(w2) as u128
-                + u64::from_be(w3) as u128;
-            p = p.add(32);
-        }
-    }
-    let rem = n % 4;
-    for _ in 0..rem {
-        let w = unsafe { (p as *const u64).read_unaligned() };
-        acc += u64::from_be(w) as u128;
-        p = unsafe { p.add(8) };
-    }
-    (acc, n)
-}
+// No bench-only reducers.
 
 fn make_be_bytes(n: usize, seed: u64) -> (Vec<u8>, Vec<u64>) {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -54,6 +32,7 @@ fn make_be_bytes(n: usize, seed: u64) -> (Vec<u8>, Vec<u64>) {
 
 // TODO: Experimental reducer benches: focus on SUM at 1,000,000 elements.
 // If adopted, consider moving alongside math_bench and unifying structure.
+#[cfg(any())]
 fn bench_reduce_many_u64(c: &mut Criterion) {
     let mut group = c.benchmark_group("u64_reduce_many");
 
@@ -129,7 +108,7 @@ fn bench_reduce_many_u64(c: &mut Criterion) {
             });
         });
 
-        // Runtime-dispatched chunked reducer
+        // Runtime-dispatched chunked reducer (concatenated input)
         group.bench_with_input(BenchmarkId::new("sum_decode_reduce_concat_dtype", n), &n, |b, &_n| {
             b.iter_batched(
                 || vec![0u64; 4096],
@@ -142,10 +121,20 @@ fn bench_reduce_many_u64(c: &mut Criterion) {
             );
         });
 
-        // Monomorphized, typed chunked reducer (fastest generic form)
+        // Monomorphized, typed chunked reducer (concatenated input)
         group.bench_with_input(BenchmarkId::new("sum_reduce_concat_typed", n), &n, |b, &_n| {
             b.iter(|| {
                 let (acc, _cnt) = reduce_concat_typed::<BeU64, _, _>(&src, 0u128, |acc, x| acc + (x as u128))
+                    .unwrap();
+                black_box(acc)
+            });
+        });
+
+        // Streaming reducer over iterator of 8-byte slices (no big buffer assumption)
+        group.bench_with_input(BenchmarkId::new("sum_reduce_stream_as_ref_unaligned", n), &n, |b, &_n| {
+            b.iter(|| {
+                let inputs = src.chunks_exact(8);
+                let (acc, _cnt) = reduce_stream_as_ref_u64_unaligned(inputs, 0u128, |acc, x| acc + (x as u128))
                     .unwrap();
                 black_box(acc)
             });
@@ -196,7 +185,7 @@ fn bench_column_map_scan_reduce(c: &mut Criterion) {
     // Expected sum: sum 0..1_000_000-1
     let expected_sum: u128 = (0u128..1_000_000u128).sum();
 
-    // Bench: scan full range and decode_reduce to sum.
+    // Bench: scan full range and reduce via decode_reduce_as_ref (reference path).
     group.bench_function("scan_sum_decode_reduce", |b| {
         // Create a fresh iterator in the setup (not measured), then consume it inside the timing closure.
         b.iter_batched(
@@ -222,8 +211,59 @@ fn bench_column_map_scan_reduce(c: &mut Criterion) {
         );
     });
 
+    // Bench: scan full range and stream-reduce using unaligned u64 loads (fast streaming path).
+    group.bench_function("scan_sum_stream_unaligned", |b| {
+        b.iter_batched(
+            || {
+                store
+                    .scan_values_lww_values_only(
+                        fid,
+                        ValueScanOpts { order_by: OrderBy::Key, ..Default::default() },
+                    )
+                    .expect("scan iterator")
+            },
+            |it| {
+                let (sum, cnt) = reduce_stream_as_ref_u64_unaligned(it, 0u128, |acc, x| acc + (x as u128))
+                    .expect("stream reduce");
+                assert_eq!(cnt, 1_000_000);
+                assert_eq!(sum, expected_sum);
+                black_box(sum)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    // Bench: plain iterator sum with per-item copy_from_slice + from_be_bytes (naive baseline).
+    group.bench_function("scan_sum_iter_copy", |b| {
+        b.iter_batched(
+            || {
+                store
+                    .scan_values_lww_values_only(
+                        fid,
+                        ValueScanOpts { order_by: OrderBy::Key, ..Default::default() },
+                    )
+                    .expect("scan iterator")
+            },
+            |it| {
+                let mut sum: u128 = 0;
+                let mut cnt: usize = 0;
+                for v in it {
+                    let s = v.as_ref();
+                    let mut b8 = [0u8; 8];
+                    b8.copy_from_slice(s);
+                    sum += u64::from_be_bytes(b8) as u128;
+                    cnt += 1;
+                }
+                assert_eq!(cnt, 1_000_000);
+                assert_eq!(sum, expected_sum);
+                black_box(sum)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     group.finish();
 }
 
-criterion_group!(benches, bench_reduce_many_u64, bench_column_map_scan_reduce);
+criterion_group!(benches, bench_column_map_scan_reduce);
 criterion_main!(benches);

@@ -2,7 +2,9 @@ mod internal;
 use crate::internal::{BeI64, BeU8, BeU16, BeU32, Bool, EncodeInto, Utf8CaseFold};
 // Public re-exports for selected internal types/traits used by benches/consumers
 pub use crate::internal::codec::Codec;
-pub use crate::internal::f32x::{F32x, f32x_decode_into, f32x_decode_many_into, f32x_decode_many_into_par};
+pub use crate::internal::f32x::{
+    F32x, f32x_decode_into, f32x_decode_many_into, f32x_decode_many_into_par,
+};
 // Re-export core fixed-width codec markers for typed reducers in benches/consumers.
 pub use crate::internal::BeU64;
 
@@ -159,6 +161,36 @@ where
     Ok((acc, n))
 }
 
+// TODO: Migrate?
+/// Streaming reduce over items that implement `AsRef<[u8]>` for BE u64.
+/// Uses unaligned loads to avoid per-item copies. Each item must be exactly 8 bytes.
+#[inline]
+pub fn reduce_stream_as_ref_u64_unaligned<I, Acc, F>(
+    inputs: I,
+    init: Acc,
+    mut f: F,
+) -> Result<(Acc, usize), DecodeError>
+where
+    I: IntoIterator,
+    I::Item: AsRef<[u8]>,
+    F: FnMut(Acc, u64) -> Acc,
+{
+    let mut acc = init;
+    let mut n = 0usize;
+    for it in inputs {
+        let s = it.as_ref();
+        if s.len() != 8 {
+            return Err(DecodeError::NotEnoughData);
+        }
+        let p = s.as_ptr();
+        let word = unsafe { (p as *const u64).read_unaligned() };
+        let x = u64::from_be(word);
+        acc = f(acc, x);
+        n += 1;
+    }
+    Ok((acc, n))
+}
+
 /// Reduce over a concatenated buffer using a reusable buffer with runtime `DataType` dispatch.
 /// Convenience wrapper that selects a reasonable buffer size automatically.
 #[inline]
@@ -206,7 +238,8 @@ where
         return Ok((init, 0));
     }
     let buf_elems = core::cmp::min(4096usize, total);
-    let mut buf = vec![unsafe { core::mem::MaybeUninit::<C::Owned>::uninit().assume_init() }; buf_elems];
+    let mut buf =
+        vec![unsafe { core::mem::MaybeUninit::<C::Owned>::uninit().assume_init() }; buf_elems];
 
     let mut acc = init;
     let mut done = 0usize;
@@ -216,7 +249,9 @@ where
         let bytes_len = take * w;
         let chunk = &src[off_bytes..off_bytes + bytes_len];
         <C as internal::codec::Codec>::decode_many_into(&mut buf[..take], chunk)?;
-        for &x in &buf[..take] { acc = f(acc, x); }
+        for &x in &buf[..take] {
+            acc = f(acc, x);
+        }
         done += take;
         off_bytes += bytes_len;
     }
@@ -384,8 +419,6 @@ pub fn decode_value<'a>(bytes: &'a [u8], dtype: &DataType) -> Option<DecodedValu
 
 // -------------------- Public batch helpers for benches/consumers --------------------
 
-
-
 /// Generic chunked reduce over a concatenated buffer for fixed-width types.
 /// Decodes up to `buf.len()` elements at a time using the `DataType`'s codec,
 /// then folds them with `f`. Returns `(accumulator, count)`.
@@ -403,8 +436,12 @@ where
     DataType: BulkDecodeMany<T>,
 {
     let w = core::mem::size_of::<T>();
-    if w == 0 || src.len() % w != 0 { return Err(DecodeError::NotEnoughData); }
-    if buf.is_empty() { return Ok((init, 0)); }
+    if w == 0 || src.len() % w != 0 {
+        return Err(DecodeError::NotEnoughData);
+    }
+    if buf.is_empty() {
+        return Ok((init, 0));
+    }
     let total = src.len() / w;
     let mut acc = init;
     let mut done = 0usize;
@@ -414,7 +451,9 @@ where
         let bytes_len = take * w;
         let chunk = &src[off_bytes..off_bytes + bytes_len];
         dtype.decode_many_into(&mut buf[..take], chunk)?;
-        for &x in &buf[..take] { acc = f(acc, x); }
+        for &x in &buf[..take] {
+            acc = f(acc, x);
+        }
         done += take;
         off_bytes += bytes_len;
     }
