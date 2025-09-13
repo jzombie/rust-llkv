@@ -4,6 +4,7 @@ use super::*;
 pub struct BeU64;
 
 impl Codec for BeU64 {
+    const WIDTH: usize = 8;
     type Borrowed<'a> = &'a u64;
     type Owned = u64;
 
@@ -22,23 +23,16 @@ impl Codec for BeU64 {
         let bytes: [u8; 8] = src[..8].try_into().unwrap();
         Ok(u64::from_be_bytes(bytes))
     }
-}
 
-impl BeU64 {
-    /// Decode `src` (concatenated big-endian u64) into `dst` in one pass.
-    /// Length must match exactly: `src.len() == dst.len() * 8`.
-    ///
-    /// TODO: Experimental bulk decoder; consider moving into a generic
-    /// codec trait extension and sharing impl across integer codecs.
+    // Specialized fast path to avoid per-item length checks in the hot loop.
     #[inline]
-    pub fn decode_many_into(dst: &mut [u64], src: &[u8]) -> Result<(), DecodeError> {
+    fn decode_many_into(dst: &mut [u64], src: &[u8]) -> Result<(), DecodeError> {
         let n = dst.len();
         if src.len() != n.saturating_mul(8) {
             return Err(DecodeError::NotEnoughData);
         }
         let mut off = 0usize;
         for out in dst.iter_mut() {
-            // Safe: we checked bounds above.
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&src[off..off + 8]);
             *out = u64::from_be_bytes(bytes);

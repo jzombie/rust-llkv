@@ -4,6 +4,7 @@ use super::*;
 pub struct BeU16;
 
 impl Codec for BeU16 {
+    const WIDTH: usize = 2;
     type Borrowed<'a> = &'a u16;
     type Owned = u16;
 
@@ -21,6 +22,23 @@ impl Codec for BeU16 {
         // Safe due to the length check above.
         let bytes: [u8; 2] = src[..2].try_into().unwrap();
         Ok(u16::from_be_bytes(bytes))
+    }
+
+    // Specialized fast path to avoid per-item length checks in the hot loop.
+    #[inline]
+    fn decode_many_into(dst: &mut [u16], src: &[u8]) -> Result<(), DecodeError> {
+        let n = dst.len();
+        if src.len() != n.saturating_mul(2) {
+            return Err(DecodeError::NotEnoughData);
+        }
+        let mut off = 0usize;
+        for out in dst.iter_mut() {
+            let mut bytes = [0u8; 2];
+            bytes.copy_from_slice(&src[off..off + 2]);
+            *out = u16::from_be_bytes(bytes);
+            off += 2;
+        }
+        Ok(())
     }
 }
 

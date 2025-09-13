@@ -34,6 +34,7 @@ impl Bytes {
 }
 
 impl Codec for Bytes {
+    const WIDTH: usize = 0; // variable-width
     type Borrowed<'a> = &'a [u8];
     type Owned = Vec<u8>;
 
@@ -48,6 +49,11 @@ impl Codec for Bytes {
         Self::decode_borrowed(src)
             .map(|b| b.to_vec())
             .ok_or(DecodeError::InvalidFormat)
+    }
+
+    #[inline]
+    fn decode_many_into(_dst: &mut [Vec<u8>], _src: &[u8]) -> Result<(), DecodeError> {
+        panic!("Bytes::decode_many_into is not supported (variable-width codec)");
     }
 }
 

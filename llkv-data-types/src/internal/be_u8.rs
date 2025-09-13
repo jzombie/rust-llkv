@@ -4,6 +4,7 @@ use super::*;
 pub struct BeU8;
 
 impl Codec for BeU8 {
+    const WIDTH: usize = 1;
     type Borrowed<'a> = &'a u8;
     type Owned = u8;
 
@@ -19,6 +20,16 @@ impl Codec for BeU8 {
             return Err(DecodeError::NotEnoughData);
         }
         Ok(src[0])
+    }
+
+    #[inline]
+    fn decode_many_into(dst: &mut [u8], src: &[u8]) -> Result<(), DecodeError> {
+        let n = dst.len();
+        if src.len() != n {
+            return Err(DecodeError::NotEnoughData);
+        }
+        dst.copy_from_slice(src);
+        Ok(())
     }
 }
 

@@ -5,7 +5,11 @@ use super::*;
 /// TODO: Experimental. If adopted, consider a generic fixed-width vector trait.
 pub struct F32x<const N: usize>;
 
+/// Alias: clearer name if used externally.
+pub type Float32Array<const N: usize> = F32x<N>;
+
 impl<const N: usize> Codec for F32x<N> {
+    const WIDTH: usize = N * 4;
     type Borrowed<'a> = &'a [f32]
     where
         Self: 'a;
@@ -27,6 +31,11 @@ impl<const N: usize> Codec for F32x<N> {
         let mut out = vec![0f32; N];
         f32x_decode_into::<N>(&mut out, src)?;
         Ok(out)
+    }
+
+    #[inline]
+    fn decode_many_into(_dst: &mut [Vec<f32>], _src: &[u8]) -> Result<(), DecodeError> {
+        panic!("F32x::decode_many_into is not supported; use f32x_decode_many_into");
     }
 }
 

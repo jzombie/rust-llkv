@@ -15,6 +15,7 @@ impl BeI64 {
 }
 
 impl Codec for BeI64 {
+    const WIDTH: usize = 8;
     type Borrowed<'a> = &'a i64;
     type Owned = i64;
 
@@ -32,6 +33,24 @@ impl Codec for BeI64 {
         }
         let bytes: [u8; 8] = src[..8].try_into().unwrap();
         Ok(Self::from_lex(u64::from_be_bytes(bytes)))
+    }
+
+    // Specialized fast path to avoid per-item length checks in the hot loop.
+    #[inline]
+    fn decode_many_into(dst: &mut [i64], src: &[u8]) -> Result<(), DecodeError> {
+        let n = dst.len();
+        if src.len() != n.saturating_mul(8) {
+            return Err(DecodeError::NotEnoughData);
+        }
+        let mut off = 0usize;
+        for out in dst.iter_mut() {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&src[off..off + 8]);
+            let u = u64::from_be_bytes(bytes);
+            *out = Self::from_lex(u);
+            off += 8;
+        }
+        Ok(())
     }
 }
 

@@ -98,6 +98,7 @@ impl Utf8CaseFold {
 }
 
 impl Codec for Utf8CaseFold {
+    const WIDTH: usize = 0; // variable-width
     type Borrowed<'a> = &'a str;
     type Owned = String;
 
@@ -114,6 +115,11 @@ impl Codec for Utf8CaseFold {
         Self::decode_borrowed(src)
             .map(|s| s.to_owned())
             .ok_or(DecodeError::InvalidFormat)
+    }
+
+    #[inline]
+    fn decode_many_into(_dst: &mut [String], _src: &[u8]) -> Result<(), DecodeError> {
+        panic!("Utf8CaseFold::decode_many_into is not supported (variable-width codec)");
     }
 }
 

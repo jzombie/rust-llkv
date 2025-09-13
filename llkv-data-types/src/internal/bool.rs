@@ -4,6 +4,7 @@ use super::*;
 pub struct Bool;
 
 impl Codec for Bool {
+    const WIDTH: usize = 1;
     type Borrowed<'a> = &'a bool;
     type Owned = bool;
 
@@ -19,6 +20,18 @@ impl Codec for Bool {
             return Err(DecodeError::NotEnoughData);
         }
         Ok(src[0] != 0)
+    }
+
+    #[inline]
+    fn decode_many_into(dst: &mut [bool], src: &[u8]) -> Result<(), DecodeError> {
+        let n = dst.len();
+        if src.len() != n {
+            return Err(DecodeError::NotEnoughData);
+        }
+        for (i, out) in dst.iter_mut().enumerate() {
+            *out = src[i] != 0;
+        }
+        Ok(())
     }
 }
 

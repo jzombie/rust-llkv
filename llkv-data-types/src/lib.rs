@@ -172,7 +172,7 @@ pub fn decode_value<'a>(bytes: &'a [u8], dtype: &DataType) -> Option<DecodedValu
 /// integrating into a refined codec trait once stabilized.
 #[inline]
 pub fn be_u64_decode_many_into(dst: &mut [u64], src: &[u8]) -> Result<(), DecodeError> {
-    internal::BeU64::decode_many_into(dst, src)
+    <internal::BeU64 as internal::Codec>::decode_many_into(dst, src)
 }
 
 /// Reduce over a concatenated buffer of BE u64 values using a bulk decode.
@@ -187,7 +187,7 @@ where
     if src.len() % 8 != 0 { return Err(DecodeError::NotEnoughData); }
     let n = src.len() / 8;
     let mut tmp = vec![0u64; n];
-    internal::BeU64::decode_many_into(&mut tmp, src)?;
+    <internal::BeU64 as internal::Codec>::decode_many_into(&mut tmp, src)?;
     let mut acc = init;
     for &x in &tmp { acc = f(acc, x); }
     Ok((acc, n))

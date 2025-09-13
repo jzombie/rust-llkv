@@ -4,6 +4,7 @@ use super::*;
 pub struct BeU128;
 
 impl Codec for BeU128 {
+    const WIDTH: usize = 16;
     type Borrowed<'a> = &'a u128;
     type Owned = u128;
 
@@ -21,6 +22,23 @@ impl Codec for BeU128 {
         // Safe due to the length check above.
         let bytes: [u8; 16] = src[..16].try_into().unwrap();
         Ok(u128::from_be_bytes(bytes))
+    }
+
+    // Specialized fast path to avoid per-item length checks in the hot loop.
+    #[inline]
+    fn decode_many_into(dst: &mut [u128], src: &[u8]) -> Result<(), DecodeError> {
+        let n = dst.len();
+        if src.len() != n.saturating_mul(16) {
+            return Err(DecodeError::NotEnoughData);
+        }
+        let mut off = 0usize;
+        for out in dst.iter_mut() {
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&src[off..off + 16]);
+            *out = u128::from_be_bytes(bytes);
+            off += 16;
+        }
+        Ok(())
     }
 }
 
