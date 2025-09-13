@@ -1,18 +1,7 @@
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
-use llkv_data_types::{
-    DataType,
-    DecodedValue,
-    // TODO: Experimental reducers; bench only SUM variants below.
-    be_u64_reduce_many_concat,
-    be_u64_reduce_streaming,
-    be_u64_reduce_streaming_unaligned,
-    be_u64_sum_streaming_unaligned,
-    be_u64_reduce_slices, be_u64_reduce_as_ref,
-    // TODO: Add generic reducer comparison against baseline one-by-one.
-    decode_reduce,
-};
+use llkv_data_types::{DataType, DecodedValue, decode_reduce, decode_reduce_as_ref, decode_reduce_concat_with_buf, decode_reduce_concat, reduce_concat_typed, BeU64};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 // TODO: Experimental end-to-end bench using column-map scan + decode_reduce.
 use llkv_column_map::ColumnStore;
@@ -20,6 +9,35 @@ use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::types::{AppendOptions, Put, ValueMode, LogicalFieldId};
 use llkv_column_map::column_store::read_scan::{ValueScanOpts, OrderBy};
 use std::borrow::Cow;
+
+// Specialized, bench-only reducer: streaming unaligned sum over BE u64.
+#[inline(always)]
+fn sum_streaming_unaligned_be_u64(src: &[u8]) -> (u128, usize) {
+    let n = src.len() / 8;
+    let mut acc: u128 = 0;
+    let mut p = src.as_ptr();
+    let chunks4 = n / 4;
+    for _ in 0..chunks4 {
+        unsafe {
+            let w0 = (p as *const u64).read_unaligned();
+            let w1 = (p.add(8) as *const u64).read_unaligned();
+            let w2 = (p.add(16) as *const u64).read_unaligned();
+            let w3 = (p.add(24) as *const u64).read_unaligned();
+            acc += u64::from_be(w0) as u128
+                + u64::from_be(w1) as u128
+                + u64::from_be(w2) as u128
+                + u64::from_be(w3) as u128;
+            p = p.add(32);
+        }
+    }
+    let rem = n % 4;
+    for _ in 0..rem {
+        let w = unsafe { (p as *const u64).read_unaligned() };
+        acc += u64::from_be(w) as u128;
+        p = unsafe { p.add(8) };
+    }
+    (acc, n)
+}
 
 fn make_be_bytes(n: usize, seed: u64) -> (Vec<u8>, Vec<u64>) {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -37,7 +55,7 @@ fn make_be_bytes(n: usize, seed: u64) -> (Vec<u8>, Vec<u64>) {
 // TODO: Experimental reducer benches: focus on SUM at 1,000,000 elements.
 // If adopted, consider moving alongside math_bench and unifying structure.
 fn bench_reduce_many_u64(c: &mut Criterion) {
-    let mut group = c.benchmark_group("be_u64_reduce_many");
+    let mut group = c.benchmark_group("u64_reduce_many");
 
     // Only benchmark the 1,000,000 element case to reduce noise.
     for &n in &[1_000_000usize] {
@@ -53,18 +71,13 @@ fn bench_reduce_many_u64(c: &mut Criterion) {
             bytes.copy_from_slice(&src[a..b]);
             sum_one += u64::from_be_bytes(bytes) as u128;
         }
-        let (sum_many, cnt) =
-            be_u64_reduce_many_concat(&src, 0u128, |acc, x| acc + (x as u128)).unwrap();
+        let (sum_many, cnt) = {
+            let mut buf = vec![0u64; 4096];
+            decode_reduce_concat_with_buf(&src, &DataType::U64, 0u128, |acc, x| acc + (x as u128), &mut buf).unwrap()
+        };
         assert_eq!(cnt, n);
         assert_eq!(sum_many, sum_one, "reduce_many must match one_by_one");
-        // streaming correctness
-        let (sum_stream, cnt2) =
-            be_u64_reduce_streaming(&src, 0u128, |acc, x| acc + (x as u128)).unwrap();
-        assert_eq!(cnt2, n);
-        assert_eq!(
-            sum_stream, sum_one,
-            "streaming reduce must match one_by_one"
-        );
+        // optional streaming correctness is removed in favor of generic chunked reduce
 
         group.bench_with_input(BenchmarkId::new("sum_one_by_one", n), &n, |b, &_n| {
             b.iter(|| {
@@ -95,15 +108,16 @@ fn bench_reduce_many_u64(c: &mut Criterion) {
         // });
 
         // // Specialized sum without closure overhead; should approach baseline.
-        // group.bench_with_input(BenchmarkId::new("sum_streaming_unaligned_spec", n), &n, |b, &_n| {
-        //     b.iter(|| {
-        //         let (acc, _cnt) = be_u64_sum_streaming_unaligned(&src).unwrap();
-        //         black_box(acc)
-        //     });
-        // });
+        // Specialized sum without closure overhead; close to baseline memory bandwidth.
+        group.bench_with_input(BenchmarkId::new("sum_streaming_unaligned_spec", n), &n, |b, &_n| {
+            b.iter(|| {
+                let (acc, _cnt) = sum_streaming_unaligned_be_u64(&src);
+                black_box(acc)
+            });
+        });
 
-        // TODO: Compare against the original generic reducer in the library.
-        group.bench_with_input(BenchmarkId::new("sum_decode_reduce", n), &n, |b, &_n| {
+        // Iterator-based reference reducer (per-item decode)
+        group.bench_with_input(BenchmarkId::new("sum_decode_reduce_iter", n), &n, |b, &_n| {
             b.iter(|| {
                 let inputs = src.chunks_exact(8);
                 let (acc, _cnt) = decode_reduce(inputs, &DataType::U64, 0u128, |acc, v| match v {
@@ -111,6 +125,28 @@ fn bench_reduce_many_u64(c: &mut Criterion) {
                     _ => unreachable!(),
                 })
                 .unwrap();
+                black_box(acc)
+            });
+        });
+
+        // Runtime-dispatched chunked reducer
+        group.bench_with_input(BenchmarkId::new("sum_decode_reduce_concat_dtype", n), &n, |b, &_n| {
+            b.iter_batched(
+                || vec![0u64; 4096],
+                |mut buf| {
+                    let (acc, _cnt) = decode_reduce_concat::<u64, _, _>(&src, &DataType::U64, 0u128, |acc, x| acc + (x as u128))
+                        .unwrap();
+                    black_box(acc)
+                },
+                BatchSize::LargeInput,
+            );
+        });
+
+        // Monomorphized, typed chunked reducer (fastest generic form)
+        group.bench_with_input(BenchmarkId::new("sum_reduce_concat_typed", n), &n, |b, &_n| {
+            b.iter(|| {
+                let (acc, _cnt) = reduce_concat_typed::<BeU64, _, _>(&src, 0u128, |acc, x| acc + (x as u128))
+                    .unwrap();
                 black_box(acc)
             });
         });
@@ -174,7 +210,10 @@ fn bench_column_map_scan_reduce(c: &mut Criterion) {
             },
             |it| {
                 // Stream the sum via codec helper over items that implement AsRef<[u8]>.
-                let (sum, cnt) = be_u64_reduce_as_ref(it, 0u128, |acc, x| acc + (x as u128)).unwrap();
+                let (sum, cnt) = decode_reduce_as_ref(it, &DataType::U64, 0u128, |acc, dv| match dv {
+                    DecodedValue::U64(x) => acc + (x as u128),
+                    _ => unreachable!(),
+                }).unwrap();
                 assert_eq!(cnt, 1_000_000);
                 assert_eq!(sum, expected_sum);
                 black_box(sum)

@@ -1,8 +1,227 @@
 mod internal;
-use crate::internal::{BeI64, BeU8, BeU16, BeU32, BeU64, Bool, EncodeInto, Utf8CaseFold};
+use crate::internal::{BeI64, BeU8, BeU16, BeU32, Bool, EncodeInto, Utf8CaseFold};
 // Public re-exports for selected internal types/traits used by benches/consumers
 pub use crate::internal::codec::Codec;
 pub use crate::internal::f32x::{F32x, f32x_decode_into, f32x_decode_many_into, f32x_decode_many_into_par};
+// Re-export core fixed-width codec markers for typed reducers in benches/consumers.
+pub use crate::internal::BeU64;
+
+/// Trait providing fast, typed bulk decode via `DataType` dispatch.
+pub trait BulkDecodeMany<T> {
+    fn decode_many_into(&self, dst: &mut [T], src: &[u8]) -> Result<(), DecodeError>;
+}
+
+impl BulkDecodeMany<u8> for DataType {
+    #[inline]
+    fn decode_many_into(&self, dst: &mut [u8], src: &[u8]) -> Result<(), DecodeError> {
+        match self {
+            DataType::U8 => <internal::BeU8 as Codec>::decode_many_into(dst, src),
+            _ => Err(DecodeError::InvalidFormat),
+        }
+    }
+}
+
+impl BulkDecodeMany<u16> for DataType {
+    #[inline]
+    fn decode_many_into(&self, dst: &mut [u16], src: &[u8]) -> Result<(), DecodeError> {
+        match self {
+            DataType::U16 => <internal::BeU16 as Codec>::decode_many_into(dst, src),
+            _ => Err(DecodeError::InvalidFormat),
+        }
+    }
+}
+
+impl BulkDecodeMany<u32> for DataType {
+    #[inline]
+    fn decode_many_into(&self, dst: &mut [u32], src: &[u8]) -> Result<(), DecodeError> {
+        match self {
+            DataType::U32 => <internal::BeU32 as Codec>::decode_many_into(dst, src),
+            DataType::CategoryId => <internal::BeU32 as Codec>::decode_many_into(dst, src),
+            _ => Err(DecodeError::InvalidFormat),
+        }
+    }
+}
+
+impl BulkDecodeMany<u64> for DataType {
+    #[inline]
+    fn decode_many_into(&self, dst: &mut [u64], src: &[u8]) -> Result<(), DecodeError> {
+        match self {
+            DataType::U64 => <internal::BeU64 as Codec>::decode_many_into(dst, src),
+            _ => Err(DecodeError::InvalidFormat),
+        }
+    }
+}
+
+impl BulkDecodeMany<i64> for DataType {
+    #[inline]
+    fn decode_many_into(&self, dst: &mut [i64], src: &[u8]) -> Result<(), DecodeError> {
+        match self {
+            DataType::I64 => <internal::BeI64 as Codec>::decode_many_into(dst, src),
+            _ => Err(DecodeError::InvalidFormat),
+        }
+    }
+}
+
+impl BulkDecodeMany<bool> for DataType {
+    #[inline]
+    fn decode_many_into(&self, dst: &mut [bool], src: &[u8]) -> Result<(), DecodeError> {
+        match self {
+            DataType::Bool => <internal::Bool as Codec>::decode_many_into(dst, src),
+            _ => Err(DecodeError::InvalidFormat),
+        }
+    }
+}
+
+/// Reduce over an iterator of items that can be viewed as `&[u8]`.
+/// Generic over `AsRef<[u8]>` producers like `ValueSlice`, avoiding lifetime issues
+/// when mapping to temporary `&[u8]` slices.
+#[inline]
+pub fn decode_reduce_as_ref<I, T, F>(
+    inputs: I,
+    dtype: &DataType,
+    init: T,
+    mut f: F,
+) -> Result<(T, usize), DecodeError>
+where
+    I: IntoIterator,
+    I::Item: AsRef<[u8]>,
+    F: FnMut(T, DecodedValue<'_>) -> T,
+{
+    let mut acc = init;
+    let mut n = 0usize;
+    match dtype {
+        DataType::Utf8 => {
+            for it in inputs {
+                let b = it.as_ref();
+                let s = Utf8CaseFold::decode_borrowed(b).ok_or(DecodeError::InvalidFormat)?;
+                acc = f(acc, DecodedValue::Str(s));
+                n += 1;
+            }
+        }
+        DataType::U8 => {
+            for it in inputs {
+                let x = BeU8::decode(it.as_ref())?;
+                acc = f(acc, DecodedValue::U8(x));
+                n += 1;
+            }
+        }
+        DataType::U16 => {
+            for it in inputs {
+                let x = BeU16::decode(it.as_ref())?;
+                acc = f(acc, DecodedValue::U16(x));
+                n += 1;
+            }
+        }
+        DataType::U32 => {
+            for it in inputs {
+                let x = BeU32::decode(it.as_ref())?;
+                acc = f(acc, DecodedValue::U32(x));
+                n += 1;
+            }
+        }
+        DataType::U64 => {
+            for it in inputs {
+                let x = BeU64::decode(it.as_ref())?;
+                acc = f(acc, DecodedValue::U64(x));
+                n += 1;
+            }
+        }
+        DataType::I64 => {
+            for it in inputs {
+                let x = BeI64::decode(it.as_ref())?;
+                acc = f(acc, DecodedValue::I64(x));
+                n += 1;
+            }
+        }
+        DataType::Bool => {
+            for it in inputs {
+                let x = Bool::decode(it.as_ref())?;
+                acc = f(acc, DecodedValue::Bool(x));
+                n += 1;
+            }
+        }
+        DataType::Bytes => {
+            for it in inputs {
+                let b = it.as_ref();
+                let x = internal::Bytes::decode_borrowed(b).ok_or(DecodeError::InvalidFormat)?;
+                acc = f(acc, DecodedValue::Bytes(x));
+                n += 1;
+            }
+        }
+        DataType::CategoryId => {
+            for it in inputs {
+                let x = BeU32::decode(it.as_ref())?;
+                acc = f(acc, DecodedValue::CategoryId(x));
+                n += 1;
+            }
+        }
+    }
+    Ok((acc, n))
+}
+
+/// Reduce over a concatenated buffer using a reusable buffer with runtime `DataType` dispatch.
+/// Convenience wrapper that selects a reasonable buffer size automatically.
+#[inline]
+pub fn decode_reduce_concat<T, Acc, F>(
+    src: &[u8],
+    dtype: &DataType,
+    init: Acc,
+    mut f: F,
+) -> Result<(Acc, usize), DecodeError>
+where
+    T: Copy,
+    F: FnMut(Acc, T) -> Acc,
+    DataType: BulkDecodeMany<T>,
+{
+    let w = core::mem::size_of::<T>();
+    if w == 0 || src.len() % w != 0 {
+        return Err(DecodeError::NotEnoughData);
+    }
+    let total = src.len() / w;
+    let buf_elems = core::cmp::min(4096usize, core::cmp::max(1usize, total));
+    let mut buf = vec![unsafe { core::mem::MaybeUninit::<T>::uninit().assume_init() }; buf_elems];
+    // Reuse the existing chunked implementation.
+    decode_reduce_concat_with_buf(src, dtype, init, f, &mut buf)
+}
+
+/// Monomorphized, fastest path when the codec type is known at compile time.
+/// Decodes in chunks via `<C as Codec>::decode_many_into` and folds with `f`.
+#[inline]
+pub fn reduce_concat_typed<C, Acc, F>(
+    src: &[u8],
+    init: Acc,
+    mut f: F,
+) -> Result<(Acc, usize), DecodeError>
+where
+    C: internal::codec::Codec,
+    C::Owned: Copy,
+    F: FnMut(Acc, C::Owned) -> Acc,
+{
+    let w = C::WIDTH;
+    if w == 0 || src.len() % w != 0 {
+        return Err(DecodeError::NotEnoughData);
+    }
+    let total = src.len() / w;
+    if total == 0 {
+        return Ok((init, 0));
+    }
+    let buf_elems = core::cmp::min(4096usize, total);
+    let mut buf = vec![unsafe { core::mem::MaybeUninit::<C::Owned>::uninit().assume_init() }; buf_elems];
+
+    let mut acc = init;
+    let mut done = 0usize;
+    let mut off_bytes = 0usize;
+    while done < total {
+        let take = core::cmp::min(buf.len(), total - done);
+        let bytes_len = take * w;
+        let chunk = &src[off_bytes..off_bytes + bytes_len];
+        <C as internal::codec::Codec>::decode_many_into(&mut buf[..take], chunk)?;
+        for &x in &buf[..take] { acc = f(acc, x); }
+        done += take;
+        off_bytes += bytes_len;
+    }
+    Ok((acc, total))
+}
 
 pub mod errors;
 pub use errors::*;
@@ -165,217 +384,41 @@ pub fn decode_value<'a>(bytes: &'a [u8], dtype: &DataType) -> Option<DecodedValu
 
 // -------------------- Public batch helpers for benches/consumers --------------------
 
-/// Decode concatenated big-endian u64 values into `dst` in a single pass.
-/// `src.len()` must equal `dst.len() * 8`.
-///
-/// TODO: Experimental helper. Consider moving this behind a feature flag or
-/// integrating into a refined codec trait once stabilized.
+
+
+/// Generic chunked reduce over a concatenated buffer for fixed-width types.
+/// Decodes up to `buf.len()` elements at a time using the `DataType`'s codec,
+/// then folds them with `f`. Returns `(accumulator, count)`.
 #[inline]
-pub fn be_u64_decode_many_into(dst: &mut [u64], src: &[u8]) -> Result<(), DecodeError> {
-    <internal::BeU64 as internal::Codec>::decode_many_into(dst, src)
-}
-
-/// Reduce over a concatenated buffer of BE u64 values using a bulk decode.
-/// Returns (accumulator, count). `src.len()` must be a multiple of 8.
-///
-/// TODO: Experimental specialization. If kept, generalize to other integer
-/// widths and unify with `decode_reduce` via a trait or enum dispatch.
-pub fn be_u64_reduce_many_concat<T, F>(src: &[u8], init: T, mut f: F) -> Result<(T, usize), DecodeError>
-where
-    F: FnMut(T, u64) -> T,
-{
-    if src.len() % 8 != 0 { return Err(DecodeError::NotEnoughData); }
-    let n = src.len() / 8;
-    let mut tmp = vec![0u64; n];
-    <internal::BeU64 as internal::Codec>::decode_many_into(&mut tmp, src)?;
-    let mut acc = init;
-    for &x in &tmp { acc = f(acc, x); }
-    Ok((acc, n))
-}
-
-/// Stream a reduce over concatenated BE u64 bytes without an intermediate buffer.
-/// Returns (accumulator, count). `src.len()` must be a multiple of 8.
-///
-/// TODO: Experimental; if useful, consider exposing a generic streaming
-/// decoder-reducer for fixed-width integers.
-#[inline(always)]
-pub fn be_u64_reduce_streaming<T, F>(src: &[u8], init: T, mut f: F) -> Result<(T, usize), DecodeError>
-where
-    F: FnMut(T, u64) -> T,
-{
-    if src.len() % 8 != 0 { return Err(DecodeError::NotEnoughData); }
-    let n = src.len() / 8;
-    let mut acc = init;
-    let mut off = 0usize;
-    for _ in 0..n {
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&src[off..off+8]);
-        let x = u64::from_be_bytes(bytes);
-        acc = f(acc, x);
-        off += 8;
-    }
-    Ok((acc, n))
-}
-
-/// Chunked reduce over concatenated BE u64 using a reusable decode buffer.
-/// Decodes up to `buf.len()` elements at a time, then folds them.
-/// Returns (accumulator, count). `src.len()` must be a multiple of 8.
-///
-/// TODO: Experimental; evaluate against streaming for various cache sizes and
-/// consider a single-pass fused variant if mapping stores into an output column.
-pub fn be_u64_reduce_chunked_with_buf<T, F>(
+pub fn decode_reduce_concat_with_buf<T, Acc, F>(
     src: &[u8],
-    init: T,
+    dtype: &DataType,
+    init: Acc,
     mut f: F,
-    buf: &mut [u64],
-) -> Result<(T, usize), DecodeError>
+    buf: &mut [T],
+) -> Result<(Acc, usize), DecodeError>
 where
-    F: FnMut(T, u64) -> T,
+    T: Copy,
+    F: FnMut(Acc, T) -> Acc,
+    DataType: BulkDecodeMany<T>,
 {
-    if src.len() % 8 != 0 { return Err(DecodeError::NotEnoughData); }
+    let w = core::mem::size_of::<T>();
+    if w == 0 || src.len() % w != 0 { return Err(DecodeError::NotEnoughData); }
     if buf.is_empty() { return Ok((init, 0)); }
-    let total = src.len() / 8;
+    let total = src.len() / w;
     let mut acc = init;
     let mut done = 0usize;
     let mut off_bytes = 0usize;
     while done < total {
         let take = core::cmp::min(buf.len(), total - done);
-        let bytes_len = take * 8;
+        let bytes_len = take * w;
         let chunk = &src[off_bytes..off_bytes + bytes_len];
-        be_u64_decode_many_into(&mut buf[..take], chunk)?;
-        for &x in &buf[..take] {
-            acc = f(acc, x);
-        }
+        dtype.decode_many_into(&mut buf[..take], chunk)?;
+        for &x in &buf[..take] { acc = f(acc, x); }
         done += take;
         off_bytes += bytes_len;
     }
     Ok((acc, total))
-}
-
-/// Streaming reduce with unsafe unaligned reads (fast path).
-/// Decodes using `read_unaligned` and `u64::from_be` to avoid per-item copies.
-/// Returns (accumulator, count). `src.len()` must be a multiple of 8.
-///
-/// TODO: Experimental fast path. Guard with a feature if kept; add similar
-/// implementations for other integer widths.
-#[inline(always)]
-pub fn be_u64_reduce_streaming_unaligned<T, F>(
-    src: &[u8],
-    init: T,
-    mut f: F,
-) -> Result<(T, usize), DecodeError>
-where
-    F: FnMut(T, u64) -> T,
-{
-    if src.len() % 8 != 0 {
-        return Err(DecodeError::NotEnoughData);
-    }
-    let n = src.len() / 8;
-    let mut acc = init;
-    let mut p = src.as_ptr();
-    for _ in 0..n {
-        // SAFETY: We only advance within bounds in 8-byte steps; alignment is not required.
-        let word = unsafe { (p as *const u64).read_unaligned() };
-        let x = u64::from_be(word);
-        acc = f(acc, x);
-        // SAFETY: pointer arithmetic within checked bounds above.
-        p = unsafe { p.add(8) };
-    }
-    Ok((acc, n))
-}
-
-/// Reduce over an iterator of BE u64 slices (each exactly 8 bytes).
-///
-/// This is a streaming variant suitable for iterators of ValueSlice where
-/// values are not laid out in a single contiguous buffer. Each item must be
-/// exactly 8 bytes long.
-///
-/// TODO: Experimental. If kept, consider a generic fixed-width version.
-pub fn be_u64_reduce_slices<'a, I, T, F>(
-    inputs: I,
-    init: T,
-    mut f: F,
-) -> Result<(T, usize), DecodeError>
-where
-    I: IntoIterator<Item = &'a [u8]>,
-    F: FnMut(T, u64) -> T,
-{
-    let mut acc = init;
-    let mut n = 0usize;
-    for s in inputs {
-        if s.len() != 8 { return Err(DecodeError::NotEnoughData); }
-        let mut b8 = [0u8; 8];
-        b8.copy_from_slice(s);
-        let x = u64::from_be_bytes(b8);
-        acc = f(acc, x);
-        n += 1;
-    }
-    Ok((acc, n))
-}
-
-/// Reduce over an iterator of items that can be viewed as `&[u8]` (each exactly 8 bytes).
-/// Useful for types like ValueSlice that implement `AsRef<[u8]>`.
-///
-/// TODO: Experimental. If kept, consider a generic fixed-width version with const N.
-pub fn be_u64_reduce_as_ref<I, T, F>(
-    inputs: I,
-    init: T,
-    mut f: F,
-) -> Result<(T, usize), DecodeError>
-where
-    I: IntoIterator,
-    I::Item: AsRef<[u8]>,
-    F: FnMut(T, u64) -> T,
-{
-    let mut acc = init;
-    let mut n = 0usize;
-    for it in inputs {
-        let s = it.as_ref();
-        if s.len() != 8 { return Err(DecodeError::NotEnoughData); }
-        let mut b8 = [0u8; 8];
-        b8.copy_from_slice(s);
-        let x = u64::from_be_bytes(b8);
-        acc = f(acc, x);
-        n += 1;
-    }
-    Ok((acc, n))
-}
-
-/// Specialized streaming sum over concatenated BE u64 without intermediate buffer.
-/// Returns (sum_u128, count). `src.len()` must be a multiple of 8.
-///
-/// TODO: Experimental specialized op used for benchmarking; if kept, consider
-/// generating these via a macro for common reducers to avoid closure overhead.
-#[inline(always)]
-pub fn be_u64_sum_streaming_unaligned(src: &[u8]) -> Result<(u128, usize), DecodeError> {
-    if src.len() % 8 != 0 { return Err(DecodeError::NotEnoughData); }
-    let n = src.len() / 8;
-    let mut acc: u128 = 0;
-
-    // Unroll by 4 for better ILP and fewer loop branches.
-    let mut p = src.as_ptr();
-    let chunks4 = n / 4;
-    for _ in 0..chunks4 {
-        unsafe {
-            let w0 = (p as *const u64).read_unaligned();
-            let w1 = (p.add(8) as *const u64).read_unaligned();
-            let w2 = (p.add(16) as *const u64).read_unaligned();
-            let w3 = (p.add(24) as *const u64).read_unaligned();
-            acc += u64::from_be(w0) as u128
-                + u64::from_be(w1) as u128
-                + u64::from_be(w2) as u128
-                + u64::from_be(w3) as u128;
-            p = p.add(32);
-        }
-    }
-    let rem = n % 4;
-    for _ in 0..rem {
-        let w = unsafe { (p as *const u64).read_unaligned() };
-        acc += u64::from_be(w) as u128;
-        p = unsafe { p.add(8) };
-    }
-
-    Ok((acc, n))
 }
 
 /// Value-returning reducer over decoded values.
