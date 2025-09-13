@@ -281,6 +281,61 @@ where
     Ok((acc, n))
 }
 
+/// Reduce over an iterator of BE u64 slices (each exactly 8 bytes).
+///
+/// This is a streaming variant suitable for iterators of ValueSlice where
+/// values are not laid out in a single contiguous buffer. Each item must be
+/// exactly 8 bytes long.
+///
+/// TODO: Experimental. If kept, consider a generic fixed-width version.
+pub fn be_u64_reduce_slices<'a, I, T, F>(
+    inputs: I,
+    init: T,
+    mut f: F,
+) -> Result<(T, usize), DecodeError>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+    F: FnMut(T, u64) -> T,
+{
+    let mut acc = init;
+    let mut n = 0usize;
+    for s in inputs {
+        if s.len() != 8 { return Err(DecodeError::NotEnoughData); }
+        let word = unsafe { (s.as_ptr() as *const u64).read_unaligned() };
+        let x = u64::from_be(word);
+        acc = f(acc, x);
+        n += 1;
+    }
+    Ok((acc, n))
+}
+
+/// Reduce over an iterator of items that can be viewed as `&[u8]` (each exactly 8 bytes).
+/// Useful for types like ValueSlice that implement `AsRef<[u8]>`.
+///
+/// TODO: Experimental. If kept, consider a generic fixed-width version with const N.
+pub fn be_u64_reduce_as_ref<I, T, F>(
+    inputs: I,
+    init: T,
+    mut f: F,
+) -> Result<(T, usize), DecodeError>
+where
+    I: IntoIterator,
+    I::Item: AsRef<[u8]>,
+    F: FnMut(T, u64) -> T,
+{
+    let mut acc = init;
+    let mut n = 0usize;
+    for it in inputs {
+        let s = it.as_ref();
+        if s.len() != 8 { return Err(DecodeError::NotEnoughData); }
+        let word = unsafe { (s.as_ptr() as *const u64).read_unaligned() };
+        let x = u64::from_be(word);
+        acc = f(acc, x);
+        n += 1;
+    }
+    Ok((acc, n))
+}
+
 /// Specialized streaming sum over concatenated BE u64 without intermediate buffer.
 /// Returns (sum_u128, count). `src.len()` must be a multiple of 8.
 ///

@@ -9,6 +9,7 @@ use llkv_data_types::{
     be_u64_reduce_streaming,
     be_u64_reduce_streaming_unaligned,
     be_u64_sum_streaming_unaligned,
+    be_u64_reduce_slices, be_u64_reduce_as_ref,
     // TODO: Add generic reducer comparison against baseline one-by-one.
     decode_reduce,
 };
@@ -171,17 +172,9 @@ fn bench_column_map_scan_reduce(c: &mut Criterion) {
                     )
                     .expect("scan iterator")
             },
-            |mut it| {
-                // Stream the sum; do not collect 1M items into a Vec.
-                let mut sum: u128 = 0;
-                let mut cnt: usize = 0;
-                while let Some(vs) = it.next() {
-                    let bytes = vs.as_slice();
-                    let mut tmp = [0u8; 8];
-                    tmp.copy_from_slice(bytes);
-                    sum += u64::from_be_bytes(tmp) as u128;
-                    cnt += 1;
-                }
+            |it| {
+                // Stream the sum via codec helper over items that implement AsRef<[u8]>.
+                let (sum, cnt) = be_u64_reduce_as_ref(it, 0u128, |acc, x| acc + (x as u128)).unwrap();
                 assert_eq!(cnt, 1_000_000);
                 assert_eq!(sum, expected_sum);
                 black_box(sum)
