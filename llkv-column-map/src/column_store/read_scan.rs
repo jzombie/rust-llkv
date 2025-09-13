@@ -3019,3 +3019,192 @@ mod value_scan_tests {
         assert_eq!(last, 1000u64);
     }
 }
+
+// ---------------- values-only scan tests -----------------
+#[cfg(test)]
+mod value_scan_values_only_tests {
+    use super::*;
+    use crate::ColumnStore;
+    use crate::codecs::big_endian::u64_be_array;
+    use crate::storage::pager::MemPager;
+    use crate::types::{AppendOptions, Put, ValueMode, LogicalFieldId};
+    use std::sync::Arc;
+    use std::borrow::Cow;
+
+    fn be64_vec(x: u64) -> Vec<u8> { u64_be_array(x).to_vec() }
+
+    // Simple deterministic RNG (LCG) to avoid external deps in tests.
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *seed
+    }
+
+    /// Seed three overlapping generations (same as other tests), then delete a band of keys.
+    fn seed_three_generations_with_deletes<P: Pager>(store: &ColumnStore<P>, fid: LogicalFieldId) {
+        let opts = AppendOptions {
+            mode: ValueMode::ForceFixed(8),
+            // small limits to force multiple physical segments while keeping blobs reasonable
+            segment_max_entries: 64_000,
+            segment_max_bytes: 8 * 1024 * 1024,
+            last_write_wins_in_batch: true,
+        };
+
+        // gen1: keys [0..1000)
+        let mut items: Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)> = Vec::with_capacity(1000);
+        for i in 0u32..1000 {
+            items.push((Cow::Owned(be64_vec(i as u64)), Cow::Owned(be64_vec(1_000 + i as u64))));
+        }
+        store.append_many(vec![Put { field_id: fid, items }], opts.clone());
+
+        // gen2: keys [200..1200)
+        let mut items: Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)> = Vec::with_capacity(1000);
+        for i in 200u32..1200 {
+            items.push((Cow::Owned(be64_vec(i as u64)), Cow::Owned(be64_vec(200_000 + i as u64))));
+        }
+        store.append_many(vec![Put { field_id: fid, items }], opts.clone());
+
+        // gen3: keys [600..1400)
+        let mut items: Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)> = Vec::with_capacity(800);
+        for i in 600u32..1400 {
+            items.push((Cow::Owned(be64_vec(i as u64)), Cow::Owned(be64_vec(300_000 + i as u64))));
+        }
+        store.append_many(vec![Put { field_id: fid, items }], opts);
+
+        // Delete a band [750..800) using tombstones (variable layout)
+        let del_keys: Vec<Vec<u8>> = (750u32..800).map(|i| be64_vec(i as u64)).collect();
+        store.delete_many(vec![(fid, del_keys)]);
+    }
+
+    /// Seed three generations, then delete a pseudo-random subset of keys across the full domain.
+    fn seed_three_generations_with_random_deletes<P: Pager>(store: &ColumnStore<P>, fid: LogicalFieldId) {
+        // Reuse the three-gen seed
+        seed_three_generations_with_deletes(store, fid);
+        // Now add more deletes for random keys outside the contiguous band to stress the paths.
+        let mut seed = 0xDEADBEEFCAFEBABEu64;
+        let mut to_del: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+        // Choose ~200 random keys in [0, 1400)
+        while to_del.len() < 200 {
+            let r = lcg(&mut seed) % 1400u64;
+            to_del.insert(r);
+        }
+        let mut del_keys: Vec<Vec<u8>> = Vec::with_capacity(to_del.len());
+        for k in to_del { del_keys.push(be64_vec(k)); }
+        store.delete_many(vec![(fid, del_keys)]);
+    }
+
+    /// Compare values-only scan to full scan after deletes; ensure sequences match (LWW + tombstones).
+    #[test]
+    fn values_only_matches_full_with_deletes_forward() {
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 9001;
+        seed_three_generations_with_deletes(&store, fid);
+
+        // Full scan (keys+values) in key order; build expected values.
+        let full_it = store
+            .scan_values_lww(
+                fid,
+                ValueScanOpts { order_by: OrderBy::Key, ..Default::default() },
+            )
+            .expect("full iterator");
+        let mut full_vals: Vec<Vec<u8>> = Vec::new();
+        for item in full_it { full_vals.push(item.value.as_slice().to_vec()); }
+
+        // Values-only scan, same order; compare bytes.
+        let vals_only = store
+            .scan_values_lww_values_only(
+                fid,
+                ValueScanOpts { order_by: OrderBy::Key, ..Default::default() },
+            )
+            .expect("values-only iterator");
+        let mut vo_vals: Vec<Vec<u8>> = Vec::new();
+        for vs in vals_only { vo_vals.push(vs.as_slice().to_vec()); }
+
+        assert_eq!(full_vals.len(), vo_vals.len(), "value-only len must match full len");
+        assert_eq!(full_vals, vo_vals, "value-only bytes must equal full scan bytes");
+    }
+
+    #[test]
+    fn values_only_matches_full_with_deletes_reverse() {
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 9002;
+        seed_three_generations_with_deletes(&store, fid);
+
+        let full_it = store
+            .scan_values_lww(
+                fid,
+                ValueScanOpts { order_by: OrderBy::Key, dir: Direction::Reverse, ..Default::default() },
+            )
+            .expect("full iterator");
+        let mut full_vals: Vec<Vec<u8>> = Vec::new();
+        for item in full_it { full_vals.push(item.value.as_slice().to_vec()); }
+
+        let vals_only = store
+            .scan_values_lww_values_only(
+                fid,
+                ValueScanOpts { order_by: OrderBy::Key, dir: Direction::Reverse, ..Default::default() },
+            )
+            .expect("values-only iterator");
+        let mut vo_vals: Vec<Vec<u8>> = Vec::new();
+        for vs in vals_only { vo_vals.push(vs.as_slice().to_vec()); }
+
+        assert_eq!(full_vals, vo_vals, "reverse value-only must match full scan");
+    }
+
+    #[test]
+    fn values_only_matches_full_with_random_deletes_forward() {
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 9003;
+        seed_three_generations_with_random_deletes(&store, fid);
+
+        let full_it = store
+            .scan_values_lww(
+                fid,
+                ValueScanOpts { order_by: OrderBy::Key, ..Default::default() },
+            )
+            .expect("full iterator");
+        let mut full_vals: Vec<Vec<u8>> = Vec::new();
+        for item in full_it { full_vals.push(item.value.as_slice().to_vec()); }
+
+        let vals_only = store
+            .scan_values_lww_values_only(
+                fid,
+                ValueScanOpts { order_by: OrderBy::Key, ..Default::default() },
+            )
+            .expect("values-only iterator");
+        let mut vo_vals: Vec<Vec<u8>> = Vec::new();
+        for vs in vals_only { vo_vals.push(vs.as_slice().to_vec()); }
+
+        assert_eq!(full_vals, vo_vals, "values-only must match full scan for random deletes (forward)");
+    }
+
+    #[test]
+    fn values_only_matches_full_with_random_deletes_reverse() {
+        let p = Arc::new(MemPager::default());
+        let store = ColumnStore::open(p);
+        let fid: LogicalFieldId = 9004;
+        seed_three_generations_with_random_deletes(&store, fid);
+
+        let full_it = store
+            .scan_values_lww(
+                fid,
+                ValueScanOpts { order_by: OrderBy::Key, dir: Direction::Reverse, ..Default::default() },
+            )
+            .expect("full iterator");
+        let mut full_vals: Vec<Vec<u8>> = Vec::new();
+        for item in full_it { full_vals.push(item.value.as_slice().to_vec()); }
+
+        let vals_only = store
+            .scan_values_lww_values_only(
+                fid,
+                ValueScanOpts { order_by: OrderBy::Key, dir: Direction::Reverse, ..Default::default() },
+            )
+            .expect("values-only iterator");
+        let mut vo_vals: Vec<Vec<u8>> = Vec::new();
+        for vs in vals_only { vo_vals.push(vs.as_slice().to_vec()); }
+
+        assert_eq!(full_vals, vo_vals, "values-only must match full scan for random deletes (reverse)");
+    }
+}
