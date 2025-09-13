@@ -71,6 +71,9 @@ pub use bool::*;
 pub mod utf8_case_fold;
 pub use utf8_case_fold::*;
 
+pub mod f32x;
+pub use f32x::*;
+
 /* ---------------------- Value-side encode convenience ------------------- */
 
 /// Default, value-side encoding: `v.encode_into(&mut buf)`.
