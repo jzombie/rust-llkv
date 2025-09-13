@@ -167,6 +167,7 @@ fn bench_column_map_scan_reduce(c: &mut Criterion) {
     let pager = std::sync::Arc::new(MemPager::default());
     let store = ColumnStore::open(pager);
     let fid: LogicalFieldId = 4242;
+    let fid_frag: LogicalFieldId = 4243;
 
     // Seed 1,000,000 entries: key=u64_be(i), value=u64_be(i)
     {
@@ -180,6 +181,46 @@ fn bench_column_map_scan_reduce(c: &mut Criterion) {
             vec![Put { field_id: fid, items }],
             AppendOptions { mode: ValueMode::ForceFixed(8), ..Default::default() },
         );
+    }
+
+    // Seed a fragmented column: overlapping generations, out-of-order appends, and deletes.
+    {
+        // Use small segment limits to force many segments
+        let opts_small = AppendOptions { mode: ValueMode::ForceFixed(8), segment_max_entries: 10_000, segment_max_bytes: 1 * 1024 * 1024, last_write_wins_in_batch: true };
+
+        // Append odds first (out-of-order segmenting)
+        let mut items: Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)> = Vec::with_capacity(500_000);
+        for i in (1u64..1_000_000u64).step_by(2) {
+            let k = i.to_be_bytes().to_vec();
+            let v = i.to_be_bytes().to_vec();
+            items.push((Cow::Owned(k), Cow::Owned(v)));
+        }
+        store.append_many(vec![Put { field_id: fid_frag, items }], opts_small.clone());
+
+        // Append evens next
+        let mut items: Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)> = Vec::with_capacity(500_000);
+        for i in (0u64..1_000_000u64).step_by(2) {
+            let k = i.to_be_bytes().to_vec();
+            let v = i.to_be_bytes().to_vec();
+            items.push((Cow::Owned(k), Cow::Owned(v)));
+        }
+        store.append_many(vec![Put { field_id: fid_frag, items }], opts_small.clone());
+
+        // Sprinkle deletes for some keys
+        let mut del_keys: Vec<Vec<u8>> = Vec::with_capacity(25_000);
+        for i in (0u64..1_000_000u64).step_by(40) {
+            del_keys.push(i.to_be_bytes().to_vec());
+        }
+        store.delete_many(vec![(fid_frag, del_keys)]);
+
+        // Re-insert deleted keys (so final winners still include all 1,000,000 keys)
+        let mut items: Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)> = Vec::with_capacity(25_000);
+        for i in (0u64..1_000_000u64).step_by(40) {
+            let k = i.to_be_bytes().to_vec();
+            let v = i.to_be_bytes().to_vec();
+            items.push((Cow::Owned(k), Cow::Owned(v)));
+        }
+        store.append_many(vec![Put { field_id: fid_frag, items }], opts_small);
     }
 
     // Expected sum: sum 0..1_000_000-1
@@ -254,6 +295,30 @@ fn bench_column_map_scan_reduce(c: &mut Criterion) {
                     sum += u64::from_be_bytes(b8) as u128;
                     cnt += 1;
                 }
+                assert_eq!(cnt, 1_000_000);
+                assert_eq!(sum, expected_sum);
+                black_box(sum)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    // Bench: fragmented column, decode_reduce_as_ref path (same expected result; more segments/overlaps)
+    group.bench_function("scan_sum_decode_reduce_fragmented", |b| {
+        b.iter_batched(
+            || {
+                store
+                    .scan_values_lww_values_only(
+                        fid_frag,
+                        ValueScanOpts { order_by: OrderBy::Key, ..Default::default() },
+                    )
+                    .expect("scan iterator")
+            },
+            |it| {
+                let (sum, cnt) = decode_reduce_as_ref(it, &DataType::U64, 0u128, |acc, dv| match dv {
+                    DecodedValue::U64(x) => acc + (x as u128),
+                    _ => unreachable!(),
+                }).unwrap();
                 assert_eq!(cnt, 1_000_000);
                 assert_eq!(sum, expected_sum);
                 black_box(sum)
