@@ -100,6 +100,43 @@ pub struct ValueScanItem<B> {
     pub value: ValueSlice<B>,
 }
 
+// -------------------- Values-only iterator (no key allocations) --------------------
+
+/// Values-only scan: identical behavior to `ValueScan`, but yields only values
+/// and never allocates per-row keys. This is the fast path for analytics when
+/// keys are not needed by the caller.
+pub struct ValueScanValuesOnly<P: Pager> {
+    segs: Vec<SegCtx<P>>,
+    pq: RadixPq<P>,
+    _field_id: LogicalFieldId,
+    _lo: Bound<Vec<u8>>,
+    _hi: Bound<Vec<u8>>,
+    reverse: bool,
+    by_value: bool,
+    frame_pred: Option<FramePred>,
+    frame_head: Option<ValueSlice<P::Blob>>,
+    halted: bool,
+    shadow_by_rank: Vec<Vec<ShadowRef>>,
+    shadow_seg_map: FxHashMap<PhysicalKey, IndexSegment>,
+    bucket_prefix_len: usize,
+    head_tag_len: usize,
+    policy: ConflictPolicy,
+    /// True if any active segments' key spans overlap (potential duplicates).
+    may_key_duplicates: bool,
+    /// Linear merge state for key-ordered scans when spans don’t overlap.
+    linear_merge: Option<LinearMergeState>,
+}
+
+/// State for linear k-way merge (no heap) when key spans don’t overlap.
+struct LinearMergeState {
+    /// Order of segments by key span (ascending or descending depending on direction).
+    order: Vec<usize>,
+    /// Index into `order` for the current segment.
+    seg_i: usize,
+    /// Current position within the current segment (row index in key order).
+    pos: usize,
+}
+
 /// Internal: context per active segment.
 struct SegCtx<P: Pager> {
     _seg_pk: PhysicalKey,
@@ -230,6 +267,16 @@ impl<P: Pager> RadixPq<P> {
             // **Important**: 65_536 entries, not 65_535.
             slot_of_bucket: vec![u32::MAX; BUCKETS],
         }
+    }
+
+    /// Peek the next node without removing it (if any).
+    #[inline]
+    fn peek(&self, reverse: bool) -> Option<&Node<P>> {
+        let bi = self.find_bucket(reverse)? as usize;
+        let slot_idx_u32 = self.slot_of_bucket[bi];
+        if slot_idx_u32 == u32::MAX { return None; }
+        let idx = slot_idx_u32 as usize;
+        self.slots[idx].heap.peek().map(|x| &x.0)
     }
 
     #[inline]
@@ -547,6 +594,17 @@ impl<P: Pager> super::ColumnStore<P> {
         policy: ConflictPolicy,
     ) -> Result<ValueScan<P>, ScanError> {
         ValueScan::new(self, field_id, opts, policy)
+    }
+
+    /// Values-only: LWW-enforced scan that yields only `ValueSlice` without
+    /// allocating per-row keys. Order and frame predicate semantics match
+    /// `scan_values_lww`.
+    pub fn scan_values_lww_values_only(
+        &self,
+        field_id: LogicalFieldId,
+        opts: ValueScanOpts<'_>,
+    ) -> Result<ValueScanValuesOnly<P>, ScanError> {
+        ValueScanValuesOnly::new(self, field_id, opts, ConflictPolicy::LWW)
     }
 }
 
@@ -1007,6 +1065,478 @@ impl<P: Pager> ValueScan<P> {
             key,
         )
         .is_some()
+    }
+}
+
+impl<P: Pager> ValueScanValuesOnly<P> {
+    pub fn new(
+        col: &super::ColumnStore<P>,
+        field_id: LogicalFieldId,
+        opts: ValueScanOpts<'_>,
+        policy: ConflictPolicy,
+    ) -> Result<Self, ScanError> {
+        let by_value = matches!(opts.order_by, OrderBy::Value);
+
+        // -------- ensure ColumnIndex in cache ----------
+        let colindex = {
+            let cache = col.colindex_cache.read().unwrap();
+            if let Some((_pk, ci)) = cache.get(&field_id) {
+                ci.clone()
+            } else {
+                let man = col.manifest.read().unwrap();
+                let ent = man
+                    .columns
+                    .iter()
+                    .find(|e| e.field_id == field_id)
+                    .ok_or(ScanError::ColumnMissing(field_id))?;
+                drop(cache);
+                let resp = col.do_gets(vec![BatchGet::Typed {
+                    key: ent.column_index_physical_key,
+                    kind: TypedKind::ColumnIndex,
+                }]);
+                let mut got = None;
+                for gr in resp {
+                    if let GetResult::Typed {
+                        value: TypedValue::ColumnIndex(ci),
+                        ..
+                    } = gr
+                    {
+                        got = Some(ci);
+                    }
+                }
+                let ci = got.ok_or_else(|| ScanError::Storage("ColumnIndex missing".into()))?;
+                let mut cache_w = col.colindex_cache.write().unwrap();
+                cache_w.insert(field_id, (ent.column_index_physical_key, ci.clone()));
+                ci
+            }
+        };
+
+        // -------- choose candidate segments by bounds ----------
+        let (act_refs, seg_rank) = {
+            let mut v = Vec::new();
+            let mut ranks = FxHashMap::default();
+            for (rank, r) in colindex.segments.iter().enumerate() {
+                let keep = if by_value {
+                    overlap_bounds(
+                        &opts.lo,
+                        &opts.hi,
+                        r.value_min.as_ref(),
+                        r.value_max.as_ref(),
+                    )
+                } else {
+                    overlap_bounds_key(
+                        &opts.lo,
+                        &opts.hi,
+                        r.logical_key_min.as_slice(),
+                        r.logical_key_max.as_slice(),
+                    )
+                };
+                if keep {
+                    v.push(r.clone());
+                    ranks.insert(r.index_physical_key, rank);
+                }
+            }
+            (v, ranks)
+        };
+        if act_refs.is_empty() {
+            return Err(ScanError::NoActiveSegments);
+        }
+
+        // ---- active logical-key spans (borrowed; no clones) ----
+        let mut active_spans: Vec<(&[u8], &[u8])> = Vec::new();
+        for r in &act_refs {
+            active_spans.push((r.logical_key_min.as_slice(), r.logical_key_max.as_slice()));
+        }
+
+        // Determine if active key spans overlap (potential duplicates across segments).
+        let mut may_key_duplicates = false;
+        if !by_value {
+            for i in 0..active_spans.len() {
+                for j in (i + 1)..active_spans.len() {
+                    let (a_min, a_max) = active_spans[i];
+                    let (b_min, b_max) = active_spans[j];
+                    if !(a_max < b_min || a_min > b_max) { may_key_duplicates = true; break; }
+                }
+                if may_key_duplicates { break; }
+            }
+        }
+
+        // ---- build gets: active (index+data) + shadow (index-only) ----
+        let mut gets: Vec<BatchGet> =
+            Vec::with_capacity(act_refs.len() * 2 + colindex.segments.len());
+        let mut active_index_pks = FxHashSet::default();
+        let mut active_data_pks = FxHashSet::default();
+        for r in &act_refs {
+            active_index_pks.insert(r.index_physical_key);
+            active_data_pks.insert(r.data_physical_key);
+            gets.push(BatchGet::Typed {
+                key: r.index_physical_key,
+                kind: TypedKind::IndexSegment,
+            });
+            gets.push(BatchGet::Raw { key: r.data_physical_key });
+        }
+        let mut shadow_refs_all: Vec<ShadowRef> = Vec::new();
+        if may_key_duplicates {
+            let mut seen = FxHashSet::default();
+            // compute shadow refs like ValueScan::new
+            let mut active_ranks: Vec<usize> = Vec::with_capacity(act_refs.len());
+            for r in &act_refs {
+                let rk = *seg_rank.get(&r.index_physical_key).unwrap_or(&usize::MAX);
+                active_ranks.push(rk);
+            }
+            let min_active_rank = *active_ranks.iter().min().unwrap_or(&0);
+            let max_active_rank = *active_ranks.iter().max().unwrap_or(&0);
+            for (rank, r) in colindex.segments.iter().enumerate() {
+                let needed = match policy {
+                    ConflictPolicy::LWW => rank < max_active_rank,
+                    ConflictPolicy::FWW => rank > min_active_rank,
+                };
+                if !needed { continue; }
+                if overlaps_any(
+                    r.logical_key_min.as_slice(),
+                    r.logical_key_max.as_slice(),
+                    &active_spans,
+                ) {
+                    if seen.insert(r.index_physical_key) && !active_index_pks.contains(&r.index_physical_key) {
+                        gets.push(BatchGet::Typed { key: r.index_physical_key, kind: TypedKind::IndexSegment });
+                    }
+                    shadow_refs_all.push(ShadowRef { pk: r.index_physical_key, rank });
+                }
+            }
+        }
+
+        // ---- fetch everything in one go ----
+        let mut resp = col.do_gets(gets);
+        let mut seg_map: FxHashMap<PhysicalKey, IndexSegment> = FxHashMap::default();
+        let mut data_map: FxHashMap<PhysicalKey, P::Blob> = FxHashMap::default();
+        let mut shadow_seg_map: FxHashMap<PhysicalKey, IndexSegment> = FxHashMap::default();
+        for gr in resp.drain(..) {
+            match gr {
+                GetResult::Typed { key, value: TypedValue::IndexSegment(seg) } => {
+                    if active_index_pks.contains(&key) { seg_map.insert(key, seg); } else { shadow_seg_map.insert(key, seg); }
+                }
+                GetResult::Raw { key, bytes } => { if active_data_pks.contains(&key) { data_map.insert(key, bytes); } }
+                _ => {}
+            }
+        }
+
+        // ---- index shadow refs by rank ----
+        let total_ranks = colindex.segments.len();
+        let mut shadow_by_rank: Vec<Vec<ShadowRef>> = Vec::new();
+        shadow_by_rank.resize_with(total_ranks, Vec::new);
+        for rf in shadow_refs_all { shadow_by_rank[rf.rank].push(rf); }
+
+        // -------- build cursors and PQ heads ----------
+        let mut segs: Vec<SegCtx<P>> = Vec::with_capacity(act_refs.len());
+        let mut pq = RadixPq::new();
+        for r in act_refs {
+            let seg = seg_map.remove(&r.index_physical_key).ok_or_else(|| ScanError::Storage("segment blob missing".into()))?;
+            let data = data_map.remove(&r.data_physical_key).ok_or_else(|| ScanError::Storage("data blob missing".into()))?;
+            let (begin, end) = if by_value {
+                let vix = match &seg.value_index { Some(v) => v, None => return Err(ScanError::ValueIndexMissing(r.index_physical_key)), };
+                range_in_value_index::<P>(&seg, vix, &data, &opts.lo, &opts.hi)
+            } else {
+                range_in_key_index(&seg, &opts.lo, &opts.hi)
+            };
+            if begin >= end { continue; }
+            let rank = *seg_rank.get(&r.index_physical_key).unwrap_or(&usize::MAX);
+            let min_key = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0).to_vec();
+            let max_key = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, seg.n_entries as usize - 1).to_vec();
+            let seg_idx = segs.len();
+            segs.push(SegCtx { _seg_pk: r.index_physical_key, _data_pk: r.data_physical_key, seg, data, rank, begin, end, min_key, max_key, dominators_active: Vec::new(), dominators_shadow: Vec::new() });
+
+            // seed PQ
+            let sc = &segs[seg_idx];
+            let row0 = if by_value { row_pos_at(&sc.seg, if !opts.dir.eq(&Direction::Reverse) { begin } else { end - 1 }) } else { if !opts.dir.eq(&Direction::Reverse) { begin } else { end - 1 } };
+            let sval = slice_value::<P>(&sc.seg, &sc.data, row0);
+            if by_value {
+                let (bkt, hi, lo) = bucket_and_tag128_from_value_slice::<P>(&sval, opts.bucket_prefix_len, opts.head_tag_len);
+                pq.push(Node { bucket: bkt, head_tag_hi: hi, head_tag_lo: lo, rank, seg_idx, pos: if !opts.dir.eq(&Direction::Reverse) { begin } else { end - 1 }, val: sval, key_ord: None, reverse: matches!(opts.dir, Direction::Reverse) });
+            } else {
+                let ks = KeyLayout::slice_key_by_layout(&sc.seg.logical_key_bytes, &sc.seg.key_layout, row0);
+                push_next_keyordered(&mut pq, rank, seg_idx, if !opts.dir.eq(&Direction::Reverse) { begin } else { end - 1 }, sval, KeyRef::from_slice(ks), matches!(opts.dir, Direction::Reverse), opts.bucket_prefix_len, opts.head_tag_len);
+            }
+        }
+        if pq.is_empty() { return Err(ScanError::NoActiveSegments); }
+
+        // precompute dominators
+        // Optionally set up linear merge for key-ordered scans with disjoint spans.
+        let linear_merge = if !by_value && !may_key_duplicates {
+            // Build segment order by min_key (ascending for forward, descending for reverse)
+            let mut idxs: Vec<usize> = (0..segs.len()).collect();
+            if !matches!(opts.dir, Direction::Reverse) {
+                idxs.sort_by(|&a, &b| segs[a].min_key.as_slice().cmp(segs[b].min_key.as_slice()));
+            } else {
+                idxs.sort_by(|&a, &b| segs[b].max_key.as_slice().cmp(segs[a].max_key.as_slice()));
+            }
+            // Initialize to first segment in order.
+            let seg_i = 0usize;
+            let pos = if !matches!(opts.dir, Direction::Reverse) {
+                if idxs.is_empty() { 0 } else { let s = &segs[idxs[0]]; s.begin }
+            } else {
+                if idxs.is_empty() { 0 } else { let s = &segs[idxs[0]]; s.end }
+            };
+            Some(LinearMergeState { order: idxs, seg_i, pos })
+        } else { None };
+
+        let mut me = Self { segs, pq, _field_id: field_id, _lo: clone_bound_bytes(&opts.lo), _hi: clone_bound_bytes(&opts.hi), reverse: matches!(opts.dir, Direction::Reverse), by_value, frame_pred: opts.frame_predicate.clone(), frame_head: None, halted: false, shadow_by_rank, shadow_seg_map, bucket_prefix_len: opts.bucket_prefix_len, head_tag_len: opts.head_tag_len, policy, may_key_duplicates, linear_merge };
+        if me.may_key_duplicates { me.precompute_dominators(); }
+        Ok(me)
+    }
+
+    /// One-time preprocessing: same as `ValueScan::precompute_dominators` but
+    /// for the values-only iterator.
+    fn precompute_dominators(&mut self) {
+        let n = self.segs.len();
+
+        // Active-vs-active
+        for i in 0..n {
+            let (ri, min_i, max_i) = (
+                self.segs[i].rank,
+                self.segs[i].min_key.as_slice(),
+                self.segs[i].max_key.as_slice(),
+            );
+            let mut acc: Vec<usize> = Vec::new();
+            for j in 0..n {
+                if i == j { continue; }
+                let rj = self.segs[j].rank;
+                if !dominates_by_policy(self.policy, rj, ri) { continue; }
+                let min_j = self.segs[j].min_key.as_slice();
+                let max_j = self.segs[j].max_key.as_slice();
+                if !(max_i < min_j || min_i > max_j) { acc.push(j); }
+            }
+            self.segs[i].dominators_active = acc;
+        }
+
+        // Shadow (index-only) grouped by rank.
+        let ranks_len = self.shadow_by_rank.len();
+        for i in 0..n {
+            let (ri, min_i, max_i) = (
+                self.segs[i].rank,
+                self.segs[i].min_key.as_slice(),
+                self.segs[i].max_key.as_slice(),
+            );
+            let mut acc: Vec<ShadowBound> = Vec::new();
+            let rank_iter: Box<dyn Iterator<Item = usize>> = match self.policy {
+                ConflictPolicy::LWW => Box::new(0..ri),
+                ConflictPolicy::FWW => Box::new((ri + 1)..ranks_len),
+            };
+            for r in rank_iter {
+                for rf in &self.shadow_by_rank[r] {
+                    if let Some(seg) = self.shadow_seg_map.get(&rf.pk) {
+                        let min_j = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, 0);
+                        let max_j = KeyLayout::slice_key_by_layout(&seg.logical_key_bytes, &seg.key_layout, seg.n_entries as usize - 1);
+                        if !(max_i < min_j || min_i > max_j) {
+                            acc.push(ShadowBound { pk: rf.pk, min: KeyRef::from_slice(min_j), max: KeyRef::from_slice(max_j) });
+                        }
+                    }
+                }
+            }
+            self.segs[i].dominators_shadow = acc;
+        }
+    }
+
+    #[inline]
+    fn is_shadowed_for_seg(&self, seg_idx: usize, key: &[u8]) -> bool {
+        let sc = &self.segs[seg_idx];
+        // Active dominators
+        for &j in &sc.dominators_active {
+            let other = &self.segs[j];
+            if key < other.min_key.as_slice() || key > other.max_key.as_slice() { continue; }
+            if !other.seg.key_bloom.check(key) { continue; }
+            if Self::key_in_index(&other.seg, key) { return true; }
+        }
+        // Shadow dominators
+        for sb in &sc.dominators_shadow {
+            if key < sb.min.as_slice() || key > sb.max.as_slice() { continue; }
+            if let Some(seg) = self.shadow_seg_map.get(&sb.pk) {
+                if !seg.key_bloom.check(key) { continue; }
+                if Self::key_in_index(seg, key) { return true; }
+            }
+        }
+        false
+    }
+
+    #[inline]
+    fn key_in_index(seg: &IndexSegment, key: &[u8]) -> bool {
+        KeyLayout::binary_search_key_with_layout(
+            &seg.logical_key_bytes,
+            &seg.key_layout,
+            seg.n_entries as usize,
+            key,
+        ).is_some()
+    }
+}
+impl<P: Pager> Iterator for ValueScanValuesOnly<P> {
+    type Item = ValueSlice<P::Blob>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.halted { return None; }
+
+        // Linear merge fast path: key-ordered, disjoint spans, no heap, no shadow checks.
+        if !self.by_value {
+            if let Some(lm) = &mut self.linear_merge {
+                // Advance within current segment
+                while lm.seg_i < lm.order.len() {
+                    let i = lm.order[lm.seg_i];
+                    let sc = &self.segs[i];
+                    let (begin, end) = (sc.begin, sc.end);
+                    if !self.reverse {
+                        if lm.pos < end {
+                            let val = slice_value::<P>(&sc.seg, &sc.data, lm.pos);
+                            // frame predicate
+                            if let Some(pred) = &self.frame_pred
+                                && let Some(ref head_slice) = self.frame_head
+                            {
+                                let ha = head_slice.start as usize;
+                                let hb = head_slice.end as usize;
+                                let head = &head_slice.data.as_ref()[ha..hb];
+                                let ca = val.start as usize;
+                                let cb = val.end as usize;
+                                let cur = &val.data.as_ref()[ca..cb];
+                                if !(pred)(head, cur) { self.halted = true; return None; }
+                            }
+                            if self.frame_head.is_none() { self.frame_head = Some(val.clone()); }
+                            lm.pos += 1;
+                            return Some(val);
+                        } else {
+                            lm.seg_i += 1;
+                            if lm.seg_i < lm.order.len() { lm.pos = self.segs[lm.order[lm.seg_i]].begin; }
+                            continue;
+                        }
+                    } else {
+                        if lm.pos > begin {
+                            let row = lm.pos - 1;
+                            let val = slice_value::<P>(&sc.seg, &sc.data, row);
+                            if let Some(pred) = &self.frame_pred
+                                && let Some(ref head_slice) = self.frame_head
+                            {
+                                let ha = head_slice.start as usize;
+                                let hb = head_slice.end as usize;
+                                let head = &head_slice.data.as_ref()[ha..hb];
+                                let ca = val.start as usize;
+                                let cb = val.end as usize;
+                                let cur = &val.data.as_ref()[ca..cb];
+                                if !(pred)(head, cur) { self.halted = true; return None; }
+                            }
+                            if self.frame_head.is_none() { self.frame_head = Some(val.clone()); }
+                            lm.pos -= 1;
+                            return Some(val);
+                        } else {
+                            lm.seg_i += 1;
+                            if lm.seg_i < lm.order.len() { lm.pos = self.segs[lm.order[lm.seg_i]].end; }
+                            continue;
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+
+        loop {
+            let mut node = self.pq.pop(self.reverse)?;
+            let seg_idx = node.seg_idx;
+
+            // Key-ordered fast path: coalesce equal heads (same logical key)
+            // across segments and keep only the winner by policy. This enforces
+            // LWW without per-row shadow checks.
+            if !self.by_value && self.may_key_duplicates {
+                if let Some(kref0) = node.key_ord {
+                    let key0 = kref0.as_slice();
+                    // Collect equal-head group
+                    let mut best = node;
+                    let mut losers: Vec<Node<P>> = Vec::new();
+                    while let Some(peek) = self.pq.peek(self.reverse) {
+                        if let Some(k2) = peek.key_ord {
+                            if k2.as_slice() == key0 {
+                                // pop actual
+                                if let Some(next) = self.pq.pop(self.reverse) {
+                                    let winner_is_next = (matches!(self.policy, ConflictPolicy::LWW) && next.rank < best.rank)
+                                        || (matches!(self.policy, ConflictPolicy::FWW) && next.rank > best.rank);
+                                    if winner_is_next { losers.push(best); best = next; } else { losers.push(next); }
+                                    continue;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    // Advance losers immediately
+                    for ln in losers {
+                        let sc = &self.segs[ln.seg_idx];
+                        if let Some(np) = next_pos(ln.pos, sc.begin, sc.end, self.reverse) {
+                            let next_row = np; // key-ordered: row index
+                            let sval = slice_value::<P>(&sc.seg, &sc.data, next_row);
+                            let ks = KeyLayout::slice_key_by_layout(&sc.seg.logical_key_bytes, &sc.seg.key_layout, next_row);
+                            push_next_keyordered(
+                                &mut self.pq, sc.rank, ln.seg_idx, np, sval,
+                                KeyRef::from_slice(ks), self.reverse,
+                                self.bucket_prefix_len, self.head_tag_len,
+                            );
+                        }
+                    }
+                    node = best;
+                }
+            }
+            let seg_idx = node.seg_idx;
+
+            // Early frame check (value-only).
+            if let Some(pred) = &self.frame_pred
+                && let Some(ref head_slice) = self.frame_head
+            {
+                let ha = head_slice.start as usize;
+                let hb = head_slice.end as usize;
+                let head = &head_slice.data.as_ref()[ha..hb];
+                let ca = node.val.start as usize;
+                let cb = node.val.end as usize;
+                let cur = &node.val.data.as_ref()[ca..cb];
+                if !(pred)(head, cur) {
+                    self.halted = true;
+                    return None;
+                }
+            }
+            if self.frame_head.is_none() { self.frame_head = Some(node.val.clone()); }
+
+            // Prepare reseed state and shadow check (using borrowed key only).
+            let (rank, next_pos_opt, next_val_opt, next_key_for_order, shadowed) = {
+                let sc = &self.segs[seg_idx];
+                let row_pos = if self.by_value { row_pos_at(&sc.seg, node.pos) } else { node.pos };
+                let key_slice = KeyLayout::slice_key_by_layout(&sc.seg.logical_key_bytes, &sc.seg.key_layout, row_pos);
+                let next_pos_opt = next_pos(node.pos, sc.begin, sc.end, self.reverse);
+                let (next_val_opt, next_key_for_order) = next_pos_opt.map_or((None, None), |np| {
+                    let next_row = if self.by_value { row_pos_at(&sc.seg, np) } else { np };
+                    let sval = slice_value::<P>(&sc.seg, &sc.data, next_row);
+                    let skey_ref = if self.by_value { None } else {
+                        let ks = KeyLayout::slice_key_by_layout(&sc.seg.logical_key_bytes, &sc.seg.key_layout, next_row);
+                        Some(KeyRef::from_slice(ks))
+                    };
+                    (Some(sval), skey_ref)
+                });
+                let shadowed = if self.by_value { self.is_shadowed_for_seg(seg_idx, key_slice) } else { false };
+                (sc.rank, next_pos_opt, next_val_opt, next_key_for_order, shadowed)
+            };
+
+            // Helper to push the next head if present.
+            let mut push_next = |np: usize, val: ValueSlice<P::Blob>| {
+                if self.by_value {
+                    let (bkt, hi, lo) = bucket_and_tag128_from_value_slice::<P>(&val, self.bucket_prefix_len, self.head_tag_len);
+                    self.pq.push(Node { bucket: bkt, head_tag_hi: hi, head_tag_lo: lo, rank, seg_idx, pos: np, val, key_ord: None, reverse: self.reverse });
+                } else {
+                    let kb = next_key_for_order.expect("prepared KeyRef for key-ordered reseed");
+                    push_next_keyordered(&mut self.pq, rank, seg_idx, np, val, kb, self.reverse, self.bucket_prefix_len, self.head_tag_len);
+                }
+            };
+
+            // If shadowed, advance and continue.
+            if shadowed {
+                if let (Some(np), Some(v)) = (next_pos_opt, next_val_opt) { push_next(np, v); }
+                continue;
+            }
+
+            // Accepted: advance before yielding.
+            if let (Some(np), Some(v)) = (next_pos_opt, next_val_opt) { push_next(np, v); }
+
+            return Some(node.val);
+        }
     }
 }
 

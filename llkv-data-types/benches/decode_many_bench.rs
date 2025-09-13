@@ -165,21 +165,23 @@ fn bench_column_map_scan_reduce(c: &mut Criterion) {
         b.iter_batched(
             || {
                 store
-                    .scan_values_lww(
+                    .scan_values_lww_values_only(
                         fid,
                         ValueScanOpts { order_by: OrderBy::Key, ..Default::default() },
                     )
                     .expect("scan iterator")
             },
-            |it| {
-                // Hold ValueSlices to keep blobs alive; then feed &[u8] slices.
-                let vals: Vec<_> = it.map(|x| x.value).collect();
-                let inputs = vals.iter().map(|v| v.as_slice());
-                let (sum, cnt) = decode_reduce(inputs, &DataType::U64, 0u128, |acc, v| match v {
-                    DecodedValue::U64(x) => acc + (x as u128),
-                    _ => unreachable!(),
-                })
-                .expect("reduce");
+            |mut it| {
+                // Stream the sum; do not collect 1M items into a Vec.
+                let mut sum: u128 = 0;
+                let mut cnt: usize = 0;
+                while let Some(vs) = it.next() {
+                    let bytes = vs.as_slice();
+                    let mut tmp = [0u8; 8];
+                    tmp.copy_from_slice(bytes);
+                    sum += u64::from_be_bytes(tmp) as u128;
+                    cnt += 1;
+                }
                 assert_eq!(cnt, 1_000_000);
                 assert_eq!(sum, expected_sum);
                 black_box(sum)
