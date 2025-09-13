@@ -62,3 +62,14 @@ pub fn f32x_decode_many_into<const N: usize>(dst: &mut [f32], src: &[u8], rows: 
     }
     Ok(())
 }
+
+/// Parallel decode many fixed-length f32 arrays using Rayon.
+/// Splits by rows and decodes each row independently.
+pub fn f32x_decode_many_into_par<const N: usize>(dst: &mut [f32], src: &[u8], rows: usize) -> Result<(), DecodeError> {
+    if dst.len() != rows * N { return Err(DecodeError::InvalidFormat); }
+    if src.len() < rows * N * 4 { return Err(DecodeError::NotEnoughData); }
+    use rayon::prelude::*;
+    dst.par_chunks_mut(N)
+        .zip(src.par_chunks_exact(N * 4))
+        .try_for_each(|(row_dst, row_src)| f32x_decode_into::<N>(row_dst, row_src))
+}

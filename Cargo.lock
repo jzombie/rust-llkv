@@ -985,6 +985,7 @@ dependencies = [
  "icu_normalizer",
  "llkv-column-map",
  "rand",
+ "rayon",
 ]
 
 [[package]]

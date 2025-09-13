@@ -2,7 +2,7 @@ mod internal;
 use crate::internal::{BeI64, BeU8, BeU16, BeU32, BeU64, Bool, EncodeInto, Utf8CaseFold};
 // Public re-exports for selected internal types/traits used by benches/consumers
 pub use crate::internal::codec::Codec;
-pub use crate::internal::f32x::{F32x, f32x_decode_into, f32x_decode_many_into};
+pub use crate::internal::f32x::{F32x, f32x_decode_into, f32x_decode_many_into, f32x_decode_many_into_par};
 
 pub mod errors;
 pub use errors::*;

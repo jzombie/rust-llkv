@@ -11,6 +11,7 @@ publish.workspace = true
 bitcode.workspace = true
 icu_casemap = "2.0.0"
 icu_normalizer = "2.0.0"
+rayon = "1.8"
 
 [dev-dependencies]
 criterion.workspace = true

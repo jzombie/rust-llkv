@@ -1,5 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
-use llkv_data_types::{F32x, f32x_decode_many_into, Codec};
+use std::hint::black_box;
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use llkv_data_types::{F32x, f32x_decode_many_into, f32x_decode_many_into_par, Codec};
 
 const N: usize = 1024; // dimensions per vector
 const CHUNK_ROWS: usize = 4096; // rows per encoded chunk (CHUNK_ROWS * N * 4 bytes)
@@ -31,6 +32,25 @@ fn bench_f32x_decode(c: &mut Criterion) {
                 while rows_done < 1_000_000 {
                     f32x_decode_many_into::<N>(&mut scratch, &enc, CHUNK_ROWS).unwrap();
                     // do a tiny reduction to keep the work
+                    let mut acc = 0f32;
+                    for &x in &scratch[0..N] { acc += x; }
+                    black_box(acc);
+                    rows_done += CHUNK_ROWS;
+                }
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    // Parallel variant
+    group.bench_with_input(BenchmarkId::new("decode_1M_rows_1024d_par", N), &N, |b, &_n| {
+        b.iter_batched(
+            || vec![0f32; CHUNK_ROWS * N],
+            |mut scratch| {
+                let mut rows_done = 0usize;
+                while rows_done < 1_000_000 {
+                    f32x_decode_many_into_par::<N>(&mut scratch, &enc, CHUNK_ROWS).unwrap();
+                    // small reduction to keep work live
                     let mut acc = 0f32;
                     for &x in &scratch[0..N] { acc += x; }
                     black_box(acc);
