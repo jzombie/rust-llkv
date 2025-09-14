@@ -5,15 +5,15 @@ const MAGIC: &[u8; 8] = b"LLKVCHNK";
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-struct ChunkHeader {
+pub(crate) struct ChunkHeader {
     magic: [u8; 8],
-    version: u16,
-    kind: u8,       // 3 = chunk
-    endian: u8,     // 1 = little-endian
-    width: u16,     // bytes per value
-    vector_len: u32,
-    row_count: u64,
-    epoch: u64,
+    pub(crate) version: u16,
+    pub(crate) kind: u8,       // 3 = chunk
+    pub(crate) endian: u8,     // 1 = little-endian
+    pub(crate) width: u16,     // bytes per value
+    pub(crate) vector_len: u32,
+    pub(crate) row_count: u64,
+    pub(crate) epoch: u64,
     _pad: [u8; 64 - (8 + 2 + 1 + 1 + 2 + 4 + 8 + 8)],
 }
 
@@ -32,7 +32,7 @@ impl ChunkHeader {
         }
     }
 
-    fn encode(&self, dst: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, dst: &mut Vec<u8>) {
         dst.extend_from_slice(&self.magic);
         dst.extend_from_slice(&self.version.to_le_bytes());
         dst.push(self.kind);
@@ -44,7 +44,7 @@ impl ChunkHeader {
         dst.extend_from_slice(&self._pad);
     }
 
-    fn decode(src: &[u8]) -> Option<(Self, usize)> {
+    pub(crate) fn decode(src: &[u8]) -> Option<(Self, usize)> {
         if src.len() < 64 { return None; }
         let mut off = 0;
         let mut magic = [0u8; 8]; magic.copy_from_slice(&src[off..off+8]); off += 8;

@@ -204,7 +204,7 @@ impl<P: Pager> ColumnStore<P> {
 }
 
 /* ------------------------- Columnar (u64 prototype) ------------------------- */
-use crate::column_store::columnar::{write_u64_chunk, get_chunk_blob, U64ChunkView};
+use crate::column_store::columnar::{write_u64_chunk, get_chunk_blob, ChunkHeader};
 
 impl<P: Pager> ColumnStore<P> {
     /// Append a dense u64 chunk (columnar, little-endian stripe) for `field_id`.
@@ -233,35 +233,33 @@ pub struct U64VectorScan<'a, P: Pager> {
     pager: &'a Arc<P>,
     keys: Vec<PhysicalKey>,
     cur_idx: usize,
-    cur_stripe: Option<Vec<u8>>, // owned LE stripe for current chunk
-    cur_row_count: usize,
+    cur_blob: Option<P::Blob>,
+    cur_off_base: usize,
+    cur_total_bytes: usize,
     cur_vector_len: usize,
     off_bytes: usize,
 }
 
 impl<'a, P: Pager> U64VectorScan<'a, P> {
     fn new(pager: &'a Arc<P>, keys: Vec<PhysicalKey>) -> Self {
-        Self { pager, keys, cur_idx: 0, cur_stripe: None, cur_row_count: 0, cur_vector_len: 0, off_bytes: 0 }
+        Self { pager, keys, cur_idx: 0, cur_blob: None, cur_off_base: 0, cur_total_bytes: 0, cur_vector_len: 0, off_bytes: 0 }
     }
 }
 
 impl<'a, P: Pager> Iterator for U64VectorScan<'a, P> {
-    type Item = Vec<u8>;
+    type Item = (P::Blob, core::ops::Range<usize>);
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(stripe) = &self.cur_stripe {
-                let total_bytes = self.cur_row_count * 8;
-                if self.off_bytes < total_bytes {
-                    let take_vals = core::cmp::min(self.cur_vector_len, (total_bytes - self.off_bytes) / 8);
-                    let start = self.off_bytes;
+            if let Some(blob) = &self.cur_blob {
+                if self.off_bytes < self.cur_total_bytes {
+                    let take_vals = core::cmp::min(self.cur_vector_len, (self.cur_total_bytes - self.off_bytes) / 8);
+                    let start = self.cur_off_base + self.off_bytes;
                     let end = start + take_vals * 8;
-                    let slice_u8 = &stripe[start..end];
-                    let out = slice_u8.to_vec();
-                    self.off_bytes = end;
-                    return Some(out);
+                    self.off_bytes += take_vals * 8;
+                    return Some((blob.clone(), start..end));
                 }
                 // advance to next chunk
-                self.cur_stripe = None;
+                self.cur_blob = None;
                 self.off_bytes = 0;
             }
             if self.cur_idx >= self.keys.len() { return None; }
@@ -269,10 +267,14 @@ impl<'a, P: Pager> Iterator for U64VectorScan<'a, P> {
             self.cur_idx += 1;
             let blob = get_chunk_blob(self.pager.as_ref(), key)?;
             let bytes = blob.as_ref();
-            let view = U64ChunkView::from_blob_le(bytes)?;
-            self.cur_row_count = view.row_count;
-            self.cur_vector_len = view.vector_len;
-            self.cur_stripe = Some(view.values_le.to_vec()); // own it to avoid lifetime issues
+            let (hdr, off) = ChunkHeader::decode(bytes)?;
+            if hdr.kind != 3 || hdr.width != 8 || hdr.endian != 1 { return None; }
+            let need = hdr.row_count as usize * 8;
+            if bytes.len() < off + need { return None; }
+            self.cur_blob = Some(blob);
+            self.cur_off_base = off;
+            self.cur_total_bytes = need;
+            self.cur_vector_len = hdr.vector_len as usize;
             self.off_bytes = 0;
         }
     }

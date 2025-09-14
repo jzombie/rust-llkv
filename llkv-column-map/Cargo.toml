@@ -35,6 +35,10 @@ harness = false
 name = "columnar_bench"
 harness = false
 
+[[bench]]
+name = "columnar_store_bench"
+harness = false
+
 [profile.bench]
 opt-level = 3
 lto = "thin"
