@@ -3,7 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::serialization::{deserialize_array, serialize_array};
-use crate::storage::pager::{BatchPut, Pager};
+use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
@@ -11,6 +11,7 @@ use crate::store::descriptor::{
 use crate::types::{CATALOG_ROOT_PKEY, LogicalFieldId, PhysicalKey};
 use arrow::array::{Array, ArrayRef};
 use arrow::record_batch::RecordBatch;
+use rustc_hash::FxHashMap;
 use std::sync::{Arc, RwLock};
 
 pub mod catalog;
@@ -42,9 +43,7 @@ impl<P: Pager> ColumnStore<P> {
         let mut puts = Vec::new();
         let schema = batch.schema();
 
-        // This flag will track if we need to save the catalog at the end.
         let mut catalog_dirty = false;
-        // Take a write lock on the catalog for the duration of the append.
         let mut catalog = self.catalog.write().unwrap();
 
         for (i, array) in batch.columns().iter().enumerate() {
@@ -74,11 +73,9 @@ impl<P: Pager> ColumnStore<P> {
                 max_val_u64: u64::MAX,
             };
 
-            // Look up the descriptor key in the catalog.
             let descriptor_pk = match catalog.map.get(&field_id) {
                 Some(&pk) => pk,
                 None => {
-                    // This is a new column. Allocate a key for its descriptor.
                     let new_descriptor_pk = self.pager.alloc_many(1)?[0];
                     catalog.map.insert(field_id, new_descriptor_pk);
                     catalog_dirty = true;
@@ -89,7 +86,6 @@ impl<P: Pager> ColumnStore<P> {
             self.append_chunk_metadata(descriptor_pk, field_id, chunk_meta, &mut puts)?;
         }
 
-        // If we added new columns, save the updated catalog.
         if catalog_dirty {
             puts.push(BatchPut::Raw {
                 key: CATALOG_ROOT_PKEY,
@@ -103,32 +99,59 @@ impl<P: Pager> ColumnStore<P> {
 
     /// Returns a stream of Arrow arrays for a given column.
     pub fn scan(&self, field_id: LogicalFieldId) -> Result<impl Iterator<Item = Result<ArrayRef>>> {
-        // Take a read lock on the catalog to perform the lookup.
+        // --- Phase 1: Lookups ---
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = match catalog.map.get(&field_id) {
             Some(&pk) => pk,
-            // If the column doesn't exist in the catalog, return an empty iterator.
             None => {
                 return Ok(
                     Box::new(std::iter::empty()) as Box<dyn Iterator<Item = Result<ArrayRef>>>
                 );
             }
         };
-
         let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
         let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
+        // --- Phase 2: Collect all chunk metadata ---
+        // This still requires sequential I/O due to the linked-list nature of descriptor pages,
+        // but it contains the I/O to just the (small) metadata pages.
+        let mut all_chunk_metadata = Vec::new();
         let meta_iter = DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk);
+        for meta_result in meta_iter {
+            all_chunk_metadata.push(meta_result?);
+        }
 
-        let pager = self.pager.clone();
-        let array_iter = meta_iter.map(move |meta_result| {
-            let metadata = meta_result?;
-            let array_blob = pager.get_raw(metadata.chunk_pk)?.ok_or(Error::NotFound)?;
-            deserialize_array(array_blob.as_ref())
-        });
+        if all_chunk_metadata.is_empty() {
+            return Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = Result<ArrayRef>>>);
+        }
 
-        // Box the iterator to erase its concrete type for the return signature.
-        Ok(Box::new(array_iter) as Box<dyn Iterator<Item = Result<ArrayRef>>>)
+        // --- Phase 3: Batch-fetch all data chunks ---
+        // This is the critical performance improvement. All data is read in one request.
+        let data_chunk_gets: Vec<BatchGet> = all_chunk_metadata
+            .iter()
+            .map(|meta| BatchGet::Raw { key: meta.chunk_pk })
+            .collect();
+        let get_results = self.pager.batch_get(&data_chunk_gets)?;
+
+        // --- Phase 4: Prepare results for iteration ---
+        // Place results into a map for efficient lookup.
+        let mut chunks_map = FxHashMap::default();
+        for result in get_results {
+            if let GetResult::Raw { key, bytes } = result {
+                chunks_map.insert(key, bytes);
+            }
+        }
+
+        // The final iterator is now I/O-free. It works over the data we just fetched.
+        let result_iterator =
+            all_chunk_metadata
+                .into_iter()
+                .map(move |meta| match chunks_map.get(&meta.chunk_pk) {
+                    Some(bytes) => deserialize_array(bytes.as_ref()),
+                    None => Err(Error::NotFound),
+                });
+
+        Ok(Box::new(result_iterator) as Box<dyn Iterator<Item = Result<ArrayRef>>>)
     }
 
     // A helper to encapsulate the logic of appending to the descriptor chain.
