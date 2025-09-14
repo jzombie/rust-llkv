@@ -9,11 +9,14 @@ use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
 };
 use crate::types::{CATALOG_ROOT_PKEY, LogicalFieldId, PhysicalKey};
-use arrow::array::{Array, ArrayRef, BooleanArray};
-use arrow::compute;
+use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, UInt32Array, UInt64Array};
+use arrow::compute::{self, SortColumn, lexsort_to_indices};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::ops::BitOrAssign;
 use std::sync::{Arc, RwLock};
 
@@ -134,7 +137,6 @@ impl<P: Pager> ColumnStore<P> {
                     RoaringBitmap::new()
                 };
 
-                // FIX: Use `bitor_assign` for in-place union, not `union_with`.
                 existing_tombstone.bitor_assign(&deletes_in_chunk);
 
                 let mut tombstone_bytes = Vec::new();
@@ -193,7 +195,6 @@ impl<P: Pager> ColumnStore<P> {
         let catalog = self.catalog.read().unwrap();
         let &descriptor_pk = match catalog.map.get(&field_id) {
             Some(pk) => pk,
-            // FIX: Return a boxed empty iterator if the column is not found.
             None => return Ok(Box::new(std::iter::empty())),
         };
 
@@ -207,7 +208,6 @@ impl<P: Pager> ColumnStore<P> {
         }
 
         if all_chunk_metadata.is_empty() {
-            // FIX: Return a boxed empty iterator here as well.
             return Ok(Box::new(std::iter::empty()));
         }
 
@@ -246,8 +246,127 @@ impl<P: Pager> ColumnStore<P> {
             }
         });
 
-        // FIX: Return the final iterator, boxed to create a uniform return type.
         Ok(Box::new(result_iterator))
+    }
+
+    pub fn create_sort_index(&self, field_id: LogicalFieldId) -> Result<()> {
+        let catalog = self.catalog.read().unwrap();
+        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+        let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
+        let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+
+        let mut all_chunk_metadata = Vec::new();
+        let meta_iter = DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk);
+        for meta_result in meta_iter {
+            all_chunk_metadata.push(meta_result?);
+        }
+
+        let data_chunk_keys: Vec<PhysicalKey> =
+            all_chunk_metadata.iter().map(|m| m.chunk_pk).collect();
+        let gets: Vec<BatchGet> = data_chunk_keys
+            .into_iter()
+            .map(|k| BatchGet::Raw { key: k })
+            .collect();
+        let results = self.pager.batch_get(&gets)?;
+
+        let mut chunks_map = FxHashMap::default();
+        for result in results {
+            if let GetResult::Raw { key, bytes } = result {
+                chunks_map.insert(key, bytes);
+            }
+        }
+
+        let mut puts = Vec::new();
+        for meta in all_chunk_metadata.iter_mut() {
+            let chunk_blob = chunks_map.get(&meta.chunk_pk).ok_or(Error::NotFound)?;
+            let chunk_array = deserialize_array(chunk_blob.as_ref())?;
+
+            let sort_column = SortColumn {
+                values: chunk_array,
+                options: None,
+            };
+            let indices = lexsort_to_indices(&[sort_column], None)?;
+            let perm_bytes = serialize_array(&indices)?;
+            let perm_pk = self.pager.alloc_many(1)?[0];
+
+            puts.push(BatchPut::Raw {
+                key: perm_pk,
+                bytes: perm_bytes,
+            });
+            meta.value_order_perm_pk = perm_pk;
+        }
+
+        let mut current_page_pk = descriptor.head_page_pk;
+        let mut page_start_chunk_idx = 0;
+        while current_page_pk != 0 {
+            let mut page_blob = self
+                .pager
+                .get_raw(current_page_pk)?
+                .ok_or(Error::NotFound)?
+                .as_ref()
+                .to_vec();
+            let header =
+                DescriptorPageHeader::from_le_bytes(&page_blob[..DescriptorPageHeader::DISK_SIZE]);
+            let chunks_on_this_page = header.entry_count as usize;
+            let page_end_chunk_idx = page_start_chunk_idx + chunks_on_this_page;
+            let updated_chunks = &all_chunk_metadata[page_start_chunk_idx..page_end_chunk_idx];
+
+            let mut new_page_data = Vec::new();
+            for chunk_meta in updated_chunks {
+                new_page_data.extend_from_slice(&chunk_meta.to_le_bytes());
+            }
+
+            page_blob.truncate(DescriptorPageHeader::DISK_SIZE);
+            page_blob.extend_from_slice(&new_page_data);
+
+            puts.push(BatchPut::Raw {
+                key: current_page_pk,
+                bytes: page_blob,
+            });
+            current_page_pk = header.next_page_pk;
+            page_start_chunk_idx = page_end_chunk_idx;
+        }
+
+        self.pager.batch_put(&puts)?;
+        Ok(())
+    }
+
+    pub fn scan_sorted(&self, field_id: LogicalFieldId) -> Result<MergeSortedIterator<P::Blob>> {
+        let catalog = self.catalog.read().unwrap();
+        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+        let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
+        let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+
+        let mut all_chunk_metadata = Vec::new();
+        let meta_iter = DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk);
+        for meta_result in meta_iter {
+            all_chunk_metadata.push(meta_result?);
+        }
+
+        let mut gets = Vec::new();
+        for meta in &all_chunk_metadata {
+            gets.push(BatchGet::Raw { key: meta.chunk_pk });
+            if meta.value_order_perm_pk != 0 {
+                gets.push(BatchGet::Raw {
+                    key: meta.value_order_perm_pk,
+                });
+            } else {
+                return Err(Error::Internal(format!(
+                    "Chunk {} is not sorted",
+                    meta.chunk_pk
+                )));
+            }
+        }
+        let get_results = self.pager.batch_get(&gets)?;
+
+        let mut blobs_map = FxHashMap::default();
+        for result in get_results {
+            if let GetResult::Raw { key, bytes } = result {
+                blobs_map.insert(key, bytes);
+            }
+        }
+
+        MergeSortedIterator::try_new(all_chunk_metadata, blobs_map)
     }
 
     fn append_chunk_metadata(
@@ -339,5 +458,150 @@ impl<P: Pager> ColumnStore<P> {
             }
         }
         Ok(())
+    }
+}
+
+// --- K-way merge implementation ---
+
+struct ChunkCursor {
+    perm_indices: Arc<UInt32Array>,
+    data_array: ArrayRef,
+    pos: usize,
+}
+
+struct HeapItem {
+    cursor_idx: usize,
+    value: ArrayRef,
+}
+
+impl PartialEq for HeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for HeapItem {}
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // This implementation is now generalized to handle multiple primitive types.
+        let ordering = match self.value.data_type() {
+            &DataType::UInt64 => {
+                let self_val = self
+                    .value
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0);
+                let other_val = other
+                    .value
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0);
+                self_val.cmp(&other_val)
+            }
+            &DataType::Int32 => {
+                let self_val = self
+                    .value
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0);
+                let other_val = other
+                    .value
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0);
+                self_val.cmp(&other_val)
+            }
+            _ => {
+                panic!("Unsupported sort type in HeapItem::cmp. This needs to be generalized.");
+            }
+        };
+        // Reversed for min-heap behavior.
+        ordering.reverse()
+    }
+}
+
+pub struct MergeSortedIterator<B: AsRef<[u8]>> {
+    cursors: Vec<ChunkCursor>,
+    heap: BinaryHeap<HeapItem>,
+    _blobs: FxHashMap<PhysicalKey, B>,
+}
+
+impl<B: AsRef<[u8]>> MergeSortedIterator<B> {
+    fn try_new(metadata: Vec<ChunkMetadata>, blobs: FxHashMap<PhysicalKey, B>) -> Result<Self> {
+        let mut cursors = Vec::with_capacity(metadata.len());
+        for meta in &metadata {
+            let data_blob = blobs.get(&meta.chunk_pk).ok_or(Error::NotFound)?;
+            let perm_blob = blobs
+                .get(&meta.value_order_perm_pk)
+                .ok_or(Error::NotFound)?;
+
+            let data_array = deserialize_array(data_blob.as_ref())?;
+            let perm_array = deserialize_array(perm_blob.as_ref())?;
+            let perm_indices = perm_array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| Error::Internal("Invalid permutation index type".into()))?;
+
+            cursors.push(ChunkCursor {
+                perm_indices: Arc::new(perm_indices.clone()),
+                data_array,
+                pos: 0,
+            });
+        }
+
+        let mut heap = BinaryHeap::new();
+        for (i, cursor) in cursors.iter_mut().enumerate() {
+            if let Some(value) = Self::get_value_at_cursor(cursor) {
+                heap.push(HeapItem {
+                    cursor_idx: i,
+                    value,
+                });
+            }
+        }
+
+        Ok(Self {
+            cursors,
+            heap,
+            _blobs: blobs,
+        })
+    }
+
+    fn get_value_at_cursor(cursor: &ChunkCursor) -> Option<ArrayRef> {
+        if cursor.pos < cursor.perm_indices.len() {
+            let data_idx = cursor.perm_indices.value(cursor.pos) as usize;
+            Some(cursor.data_array.slice(data_idx, 1))
+        } else {
+            None
+        }
+    }
+}
+
+impl<B: AsRef<[u8]>> Iterator for MergeSortedIterator<B> {
+    type Item = Result<ArrayRef>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.heap.pop() {
+            Some(item) => {
+                let cursor = &mut self.cursors[item.cursor_idx];
+                cursor.pos += 1;
+
+                if let Some(next_value) = Self::get_value_at_cursor(cursor) {
+                    self.heap.push(HeapItem {
+                        cursor_idx: item.cursor_idx,
+                        value: next_value,
+                    });
+                }
+                Some(Ok(item.value))
+            }
+            None => None,
+        }
     }
 }

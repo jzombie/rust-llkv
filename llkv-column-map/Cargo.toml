@@ -10,6 +10,7 @@ autobenches = false
 
 [dependencies]
 arrow = { version = "56.1.0", features = ["ipc"] }
+arrow-ord = "56.1.0"
 roaring = "0.11.2"
 rustc-hash.workspace = true
 thiserror = "2.0.16"
@@ -19,10 +20,6 @@ criterion.workspace = true
 rand.workspace = true
 
 # Legacy benches disabled. Kept only columnar benches.
-
-[[bench]]
-name = "columnar_bench"
-harness = false
 
 [[bench]]
 name = "columnar_store_bench"
