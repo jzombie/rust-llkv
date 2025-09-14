@@ -9,15 +9,17 @@ use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
 };
 use crate::types::{CATALOG_ROOT_PKEY, LogicalFieldId, PhysicalKey};
-use arrow::array::{Array, ArrayRef};
+use arrow::array::{Array, ArrayRef, BooleanArray};
+use arrow::compute;
 use arrow::record_batch::RecordBatch;
+use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
+use std::ops::BitOrAssign;
 use std::sync::{Arc, RwLock};
 
 pub mod catalog;
 pub mod descriptor;
 
-// Maximum number of ChunkMetadata entries we'll pack into a single descriptor page.
 const DESCRIPTOR_ENTRIES_PER_PAGE: usize = 256;
 
 pub struct ColumnStore<P: Pager> {
@@ -26,11 +28,10 @@ pub struct ColumnStore<P: Pager> {
 }
 
 impl<P: Pager> ColumnStore<P> {
-    /// Opens an existing store or creates a new one.
     pub fn open(pager: Arc<P>) -> Result<Self> {
         let catalog = match pager.get_raw(CATALOG_ROOT_PKEY)? {
             Some(blob) => ColumnCatalog::from_bytes(blob.as_ref())?,
-            None => ColumnCatalog::default(), // New store, empty catalog
+            None => ColumnCatalog::default(),
         };
         Ok(Self {
             pager,
@@ -38,11 +39,9 @@ impl<P: Pager> ColumnStore<P> {
         })
     }
 
-    /// Appends a batch of data to the store.
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         let mut puts = Vec::new();
         let schema = batch.schema();
-
         let mut catalog_dirty = false;
         let mut catalog = self.catalog.write().unwrap();
 
@@ -51,13 +50,11 @@ impl<P: Pager> ColumnStore<P> {
             let field_id = field
                 .metadata()
                 .get("field_id")
-                .ok_or_else(|| Error::Internal("Missing field_id in metadata".to_string()))?
+                .ok_or_else(|| Error::Internal("Missing field_id".into()))?
                 .parse::<LogicalFieldId>()
                 .unwrap();
-
             let chunk_pk = self.pager.alloc_many(1)?[0];
             let chunk_bytes = serialize_array(array.as_ref())?;
-
             puts.push(BatchPut::Raw {
                 key: chunk_pk,
                 bytes: chunk_bytes.clone(),
@@ -73,16 +70,10 @@ impl<P: Pager> ColumnStore<P> {
                 max_val_u64: u64::MAX,
             };
 
-            let descriptor_pk = match catalog.map.get(&field_id) {
-                Some(&pk) => pk,
-                None => {
-                    let new_descriptor_pk = self.pager.alloc_many(1)?[0];
-                    catalog.map.insert(field_id, new_descriptor_pk);
-                    catalog_dirty = true;
-                    new_descriptor_pk
-                }
-            };
-
+            let descriptor_pk = *catalog.map.entry(field_id).or_insert_with(|| {
+                catalog_dirty = true;
+                self.pager.alloc_many(1).unwrap()[0]
+            });
             self.append_chunk_metadata(descriptor_pk, field_id, chunk_meta, &mut puts)?;
         }
 
@@ -92,29 +83,123 @@ impl<P: Pager> ColumnStore<P> {
                 bytes: catalog.to_bytes(),
             });
         }
+        self.pager.batch_put(&puts)?;
+        Ok(())
+    }
+
+    pub fn delete_rows(
+        &self,
+        field_id: LogicalFieldId,
+        rows_to_delete: &RoaringBitmap,
+    ) -> Result<()> {
+        if rows_to_delete.is_empty() {
+            return Ok(());
+        }
+
+        let catalog = self.catalog.read().unwrap();
+        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+        let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
+        let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+
+        let mut all_chunk_metadata = Vec::new();
+        let meta_iter = DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk);
+        for meta_result in meta_iter {
+            all_chunk_metadata.push(meta_result?);
+        }
+
+        let mut puts = Vec::new();
+        let mut cumulative_rows = 0;
+
+        for meta in all_chunk_metadata.iter_mut() {
+            let chunk_row_start = cumulative_rows;
+            let chunk_row_end = chunk_row_start + meta.row_count;
+
+            let deletes_in_chunk: RoaringBitmap = rows_to_delete
+                .iter()
+                .filter(|&row_idx| {
+                    (row_idx as u64) >= chunk_row_start && (row_idx as u64) < chunk_row_end
+                })
+                .map(|row_idx| (row_idx as u64 - chunk_row_start) as u32)
+                .collect();
+
+            if !deletes_in_chunk.is_empty() {
+                let mut existing_tombstone = if meta.tombstone_pk != 0 {
+                    let tombstone_blob = self
+                        .pager
+                        .get_raw(meta.tombstone_pk)?
+                        .ok_or(Error::NotFound)?;
+                    RoaringBitmap::deserialize_from(tombstone_blob.as_ref())
+                        .map_err(|e| Error::Io(e))?
+                } else {
+                    RoaringBitmap::new()
+                };
+
+                // FIX: Use `bitor_assign` for in-place union, not `union_with`.
+                existing_tombstone.bitor_assign(&deletes_in_chunk);
+
+                let mut tombstone_bytes = Vec::new();
+                existing_tombstone.serialize_into(&mut tombstone_bytes)?;
+                let new_tombstone_pk = self.pager.alloc_many(1)?[0];
+                puts.push(BatchPut::Raw {
+                    key: new_tombstone_pk,
+                    bytes: tombstone_bytes,
+                });
+
+                meta.tombstone_pk = new_tombstone_pk;
+            }
+            cumulative_rows = chunk_row_end;
+        }
+
+        let mut current_page_pk = descriptor.head_page_pk;
+        let mut page_start_chunk_idx = 0;
+        while current_page_pk != 0 {
+            let mut page_blob = self
+                .pager
+                .get_raw(current_page_pk)?
+                .ok_or(Error::NotFound)?
+                .as_ref()
+                .to_vec();
+            let header =
+                DescriptorPageHeader::from_le_bytes(&page_blob[..DescriptorPageHeader::DISK_SIZE]);
+
+            let chunks_on_this_page = header.entry_count as usize;
+            let page_end_chunk_idx = page_start_chunk_idx + chunks_on_this_page;
+
+            let updated_chunks = &all_chunk_metadata[page_start_chunk_idx..page_end_chunk_idx];
+            let mut new_page_data = Vec::new();
+            for chunk_meta in updated_chunks {
+                new_page_data.extend_from_slice(&chunk_meta.to_le_bytes());
+            }
+
+            page_blob.truncate(DescriptorPageHeader::DISK_SIZE);
+            page_blob.extend_from_slice(&new_page_data);
+
+            puts.push(BatchPut::Raw {
+                key: current_page_pk,
+                bytes: page_blob,
+            });
+            current_page_pk = header.next_page_pk;
+            page_start_chunk_idx = page_end_chunk_idx;
+        }
 
         self.pager.batch_put(&puts)?;
         Ok(())
     }
 
-    /// Returns a stream of Arrow arrays for a given column.
-    pub fn scan(&self, field_id: LogicalFieldId) -> Result<impl Iterator<Item = Result<ArrayRef>>> {
-        // --- Phase 1: Lookups ---
+    pub fn scan(
+        &self,
+        field_id: LogicalFieldId,
+    ) -> Result<Box<dyn Iterator<Item = Result<ArrayRef>>>> {
         let catalog = self.catalog.read().unwrap();
-        let descriptor_pk = match catalog.map.get(&field_id) {
-            Some(&pk) => pk,
-            None => {
-                return Ok(
-                    Box::new(std::iter::empty()) as Box<dyn Iterator<Item = Result<ArrayRef>>>
-                );
-            }
+        let &descriptor_pk = match catalog.map.get(&field_id) {
+            Some(pk) => pk,
+            // FIX: Return a boxed empty iterator if the column is not found.
+            None => return Ok(Box::new(std::iter::empty())),
         };
+
         let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
         let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
-        // --- Phase 2: Collect all chunk metadata ---
-        // This still requires sequential I/O due to the linked-list nature of descriptor pages,
-        // but it contains the I/O to just the (small) metadata pages.
         let mut all_chunk_metadata = Vec::new();
         let meta_iter = DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk);
         for meta_result in meta_iter {
@@ -122,39 +207,49 @@ impl<P: Pager> ColumnStore<P> {
         }
 
         if all_chunk_metadata.is_empty() {
-            return Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = Result<ArrayRef>>>);
+            // FIX: Return a boxed empty iterator here as well.
+            return Ok(Box::new(std::iter::empty()));
         }
 
-        // --- Phase 3: Batch-fetch all data chunks ---
-        // This is the critical performance improvement. All data is read in one request.
-        let data_chunk_gets: Vec<BatchGet> = all_chunk_metadata
-            .iter()
-            .map(|meta| BatchGet::Raw { key: meta.chunk_pk })
-            .collect();
-        let get_results = self.pager.batch_get(&data_chunk_gets)?;
+        let mut gets = Vec::new();
+        for meta in &all_chunk_metadata {
+            gets.push(BatchGet::Raw { key: meta.chunk_pk });
+            if meta.tombstone_pk != 0 {
+                gets.push(BatchGet::Raw {
+                    key: meta.tombstone_pk,
+                });
+            }
+        }
+        let get_results = self.pager.batch_get(&gets)?;
 
-        // --- Phase 4: Prepare results for iteration ---
-        // Place results into a map for efficient lookup.
-        let mut chunks_map = FxHashMap::default();
+        let mut blobs_map = FxHashMap::default();
         for result in get_results {
             if let GetResult::Raw { key, bytes } = result {
-                chunks_map.insert(key, bytes);
+                blobs_map.insert(key, bytes);
             }
         }
 
-        // The final iterator is now I/O-free. It works over the data we just fetched.
-        let result_iterator =
-            all_chunk_metadata
-                .into_iter()
-                .map(move |meta| match chunks_map.get(&meta.chunk_pk) {
-                    Some(bytes) => deserialize_array(bytes.as_ref()),
-                    None => Err(Error::NotFound),
-                });
+        let result_iterator = all_chunk_metadata.into_iter().map(move |meta| {
+            let array_blob = blobs_map.get(&meta.chunk_pk).ok_or(Error::NotFound)?;
+            let array = deserialize_array(array_blob.as_ref())?;
 
-        Ok(Box::new(result_iterator) as Box<dyn Iterator<Item = Result<ArrayRef>>>)
+            if meta.tombstone_pk != 0 {
+                let tombstone_blob = blobs_map.get(&meta.tombstone_pk).ok_or(Error::NotFound)?;
+                let bitmap = RoaringBitmap::deserialize_from(tombstone_blob.as_ref())
+                    .map_err(|e| Error::Io(e))?;
+                let filter_mask = BooleanArray::from_iter(
+                    (0..array.len()).map(|i| Some(!bitmap.contains(i as u32))),
+                );
+                Ok(compute::filter(&array, &filter_mask)?)
+            } else {
+                Ok(array)
+            }
+        });
+
+        // FIX: Return the final iterator, boxed to create a uniform return type.
+        Ok(Box::new(result_iterator))
     }
 
-    // A helper to encapsulate the logic of appending to the descriptor chain.
     fn append_chunk_metadata(
         &self,
         descriptor_pk: PhysicalKey,
@@ -164,7 +259,6 @@ impl<P: Pager> ColumnStore<P> {
     ) -> Result<()> {
         match self.pager.get_raw(descriptor_pk)? {
             Some(blob) => {
-                // Logic for an EXISTING column
                 let mut descriptor = ColumnDescriptor::from_le_bytes(blob.as_ref());
                 let tail_page_pk = descriptor.tail_page_pk;
                 let mut tail_page_bytes = self
@@ -173,7 +267,6 @@ impl<P: Pager> ColumnStore<P> {
                     .ok_or(Error::NotFound)?
                     .as_ref()
                     .to_vec();
-
                 let header = DescriptorPageHeader::from_le_bytes(
                     &tail_page_bytes[..DescriptorPageHeader::DISK_SIZE],
                 );
@@ -198,6 +291,7 @@ impl<P: Pager> ColumnStore<P> {
                         key: tail_page_pk,
                         bytes: tail_page_bytes,
                     });
+
                     let new_header = DescriptorPageHeader {
                         next_page_pk: 0,
                         entry_count: 1,
@@ -211,7 +305,6 @@ impl<P: Pager> ColumnStore<P> {
                     });
                     descriptor.tail_page_pk = new_tail_pk;
                 }
-
                 descriptor.total_row_count += meta.row_count;
                 descriptor.total_chunk_count += 1;
                 puts.push(BatchPut::Raw {
@@ -220,7 +313,6 @@ impl<P: Pager> ColumnStore<P> {
                 });
             }
             None => {
-                // Logic for a NEW column
                 let first_page_pk = self.pager.alloc_many(1)?[0];
                 let descriptor = ColumnDescriptor {
                     field_id,
