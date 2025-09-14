@@ -8,6 +8,8 @@ pub fn encode_typed(v: &TypedValue) -> Vec<u8> {
         TypedValue::Manifest(x) => bitcode::encode(x),
         TypedValue::ColumnIndex(x) => bitcode::encode(x),
         TypedValue::IndexSegment(x) => bitcode::encode(x),
+        TypedValue::ColumnarRegistry(x) => bitcode::encode(x),
+        TypedValue::ColumnarDescriptor(x) => bitcode::encode(x),
     }
 }
 
@@ -34,6 +36,16 @@ pub fn decode_typed(kind: TypedKind, bytes: &[u8]) -> io::Result<TypedValue> {
             let v: crate::column_index::IndexSegment =
                 bitcode::decode(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
             Ok(TypedValue::IndexSegment(v))
+        }
+        TypedKind::ColumnarRegistry => {
+            let v: crate::column_store::ColumnarRegistry =
+                bitcode::decode(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+            Ok(TypedValue::ColumnarRegistry(v))
+        }
+        TypedKind::ColumnarDescriptor => {
+            let v: crate::column_store::ColumnarDescriptor =
+                bitcode::decode(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+            Ok(TypedValue::ColumnarDescriptor(v))
         }
     }
 }

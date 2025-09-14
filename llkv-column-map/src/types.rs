@@ -91,6 +91,10 @@ pub enum TypedKind {
     ColumnIndex,
     /// Packed logical keys and value layout for one sealed segment (points to data blob).
     IndexSegment,
+    /// Columnar descriptor registry mapping field ids to descriptor keys.
+    ColumnarRegistry,
+    /// Per-column list of columnar chunks (prototype u64 path).
+    ColumnarDescriptor,
 }
 
 /// Type-erased typed value. Concrete structs live in your crate's
@@ -101,6 +105,8 @@ pub enum TypedValue {
     Manifest(crate::column_index::Manifest),
     ColumnIndex(crate::column_index::ColumnIndex),
     IndexSegment(crate::column_index::IndexSegment),
+    ColumnarRegistry(crate::column_store::ColumnarRegistry),
+    ColumnarDescriptor(crate::column_store::ColumnarDescriptor),
 }
 
 /// Type-erased container for all metadata blobs we persist via `bitcode`.
@@ -131,6 +137,8 @@ impl TypedValue {
             TypedValue::Manifest(_) => TypedKind::Manifest,
             TypedValue::ColumnIndex(_) => TypedKind::ColumnIndex,
             TypedValue::IndexSegment(_) => TypedKind::IndexSegment,
+            TypedValue::ColumnarRegistry(_) => TypedKind::ColumnarRegistry,
+            TypedValue::ColumnarDescriptor(_) => TypedKind::ColumnarDescriptor,
         }
     }
 }
