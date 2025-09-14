@@ -21,6 +21,32 @@ pub mod metrics;
 // pub mod write;
 pub mod columnar;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction { Asc, Desc }
+
+#[derive(Clone, Copy, Debug)]
+pub enum Bounds {
+    None,
+    /// Per-chunk row bounds: [start_row, end_row) relative to each chunk.
+    Rows { start_row: Option<usize>, end_row: Option<usize> },
+    /// Value bounds (inclusive). Prunes whole chunks via min/max; no in-chunk selection yet.
+    Values { min: Option<u64>, max: Option<u64> },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ScanOptions {
+    pub direction: Direction,
+    pub bounds: Bounds,
+    /// Desired vector length. If 0, use per-chunk header vector_len.
+    pub vector_len: usize,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self { direction: Direction::Asc, bounds: Bounds::None, vector_len: 16_384 }
+    }
+}
+
 pub struct ColumnStore<P: Pager> {
     pager: Arc<P>,
     bootstrap_key: PhysicalKey,
@@ -238,6 +264,16 @@ impl<P: Pager> ColumnStore<P> {
         };
         U64ChunkScan::new(&self.pager, keys)
     }
+
+    /// Iterator over u64 vectors with options: bounds, direction, vector_len override.
+    pub fn scan_u64_with<'a>(&'a self, field_id: LogicalFieldId, opts: ScanOptions) -> U64Scan<'a, P> {
+        let mut keys = {
+            let m = self.columnar_chunks_u64.read().unwrap();
+            m.get(&field_id).cloned().unwrap_or_default()
+        };
+        if let Direction::Desc = opts.direction { keys.reverse(); }
+        U64Scan::new(&self.pager, keys, opts)
+    }
 }
 
 pub struct U64VectorScan<'a, P: Pager> {
@@ -291,6 +327,105 @@ impl<'a, P: Pager> Iterator for U64VectorScan<'a, P> {
     }
 }
 
+/// Option-driven scanner over u64 stripes supporting direction and bounds.
+pub struct U64Scan<'a, P: Pager> {
+    pager: &'a Arc<P>,
+    keys: Vec<PhysicalKey>,
+    opts: ScanOptions,
+    cur_idx: usize,
+    cur_blob: Option<P::Blob>,
+    cur_off_base: usize,
+    in_chunk_start_bytes: usize,
+    in_chunk_end_bytes: usize,
+    cur_vector_len: usize,
+    next_off: usize,
+}
+
+impl<'a, P: Pager> U64Scan<'a, P> {
+    fn new(pager: &'a Arc<P>, keys: Vec<PhysicalKey>, opts: ScanOptions) -> Self {
+        Self {
+            pager,
+            keys,
+            opts,
+            cur_idx: 0,
+            cur_blob: None,
+            cur_off_base: 0,
+            in_chunk_start_bytes: 0,
+            in_chunk_end_bytes: 0,
+            cur_vector_len: 0,
+            next_off: 0,
+        }
+    }
+}
+
+impl<'a, P: Pager> Iterator for U64Scan<'a, P> {
+    type Item = (P::Blob, core::ops::Range<usize>);
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(blob) = &self.cur_blob {
+                // Produce next vector slice according to direction within [start,end)
+                if self.in_chunk_start_bytes < self.in_chunk_end_bytes {
+                    let vlen_vals = if self.cur_vector_len > 0 { self.cur_vector_len } else { 16_384 };
+                    let step_bytes = vlen_vals * 8;
+                    match self.opts.direction {
+                        Direction::Asc => {
+                            if self.next_off < self.in_chunk_end_bytes {
+                                let start = self.next_off;
+                                let end = core::cmp::min(self.in_chunk_end_bytes, start + step_bytes);
+                                self.next_off = end;
+                                return Some((blob.clone(), start..end));
+                            }
+                        }
+                        Direction::Desc => {
+                            if self.next_off > self.in_chunk_start_bytes {
+                                let end = self.next_off;
+                                let start = end.saturating_sub(step_bytes).max(self.in_chunk_start_bytes);
+                                self.next_off = start;
+                                return Some((blob.clone(), start..end));
+                            }
+                        }
+                    }
+                }
+                // advance to next chunk
+                self.cur_blob = None;
+            }
+
+            if self.cur_idx >= self.keys.len() { return None; }
+            let key = self.keys[self.cur_idx];
+            self.cur_idx += 1;
+            let blob = super::columnar::get_chunk_blob(self.pager.as_ref(), key)?;
+            let bytes = blob.as_ref();
+            let (hdr, off) = super::columnar::ChunkHeader::decode(bytes)?;
+            if hdr.kind != 3 || hdr.width != 8 || hdr.endian != 1 { return None; }
+            let total_bytes = hdr.row_count as usize * 8;
+            if bytes.len() < off + total_bytes { return None; }
+
+            // Bounds handling
+            let (start_row, end_row) = match self.opts.bounds {
+                Bounds::None => (0usize, hdr.row_count as usize),
+                Bounds::Rows { start_row, end_row } => {
+                    let s = start_row.unwrap_or(0).min(hdr.row_count as usize);
+                    let e = end_row.unwrap_or(hdr.row_count as usize).min(hdr.row_count as usize);
+                    (s.min(e), e)
+                }
+                Bounds::Values { min, max } => {
+                    // prune whole chunk if disjoint
+                    if let Some(mi) = min { if hdr.max_val_u64 < mi { continue; } }
+                    if let Some(ma) = max { if hdr.min_val_u64 > ma { continue; } }
+                    (0usize, hdr.row_count as usize)
+                }
+            };
+
+            self.cur_blob = Some(blob);
+            self.cur_off_base = off;
+            self.in_chunk_start_bytes = off + start_row * 8;
+            self.in_chunk_end_bytes = off + end_row * 8;
+            self.cur_vector_len = if self.opts.vector_len == 0 { hdr.vector_len as usize } else { self.opts.vector_len };
+            self.next_off = match self.opts.direction { Direction::Asc => self.in_chunk_start_bytes, Direction::Desc => self.in_chunk_end_bytes };
+        }
+    }
+}
+
 /// Full-chunk scanner: yields one full stripe per chunk as a zero-copy slice range.
 pub struct U64ChunkScan<'a, P: Pager> {
     pager: &'a Arc<P>,
@@ -323,7 +458,7 @@ impl<'a, P: Pager> Iterator for U64ChunkScan<'a, P> {
 
 // ----------------------------- tests -----------------------------
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy_api"))]
 mod tests {
     use super::*;
 

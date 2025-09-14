@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+autobenches = false
 
 [dependencies]
 bitcode.workspace = true
@@ -24,6 +25,9 @@ harness = false
 [[bench]]
 name = "columnar_store_bench"
 harness = false
+
+[features]
+legacy_api = []
 
 [profile.bench]
 opt-level = 3

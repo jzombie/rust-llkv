@@ -14,11 +14,14 @@ pub(crate) struct ChunkHeader {
     pub(crate) vector_len: u32,
     pub(crate) row_count: u64,
     pub(crate) epoch: u64,
-    _pad: [u8; 64 - (8 + 2 + 1 + 1 + 2 + 4 + 8 + 8)],
+    // Optional value-range metadata for pruning value-bounded scans.
+    pub(crate) min_val_u64: u64,
+    pub(crate) max_val_u64: u64,
+    _pad: [u8; 64 - (8 + 2 + 1 + 1 + 2 + 4 + 8 + 8 + 8 + 8)],
 }
 
 impl ChunkHeader {
-    fn new_le(width: u16, vector_len: u32, row_count: u64, epoch: u64) -> Self {
+    fn new_le(width: u16, vector_len: u32, row_count: u64, epoch: u64, min_val_u64: u64, max_val_u64: u64) -> Self {
         Self {
             magic: *MAGIC,
             version: 1,
@@ -28,7 +31,9 @@ impl ChunkHeader {
             vector_len,
             row_count,
             epoch,
-            _pad: [0u8; 64 - (8 + 2 + 1 + 1 + 2 + 4 + 8 + 8)],
+            min_val_u64,
+            max_val_u64,
+            _pad: [0u8; 64 - (8 + 2 + 1 + 1 + 2 + 4 + 8 + 8 + 8 + 8)],
         }
     }
 
@@ -41,6 +46,8 @@ impl ChunkHeader {
         dst.extend_from_slice(&self.vector_len.to_le_bytes());
         dst.extend_from_slice(&self.row_count.to_le_bytes());
         dst.extend_from_slice(&self.epoch.to_le_bytes());
+        dst.extend_from_slice(&self.min_val_u64.to_le_bytes());
+        dst.extend_from_slice(&self.max_val_u64.to_le_bytes());
         dst.extend_from_slice(&self._pad);
     }
 
@@ -59,18 +66,30 @@ impl ChunkHeader {
         let vector_len = u32le(src, &mut off);
         let row_count = u64le(src, &mut off);
         let epoch = u64le(src, &mut off);
-        let mut pad_arr = [0u8; 64 - (8 + 2 + 1 + 1 + 2 + 4 + 8 + 8)];
+        // For version 1, expect min/max fields to be present.
+        let min_val_u64 = u64le(src, &mut off);
+        let max_val_u64 = u64le(src, &mut off);
+        let mut pad_arr = [0u8; 64 - (8 + 2 + 1 + 1 + 2 + 4 + 8 + 8 + 8 + 8)];
         let pad_len = pad_arr.len();
         pad_arr.copy_from_slice(&src[off..off+pad_len]);
         off += pad_len;
-        Some((Self { magic, version, kind, endian, width, vector_len, row_count, epoch, _pad: pad_arr }, off))
+        Some((Self { magic, version, kind, endian, width, vector_len, row_count, epoch, min_val_u64, max_val_u64, _pad: pad_arr }, off))
     }
 }
 
 /// Write a single u64 chunk (little-endian stripe) at `key`.
 pub fn write_u64_chunk<P: Pager>(pager: &P, key: PhysicalKey, values: &[u64], vector_len: u32, epoch: u64) -> Result<(), String> {
     let mut buf = Vec::with_capacity(64 + values.len() * 8);
-    let hdr = ChunkHeader::new_le(8, vector_len, values.len() as u64, epoch);
+    // Compute min/max for pruning.
+    let (min_val_u64, max_val_u64) = if values.is_empty() {
+        (u64::MAX, u64::MIN)
+    } else {
+        let mut minv = u64::MAX;
+        let mut maxv = u64::MIN;
+        for &v in values { if v < minv { minv = v; } if v > maxv { maxv = v; } }
+        (minv, maxv)
+    };
+    let hdr = ChunkHeader::new_le(8, vector_len, values.len() as u64, epoch, min_val_u64, max_val_u64);
     hdr.encode(&mut buf);
     for &v in values {
         buf.extend_from_slice(&v.to_le_bytes());
@@ -90,6 +109,8 @@ pub struct U64ChunkView<'a> {
     pub values_le: &'a [u8], // little-endian u64 stripe
     pub row_count: usize,
     pub vector_len: usize,
+    pub min_val_u64: u64,
+    pub max_val_u64: u64,
 }
 
 impl<'a> U64ChunkView<'a> {
@@ -99,7 +120,7 @@ impl<'a> U64ChunkView<'a> {
         let stripe = &blob[off..];
         let need = hdr.row_count as usize * 8;
         if stripe.len() < need { return None; }
-        Some(Self { values_le: &stripe[..need], row_count: hdr.row_count as usize, vector_len: hdr.vector_len as usize })
+        Some(Self { values_le: &stripe[..need], row_count: hdr.row_count as usize, vector_len: hdr.vector_len as usize, min_val_u64: hdr.min_val_u64, max_val_u64: hdr.max_val_u64 })
     }
 }
 
