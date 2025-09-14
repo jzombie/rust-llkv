@@ -9,21 +9,29 @@ use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
 };
 use crate::types::{CATALOG_ROOT_PKEY, LogicalFieldId, PhysicalKey};
+
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, UInt32Array, UInt64Array};
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+
 use roaring::RoaringBitmap;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::ops::BitOrAssign;
 use std::sync::{Arc, RwLock};
 
 pub mod catalog;
 pub mod descriptor;
 
 const DESCRIPTOR_ENTRIES_PER_PAGE: usize = 256;
+
+/// High bit is reserved for per-field shadow row_id columns.
+const ROW_ID_TAG: u64 = 1u64 << 63;
+
+fn rowid_fid(fid: LogicalFieldId) -> LogicalFieldId {
+    fid | ROW_ID_TAG
+}
 
 pub struct ColumnStore<P: Pager> {
     pager: Arc<P>,
@@ -42,23 +50,86 @@ impl<P: Pager> ColumnStore<P> {
         })
     }
 
+    /// Append with automatic LWW (by row_id) using in-place rewrites.
+    ///
+    /// Requirements:
+    /// - Batch must contain a non-nullable UInt64 column named "row_id".
+    /// - For each data column (with "field_id" metadata), we:
+    ///   1) rewrite any existing chunks to remove rows whose per-field
+    ///      shadow row_ids match incoming row_ids (LWW),
+    ///   2) append the new data chunk, and
+    ///   3) append a shadow row_id chunk for this field.
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
-        let mut puts = Vec::new();
+        // Validate and get the row_id column once.
         let schema = batch.schema();
+        let mut row_id_idx: Option<usize> = None;
+        for (i, f) in schema.fields().iter().enumerate() {
+            if f.name() == "row_id" {
+                row_id_idx = Some(i);
+                break;
+            }
+        }
+        let row_id_idx = row_id_idx.ok_or_else(|| Error::Internal("row_id required".into()))?;
+        let row_id_field = schema.field(row_id_idx);
+        if row_id_field.data_type() != &DataType::UInt64 {
+            return Err(Error::Internal("row_id must be UInt64".into()));
+        }
+        if row_id_field.is_nullable() {
+            return Err(Error::Internal("row_id must be non-null".into()));
+        }
+        let row_id_arr = batch
+            .column(row_id_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::Internal("row_id downcast failed".into()))?;
+
+        // Build set for matches.
+        let mut incoming_ids = FxHashSet::default();
+        incoming_ids.reserve(row_id_arr.len());
+        for i in 0..row_id_arr.len() {
+            incoming_ids.insert(row_id_arr.value(i));
+        }
+
         let mut catalog_dirty = false;
         let mut catalog = self.catalog.write().unwrap();
 
+        // -------------------- Phase 1: LWW rewrites --------------------
+        // Batch all rewrites and flush, so subsequent appends read the
+        // updated descriptor state from the pager.
+        let mut puts_rewrites: Vec<BatchPut> = Vec::new();
+
+        // Iterate data columns and stage LWW rewrites.
+        let mut data_cols: Vec<(LogicalFieldId, ArrayRef)> = Vec::new();
         for (i, array) in batch.columns().iter().enumerate() {
+            if i == row_id_idx {
+                continue;
+            }
             let field = schema.field(i);
             let field_id = field
                 .metadata()
                 .get("field_id")
                 .ok_or_else(|| Error::Internal("Missing field_id".into()))?
                 .parse::<LogicalFieldId>()
-                .unwrap();
+                .map_err(|_| Error::Internal("bad field_id".into()))?;
+
+            self.lww_rewrite_for_field(&mut catalog, field_id, &incoming_ids, &mut puts_rewrites)?;
+
+            data_cols.push((field_id, Arc::clone(array)));
+        }
+
+        if !puts_rewrites.is_empty() {
+            self.pager.batch_put(&puts_rewrites)?;
+        }
+
+        // -------------------- Phase 2: Appends -------------------------
+        let row_id_bytes = serialize_array(row_id_arr)?;
+        let mut puts_appends: Vec<BatchPut> = Vec::new();
+
+        for (field_id, array) in data_cols.into_iter() {
+            // data chunk
             let chunk_pk = self.pager.alloc_many(1)?[0];
             let chunk_bytes = serialize_array(array.as_ref())?;
-            puts.push(BatchPut::Raw {
+            puts_appends.push(BatchPut::Raw {
                 key: chunk_pk,
                 bytes: chunk_bytes.clone(),
             });
@@ -77,19 +148,268 @@ impl<P: Pager> ColumnStore<P> {
                 catalog_dirty = true;
                 self.pager.alloc_many(1).unwrap()[0]
             });
-            self.append_chunk_metadata(descriptor_pk, field_id, chunk_meta, &mut puts)?;
+            self.append_chunk_metadata(descriptor_pk, field_id, chunk_meta, &mut puts_appends)?;
+
+            // shadow row_id chunk for this field
+            let rid_fid = rowid_fid(field_id);
+            let rid_chunk_pk = self.pager.alloc_many(1)?[0];
+            puts_appends.push(BatchPut::Raw {
+                key: rid_chunk_pk,
+                bytes: row_id_bytes.clone(),
+            });
+
+            let rid_meta = ChunkMetadata {
+                chunk_pk: rid_chunk_pk,
+                tombstone_pk: 0,
+                value_order_perm_pk: 0,
+                row_count: row_id_arr.len() as u64,
+                serialized_bytes: row_id_bytes.len() as u64,
+                min_val_u64: 0,
+                max_val_u64: u64::MAX,
+            };
+
+            let rid_descriptor_pk = *catalog.map.entry(rid_fid).or_insert_with(|| {
+                catalog_dirty = true;
+                self.pager.alloc_many(1).unwrap()[0]
+            });
+            self.append_chunk_metadata(rid_descriptor_pk, rid_fid, rid_meta, &mut puts_appends)?;
         }
 
         if catalog_dirty {
-            puts.push(BatchPut::Raw {
+            puts_appends.push(BatchPut::Raw {
                 key: CATALOG_ROOT_PKEY,
                 bytes: catalog.to_bytes(),
             });
         }
-        self.pager.batch_put(&puts)?;
+
+        if !puts_appends.is_empty() {
+            self.pager.batch_put(&puts_appends)?;
+        }
         Ok(())
     }
 
+    /// LWW via in-place rewrite for a single field.
+    /// For any chunk whose shadow row_id contains an incoming id, we:
+    /// - filter the data chunk to drop those rows and overwrite same pk,
+    /// - filter the shadow row_id chunk the same way and overwrite,
+    /// - recompute sort perm if present (overwrite same pk),
+    /// - rewrite descriptor pages to update row_count/bytes.
+    fn lww_rewrite_for_field(
+        &self,
+        catalog: &mut ColumnCatalog,
+        field_id: LogicalFieldId,
+        incoming_ids: &FxHashSet<u64>,
+        puts: &mut Vec<BatchPut>,
+    ) -> Result<()> {
+        let desc_pk_data = match catalog.map.get(&field_id) {
+            Some(pk) => *pk,
+            None => return Ok(()), // nothing to rewrite
+        };
+        let rid_fid = rowid_fid(field_id);
+        let desc_pk_rid = match catalog.map.get(&rid_fid) {
+            Some(pk) => *pk,
+            None => return Ok(()), // prior data predates row_id shadow
+        };
+
+        let desc_blob_data = self.pager.get_raw(desc_pk_data)?.ok_or(Error::NotFound)?;
+        let mut descriptor_data = ColumnDescriptor::from_le_bytes(desc_blob_data.as_ref());
+
+        let desc_blob_rid = self.pager.get_raw(desc_pk_rid)?.ok_or(Error::NotFound)?;
+        let mut descriptor_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
+
+        let mut metas_data: Vec<ChunkMetadata> = Vec::new();
+        let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
+        for m in DescriptorIterator::new(self.pager.as_ref(), descriptor_data.head_page_pk) {
+            metas_data.push(m?);
+        }
+        for m in DescriptorIterator::new(self.pager.as_ref(), descriptor_rid.head_page_pk) {
+            metas_rid.push(m?);
+        }
+        let n = metas_data.len().min(metas_rid.len());
+        if n == 0 {
+            return Ok(());
+        }
+
+        // Batch-get row_id chunks to detect hits.
+        let mut hit_idxs: Vec<usize> = Vec::new();
+        {
+            let mut gets_rid = Vec::with_capacity(n);
+            for i in 0..n {
+                gets_rid.push(BatchGet::Raw {
+                    key: metas_rid[i].chunk_pk,
+                });
+            }
+            let rid_results = self.pager.batch_get(&gets_rid)?;
+            let mut rid_blobs: FxHashMap<PhysicalKey, P::Blob> = FxHashMap::default();
+            for r in rid_results {
+                if let GetResult::Raw { key, bytes } = r {
+                    rid_blobs.insert(key, bytes);
+                }
+            }
+            for i in 0..n {
+                let rid_blob = rid_blobs
+                    .get(&metas_rid[i].chunk_pk)
+                    .ok_or(Error::NotFound)?;
+                let rid_arr = deserialize_array(rid_blob.as_ref())?;
+                let rid_arr = rid_arr
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::Internal("row_id chunk type mismatch".into()))?;
+                let mut any = false;
+                for j in 0..rid_arr.len() {
+                    if incoming_ids.contains(&rid_arr.value(j)) {
+                        any = true;
+                        break;
+                    }
+                }
+                if any {
+                    hit_idxs.push(i);
+                }
+            }
+        }
+        if hit_idxs.is_empty() {
+            return Ok(());
+        }
+
+        // Now batch-get needed data + rid chunks for rewrites.
+        let mut gets = Vec::with_capacity(hit_idxs.len() * 2);
+        for &i in &hit_idxs {
+            gets.push(BatchGet::Raw {
+                key: metas_data[i].chunk_pk,
+            });
+            gets.push(BatchGet::Raw {
+                key: metas_rid[i].chunk_pk,
+            });
+        }
+        let results = self.pager.batch_get(&gets)?;
+        let mut blob_map: FxHashMap<PhysicalKey, P::Blob> = FxHashMap::default();
+        for r in results {
+            if let GetResult::Raw { key, bytes } = r {
+                blob_map.insert(key, bytes);
+            }
+        }
+
+        // Rewrite each hit chunk in place.
+        for &i in &hit_idxs {
+            // Build keep mask from row_id shadow.
+            let rid_blob = blob_map
+                .get(&metas_rid[i].chunk_pk)
+                .ok_or(Error::NotFound)?;
+            let rid_arr_any = deserialize_array(rid_blob.as_ref())?;
+            let rid_arr = rid_arr_any
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("row_id chunk type mismatch".into()))?;
+            let keep = BooleanArray::from_iter(
+                (0..rid_arr.len()).map(|j| Some(!incoming_ids.contains(&rid_arr.value(j)))),
+            );
+
+            // Filter data array and overwrite.
+            let data_blob = blob_map
+                .get(&metas_data[i].chunk_pk)
+                .ok_or(Error::NotFound)?;
+            let data_arr = deserialize_array(data_blob.as_ref())?;
+            let data_f = compute::filter(&data_arr, &keep)?;
+            let data_bytes = serialize_array(&data_f)?;
+            puts.push(BatchPut::Raw {
+                key: metas_data[i].chunk_pk,
+                bytes: data_bytes.clone(),
+            });
+
+            // Filter row_id array and overwrite.
+            let rid_f = compute::filter(&rid_arr_any, &keep)?;
+            let rid_bytes = serialize_array(&rid_f)?;
+            puts.push(BatchPut::Raw {
+                key: metas_rid[i].chunk_pk,
+                bytes: rid_bytes.clone(),
+            });
+
+            // Update metadata and recompute perm if present.
+            metas_data[i].row_count = data_f.len() as u64;
+            metas_data[i].serialized_bytes = data_bytes.len() as u64;
+            metas_data[i].tombstone_pk = 0;
+
+            metas_rid[i].row_count = rid_f.len() as u64;
+            metas_rid[i].serialized_bytes = rid_bytes.len() as u64;
+
+            if metas_data[i].value_order_perm_pk != 0 {
+                let sort_column = SortColumn {
+                    values: data_f.clone(),
+                    options: None,
+                };
+                let indices = lexsort_to_indices(&[sort_column], None)?;
+                let perm_bytes = serialize_array(&indices)?;
+                puts.push(BatchPut::Raw {
+                    key: metas_data[i].value_order_perm_pk,
+                    bytes: perm_bytes,
+                });
+            }
+        }
+
+        // Rewrite descriptor pages to reflect new row counts/bytes.
+        self.rewrite_descriptor_pages(desc_pk_data, &mut descriptor_data, &mut metas_data, puts)?;
+        self.rewrite_descriptor_pages(desc_pk_rid, &mut descriptor_rid, &mut metas_rid, puts)?;
+
+        Ok(())
+    }
+
+    /// Rewrite all descriptor pages for a column and update totals.
+    fn rewrite_descriptor_pages(
+        &self,
+        descriptor_pk: PhysicalKey,
+        descriptor: &mut ColumnDescriptor,
+        metas: &mut [ChunkMetadata],
+        puts: &mut Vec<BatchPut>,
+    ) -> Result<()> {
+        let mut current_page_pk = descriptor.head_page_pk;
+        let mut page_start_idx = 0usize;
+
+        while current_page_pk != 0 {
+            let mut page_blob = self
+                .pager
+                .get_raw(current_page_pk)?
+                .ok_or(Error::NotFound)?
+                .as_ref()
+                .to_vec();
+
+            let header =
+                DescriptorPageHeader::from_le_bytes(&page_blob[..DescriptorPageHeader::DISK_SIZE]);
+            let n_on_page = header.entry_count as usize;
+            let end_idx = page_start_idx + n_on_page;
+
+            let mut new_page_data = Vec::new();
+            for m in &metas[page_start_idx..end_idx] {
+                new_page_data.extend_from_slice(&m.to_le_bytes());
+            }
+
+            page_blob.truncate(DescriptorPageHeader::DISK_SIZE);
+            page_blob.extend_from_slice(&new_page_data);
+
+            puts.push(BatchPut::Raw {
+                key: current_page_pk,
+                bytes: page_blob,
+            });
+
+            current_page_pk = header.next_page_pk;
+            page_start_idx = end_idx;
+        }
+
+        // Update descriptor totals.
+        let mut total_rows = 0u64;
+        for m in metas.iter() {
+            total_rows += m.row_count;
+        }
+        descriptor.total_row_count = total_rows;
+
+        puts.push(BatchPut::Raw {
+            key: descriptor_pk,
+            bytes: descriptor.to_le_bytes(),
+        });
+
+        Ok(())
+    }
+
+    /// Explicit delete by global row indexes -> in-place chunk rewrite.
     pub fn delete_rows(
         &self,
         field_id: LogicalFieldId,
@@ -102,86 +422,113 @@ impl<P: Pager> ColumnStore<P> {
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
         let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
-        let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+        let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
-        let mut all_chunk_metadata = Vec::new();
-        let meta_iter = DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk);
-        for meta_result in meta_iter {
-            all_chunk_metadata.push(meta_result?);
+        // Gather metas.
+        let mut metas: Vec<ChunkMetadata> = Vec::new();
+        for m in DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk) {
+            metas.push(m?);
+        }
+        if metas.is_empty() {
+            return Ok(());
         }
 
+        // If we have a shadow row_id column, rewrite it too.
+        let rid_fid = rowid_fid(field_id);
+        let desc_pk_rid = catalog.map.get(&rid_fid).copied();
+
+        let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
+        let mut descriptor_rid: Option<ColumnDescriptor> = None;
+        if let Some(pk) = desc_pk_rid {
+            let desc_blob_rid = self.pager.get_raw(pk)?.ok_or(Error::NotFound)?;
+            descriptor_rid = Some(ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref()));
+            for m in DescriptorIterator::new(
+                self.pager.as_ref(),
+                descriptor_rid.as_ref().unwrap().head_page_pk,
+            ) {
+                metas_rid.push(m?);
+            }
+        }
+
+        // Work chunk-by-chunk and rewrite in place where needed.
         let mut puts = Vec::new();
-        let mut cumulative_rows = 0;
+        let mut cum_rows = 0u64;
 
-        for meta in all_chunk_metadata.iter_mut() {
-            let chunk_row_start = cumulative_rows;
-            let chunk_row_end = chunk_row_start + meta.row_count;
+        for (i, meta) in metas.iter_mut().enumerate() {
+            let start = cum_rows;
+            let end = start + meta.row_count;
 
-            let deletes_in_chunk: RoaringBitmap = rows_to_delete
-                .iter()
-                .filter(|&row_idx| {
-                    (row_idx as u64) >= chunk_row_start && (row_idx as u64) < chunk_row_end
-                })
-                .map(|row_idx| (row_idx as u64 - chunk_row_start) as u32)
-                .collect();
+            // Build relative delete set for this chunk.
+            let mut del_set = FxHashSet::default();
+            for idx in rows_to_delete.iter() {
+                let idx = idx as u64;
+                if idx >= start && idx < end {
+                    del_set.insert((idx - start) as u32);
+                }
+            }
+            if del_set.is_empty() {
+                cum_rows = end;
+                continue;
+            }
 
-            if !deletes_in_chunk.is_empty() {
-                let mut existing_tombstone = if meta.tombstone_pk != 0 {
-                    let tombstone_blob = self
-                        .pager
-                        .get_raw(meta.tombstone_pk)?
-                        .ok_or(Error::NotFound)?;
-                    RoaringBitmap::deserialize_from(tombstone_blob.as_ref())
-                        .map_err(|e| Error::Io(e))?
-                } else {
-                    RoaringBitmap::new()
-                };
+            // Build keep mask.
+            let keep = BooleanArray::from_iter(
+                (0..meta.row_count as usize).map(|j| Some(!del_set.contains(&(j as u32)))),
+            );
 
-                existing_tombstone.bitor_assign(&deletes_in_chunk);
+            // Rewrite data chunk.
+            let data_blob = self.pager.get_raw(meta.chunk_pk)?.ok_or(Error::NotFound)?;
+            let data_arr = deserialize_array(data_blob.as_ref())?;
+            let data_f = compute::filter(&data_arr, &keep)?;
+            let data_bytes = serialize_array(&data_f)?;
+            puts.push(BatchPut::Raw {
+                key: meta.chunk_pk,
+                bytes: data_bytes.clone(),
+            });
 
-                let mut tombstone_bytes = Vec::new();
-                existing_tombstone.serialize_into(&mut tombstone_bytes)?;
-                let new_tombstone_pk = self.pager.alloc_many(1)?[0];
+            meta.row_count = data_f.len() as u64;
+            meta.serialized_bytes = data_bytes.len() as u64;
+            meta.tombstone_pk = 0;
+
+            // Rewrite row_id shadow chunk if present and aligned.
+            if let (Some(_pk), Some(rm)) = (desc_pk_rid, metas_rid.get_mut(i)) {
+                let rid_blob = self.pager.get_raw(rm.chunk_pk)?.ok_or(Error::NotFound)?;
+                let rid_arr = deserialize_array(rid_blob.as_ref())?;
+                let rid_f = compute::filter(&rid_arr, &keep)?;
+                let rid_bytes = serialize_array(&rid_f)?;
                 puts.push(BatchPut::Raw {
-                    key: new_tombstone_pk,
-                    bytes: tombstone_bytes,
+                    key: rm.chunk_pk,
+                    bytes: rid_bytes.clone(),
                 });
 
-                meta.tombstone_pk = new_tombstone_pk;
+                rm.row_count = rid_f.len() as u64;
+                rm.serialized_bytes = rid_bytes.len() as u64;
+                rm.tombstone_pk = 0;
             }
-            cumulative_rows = chunk_row_end;
+
+            // Rewrite permutation if present.
+            if meta.value_order_perm_pk != 0 {
+                let sort_column = SortColumn {
+                    values: data_f.clone(),
+                    options: None,
+                };
+                let indices = lexsort_to_indices(&[sort_column], None)?;
+                let perm_bytes = serialize_array(&indices)?;
+                puts.push(BatchPut::Raw {
+                    key: meta.value_order_perm_pk,
+                    bytes: perm_bytes,
+                });
+            }
+
+            cum_rows = end;
         }
 
-        let mut current_page_pk = descriptor.head_page_pk;
-        let mut page_start_chunk_idx = 0;
-        while current_page_pk != 0 {
-            let mut page_blob = self
-                .pager
-                .get_raw(current_page_pk)?
-                .ok_or(Error::NotFound)?
-                .as_ref()
-                .to_vec();
-            let header =
-                DescriptorPageHeader::from_le_bytes(&page_blob[..DescriptorPageHeader::DISK_SIZE]);
+        // Rewrite descriptor pages for data.
+        self.rewrite_descriptor_pages(descriptor_pk, &mut descriptor, &mut metas, &mut puts)?;
 
-            let chunks_on_this_page = header.entry_count as usize;
-            let page_end_chunk_idx = page_start_chunk_idx + chunks_on_this_page;
-
-            let updated_chunks = &all_chunk_metadata[page_start_chunk_idx..page_end_chunk_idx];
-            let mut new_page_data = Vec::new();
-            for chunk_meta in updated_chunks {
-                new_page_data.extend_from_slice(&chunk_meta.to_le_bytes());
-            }
-
-            page_blob.truncate(DescriptorPageHeader::DISK_SIZE);
-            page_blob.extend_from_slice(&new_page_data);
-
-            puts.push(BatchPut::Raw {
-                key: current_page_pk,
-                bytes: page_blob,
-            });
-            current_page_pk = header.next_page_pk;
-            page_start_chunk_idx = page_end_chunk_idx;
+        // And for row_id shadow if present.
+        if let (Some(pk), Some(mut d_rid)) = (desc_pk_rid, descriptor_rid) {
+            self.rewrite_descriptor_pages(pk, &mut d_rid, &mut metas_rid, &mut puts)?;
         }
 
         self.pager.batch_put(&puts)?;
@@ -215,6 +562,7 @@ impl<P: Pager> ColumnStore<P> {
         for meta in &all_chunk_metadata {
             gets.push(BatchGet::Raw { key: meta.chunk_pk });
             if meta.tombstone_pk != 0 {
+                // Old data may still have tombstones.
                 gets.push(BatchGet::Raw {
                     key: meta.tombstone_pk,
                 });
@@ -487,7 +835,6 @@ impl PartialOrd for HeapItem {
 }
 impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> Ordering {
-        // This implementation is now generalized to handle multiple primitive types.
         let ordering = match self.value.data_type() {
             &DataType::UInt64 => {
                 let self_val = self
@@ -520,10 +867,12 @@ impl Ord for HeapItem {
                 self_val.cmp(&other_val)
             }
             _ => {
-                panic!("Unsupported sort type in HeapItem::cmp. This needs to be generalized.");
+                panic!(
+                    "Unsupported sort type in HeapItem::cmp. \
+                     This needs to be generalized."
+                );
             }
         };
-        // Reversed for min-heap behavior.
         ordering.reverse()
     }
 }

@@ -1,4 +1,3 @@
-// File: src/store/descriptor.rs
 //! Streamable, paged metadata for a single column.
 //!
 //! This module avoids deserialization by defining fixed-layout structs that

@@ -1,5 +1,3 @@
-// File: tests/ingestion.rs
-
 use arrow::array::{Array, FixedSizeListArray, Float32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -15,7 +13,8 @@ fn ingest_and_scan_multiple_columns() {
     let store = ColumnStore::open(pager).unwrap();
 
     // 2. Define the first column (u64 scalars) and its metadata.
-    // The "field_id" metadata is critical for the store to identify the column.
+    // The "field_id" metadata is critical for the store to identify
+    // the column.
     let mut metadata1 = HashMap::new();
     metadata1.insert("field_id".to_string(), "101".to_string());
     let field1 = Field::new("user_id", DataType::UInt64, false).with_metadata(metadata1);
@@ -38,9 +37,14 @@ fn ingest_and_scan_multiple_columns() {
         None,             // No nulls in this example
     ));
 
+    // 3b. Add required row_id column (UInt64, non-null, same length).
+    let row_id_field = Field::new("row_id", DataType::UInt64, false);
+    let row_ids = Arc::new(UInt64Array::from(vec![0u64, 1, 2]));
+
     // 4. Create the RecordBatch from the schema and arrays.
-    let schema = Arc::new(Schema::new(vec![field1, field2]));
-    let batch = RecordBatch::try_new(schema, vec![array1, array2.clone()]).unwrap();
+    // The schema must include the row_id column.
+    let schema = Arc::new(Schema::new(vec![row_id_field, field1, field2]));
+    let batch = RecordBatch::try_new(schema, vec![row_ids, array1, array2.clone()]).unwrap();
 
     // 5. Ingest the entire batch.
     store.append(&batch).unwrap();
@@ -52,7 +56,7 @@ fn ingest_and_scan_multiple_columns() {
         .expect("iterator should have one batch")
         .unwrap();
 
-    // Cast the generic ArrayRef to the concrete type and check its contents.
+    // Cast the generic ArrayRef to the concrete type and check contents.
     let scanned_u64_array = scanned_array1
         .as_any()
         .downcast_ref::<UInt64Array>()
@@ -74,8 +78,8 @@ fn ingest_and_scan_multiple_columns() {
         .downcast_ref::<FixedSizeListArray>()
         .expect("array should be a FixedSizeListArray");
 
-    // FIX: Dereference the Arc (`array2`) to get a reference to the inner array
-    // for a valid comparison with the other reference.
+    // FIX: Dereference the Arc (`array2`) to get a reference to
+    // the inner array for a valid comparison with the other ref.
     assert_eq!(&*array2, scanned_fsl_array);
     assert!(results2_iter.next().is_none(), "iterator should be empty");
 }

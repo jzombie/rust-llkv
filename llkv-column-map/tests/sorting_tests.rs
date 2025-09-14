@@ -21,8 +21,11 @@ fn test_large_sort_u64() {
 
     let mut metadata = HashMap::new();
     metadata.insert("field_id".to_string(), field_id.to_string());
-    let field = Field::new("data", DataType::UInt64, false).with_metadata(metadata);
-    let schema = Arc::new(Schema::new(vec![field]));
+    let data_field = Field::new("data", DataType::UInt64, false).with_metadata(metadata);
+
+    // Add required row_id column to the schema.
+    let row_id_field = Field::new("row_id", DataType::UInt64, false);
+    let schema = Arc::new(Schema::new(vec![row_id_field, data_field]));
 
     // --- 2. Generate and Ingest Unsorted Data ---
     println!("Generating and ingesting {} shuffled u64 rows...", NUM_ROWS);
@@ -32,9 +35,15 @@ fn test_large_sort_u64() {
     for i in 0..NUM_BATCHES {
         let start = i * BATCH_SIZE;
         let end = start + BATCH_SIZE;
+
+        // row_id must be present; make it unique to avoid LWW deletes.
+        let rid_vec: Vec<u64> = (start as u64..end as u64).collect();
+        let rid_array = Arc::new(UInt64Array::from(rid_vec));
+
         let batch_data = &data[start..end];
         let array = Arc::new(UInt64Array::from(batch_data.to_vec()));
-        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![rid_array, array]).unwrap();
         store.append(&batch).unwrap();
     }
     println!("Ingestion complete.");
@@ -80,10 +89,13 @@ fn test_large_sort_i32() {
 
     let mut metadata = HashMap::new();
     metadata.insert("field_id".to_string(), field_id.to_string());
-    let field = Field::new("data", DataType::Int32, false).with_metadata(metadata);
-    let schema = Arc::new(Schema::new(vec![field]));
+    let data_field = Field::new("data", DataType::Int32, false).with_metadata(metadata);
 
-    // --- 2. Generate and Ingest Unsorted Data (including negative numbers) ---
+    // Add required row_id column to the schema.
+    let row_id_field = Field::new("row_id", DataType::UInt64, false);
+    let schema = Arc::new(Schema::new(vec![row_id_field, data_field]));
+
+    // --- 2. Generate and Ingest Unsorted Data (with negatives) ---
     println!("Generating and ingesting {} shuffled i32 rows...", NUM_ROWS);
     let mut data: Vec<i32> = (0..NUM_ROWS as i32)
         .map(|i| i - (NUM_ROWS as i32 / 2))
@@ -93,9 +105,15 @@ fn test_large_sort_i32() {
     for i in 0..NUM_BATCHES {
         let start = i * BATCH_SIZE;
         let end = start + BATCH_SIZE;
+
+        // row_id must be present; make it unique to avoid LWW deletes.
+        let rid_vec: Vec<u64> = (start as u64..end as u64).collect();
+        let rid_array = Arc::new(UInt64Array::from(rid_vec));
+
         let batch_data = &data[start..end];
         let array = Arc::new(Int32Array::from(batch_data.to_vec()));
-        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![rid_array, array]).unwrap();
         store.append(&batch).unwrap();
     }
     println!("Ingestion complete.");
@@ -125,7 +143,7 @@ fn test_large_sort_i32() {
     let mut expected_sorted_data: Vec<i32> = (0..NUM_ROWS as i32)
         .map(|i| i - (NUM_ROWS as i32 / 2))
         .collect();
-    expected_sorted_data.sort(); // Sort the verification data
+    expected_sorted_data.sort();
 
     assert_eq!(collected_results.len(), NUM_ROWS);
     assert_eq!(collected_results, expected_sorted_data);
