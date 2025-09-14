@@ -37,6 +37,35 @@ fn bench_column_store_u64_sum(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+
+    group.bench_function("append_and_sum_u64_full_chunks", |b| {
+        b.iter_batched(
+            || {
+                let pager = Arc::new(MemPager::default());
+                let store: ColumnStore<MemPager> = ColumnStore::open(pager.clone());
+                let fid: LogicalFieldId = 8888;
+                let mut vals = vec![0u64; 1_000_000];
+                for i in 0..vals.len() { vals[i] = (i as u64) & 0xFFFF_FFFF; }
+                store.append_u64_chunk(fid, &vals);
+                (store, fid)
+            },
+            |(store, fid)| {
+                // Warm once
+                let mut warm: u128 = 0;
+                for (blob, range) in store.scan_u64_full_chunks(fid) {
+                    warm += sum_u64_le_simd(&blob.as_ref()[range.clone()]);
+                }
+                black_box(warm);
+                // Measure
+                let mut acc: u128 = 0;
+                for (blob, range) in store.scan_u64_full_chunks(fid) {
+                    acc += sum_u64_le_simd(&blob.as_ref()[range.clone()]);
+                }
+                black_box(acc)
+            },
+            BatchSize::SmallInput,
+        );
+    });
     group.finish();
 }
 

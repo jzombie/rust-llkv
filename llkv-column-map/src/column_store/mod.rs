@@ -228,6 +228,16 @@ impl<P: Pager> ColumnStore<P> {
         };
         U64VectorScan::new(&self.pager, keys)
     }
+
+    /// Iterator yielding full contiguous u64 stripes per chunk (fastest path).
+    /// Returns one `(Blob, Range)` per chunk covering the entire value stripe.
+    pub fn scan_u64_full_chunks<'a>(&'a self, field_id: LogicalFieldId) -> U64ChunkScan<'a, P> {
+        let keys = {
+            let m = self.columnar_chunks_u64.read().unwrap();
+            m.get(&field_id).cloned().unwrap_or_default()
+        };
+        U64ChunkScan::new(&self.pager, keys)
+    }
 }
 
 pub struct U64VectorScan<'a, P: Pager> {
@@ -278,6 +288,35 @@ impl<'a, P: Pager> Iterator for U64VectorScan<'a, P> {
             self.cur_vector_len = hdr.vector_len as usize;
             self.off_bytes = 0;
         }
+    }
+}
+
+/// Full-chunk scanner: yields one full stripe per chunk as a zero-copy slice range.
+pub struct U64ChunkScan<'a, P: Pager> {
+    pager: &'a Arc<P>,
+    keys: Vec<PhysicalKey>,
+    cur_idx: usize,
+}
+
+impl<'a, P: Pager> U64ChunkScan<'a, P> {
+    fn new(pager: &'a Arc<P>, keys: Vec<PhysicalKey>) -> Self {
+        Self { pager, keys, cur_idx: 0 }
+    }
+}
+
+impl<'a, P: Pager> Iterator for U64ChunkScan<'a, P> {
+    type Item = (P::Blob, core::ops::Range<usize>);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cur_idx >= self.keys.len() { return None; }
+        let key = self.keys[self.cur_idx];
+        self.cur_idx += 1;
+        let blob = super::columnar::get_chunk_blob(self.pager.as_ref(), key)?;
+        let bytes = blob.as_ref();
+        let (hdr, off) = super::columnar::ChunkHeader::decode(bytes)?;
+        if hdr.kind != 3 || hdr.width != 8 || hdr.endian != 1 { return None; }
+        let need = hdr.row_count as usize * 8;
+        if bytes.len() < off + need { return None; }
+        Some((blob, off..off + need))
     }
 }
 
