@@ -39,6 +39,9 @@ pub struct ColumnStore<P: Pager> {
     io_put_raw_ops: AtomicUsize,
     io_put_typed_ops: AtomicUsize,
     io_free_ops: AtomicUsize,
+
+    // New: simple in-memory map of columnar chunks per field (u64 prototype path).
+    columnar_chunks_u64: RwLock<FxHashMap<LogicalFieldId, Vec<PhysicalKey>>>,
 }
 
 impl<P: Pager> ColumnStore<P> {
@@ -121,6 +124,7 @@ impl<P: Pager> ColumnStore<P> {
             io_put_raw_ops: AtomicUsize::new(0),
             io_put_typed_ops: AtomicUsize::new(0),
             io_free_ops: AtomicUsize::new(0),
+            columnar_chunks_u64: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -198,6 +202,82 @@ impl<P: Pager> ColumnStore<P> {
         self.io_free_ops.store(0, Ordering::Relaxed);
     }
 }
+
+/* ------------------------- Columnar (u64 prototype) ------------------------- */
+use crate::column_store::columnar::{write_u64_chunk, get_chunk_blob, U64ChunkView};
+
+impl<P: Pager> ColumnStore<P> {
+    /// Append a dense u64 chunk (columnar, little-endian stripe) for `field_id`.
+    /// Returns the PhysicalKey of the chunk.
+    pub fn append_u64_chunk(&self, field_id: LogicalFieldId, values: &[u64]) -> PhysicalKey {
+        let pk = self.pager.alloc_many(1).expect("alloc pk")[0];
+        write_u64_chunk(self.pager.as_ref(), pk, values, 16_384, 0).expect("write u64 chunk");
+        {
+            let mut m = self.columnar_chunks_u64.write().unwrap();
+            m.entry(field_id).or_default().push(pk);
+        }
+        pk
+    }
+
+    /// Iterator over &[u64] vectors for a column's chunks (u64 prototype path).
+    pub fn scan_u64_vectors<'a>(&'a self, field_id: LogicalFieldId) -> U64VectorScan<'a, P> {
+        let keys = {
+            let m = self.columnar_chunks_u64.read().unwrap();
+            m.get(&field_id).cloned().unwrap_or_default()
+        };
+        U64VectorScan::new(&self.pager, keys)
+    }
+}
+
+pub struct U64VectorScan<'a, P: Pager> {
+    pager: &'a Arc<P>,
+    keys: Vec<PhysicalKey>,
+    cur_idx: usize,
+    cur_stripe: Option<Vec<u8>>, // owned LE stripe for current chunk
+    cur_row_count: usize,
+    cur_vector_len: usize,
+    off_bytes: usize,
+}
+
+impl<'a, P: Pager> U64VectorScan<'a, P> {
+    fn new(pager: &'a Arc<P>, keys: Vec<PhysicalKey>) -> Self {
+        Self { pager, keys, cur_idx: 0, cur_stripe: None, cur_row_count: 0, cur_vector_len: 0, off_bytes: 0 }
+    }
+}
+
+impl<'a, P: Pager> Iterator for U64VectorScan<'a, P> {
+    type Item = Vec<u8>;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(stripe) = &self.cur_stripe {
+                let total_bytes = self.cur_row_count * 8;
+                if self.off_bytes < total_bytes {
+                    let take_vals = core::cmp::min(self.cur_vector_len, (total_bytes - self.off_bytes) / 8);
+                    let start = self.off_bytes;
+                    let end = start + take_vals * 8;
+                    let slice_u8 = &stripe[start..end];
+                    let out = slice_u8.to_vec();
+                    self.off_bytes = end;
+                    return Some(out);
+                }
+                // advance to next chunk
+                self.cur_stripe = None;
+                self.off_bytes = 0;
+            }
+            if self.cur_idx >= self.keys.len() { return None; }
+            let key = self.keys[self.cur_idx];
+            self.cur_idx += 1;
+            let blob = get_chunk_blob(self.pager.as_ref(), key)?;
+            let bytes = blob.as_ref();
+            let view = U64ChunkView::from_blob_le(bytes)?;
+            self.cur_row_count = view.row_count;
+            self.cur_vector_len = view.vector_len;
+            self.cur_stripe = Some(view.values_le.to_vec()); // own it to avoid lifetime issues
+            self.off_bytes = 0;
+        }
+    }
+}
+
 
 // ----------------------------- tests -----------------------------
 
