@@ -18,6 +18,7 @@ pub mod metrics;
 pub mod read;
 pub mod read_scan;
 pub mod write;
+pub mod columnar;
 
 pub struct ColumnStore<P: Pager> {
     pager: Arc<P>,

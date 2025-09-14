@@ -33,3 +33,7 @@ harness = false
 [[bench]]
 name = "f32x_bench"
 harness = false
+
+[[bench]]
+name = "simd_sum_bench"
+harness = false
