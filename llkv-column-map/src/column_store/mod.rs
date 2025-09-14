@@ -15,9 +15,10 @@ use std::sync::{
 };
 pub mod introspect;
 pub mod metrics;
-pub mod read;
-pub mod read_scan;
-pub mod write;
+// Legacy read/write paths removed in favor of columnar u64 prototype.
+// pub mod read;
+// pub mod read_scan;
+// pub mod write;
 pub mod columnar;
 
 pub struct ColumnStore<P: Pager> {

@@ -15,21 +15,7 @@ rustc-hash.workspace = true
 criterion.workspace = true
 rand.workspace = true
 
-[[bench]]
-name = "indexing_bench"
-harness = false
-
-[[bench]]
-name = "ingest_bench"
-harness = false
-
-[[bench]]
-name = "read_bench"
-harness = false
-
-[[bench]]
-name = "segment_scan_bench"
-harness = false
+# Legacy benches disabled. Kept only columnar benches.
 
 [[bench]]
 name = "columnar_bench"
