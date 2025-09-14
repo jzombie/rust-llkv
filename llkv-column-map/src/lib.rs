@@ -1,5 +1,3 @@
-pub mod bloom;
-pub mod bounds;
 pub mod codecs;
 pub mod column_index;
 pub mod constants;

@@ -7,7 +7,6 @@ use crate::storage::{
     pager::{BatchGet, BatchPut, GetResult, Pager},
 };
 use crate::types::{ByteOffset, ByteWidth, LogicalFieldId, PhysicalKey, TypedKind, TypedValue};
-use bitcode::{Encode, Decode};
 use rustc_hash::FxHashMap;
 use std::fmt::Write;
 use std::sync::{
@@ -21,17 +20,29 @@ pub mod metrics;
 // pub mod read_scan;
 // pub mod write;
 pub mod columnar;
+pub mod descriptor_pages;
+
+const DESC_ENTRIES_PER_PAGE: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Direction { Asc, Desc }
+pub enum Direction {
+    Asc,
+    Desc,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum Bounds {
     None,
     /// Per-chunk row bounds: [start_row, end_row) relative to each chunk.
-    Rows { start_row: Option<usize>, end_row: Option<usize> },
+    Rows {
+        start_row: Option<usize>,
+        end_row: Option<usize>,
+    },
     /// Value bounds (inclusive). Prunes whole chunks via min/max; no in-chunk selection yet.
-    Values { min: Option<u64>, max: Option<u64> },
+    Values {
+        min: Option<u64>,
+        max: Option<u64>,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -44,24 +55,28 @@ pub struct ScanOptions {
 
 impl Default for ScanOptions {
     fn default() -> Self {
-        Self { direction: Direction::Asc, bounds: Bounds::None, vector_len: 16_384 }
+        Self {
+            direction: Direction::Asc,
+            bounds: Bounds::None,
+            vector_len: 16_384,
+        }
     }
 }
 
 /// Typed on-disk registry mapping columns to their columnar descriptor key.
-#[derive(Debug, Clone, Encode, Decode, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ColumnarRegistry {
     pub columns: Vec<(LogicalFieldId, PhysicalKey)>,
 }
 
 /// Typed on-disk descriptor of columnar chunks for one column (prototype: u64-only values).
-#[derive(Debug, Clone, Encode, Decode, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ColumnarDescriptor {
     pub field_id: LogicalFieldId,
     pub chunks: Vec<ColumnarChunkRef>,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone)]
 pub struct ColumnarChunkRef {
     pub chunk_pk: PhysicalKey,
     pub perm_pk: Option<PhysicalKey>,
@@ -93,7 +108,6 @@ pub struct ColumnStore<P: Pager> {
     io_put_raw_ops: AtomicUsize,
     io_put_typed_ops: AtomicUsize,
     io_free_ops: AtomicUsize,
-
 }
 
 impl<P: Pager> ColumnStore<P> {
@@ -244,25 +258,49 @@ impl<P: Pager> ColumnStore<P> {
     }
 
     fn load_columnar_registry(&self) -> ColumnarRegistry {
-        match self.do_gets(vec![BatchGet::Typed { key: COLUMNAR_REGISTRY_PKEY, kind: TypedKind::ColumnarRegistry }]).pop() {
-            Some(GetResult::Typed { value: TypedValue::ColumnarRegistry(r), .. }) => r,
+        match self
+            .do_gets(vec![BatchGet::Typed {
+                key: COLUMNAR_REGISTRY_PKEY,
+                kind: TypedKind::ColumnarRegistry,
+            }])
+            .pop()
+        {
+            Some(GetResult::Typed {
+                value: TypedValue::ColumnarRegistry(r),
+                ..
+            }) => r,
             _ => ColumnarRegistry::default(),
         }
     }
 
     fn save_columnar_registry(&self, reg: &ColumnarRegistry) {
-        self.do_puts(vec![BatchPut::Typed { key: COLUMNAR_REGISTRY_PKEY, value: TypedValue::ColumnarRegistry(reg.clone()) }]);
+        self.do_puts(vec![BatchPut::Typed {
+            key: COLUMNAR_REGISTRY_PKEY,
+            value: TypedValue::ColumnarRegistry(reg.clone()),
+        }]);
     }
 
     fn load_descriptor(&self, pkey: PhysicalKey) -> Option<ColumnarDescriptor> {
-        match self.do_gets(vec![BatchGet::Typed { key: pkey, kind: TypedKind::ColumnarDescriptor }]).pop()? {
-            GetResult::Typed { value: TypedValue::ColumnarDescriptor(d), .. } => Some(d),
+        match self
+            .do_gets(vec![BatchGet::Typed {
+                key: pkey,
+                kind: TypedKind::ColumnarDescriptor,
+            }])
+            .pop()?
+        {
+            GetResult::Typed {
+                value: TypedValue::ColumnarDescriptor(d),
+                ..
+            } => Some(d),
             _ => None,
         }
     }
 
     fn save_descriptor(&self, pkey: PhysicalKey, d: &ColumnarDescriptor) {
-        self.do_puts(vec![BatchPut::Typed { key: pkey, value: TypedValue::ColumnarDescriptor(d.clone()) }]);
+        self.do_puts(vec![BatchPut::Typed {
+            key: pkey,
+            value: TypedValue::ColumnarDescriptor(d.clone()),
+        }]);
     }
 
     /// Reset metrics to zero.
@@ -277,105 +315,243 @@ impl<P: Pager> ColumnStore<P> {
 }
 
 /* ------------------------- Columnar (u64 prototype) ------------------------- */
-use crate::column_store::columnar::{write_u64_chunk, get_chunk_blob, ChunkHeader};
+use crate::column_store::columnar::{ChunkHeader, get_chunk_blob, write_u64_chunk};
 
 impl<P: Pager> ColumnStore<P> {
-    /// Append a dense u64 chunk (columnar, little-endian stripe) for `field_id`.
-    /// Returns the PhysicalKey of the chunk.
+    /// Append a dense u64 chunk (columnar, little-endian stripe) for
+    /// `field_id`. Returns the PhysicalKey of the chunk.
     pub fn append_u64_chunk(&self, field_id: LogicalFieldId, values: &[u64]) -> PhysicalKey {
-        // Allocate chunk and descriptor key (if new)
+        // 1) Allocate a key and write the data chunk.
         let pk_chunk = self.pager.alloc_many(1).expect("alloc pk")[0];
-        write_u64_chunk(self.pager.as_ref(), pk_chunk, values, 16_384, 0).expect("write u64 chunk");
+        super::columnar::write_u64_chunk(self.pager.as_ref(), pk_chunk, values, 16_384, 0)
+            .expect("write u64 chunk");
 
-        // Registry lookup/update
+        // 2) Ensure registry has a head page for this field.
         let mut reg = self.load_columnar_registry();
-        let mut desc_key = reg.columns.iter().find(|(fid, _)| *fid == field_id).map(|(_, k)| *k);
+        let mut desc_key: Option<PhysicalKey> = reg
+            .columns
+            .iter()
+            .find(|(fid, _)| *fid == field_id)
+            .map(|(_, k)| *k);
         if desc_key.is_none() {
-            desc_key = Some(self.pager.alloc_many(1).expect("alloc desc pk")[0]);
-            reg.columns.push((field_id, desc_key.unwrap()));
+            let head = self.pager.alloc_many(1).expect("alloc desc pk")[0];
+            reg.columns.push((field_id, head));
             self.save_columnar_registry(&reg);
+            desc_key = Some(head);
         }
         let dkey = desc_key.unwrap();
-        // Append a chunk ref entry
-        let (min_val_u64, max_val_u64) = if values.is_empty() { (u64::MAX, u64::MIN) } else {
-            let mut minv = u64::MAX; let mut maxv = u64::MIN; for &v in values { if v < minv { minv = v; } if v > maxv { maxv = v; } } (minv, maxv)
+
+        // 3) Compute min/max for entry metadata.
+        let (min_val_u64, max_val_u64) = if values.is_empty() {
+            (u64::MAX, u64::MIN)
+        } else {
+            let mut minv = u64::MAX;
+            let mut maxv = u64::MIN;
+            for &v in values {
+                if v < minv {
+                    minv = v;
+                }
+                if v > maxv {
+                    maxv = v;
+                }
+            }
+            (minv, maxv)
         };
-        let mut desc = self.load_descriptor(dkey).unwrap_or(ColumnarDescriptor { field_id, chunks: Vec::new() });
-        desc.chunks.push(ColumnarChunkRef { chunk_pk: pk_chunk, perm_pk: None, row_count: values.len() as u64, vector_len: 16_384, epoch: 0, min_val_u64, max_val_u64 });
-        self.save_descriptor(dkey, &desc);
+
+        // 4) Append a descriptor entry to the tail page.
+        let entry = crate::column_store::descriptor_pages::DescPageEntry {
+            chunk_pk: pk_chunk,
+            perm_pk: None,
+            row_count: values.len() as u64,
+            vector_len: 16_384,
+            epoch: 0,
+            min_val_u64,
+            max_val_u64,
+        };
+        let _ = crate::column_store::descriptor_pages::append_entry(
+            self.pager.as_ref(),
+            dkey,
+            field_id,
+            entry,
+            DESC_ENTRIES_PER_PAGE,
+        ); // paged write. :contentReference[oaicite:1]{index=1}
+
         pk_chunk
     }
 
-    /// Append a u64 chunk plus a value-order permutation sidecar. Returns (chunk_pk, perm_pk).
-    pub fn append_u64_chunk_with_value_perm(&self, field_id: LogicalFieldId, values: &[u64]) -> (PhysicalKey, PhysicalKey) {
-        let [pk_chunk, pk_perm] = self.pager.alloc_many(2).expect("alloc pks").try_into().unwrap();
-        // Write the main chunk
-        write_u64_chunk(self.pager.as_ref(), pk_chunk, values, 16_384, 0).expect("write u64 chunk");
-        // Build and write the permutation sidecar (u32 rowids sorted by ascending value)
-        let n = values.len();
-        assert!(n <= u32::MAX as usize, "perm sidecar limited to u32 rowids in prototype");
-        let mut idx: Vec<u32> = (0..n as u32).collect();
-        idx.sort_by_key(|&i| values[i as usize]);
-        // Serialize as little-endian u32s
-        let mut buf = Vec::with_capacity(n * 4);
-        for &i in &idx { buf.extend_from_slice(&i.to_le_bytes()); }
-        self.pager.batch_put(&[BatchPut::Raw { key: pk_perm, bytes: buf }]).expect("write perm sidecar");
-        // Registry lookup/update
+    /// Append a u64 chunk with a value-order permutation sidecar.
+    /// Returns (chunk_pk, perm_pk).
+    pub fn append_u64_chunk_with_value_perm(
+        &self,
+        field_id: LogicalFieldId,
+        values: &[u64],
+        perm_u32: &[u32],
+    ) -> (PhysicalKey, PhysicalKey) {
+        // 1) Allocate keys and write the data chunk.
+        let [pk_chunk, pk_perm]: [PhysicalKey; 2] = self
+            .pager
+            .alloc_many(2)
+            .expect("alloc pks")
+            .try_into()
+            .unwrap();
+
+        super::columnar::write_u64_chunk(self.pager.as_ref(), pk_chunk, values, 16_384, 0)
+            .expect("write u64 chunk"); // uses existing helper. :contentReference[oaicite:3]{index=3}
+
+        // 2) Serialize the provided permutation sidecar (LE u32).
+        let mut buf = Vec::with_capacity(perm_u32.len() * 4);
+        for &i in perm_u32 {
+            buf.extend_from_slice(&i.to_le_bytes());
+        }
+        self.pager
+            .batch_put(&[BatchPut::Raw {
+                key: pk_perm,
+                bytes: buf,
+            }])
+            .expect("write perm sidecar");
+
+        // 3) Ensure registry has a head page for this field.
         let mut reg = self.load_columnar_registry();
-        let mut desc_key = reg.columns.iter().find(|(fid, _)| *fid == field_id).map(|(_, k)| *k);
+        let mut desc_key: Option<PhysicalKey> = reg
+            .columns
+            .iter()
+            .find(|(fid, _)| *fid == field_id)
+            .map(|(_, k)| *k);
         if desc_key.is_none() {
-            desc_key = Some(self.pager.alloc_many(1).expect("alloc desc pk")[0]);
-            reg.columns.push((field_id, desc_key.unwrap()));
+            let head = self.pager.alloc_many(1).expect("alloc desc pk")[0];
+            reg.columns.push((field_id, head));
             self.save_columnar_registry(&reg);
+            desc_key = Some(head);
         }
         let dkey = desc_key.unwrap();
-        let (min_val_u64, max_val_u64) = if values.is_empty() { (u64::MAX, u64::MIN) } else {
-            let mut minv = u64::MAX; let mut maxv = u64::MIN; for &v in values { if v < minv { minv = v; } if v > maxv { maxv = v; } } (minv, maxv)
+
+        // 4) Compute min/max for the entry metadata.
+        let (min_val_u64, max_val_u64) = if values.is_empty() {
+            (u64::MAX, u64::MIN)
+        } else {
+            let mut minv = u64::MAX;
+            let mut maxv = u64::MIN;
+            for &v in values {
+                if v < minv {
+                    minv = v;
+                }
+                if v > maxv {
+                    maxv = v;
+                }
+            }
+            (minv, maxv)
         };
-        let mut desc = self.load_descriptor(dkey).unwrap_or(ColumnarDescriptor { field_id, chunks: Vec::new() });
-        desc.chunks.push(ColumnarChunkRef { chunk_pk: pk_chunk, perm_pk: Some(pk_perm), row_count: values.len() as u64, vector_len: 16_384, epoch: 0, min_val_u64, max_val_u64 });
-        self.save_descriptor(dkey, &desc);
+
+        // 5) Append a descriptor entry to the tail page.
+        let entry = crate::column_store::descriptor_pages::DescPageEntry {
+            chunk_pk: pk_chunk,
+            perm_pk: Some(pk_perm),
+            row_count: values.len() as u64,
+            vector_len: 16_384,
+            epoch: 0,
+            min_val_u64,
+            max_val_u64,
+        };
+        let _ = crate::column_store::descriptor_pages::append_entry(
+            self.pager.as_ref(),
+            dkey,
+            field_id,
+            entry,
+            DESC_ENTRIES_PER_PAGE,
+        ); // paged write. :contentReference[oaicite:4]{index=4}
+
         (pk_chunk, pk_perm)
     }
 
-    /// Iterator over &[u64] vectors for a column's chunks (u64 prototype path).
+    /// Iterator over &[u64] vectors for a column's chunks.
     pub fn scan_u64_vectors<'a>(&'a self, field_id: LogicalFieldId) -> U64VectorScan<'a, P> {
+        // Resolve head page for the field.
         let reg = self.load_columnar_registry();
-        let dkey = match reg.columns.iter().find(|(fid, _)| *fid == field_id) { Some((_, k)) => *k, None => return U64VectorScan::new(&self.pager, Vec::new()) };
-        let keys: Vec<PhysicalKey> = self.load_descriptor(dkey).map(|d| d.chunks.iter().map(|c| c.chunk_pk).collect()).unwrap_or_default();
+        let dkey = match reg.columns.iter().find(|(fid, _)| *fid == field_id) {
+            Some((_, k)) => *k,
+            None => return U64VectorScan::new(&self.pager, Vec::new()),
+        };
+
+        // Collect chunk keys by walking descriptor pages.
+        let mut keys: Vec<PhysicalKey> = Vec::new();
+        let _ =
+            crate::column_store::descriptor_pages::for_each_entry(self.pager.as_ref(), dkey, |e| {
+                keys.push(e.chunk_pk)
+            });
+
         U64VectorScan::new(&self.pager, keys)
     }
 
-    /// Iterator yielding full contiguous u64 stripes per chunk (fastest path).
-    /// Returns one `(Blob, Range)` per chunk covering the entire value stripe.
+    /// Returns one (Blob, Range) per chunk for the whole u64 stripe.
     pub fn scan_u64_full_chunks<'a>(&'a self, field_id: LogicalFieldId) -> U64ChunkScan<'a, P> {
+        // Resolve head page for the field.
         let reg = self.load_columnar_registry();
-        let dkey = match reg.columns.iter().find(|(fid, _)| *fid == field_id) { Some((_, k)) => *k, None => return U64ChunkScan::new(&self.pager, Vec::new()) };
-        let keys: Vec<PhysicalKey> = self.load_descriptor(dkey).map(|d| d.chunks.iter().map(|c| c.chunk_pk).collect()).unwrap_or_default();
+        let dkey = match reg.columns.iter().find(|(fid, _)| *fid == field_id) {
+            Some((_, k)) => *k,
+            None => return U64ChunkScan::new(&self.pager, Vec::new()),
+        };
+
+        // Collect chunk keys by walking descriptor pages.
+        let mut keys: Vec<PhysicalKey> = Vec::new();
+        let _ =
+            crate::column_store::descriptor_pages::for_each_entry(self.pager.as_ref(), dkey, |e| {
+                keys.push(e.chunk_pk)
+            });
+
         U64ChunkScan::new(&self.pager, keys)
     }
 
-    /// Iterator over u64 vectors with options: bounds, direction, vector_len override.
-    pub fn scan_u64_with<'a>(&'a self, field_id: LogicalFieldId, opts: ScanOptions) -> U64Scan<'a, P> {
+    /// Iterator over u64 vectors with bounds, direction, vector_len override.
+    pub fn scan_u64_with<'a>(
+        &'a self,
+        field_id: LogicalFieldId,
+        opts: ScanOptions,
+    ) -> U64Scan<'a, P> {
+        // Resolve head page for the field.
         let reg = self.load_columnar_registry();
-        let mut keys: Vec<PhysicalKey> = if let Some((_, dkey)) = reg.columns.iter().find(|(fid, _)| *fid == field_id) {
-            self.load_descriptor(*dkey).map(|d| d.chunks.iter().map(|c| c.chunk_pk).collect()).unwrap_or_default()
-        } else { Vec::new() };
-        if let Direction::Desc = opts.direction { keys.reverse(); }
+        let dkey = match reg.columns.iter().find(|(fid, _)| *fid == field_id) {
+            Some((_, k)) => *k,
+            None => return U64Scan::new(&self.pager, Vec::new(), opts),
+        };
+
+        // Collect chunk keys by walking descriptor pages.
+        let mut keys: Vec<PhysicalKey> = Vec::new();
+        let _ =
+            crate::column_store::descriptor_pages::for_each_entry(self.pager.as_ref(), dkey, |e| {
+                keys.push(e.chunk_pk)
+            });
+
+        // Apply direction.
+        if let Direction::Desc = opts.direction {
+            keys.reverse();
+        }
+
         U64Scan::new(&self.pager, keys, opts)
     }
 
     /// Value-ordered scan using the permutation sidecar. Yields contiguous runs as zero-copy ranges.
-    pub fn scan_u64_value_order<'a>(&'a self, field_id: LogicalFieldId, opts: ScanOptions) -> Option<U64ValueOrderScan<'a, P>> {
-        // Build (chunk, perm) pairs from descriptor
+    /// Value-ordered scan using the permutation sidecar.
+    pub fn scan_u64_value_order<'a>(
+        &'a self,
+        field_id: LogicalFieldId,
+        opts: ScanOptions,
+    ) -> Option<U64ValueOrderScan<'a, P>> {
+        // Resolve head page for the field.
         let reg = self.load_columnar_registry();
         let dkey = reg.columns.iter().find(|(fid, _)| *fid == field_id)?.1;
-        let desc = self.load_descriptor(dkey)?;
+
+        // Collect (chunk, perm) pairs from descriptor pages.
         let mut pairs: Vec<(PhysicalKey, PhysicalKey)> = Vec::new();
-        for c in &desc.chunks {
-            if let Some(pk) = c.perm_pk { pairs.push((c.chunk_pk, pk)); }
+        let _ =
+            crate::column_store::descriptor_pages::for_each_entry(self.pager.as_ref(), dkey, |e| {
+                if let Some(pk_perm) = e.perm_pk {
+                    pairs.push((e.chunk_pk, pk_perm));
+                }
+            });
+        if pairs.is_empty() {
+            return None;
         }
-        if pairs.is_empty() { return None; }
+
         Some(U64ValueOrderScan::new(&self.pager, pairs, opts))
     }
 }
@@ -393,7 +569,16 @@ pub struct U64VectorScan<'a, P: Pager> {
 
 impl<'a, P: Pager> U64VectorScan<'a, P> {
     fn new(pager: &'a Arc<P>, keys: Vec<PhysicalKey>) -> Self {
-        Self { pager, keys, cur_idx: 0, cur_blob: None, cur_off_base: 0, cur_total_bytes: 0, cur_vector_len: 0, off_bytes: 0 }
+        Self {
+            pager,
+            keys,
+            cur_idx: 0,
+            cur_blob: None,
+            cur_off_base: 0,
+            cur_total_bytes: 0,
+            cur_vector_len: 0,
+            off_bytes: 0,
+        }
     }
 }
 
@@ -403,7 +588,10 @@ impl<'a, P: Pager> Iterator for U64VectorScan<'a, P> {
         loop {
             if let Some(blob) = &self.cur_blob {
                 if self.off_bytes < self.cur_total_bytes {
-                    let take_vals = core::cmp::min(self.cur_vector_len, (self.cur_total_bytes - self.off_bytes) / 8);
+                    let take_vals = core::cmp::min(
+                        self.cur_vector_len,
+                        (self.cur_total_bytes - self.off_bytes) / 8,
+                    );
                     let start = self.cur_off_base + self.off_bytes;
                     let end = start + take_vals * 8;
                     self.off_bytes += take_vals * 8;
@@ -413,15 +601,21 @@ impl<'a, P: Pager> Iterator for U64VectorScan<'a, P> {
                 self.cur_blob = None;
                 self.off_bytes = 0;
             }
-            if self.cur_idx >= self.keys.len() { return None; }
+            if self.cur_idx >= self.keys.len() {
+                return None;
+            }
             let key = self.keys[self.cur_idx];
             self.cur_idx += 1;
             let blob = get_chunk_blob(self.pager.as_ref(), key)?;
             let bytes = blob.as_ref();
             let (hdr, off) = ChunkHeader::decode(bytes)?;
-            if hdr.kind != 3 || hdr.width != 8 || hdr.endian != 1 { return None; }
+            if hdr.kind != 3 || hdr.width != 8 || hdr.endian != 1 {
+                return None;
+            }
             let need = hdr.row_count as usize * 8;
-            if bytes.len() < off + need { return None; }
+            if bytes.len() < off + need {
+                return None;
+            }
             self.cur_blob = Some(blob);
             self.cur_off_base = off;
             self.cur_total_bytes = need;
@@ -469,13 +663,18 @@ impl<'a, P: Pager> Iterator for U64Scan<'a, P> {
             if let Some(blob) = &self.cur_blob {
                 // Produce next vector slice according to direction within [start,end)
                 if self.in_chunk_start_bytes < self.in_chunk_end_bytes {
-                    let vlen_vals = if self.cur_vector_len > 0 { self.cur_vector_len } else { 16_384 };
+                    let vlen_vals = if self.cur_vector_len > 0 {
+                        self.cur_vector_len
+                    } else {
+                        16_384
+                    };
                     let step_bytes = vlen_vals * 8;
                     match self.opts.direction {
                         Direction::Asc => {
                             if self.next_off < self.in_chunk_end_bytes {
                                 let start = self.next_off;
-                                let end = core::cmp::min(self.in_chunk_end_bytes, start + step_bytes);
+                                let end =
+                                    core::cmp::min(self.in_chunk_end_bytes, start + step_bytes);
                                 self.next_off = end;
                                 return Some((blob.clone(), start..end));
                             }
@@ -483,7 +682,9 @@ impl<'a, P: Pager> Iterator for U64Scan<'a, P> {
                         Direction::Desc => {
                             if self.next_off > self.in_chunk_start_bytes {
                                 let end = self.next_off;
-                                let start = end.saturating_sub(step_bytes).max(self.in_chunk_start_bytes);
+                                let start = end
+                                    .saturating_sub(step_bytes)
+                                    .max(self.in_chunk_start_bytes);
                                 self.next_off = start;
                                 return Some((blob.clone(), start..end));
                             }
@@ -494,28 +695,44 @@ impl<'a, P: Pager> Iterator for U64Scan<'a, P> {
                 self.cur_blob = None;
             }
 
-            if self.cur_idx >= self.keys.len() { return None; }
+            if self.cur_idx >= self.keys.len() {
+                return None;
+            }
             let key = self.keys[self.cur_idx];
             self.cur_idx += 1;
             let blob = super::columnar::get_chunk_blob(self.pager.as_ref(), key)?;
             let bytes = blob.as_ref();
             let (hdr, off) = super::columnar::ChunkHeader::decode(bytes)?;
-            if hdr.kind != 3 || hdr.width != 8 || hdr.endian != 1 { return None; }
+            if hdr.kind != 3 || hdr.width != 8 || hdr.endian != 1 {
+                return None;
+            }
             let total_bytes = hdr.row_count as usize * 8;
-            if bytes.len() < off + total_bytes { return None; }
+            if bytes.len() < off + total_bytes {
+                return None;
+            }
 
             // Bounds handling
             let (start_row, end_row) = match self.opts.bounds {
                 Bounds::None => (0usize, hdr.row_count as usize),
                 Bounds::Rows { start_row, end_row } => {
                     let s = start_row.unwrap_or(0).min(hdr.row_count as usize);
-                    let e = end_row.unwrap_or(hdr.row_count as usize).min(hdr.row_count as usize);
+                    let e = end_row
+                        .unwrap_or(hdr.row_count as usize)
+                        .min(hdr.row_count as usize);
                     (s.min(e), e)
                 }
                 Bounds::Values { min, max } => {
                     // prune whole chunk if disjoint
-                    if let Some(mi) = min { if hdr.max_val_u64 < mi { continue; } }
-                    if let Some(ma) = max { if hdr.min_val_u64 > ma { continue; } }
+                    if let Some(mi) = min {
+                        if hdr.max_val_u64 < mi {
+                            continue;
+                        }
+                    }
+                    if let Some(ma) = max {
+                        if hdr.min_val_u64 > ma {
+                            continue;
+                        }
+                    }
                     (0usize, hdr.row_count as usize)
                 }
             };
@@ -524,8 +741,15 @@ impl<'a, P: Pager> Iterator for U64Scan<'a, P> {
             self.cur_off_base = off;
             self.in_chunk_start_bytes = off + start_row * 8;
             self.in_chunk_end_bytes = off + end_row * 8;
-            self.cur_vector_len = if self.opts.vector_len == 0 { hdr.vector_len as usize } else { self.opts.vector_len };
-            self.next_off = match self.opts.direction { Direction::Asc => self.in_chunk_start_bytes, Direction::Desc => self.in_chunk_end_bytes };
+            self.cur_vector_len = if self.opts.vector_len == 0 {
+                hdr.vector_len as usize
+            } else {
+                self.opts.vector_len
+            };
+            self.next_off = match self.opts.direction {
+                Direction::Asc => self.in_chunk_start_bytes,
+                Direction::Desc => self.in_chunk_end_bytes,
+            };
         }
     }
 }
@@ -539,7 +763,11 @@ pub struct U64ChunkScan<'a, P: Pager> {
 
 impl<'a, P: Pager> U64ChunkScan<'a, P> {
     fn new(pager: &'a Arc<P>, keys: Vec<PhysicalKey>) -> Self {
-        Self { pager, keys, cur_idx: 0 }
+        Self {
+            pager,
+            keys,
+            cur_idx: 0,
+        }
     }
 }
 
@@ -559,7 +787,18 @@ pub struct U64ValueOrderScan<'a, P: Pager> {
 
 impl<'a, P: Pager> U64ValueOrderScan<'a, P> {
     fn new(pager: &'a Arc<P>, pairs: Vec<(PhysicalKey, PhysicalKey)>, opts: ScanOptions) -> Self {
-        Self { pager, pairs, opts, cur_idx: 0, cur_blob: None, cur_perm: None, cur_off_base: 0, perm_lo: 0, perm_hi: 0, perm_next: 0 }
+        Self {
+            pager,
+            pairs,
+            opts,
+            cur_idx: 0,
+            cur_blob: None,
+            cur_perm: None,
+            cur_off_base: 0,
+            perm_lo: 0,
+            perm_hi: 0,
+            perm_next: 0,
+        }
     }
 
     #[inline]
@@ -576,7 +815,11 @@ impl<'a, P: Pager> U64ValueOrderScan<'a, P> {
             let mid = (lo + hi) / 2;
             let row = perm[mid] as usize;
             let v = Self::value_at(bytes, off_base, row);
-            if v < target { lo = mid + 1; } else { hi = mid; }
+            if v < target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
         lo
     }
@@ -588,7 +831,11 @@ impl<'a, P: Pager> U64ValueOrderScan<'a, P> {
             let mid = (lo + hi) / 2;
             let row = perm[mid] as usize;
             let v = Self::value_at(bytes, off_base, row);
-            if v <= target { lo = mid + 1; } else { hi = mid; }
+            if v <= target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
         lo
     }
@@ -602,7 +849,10 @@ impl<'a, P: Pager> Iterator for U64ValueOrderScan<'a, P> {
                 let bytes = blob.as_ref();
                 let perm_bytes = perm_blob.as_ref();
                 let perm_u32: &[u32] = unsafe {
-                    core::slice::from_raw_parts(perm_bytes.as_ptr() as *const u32, perm_bytes.len() / 4)
+                    core::slice::from_raw_parts(
+                        perm_bytes.as_ptr() as *const u32,
+                        perm_bytes.len() / 4,
+                    )
                 };
                 if self.perm_lo < self.perm_hi {
                     match self.opts.direction {
@@ -614,7 +864,12 @@ impl<'a, P: Pager> Iterator for U64ValueOrderScan<'a, P> {
                                 let mut i = self.perm_next + 1;
                                 while i < self.perm_hi {
                                     let r = perm_u32[i] as usize;
-                                    if r == last_row + 1 { last_row = r; i += 1; } else { break; }
+                                    if r == last_row + 1 {
+                                        last_row = r;
+                                        i += 1;
+                                    } else {
+                                        break;
+                                    }
                                 }
                                 self.perm_next = i;
                                 let start = self.cur_off_base + start_row * 8;
@@ -629,7 +884,12 @@ impl<'a, P: Pager> Iterator for U64ValueOrderScan<'a, P> {
                                 let mut i = self.perm_next.saturating_sub(1);
                                 while i > self.perm_lo {
                                     let r = perm_u32[i - 1] as usize;
-                                    if r + 1 == first_row { first_row = r; i -= 1; } else { break; }
+                                    if r + 1 == first_row {
+                                        first_row = r;
+                                        i -= 1;
+                                    } else {
+                                        break;
+                                    }
                                 }
                                 self.perm_next = i;
                                 let start = self.cur_off_base + first_row * 8;
@@ -644,40 +904,82 @@ impl<'a, P: Pager> Iterator for U64ValueOrderScan<'a, P> {
                 self.cur_perm = None;
             }
 
-            if self.cur_idx >= self.pairs.len() { return None; }
+            if self.cur_idx >= self.pairs.len() {
+                return None;
+            }
             let (pk_chunk, pk_perm) = self.pairs[self.cur_idx];
             self.cur_idx += 1;
             let blob = super::columnar::get_chunk_blob(self.pager.as_ref(), pk_chunk)?;
             let bytes = blob.as_ref();
             let (hdr, off) = super::columnar::ChunkHeader::decode(bytes)?;
-            if hdr.kind != 3 || hdr.width != 8 || hdr.endian != 1 { return None; }
+            if hdr.kind != 3 || hdr.width != 8 || hdr.endian != 1 {
+                return None;
+            }
             let need = hdr.row_count as usize * 8;
-            if bytes.len() < off + need { return None; }
+            if bytes.len() < off + need {
+                return None;
+            }
             // Prune by chunk min/max for value bounds
             if let Bounds::Values { min, max } = self.opts.bounds {
-                if let Some(mi) = min { if hdr.max_val_u64 < mi { continue; } }
-                if let Some(ma) = max { if hdr.min_val_u64 > ma { continue; } }
+                if let Some(mi) = min {
+                    if hdr.max_val_u64 < mi {
+                        continue;
+                    }
+                }
+                if let Some(ma) = max {
+                    if hdr.min_val_u64 > ma {
+                        continue;
+                    }
+                }
             }
-            let perm_blob = match self.pager.batch_get(&[BatchGet::Raw { key: pk_perm }]).ok()?.pop()? {
+            let perm_blob = match self
+                .pager
+                .batch_get(&[BatchGet::Raw { key: pk_perm }])
+                .ok()?
+                .pop()?
+            {
                 GetResult::Raw { bytes, .. } => bytes,
                 _ => return None,
             };
             let perm_bytes = perm_blob.as_ref();
-            if perm_bytes.len() / 4 != hdr.row_count as usize { return None; }
+            if perm_bytes.len() / 4 != hdr.row_count as usize {
+                return None;
+            }
             // Compute perm range for bounds
-            let perm_u32: &[u32] = unsafe { core::slice::from_raw_parts(perm_bytes.as_ptr() as *const u32, perm_bytes.len() / 4) };
+            let perm_u32: &[u32] = unsafe {
+                core::slice::from_raw_parts(perm_bytes.as_ptr() as *const u32, perm_bytes.len() / 4)
+            };
             let (lo, hi) = match self.opts.bounds {
                 Bounds::None | Bounds::Rows { .. } => (0usize, perm_u32.len()),
                 Bounds::Values { min, max } => {
-                    let lo = if let Some(mi) = min { self.lower_bound(bytes, off, perm_u32, mi) } else { 0 };
-                    let hi = if let Some(ma) = max { self.upper_bound(bytes, off, perm_u32, ma) } else { perm_u32.len() };
+                    let lo = if let Some(mi) = min {
+                        self.lower_bound(bytes, off, perm_u32, mi)
+                    } else {
+                        0
+                    };
+                    let hi = if let Some(ma) = max {
+                        self.upper_bound(bytes, off, perm_u32, ma)
+                    } else {
+                        perm_u32.len()
+                    };
                     (lo.min(hi), hi)
                 }
             };
             self.cur_blob = Some(blob);
             self.cur_perm = Some(perm_blob);
             self.cur_off_base = off;
-            match self.opts.direction { Direction::Asc => { self.perm_lo = lo; self.perm_hi = hi; self.perm_next = lo; } Direction::Desc => { self.perm_lo = lo; self.perm_hi = hi; self.perm_next = hi; } }
+            match self.opts.direction {
+                Direction::Asc => {
+                    self.perm_lo = lo;
+                    self.perm_hi = hi;
+                    self.perm_next = lo;
+                }
+                Direction::Desc => {
+                    self.perm_lo = lo;
+                    self.perm_hi = hi;
+                    self.perm_next = hi;
+                }
+            }
         }
     }
 }
@@ -685,19 +987,24 @@ impl<'a, P: Pager> Iterator for U64ValueOrderScan<'a, P> {
 impl<'a, P: Pager> Iterator for U64ChunkScan<'a, P> {
     type Item = (P::Blob, core::ops::Range<usize>);
     fn next(&mut self) -> Option<Self::Item> {
-        if self.cur_idx >= self.keys.len() { return None; }
+        if self.cur_idx >= self.keys.len() {
+            return None;
+        }
         let key = self.keys[self.cur_idx];
         self.cur_idx += 1;
         let blob = super::columnar::get_chunk_blob(self.pager.as_ref(), key)?;
         let bytes = blob.as_ref();
         let (hdr, off) = super::columnar::ChunkHeader::decode(bytes)?;
-        if hdr.kind != 3 || hdr.width != 8 || hdr.endian != 1 { return None; }
+        if hdr.kind != 3 || hdr.width != 8 || hdr.endian != 1 {
+            return None;
+        }
         let need = hdr.row_count as usize * 8;
-        if bytes.len() < off + need { return None; }
+        if bytes.len() < off + need {
+            return None;
+        }
         Some((blob, off..off + need))
     }
 }
-
 
 // ----------------------------- tests -----------------------------
 

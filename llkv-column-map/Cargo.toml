@@ -9,7 +9,6 @@ publish.workspace = true
 autobenches = false
 
 [dependencies]
-bitcode.workspace = true
 rustc-hash.workspace = true
 
 [dev-dependencies]
