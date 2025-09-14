@@ -1,7 +1,4 @@
-//! Minimal manual codecs replacing prior bitcode usage.
-//!
-//! Encoding is little-endian and length-prefixed for variable data.
-//! This is an internal format (not stable over the wire).
+//! Minimal manual codecs (little-endian). All large vectors are paged.
 
 use crate::column_index::{
     Bootstrap, ColumnEntry, ColumnIndex, IndexSegment, IndexSegmentRef, Manifest, ValueDirL2,
@@ -12,23 +9,23 @@ use crate::layout::{KeyLayout, ValueLayout};
 use crate::types::{TypedKind, TypedValue};
 use std::io::{self, Error, ErrorKind};
 
-mod big_endian;
-pub use big_endian::*;
-
-/// Helpers
+/// Small helpers
 
 fn put_u8(out: &mut Vec<u8>, v: u8) {
     out.push(v);
 }
+
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
+
 fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    put_u32(out, bytes.len() as u32);
-    out.extend_from_slice(bytes);
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    put_u32(out, b.len() as u32);
+    out.extend_from_slice(b);
 }
 
 fn get_u8(inp: &mut &[u8]) -> io::Result<u8> {
@@ -39,6 +36,7 @@ fn get_u8(inp: &mut &[u8]) -> io::Result<u8> {
     *inp = &inp[1..];
     Ok(v)
 }
+
 fn get_u32(inp: &mut &[u8]) -> io::Result<u32> {
     if inp.len() < 4 {
         return Err(Error::new(ErrorKind::UnexpectedEof, "u32"));
@@ -48,6 +46,7 @@ fn get_u32(inp: &mut &[u8]) -> io::Result<u32> {
     *inp = &inp[4..];
     Ok(u32::from_le_bytes(b))
 }
+
 fn get_u64(inp: &mut &[u8]) -> io::Result<u64> {
     if inp.len() < 8 {
         return Err(Error::new(ErrorKind::UnexpectedEof, "u64"));
@@ -57,6 +56,7 @@ fn get_u64(inp: &mut &[u8]) -> io::Result<u64> {
     *inp = &inp[8..];
     Ok(u64::from_le_bytes(b))
 }
+
 fn get_bytes(inp: &mut &[u8]) -> io::Result<Vec<u8>> {
     let n = get_u32(inp)? as usize;
     if inp.len() < n {
@@ -78,9 +78,17 @@ fn enc_key_layout(out: &mut Vec<u8>, kl: &KeyLayout) {
         KeyLayout::Variable { key_offsets } => {
             put_u8(out, 1);
             put_u32(out, key_offsets.len() as u32);
-            for o in key_offsets {
-                put_u32(out, *o as u32);
+            for &o in key_offsets {
+                put_u32(out, o as u32);
             }
+        }
+        KeyLayout::VariablePaged {
+            offsets_pk,
+            n_entries,
+        } => {
+            put_u8(out, 2);
+            put_u64(out, *offsets_pk);
+            put_u32(out, *n_entries as u32);
         }
     }
 }
@@ -98,6 +106,14 @@ fn dec_key_layout(inp: &mut &[u8]) -> io::Result<KeyLayout> {
             }
             Ok(KeyLayout::Variable { key_offsets: v })
         }
+        2 => {
+            let offsets_pk = get_u64(inp)?;
+            let n_entries = get_u32(inp)?;
+            Ok(KeyLayout::VariablePaged {
+                offsets_pk,
+                n_entries,
+            })
+        }
         _ => Err(Error::new(ErrorKind::InvalidData, "KeyLayout tag")),
     }
 }
@@ -113,9 +129,17 @@ fn enc_value_layout(out: &mut Vec<u8>, vl: &ValueLayout) {
         ValueLayout::Variable { value_offsets } => {
             put_u8(out, 1);
             put_u32(out, value_offsets.len() as u32);
-            for o in value_offsets {
-                put_u32(out, *o as u32);
+            for &o in value_offsets {
+                put_u32(out, o as u32);
             }
+        }
+        ValueLayout::VariablePaged {
+            offsets_pk,
+            n_entries,
+        } => {
+            put_u8(out, 2);
+            put_u64(out, *offsets_pk);
+            put_u32(out, *n_entries as u32);
         }
     }
 }
@@ -133,17 +157,25 @@ fn dec_value_layout(inp: &mut &[u8]) -> io::Result<ValueLayout> {
             }
             Ok(ValueLayout::Variable { value_offsets: v })
         }
+        2 => {
+            let offsets_pk = get_u64(inp)?;
+            let n_entries = get_u32(inp)?;
+            Ok(ValueLayout::VariablePaged {
+                offsets_pk,
+                n_entries,
+            })
+        }
         _ => Err(Error::new(ErrorKind::InvalidData, "ValueLayout tag")),
     }
 }
 
-/// Columnar types
+/// Columnar registry/descriptor
 
 fn enc_columnar_registry(out: &mut Vec<u8>, r: &ColumnarRegistry) {
     put_u32(out, r.columns.len() as u32);
     for (fid, pk) in &r.columns {
         put_u64(out, *fid as u64);
-        put_u64(out, *pk as u64);
+        put_u64(out, *pk);
     }
 }
 
@@ -214,7 +246,7 @@ fn enc_manifest(out: &mut Vec<u8>, m: &Manifest) {
     } in &m.columns
     {
         put_u64(out, *field_id as u64);
-        put_u64(out, *column_index_physical_key as u64);
+        put_u64(out, *column_index_physical_key);
     }
 }
 
@@ -279,12 +311,10 @@ fn dec_bootstrap(inp: &mut &[u8]) -> io::Result<Bootstrap> {
 }
 
 fn enc_value_index(out: &mut Vec<u8>, vi: &ValueIndex) {
-    put_u32(out, vi.value_order.len() as u32);
-    out.extend_from_slice(&vi.value_order);
+    put_u64(out, vi.value_order_pk);
     for x in &vi.l1_dir {
         put_u32(out, *x);
     }
-
     put_u32(out, vi.l2_dirs.len() as u32);
     for d in &vi.l2_dirs {
         put_u8(out, d.first_byte);
@@ -295,19 +325,11 @@ fn enc_value_index(out: &mut Vec<u8>, vi: &ValueIndex) {
 }
 
 fn dec_value_index(inp: &mut &[u8]) -> io::Result<ValueIndex> {
-    let n = get_u32(inp)? as usize;
-    let mut value_order = vec![0u8; n];
-    if inp.len() < n {
-        return Err(Error::new(ErrorKind::UnexpectedEof, "value_order"));
-    }
-    value_order.copy_from_slice(&inp[..n]);
-    *inp = &inp[n..];
-
+    let value_order_pk = get_u64(inp)?;
     let mut l1_dir = [0u32; 256];
     for i in 0..256 {
         l1_dir[i] = get_u32(inp)?;
     }
-
     let m = get_u32(inp)? as usize;
     let mut l2_dirs = Vec::with_capacity(m);
     for _ in 0..m {
@@ -318,9 +340,8 @@ fn dec_value_index(inp: &mut &[u8]) -> io::Result<ValueIndex> {
         }
         l2_dirs.push(ValueDirL2 { first_byte, dir257 });
     }
-
     Ok(ValueIndex {
-        value_order,
+        value_order_pk,
         l1_dir,
         l2_dirs,
     })
@@ -329,12 +350,9 @@ fn dec_value_index(inp: &mut &[u8]) -> io::Result<ValueIndex> {
 fn enc_index_segment(out: &mut Vec<u8>, s: &IndexSegment) {
     put_u64(out, s.data_physical_key);
     put_u32(out, s.n_entries as u32);
-
+    put_u64(out, s.key_bytes_pk);
     enc_key_layout(out, &s.key_layout);
     enc_value_layout(out, &s.value_layout);
-
-    put_bytes(out, &s.logical_key_bytes);
-
     match &s.value_index {
         Some(vi) => {
             put_u8(out, 1);
@@ -347,68 +365,41 @@ fn enc_index_segment(out: &mut Vec<u8>, s: &IndexSegment) {
 fn dec_index_segment(inp: &mut &[u8]) -> io::Result<IndexSegment> {
     let data_physical_key = get_u64(inp)?;
     let n_entries = get_u32(inp)?;
+    let key_bytes_pk = get_u64(inp)?;
     let key_layout = dec_key_layout(inp)?;
     let value_layout = dec_value_layout(inp)?;
-    let logical_key_bytes = get_bytes(inp)?;
     let has_vi = get_u8(inp)? != 0;
     let value_index = if has_vi {
         Some(dec_value_index(inp)?)
     } else {
         None
     };
-
     Ok(IndexSegment {
         data_physical_key,
         n_entries,
-        logical_key_bytes,
+        key_bytes_pk,
         key_layout,
         value_layout,
         value_index,
     })
 }
 
-/// Public API used by the Pager.
+/// Public API: strict payloads only (no leading kind tag).
 
 pub fn encode_typed(v: &TypedValue) -> Vec<u8> {
     let mut out = Vec::new();
-
     match v {
-        TypedValue::Bootstrap(b) => {
-            put_u8(&mut out, TypedKind::Bootstrap as u8);
-            enc_bootstrap(&mut out, b);
-        }
-        TypedValue::Manifest(m) => {
-            put_u8(&mut out, TypedKind::Manifest as u8);
-            enc_manifest(&mut out, m);
-        }
-        TypedValue::ColumnIndex(ci) => {
-            put_u8(&mut out, TypedKind::ColumnIndex as u8);
-            enc_column_index(&mut out, ci);
-        }
-        TypedValue::IndexSegment(seg) => {
-            put_u8(&mut out, TypedKind::IndexSegment as u8);
-            enc_index_segment(&mut out, seg);
-        }
-        TypedValue::ColumnarRegistry(r) => {
-            put_u8(&mut out, TypedKind::ColumnarRegistry as u8);
-            enc_columnar_registry(&mut out, r);
-        }
-        TypedValue::ColumnarDescriptor(d) => {
-            put_u8(&mut out, TypedKind::ColumnarDescriptor as u8);
-            enc_columnar_descriptor(&mut out, d);
-        }
+        TypedValue::Bootstrap(b) => enc_bootstrap(&mut out, b),
+        TypedValue::Manifest(m) => enc_manifest(&mut out, m),
+        TypedValue::ColumnIndex(ci) => enc_column_index(&mut out, ci),
+        TypedValue::IndexSegment(s) => enc_index_segment(&mut out, s),
+        TypedValue::ColumnarRegistry(r) => enc_columnar_registry(&mut out, r),
+        TypedValue::ColumnarDescriptor(d) => enc_columnar_descriptor(&mut out, d),
     }
-
     out
 }
 
 pub fn decode_typed(kind: TypedKind, mut bytes: &[u8]) -> io::Result<TypedValue> {
-    // First byte is a kind tag for sanity; ignore mismatch softly to
-    // keep compatibility with older in-mem blobs that lacked it.
-    if !bytes.is_empty() {
-        let _ = get_u8(&mut bytes);
-    }
-
     let v = match kind {
         TypedKind::Bootstrap => TypedValue::Bootstrap(dec_bootstrap(&mut bytes)?),
         TypedKind::Manifest => TypedValue::Manifest(dec_manifest(&mut bytes)?),
@@ -421,9 +412,5 @@ pub fn decode_typed(kind: TypedKind, mut bytes: &[u8]) -> io::Result<TypedValue>
             TypedValue::ColumnarDescriptor(dec_columnar_descriptor(&mut bytes)?)
         }
     };
-
-    if !bytes.is_empty() {
-        // Trailing bytes tolerated; indicates a bug in encoder.
-    }
     Ok(v)
 }

@@ -1,12 +1,21 @@
-use crate::types::{ByteWidth, IndexEntryCount};
+use crate::types::{ByteWidth, IndexEntryCount, PhysicalKey};
 
-/// Slicing recipe for values inside the data blob.
+/// Value layout for a segment. Supports streaming.
+///
+/// Keep the legacy in-memory variant for compatibility, but prefer
+/// `VariablePaged` for large segments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueLayout {
     /// Every value is exactly `width` bytes.
     FixedWidth { width: ByteWidth },
 
-    /// Variable width values. Prefix sum of byte offsets into data blob.
-    /// Slice i is [value_offsets[i], value_offsets[i + 1]).
-    Variable { value_offsets: Vec<IndexEntryCount> }, // len = n + 1
+    /// Legacy, in-memory variable-width directory (len = n + 1).
+    Variable { value_offsets: Vec<IndexEntryCount> },
+
+    /// Streamable variable-width directory stored as a blob of
+    /// little-endian u32 prefix sums with length n+1.
+    VariablePaged {
+        offsets_pk: PhysicalKey,
+        n_entries: IndexEntryCount,
+    },
 }

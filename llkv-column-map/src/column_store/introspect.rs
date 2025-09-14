@@ -1,13 +1,15 @@
 use super::*;
-use crate::types::PhysicalKey;
+use crate::column_index::{ColumnIndex, IndexSegment};
+use crate::layout::{IndexLayoutInfo, KeyLayout, ValueLayout};
+use crate::storage::{BatchGet, GetResult, Pager};
+use crate::types::{ByteOffset, ByteWidth, LogicalFieldId, PhysicalKey, TypedKind, TypedValue};
 use rustc_hash::FxHashMap;
+use std::fmt::Write;
 
-// TODO: Put behind feature flag?
-// TODO: Verify that per-node byte measurements are accurate despite schema changes
 impl<P: Pager> ColumnStore<P> {
-    /// Scans the manifest -> ColumnIndex -> IndexSegments -> Data blobs,
-    /// returns one entry per physical key with sizes and relationships.
-    /// Batch-only I/O.
+    /// Scans bootstrap -> manifest -> column indexes -> segments -> data and
+    /// returns a list of storage nodes with sizes and relationships. Uses
+    /// batch-only I/O and works with paged layouts.
     pub fn describe_storage(&self) -> Vec<StorageNode> {
         let mut out: Vec<StorageNode> = Vec::new();
 
@@ -15,7 +17,6 @@ impl<P: Pager> ColumnStore<P> {
         let bootstrap_key: PhysicalKey = self.bootstrap_key;
         let header_keys = [bootstrap_key, self.manifest_key];
 
-        // Fetch raw bytes for bootstrap + manifest in one batch.
         let gets = header_keys
             .iter()
             .map(|k| BatchGet::Raw { key: *k })
@@ -35,15 +36,16 @@ impl<P: Pager> ColumnStore<P> {
             stored_len: *raw_len_map.get(&bootstrap_key).unwrap_or(&0),
             kind: StorageKind::Bootstrap,
         });
+
         // manifest
-        let column_count = { self.manifest.read().unwrap().columns.len() };
+        let column_count = self.manifest.read().unwrap().columns.len();
         out.push(StorageNode {
             pk: self.manifest_key,
             stored_len: *raw_len_map.get(&self.manifest_key).unwrap_or(&0),
             kind: StorageKind::Manifest { column_count },
         });
 
-        // --- column indexes (typed + raw in a single pass)
+        // --- column indexes (typed + raw)
         let col_index_pks: Vec<PhysicalKey> = {
             let man = self.manifest.read().unwrap();
             man.columns
@@ -59,7 +61,7 @@ impl<P: Pager> ColumnStore<P> {
             FxHashMap::default();
 
         if !col_index_pks.is_empty() {
-            // Combined batch: raw + typed for each ColumnIndex key
+            // raw + typed for each ColumnIndex key
             let mut gets: Vec<BatchGet> = Vec::with_capacity(col_index_pks.len() * 2);
             for pk in &col_index_pks {
                 gets.push(BatchGet::Raw { key: *pk });
@@ -100,7 +102,6 @@ impl<P: Pager> ColumnStore<P> {
                         },
                     });
 
-                    // collect segment index pkeys and owners
                     for sref in &ci.segments {
                         all_seg_index_pks.push(sref.index_physical_key);
                         seg_owner_colindex.insert(sref.index_physical_key, (ci.field_id, *pk));
@@ -111,13 +112,15 @@ impl<P: Pager> ColumnStore<P> {
 
         out.extend(colindex_nodes);
 
-        // --- index segments (typed + raw) and discover data pkeys
+        // --- index segments (typed + raw) and collect paged pk blobs
         let mut data_pkeys: Vec<PhysicalKey> = Vec::new();
-        let mut owner_for_data: FxHashMap<PhysicalKey, PhysicalKey> = FxHashMap::default(); // data_pkey -> index_segment_pk
+        let mut key_bytes_pks: Vec<PhysicalKey> = Vec::new();
+        let mut key_offs_pks: Vec<PhysicalKey> = Vec::new();
+        let mut val_offs_pks: Vec<PhysicalKey> = Vec::new();
+
         let mut seg_nodes: Vec<StorageNode> = Vec::new();
 
         if !all_seg_index_pks.is_empty() {
-            // Combined batch: raw + typed for each IndexSegment key
             let mut gets: Vec<BatchGet> = Vec::with_capacity(all_seg_index_pks.len() * 2);
             for pk in &all_seg_index_pks {
                 gets.push(BatchGet::Raw { key: *pk });
@@ -146,32 +149,87 @@ impl<P: Pager> ColumnStore<P> {
                 }
             }
 
+            // Stage second round of gets to size blobs referenced by
+            // the typed IndexSegments (paged fields).
+            let mut second_gets: Vec<BatchGet> = Vec::new();
+
+            for pk in &all_seg_index_pks {
+                if let Some(seg) = segs_by_pk.get(pk) {
+                    // book-keep owners and pks to size
+                    data_pkeys.push(seg.data_physical_key);
+                    key_bytes_pks.push(seg.key_bytes_pk);
+                    second_gets.push(BatchGet::Raw {
+                        key: seg.key_bytes_pk,
+                    });
+
+                    match &seg.key_layout {
+                        KeyLayout::FixedWidth { .. } => {}
+                        KeyLayout::Variable { key_offsets } => {
+                            let _ = key_offsets;
+                        }
+                        KeyLayout::VariablePaged { offsets_pk, .. } => {
+                            key_offs_pks.push(*offsets_pk);
+                            second_gets.push(BatchGet::Raw { key: *offsets_pk });
+                        }
+                    }
+                    match &seg.value_layout {
+                        ValueLayout::FixedWidth { .. } => {}
+                        ValueLayout::Variable { value_offsets } => {
+                            let _ = value_offsets;
+                        }
+                        ValueLayout::VariablePaged { offsets_pk, .. } => {
+                            val_offs_pks.push(*offsets_pk);
+                            second_gets.push(BatchGet::Raw { key: *offsets_pk });
+                        }
+                    }
+                }
+            }
+
+            let resp2 = if second_gets.is_empty() {
+                Vec::new()
+            } else {
+                self.do_gets(second_gets)
+            };
+
+            let mut blob_len: FxHashMap<PhysicalKey, usize> = FxHashMap::default();
+            for gr in resp2 {
+                if let GetResult::Raw { key, bytes } = gr {
+                    blob_len.insert(key, bytes.as_ref().len());
+                }
+            }
+
             for pk in &all_seg_index_pks {
                 if let Some(seg) = segs_by_pk.get(pk) {
                     let (field_id, owner_colindex_pk) =
                         seg_owner_colindex.get(pk).cloned().unwrap();
 
-                    // book-keep data blob for later
-                    data_pkeys.push(seg.data_physical_key);
-                    owner_for_data.insert(seg.data_physical_key, *pk);
+                    // Compute layout sizes from paged blobs.
+                    let key_bytes = *blob_len.get(&seg.key_bytes_pk).unwrap_or(&0);
 
-                    // compute layout info
-                    let key_bytes = seg.logical_key_bytes.len();
                     let key_offs_bytes = match &seg.key_layout {
                         KeyLayout::FixedWidth { .. } => 0,
                         KeyLayout::Variable { key_offsets } => {
                             key_offsets.len() * std::mem::size_of::<ByteOffset>()
                         }
-                    };
-                    let (kind, fixed_width, value_meta_bytes) = match &seg.value_layout {
-                        ValueLayout::FixedWidth { width } => {
-                            ("fixed", Some(*width), std::mem::size_of::<ByteWidth>())
+                        KeyLayout::VariablePaged { offsets_pk, .. } => {
+                            *blob_len.get(&offsets_pk).unwrap_or(&0)
                         }
+                    };
+
+                    let (kind, fixed_width, value_meta_bytes) = match &seg.value_layout {
+                        ValueLayout::FixedWidth { width } => (
+                            "fixed",
+                            Some(*width as ByteWidth),
+                            std::mem::size_of::<ByteWidth>(),
+                        ),
                         ValueLayout::Variable { value_offsets } => (
                             "variable",
                             None,
                             value_offsets.len() * std::mem::size_of::<ByteOffset>(),
                         ),
+                        ValueLayout::VariablePaged { offsets_pk, .. } => {
+                            ("variable", None, *blob_len.get(&offsets_pk).unwrap_or(&0))
+                        }
                     };
 
                     let layout = IndexLayoutInfo {
@@ -215,7 +273,7 @@ impl<P: Pager> ColumnStore<P> {
             }
 
             for dpk in data_pkeys {
-                let owner = *owner_for_data.get(&dpk).unwrap();
+                let owner = self.find_segment_owner_slow(&dpk).unwrap_or(0);
                 out.push(StorageNode {
                     pk: dpk,
                     stored_len: *data_len.get(&dpk).unwrap_or(&0),
@@ -226,191 +284,45 @@ impl<P: Pager> ColumnStore<P> {
             }
         }
 
-        // deterministic order
         out.sort_by_key(|n| n.pk);
         out
     }
 
-    /// Renders a compact ASCII table of the current storage layout.
-    /// (bytes column moved before details to keep the table aligned)
-    pub fn render_storage_ascii(&self) -> String {
-        let nodes = self.describe_storage();
-        let mut s = String::new();
-
-        // Header: phys_key | kind | field | bytes | details
-        let header = format!(
-            "{:<10} {:<12} {:<9} {:>10}  {}",
-            "phys_key", "kind", "field", "bytes", "details"
-        );
-        let _ = writeln!(&mut s, "{header}");
-
-        // Divider length covers the fixed-width columns (details is free-width at the end)
-        let _ = writeln!(&mut s, "{}", "-".repeat(header.len()));
-
-        for n in nodes {
-            match n.kind {
-                StorageKind::Bootstrap => {
-                    let _ = writeln!(
-                        &mut s,
-                        "{:<10} {:<12} {:<9} {:>10}  -",
-                        n.pk, "bootstrap", "-", n.stored_len,
-                    );
-                }
-                StorageKind::Manifest { column_count } => {
-                    let det = format!("columns={}", column_count);
-                    let _ = writeln!(
-                        &mut s,
-                        "{:<10} {:<12} {:<9} {:>10}  {}",
-                        n.pk, "manifest", "-", n.stored_len, det
-                    );
-                }
-                StorageKind::ColumnIndex {
-                    field_id,
-                    n_segments,
-                } => {
-                    let det = format!("segments={}", n_segments);
-                    let _ = writeln!(
-                        &mut s,
-                        "{:<10} {:<12} {:<9} {:>10}  {}",
-                        n.pk, "col_index", field_id, n.stored_len, det
-                    );
-                }
-                StorageKind::IndexSegment {
-                    field_id,
-                    n_entries,
-                    layout,
-                    data_pkey,
-                    owner_colindex_pk,
-                } => {
-                    let det = match layout.fixed_width {
-                        Some(w) => format!(
-                            "entries={} layout=fixed({}) key_bytes={} key_offs={} val_meta={} data_pk={} colidx_pk={}",
-                            n_entries,
-                            w,
-                            layout.key_bytes,
-                            layout.key_offs_bytes,
-                            layout.value_meta_bytes,
-                            data_pkey,
-                            owner_colindex_pk
-                        ),
-                        None => format!(
-                            "entries={} layout=variable key_bytes={} key_offs={} val_meta={} data_pk={} colidx_pk={}",
-                            n_entries,
-                            layout.key_bytes,
-                            layout.key_offs_bytes,
-                            layout.value_meta_bytes,
-                            data_pkey,
-                            owner_colindex_pk
-                        ),
-                    };
-                    let _ = writeln!(
-                        &mut s,
-                        "{:<10} {:<12} {:<9} {:>10}  {}",
-                        n.pk, "idx_segment", field_id, n.stored_len, det
-                    );
-                }
-                StorageKind::DataBlob { owner_index_pk } => {
-                    let det = format!("owner_idx_pk={}", owner_index_pk);
-                    let _ = writeln!(
-                        &mut s,
-                        "{:<10} {:<12} {:<9} {:>10}  {}",
-                        n.pk, "data_blob", "-", n.stored_len, det
-                    );
-                }
-            }
-        }
-        s
-    }
-
-    /// Renders a Graphviz DOT graph showing edges:
-    /// bootstrap -> manifest -> ColumnIndex -> IndexSegment -> DataBlob
-    pub fn render_storage_dot(&self) -> String {
-        let nodes = self.describe_storage();
-
-        // index nodes by pk for quick lookup
-        let mut map: FxHashMap<PhysicalKey, &StorageNode> = FxHashMap::default();
-        for n in &nodes {
-            map.insert(n.pk, n);
+    /// Reverse edge: data pk -> owning segment pk (best-effort).
+    ///
+    /// No dependency on a non-existent `load_column_index`; instead, fetch
+    /// typed ColumnIndex objects on demand and scan segments.
+    fn find_segment_owner_slow(&self, data_pk: &PhysicalKey) -> Option<PhysicalKey> {
+        let man = self.manifest.read().ok()?;
+        if man.columns.is_empty() {
+            return None;
         }
 
-        let mut s = String::new();
-        let _ = writeln!(&mut s, "digraph storage {{");
-        let _ = writeln!(&mut s, "  node [shape=box, fontname=\"monospace\"];");
+        // Batch fetch all column indexes as typed values.
+        let gets = man
+            .columns
+            .iter()
+            .map(|c| BatchGet::Typed {
+                key: c.column_index_physical_key,
+                kind: TypedKind::ColumnIndex,
+            })
+            .collect::<Vec<_>>();
 
-        // emit nodes
-        for n in &nodes {
-            match &n.kind {
-                StorageKind::Bootstrap => {
-                    let _ = writeln!(
-                        &mut s,
-                        "  n{} [label=\"Bootstrap pk={} bytes={}\"];",
-                        n.pk, n.pk, n.stored_len
-                    );
-                    // edge to manifest
-                    let _ = writeln!(&mut s, "  n{} -> n{};", n.pk, self.manifest_key);
-                }
-                StorageKind::Manifest { column_count } => {
-                    let _ = writeln!(
-                        &mut s,
-                        "  n{} [label=\"Manifest pk={} columns={} bytes={}\"];",
-                        n.pk, n.pk, column_count, n.stored_len
-                    );
-                    // edges to column indexes
-                    for e in &self.manifest.read().unwrap().columns {
-                        let _ =
-                            writeln!(&mut s, "  n{} -> n{};", n.pk, e.column_index_physical_key);
+        let resp = self.do_gets(gets);
+
+        for gr in resp {
+            if let GetResult::Typed {
+                value: TypedValue::ColumnIndex(ci),
+                ..
+            } = gr
+            {
+                for s in ci.segments {
+                    if s.data_physical_key == *data_pk {
+                        return Some(s.index_physical_key);
                     }
                 }
-                StorageKind::ColumnIndex {
-                    field_id,
-                    n_segments,
-                } => {
-                    let _ = writeln!(
-                        &mut s,
-                        "  n{} [label=\"ColumnIndex pk={} field={} segs={} bytes={}\"];",
-                        n.pk, n.pk, field_id, n_segments, n.stored_len
-                    );
-                }
-                StorageKind::IndexSegment {
-                    field_id,
-                    n_entries,
-                    layout,
-                    data_pkey,
-                    owner_colindex_pk,
-                } => {
-                    let lay = match layout.fixed_width {
-                        Some(w) => format!("fixed({})", w),
-                        None => "variable".to_string(),
-                    };
-                    let _ = writeln!(
-                        &mut s,
-                        "  n{} [label=\"IndexSegment pk={} field={} entries={} layout={} idx_bytes={} (key_bytes={}, key_offs={}, val_meta={})\"];",
-                        n.pk,
-                        n.pk,
-                        field_id,
-                        n_entries,
-                        lay,
-                        n.stored_len,
-                        layout.key_bytes,
-                        layout.key_offs_bytes,
-                        layout.value_meta_bytes
-                    );
-                    // owner colindex and data edge
-                    let _ = writeln!(&mut s, "  n{} -> n{};", owner_colindex_pk, n.pk);
-                    let _ = writeln!(&mut s, "  n{} -> n{};", n.pk, data_pkey);
-                }
-                StorageKind::DataBlob { owner_index_pk } => {
-                    let _ = writeln!(
-                        &mut s,
-                        "  n{} [label=\"DataBlob pk={} bytes={}\"];",
-                        n.pk, n.pk, n.stored_len
-                    );
-                    let _ = writeln!(&mut s, "  n{} -> n{};", owner_index_pk, n.pk);
-                }
             }
         }
-
-        let _ = writeln!(&mut s, "}}");
-        s
+        None
     }
 }

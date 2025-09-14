@@ -22,20 +22,17 @@
 //!   min_val_u64: u64
 //!   max_val_u64: u64
 
-#![forbid(unsafe_code)]
-
+use crate::storage::{BatchGet, BatchPut, GetResult, Pager};
+use crate::types::{LogicalFieldId, PhysicalKey};
 use std::io::{self, Error, ErrorKind};
 
-use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
-use crate::types::{LogicalFieldId, PhysicalKey};
+const MAGIC: &[u8; 8] = b"LLKVCDPG";
+const VERSION: u16 = 1;
+const KIND: u8 = 1;
+const ENDIAN_LE: u8 = 1;
 
-pub const MAGIC: &[u8; 8] = b"LLKVCDPG";
-pub const VERSION: u16 = 1;
-pub const KIND_DESC_PAGE: u8 = 1;
-pub const ENDIAN_LE: u8 = 1;
-
-pub const HEADER_SIZE: usize = 64;
-pub const ENTRY_SIZE: usize = 52;
+const HEADER_SIZE: usize = 64;
+const ENTRY_SIZE: usize = 52;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DescPageHeader {
@@ -44,7 +41,7 @@ pub struct DescPageHeader {
     pub entry_count: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DescPageEntry {
     pub chunk_pk: PhysicalKey,
     pub perm_pk: Option<PhysicalKey>,
@@ -56,44 +53,92 @@ pub struct DescPageEntry {
 }
 
 #[inline]
-fn encode_header(h: &DescPageHeader) -> [u8; HEADER_SIZE] {
-    let mut b = [0u8; HEADER_SIZE];
-    b[0..8].copy_from_slice(MAGIC);
-    b[8..10].copy_from_slice(&VERSION.to_le_bytes());
-    b[10] = KIND_DESC_PAGE;
-    b[11] = ENDIAN_LE;
-    b[12..20].copy_from_slice(&h.field_id.to_le_bytes());
-    b[20..28].copy_from_slice(&h.next_page_pk.to_le_bytes());
-    b[28..32].copy_from_slice(&h.entry_count.to_le_bytes());
-    b
+fn put_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
 }
 
 #[inline]
-fn decode_header(bytes: &[u8]) -> io::Result<DescPageHeader> {
-    if bytes.len() < HEADER_SIZE {
-        return Err(Error::new(ErrorKind::InvalidData, "truncated header"));
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
+fn get_u16(inp: &mut &[u8]) -> io::Result<u16> {
+    if inp.len() < 2 {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "u16"));
     }
-    if &bytes[0..8] != MAGIC {
+    let mut b = [0u8; 2];
+    b.copy_from_slice(&inp[..2]);
+    *inp = &inp[2..];
+    Ok(u16::from_le_bytes(b))
+}
+
+#[inline]
+fn get_u32(inp: &mut &[u8]) -> io::Result<u32> {
+    if inp.len() < 4 {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "u32"));
+    }
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&inp[..4]);
+    *inp = &inp[4..];
+    Ok(u32::from_le_bytes(b))
+}
+
+#[inline]
+fn get_u64(inp: &mut &[u8]) -> io::Result<u64> {
+    if inp.len() < 8 {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "u64"));
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&inp[..8]);
+    *inp = &inp[8..];
+    Ok(u64::from_le_bytes(b))
+}
+
+#[inline]
+fn encode_header(h: &DescPageHeader) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HEADER_SIZE);
+    out.extend_from_slice(MAGIC);
+    put_u16(&mut out, VERSION);
+    out.push(KIND);
+    out.push(ENDIAN_LE);
+    put_u64(&mut out, h.field_id as u64);
+    put_u64(&mut out, h.next_page_pk);
+    put_u32(&mut out, h.entry_count);
+    out.resize(HEADER_SIZE, 0);
+    out
+}
+
+#[inline]
+fn decode_header(mut s: &[u8]) -> io::Result<DescPageHeader> {
+    if s.len() < HEADER_SIZE {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "header"));
+    }
+    let magic = &s[..8];
+    if magic != MAGIC {
         return Err(Error::new(ErrorKind::InvalidData, "bad magic"));
     }
-    let ver = u16::from_le_bytes([bytes[8], bytes[9]]);
+    s = &s[8..];
+    let ver = get_u16(&mut s)?;
     if ver != VERSION {
         return Err(Error::new(ErrorKind::InvalidData, "bad version"));
     }
-    if bytes[10] != KIND_DESC_PAGE {
+    let kind = get_u8(&mut s)?;
+    if kind != KIND {
         return Err(Error::new(ErrorKind::InvalidData, "bad kind"));
     }
-    if bytes[11] != ENDIAN_LE {
+    let endian = get_u8(&mut s)?;
+    if endian != ENDIAN_LE {
         return Err(Error::new(ErrorKind::InvalidData, "bad endian"));
     }
-    let mut u8_8 = [0u8; 8];
-    u8_8.copy_from_slice(&bytes[12..20]);
-    let field_id = u64::from_le_bytes(u8_8);
-    u8_8.copy_from_slice(&bytes[20..28]);
-    let next_page_pk = u64::from_le_bytes(u8_8);
-    let mut u8_4 = [0u8; 4];
-    u8_4.copy_from_slice(&bytes[28..32]);
-    let entry_count = u32::from_le_bytes(u8_4);
+    let field_id = get_u64(&mut s)?;
+    let next_page_pk = get_u64(&mut s)?;
+    let entry_count = get_u32(&mut s)?;
     Ok(DescPageHeader {
         field_id,
         next_page_pk,
@@ -102,65 +147,48 @@ fn decode_header(bytes: &[u8]) -> io::Result<DescPageHeader> {
 }
 
 #[inline]
-fn encode_entries(entries: &[DescPageEntry]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(entries.len() * ENTRY_SIZE);
-    for e in entries {
-        out.extend_from_slice(&e.chunk_pk.to_le_bytes());
-        let perm = e.perm_pk.unwrap_or(0);
-        out.extend_from_slice(&perm.to_le_bytes());
-        out.extend_from_slice(&e.row_count.to_le_bytes());
-        out.extend_from_slice(&e.vector_len.to_le_bytes());
-        out.extend_from_slice(&e.epoch.to_le_bytes());
-        out.extend_from_slice(&e.min_val_u64.to_le_bytes());
-        out.extend_from_slice(&e.max_val_u64.to_le_bytes());
+fn get_u8(inp: &mut &[u8]) -> io::Result<u8> {
+    if inp.is_empty() {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "u8"));
+    }
+    let v = inp[0];
+    *inp = &inp[1..];
+    Ok(v)
+}
+
+#[inline]
+fn encode_entries(es: &[DescPageEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(es.len() * ENTRY_SIZE);
+    for e in es {
+        put_u64(&mut out, e.chunk_pk);
+        match e.perm_pk {
+            Some(pk) => {
+                put_u64(&mut out, pk);
+            }
+            None => put_u64(&mut out, 0),
+        }
+        put_u64(&mut out, e.row_count);
+        put_u32(&mut out, e.vector_len);
+        put_u64(&mut out, e.epoch);
+        put_u64(&mut out, e.min_val_u64);
+        put_u64(&mut out, e.max_val_u64);
     }
     out
 }
 
 #[inline]
-fn decode_entries(bytes: &[u8], n: usize) -> io::Result<Vec<DescPageEntry>> {
-    let need = n
-        .checked_mul(ENTRY_SIZE)
-        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "overflow"))?;
-    if bytes.len() < need {
-        return Err(Error::new(ErrorKind::InvalidData, "truncated entries"));
-    }
-    let mut v = Vec::with_capacity(n);
-    let mut off = 0usize;
+fn decode_entries(mut s: &[u8], n: usize) -> io::Result<Vec<DescPageEntry>> {
+    let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        let mut u8_8 = [0u8; 8];
-
-        u8_8.copy_from_slice(&bytes[off..off + 8]);
-        let chunk_pk = u64::from_le_bytes(u8_8);
-        off += 8;
-
-        u8_8.copy_from_slice(&bytes[off..off + 8]);
-        let perm_raw = u64::from_le_bytes(u8_8);
-        let perm_pk = if perm_raw == 0 { None } else { Some(perm_raw) };
-        off += 8;
-
-        u8_8.copy_from_slice(&bytes[off..off + 8]);
-        let row_count = u64::from_le_bytes(u8_8);
-        off += 8;
-
-        let mut u8_4 = [0u8; 4];
-        u8_4.copy_from_slice(&bytes[off..off + 4]);
-        let vector_len = u32::from_le_bytes(u8_4);
-        off += 4;
-
-        u8_8.copy_from_slice(&bytes[off..off + 8]);
-        let epoch = u64::from_le_bytes(u8_8);
-        off += 8;
-
-        u8_8.copy_from_slice(&bytes[off..off + 8]);
-        let min_val_u64 = u64::from_le_bytes(u8_8);
-        off += 8;
-
-        u8_8.copy_from_slice(&bytes[off..off + 8]);
-        let max_val_u64 = u64::from_le_bytes(u8_8);
-        off += 8;
-
-        v.push(DescPageEntry {
+        let chunk_pk = get_u64(&mut s)?;
+        let p = get_u64(&mut s)?;
+        let perm_pk = if p == 0 { None } else { Some(p) };
+        let row_count = get_u64(&mut s)?;
+        let vector_len = get_u32(&mut s)?;
+        let epoch = get_u64(&mut s)?;
+        let min_val_u64 = get_u64(&mut s)?;
+        let max_val_u64 = get_u64(&mut s)?;
+        out.push(DescPageEntry {
             chunk_pk,
             perm_pk,
             row_count,
@@ -170,18 +198,20 @@ fn decode_entries(bytes: &[u8], n: usize) -> io::Result<Vec<DescPageEntry>> {
             max_val_u64,
         });
     }
-    Ok(v)
+    Ok(out)
 }
 
 #[inline]
 pub fn decode_page(bytes: &[u8]) -> io::Result<(DescPageHeader, Vec<DescPageEntry>)> {
-    let hdr = decode_header(bytes)?;
-    let start = HEADER_SIZE;
-    let need = start + (hdr.entry_count as usize) * ENTRY_SIZE;
-    if bytes.len() < need {
-        return Err(Error::new(ErrorKind::InvalidData, "truncated page"));
+    if bytes.len() < HEADER_SIZE {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "page too small"));
     }
-    let entries = decode_entries(&bytes[start..need], hdr.entry_count as usize)?;
+    let hdr = decode_header(&bytes[..HEADER_SIZE])?;
+    let need = HEADER_SIZE + (hdr.entry_count as usize) * ENTRY_SIZE;
+    if bytes.len() < need {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "page body"));
+    }
+    let entries = decode_entries(&bytes[HEADER_SIZE..need], hdr.entry_count as usize)?;
     Ok((hdr, entries))
 }
 
@@ -201,7 +231,11 @@ fn load_page_raw<P: Pager>(pager: &P, pk: PhysicalKey) -> io::Result<Vec<u8>> {
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "missing get result"))?
     {
         GetResult::Raw { bytes, .. } => Ok(bytes.as_ref().to_vec()),
-        _ => Err(Error::new(ErrorKind::InvalidData, "unexpected typed")),
+        GetResult::Missing { .. } => Err(Error::new(ErrorKind::NotFound, "page not found")),
+        GetResult::Typed { .. } => Err(Error::new(
+            ErrorKind::InvalidData,
+            "typed where raw expected",
+        )),
     }
 }
 
@@ -263,64 +297,53 @@ pub fn append_entry<P: Pager>(
 
     // Load tail entries to check capacity and rewrite.
     let bytes = load_page_raw(pager, page_pk)?;
-    let (mut hdr, mut entries) = decode_page(&bytes)?;
-    if (entries.len() as usize) < entries_per_page {
-        entries.push(entry);
-        hdr.entry_count += 1;
-        let bytes = encode_page(&hdr, &entries);
+    let (mut hdr, mut es) = decode_page(&bytes)?;
+    if es.len() >= entries_per_page {
+        // Allocate a new tail, link, and switch current tail pointer.
+        let npk = pager.alloc_many(1)?.get(0).copied().unwrap();
+        hdr.next_page_pk = npk;
+        let bytes = encode_page(&hdr, &es);
         pager.batch_put(&[BatchPut::Raw {
             key: page_pk,
             bytes,
         }])?;
-        Ok(page_pk)
-    } else {
-        let new_pk = pager.alloc_many(1)?[0];
-        // Link old tail to new page.
-        hdr.next_page_pk = new_pk;
-        let old_bytes = encode_page(&hdr, &entries);
-        // New page with the single entry.
-        let new_hdr = DescPageHeader {
+        page_pk = npk;
+        hdr = DescPageHeader {
             field_id,
             next_page_pk: 0,
-            entry_count: 1,
+            entry_count: 0,
         };
-        let new_bytes = encode_page(&new_hdr, std::slice::from_ref(&entry));
-        pager.batch_put(&[
-            BatchPut::Raw {
-                key: page_pk,
-                bytes: old_bytes,
-            },
-            BatchPut::Raw {
-                key: new_pk,
-                bytes: new_bytes,
-            },
-        ])?;
-        Ok(new_pk)
+        es.clear();
     }
+
+    es.push(entry);
+    hdr.entry_count = es.len() as u32;
+    let bytes = encode_page(&hdr, &es);
+    pager.batch_put(&[BatchPut::Raw {
+        key: page_pk,
+        bytes,
+    }])?;
+    Ok(page_pk)
 }
 
-/// Iterate all entries by following next_page_pk starting at `dkey`.
-/// Calls `f` once per entry and returns the total count.
-pub fn for_each_entry<P, F>(pager: &P, dkey: PhysicalKey, mut f: F) -> io::Result<usize>
+/// Iterate entries in order.
+pub fn for_each_entry<P: Pager, F>(pager: &P, head: PhysicalKey, mut f: F) -> io::Result<()>
 where
-    P: Pager,
-    F: FnMut(&DescPageEntry),
+    F: FnMut(DescPageEntry),
 {
-    let mut count = 0usize;
-    let mut pk = dkey;
+    let mut page_pk = head;
     loop {
-        let bytes = load_page_raw(pager, pk)?;
-        let (hdr, entries) = decode_page(&bytes)?;
-        for e in &entries {
+        let bytes = load_page_raw(pager, page_pk)?;
+        let (hdr, es) = decode_page(&bytes)?;
+        for e in es {
             f(e);
-            count += 1;
         }
         if hdr.next_page_pk == 0 {
             break;
         }
-        pk = hdr.next_page_pk;
+        page_pk = hdr.next_page_pk;
     }
-    Ok(count)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -331,28 +354,28 @@ mod tests {
     #[test]
     fn roundtrip_page_encode_decode() {
         let h = DescPageHeader {
-            field_id: 42,
-            next_page_pk: 0,
+            field_id: 11,
+            next_page_pk: 22,
             entry_count: 2,
         };
         let e = vec![
             DescPageEntry {
-                chunk_pk: 1,
+                chunk_pk: 100,
                 perm_pk: None,
-                row_count: 3,
-                vector_len: 4,
-                epoch: 5,
-                min_val_u64: 6,
-                max_val_u64: 7,
+                row_count: 1,
+                vector_len: 2,
+                epoch: 3,
+                min_val_u64: 0,
+                max_val_u64: 0,
             },
             DescPageEntry {
-                chunk_pk: 8,
-                perm_pk: Some(9),
-                row_count: 10,
-                vector_len: 11,
-                epoch: 12,
-                min_val_u64: 13,
-                max_val_u64: 14,
+                chunk_pk: 200,
+                perm_pk: Some(300),
+                row_count: 4,
+                vector_len: 5,
+                epoch: 6,
+                min_val_u64: 1,
+                max_val_u64: 9,
             },
         ];
         let bytes = encode_page(&h, &e);
@@ -385,10 +408,12 @@ mod tests {
             vector_len: 5,
             epoch: 6,
             min_val_u64: 1,
-            max_val_u64: 2,
+            max_val_u64: 9,
         };
-        append_entry(&pager, head, 7, e1, 1).unwrap();
-        append_entry(&pager, head, 7, e2, 1).unwrap();
+        let p1 = append_entry(&pager, head, 11, e1, 1).unwrap();
+        let p2 = append_entry(&pager, head, 11, e2, 1).unwrap();
+        assert_ne!(p1, p2);
+
         let mut got = Vec::new();
         for_each_entry(&pager, head, |e| got.push(e.chunk_pk)).unwrap();
         assert_eq!(got, vec![100, 200]);
