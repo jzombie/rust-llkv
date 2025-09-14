@@ -25,6 +25,11 @@ rand.workspace = true
 name = "column_sum_bench"
 harness = false
 
+[[bench]]
+name = "random_probe_bench"
+harness = false
+
+
 [features]
 legacy_api = []
 
