@@ -22,7 +22,7 @@ rand.workspace = true
 # Legacy benches disabled. Kept only columnar benches.
 
 [[bench]]
-name = "columnar_store_bench"
+name = "column_sum_bench"
 harness = false
 
 [features]

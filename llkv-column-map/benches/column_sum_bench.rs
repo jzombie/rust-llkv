@@ -17,8 +17,8 @@ const NUM_CHUNKS_FRAGMENTED: u64 = 1_000;
 const CHUNK_SIZE_FRAGMENTED: u64 = NUM_ROWS_FRAGMENTED / NUM_CHUNKS_FRAGMENTED;
 
 /// Benchmarks for simple, non-fragmented summation.
-fn bench_arrow_store_sum(c: &mut Criterion) {
-    let mut group = c.benchmark_group("arrow_store_sum_1M");
+fn bench_column_store_sum(c: &mut Criterion) {
+    let mut group = c.benchmark_group("column_store_sum_1M");
     group.sample_size(20);
 
     // --- Benchmark for u64 column ---
@@ -100,7 +100,7 @@ fn bench_arrow_store_sum(c: &mut Criterion) {
 
 /// Benchmarks for fragmented data with deletes and updates.
 fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
-    let mut group = c.benchmark_group("arrow_store_fragmented_1M");
+    let mut group = c.benchmark_group("column_store_fragmented_1M");
     group.sample_size(10); // This is a slower test, so fewer samples.
 
     group.bench_function("sum_u64_fragmented_with_deletes", |b| {
@@ -172,7 +172,7 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_arrow_store_sum,
+    bench_column_store_sum,
     bench_fragmented_deletes_and_updates
 );
 criterion_main!(benches);
