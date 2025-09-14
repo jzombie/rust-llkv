@@ -1,10 +1,11 @@
-pub mod codecs;
-pub mod column_index;
-pub mod constants;
-pub mod layout;
+pub mod error;
 pub mod storage;
+pub mod store;
 pub mod types;
-pub mod views;
 
-pub mod column_store;
-pub use column_store::*;
+// Internal modules
+mod codecs;
+mod serialization;
+
+pub use error::{Error, Result};
+pub use store::ColumnStore;
