@@ -1,8 +1,8 @@
 // File: src/store/descriptor.rs
 //! Streamable, paged metadata for a single column.
 //!
-//! This module avoids deserialization by defining fixed-layout structs that can be
-//! interpreted directly from byte buffers provided by the pager.
+//! This module avoids deserialization by defining fixed-layout structs that
+//! can be interpreted directly from byte buffers provided by the pager.
 
 use crate::codecs::{get_u32, get_u64, put_u32, put_u64};
 use crate::error::{Error, Result};
@@ -29,6 +29,7 @@ pub struct ChunkMetadata {
 impl ChunkMetadata {
     pub const DISK_SIZE: usize = mem::size_of::<Self>();
 
+    /// Single allocation; append fields as LE without growth churn.
     pub fn to_le_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::DISK_SIZE);
         buf.extend_from_slice(&self.chunk_pk.to_le_bytes());
@@ -42,20 +43,19 @@ impl ChunkMetadata {
     }
 
     pub fn from_le_bytes(bytes: &[u8]) -> Self {
-        let mut offset = 0;
-        let chunk_pk = get_u64(&bytes[offset..offset + 8]);
-        offset += 8;
-        let tombstone_pk = get_u64(&bytes[offset..offset + 8]);
-        offset += 8;
-        let value_order_perm_pk = get_u64(&bytes[offset..offset + 8]);
-        offset += 8;
-        let row_count = get_u64(&bytes[offset..offset + 8]);
-        offset += 8;
-        let serialized_bytes = get_u64(&bytes[offset..offset + 8]);
-        offset += 8;
-        let min_val_u64 = get_u64(&bytes[offset..offset + 8]);
-        offset += 8;
-        let max_val_u64 = get_u64(&bytes[offset..offset + 8]);
+        let mut o = 0usize;
+        let rd = |off: &mut usize| {
+            let v = get_u64(&bytes[*off..*off + 8]);
+            *off += 8;
+            v
+        };
+        let chunk_pk = rd(&mut o);
+        let tombstone_pk = rd(&mut o);
+        let value_order_perm_pk = rd(&mut o);
+        let row_count = rd(&mut o);
+        let serialized_bytes = rd(&mut o);
+        let min_val_u64 = rd(&mut o);
+        let max_val_u64 = rd(&mut o);
 
         Self {
             chunk_pk,
@@ -84,6 +84,7 @@ pub struct ColumnDescriptor {
 impl ColumnDescriptor {
     pub const DISK_SIZE: usize = mem::size_of::<Self>();
 
+    /// Single allocation; append fields as LE without growth churn.
     pub fn to_le_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::DISK_SIZE);
         buf.extend_from_slice(&self.field_id.to_le_bytes());
@@ -95,16 +96,17 @@ impl ColumnDescriptor {
     }
 
     pub fn from_le_bytes(bytes: &[u8]) -> Self {
-        let mut offset = 0;
-        let field_id = get_u64(&bytes[offset..offset + 8]);
-        offset += 8;
-        let head_page_pk = get_u64(&bytes[offset..offset + 8]);
-        offset += 8;
-        let tail_page_pk = get_u64(&bytes[offset..offset + 8]);
-        offset += 8;
-        let total_row_count = get_u64(&bytes[offset..offset + 8]);
-        offset += 8;
-        let total_chunk_count = get_u64(&bytes[offset..offset + 8]);
+        let mut o = 0usize;
+        let rd = |off: &mut usize| {
+            let v = get_u64(&bytes[*off..*off + 8]);
+            *off += 8;
+            v
+        };
+        let field_id = rd(&mut o);
+        let head_page_pk = rd(&mut o);
+        let tail_page_pk = rd(&mut o);
+        let total_row_count = rd(&mut o);
+        let total_chunk_count = rd(&mut o);
         Self {
             field_id,
             head_page_pk,
@@ -147,8 +149,8 @@ impl DescriptorPageHeader {
     }
 }
 
-/// An iterator that streams `ChunkMetadata` by walking the descriptor page chain.
-/// It only holds one page blob in memory at a time.
+/// An iterator that streams `ChunkMetadata` by walking the descriptor page
+/// chain. It only holds one page blob in memory at a time.
 pub struct DescriptorIterator<'a, P: Pager> {
     pager: &'a P,
     current_page_pk: PhysicalKey,
@@ -172,7 +174,7 @@ impl<'a, P: Pager> Iterator for DescriptorIterator<'a, P> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // If we don't have a page loaded, try to load one.
+            // If we do not have a page loaded, try to load one.
             if self.current_blob.is_none() {
                 if self.current_page_pk == 0 {
                     return None; // End of the chain
@@ -188,13 +190,13 @@ impl<'a, P: Pager> Iterator for DescriptorIterator<'a, P> {
             }
 
             let blob_bytes = self.current_blob.as_ref().unwrap().as_ref();
-            let header =
-                DescriptorPageHeader::from_le_bytes(&blob_bytes[..DescriptorPageHeader::DISK_SIZE]);
+            let hdr_sz = DescriptorPageHeader::DISK_SIZE;
+            let header = DescriptorPageHeader::from_le_bytes(&blob_bytes[..hdr_sz]);
 
             if self.cursor_in_page < header.entry_count as usize {
-                let offset = DescriptorPageHeader::DISK_SIZE
-                    + self.cursor_in_page * ChunkMetadata::DISK_SIZE;
-                let entry_bytes = &blob_bytes[offset..offset + ChunkMetadata::DISK_SIZE];
+                let off = hdr_sz + self.cursor_in_page * ChunkMetadata::DISK_SIZE;
+                let end = off + ChunkMetadata::DISK_SIZE;
+                let entry_bytes = &blob_bytes[off..end];
                 let metadata = ChunkMetadata::from_le_bytes(entry_bytes);
                 self.cursor_in_page += 1;
                 return Some(Ok(metadata));
@@ -206,4 +208,19 @@ impl<'a, P: Pager> Iterator for DescriptorIterator<'a, P> {
             }
         }
     }
+}
+
+/// Build a descriptor page payload (header + packed entries) with a single
+/// allocation. Useful when rewriting a page after metadata updates.
+pub fn build_descriptor_page_bytes(
+    header: &DescriptorPageHeader,
+    entries: &[ChunkMetadata],
+) -> Vec<u8> {
+    let cap = DescriptorPageHeader::DISK_SIZE + entries.len() * ChunkMetadata::DISK_SIZE;
+    let mut page = Vec::with_capacity(cap);
+    page.extend_from_slice(&header.to_le_bytes());
+    for m in entries {
+        page.extend_from_slice(&m.to_le_bytes());
+    }
+    page
 }
