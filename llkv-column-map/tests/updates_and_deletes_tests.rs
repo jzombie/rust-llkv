@@ -18,7 +18,7 @@ use arrow::array::{Array, Int32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use llkv_column_map::storage::pager::{MemPager, Pager};
+use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
 
 use roaring::RoaringBitmap;

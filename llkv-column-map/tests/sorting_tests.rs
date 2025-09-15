@@ -3,8 +3,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
+use rand::rng;
 use rand::seq::SliceRandom;
-use rand::thread_rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,7 +30,7 @@ fn test_large_sort_u64() {
     // --- 2. Generate and Ingest Unsorted Data ---
     println!("Generating and ingesting {} shuffled u64 rows...", NUM_ROWS);
     let mut data: Vec<u64> = (0..NUM_ROWS as u64).collect();
-    data.shuffle(&mut thread_rng());
+    data.shuffle(&mut rng());
 
     for i in 0..NUM_BATCHES {
         let start = i * BATCH_SIZE;
@@ -100,7 +100,7 @@ fn test_large_sort_i32() {
     let mut data: Vec<i32> = (0..NUM_ROWS as i32)
         .map(|i| i - (NUM_ROWS as i32 / 2))
         .collect();
-    data.shuffle(&mut thread_rng());
+    data.shuffle(&mut rng());
 
     for i in 0..NUM_BATCHES {
         let start = i * BATCH_SIZE;

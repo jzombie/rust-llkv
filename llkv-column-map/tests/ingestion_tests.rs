@@ -1,7 +1,7 @@
 use arrow::array::{Array, FixedSizeListArray, Float32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use llkv_column_map::storage::pager::{MemPager, Pager};
+use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
 use std::collections::HashMap;
 use std::sync::Arc;
