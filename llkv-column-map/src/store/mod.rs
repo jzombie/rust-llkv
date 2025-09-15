@@ -1,4 +1,15 @@
 //! The main ColumnStore API.
+//!
+//! Automatic coalescing (no tombstones):
+//! - On append, for fixed-width types, we merge a prefix of the incoming
+//!   data into the current tail chunk up to ~TARGET_BYTES and rewrite the
+//!   tail in place (data and shadow row_id). The remainder is appended as
+//!   one new chunk (no tiny-slice splitting). No tombstones.
+//! - Deletes already do full in-place overwrites with a keep mask.
+//!
+//! Sort index handling:
+//! - If a chunk has a stored permutation, we rebuild it whenever that
+//!   chunk is rewritten (e.g., tail merge or delete rewrite).
 
 use crate::error::{Error, Result};
 use crate::serialization::{deserialize_array, serialize_array};
@@ -9,7 +20,9 @@ use crate::store::descriptor::{
 };
 use crate::types::{CATALOG_ROOT_PKEY, LogicalFieldId, PhysicalKey};
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, UInt32Array, UInt64Array};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Int32Array, UInt32Array, UInt64Array, make_array,
+};
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -33,6 +46,42 @@ fn rowid_fid(fid: LogicalFieldId) -> LogicalFieldId {
     fid | ROW_ID_TAG
 }
 
+/// Desired serialized size of a data chunk (~65 KiB).
+const TARGET_BYTES: usize = 65 * 1024;
+
+/// Below this threshold, try merging tail with incoming data.
+const MIN_BYTES: usize = TARGET_BYTES / 2;
+
+/// Bytes-per-value for fixed-width primitives. Boolean as 1 byte here.
+#[inline]
+fn fixed_width_bpv(dt: &DataType) -> Option<usize> {
+    match dt {
+        DataType::Int8 | DataType::UInt8 => Some(1),
+        DataType::Int16 | DataType::UInt16 => Some(2),
+        DataType::Int32 | DataType::UInt32 | DataType::Float32 => Some(4),
+        DataType::Int64 | DataType::UInt64 | DataType::Float64 => Some(8),
+        DataType::Boolean => Some(1),
+        _ => None,
+    }
+}
+
+/// Normalize an array to offset==0 without copying payload buffers.
+#[inline]
+fn zero_offset(arr: &ArrayRef) -> ArrayRef {
+    if arr.offset() == 0 {
+        return arr.clone();
+    }
+    let data = arr.to_data();
+    let sliced = data.slice(arr.offset(), arr.len());
+    make_array(sliced)
+}
+
+/// Concatenate two arrays (Arrow does the right thing).
+#[inline]
+fn concat_arrays(a: &ArrayRef, b: &ArrayRef) -> Result<ArrayRef> {
+    Ok(arrow::compute::concat(&[a.as_ref(), b.as_ref()])?)
+}
+
 pub struct ColumnStore<P: Pager> {
     pager: Arc<P>,
     catalog: RwLock<ColumnCatalog>,
@@ -53,17 +102,19 @@ where
         })
     }
 
-    /// Append with automatic LWW (by row_id) using in-place rewrites.
+    /// Append with automatic LWW (by row_id) and tail coalescing.
     ///
     /// Requirements:
-    /// - Batch must contain a non-nullable UInt64 column named "row_id".
-    /// - For each data column (with "field_id" metadata), we:
-    ///   1) rewrite any existing chunks to remove rows whose per-field
-    ///      shadow row_ids match incoming row_ids (LWW),
-    ///   2) append the new data chunk, and
-    ///   3) append a shadow row_id chunk for this field.
+    /// - Batch contains non-nullable UInt64 column "row_id".
+    /// - For each data column (with "field_id" metadata):
+    ///   1) In-place rewrite to drop rows whose per-field shadow row_ids
+    ///      match incoming IDs (LWW, no tombstones).
+    ///   2) Coalesce into the tail by bytes (fixed-width types only).
+    ///   3) Append remainder data and aligned shadow row_ids as one chunk.
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         let schema = batch.schema();
+
+        // Locate "row_id".
         let mut row_id_idx: Option<usize> = None;
         for (i, f) in schema.fields().iter().enumerate() {
             if f.name() == "row_id" {
@@ -85,6 +136,7 @@ where
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| Error::Internal("row_id downcast failed".into()))?;
 
+        // Incoming IDs for LWW.
         let mut incoming_ids = FxHashSet::default();
         incoming_ids.reserve(row_id_arr.len());
         for i in 0..row_id_arr.len() {
@@ -94,10 +146,10 @@ where
         let mut catalog_dirty = false;
         let mut catalog = self.catalog.write().unwrap();
 
-        // -------------------- Phase 1: in-place LWW rewrites -----------------
+        // Phase 1: LWW rewrites.
         let mut puts_rewrites: Vec<BatchPut> = Vec::new();
-
         let mut data_cols: Vec<(LogicalFieldId, ArrayRef)> = Vec::new();
+
         for (i, array) in batch.columns().iter().enumerate() {
             if i == row_id_idx {
                 continue;
@@ -119,14 +171,34 @@ where
             self.pager.batch_put(&puts_rewrites)?;
         }
 
-        // -------------------- Phase 2: appends ------------------------------
-        let row_id_bytes = serialize_array(row_id_arr)?;
+        // Phase 2: coalesce tail and append remainder (single chunk).
         let mut puts_appends: Vec<BatchPut> = Vec::new();
 
         for (field_id, array) in data_cols.into_iter() {
-            // data chunk
+            let (data_remaining, rid_remaining) = self.coalesce_with_tail_bytes(
+                &mut catalog,
+                field_id,
+                &array,
+                row_id_arr,
+                &mut puts_appends,
+            )?;
+
+            if data_remaining.len() == 0 {
+                continue;
+            }
+
+            // Append remainder as one chunk, with aligned row_ids.
+            let rows = data_remaining.len();
+            let rid_slice_any = rid_remaining.slice(0, rows);
+            let rid_slice = rid_slice_any
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("row_id type mismatch".into()))?;
+
+            // Data chunk
             let chunk_pk = self.pager.alloc_many(1)?[0];
-            let chunk_bytes = serialize_array(array.as_ref())?;
+            let data_norm = zero_offset(&data_remaining);
+            let chunk_bytes = serialize_array(data_norm.as_ref())?;
             puts_appends.push(BatchPut::Raw {
                 key: chunk_pk,
                 bytes: chunk_bytes.clone(),
@@ -136,7 +208,7 @@ where
                 chunk_pk,
                 tombstone_pk: 0,
                 value_order_perm_pk: 0,
-                row_count: array.len() as u64,
+                row_count: rows as u64,
                 serialized_bytes: chunk_bytes.len() as u64,
                 min_val_u64: 0,
                 max_val_u64: u64::MAX,
@@ -148,20 +220,23 @@ where
             });
             self.append_chunk_metadata(descriptor_pk, field_id, chunk_meta, &mut puts_appends)?;
 
-            // shadow row_id chunk for this field
+            // Shadow row_id chunk aligned to data chunk.
             let rid_fid = rowid_fid(field_id);
             let rid_chunk_pk = self.pager.alloc_many(1)?[0];
+            let rid_ref: ArrayRef = Arc::new(rid_slice.clone());
+            let rid_norm = zero_offset(&rid_ref);
+            let rid_bytes = serialize_array(rid_norm.as_ref())?;
             puts_appends.push(BatchPut::Raw {
                 key: rid_chunk_pk,
-                bytes: row_id_bytes.clone(),
+                bytes: rid_bytes.clone(),
             });
 
             let rid_meta = ChunkMetadata {
                 chunk_pk: rid_chunk_pk,
                 tombstone_pk: 0,
                 value_order_perm_pk: 0,
-                row_count: row_id_arr.len() as u64,
-                serialized_bytes: row_id_bytes.len() as u64,
+                row_count: rows as u64,
+                serialized_bytes: rid_bytes.len() as u64,
                 min_val_u64: 0,
                 max_val_u64: u64::MAX,
             };
@@ -186,7 +261,7 @@ where
         Ok(())
     }
 
-    /// LWW via in-place rewrite for a single field.
+    /// LWW via in-place rewrite for a single field (no tombstones).
     fn lww_rewrite_for_field(
         &self,
         catalog: &mut ColumnCatalog,
@@ -223,7 +298,7 @@ where
             return Ok(());
         }
 
-        // Find hit chunks by looking at shadow row_id content.
+        // Identify chunks with any matching row_id.
         let mut hit_idxs: Vec<usize> = Vec::new();
         {
             let mut gets_rid = Vec::with_capacity(n);
@@ -267,7 +342,7 @@ where
             return Ok(());
         }
 
-        // Batch-get needed data + rid chunks for rewrites.
+        // Fetch data+rid for each hit chunk and rewrite with keep mask.
         let mut gets = Vec::with_capacity(hit_idxs.len() * 2);
         for &i in &hit_idxs {
             gets.push(BatchGet::Raw {
@@ -288,7 +363,6 @@ where
             }
         }
 
-        // Rewrite each hit chunk in place.
         for &i in &hit_idxs {
             let rid_blob = blob_map
                 .get(&metas_rid[i].chunk_pk)
@@ -307,26 +381,28 @@ where
                 .ok_or(Error::NotFound)?;
             let data_arr = deserialize_array(data_blob.clone())?;
             let data_f = compute::filter(&data_arr, &keep)?;
+
+            // Rewrite data chunk.
             let data_bytes = serialize_array(&data_f)?;
             puts.push(BatchPut::Raw {
                 key: metas_data[i].chunk_pk,
                 bytes: data_bytes.clone(),
             });
+            metas_data[i].row_count = data_f.len() as u64;
+            metas_data[i].serialized_bytes = data_bytes.len() as u64;
+            metas_data[i].tombstone_pk = 0;
 
+            // Rewrite row_id chunk.
             let rid_f = compute::filter(&rid_arr_any, &keep)?;
             let rid_bytes = serialize_array(&rid_f)?;
             puts.push(BatchPut::Raw {
                 key: metas_rid[i].chunk_pk,
                 bytes: rid_bytes.clone(),
             });
-
-            metas_data[i].row_count = data_f.len() as u64;
-            metas_data[i].serialized_bytes = data_bytes.len() as u64;
-            metas_data[i].tombstone_pk = 0;
-
             metas_rid[i].row_count = rid_f.len() as u64;
             metas_rid[i].serialized_bytes = rid_bytes.len() as u64;
 
+            // Refresh sort permutation if present.
             if metas_data[i].value_order_perm_pk != 0 {
                 let sort_column = SortColumn {
                     values: data_f.clone(),
@@ -417,7 +493,7 @@ where
         let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
         let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
-        // Gather metadata for data column.
+        // Data metas
         let mut metas: Vec<ChunkMetadata> = Vec::new();
         for m in DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk) {
             metas.push(m?);
@@ -426,7 +502,7 @@ where
             return Ok(());
         }
 
-        // Optional: corresponding shadow row_id descriptor + metas.
+        // Optional shadow row_id metas
         let rid_fid = rowid_fid(field_id);
         let desc_pk_rid = catalog.map.get(&rid_fid).copied();
 
@@ -445,9 +521,7 @@ where
 
         let mut puts = Vec::new();
 
-        // Single-pass walk over the delete bitmap
-        // We stream the deletes in increasing order once, and for each chunk
-        // collect only the local positions that fall into [start, end).
+        // Single-pass walk over delete bitmap.
         let mut del_iter = rows_to_delete.iter();
         let mut cur_del = del_iter.next(); // Option<u32>
 
@@ -457,10 +531,9 @@ where
             let start_u64 = cum_rows;
             let end_u64 = start_u64 + meta.row_count;
 
-            // Fast-forward the delete cursor to the first delete >= start.
+            // Fast-forward to first delete >= start.
             let start = start_u64 as u32;
             let end = end_u64 as u32;
-
             while let Some(d) = cur_del {
                 if d < start {
                     cur_del = del_iter.next();
@@ -469,31 +542,26 @@ where
                 }
             }
 
-            // Collect deletes that fall into this chunk.
-            // Usually small (e.g., ~chunk_len / 10 in your bench), so a small
-            // set is fine. This avoids scanning the whole bitmap repeatedly.
+            // Collect deletes local to this chunk.
             let mut del_local: FxHashSet<u32> = FxHashSet::default();
             while let Some(d) = cur_del {
                 if d >= end {
                     break;
                 }
-                del_local.insert(d - start); // local index in [0, row_count)
+                del_local.insert(d - start);
                 cur_del = del_iter.next();
             }
 
             if del_local.is_empty() {
-                // Nothing to rewrite for this chunk.
                 cum_rows = end_u64;
                 continue;
             }
 
-            // Build a Boolean keep mask: true = keep, false = delete.
-            // Using from_iter keeps code simple; cost is O(chunk_len).
-            let keep = arrow::array::BooleanArray::from_iter(
+            // Build keep mask and rewrite data chunk.
+            let keep = BooleanArray::from_iter(
                 (0..meta.row_count as usize).map(|j| Some(!del_local.contains(&(j as u32)))),
             );
 
-            // Rewrite data chunk in place.
             let data_blob = self.pager.get_raw(meta.chunk_pk)?.ok_or(Error::NotFound)?;
             let data_arr = deserialize_array(data_blob.clone())?;
             let data_f = compute::filter(&data_arr, &keep)?;
@@ -507,7 +575,7 @@ where
             meta.serialized_bytes = data_bytes.len() as u64;
             meta.tombstone_pk = 0;
 
-            // Rewrite matching shadow row_id chunk, if present.
+            // Rewrite shadow row_id if present.
             if let (Some(_pk), Some(rm)) = (desc_pk_rid, metas_rid.get_mut(i)) {
                 let rid_blob = self.pager.get_raw(rm.chunk_pk)?.ok_or(Error::NotFound)?;
                 let rid_arr = deserialize_array(rid_blob.clone())?;
@@ -523,9 +591,9 @@ where
                 rm.tombstone_pk = 0;
             }
 
-            // If a sorted permutation exists for this chunk, refresh it.
+            // Refresh sort permutation if present.
             if meta.value_order_perm_pk != 0 {
-                let sort_column = arrow::compute::SortColumn {
+                let sort_column = SortColumn {
                     values: data_f.clone(),
                     options: None,
                 };
@@ -540,13 +608,11 @@ where
             cum_rows = end_u64;
         }
 
-        // Rewrite descriptors with updated chunk metadata.
         self.rewrite_descriptor_pages(descriptor_pk, &mut descriptor, &mut metas, &mut puts)?;
         if let (Some(pk), Some(mut d_rid)) = (desc_pk_rid, descriptor_rid) {
             self.rewrite_descriptor_pages(pk, &mut d_rid, &mut metas_rid, &mut puts)?;
         }
 
-        // Persist writes.
         if !puts.is_empty() {
             self.pager.batch_put(&puts)?;
         }
@@ -568,8 +634,8 @@ where
         let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
         let mut metas = Vec::new();
-        for meta in DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk) {
-            metas.push(meta?);
+        for m in DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk) {
+            metas.push(m?);
         }
         if metas.is_empty() {
             return Ok(Box::new(std::iter::empty()));
@@ -623,6 +689,7 @@ where
             all_chunk_metadata.push(meta_result?);
         }
 
+        // Fetch all data chunks.
         let data_chunk_keys: Vec<PhysicalKey> =
             all_chunk_metadata.iter().map(|m| m.chunk_pk).collect();
         let gets: Vec<BatchGet> = data_chunk_keys
@@ -642,9 +709,13 @@ where
         }
 
         let mut puts = Vec::new();
+
         for meta in all_chunk_metadata.iter_mut() {
             let chunk_blob = chunks_map.get(&meta.chunk_pk).ok_or(Error::NotFound)?;
             let chunk_array = deserialize_array(chunk_blob.clone())?;
+
+            // Make row_count authoritative from the real array length.
+            meta.row_count = chunk_array.len() as u64;
 
             let sort_column = SortColumn {
                 values: chunk_array,
@@ -661,8 +732,9 @@ where
             meta.value_order_perm_pk = perm_pk;
         }
 
+        // Rewrite descriptor pages to reflect updated metas.
         let mut current_page_pk = descriptor.head_page_pk;
-        let mut page_start_chunk_idx = 0;
+        let mut page_start_chunk_idx = 0usize;
         while current_page_pk != 0 {
             let mut page_blob = self
                 .pager
@@ -725,8 +797,8 @@ where
         let get_results = self.pager.batch_get(&gets)?;
 
         let mut blobs_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-        for result in get_results {
-            match result {
+        for r in get_results {
+            match r {
                 GetResult::Raw { key, bytes } => {
                     blobs_map.insert(key, bytes);
                 }
@@ -827,6 +899,170 @@ where
         }
         Ok(())
     }
+
+    /// Byte-based tail coalescing at append (fixed-width precise).
+    fn coalesce_with_tail_bytes(
+        &self,
+        catalog: &mut ColumnCatalog,
+        field_id: LogicalFieldId,
+        incoming_data: &ArrayRef,
+        incoming_row_ids: &UInt64Array,
+        puts: &mut Vec<BatchPut>,
+    ) -> Result<(ArrayRef, Arc<UInt64Array>)> {
+        let bpv = match fixed_width_bpv(incoming_data.data_type()) {
+            Some(b) => b,
+            None => {
+                return Ok((incoming_data.clone(), Arc::new(incoming_row_ids.clone())));
+            }
+        };
+
+        // Need existing data and its shadow row_id descriptor.
+        let desc_pk = match catalog.map.get(&field_id) {
+            Some(&pk) => pk,
+            None => {
+                return Ok((incoming_data.clone(), Arc::new(incoming_row_ids.clone())));
+            }
+        };
+        let rid_fid = rowid_fid(field_id);
+        let desc_pk_rid = match catalog.map.get(&rid_fid) {
+            Some(&pk) => pk,
+            None => {
+                return Ok((incoming_data.clone(), Arc::new(incoming_row_ids.clone())));
+            }
+        };
+
+        let desc_blob = self.pager.get_raw(desc_pk)?.ok_or(Error::NotFound)?;
+        let mut desc = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+        let desc_blob_rid = self.pager.get_raw(desc_pk_rid)?.ok_or(Error::NotFound)?;
+        let mut desc_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
+
+        let mut metas: Vec<ChunkMetadata> =
+            DescriptorIterator::new(self.pager.as_ref(), desc.head_page_pk)
+                .collect::<Result<_>>()?;
+        let mut metas_rid: Vec<ChunkMetadata> =
+            DescriptorIterator::new(self.pager.as_ref(), desc_rid.head_page_pk)
+                .collect::<Result<_>>()?;
+
+        if metas.is_empty() || incoming_data.len() == 0 {
+            return Ok((incoming_data.clone(), Arc::new(incoming_row_ids.clone())));
+        }
+
+        // Touch tail only if small by bytes.
+        let tail_idx = metas.len() - 1;
+        let tail_bytes = metas[tail_idx].serialized_bytes as usize;
+        if tail_bytes >= MIN_BYTES {
+            return Ok((incoming_data.clone(), Arc::new(incoming_row_ids.clone())));
+        }
+
+        // Rows we can add to reach TARGET_BYTES.
+        let budget = TARGET_BYTES.saturating_sub(tail_bytes);
+        if budget == 0 {
+            return Ok((incoming_data.clone(), Arc::new(incoming_row_ids.clone())));
+        }
+
+        let take_rows = (budget / bpv).min(incoming_data.len());
+        if take_rows == 0 {
+            return Ok((incoming_data.clone(), Arc::new(incoming_row_ids.clone())));
+        }
+
+        // Split head vs rest for data and row_ids.
+        let head_data = incoming_data.slice(0, take_rows);
+        let rest_data = incoming_data.slice(take_rows, incoming_data.len() - take_rows);
+        let head_rid = Arc::new(
+            incoming_row_ids
+                .slice(0, take_rows)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("row_id type mismatch".into()))?
+                .clone(),
+        );
+        let rest_rid = Arc::new(
+            incoming_row_ids
+                .slice(take_rows, incoming_row_ids.len() - take_rows)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("row_id type mismatch".into()))?
+                .clone(),
+        );
+
+        // Fetch tail blobs and deserialize.
+        let gets = &[
+            BatchGet::Raw {
+                key: metas[tail_idx].chunk_pk,
+            },
+            BatchGet::Raw {
+                key: metas_rid[tail_idx].chunk_pk,
+            },
+        ];
+        let got = self.pager.batch_get(gets)?;
+        let mut by_pk = FxHashMap::default();
+        for r in got {
+            match r {
+                GetResult::Raw { key, bytes } => {
+                    by_pk.insert(key, bytes);
+                }
+                _ => return Err(Error::NotFound),
+            }
+        }
+
+        let tail_data_blob = by_pk
+            .remove(&metas[tail_idx].chunk_pk)
+            .ok_or(Error::NotFound)?;
+        let tail_rid_blob = by_pk
+            .remove(&metas_rid[tail_idx].chunk_pk)
+            .ok_or(Error::NotFound)?;
+
+        let tail_data_arr = deserialize_array(tail_data_blob)?;
+        let tail_rid_any = deserialize_array(tail_rid_blob)?;
+        let tail_rid_arr = tail_rid_any
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::Internal("row_id type mismatch".into()))?;
+
+        // Merge data and row_ids; no tombstones.
+        let merged_data = concat_arrays(&tail_data_arr, &head_data)?;
+        let merged_rid =
+            arrow::compute::concat(&[tail_rid_arr as &dyn Array, (&*head_rid) as &dyn Array])?;
+
+        let merged_data_norm = zero_offset(&merged_data);
+        let merged_rid_norm = zero_offset(&merged_rid);
+        let merged_data_bytes = serialize_array(merged_data_norm.as_ref())?;
+        let merged_rid_bytes = serialize_array(merged_rid_norm.as_ref())?;
+
+        puts.push(BatchPut::Raw {
+            key: metas[tail_idx].chunk_pk,
+            bytes: merged_data_bytes.clone(),
+        });
+        puts.push(BatchPut::Raw {
+            key: metas_rid[tail_idx].chunk_pk,
+            bytes: merged_rid_bytes.clone(),
+        });
+
+        metas[tail_idx].row_count = merged_data.len() as u64;
+        metas[tail_idx].serialized_bytes = merged_data_bytes.len() as u64;
+        metas_rid[tail_idx].row_count = merged_rid.len() as u64;
+        metas_rid[tail_idx].serialized_bytes = merged_rid_bytes.len() as u64;
+
+        // If tail had a sort permutation, rebuild it.
+        if metas[tail_idx].value_order_perm_pk != 0 {
+            let sort_column = SortColumn {
+                values: merged_data.clone(),
+                options: None,
+            };
+            let indices = lexsort_to_indices(&[sort_column], None)?;
+            let perm_bytes = serialize_array(&indices)?;
+            puts.push(BatchPut::Raw {
+                key: metas[tail_idx].value_order_perm_pk,
+                bytes: perm_bytes,
+            });
+        }
+
+        // Persist updated descriptors.
+        self.rewrite_descriptor_pages(desc_pk, &mut desc, &mut metas, puts)?;
+        self.rewrite_descriptor_pages(desc_pk_rid, &mut desc_rid, &mut metas_rid, puts)?;
+
+        Ok((rest_data, rest_rid))
+    }
 }
 
 // --- K-way merge implementation (EntryHandle-backed, zero-copy) ---
@@ -921,17 +1157,23 @@ impl MergeSortedIterator {
             let perm_indices = perm_array
                 .as_any()
                 .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| Error::Internal("Invalid permutation index type".into()))?;
+                .ok_or_else(|| Error::Internal("Invalid permutation index type".into()))?
+                .clone();
+
+            // Be tolerant: if storage ever drifted, guard here.
+            if perm_indices.len() != data_array.len() {
+                return Err(Error::Internal("perm/data length mismatch".into()));
+            }
 
             cursors.push(ChunkCursor {
-                perm_indices: Arc::new(perm_indices.clone()),
+                perm_indices: Arc::new(perm_indices),
                 data_array,
                 pos: 0,
             });
         }
 
         let mut heap = BinaryHeap::new();
-        for (i, cursor) in cursors.iter_mut().enumerate() {
+        for (i, cursor) in cursors.iter().enumerate() {
             if let Some(value) = Self::get_value_at_cursor(cursor) {
                 heap.push(HeapItem {
                     cursor_idx: i,
