@@ -11,6 +11,9 @@ pub enum Error {
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
 
+    #[error("Invalid argument: {0}")]
+    InvalidArgumentError(String),
+
     #[error("Storage key not found")]
     NotFound,
 
