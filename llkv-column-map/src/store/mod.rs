@@ -13,6 +13,7 @@ use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, UInt32Array, UInt6
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
 
 use roaring::RoaringBitmap;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -37,7 +38,7 @@ pub struct ColumnStore<P: Pager> {
     catalog: RwLock<ColumnCatalog>,
 }
 
-impl<P: Pager> ColumnStore<P> {
+impl<P: Pager<Blob = Bytes>> ColumnStore<P> {
     pub fn open(pager: Arc<P>) -> Result<Self> {
         let catalog = match pager.get_raw(CATALOG_ROOT_PKEY)? {
             Some(blob) => ColumnCatalog::from_bytes(blob.as_ref())?,
@@ -183,8 +184,6 @@ impl<P: Pager> ColumnStore<P> {
     }
 
     /// LWW via in-place rewrite for a single field.
-    /// Any chunk whose shadow row_id contains an incoming id is rewritten
-    /// in place (data, shadow row_id, and sort perm if present).
     fn lww_rewrite_for_field(
         &self,
         catalog: &mut ColumnCatalog,
@@ -233,15 +232,18 @@ impl<P: Pager> ColumnStore<P> {
             let rid_results = self.pager.batch_get(&gets_rid)?;
             let mut rid_blobs: FxHashMap<PhysicalKey, P::Blob> = FxHashMap::default();
             for r in rid_results {
-                if let GetResult::Raw { key, bytes } = r {
-                    rid_blobs.insert(key, bytes);
+                match r {
+                    GetResult::Raw { key, bytes } => {
+                        rid_blobs.insert(key, bytes);
+                    }
+                    GetResult::Missing { .. } => return Err(Error::NotFound),
                 }
             }
             for i in 0..n {
                 let rid_blob = rid_blobs
                     .get(&metas_rid[i].chunk_pk)
                     .ok_or(Error::NotFound)?;
-                let rid_arr = deserialize_array(rid_blob.as_ref())?;
+                let rid_arr = deserialize_array(rid_blob.clone())?;
                 let rid_arr = rid_arr
                     .as_any()
                     .downcast_ref::<UInt64Array>()
@@ -275,8 +277,11 @@ impl<P: Pager> ColumnStore<P> {
         let results = self.pager.batch_get(&gets)?;
         let mut blob_map: FxHashMap<PhysicalKey, P::Blob> = FxHashMap::default();
         for r in results {
-            if let GetResult::Raw { key, bytes } = r {
-                blob_map.insert(key, bytes);
+            match r {
+                GetResult::Raw { key, bytes } => {
+                    blob_map.insert(key, bytes);
+                }
+                GetResult::Missing { .. } => return Err(Error::NotFound),
             }
         }
 
@@ -285,7 +290,7 @@ impl<P: Pager> ColumnStore<P> {
             let rid_blob = blob_map
                 .get(&metas_rid[i].chunk_pk)
                 .ok_or(Error::NotFound)?;
-            let rid_arr_any = deserialize_array(rid_blob.as_ref())?;
+            let rid_arr_any = deserialize_array(rid_blob.clone())?;
             let rid_arr = rid_arr_any
                 .as_any()
                 .downcast_ref::<UInt64Array>()
@@ -297,7 +302,7 @@ impl<P: Pager> ColumnStore<P> {
             let data_blob = blob_map
                 .get(&metas_data[i].chunk_pk)
                 .ok_or(Error::NotFound)?;
-            let data_arr = deserialize_array(data_blob.as_ref())?;
+            let data_arr = deserialize_array(data_blob.clone())?;
             let data_f = compute::filter(&data_arr, &keep)?;
             let data_bytes = serialize_array(&data_f)?;
             puts.push(BatchPut::Raw {
@@ -457,7 +462,7 @@ impl<P: Pager> ColumnStore<P> {
             );
 
             let data_blob = self.pager.get_raw(meta.chunk_pk)?.ok_or(Error::NotFound)?;
-            let data_arr = deserialize_array(data_blob.as_ref())?;
+            let data_arr = deserialize_array(data_blob.clone())?;
             let data_f = compute::filter(&data_arr, &keep)?;
             let data_bytes = serialize_array(&data_f)?;
             puts.push(BatchPut::Raw {
@@ -471,7 +476,7 @@ impl<P: Pager> ColumnStore<P> {
 
             if let (Some(_pk), Some(rm)) = (desc_pk_rid, metas_rid.get_mut(i)) {
                 let rid_blob = self.pager.get_raw(rm.chunk_pk)?.ok_or(Error::NotFound)?;
-                let rid_arr = deserialize_array(rid_blob.as_ref())?;
+                let rid_arr = deserialize_array(rid_blob.clone())?;
                 let rid_f = compute::filter(&rid_arr, &keep)?;
                 let rid_bytes = serialize_array(&rid_f)?;
                 puts.push(BatchPut::Raw {
@@ -510,8 +515,7 @@ impl<P: Pager> ColumnStore<P> {
         Ok(())
     }
 
-    /// Scan returns arrays in append order. No tombstone logic remains;
-    /// all LWW and deletes are physically applied at write time.
+    /// Scan returns arrays in append order (no tombstones).
     pub fn scan(
         &self,
         field_id: LogicalFieldId,
@@ -533,17 +537,17 @@ impl<P: Pager> ColumnStore<P> {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        // Fast path: single chunk, direct get_raw.
+        // Fast path: single chunk
         if metas.len() == 1 {
             let blob = self
                 .pager
                 .get_raw(metas[0].chunk_pk)?
                 .ok_or(Error::NotFound)?;
-            let arr = deserialize_array(blob.as_ref())?;
+            let arr = deserialize_array(blob)?;
             return Ok(Box::new(std::iter::once(Ok(arr))));
         }
 
-        // Multi-chunk: batch_get all chunks, then map to arrays.
+        // Multi-chunk: batch_get and map
         let mut gets = Vec::with_capacity(metas.len());
         for m in &metas {
             gets.push(BatchGet::Raw { key: m.chunk_pk });
@@ -552,14 +556,17 @@ impl<P: Pager> ColumnStore<P> {
 
         let mut blobs_map = FxHashMap::default();
         for r in results {
-            if let GetResult::Raw { key, bytes } = r {
-                blobs_map.insert(key, bytes);
+            match r {
+                GetResult::Raw { key, bytes } => {
+                    blobs_map.insert(key, bytes);
+                }
+                GetResult::Missing { .. } => return Err(Error::NotFound),
             }
         }
 
         let it = metas.into_iter().map(move |m| {
             let blob = blobs_map.get(&m.chunk_pk).ok_or(Error::NotFound)?;
-            let array = deserialize_array(blob.as_ref())?;
+            let array = deserialize_array(blob.clone())?;
             Ok(array)
         });
 
@@ -588,15 +595,18 @@ impl<P: Pager> ColumnStore<P> {
 
         let mut chunks_map = FxHashMap::default();
         for result in results {
-            if let GetResult::Raw { key, bytes } = result {
-                chunks_map.insert(key, bytes);
+            match result {
+                GetResult::Raw { key, bytes } => {
+                    chunks_map.insert(key, bytes);
+                }
+                GetResult::Missing { .. } => return Err(Error::NotFound),
             }
         }
 
         let mut puts = Vec::new();
         for meta in all_chunk_metadata.iter_mut() {
             let chunk_blob = chunks_map.get(&meta.chunk_pk).ok_or(Error::NotFound)?;
-            let chunk_array = deserialize_array(chunk_blob.as_ref())?;
+            let chunk_array = deserialize_array(chunk_blob.clone())?;
 
             let sort_column = SortColumn {
                 values: chunk_array,
@@ -648,7 +658,7 @@ impl<P: Pager> ColumnStore<P> {
         Ok(())
     }
 
-    pub fn scan_sorted(&self, field_id: LogicalFieldId) -> Result<MergeSortedIterator<P::Blob>> {
+    pub fn scan_sorted(&self, field_id: LogicalFieldId) -> Result<MergeSortedIterator> {
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
         let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
@@ -676,10 +686,13 @@ impl<P: Pager> ColumnStore<P> {
         }
         let get_results = self.pager.batch_get(&gets)?;
 
-        let mut blobs_map = FxHashMap::default();
+        let mut blobs_map: FxHashMap<PhysicalKey, Bytes> = FxHashMap::default();
         for result in get_results {
-            if let GetResult::Raw { key, bytes } = result {
-                blobs_map.insert(key, bytes);
+            match result {
+                GetResult::Raw { key, bytes } => {
+                    blobs_map.insert(key, bytes);
+                }
+                GetResult::Missing { .. } => return Err(Error::NotFound),
             }
         }
 
@@ -778,7 +791,7 @@ impl<P: Pager> ColumnStore<P> {
     }
 }
 
-// --- K-way merge implementation ---
+// --- K-way merge implementation (Bytes-backed, zero-copy) ---
 
 struct ChunkCursor {
     perm_indices: Arc<UInt32Array>,
@@ -846,23 +859,24 @@ impl Ord for HeapItem {
     }
 }
 
-pub struct MergeSortedIterator<B: AsRef<[u8]>> {
+pub struct MergeSortedIterator {
     cursors: Vec<ChunkCursor>,
     heap: BinaryHeap<HeapItem>,
-    _blobs: FxHashMap<PhysicalKey, B>,
+    _blobs: FxHashMap<PhysicalKey, Bytes>,
 }
 
-impl<B: AsRef<[u8]>> MergeSortedIterator<B> {
-    fn try_new(metadata: Vec<ChunkMetadata>, blobs: FxHashMap<PhysicalKey, B>) -> Result<Self> {
+impl MergeSortedIterator {
+    fn try_new(metadata: Vec<ChunkMetadata>, blobs: FxHashMap<PhysicalKey, Bytes>) -> Result<Self> {
         let mut cursors = Vec::with_capacity(metadata.len());
         for meta in &metadata {
-            let data_blob = blobs.get(&meta.chunk_pk).ok_or(Error::NotFound)?;
+            let data_blob = blobs.get(&meta.chunk_pk).ok_or(Error::NotFound)?.clone();
             let perm_blob = blobs
                 .get(&meta.value_order_perm_pk)
-                .ok_or(Error::NotFound)?;
+                .ok_or(Error::NotFound)?
+                .clone();
 
-            let data_array = deserialize_array(data_blob.as_ref())?;
-            let perm_array = deserialize_array(perm_blob.as_ref())?;
+            let data_array = deserialize_array(data_blob)?;
+            let perm_array = deserialize_array(perm_blob)?;
             let perm_indices = perm_array
                 .as_any()
                 .downcast_ref::<UInt32Array>()
@@ -902,7 +916,7 @@ impl<B: AsRef<[u8]>> MergeSortedIterator<B> {
     }
 }
 
-impl<B: AsRef<[u8]>> Iterator for MergeSortedIterator<B> {
+impl Iterator for MergeSortedIterator {
     type Item = Result<ArrayRef>;
 
     fn next(&mut self) -> Option<Self::Item> {

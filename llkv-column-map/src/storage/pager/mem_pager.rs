@@ -1,20 +1,18 @@
-// File: src/storage/pager/mem_pager.rs
 use super::*;
+use crate::error::{Error, Result};
 use crate::types::{CATALOG_ROOT_PKEY, PhysicalKey};
+use bytes::Bytes;
 use rustc_hash::FxHashMap;
-use std::io::{self, Error};
 use std::sync::{
-    Arc, RwLock,
+    RwLock,
     atomic::{AtomicU64, Ordering},
 };
 
 /// In-memory pager used for tests/benchmarks.
 #[allow(clippy::module_name_repetitions)]
 pub struct MemPager {
-    /// Next physical key to hand out.
     next_key: AtomicU64,
-    // PhysicalKey -> Arc<[u8]>
-    blobs: RwLock<FxHashMap<PhysicalKey, Arc<[u8]>>>,
+    blobs: RwLock<FxHashMap<PhysicalKey, Bytes>>,
 }
 
 impl Default for MemPager {
@@ -33,21 +31,28 @@ impl MemPager {
 }
 
 impl Pager for MemPager {
-    type Blob = Arc<[u8]>;
+    type Blob = Bytes;
 
-    fn alloc_many(&self, n: usize) -> io::Result<Vec<PhysicalKey>> {
+    fn alloc_many(&self, n: usize) -> Result<Vec<PhysicalKey>> {
         let n_u64 = n as u64;
         let start = self
             .next_key
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 cur.checked_add(n_u64)
             })
-            .map_err(|_| Error::other("physical key space overflow in MemPager::alloc_many"))?;
-        let end = start + n_u64;
-        Ok((start..end).collect())
+            .map_err(|_| Error::Internal("physical key space overflow".to_string()))?;
+        Ok((start..start + n_u64).collect())
     }
 
-    fn batch_put(&self, puts: &[BatchPut]) -> io::Result<()> {
+    fn get_raw(&self, key: PhysicalKey) -> Result<Option<Self::Blob>> {
+        let map = self
+            .blobs
+            .read()
+            .expect("MemPager blobs read lock poisoned");
+        Ok(map.get(&key).cloned())
+    }
+
+    fn batch_put(&self, puts: &[BatchPut]) -> Result<()> {
         let mut map = self
             .blobs
             .write()
@@ -55,14 +60,14 @@ impl Pager for MemPager {
         for p in puts {
             match p {
                 BatchPut::Raw { key, bytes } => {
-                    map.insert(*key, Arc::from(bytes.clone()));
+                    map.insert(*key, Bytes::from(bytes.clone()));
                 }
             }
         }
         Ok(())
     }
 
-    fn batch_get(&self, gets: &[BatchGet]) -> io::Result<Vec<GetResult<Self::Blob>>> {
+    fn batch_get(&self, gets: &[BatchGet]) -> Result<Vec<GetResult<Self::Blob>>> {
         let map = self
             .blobs
             .read()
@@ -74,7 +79,7 @@ impl Pager for MemPager {
                     if let Some(b) = map.get(&key) {
                         out.push(GetResult::Raw {
                             key,
-                            bytes: Arc::clone(b),
+                            bytes: b.clone(),
                         });
                     } else {
                         out.push(GetResult::Missing { key });
@@ -85,13 +90,13 @@ impl Pager for MemPager {
         Ok(out)
     }
 
-    fn free_many(&self, keys: &[PhysicalKey]) -> io::Result<()> {
+    fn free_many(&self, keys: &[PhysicalKey]) -> Result<()> {
         let mut map = self
             .blobs
             .write()
             .expect("MemPager blobs write lock poisoned");
-        for key in keys {
-            map.remove(key);
+        for &k in keys {
+            map.remove(&k);
         }
         Ok(())
     }

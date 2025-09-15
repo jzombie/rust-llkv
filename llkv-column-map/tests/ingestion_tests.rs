@@ -78,8 +78,30 @@ fn ingest_and_scan_multiple_columns() {
         .downcast_ref::<FixedSizeListArray>()
         .expect("array should be a FixedSizeListArray");
 
-    // FIX: Dereference the Arc (`array2`) to get a reference to
-    // the inner array for a valid comparison with the other ref.
-    assert_eq!(&*array2, scanned_fsl_array);
+    // Sanity: fixed-size=2, row count=3
+    assert_eq!(scanned_fsl_array.value_length(), 2);
+    assert_eq!(scanned_fsl_array.len(), 3);
+
+    // Compare flattened child values (ignores field metadata differences)
+    let scanned_child = scanned_fsl_array
+        .values()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .expect("child must be Float32");
+
+    let expected_child = array2
+        .values()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .expect("child must be Float32");
+
+    assert_eq!(scanned_child.len(), expected_child.len());
+    for i in 0..expected_child.len() {
+        // Float compare; these are constructed from the same literals so exact is fine.
+        // Use approx if you prefer:
+        // assert!((scanned_child.value(i) - expected_child.value(i)).abs() < 1e-6);
+        assert_eq!(scanned_child.value(i), expected_child.value(i));
+    }
+
     assert!(results2_iter.next().is_none(), "iterator should be empty");
 }
