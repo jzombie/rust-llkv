@@ -49,6 +49,23 @@ const MIN_CHUNK_BYTES: usize = TARGET_CHUNK_BYTES / 2; // ~512 KiB
 /// Upper bound on bytes coalesced per run, to cap rewrite cost.
 const MAX_MERGE_RUN_BYTES: usize = 16 * 1024 * 1024; // ~16 MiB
 
+/// Statistics for a single descriptor page.
+#[derive(Debug, Clone)]
+pub struct DescriptorPageStats {
+    pub page_pk: PhysicalKey,
+    pub entry_count: u32,
+    pub page_size_bytes: usize,
+}
+
+/// Aggregated layout statistics for a single column.
+#[derive(Debug, Clone)]
+pub struct ColumnLayoutStats {
+    pub field_id: LogicalFieldId,
+    pub total_rows: u64,
+    pub total_chunks: u64,
+    pub pages: Vec<DescriptorPageStats>,
+}
+
 /// Normalize an array so its offset is zero without copying buffers.
 #[inline]
 fn zero_offset(arr: &ArrayRef) -> ArrayRef {
@@ -1278,6 +1295,113 @@ where
         descriptor.total_row_count += meta.row_count;
         descriptor.total_chunk_count += 1;
         Ok(())
+    }
+
+    /// Verifies the integrity of the column store's metadata.
+    ///
+    /// This check is useful for tests and debugging. It verifies:
+    /// 1. The catalog can be read.
+    /// 2. All descriptor chains are walkable.
+    /// 3. The row and chunk counts in the descriptors match the sum of the chunk metadata.
+    ///
+    /// Returns `Ok(())` if consistent, otherwise returns an `Error`.
+    pub fn verify_integrity(&self) -> Result<()> {
+        let catalog = self.catalog.read().unwrap();
+        for (&field_id, &descriptor_pk) in &catalog.map {
+            let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or_else(|| {
+                Error::Internal(format!(
+                    "Catalog points to missing descriptor pk={}",
+                    descriptor_pk
+                ))
+            })?;
+            let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+
+            if descriptor.field_id != field_id {
+                return Err(Error::Internal(format!(
+                    "Descriptor at pk={} has wrong field_id: expected {}, got {}",
+                    descriptor_pk, field_id, descriptor.field_id
+                )));
+            }
+
+            let mut actual_rows = 0;
+            let mut actual_chunks = 0;
+            let mut current_page_pk = descriptor.head_page_pk;
+
+            while current_page_pk != 0 {
+                let page_blob = self.pager.get_raw(current_page_pk)?.ok_or_else(|| {
+                    Error::Internal(format!(
+                        "Descriptor page chain broken at pk={}",
+                        current_page_pk
+                    ))
+                })?;
+                let header = DescriptorPageHeader::from_le_bytes(
+                    &page_blob.as_ref()[..DescriptorPageHeader::DISK_SIZE],
+                );
+
+                for i in 0..(header.entry_count as usize) {
+                    let off = DescriptorPageHeader::DISK_SIZE + i * ChunkMetadata::DISK_SIZE;
+                    let end = off + ChunkMetadata::DISK_SIZE;
+                    let meta = ChunkMetadata::from_le_bytes(&page_blob.as_ref()[off..end]);
+                    actual_rows += meta.row_count;
+                    actual_chunks += 1;
+                }
+                current_page_pk = header.next_page_pk;
+            }
+
+            if descriptor.total_row_count != actual_rows {
+                return Err(Error::Internal(format!(
+                    "Row count mismatch for field {}: descriptor says {}, actual is {}",
+                    field_id, descriptor.total_row_count, actual_rows
+                )));
+            }
+            if descriptor.total_chunk_count != actual_chunks {
+                return Err(Error::Internal(format!(
+                    "Chunk count mismatch for field {}: descriptor says {}, actual is {}",
+                    field_id, descriptor.total_chunk_count, actual_chunks
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Gathers detailed statistics about the storage layout.
+    ///
+    /// This method is designed for low-level analysis and debugging, allowing you to
+    /// check for under- or over-utilization of descriptor pages.
+    pub fn get_layout_stats(&self) -> Result<Vec<ColumnLayoutStats>> {
+        let catalog = self.catalog.read().unwrap();
+        let mut all_stats = Vec::new();
+
+        for (&field_id, &descriptor_pk) in &catalog.map {
+            let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
+            let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+
+            let mut page_stats = Vec::new();
+            let mut current_page_pk = descriptor.head_page_pk;
+            while current_page_pk != 0 {
+                let page_blob = self
+                    .pager
+                    .get_raw(current_page_pk)?
+                    .ok_or(Error::NotFound)?;
+                let header = DescriptorPageHeader::from_le_bytes(
+                    &page_blob.as_ref()[..DescriptorPageHeader::DISK_SIZE],
+                );
+                page_stats.push(DescriptorPageStats {
+                    page_pk: current_page_pk,
+                    entry_count: header.entry_count,
+                    page_size_bytes: page_blob.as_ref().len(),
+                });
+                current_page_pk = header.next_page_pk;
+            }
+
+            all_stats.push(ColumnLayoutStats {
+                field_id,
+                total_rows: descriptor.total_row_count,
+                total_chunks: descriptor.total_chunk_count,
+                pages: page_stats,
+            });
+        }
+        Ok(all_stats)
     }
 }
 
