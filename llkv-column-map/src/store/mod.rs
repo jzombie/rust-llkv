@@ -417,6 +417,7 @@ where
         let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
         let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
+        // Gather metadata for data column.
         let mut metas: Vec<ChunkMetadata> = Vec::new();
         for m in DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk) {
             metas.push(m?);
@@ -425,6 +426,7 @@ where
             return Ok(());
         }
 
+        // Optional: corresponding shadow row_id descriptor + metas.
         let rid_fid = rowid_fid(field_id);
         let desc_pk_rid = catalog.map.get(&rid_fid).copied();
 
@@ -442,28 +444,56 @@ where
         }
 
         let mut puts = Vec::new();
+
+        // Single-pass walk over the delete bitmap
+        // We stream the deletes in increasing order once, and for each chunk
+        // collect only the local positions that fall into [start, end).
+        let mut del_iter = rows_to_delete.iter();
+        let mut cur_del = del_iter.next(); // Option<u32>
+
         let mut cum_rows = 0u64;
 
         for (i, meta) in metas.iter_mut().enumerate() {
-            let start = cum_rows;
-            let end = start + meta.row_count;
+            let start_u64 = cum_rows;
+            let end_u64 = start_u64 + meta.row_count;
 
-            let mut del_set = FxHashSet::default();
-            for idx in rows_to_delete.iter() {
-                let idx = idx as u64;
-                if idx >= start && idx < end {
-                    del_set.insert((idx - start) as u32);
+            // Fast-forward the delete cursor to the first delete >= start.
+            let start = start_u64 as u32;
+            let end = end_u64 as u32;
+
+            while let Some(d) = cur_del {
+                if d < start {
+                    cur_del = del_iter.next();
+                } else {
+                    break;
                 }
             }
-            if del_set.is_empty() {
-                cum_rows = end;
+
+            // Collect deletes that fall into this chunk.
+            // Usually small (e.g., ~chunk_len / 10 in your bench), so a small
+            // set is fine. This avoids scanning the whole bitmap repeatedly.
+            let mut del_local: FxHashSet<u32> = FxHashSet::default();
+            while let Some(d) = cur_del {
+                if d >= end {
+                    break;
+                }
+                del_local.insert(d - start); // local index in [0, row_count)
+                cur_del = del_iter.next();
+            }
+
+            if del_local.is_empty() {
+                // Nothing to rewrite for this chunk.
+                cum_rows = end_u64;
                 continue;
             }
 
-            let keep = BooleanArray::from_iter(
-                (0..meta.row_count as usize).map(|j| Some(!del_set.contains(&(j as u32)))),
+            // Build a Boolean keep mask: true = keep, false = delete.
+            // Using from_iter keeps code simple; cost is O(chunk_len).
+            let keep = arrow::array::BooleanArray::from_iter(
+                (0..meta.row_count as usize).map(|j| Some(!del_local.contains(&(j as u32)))),
             );
 
+            // Rewrite data chunk in place.
             let data_blob = self.pager.get_raw(meta.chunk_pk)?.ok_or(Error::NotFound)?;
             let data_arr = deserialize_array(data_blob.clone())?;
             let data_f = compute::filter(&data_arr, &keep)?;
@@ -477,6 +507,7 @@ where
             meta.serialized_bytes = data_bytes.len() as u64;
             meta.tombstone_pk = 0;
 
+            // Rewrite matching shadow row_id chunk, if present.
             if let (Some(_pk), Some(rm)) = (desc_pk_rid, metas_rid.get_mut(i)) {
                 let rid_blob = self.pager.get_raw(rm.chunk_pk)?.ok_or(Error::NotFound)?;
                 let rid_arr = deserialize_array(rid_blob.clone())?;
@@ -492,8 +523,9 @@ where
                 rm.tombstone_pk = 0;
             }
 
+            // If a sorted permutation exists for this chunk, refresh it.
             if meta.value_order_perm_pk != 0 {
-                let sort_column = SortColumn {
+                let sort_column = arrow::compute::SortColumn {
                     values: data_f.clone(),
                     options: None,
                 };
@@ -505,16 +537,19 @@ where
                 });
             }
 
-            cum_rows = end;
+            cum_rows = end_u64;
         }
 
+        // Rewrite descriptors with updated chunk metadata.
         self.rewrite_descriptor_pages(descriptor_pk, &mut descriptor, &mut metas, &mut puts)?;
-
         if let (Some(pk), Some(mut d_rid)) = (desc_pk_rid, descriptor_rid) {
             self.rewrite_descriptor_pages(pk, &mut d_rid, &mut metas_rid, &mut puts)?;
         }
 
-        self.pager.batch_put(&puts)?;
+        // Persist writes.
+        if !puts.is_empty() {
+            self.pager.batch_put(&puts)?;
+        }
         Ok(())
     }
 
