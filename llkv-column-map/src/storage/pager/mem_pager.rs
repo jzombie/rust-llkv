@@ -1,8 +1,8 @@
 use super::*;
 use crate::error::{Error, Result};
 use crate::types::{CATALOG_ROOT_PKEY, PhysicalKey};
-use bytes::Bytes;
 use rustc_hash::FxHashMap;
+use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{
     RwLock,
     atomic::{AtomicU64, Ordering},
@@ -12,7 +12,7 @@ use std::sync::{
 #[allow(clippy::module_name_repetitions)]
 pub struct MemPager {
     next_key: AtomicU64,
-    blobs: RwLock<FxHashMap<PhysicalKey, Bytes>>,
+    blobs: RwLock<FxHashMap<PhysicalKey, EntryHandle>>,
 }
 
 impl Default for MemPager {
@@ -31,7 +31,7 @@ impl MemPager {
 }
 
 impl Pager for MemPager {
-    type Blob = Bytes;
+    type Blob = EntryHandle;
 
     fn alloc_many(&self, n: usize) -> Result<Vec<PhysicalKey>> {
         let n_u64 = n as u64;
@@ -60,7 +60,11 @@ impl Pager for MemPager {
         for p in puts {
             match p {
                 BatchPut::Raw { key, bytes } => {
-                    map.insert(*key, Bytes::from(bytes.clone()));
+                    // One O(len) copy on write into an anonymous mmap; reads are
+                    // zero-copy via EntryHandle::as_slice().
+                    let eh = EntryHandle::from_owned_bytes_anon(bytes, *key)
+                        .map_err(|e| Error::Internal(format!("anon mmap failed: {e:?}")))?;
+                    map.insert(*key, eh);
                 }
             }
         }

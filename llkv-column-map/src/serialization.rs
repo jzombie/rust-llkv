@@ -34,7 +34,7 @@ use arrow::array::{
 };
 use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field};
-use bytes::Bytes;
+use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::error::{Error, Result};
 
@@ -169,25 +169,25 @@ fn serialize_fsl_float32(arr: &dyn Array, list_size: i32) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Deserialize zero-copy from pager blob bytes (Bytes).
+/// Deserialize zero-copy from a pager blob (`EntryHandle`).
 /// Arrow `Buffer`s borrow the pager memory with no cloning or IPC parsing.
-pub fn deserialize_array(blob: Bytes) -> Result<ArrayRef> {
-    if blob.len() < 24 || &blob[0..4] != &MAGIC {
+pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
+    let raw = blob.as_ref();
+    if raw.len() < 24 || &raw[0..4] != &MAGIC {
         return Err(Error::Internal("bad array blob magic/size".into()));
     }
-    let layout = blob[4];
-    let type_code = blob[5];
+    let layout = raw[4];
+    let type_code = raw[5];
     // [6..8) reserved
     let mut o = 8usize;
-    let len = get_u64_le(&blob, &mut o) as usize;
-    let extra_a = get_u32_le(&blob, &mut o);
-    let extra_b = get_u32_le(&blob, &mut o);
+    let len = get_u64_le(raw, &mut o) as usize;
+    let extra_a = get_u32_le(raw, &mut o);
+    let extra_b = get_u32_le(raw, &mut o);
 
-    // Create a Buffer that references the whole blob, then slice to payload.
-    // (Deprecated in Arrow 56, but still zero-copy. Can be swapped to
-    //  Buffer::from(blob.into()) once you bump and want to quiet the warn.)
-    let whole = Buffer::from_bytes(blob.into()); // zero-copy
-    let payload = whole.slice(o); // Arrow 56 slice(offset)
+    // Build a Buffer that references the EntryHandle mmap directly, then
+    // slice to the payload. This is zero-copy via EntryHandle::as_arrow_buffer().
+    let whole: Buffer = blob.as_arrow_buffer();
+    let payload: Buffer = whole.slice(o);
 
     match layout {
         x if x == Layout::Primitive as u8 => {

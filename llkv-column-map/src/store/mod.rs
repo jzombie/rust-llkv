@@ -13,10 +13,10 @@ use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, UInt32Array, UInt6
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use bytes::Bytes;
 
 use roaring::RoaringBitmap;
 use rustc_hash::{FxHashMap, FxHashSet};
+use simd_r_drive_entry_handle::EntryHandle;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::{Arc, RwLock};
@@ -38,7 +38,10 @@ pub struct ColumnStore<P: Pager> {
     catalog: RwLock<ColumnCatalog>,
 }
 
-impl<P: Pager<Blob = Bytes>> ColumnStore<P> {
+impl<P> ColumnStore<P>
+where
+    P: Pager<Blob = EntryHandle>,
+{
     pub fn open(pager: Arc<P>) -> Result<Self> {
         let catalog = match pager.get_raw(CATALOG_ROOT_PKEY)? {
             Some(blob) => ColumnCatalog::from_bytes(blob.as_ref())?,
@@ -230,7 +233,7 @@ impl<P: Pager<Blob = Bytes>> ColumnStore<P> {
                 });
             }
             let rid_results = self.pager.batch_get(&gets_rid)?;
-            let mut rid_blobs: FxHashMap<PhysicalKey, P::Blob> = FxHashMap::default();
+            let mut rid_blobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
             for r in rid_results {
                 match r {
                     GetResult::Raw { key, bytes } => {
@@ -275,7 +278,7 @@ impl<P: Pager<Blob = Bytes>> ColumnStore<P> {
             });
         }
         let results = self.pager.batch_get(&gets)?;
-        let mut blob_map: FxHashMap<PhysicalKey, P::Blob> = FxHashMap::default();
+        let mut blob_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
         for r in results {
             match r {
                 GetResult::Raw { key, bytes } => {
@@ -554,7 +557,7 @@ impl<P: Pager<Blob = Bytes>> ColumnStore<P> {
         }
         let results = self.pager.batch_get(&gets)?;
 
-        let mut blobs_map = FxHashMap::default();
+        let mut blobs_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
         for r in results {
             match r {
                 GetResult::Raw { key, bytes } => {
@@ -593,7 +596,7 @@ impl<P: Pager<Blob = Bytes>> ColumnStore<P> {
             .collect();
         let results = self.pager.batch_get(&gets)?;
 
-        let mut chunks_map = FxHashMap::default();
+        let mut chunks_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
         for result in results {
             match result {
                 GetResult::Raw { key, bytes } => {
@@ -686,7 +689,7 @@ impl<P: Pager<Blob = Bytes>> ColumnStore<P> {
         }
         let get_results = self.pager.batch_get(&gets)?;
 
-        let mut blobs_map: FxHashMap<PhysicalKey, Bytes> = FxHashMap::default();
+        let mut blobs_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
         for result in get_results {
             match result {
                 GetResult::Raw { key, bytes } => {
@@ -791,7 +794,7 @@ impl<P: Pager<Blob = Bytes>> ColumnStore<P> {
     }
 }
 
-// --- K-way merge implementation (Bytes-backed, zero-copy) ---
+// --- K-way merge implementation (EntryHandle-backed, zero-copy) ---
 
 struct ChunkCursor {
     perm_indices: Arc<UInt32Array>,
@@ -862,11 +865,14 @@ impl Ord for HeapItem {
 pub struct MergeSortedIterator {
     cursors: Vec<ChunkCursor>,
     heap: BinaryHeap<HeapItem>,
-    _blobs: FxHashMap<PhysicalKey, Bytes>,
+    _blobs: FxHashMap<PhysicalKey, EntryHandle>,
 }
 
 impl MergeSortedIterator {
-    fn try_new(metadata: Vec<ChunkMetadata>, blobs: FxHashMap<PhysicalKey, Bytes>) -> Result<Self> {
+    fn try_new(
+        metadata: Vec<ChunkMetadata>,
+        blobs: FxHashMap<PhysicalKey, EntryHandle>,
+    ) -> Result<Self> {
         let mut cursors = Vec::with_capacity(metadata.len());
         for meta in &metadata {
             let data_blob = blobs.get(&meta.chunk_pk).ok_or(Error::NotFound)?.clone();
