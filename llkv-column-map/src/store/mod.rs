@@ -49,13 +49,10 @@ impl<P: Pager> ColumnStore<P> {
         })
     }
 
-    /// Append with automatic LWW (by row_id) via in-place rewrites.
+    /// Append with automatic LWW (by row_id) using in-place rewrites.
     ///
     /// Requirements:
-    /// - Batch must contain a non-nullable UInt64 "row_id" column.
-    /// - "row_id" in a single batch must be strictly increasing
-    ///   (sorted asc) and contain no duplicates. This avoids any
-    ///   per-batch hash/dedup work and keeps ingest hot.
+    /// - Batch must contain a non-nullable UInt64 column named "row_id".
     /// - For each data column (with "field_id" metadata), we:
     ///   1) rewrite any existing chunks to remove rows whose per-field
     ///      shadow row_ids match incoming row_ids (LWW),
@@ -63,8 +60,6 @@ impl<P: Pager> ColumnStore<P> {
     ///   3) append a shadow row_id chunk for this field.
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         let schema = batch.schema();
-
-        // Locate row_id.
         let mut row_id_idx: Option<usize> = None;
         for (i, f) in schema.fields().iter().enumerate() {
             if f.name() == "row_id" {
@@ -86,20 +81,6 @@ impl<P: Pager> ColumnStore<P> {
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| Error::Internal("row_id downcast failed".into()))?;
 
-        // CHECK: enforce strictly increasing, unique row_id in this batch.
-        // O(1) extra space, single pass, no hashing/sorting.
-        for i in 1..row_id_arr.len() {
-            if row_id_arr.value(i - 1) >= row_id_arr.value(i) {
-                return Err(Error::InvalidArgumentError(
-                    "row_id in batch must be strictly increasing \
-                     and unique"
-                        .into(),
-                ));
-            }
-        }
-
-        // Build set for matches (used only to detect overlaps with old
-        // chunks). We keep it compact and reuse it across fields.
         let mut incoming_ids = FxHashSet::default();
         incoming_ids.reserve(row_id_arr.len());
         for i in 0..row_id_arr.len() {
@@ -109,10 +90,9 @@ impl<P: Pager> ColumnStore<P> {
         let mut catalog_dirty = false;
         let mut catalog = self.catalog.write().unwrap();
 
-        // Phase 1: LWW in-place rewrites on any overlapping old chunks.
+        // -------------------- Phase 1: in-place LWW rewrites -----------------
         let mut puts_rewrites: Vec<BatchPut> = Vec::new();
 
-        // Keep the data columns we will append after rewrites are staged.
         let mut data_cols: Vec<(LogicalFieldId, ArrayRef)> = Vec::new();
         for (i, array) in batch.columns().iter().enumerate() {
             if i == row_id_idx {
@@ -135,7 +115,7 @@ impl<P: Pager> ColumnStore<P> {
             self.pager.batch_put(&puts_rewrites)?;
         }
 
-        // Phase 2: Append new data chunks + per-field shadow row_id chunks.
+        // -------------------- Phase 2: appends ------------------------------
         let row_id_bytes = serialize_array(row_id_arr)?;
         let mut puts_appends: Vec<BatchPut> = Vec::new();
 
@@ -203,6 +183,8 @@ impl<P: Pager> ColumnStore<P> {
     }
 
     /// LWW via in-place rewrite for a single field.
+    /// Any chunk whose shadow row_id contains an incoming id is rewritten
+    /// in place (data, shadow row_id, and sort perm if present).
     fn lww_rewrite_for_field(
         &self,
         catalog: &mut ColumnCatalog,
@@ -239,7 +221,7 @@ impl<P: Pager> ColumnStore<P> {
             return Ok(());
         }
 
-        // Detect which chunks have any of the incoming row_ids.
+        // Find hit chunks by looking at shadow row_id content.
         let mut hit_idxs: Vec<usize> = Vec::new();
         {
             let mut gets_rid = Vec::with_capacity(n);
@@ -280,7 +262,7 @@ impl<P: Pager> ColumnStore<P> {
             return Ok(());
         }
 
-        // Fetch data + rid blobs for the hit chunks once.
+        // Batch-get needed data + rid chunks for rewrites.
         let mut gets = Vec::with_capacity(hit_idxs.len() * 2);
         for &i in &hit_idxs {
             gets.push(BatchGet::Raw {
@@ -300,7 +282,6 @@ impl<P: Pager> ColumnStore<P> {
 
         // Rewrite each hit chunk in place.
         for &i in &hit_idxs {
-            // Keep mask from row_id shadow.
             let rid_blob = blob_map
                 .get(&metas_rid[i].chunk_pk)
                 .ok_or(Error::NotFound)?;
@@ -313,7 +294,6 @@ impl<P: Pager> ColumnStore<P> {
                 (0..rid_arr.len()).map(|j| Some(!incoming_ids.contains(&rid_arr.value(j)))),
             );
 
-            // Data rewrite.
             let data_blob = blob_map
                 .get(&metas_data[i].chunk_pk)
                 .ok_or(Error::NotFound)?;
@@ -325,7 +305,6 @@ impl<P: Pager> ColumnStore<P> {
                 bytes: data_bytes.clone(),
             });
 
-            // Row_id shadow rewrite.
             let rid_f = compute::filter(&rid_arr_any, &keep)?;
             let rid_bytes = serialize_array(&rid_f)?;
             puts.push(BatchPut::Raw {
@@ -333,7 +312,6 @@ impl<P: Pager> ColumnStore<P> {
                 bytes: rid_bytes.clone(),
             });
 
-            // Update metas; drop tombstone; recompute perm if present.
             metas_data[i].row_count = data_f.len() as u64;
             metas_data[i].serialized_bytes = data_bytes.len() as u64;
             metas_data[i].tombstone_pk = 0;
@@ -355,7 +333,6 @@ impl<P: Pager> ColumnStore<P> {
             }
         }
 
-        // Persist descriptor page updates for data and row_id shadow.
         self.rewrite_descriptor_pages(desc_pk_data, &mut descriptor_data, &mut metas_data, puts)?;
         self.rewrite_descriptor_pages(desc_pk_rid, &mut descriptor_rid, &mut metas_rid, puts)?;
 
@@ -403,7 +380,6 @@ impl<P: Pager> ColumnStore<P> {
             page_start_idx = end_idx;
         }
 
-        // Update descriptor totals.
         let mut total_rows = 0u64;
         for m in metas.iter() {
             total_rows += m.row_count;
@@ -433,7 +409,6 @@ impl<P: Pager> ColumnStore<P> {
         let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
         let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
-        // Gather metas.
         let mut metas: Vec<ChunkMetadata> = Vec::new();
         for m in DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk) {
             metas.push(m?);
@@ -442,7 +417,6 @@ impl<P: Pager> ColumnStore<P> {
             return Ok(());
         }
 
-        // If we have a shadow row_id column, rewrite it too.
         let rid_fid = rowid_fid(field_id);
         let desc_pk_rid = catalog.map.get(&rid_fid).copied();
 
@@ -459,7 +433,6 @@ impl<P: Pager> ColumnStore<P> {
             }
         }
 
-        // Work chunk-by-chunk and rewrite in place where needed.
         let mut puts = Vec::new();
         let mut cum_rows = 0u64;
 
@@ -467,7 +440,6 @@ impl<P: Pager> ColumnStore<P> {
             let start = cum_rows;
             let end = start + meta.row_count;
 
-            // Relative delete set for this chunk.
             let mut del_set = FxHashSet::default();
             for idx in rows_to_delete.iter() {
                 let idx = idx as u64;
@@ -480,12 +452,10 @@ impl<P: Pager> ColumnStore<P> {
                 continue;
             }
 
-            // Keep mask.
             let keep = BooleanArray::from_iter(
                 (0..meta.row_count as usize).map(|j| Some(!del_set.contains(&(j as u32)))),
             );
 
-            // Data rewrite.
             let data_blob = self.pager.get_raw(meta.chunk_pk)?.ok_or(Error::NotFound)?;
             let data_arr = deserialize_array(data_blob.as_ref())?;
             let data_f = compute::filter(&data_arr, &keep)?;
@@ -499,7 +469,6 @@ impl<P: Pager> ColumnStore<P> {
             meta.serialized_bytes = data_bytes.len() as u64;
             meta.tombstone_pk = 0;
 
-            // Shadow row_id rewrite if present.
             if let (Some(_pk), Some(rm)) = (desc_pk_rid, metas_rid.get_mut(i)) {
                 let rid_blob = self.pager.get_raw(rm.chunk_pk)?.ok_or(Error::NotFound)?;
                 let rid_arr = deserialize_array(rid_blob.as_ref())?;
@@ -515,7 +484,6 @@ impl<P: Pager> ColumnStore<P> {
                 rm.tombstone_pk = 0;
             }
 
-            // Rewrite permutation if present.
             if meta.value_order_perm_pk != 0 {
                 let sort_column = SortColumn {
                     values: data_f.clone(),
@@ -532,8 +500,8 @@ impl<P: Pager> ColumnStore<P> {
             cum_rows = end;
         }
 
-        // Persist descriptor updates for data and row_id shadow.
         self.rewrite_descriptor_pages(descriptor_pk, &mut descriptor, &mut metas, &mut puts)?;
+
         if let (Some(pk), Some(mut d_rid)) = (desc_pk_rid, descriptor_rid) {
             self.rewrite_descriptor_pages(pk, &mut d_rid, &mut metas_rid, &mut puts)?;
         }
@@ -542,6 +510,8 @@ impl<P: Pager> ColumnStore<P> {
         Ok(())
     }
 
+    /// Scan returns arrays in append order. No tombstone logic remains;
+    /// all LWW and deletes are physically applied at write time.
     pub fn scan(
         &self,
         field_id: LogicalFieldId,
@@ -555,52 +525,45 @@ impl<P: Pager> ColumnStore<P> {
         let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
         let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
-        let mut all_chunk_metadata = Vec::new();
-        let meta_iter = DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk);
-        for meta_result in meta_iter {
-            all_chunk_metadata.push(meta_result?);
+        let mut metas = Vec::new();
+        for meta in DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk) {
+            metas.push(meta?);
         }
-
-        if all_chunk_metadata.is_empty() {
+        if metas.is_empty() {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        let mut gets = Vec::new();
-        for meta in &all_chunk_metadata {
-            gets.push(BatchGet::Raw { key: meta.chunk_pk });
-            if meta.tombstone_pk != 0 {
-                gets.push(BatchGet::Raw {
-                    key: meta.tombstone_pk,
-                });
-            }
+        // Fast path: single chunk, direct get_raw.
+        if metas.len() == 1 {
+            let blob = self
+                .pager
+                .get_raw(metas[0].chunk_pk)?
+                .ok_or(Error::NotFound)?;
+            let arr = deserialize_array(blob.as_ref())?;
+            return Ok(Box::new(std::iter::once(Ok(arr))));
         }
-        let get_results = self.pager.batch_get(&gets)?;
+
+        // Multi-chunk: batch_get all chunks, then map to arrays.
+        let mut gets = Vec::with_capacity(metas.len());
+        for m in &metas {
+            gets.push(BatchGet::Raw { key: m.chunk_pk });
+        }
+        let results = self.pager.batch_get(&gets)?;
 
         let mut blobs_map = FxHashMap::default();
-        for result in get_results {
-            if let GetResult::Raw { key, bytes } = result {
+        for r in results {
+            if let GetResult::Raw { key, bytes } = r {
                 blobs_map.insert(key, bytes);
             }
         }
 
-        let result_iterator = all_chunk_metadata.into_iter().map(move |meta| {
-            let array_blob = blobs_map.get(&meta.chunk_pk).ok_or(Error::NotFound)?;
-            let array = deserialize_array(array_blob.as_ref())?;
-
-            if meta.tombstone_pk != 0 {
-                let tombstone_blob = blobs_map.get(&meta.tombstone_pk).ok_or(Error::NotFound)?;
-                let bitmap = RoaringBitmap::deserialize_from(tombstone_blob.as_ref())
-                    .map_err(|e| Error::Io(e))?;
-                let filter_mask = BooleanArray::from_iter(
-                    (0..array.len()).map(|i| Some(!bitmap.contains(i as u32))),
-                );
-                Ok(compute::filter(&array, &filter_mask)?)
-            } else {
-                Ok(array)
-            }
+        let it = metas.into_iter().map(move |m| {
+            let blob = blobs_map.get(&m.chunk_pk).ok_or(Error::NotFound)?;
+            let array = deserialize_array(blob.as_ref())?;
+            Ok(array)
         });
 
-        Ok(Box::new(result_iterator))
+        Ok(Box::new(it))
     }
 
     pub fn create_sort_index(&self, field_id: LogicalFieldId) -> Result<()> {
@@ -870,7 +833,6 @@ impl Ord for HeapItem {
                     .downcast_ref::<Int32Array>()
                     .unwrap()
                     .value(0);
-                other_val.cmp(&self_val).reverse().reverse(); // same
                 self_val.cmp(&other_val)
             }
             _ => {

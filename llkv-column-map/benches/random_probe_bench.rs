@@ -36,19 +36,29 @@ const N_ROWS: usize = 1_000_000;
 const N_QUERIES: usize = 10_000;
 const SEED: u64 = 0xCBF2_A1B1_D3E4_F905;
 
+/// Build schema: row_id (u64, non-null) + data(u64 with field_id).
+fn schema_with_row_id(field_id: u64) -> Arc<Schema> {
+    let rid = Field::new("row_id", DataType::UInt64, false);
+    let mut md = HashMap::new();
+    md.insert("field_id".to_string(), field_id.to_string());
+    let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);
+    Arc::new(Schema::new(vec![rid, data_f]))
+}
+
 fn seed_store_1m() -> (ColumnStore<MemPager>, u64) {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
     let field_id: u64 = 42;
-    let mut md = HashMap::new();
-    md.insert("field_id".to_string(), field_id.to_string());
-    let field = Field::new("data", DataType::UInt64, false).with_metadata(md);
-    let schema = Arc::new(Schema::new(vec![field]));
+    let schema = schema_with_row_id(field_id);
 
+    // row_id 0..N-1; values 0..N-1
+    let rid: Vec<u64> = (0..N_ROWS as u64).collect();
     let vals: Vec<u64> = (0..N_ROWS as u64).collect();
-    let array = Arc::new(UInt64Array::from(vals));
-    let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+
+    let rid_arr = Arc::new(UInt64Array::from(rid));
+    let val_arr = Arc::new(UInt64Array::from(vals));
+    let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
 
     store.append(&batch).unwrap();
     store.create_sort_index(field_id).unwrap();

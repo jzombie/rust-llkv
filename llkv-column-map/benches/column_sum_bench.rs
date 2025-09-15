@@ -1,48 +1,70 @@
-use arrow::array::{Array, Int32Array, UInt64Array};
-use arrow::compute;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::ColumnStore;
-use roaring::RoaringBitmap;
+//! Simple and fragmented sum benches using the ColumnStore API.
+//!
+//! Notes for the new API:
+//! - Every RecordBatch must include a non-nullable UInt64 "row_id" column.
+//! - Only data columns carry "field_id" metadata.
+//!
+//! Run:
+//!   cargo bench --bench sum_and_fragment_bench
+
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
 
-// --- Constants for Benchmark Parameters ---
+use arrow::array::{Array, Int32Array, UInt64Array};
+use arrow::compute;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+
+use llkv_column_map::storage::pager::MemPager;
+use llkv_column_map::store::ColumnStore;
+
+use roaring::RoaringBitmap;
+
 const NUM_ROWS_SIMPLE: usize = 1_000_000;
 const NUM_ROWS_FRAGMENTED: u64 = 1_000_000;
 const NUM_CHUNKS_FRAGMENTED: u64 = 1_000;
 const CHUNK_SIZE_FRAGMENTED: u64 = NUM_ROWS_FRAGMENTED / NUM_CHUNKS_FRAGMENTED;
+
+/// Build a 2-field schema: row_id (u64, non-null) + one data field.
+fn schema_with_row_id(field: Field) -> Arc<Schema> {
+    let rid = Field::new("row_id", DataType::UInt64, false);
+    Arc::new(Schema::new(vec![rid, field]))
+}
 
 /// Benchmarks for simple, non-fragmented summation.
 fn bench_column_store_sum(c: &mut Criterion) {
     let mut group = c.benchmark_group("column_store_sum_1M");
     group.sample_size(20);
 
-    // --- Benchmark for u64 column ---
+    // --- u64 column ---
     group.bench_function("sum_u64", |b| {
         b.iter_batched(
-            // Setup: Create a store and append one chunk of 1M u64 values.
             || {
                 let pager = Arc::new(MemPager::new());
                 let store = ColumnStore::open(pager).unwrap();
-                let field_id = 7777;
+                let field_id = 7777u64;
 
-                let mut metadata = HashMap::new();
-                metadata.insert("field_id".to_string(), field_id.to_string());
-                let field = Field::new("data", DataType::UInt64, false).with_metadata(metadata);
-                let schema = Arc::new(Schema::new(vec![field]));
+                let mut md = HashMap::new();
+                md.insert("field_id".to_string(), field_id.to_string());
+                let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);
+                let schema = schema_with_row_id(data_f);
 
-                let vals: Vec<u64> = (0..NUM_ROWS_SIMPLE).map(|i| i as u64).collect();
-                let array = Arc::new(UInt64Array::from(vals));
-                let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+                // row_id 0..N-1, values 0..N-1 as u64
+                let rid: Vec<u64> = (0..NUM_ROWS_SIMPLE as u64).collect();
+                let vals: Vec<u64> = (0..NUM_ROWS_SIMPLE as u64).collect();
+
+                let rid_arr = Arc::new(UInt64Array::from(rid));
+                let val_arr = Arc::new(UInt64Array::from(vals));
+                let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
 
                 store.append(&batch).unwrap();
                 (store, field_id)
             },
-            // Measurement: Scan the column and sum the values in each array chunk.
             |(store, fid)| {
                 let mut acc: u128 = 0;
                 for array_result in store.scan(fid).unwrap() {
@@ -58,28 +80,30 @@ fn bench_column_store_sum(c: &mut Criterion) {
         );
     });
 
-    // --- Benchmark for i32 column ---
+    // --- i32 column ---
     group.bench_function("sum_i32", |b| {
         b.iter_batched(
-            // Setup: Create a store and append one chunk of 1M i32 values.
             || {
                 let pager = Arc::new(MemPager::new());
                 let store = ColumnStore::open(pager).unwrap();
-                let field_id = 8888;
+                let field_id = 8888u64;
 
-                let mut metadata = HashMap::new();
-                metadata.insert("field_id".to_string(), field_id.to_string());
-                let field = Field::new("data", DataType::Int32, false).with_metadata(metadata);
-                let schema = Arc::new(Schema::new(vec![field]));
+                let mut md = HashMap::new();
+                md.insert("field_id".to_string(), field_id.to_string());
+                let data_f = Field::new("data", DataType::Int32, false).with_metadata(md);
+                let schema = schema_with_row_id(data_f);
 
-                let vals: Vec<i32> = (0..NUM_ROWS_SIMPLE).map(|i| i as i32).collect();
-                let array = Arc::new(Int32Array::from(vals));
-                let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+                // row_id 0..N-1, values 0..N-1 as i32
+                let rid: Vec<u64> = (0..NUM_ROWS_SIMPLE as u64).collect();
+                let vals: Vec<i32> = (0..NUM_ROWS_SIMPLE as i32).collect();
+
+                let rid_arr = Arc::new(UInt64Array::from(rid));
+                let val_arr = Arc::new(Int32Array::from(vals));
+                let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
 
                 store.append(&batch).unwrap();
                 (store, field_id)
             },
-            // Measurement: Scan the column and sum the values in each array chunk.
             |(store, fid)| {
                 let mut acc: i128 = 0;
                 for array_result in store.scan(fid).unwrap() {
@@ -101,57 +125,69 @@ fn bench_column_store_sum(c: &mut Criterion) {
 /// Benchmarks for fragmented data with deletes and updates.
 fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
     let mut group = c.benchmark_group("column_store_fragmented_1M");
-    group.sample_size(10); // This is a slower test, so fewer samples.
+    group.sample_size(10); // slower
 
     group.bench_function("sum_u64_fragmented_with_deletes", |b| {
         b.iter_batched(
-            // --- Setup ---
             || {
-                let field_id = 9001;
+                let field_id = 9001u64;
                 let pager = Arc::new(MemPager::new());
                 let store = ColumnStore::open(pager).unwrap();
 
-                let mut metadata = HashMap::new();
-                metadata.insert("field_id".to_string(), field_id.to_string());
-                let field = Field::new("data", DataType::UInt64, false).with_metadata(metadata);
-                let schema = Arc::new(Schema::new(vec![field]));
+                let mut md = HashMap::new();
+                md.insert("field_id".to_string(), field_id.to_string());
+                let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);
+                let schema = schema_with_row_id(data_f);
 
-                // 1. Ingest data in many small, fragmented chunks.
-                let initial_data: Vec<u64> = (0..NUM_ROWS_FRAGMENTED).collect();
+                // 1) Ingest in many small, fragmented chunks.
+                // row_id is global 0..N-1 to keep absolute indices stable.
                 for i in 0..NUM_CHUNKS_FRAGMENTED {
-                    let start = (i * CHUNK_SIZE_FRAGMENTED) as usize;
-                    let end = start + CHUNK_SIZE_FRAGMENTED as usize;
-                    let array = Arc::new(UInt64Array::from(initial_data[start..end].to_vec()));
-                    let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+                    let start = (i * CHUNK_SIZE_FRAGMENTED) as u64;
+                    let end = start + CHUNK_SIZE_FRAGMENTED as u64;
+
+                    let rid: Vec<u64> = (start..end).collect();
+                    let vals: Vec<u64> = (start..end).collect();
+
+                    let rid_arr = Arc::new(UInt64Array::from(rid));
+                    let val_arr = Arc::new(UInt64Array::from(vals));
+                    let batch =
+                        RecordBatch::try_new(schema.clone(), vec![rid_arr, val_arr]).unwrap();
                     store.append(&batch).unwrap();
                 }
 
-                // 2. Delete every 10th row.
+                // 2) Delete every 10th row (absolute row index).
                 let rows_to_delete: RoaringBitmap = (0..NUM_ROWS_FRAGMENTED)
                     .step_by(10)
                     .map(|i| i as u32)
                     .collect();
                 store.delete_rows(field_id, &rows_to_delete).unwrap();
 
-                // 3. Append more data after the deletion.
-                let new_data: Vec<u64> =
-                    (NUM_ROWS_FRAGMENTED..NUM_ROWS_FRAGMENTED + CHUNK_SIZE_FRAGMENTED).collect();
-                let array = Arc::new(UInt64Array::from(new_data.clone()));
-                let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
-                store.append(&batch).unwrap();
+                // 3) Append one more chunk after deletions.
+                let start = NUM_ROWS_FRAGMENTED;
+                let end = start + CHUNK_SIZE_FRAGMENTED;
 
-                // 4. Pre-calculate the correct final sum.
-                let initial_sum: u128 = initial_data.iter().map(|&x| x as u128).sum();
+                let rid_new: Vec<u64> = (start..end).collect();
+                let vals_new: Vec<u64> = (start..end).collect();
+
+                let rid_arr_new = Arc::new(UInt64Array::from(rid_new.clone()));
+                let val_arr_new = Arc::new(UInt64Array::from(vals_new.clone()));
+                let batch_new =
+                    RecordBatch::try_new(schema.clone(), vec![rid_arr_new, val_arr_new]).unwrap();
+                store.append(&batch_new).unwrap();
+
+                // 4) Expected final sum.
+                let initial_sum: u128 = (0u64..NUM_ROWS_FRAGMENTED).map(|x| x as u128).sum();
+
                 let deleted_sum: u128 = rows_to_delete.iter().map(|x| x as u128).sum();
-                let new_sum: u128 = new_data.iter().map(|&x| x as u128).sum();
+
+                let new_sum: u128 = (start..end).map(|x| x as u128).sum();
+
                 let expected_final_sum = initial_sum - deleted_sum + new_sum;
 
                 (store, field_id, expected_final_sum)
             },
-            // --- Measurement and Verification ---
             |(store, fid, expected_sum)| {
                 let mut acc: u128 = 0;
-                // The scan will traverse all chunks, apply tombstones, and yield live rows.
                 for array_result in store.scan(fid).unwrap() {
                     let array = array_result.unwrap();
                     let u64_array = array.as_any().downcast_ref::<UInt64Array>().unwrap();
@@ -159,14 +195,13 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
                         acc += chunk_sum as u128;
                     }
                 }
-
-                // This is the crucial part: verify correctness inside the benchmark.
                 assert_eq!(acc, expected_sum);
                 black_box(acc);
             },
             BatchSize::SmallInput,
         );
     });
+
     group.finish();
 }
 
