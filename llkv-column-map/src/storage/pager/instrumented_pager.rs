@@ -52,12 +52,6 @@ where
 {
     type Blob = P::Blob;
 
-    fn get_raw(&self, key: PhysicalKey) -> Result<Option<Self::Blob>> {
-        self.stats.physical_gets.fetch_add(1, Ordering::Relaxed);
-        self.stats.get_batches.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_raw(key)
-    }
-
     fn batch_get(&self, gets: &[BatchGet]) -> Result<Vec<GetResult<Self::Blob>>> {
         self.stats
             .physical_gets

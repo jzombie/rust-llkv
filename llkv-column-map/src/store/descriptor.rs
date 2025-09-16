@@ -5,7 +5,7 @@
 
 use crate::codecs::{get_u32, get_u64, put_u32, put_u64};
 use crate::error::{Error, Result};
-use crate::storage::pager::Pager;
+use crate::storage::pager::{BatchGet, GetResult, Pager};
 use crate::types::{LogicalFieldId, PhysicalKey};
 use std::mem;
 
@@ -177,12 +177,17 @@ impl<'a, P: Pager> Iterator for DescriptorIterator<'a, P> {
                 if self.current_page_pk == 0 {
                     return None; // End of the chain
                 }
-                match self.pager.get_raw(self.current_page_pk) {
-                    Ok(Some(blob)) => {
-                        self.current_blob = Some(blob);
-                        self.cursor_in_page = 0;
-                    }
-                    Ok(None) => return Some(Err(Error::NotFound)),
+                match self.pager.batch_get(&[BatchGet::Raw {
+                    key: self.current_page_pk,
+                }]) {
+                    Ok(mut results) => match results.pop() {
+                        Some(GetResult::Raw { bytes, .. }) => {
+                            self.current_blob = Some(bytes);
+                            self.cursor_in_page = 0;
+                        }
+                        Some(GetResult::Missing { .. }) => return Some(Err(Error::NotFound)),
+                        None => return Some(Err(Error::Internal("batch_get empty result".into()))),
+                    },
                     Err(e) => return Some(Err(e.into())),
                 }
             }

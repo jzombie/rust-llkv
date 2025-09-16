@@ -143,9 +143,6 @@ fn split_varlen_offsets32(
             }
             j += 1;
         }
-        // BUG FIX: The number of elements to take must not exceed the remaining
-        // elements in the array. `j` can become `len + 1` if the inner loop
-        // finishes, which would create an out-of-bounds slice.
         let take = (j - i).min(len - i);
         out.push(arr.slice(i, take));
         i += take;
@@ -178,8 +175,6 @@ fn split_varlen_offsets64(
             }
             j += 1;
         }
-        // BUG FIX: The number of elements to take must not exceed the remaining
-        // elements in the array.
         let take = (j - i).min(len - i);
         out.push(arr.slice(i, take));
         i += take;
@@ -260,9 +255,14 @@ where
     }
 
     pub fn open_with_config(pager: Arc<P>, cfg: ColumnStoreConfig) -> Result<Self> {
-        let catalog = match pager.get_raw(CATALOG_ROOT_PKEY)? {
-            Some(blob) => ColumnCatalog::from_bytes(blob.as_ref())?,
-            None => ColumnCatalog::default(),
+        let catalog = match pager
+            .batch_get(&[BatchGet::Raw {
+                key: CATALOG_ROOT_PKEY,
+            }])?
+            .pop()
+        {
+            Some(GetResult::Raw { bytes, .. }) => ColumnCatalog::from_bytes(bytes.as_ref())?,
+            _ => ColumnCatalog::default(),
         };
         Ok(Self {
             pager,
@@ -483,11 +483,26 @@ where
             Some(pk) => *pk,
             None => return Ok(FxHashSet::default()),
         };
-        let desc_blob_data = self.pager.get_raw(desc_pk_data)?.ok_or(Error::NotFound)?;
+
+        // This is a TRUE BATCHING scenario.
+        let gets = vec![
+            BatchGet::Raw { key: desc_pk_data },
+            BatchGet::Raw { key: desc_pk_rid },
+        ];
+        let results = self.pager.batch_get(&gets)?;
+        let mut blobs_by_pk = FxHashMap::default();
+        for res in results {
+            if let GetResult::Raw { key, bytes } = res {
+                blobs_by_pk.insert(key, bytes);
+            }
+        }
+
+        let desc_blob_data = blobs_by_pk.remove(&desc_pk_data).ok_or(Error::NotFound)?;
         let mut descriptor_data = ColumnDescriptor::from_le_bytes(desc_blob_data.as_ref());
 
-        let desc_blob_rid = self.pager.get_raw(desc_pk_rid)?.ok_or(Error::NotFound)?;
+        let desc_blob_rid = blobs_by_pk.remove(&desc_pk_rid).ok_or(Error::NotFound)?;
         let mut descriptor_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
+
         let mut metas_data: Vec<ChunkMetadata> = Vec::new();
         let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
         for m in DescriptorIterator::new(self.pager.as_ref(), descriptor_data.head_page_pk) {
@@ -625,12 +640,21 @@ where
         let mut page_start_idx = 0usize;
 
         while current_page_pk != 0 {
-            let mut page_blob = self
+            // This is a sequential walk, so a single-item batch is appropriate.
+            let page_blob = self
                 .pager
-                .get_raw(current_page_pk)?
+                .batch_get(&[BatchGet::Raw {
+                    key: current_page_pk,
+                }])?
+                .pop()
+                .and_then(|res| match res {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
                 .ok_or(Error::NotFound)?
                 .as_ref()
                 .to_vec();
+
             let header =
                 DescriptorPageHeader::from_le_bytes(&page_blob[..DescriptorPageHeader::DISK_SIZE]);
             let n_on_page = header.entry_count as usize;
@@ -641,11 +665,14 @@ where
                 new_page_data.extend_from_slice(&m.to_le_bytes());
             }
 
-            page_blob.truncate(DescriptorPageHeader::DISK_SIZE);
-            page_blob.extend_from_slice(&new_page_data);
+            let mut final_page_bytes =
+                Vec::with_capacity(DescriptorPageHeader::DISK_SIZE + new_page_data.len());
+            final_page_bytes.extend_from_slice(&header.to_le_bytes());
+            final_page_bytes.extend_from_slice(&new_page_data);
+
             puts.push(BatchPut::Raw {
                 key: current_page_pk,
-                bytes: page_blob,
+                bytes: final_page_bytes,
             });
             current_page_pk = header.next_page_pk;
             page_start_idx = end_idx;
@@ -681,7 +708,23 @@ where
 
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
-        let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
+        let rid_fid = rowid_fid(field_id);
+        let desc_pk_rid = catalog.map.get(&rid_fid).copied();
+
+        // True batching: fetch both descriptors at once if they exist.
+        let mut gets = vec![BatchGet::Raw { key: descriptor_pk }];
+        if let Some(pk) = desc_pk_rid {
+            gets.push(BatchGet::Raw { key: pk });
+        }
+        let results = self.pager.batch_get(&gets)?;
+        let mut blobs_by_pk = FxHashMap::default();
+        for res in results {
+            if let GetResult::Raw { key, bytes } = res {
+                blobs_by_pk.insert(key, bytes);
+            }
+        }
+
+        let desc_blob = blobs_by_pk.remove(&descriptor_pk).ok_or(Error::NotFound)?;
         let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
         // Gather metadata for data column.
@@ -697,19 +740,15 @@ where
         }
 
         // Optional: corresponding shadow row_id descriptor + metas.
-        let rid_fid = rowid_fid(field_id);
-        let desc_pk_rid = catalog.map.get(&rid_fid).copied();
-
         let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
         let mut descriptor_rid: Option<ColumnDescriptor> = None;
         if let Some(pk) = desc_pk_rid {
-            let desc_blob_rid = self.pager.get_raw(pk)?.ok_or(Error::NotFound)?;
-            descriptor_rid = Some(ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref()));
-            for m in DescriptorIterator::new(
-                self.pager.as_ref(),
-                descriptor_rid.as_ref().unwrap().head_page_pk,
-            ) {
-                metas_rid.push(m?);
+            if let Some(desc_blob_rid) = blobs_by_pk.remove(&pk) {
+                let d_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
+                for m in DescriptorIterator::new(self.pager.as_ref(), d_rid.head_page_pk) {
+                    metas_rid.push(m?);
+                }
+                descriptor_rid = Some(d_rid);
             }
         }
 
@@ -758,9 +797,23 @@ where
             }
 
             let keep = BooleanArray::from_iter((0..rows).map(|j| Some(!del_local.contains(&j))));
+
+            // Batch fetch the data and row_id chunks to be rewritten
+            let mut chunk_gets = vec![BatchGet::Raw { key: meta.chunk_pk }];
+            if let Some(rm) = metas_rid.get(i) {
+                chunk_gets.push(BatchGet::Raw { key: rm.chunk_pk });
+            }
+            let chunk_results = self.pager.batch_get(&chunk_gets)?;
+            let mut chunk_blobs = FxHashMap::default();
+            for res in chunk_results {
+                if let GetResult::Raw { key, bytes } = res {
+                    chunk_blobs.insert(key, bytes);
+                }
+            }
+
             // Rewrite data chunk in place.
-            let data_blob = self.pager.get_raw(meta.chunk_pk)?.ok_or(Error::NotFound)?;
-            let data_arr = deserialize_array(data_blob.clone())?;
+            let data_blob = chunk_blobs.remove(&meta.chunk_pk).ok_or(Error::NotFound)?;
+            let data_arr = deserialize_array(data_blob)?;
             let data_f = compute::filter(&data_arr, &keep)?;
             let data_bytes = serialize_array(&data_f)?;
             puts.push(BatchPut::Raw {
@@ -771,9 +824,9 @@ where
             meta.serialized_bytes = data_f.get_array_memory_size() as u64;
 
             // Rewrite matching shadow row_id chunk, if present.
-            if let (Some(_pk), Some(rm)) = (desc_pk_rid, metas_rid.get_mut(i)) {
-                let rid_blob = self.pager.get_raw(rm.chunk_pk)?.ok_or(Error::NotFound)?;
-                let rid_arr = deserialize_array(rid_blob.clone())?;
+            if let (Some(_), Some(rm)) = (desc_pk_rid, metas_rid.get_mut(i)) {
+                let rid_blob = chunk_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?;
+                let rid_arr = deserialize_array(rid_blob)?;
                 let rid_f = compute::filter(&rid_arr, &keep)?;
                 let rid_bytes = serialize_array(&rid_f)?;
                 puts.push(BatchPut::Raw {
@@ -833,7 +886,15 @@ where
         let mut old_pages = Vec::new();
         let mut pk = descriptor.head_page_pk;
         while pk != 0 {
-            let page_blob = self.pager.get_raw(pk)?.ok_or(Error::NotFound)?;
+            let page_blob = self
+                .pager
+                .batch_get(&[BatchGet::Raw { key: pk }])?
+                .pop()
+                .and_then(|res| match res {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
+                .ok_or(Error::NotFound)?;
             let header = DescriptorPageHeader::from_le_bytes(
                 &page_blob.as_ref()[..DescriptorPageHeader::DISK_SIZE],
             );
@@ -926,10 +987,24 @@ where
             Some(&pk) => pk,
             None => return Ok(()),
         };
-        let desc_blob = self.pager.get_raw(desc_pk)?.ok_or(Error::NotFound)?;
+
+        // True batching for the two descriptor reads.
+        let gets = vec![
+            BatchGet::Raw { key: desc_pk },
+            BatchGet::Raw { key: desc_pk_rid },
+        ];
+        let results = self.pager.batch_get(&gets)?;
+        let mut blobs_by_pk = FxHashMap::default();
+        for res in results {
+            if let GetResult::Raw { key, bytes } = res {
+                blobs_by_pk.insert(key, bytes);
+            }
+        }
+        let desc_blob = blobs_by_pk.remove(&desc_pk).ok_or(Error::NotFound)?;
         let mut desc = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-        let desc_blob_rid = self.pager.get_raw(desc_pk_rid)?.ok_or(Error::NotFound)?;
+        let desc_blob_rid = blobs_by_pk.remove(&desc_pk_rid).ok_or(Error::NotFound)?;
         let mut desc_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
+
         // Load metas.
         let mut metas = Vec::new();
         for m in DescriptorIterator::new(self.pager.as_ref(), desc.head_page_pk) {
@@ -1144,7 +1219,16 @@ where
             Some(pk) => pk,
             None => return Ok(Box::new(std::iter::empty())),
         };
-        let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
+
+        let desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
         let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
         let mut metas = Vec::new();
@@ -1159,8 +1243,16 @@ where
         if metas.len() == 1 {
             let blob = self
                 .pager
-                .get_raw(metas[0].chunk_pk)?
+                .batch_get(&[BatchGet::Raw {
+                    key: metas[0].chunk_pk,
+                }])?
+                .pop()
+                .and_then(|r| match r {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
                 .ok_or(Error::NotFound)?;
+
             let arr = deserialize_array(blob)?;
             return Ok(Box::new(std::iter::once(Ok(arr))));
         }
@@ -1194,7 +1286,16 @@ where
     pub fn create_sort_index(&self, field_id: LogicalFieldId) -> Result<()> {
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
-        let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
+
+        let desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
         let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
         let mut all_chunk_metadata = Vec::new();
@@ -1244,12 +1345,20 @@ where
         let mut current_page_pk = descriptor.head_page_pk;
         let mut page_start_chunk_idx = 0;
         while current_page_pk != 0 {
-            let mut page_blob = self
+            let page_blob = self
                 .pager
-                .get_raw(current_page_pk)?
+                .batch_get(&[BatchGet::Raw {
+                    key: current_page_pk,
+                }])?
+                .pop()
+                .and_then(|r| match r {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
                 .ok_or(Error::NotFound)?
                 .as_ref()
                 .to_vec();
+
             let header =
                 DescriptorPageHeader::from_le_bytes(&page_blob[..DescriptorPageHeader::DISK_SIZE]);
             let chunks_on_this_page = header.entry_count as usize;
@@ -1260,11 +1369,14 @@ where
                 new_page_data.extend_from_slice(&chunk_meta.to_le_bytes());
             }
 
-            page_blob.truncate(DescriptorPageHeader::DISK_SIZE);
-            page_blob.extend_from_slice(&new_page_data);
+            let mut final_page_bytes =
+                Vec::with_capacity(DescriptorPageHeader::DISK_SIZE + new_page_data.len());
+            final_page_bytes.extend_from_slice(&header.to_le_bytes());
+            final_page_bytes.extend_from_slice(&new_page_data);
+
             puts.push(BatchPut::Raw {
                 key: current_page_pk,
-                bytes: page_blob,
+                bytes: final_page_bytes,
             });
             current_page_pk = header.next_page_pk;
             page_start_chunk_idx = page_end_chunk_idx;
@@ -1277,7 +1389,16 @@ where
     pub fn scan_sorted(&self, field_id: LogicalFieldId) -> Result<MergeSortedIterator> {
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
-        let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
+
+        let desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
         let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
         let mut all_chunk_metadata = Vec::new();
@@ -1320,18 +1441,29 @@ where
         descriptor_pk: PhysicalKey,
         field_id: LogicalFieldId,
     ) -> Result<(ColumnDescriptor, Vec<u8>)> {
-        match self.pager.get_raw(descriptor_pk)? {
-            Some(blob) => {
-                let descriptor = ColumnDescriptor::from_le_bytes(blob.as_ref());
+        match self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+        {
+            Some(GetResult::Raw { bytes, .. }) => {
+                let descriptor = ColumnDescriptor::from_le_bytes(bytes.as_ref());
                 let tail_page_bytes = self
                     .pager
-                    .get_raw(descriptor.tail_page_pk)?
+                    .batch_get(&[BatchGet::Raw {
+                        key: descriptor.tail_page_pk,
+                    }])?
+                    .pop()
+                    .and_then(|r| match r {
+                        GetResult::Raw { bytes, .. } => Some(bytes),
+                        _ => None,
+                    })
                     .ok_or(Error::NotFound)?
                     .as_ref()
                     .to_vec();
                 Ok((descriptor, tail_page_bytes))
             }
-            None => {
+            _ => {
                 let first_page_pk = self.pager.alloc_many(1)?[0];
                 let descriptor = ColumnDescriptor {
                     field_id,
@@ -1412,12 +1544,20 @@ where
     pub fn verify_integrity(&self) -> Result<()> {
         let catalog = self.catalog.read().unwrap();
         for (&field_id, &descriptor_pk) in &catalog.map {
-            let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or_else(|| {
-                Error::Internal(format!(
-                    "Catalog points to missing descriptor pk={}",
-                    descriptor_pk
-                ))
-            })?;
+            let desc_blob = self
+                .pager
+                .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+                .pop()
+                .and_then(|r| match r {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    Error::Internal(format!(
+                        "Catalog points to missing descriptor pk={}",
+                        descriptor_pk
+                    ))
+                })?;
             let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
             if descriptor.field_id != field_id {
                 return Err(Error::Internal(format!(
@@ -1430,12 +1570,22 @@ where
             let mut actual_chunks = 0;
             let mut current_page_pk = descriptor.head_page_pk;
             while current_page_pk != 0 {
-                let page_blob = self.pager.get_raw(current_page_pk)?.ok_or_else(|| {
-                    Error::Internal(format!(
-                        "Descriptor page chain broken at pk={}",
-                        current_page_pk
-                    ))
-                })?;
+                let page_blob = self
+                    .pager
+                    .batch_get(&[BatchGet::Raw {
+                        key: current_page_pk,
+                    }])?
+                    .pop()
+                    .and_then(|r| match r {
+                        GetResult::Raw { bytes, .. } => Some(bytes),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        Error::Internal(format!(
+                            "Descriptor page chain broken at pk={}",
+                            current_page_pk
+                        ))
+                    })?;
                 let header = DescriptorPageHeader::from_le_bytes(
                     &page_blob.as_ref()[..DescriptorPageHeader::DISK_SIZE],
                 );
@@ -1474,7 +1624,15 @@ where
         let mut all_stats = Vec::new();
 
         for (&field_id, &descriptor_pk) in &catalog.map {
-            let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
+            let desc_blob = self
+                .pager
+                .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+                .pop()
+                .and_then(|r| match r {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
+                .ok_or(Error::NotFound)?;
             let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
             let mut page_stats = Vec::new();
@@ -1482,7 +1640,14 @@ where
             while current_page_pk != 0 {
                 let page_blob = self
                     .pager
-                    .get_raw(current_page_pk)?
+                    .batch_get(&[BatchGet::Raw {
+                        key: current_page_pk,
+                    }])?
+                    .pop()
+                    .and_then(|r| match r {
+                        GetResult::Raw { bytes, .. } => Some(bytes),
+                        _ => None,
+                    })
                     .ok_or(Error::NotFound)?;
                 let header = DescriptorPageHeader::from_le_bytes(
                     &page_blob.as_ref()[..DescriptorPageHeader::DISK_SIZE],
@@ -1519,6 +1684,7 @@ struct HeapItem {
     cursor_idx: usize,
     /// The index into the `data_sorted` array for the current cursor.
     data_idx: usize,
+    // TODO: Why is this u128?
     key_u128: u128,
 }
 

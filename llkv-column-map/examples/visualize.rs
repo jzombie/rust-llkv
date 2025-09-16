@@ -30,11 +30,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use llkv_column_map::{
     ColumnStore,
-    storage::pager::{MemPager, Pager},
+    storage::pager::{BatchGet, GetResult, MemPager, Pager},
     store::catalog::ColumnCatalog,
     store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorPageHeader},
     types::{LogicalFieldId, Namespace, PhysicalKey},
@@ -54,6 +55,9 @@ const C3_ROWS: usize = 5_000;
 use arrow::array::{Array, ArrayRef, BinaryBuilder, UInt32Array, UInt64Array};
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
+
+// Global counter to ensure unique row_ids across batches.
+static NEXT_ROW_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Helper to create a standard user-data LogicalFieldId.
 fn fid(id: u32) -> LogicalFieldId {
@@ -117,7 +121,11 @@ fn batch_from_pairs(pairs: &[(LogicalFieldId, ArrayRef)]) -> RecordBatch {
         pairs[0].1.len()
     };
     let row_id_field = Field::new("row_id", arrow::datatypes::DataType::UInt64, false);
-    let row_id_array = Arc::new(UInt64Array::from_iter_values(0..num_rows as u64)) as ArrayRef;
+    let start_row_id = NEXT_ROW_ID.fetch_add(num_rows as u64, Ordering::Relaxed);
+    let end_row_id = start_row_id + num_rows as u64;
+    let row_id_array =
+        Arc::new(UInt64Array::from_iter_values(start_row_id..end_row_id)) as ArrayRef;
+
     let mut final_fields = vec![row_id_field];
     final_fields.extend(fields);
     let mut final_arrays = vec![row_id_array];
@@ -152,18 +160,40 @@ fn discover_all_pks<P: Pager>(pager: &P) -> Vec<PhysicalKey> {
     let mut out = Vec::new();
     out.push(ROOT_PK);
 
-    if let Some(cat_blob) = pager.get_raw(ROOT_PK).unwrap() {
+    if let Some(GetResult::Raw {
+        bytes: cat_blob, ..
+    }) = pager
+        .batch_get(&[BatchGet::Raw { key: ROOT_PK }])
+        .unwrap()
+        .pop()
+    {
         let cat = ColumnCatalog::from_bytes(cat_blob.as_ref()).unwrap();
         for (_fid, desc_pk) in cat.map.iter() {
             out.push(*desc_pk);
 
             // Walk descriptor pages
-            let desc_blob = pager.get_raw(*desc_pk).unwrap().unwrap();
+            let desc_blob = pager
+                .batch_get(&[BatchGet::Raw { key: *desc_pk }])
+                .unwrap()
+                .pop()
+                .and_then(|r| match r {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
+                .unwrap();
             let desc = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
             let mut page_pk = desc.head_page_pk;
             while page_pk != 0 {
                 out.push(page_pk);
-                let page_blob = pager.get_raw(page_pk).unwrap().unwrap();
+                let page_blob = pager
+                    .batch_get(&[BatchGet::Raw { key: page_pk }])
+                    .unwrap()
+                    .pop()
+                    .and_then(|r| match r {
+                        GetResult::Raw { bytes, .. } => Some(bytes),
+                        _ => None,
+                    })
+                    .unwrap();
                 let bytes = page_blob.as_ref();
                 let hdr_sz = DescriptorPageHeader::DISK_SIZE;
                 let hd = DescriptorPageHeader::from_le_bytes(&bytes[..hdr_sz]);
@@ -206,7 +236,13 @@ fn render_one_colored_dot<P: Pager>(
     // Catalog
     let cat_pk = ROOT_PK;
     let cat_color = color_for_batch(*created_in_batch.get(&cat_pk).unwrap_or(&0));
-    if let Some(cat_blob) = pager.get_raw(cat_pk).unwrap() {
+    if let Some(GetResult::Raw {
+        bytes: cat_blob, ..
+    }) = pager
+        .batch_get(&[BatchGet::Raw { key: cat_pk }])
+        .unwrap()
+        .pop()
+    {
         let cat = ColumnCatalog::from_bytes(cat_blob.as_ref()).unwrap();
         writeln!(
             &mut s,
@@ -221,7 +257,15 @@ fn render_one_colored_dot<P: Pager>(
 
         // Columns and descriptor chains
         for (fid, desc_pk) in cat.map.iter() {
-            let desc_blob = pager.get_raw(*desc_pk).unwrap().unwrap();
+            let desc_blob = pager
+                .batch_get(&[BatchGet::Raw { key: *desc_pk }])
+                .unwrap()
+                .pop()
+                .and_then(|r| match r {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
+                .unwrap();
             let desc = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
             let dcol = color_for_batch(*created_in_batch.get(desc_pk).unwrap_or(&0));
             writeln!(
@@ -238,7 +282,15 @@ fn render_one_colored_dot<P: Pager>(
             let mut prev_page: Option<PhysicalKey> = None;
             while page_pk != 0 {
                 let pcol = color_for_batch(*created_in_batch.get(&page_pk).unwrap_or(&0));
-                let page_blob = pager.get_raw(page_pk).unwrap().unwrap();
+                let page_blob = pager
+                    .batch_get(&[BatchGet::Raw { key: page_pk }])
+                    .unwrap()
+                    .pop()
+                    .and_then(|r| match r {
+                        GetResult::Raw { bytes, .. } => Some(bytes),
+                        _ => None,
+                    })
+                    .unwrap();
                 let bytes = page_blob.as_ref();
                 let hdr_sz = DescriptorPageHeader::DISK_SIZE;
                 let hd = DescriptorPageHeader::from_le_bytes(&bytes[..hdr_sz]);
@@ -264,7 +316,11 @@ fn render_one_colored_dot<P: Pager>(
                     let meta = ChunkMetadata::from_le_bytes(&bytes[off..end]);
 
                     // Data blob
-                    if let Some(b) = pager.get_raw(meta.chunk_pk).unwrap() {
+                    if let Some(GetResult::Raw { bytes: b, .. }) = pager
+                        .batch_get(&[BatchGet::Raw { key: meta.chunk_pk }])
+                        .unwrap()
+                        .pop()
+                    {
                         let len = b.as_ref().len();
                         let col =
                             color_for_batch(*created_in_batch.get(&meta.chunk_pk).unwrap_or(&0));
@@ -280,7 +336,13 @@ fn render_one_colored_dot<P: Pager>(
 
                     // Value-order permutation
                     if meta.value_order_perm_pk != 0 {
-                        if let Some(b) = pager.get_raw(meta.value_order_perm_pk).unwrap() {
+                        if let Some(GetResult::Raw { bytes: b, .. }) = pager
+                            .batch_get(&[BatchGet::Raw {
+                                key: meta.value_order_perm_pk,
+                            }])
+                            .unwrap()
+                            .pop()
+                        {
                             let len = b.as_ref().len();
                             let col = color_for_batch(
                                 *created_in_batch
@@ -343,7 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // record creation batch for each physical key we ever see
     // batch 0 = pre-existing (bootstrap, manifest)
     let mut created_in_batch: HashMap<PhysicalKey, usize> = HashMap::new();
-    for pk in discover_all_pks(&*pager) {
+    for pk in discover_all_pks(pager.as_ref()) {
         created_in_batch.insert(pk, 0);
     }
 
@@ -390,7 +452,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  batch {}: rows [{}..{}) in {:?}", b + 1, start, end, dt);
 
         // mark new physical keys as created in this batch (b+1)
-        for pk in discover_all_pks(&*pager) {
+        for pk in discover_all_pks(pager.as_ref()) {
             created_in_batch.entry(pk).or_insert(b + 1);
         }
     }
@@ -413,7 +475,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         use llkv_column_map::storage::pager::BatchGet;
         use std::fmt::Write;
         let mut s = String::new();
-        let all_pks = discover_all_pks(&*pager);
+        let all_pks = discover_all_pks(pager.as_ref());
         let gets: Vec<BatchGet> = all_pks.iter().map(|&k| BatchGet::Raw { key: k }).collect();
         let res = pager.batch_get(&gets).unwrap();
         writeln!(&mut s, "==== STORAGE ASCII ====").unwrap();
@@ -432,7 +494,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", ascii);
 
     // ONE final DOT with batch-colored nodes
-    let dot = render_one_colored_dot(&*pager, &created_in_batch);
+    let dot = render_one_colored_dot(pager.as_ref(), &created_in_batch);
     std::fs::write("storage_layout.dot", dot)?;
     println!("Wrote storage_layout.dot (single graph, nodes colored by batch)");
 

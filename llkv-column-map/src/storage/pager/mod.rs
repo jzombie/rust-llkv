@@ -34,9 +34,6 @@ pub trait Pager: Send + Sync + 'static {
     /// Allocate `n` new physical keys.
     fn alloc_many(&self, n: usize) -> Result<Vec<PhysicalKey>>;
 
-    /// Get a single blob by key.
-    fn get_raw(&self, key: PhysicalKey) -> Result<Option<Self::Blob>>;
-
     /// Batch get blobs; returns one `GetResult` per request in order.
     fn batch_get(&self, gets: &[BatchGet]) -> Result<Vec<GetResult<Self::Blob>>>;
 

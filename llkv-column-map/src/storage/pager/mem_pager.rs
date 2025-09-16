@@ -44,14 +44,6 @@ impl Pager for MemPager {
         Ok((start..start + n_u64).collect())
     }
 
-    fn get_raw(&self, key: PhysicalKey) -> Result<Option<Self::Blob>> {
-        let map = self
-            .blobs
-            .read()
-            .expect("MemPager blobs read lock poisoned");
-        Ok(map.get(&key).cloned())
-    }
-
     fn batch_put(&self, puts: &[BatchPut]) -> Result<()> {
         let mut map = self
             .blobs
