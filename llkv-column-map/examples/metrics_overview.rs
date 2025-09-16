@@ -326,17 +326,6 @@ fn render_storage_ascii<P: Pager>(pager: &P) -> String {
                     .map(|b| b.as_ref().len())
                     .unwrap_or(0);
 
-                let tomb = if meta.tombstone_pk != 0 {
-                    pager
-                        .get_raw(meta.tombstone_pk)
-                        .unwrap()
-                        .as_ref()
-                        .map(|b| b.as_ref().len())
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
-
                 let perm = if meta.value_order_perm_pk != 0 {
                     pager
                         .get_raw(meta.value_order_perm_pk)
@@ -350,8 +339,8 @@ fn render_storage_ascii<P: Pager>(pager: &P) -> String {
 
                 writeln!(
                     &mut s,
-                    "      chunk pk={} rows={} data={}B tomb={}B perm={}B",
-                    meta.chunk_pk, meta.row_count, data_len, tomb, perm
+                    "      chunk pk={} rows={} data={}B perm={}B",
+                    meta.chunk_pk, meta.row_count, data_len, perm
                 )
                 .unwrap();
             }

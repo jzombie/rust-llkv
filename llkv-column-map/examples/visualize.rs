@@ -153,9 +153,6 @@ fn discover_all_pks<P: Pager>(pager: &P) -> Vec<PhysicalKey> {
                     let end = off + ChunkMetadata::DISK_SIZE;
                     let meta = ChunkMetadata::from_le_bytes(&bytes[off..end]);
                     out.push(meta.chunk_pk);
-                    if meta.tombstone_pk != 0 {
-                        out.push(meta.tombstone_pk);
-                    }
                     if meta.value_order_perm_pk != 0 {
                         out.push(meta.value_order_perm_pk);
                     }
@@ -258,24 +255,6 @@ fn render_one_colored_dot<P: Pager>(
                         )
                         .unwrap();
                         writeln!(&mut s, "  n{} -> n{};", page_pk, meta.chunk_pk).unwrap();
-                    }
-
-                    // Tombstone
-                    if meta.tombstone_pk != 0 {
-                        if let Some(b) = pager.get_raw(meta.tombstone_pk).unwrap() {
-                            let len = b.as_ref().len();
-                            let col = color_for_batch(
-                                *created_in_batch.get(&meta.tombstone_pk).unwrap_or(&0),
-                            );
-                            writeln!(
-                                &mut s,
-                                "  n{} [label=\"Tombstone pk={} bytes={}\" \
-                                 style=filled fillcolor={}];",
-                                meta.tombstone_pk, meta.tombstone_pk, len, col
-                            )
-                            .unwrap();
-                            writeln!(&mut s, "  n{} -> n{};", page_pk, meta.tombstone_pk).unwrap();
-                        }
                     }
 
                     // Value-order permutation

@@ -17,7 +17,6 @@ use std::mem;
 #[repr(C)]
 pub struct ChunkMetadata {
     pub chunk_pk: PhysicalKey,
-    pub tombstone_pk: PhysicalKey,        // Using 0 as None
     pub value_order_perm_pk: PhysicalKey, // Using 0 as None
     pub row_count: u64,
     pub serialized_bytes: u64,
@@ -32,7 +31,6 @@ impl ChunkMetadata {
     pub fn to_le_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::DISK_SIZE);
         buf.extend_from_slice(&self.chunk_pk.to_le_bytes());
-        buf.extend_from_slice(&self.tombstone_pk.to_le_bytes());
         buf.extend_from_slice(&self.value_order_perm_pk.to_le_bytes());
         buf.extend_from_slice(&self.row_count.to_le_bytes());
         buf.extend_from_slice(&self.serialized_bytes.to_le_bytes());
@@ -49,7 +47,6 @@ impl ChunkMetadata {
             v
         };
         let chunk_pk = rd(&mut o);
-        let tombstone_pk = rd(&mut o);
         let value_order_perm_pk = rd(&mut o);
         let row_count = rd(&mut o);
         let serialized_bytes = rd(&mut o);
@@ -58,7 +55,6 @@ impl ChunkMetadata {
 
         Self {
             chunk_pk,
-            tombstone_pk,
             value_order_perm_pk,
             row_count,
             serialized_bytes,

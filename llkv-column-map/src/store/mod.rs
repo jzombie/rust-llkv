@@ -10,7 +10,8 @@ use crate::store::descriptor::{
 use crate::types::{CATALOG_ROOT_PKEY, LogicalFieldId, PhysicalKey};
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Int32Array, UInt32Array, UInt64Array, make_array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, LargeBinaryArray, LargeStringArray,
+    StringArray, UInt32Array, UInt64Array, make_array,
 };
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;
@@ -103,8 +104,73 @@ fn fixed_width_bpv(dt: &DataType) -> Option<usize> {
     }
 }
 
-/// Split array into ~target_bytes slices. Fixed-width uses bytes-based rows,
-/// variable-width falls back to a conservative row count.
+/// Split variable-width arrays (Utf8/Binary) using their offset buffers so each
+/// slice is ~target_bytes of values payload. Offsets are 32-bit here.
+#[inline]
+fn split_varlen_offsets32(
+    offsets: &[i32],
+    len: usize,
+    arr: &ArrayRef,
+    target_bytes: usize,
+) -> Vec<ArrayRef> {
+    let mut out = Vec::new();
+    if len == 0 {
+        return out;
+    }
+    let base = offsets[0] as i64;
+    let mut i = 0usize;
+    // Ensure at least 1 row per slice; pack until ~target_bytes.
+    while i < len {
+        let start_off = (offsets[i] as i64 - base) as usize;
+        let mut j = i + 1;
+        while j <= len {
+            let end_off = (offsets[j] as i64 - base) as usize;
+            let bytes = end_off - start_off;
+            if bytes >= target_bytes && j > i {
+                break;
+            }
+            j += 1;
+        }
+        out.push(arr.slice(i, j - i));
+        i = j;
+    }
+    out
+}
+
+/// Same as above but for LargeUtf8/LargeBinary (64-bit offsets).
+#[inline]
+fn split_varlen_offsets64(
+    offsets: &[i64],
+    len: usize,
+    arr: &ArrayRef,
+    target_bytes: usize,
+) -> Vec<ArrayRef> {
+    let mut out = Vec::new();
+    if len == 0 {
+        return out;
+    }
+    let base = offsets[0];
+    let mut i = 0usize;
+    while i < len {
+        let start_off = (offsets[i] - base) as usize;
+        let mut j = i + 1;
+        while j <= len {
+            let end_off = (offsets[j] - base) as usize;
+            let bytes = end_off - start_off;
+            if bytes >= target_bytes && j > i {
+                break;
+            }
+            j += 1;
+        }
+        out.push(arr.slice(i, j - i));
+        i = j;
+    }
+    out
+}
+
+/// Split array into ~target_bytes slices. Fixed-width uses bytes-based rows.
+/// For var-width (Utf8/Binary), we use offsets to target value-bytes per slice.
+/// For other exotic var-width types, we conservatively fall back to a row cap.
 fn split_to_target_bytes(arr: &ArrayRef, target_bytes: usize) -> Vec<ArrayRef> {
     let n = arr.len();
     if n == 0 {
@@ -121,16 +187,39 @@ fn split_to_target_bytes(arr: &ArrayRef, target_bytes: usize) -> Vec<ArrayRef> {
         }
         return out;
     }
-    // Variable-width fallback.
-    let rows_per = 4096usize;
-    let mut out = Vec::with_capacity((n + rows_per - 1) / rows_per);
-    let mut off = 0usize;
-    while off < n {
-        let take = (n - off).min(rows_per);
-        out.push(arr.slice(off, take));
-        off += take;
+
+    // Handle common var-width types using their offsets, after zeroing slice offset.
+    let arr0 = zero_offset(arr);
+    match arr0.data_type() {
+        DataType::Utf8 => {
+            let a = arr0.as_any().downcast_ref::<StringArray>().unwrap();
+            split_varlen_offsets32(a.value_offsets(), n, &arr0, target_bytes)
+        }
+        DataType::Binary => {
+            let a = arr0.as_any().downcast_ref::<BinaryArray>().unwrap();
+            split_varlen_offsets32(a.value_offsets(), n, &arr0, target_bytes)
+        }
+        DataType::LargeUtf8 => {
+            let a = arr0.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            split_varlen_offsets64(a.value_offsets(), n, &arr0, target_bytes)
+        }
+        DataType::LargeBinary => {
+            let a = arr0.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            split_varlen_offsets64(a.value_offsets(), n, &arr0, target_bytes)
+        }
+        // Fallback for other var-width types (e.g., List/Struct/Map): conservative row cap.
+        _ => {
+            let rows_per = 4096usize; // last-resort cap to avoid pathological slices
+            let mut out = Vec::with_capacity((n + rows_per - 1) / rows_per);
+            let mut off = 0usize;
+            while off < n {
+                let take = (n - off).min(rows_per);
+                out.push(arr.slice(off, take));
+                off += take;
+            }
+            out
+        }
     }
-    out
 }
 
 pub struct ColumnStore<P: Pager> {
@@ -272,7 +361,6 @@ where
                 });
                 let data_meta = ChunkMetadata {
                     chunk_pk: data_pk,
-                    tombstone_pk: 0,
                     value_order_perm_pk: 0,
                     row_count: rows as u64,
                     serialized_bytes: s_norm.get_array_memory_size() as u64,
@@ -296,7 +384,6 @@ where
                 });
                 let rid_meta = ChunkMetadata {
                     chunk_pk: rid_pk,
-                    tombstone_pk: 0,
                     value_order_perm_pk: 0,
                     row_count: rows as u64,
                     serialized_bytes: rid_norm.get_array_memory_size() as u64,
@@ -659,7 +746,6 @@ where
 
             meta.row_count = data_f.len() as u64;
             meta.serialized_bytes = data_f.get_array_memory_size() as u64;
-            meta.tombstone_pk = 0;
 
             // Rewrite matching shadow row_id chunk, if present.
             if let (Some(_pk), Some(rm)) = (desc_pk_rid, metas_rid.get_mut(i)) {
@@ -674,7 +760,6 @@ where
 
                 rm.row_count = rid_f.len() as u64;
                 rm.serialized_bytes = rid_f.get_array_memory_size() as u64;
-                rm.tombstone_pk = 0;
             }
 
             // If a sorted permutation exists for this chunk, refresh it.
@@ -945,7 +1030,6 @@ where
 
                 let mut meta = ChunkMetadata {
                     chunk_pk: data_pk,
-                    tombstone_pk: 0,
                     value_order_perm_pk: 0,
                     row_count: rows as u64,
                     serialized_bytes: s_norm.get_array_memory_size() as u64,
@@ -970,7 +1054,6 @@ where
 
                 let rid_meta = ChunkMetadata {
                     chunk_pk: rid_pk,
-                    tombstone_pk: 0,
                     value_order_perm_pk: 0,
                     row_count: rows as u64,
                     serialized_bytes: rid_norm.get_array_memory_size() as u64,
@@ -1020,7 +1103,7 @@ where
         self.write_descriptor_chain(
             desc_pk_rid,
             &mut desc_rid,
-            &new_rid_metas,
+            &mut new_rid_metas,
             &mut puts,
             &mut frees,
         )?;
