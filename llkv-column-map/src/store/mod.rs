@@ -268,14 +268,14 @@ where
                 let data_bytes = serialize_array(s_norm.as_ref())?;
                 puts_appends.push(BatchPut::Raw {
                     key: data_pk,
-                    bytes: data_bytes.clone(),
+                    bytes: data_bytes,
                 });
                 let data_meta = ChunkMetadata {
                     chunk_pk: data_pk,
                     tombstone_pk: 0,
                     value_order_perm_pk: 0,
                     row_count: rows as u64,
-                    serialized_bytes: data_bytes.len() as u64,
+                    serialized_bytes: s_norm.get_array_memory_size() as u64,
                     min_val_u64: 0,
                     max_val_u64: u64::MAX,
                 };
@@ -292,14 +292,14 @@ where
                 let rid_bytes = serialize_array(rid_norm.as_ref())?;
                 puts_appends.push(BatchPut::Raw {
                     key: rid_pk,
-                    bytes: rid_bytes.clone(),
+                    bytes: rid_bytes,
                 });
                 let rid_meta = ChunkMetadata {
                     chunk_pk: rid_pk,
                     tombstone_pk: 0,
                     value_order_perm_pk: 0,
                     row_count: rows as u64,
-                    serialized_bytes: rid_bytes.len() as u64,
+                    serialized_bytes: rid_norm.get_array_memory_size() as u64,
                     min_val_u64: 0,
                     max_val_u64: u64::MAX,
                 };
@@ -487,17 +487,17 @@ where
 
             puts.push(BatchPut::Raw {
                 key: metas_data[chunk_idx].chunk_pk,
-                bytes: new_data_bytes.clone(),
+                bytes: new_data_bytes,
             });
             puts.push(BatchPut::Raw {
                 key: metas_rid[chunk_idx].chunk_pk,
-                bytes: new_rid_bytes.clone(),
+                bytes: new_rid_bytes,
             });
 
             metas_data[chunk_idx].row_count = new_data_arr.len() as u64;
-            metas_data[chunk_idx].serialized_bytes = new_data_bytes.len() as u64;
+            metas_data[chunk_idx].serialized_bytes = new_data_arr.get_array_memory_size() as u64;
             metas_rid[chunk_idx].row_count = new_rid_arr.len() as u64;
-            metas_rid[chunk_idx].serialized_bytes = new_rid_bytes.len() as u64;
+            metas_rid[chunk_idx].serialized_bytes = new_rid_arr.get_array_memory_size() as u64;
         }
 
         self.rewrite_descriptor_pages(desc_pk_data, &mut descriptor_data, &mut metas_data, puts)?;
@@ -654,11 +654,11 @@ where
             let data_bytes = serialize_array(&data_f)?;
             puts.push(BatchPut::Raw {
                 key: meta.chunk_pk,
-                bytes: data_bytes.clone(),
+                bytes: data_bytes,
             });
 
             meta.row_count = data_f.len() as u64;
-            meta.serialized_bytes = data_bytes.len() as u64;
+            meta.serialized_bytes = data_f.get_array_memory_size() as u64;
             meta.tombstone_pk = 0;
 
             // Rewrite matching shadow row_id chunk, if present.
@@ -669,11 +669,11 @@ where
                 let rid_bytes = serialize_array(&rid_f)?;
                 puts.push(BatchPut::Raw {
                     key: rm.chunk_pk,
-                    bytes: rid_bytes.clone(),
+                    bytes: rid_bytes,
                 });
 
                 rm.row_count = rid_f.len() as u64;
-                rm.serialized_bytes = rid_bytes.len() as u64;
+                rm.serialized_bytes = rid_f.get_array_memory_size() as u64;
                 rm.tombstone_pk = 0;
             }
 
@@ -936,11 +936,11 @@ where
 
                 puts.push(BatchPut::Raw {
                     key: data_pk,
-                    bytes: data_bytes.clone(),
+                    bytes: data_bytes,
                 });
                 puts.push(BatchPut::Raw {
                     key: rid_pk,
-                    bytes: rid_bytes.clone(),
+                    bytes: rid_bytes,
                 });
 
                 let mut meta = ChunkMetadata {
@@ -948,7 +948,7 @@ where
                     tombstone_pk: 0,
                     value_order_perm_pk: 0,
                     row_count: rows as u64,
-                    serialized_bytes: data_bytes.len() as u64,
+                    serialized_bytes: s_norm.get_array_memory_size() as u64,
                     min_val_u64: 0,
                     max_val_u64: u64::MAX,
                 };
@@ -973,7 +973,7 @@ where
                     tombstone_pk: 0,
                     value_order_perm_pk: 0,
                     row_count: rows as u64,
-                    serialized_bytes: rid_bytes.len() as u64,
+                    serialized_bytes: rid_norm.get_array_memory_size() as u64,
                     min_val_u64: 0,
                     max_val_u64: u64::MAX,
                 };
