@@ -8,9 +8,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// A thread-safe container for I/O statistics.
 #[derive(Debug, Default)]
 pub struct IoStats {
+    // --- Total individual items ---
     pub physical_gets: AtomicU64,
     pub physical_puts: AtomicU64,
     pub physical_frees: AtomicU64,
+    pub physical_allocs: AtomicU64,
+
+    // --- Total batch operations (i.e., calls to the pager) ---
+    pub get_batches: AtomicU64,
+    pub put_batches: AtomicU64,
+    pub free_batches: AtomicU64,
+    pub alloc_batches: AtomicU64,
 }
 
 /// A wrapper around any Pager implementation that instruments I/O operations.
@@ -46,6 +54,7 @@ where
 
     fn get_raw(&self, key: PhysicalKey) -> Result<Option<Self::Blob>> {
         self.stats.physical_gets.fetch_add(1, Ordering::Relaxed);
+        self.stats.get_batches.fetch_add(1, Ordering::Relaxed);
         self.inner.get_raw(key)
     }
 
@@ -53,22 +62,23 @@ where
         self.stats
             .physical_gets
             .fetch_add(gets.len() as u64, Ordering::Relaxed);
+        self.stats.get_batches.fetch_add(1, Ordering::Relaxed);
         self.inner.batch_get(gets)
     }
 
-    // batch_put is the correct method name in the Pager trait, not put_raw.
     fn batch_put(&self, puts: &[BatchPut]) -> Result<()> {
         self.stats
             .physical_puts
             .fetch_add(puts.len() as u64, Ordering::Relaxed);
+        self.stats.put_batches.fetch_add(1, Ordering::Relaxed);
         self.inner.batch_put(puts)
     }
 
     fn alloc_many(&self, count: usize) -> Result<Vec<PhysicalKey>> {
-        // Allocations are effectively "puts" to the storage system.
         self.stats
-            .physical_puts
+            .physical_allocs
             .fetch_add(count as u64, Ordering::Relaxed);
+        self.stats.alloc_batches.fetch_add(1, Ordering::Relaxed);
         self.inner.alloc_many(count)
     }
 
@@ -76,6 +86,7 @@ where
         self.stats
             .physical_frees
             .fetch_add(keys.len() as u64, Ordering::Relaxed);
+        self.stats.free_batches.fetch_add(1, Ordering::Relaxed);
         self.inner.free_many(keys)
     }
 }

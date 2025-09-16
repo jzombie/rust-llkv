@@ -79,12 +79,12 @@ fn zero_offset(arr: &ArrayRef) -> ArrayRef {
 
 /// Concatenate many arrays; returns a zero-offset array.
 #[inline]
-fn concat_many(mut v: Vec<ArrayRef>) -> Result<ArrayRef> {
+fn concat_many(v: Vec<&ArrayRef>) -> Result<ArrayRef> {
     if v.is_empty() {
         return Err(Error::Internal("concat_many: empty".into()));
     }
     if v.len() == 1 {
-        return Ok(zero_offset(&v.pop().unwrap()));
+        return Ok(zero_offset(v[0]));
     }
     let parts: Vec<&dyn Array> = v.iter().map(|a| a.as_ref()).collect();
     Ok(arrow::compute::concat(&parts)?)
@@ -153,25 +153,11 @@ where
         })
     }
 
-    /// Append with automatic LWW (by row_id) using in-place rewrites.
-    ///
-    /// Requirements:
-    /// - Batch must contain a non-nullable UInt64 column named "row_id".
-    /// - For each data column (with "field_id" metadata), we:
-    ///   1) rewrite existing chunks to remove rows whose per-field shadow
-    ///      row_ids match incoming row_ids (LWW),
-    ///   2) append the new data chunk(s) (ingest-time slicing to ~TARGET_CHUNK_BYTES),
-    ///   3) append matching shadow row_id chunk(s) for the field.
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         let schema = batch.schema();
-        let mut row_id_idx: Option<usize> = None;
-        for (i, f) in schema.fields().iter().enumerate() {
-            if f.name() == "row_id" {
-                row_id_idx = Some(i);
-                break;
-            }
-        }
-        let row_id_idx = row_id_idx.ok_or_else(|| Error::Internal("row_id required".into()))?;
+        let row_id_idx = schema
+            .index_of("row_id")
+            .map_err(|_| Error::Internal("row_id column required".into()))?;
 
         let row_id_field = schema.field(row_id_idx);
         if row_id_field.data_type() != &DataType::UInt64 {
@@ -186,44 +172,77 @@ where
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| Error::Internal("row_id downcast failed".into()))?;
-        let row_id_any: ArrayRef = Arc::clone(batch.column(row_id_idx));
 
-        let mut incoming_ids = FxHashSet::default();
-        incoming_ids.reserve(row_id_arr.len());
+        let mut incoming_ids_map = FxHashMap::default();
+        incoming_ids_map.reserve(row_id_arr.len());
         for i in 0..row_id_arr.len() {
-            incoming_ids.insert(row_id_arr.value(i));
+            incoming_ids_map.insert(row_id_arr.value(i), i);
         }
 
         let mut catalog_dirty = false;
         let mut catalog = self.catalog.write().unwrap();
-
         let mut puts_rewrites: Vec<BatchPut> = Vec::new();
-        let mut data_cols: Vec<(LogicalFieldId, ArrayRef)> = Vec::new();
+        let mut all_rewritten_ids = FxHashSet::default();
 
-        for (i, array) in batch.columns().iter().enumerate() {
+        // --- LWW Phase: Perform all rewrites first ---
+        for i in 0..batch.num_columns() {
             if i == row_id_idx {
                 continue;
             }
             let field = schema.field(i);
-            let field_id = field
-                .metadata()
-                .get("field_id")
-                .ok_or_else(|| Error::Internal("Missing field_id".into()))?
-                .parse::<LogicalFieldId>()
-                .map_err(|_| Error::Internal("bad field_id".into()))?;
-
-            self.lww_rewrite_for_field(&mut catalog, field_id, &incoming_ids, &mut puts_rewrites)?;
-
-            data_cols.push((field_id, Arc::clone(array)));
+            if let Some(field_id_str) = field.metadata().get("field_id") {
+                let field_id = field_id_str
+                    .parse::<LogicalFieldId>()
+                    .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
+                let rewritten = self.lww_rewrite_for_field(
+                    &mut catalog,
+                    field_id,
+                    &incoming_ids_map,
+                    batch.column(i),
+                    batch.column(row_id_idx),
+                    &mut puts_rewrites,
+                )?;
+                all_rewritten_ids.extend(rewritten);
+            }
         }
 
         if !puts_rewrites.is_empty() {
             self.pager.batch_put(&puts_rewrites)?;
         }
 
+        // --- Append Phase: Filter the batch to only include NEW rows ---
+        let batch_to_append = if !all_rewritten_ids.is_empty() {
+            let keep_mask: Vec<bool> = (0..row_id_arr.len())
+                .map(|i| !all_rewritten_ids.contains(&row_id_arr.value(i)))
+                .collect();
+            let keep_array = BooleanArray::from(keep_mask);
+            compute::filter_record_batch(batch, &keep_array)?
+        } else {
+            batch.clone()
+        };
+
+        if batch_to_append.num_rows() == 0 {
+            return Ok(());
+        }
+
+        // Now, proceed with appending the correctly filtered batch
+        let append_schema = batch_to_append.schema();
+        let append_row_id_idx = append_schema.index_of("row_id")?;
+        let append_row_id_any: ArrayRef = Arc::clone(batch_to_append.column(append_row_id_idx));
         let mut puts_appends: Vec<BatchPut> = Vec::new();
 
-        for (field_id, array) in data_cols.into_iter() {
+        for (i, array) in batch_to_append.columns().iter().enumerate() {
+            if i == append_row_id_idx {
+                continue;
+            }
+            let field = append_schema.field(i);
+            let field_id = field
+                .metadata()
+                .get("field_id")
+                .ok_or_else(|| Error::Internal("Missing field_id".into()))?
+                .parse::<LogicalFieldId>()
+                .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
+
             let descriptor_pk = *catalog.map.entry(field_id).or_insert_with(|| {
                 catalog_dirty = true;
                 self.pager.alloc_many(1).unwrap()[0]
@@ -234,19 +253,16 @@ where
                 self.pager.alloc_many(1).unwrap()[0]
             });
 
-            // --- STATE MANAGEMENT FIX: Load state once before the loop ---
             let (mut data_descriptor, mut data_tail_page) =
                 self.load_descriptor_state(descriptor_pk, field_id)?;
             let (mut rid_descriptor, mut rid_tail_page) =
                 self.load_descriptor_state(rid_descriptor_pk, rid_fid)?;
 
-            let slices = split_to_target_bytes(&array, TARGET_CHUNK_BYTES);
+            let slices = split_to_target_bytes(array, TARGET_CHUNK_BYTES);
             let mut row_off = 0usize;
 
             for s in slices {
                 let rows = s.len();
-
-                // Data chunk
                 let data_pk = self.pager.alloc_many(1)?[0];
                 let s_norm = zero_offset(&s);
                 let data_bytes = serialize_array(s_norm.as_ref())?;
@@ -270,8 +286,7 @@ where
                     &mut puts_appends,
                 )?;
 
-                // Shadow row_id chunk
-                let rid_slice: ArrayRef = row_id_any.slice(row_off, rows);
+                let rid_slice: ArrayRef = append_row_id_any.slice(row_off, rows);
                 let rid_norm = zero_offset(&rid_slice);
                 let rid_pk = self.pager.alloc_many(1)?[0];
                 let rid_bytes = serialize_array(rid_norm.as_ref())?;
@@ -298,7 +313,6 @@ where
                 row_off += rows;
             }
 
-            // --- STATE MANAGEMENT FIX: Write final state after the loop ---
             puts_appends.push(BatchPut::Raw {
                 key: data_descriptor.tail_page_pk,
                 bytes: data_tail_page,
@@ -330,22 +344,28 @@ where
         Ok(())
     }
 
-    /// LWW via in-place rewrite for a single field.
     fn lww_rewrite_for_field(
         &self,
         catalog: &mut ColumnCatalog,
         field_id: LogicalFieldId,
-        incoming_ids: &FxHashSet<u64>,
+        incoming_ids_map: &FxHashMap<u64, usize>,
+        incoming_data: &ArrayRef,
+        incoming_row_ids: &ArrayRef,
         puts: &mut Vec<BatchPut>,
-    ) -> Result<()> {
+    ) -> Result<FxHashSet<u64>> {
+        let incoming_ids: FxHashSet<u64> = incoming_ids_map.keys().copied().collect();
+        if incoming_ids.is_empty() {
+            return Ok(FxHashSet::default());
+        }
+
         let desc_pk_data = match catalog.map.get(&field_id) {
             Some(pk) => *pk,
-            None => return Ok(()),
+            None => return Ok(FxHashSet::default()),
         };
         let rid_fid = rowid_fid(field_id);
         let desc_pk_rid = match catalog.map.get(&rid_fid) {
             Some(pk) => *pk,
-            None => return Ok(()),
+            None => return Ok(FxHashSet::default()),
         };
 
         let desc_blob_data = self.pager.get_raw(desc_pk_data)?.ok_or(Error::NotFound)?;
@@ -362,14 +382,12 @@ where
         for m in DescriptorIterator::new(self.pager.as_ref(), descriptor_rid.head_page_pk) {
             metas_rid.push(m?);
         }
-        let n = metas_data.len().min(metas_rid.len());
-        if n == 0 {
-            return Ok(());
-        }
 
-        // Find hit chunks by scanning shadow row_ids.
-        let mut hit_idxs: Vec<usize> = Vec::new();
-        {
+        let mut rewritten_ids = FxHashSet::default();
+        let mut hit_chunks = FxHashMap::<usize, Vec<u64>>::default();
+
+        let n = metas_data.len().min(metas_rid.len());
+        if n > 0 {
             let mut gets_rid = Vec::with_capacity(n);
             for i in 0..n {
                 gets_rid.push(BatchGet::Raw {
@@ -379,39 +397,34 @@ where
             let rid_results = self.pager.batch_get(&gets_rid)?;
             let mut rid_blobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
             for r in rid_results {
-                match r {
-                    GetResult::Raw { key, bytes } => {
-                        rid_blobs.insert(key, bytes);
-                    }
-                    GetResult::Missing { .. } => return Err(Error::NotFound),
+                if let GetResult::Raw { key, bytes } = r {
+                    rid_blobs.insert(key, bytes);
                 }
             }
+
             for i in 0..n {
-                let rid_blob = rid_blobs
-                    .get(&metas_rid[i].chunk_pk)
-                    .ok_or(Error::NotFound)?;
-                let rid_arr = deserialize_array(rid_blob.clone())?;
-                let rid_arr = rid_arr
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("row_id chunk type mismatch".into()))?;
-                let mut any = false;
-                for j in 0..rid_arr.len() {
-                    if incoming_ids.contains(&rid_arr.value(j)) {
-                        any = true;
-                        break;
+                if let Some(rid_blob) = rid_blobs.get(&metas_rid[i].chunk_pk) {
+                    let rid_arr = deserialize_array(rid_blob.clone())?;
+                    let rid_arr = rid_arr
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| Error::Internal("rid type mismatch".into()))?;
+                    for j in 0..rid_arr.len() {
+                        let rid = rid_arr.value(j);
+                        if incoming_ids.contains(&rid) {
+                            hit_chunks.entry(i).or_default().push(rid);
+                            rewritten_ids.insert(rid);
+                        }
                     }
                 }
-                if any {
-                    hit_idxs.push(i);
-                }
             }
-        }
-        if hit_idxs.is_empty() {
-            return Ok(());
         }
 
-        // Batch-get needed data + rid chunks for rewrites.
+        if hit_chunks.is_empty() {
+            return Ok(rewritten_ids);
+        }
+
+        let hit_idxs: Vec<usize> = hit_chunks.keys().copied().collect();
         let mut gets = Vec::with_capacity(hit_idxs.len() * 2);
         for &i in &hit_idxs {
             gets.push(BatchGet::Raw {
@@ -424,71 +437,73 @@ where
         let results = self.pager.batch_get(&gets)?;
         let mut blob_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
         for r in results {
-            match r {
-                GetResult::Raw { key, bytes } => {
-                    blob_map.insert(key, bytes);
-                }
-                GetResult::Missing { .. } => return Err(Error::NotFound),
+            if let GetResult::Raw { key, bytes } = r {
+                blob_map.insert(key, bytes);
             }
         }
 
-        // Rewrite each hit chunk in place.
-        for &i in &hit_idxs {
-            let rid_blob = blob_map
-                .get(&metas_rid[i].chunk_pk)
-                .ok_or(Error::NotFound)?;
-            let rid_arr_any = deserialize_array(rid_blob.clone())?;
-            let rid_arr = rid_arr_any
+        for (chunk_idx, rids_in_chunk) in hit_chunks {
+            let rids_to_update: FxHashSet<u64> = rids_in_chunk.into_iter().collect();
+
+            let old_data_arr = deserialize_array(
+                blob_map
+                    .get(&metas_data[chunk_idx].chunk_pk)
+                    .unwrap()
+                    .clone(),
+            )?;
+            let old_rid_arr_any = deserialize_array(
+                blob_map
+                    .get(&metas_rid[chunk_idx].chunk_pk)
+                    .unwrap()
+                    .clone(),
+            )?;
+            let old_rid_arr = old_rid_arr_any
                 .as_any()
                 .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| Error::Internal("row_id chunk type mismatch".into()))?;
-            let keep = BooleanArray::from_iter(
-                (0..rid_arr.len()).map(|j| Some(!incoming_ids.contains(&rid_arr.value(j)))),
+                .unwrap();
+
+            let keep_mask = BooleanArray::from_iter(
+                (0..old_rid_arr.len())
+                    .map(|j| Some(!rids_to_update.contains(&old_rid_arr.value(j)))),
             );
 
-            let data_blob = blob_map
-                .get(&metas_data[i].chunk_pk)
-                .ok_or(Error::NotFound)?;
-            let data_arr = deserialize_array(data_blob.clone())?;
-            let data_f = compute::filter(&data_arr, &keep)?;
-            let data_bytes = serialize_array(&data_f)?;
+            let data_after_delete = compute::filter(&old_data_arr, &keep_mask)?;
+            let rid_after_delete = compute::filter(&old_rid_arr_any, &keep_mask)?;
+
+            let update_indices: Vec<u32> = rids_to_update
+                .iter()
+                .map(|rid| *incoming_ids_map.get(rid).unwrap() as u32)
+                .collect();
+            let update_indices_arr = UInt32Array::from(update_indices);
+
+            let data_to_add = compute::take(incoming_data, &update_indices_arr, None)?;
+            let rids_to_add = compute::take(incoming_row_ids, &update_indices_arr, None)?;
+
+            let new_data_arr = concat_many(vec![&data_after_delete, &data_to_add])?;
+            let new_rid_arr = concat_many(vec![&rid_after_delete, &rids_to_add])?;
+
+            let new_data_bytes = serialize_array(&new_data_arr)?;
+            let new_rid_bytes = serialize_array(&new_rid_arr)?;
+
             puts.push(BatchPut::Raw {
-                key: metas_data[i].chunk_pk,
-                bytes: data_bytes.clone(),
+                key: metas_data[chunk_idx].chunk_pk,
+                bytes: new_data_bytes.clone(),
+            });
+            puts.push(BatchPut::Raw {
+                key: metas_rid[chunk_idx].chunk_pk,
+                bytes: new_rid_bytes.clone(),
             });
 
-            let rid_f = compute::filter(&rid_arr_any, &keep)?;
-            let rid_bytes = serialize_array(&rid_f)?;
-            puts.push(BatchPut::Raw {
-                key: metas_rid[i].chunk_pk,
-                bytes: rid_bytes.clone(),
-            });
-
-            metas_data[i].row_count = data_f.len() as u64;
-            metas_data[i].serialized_bytes = data_bytes.len() as u64;
-            metas_data[i].tombstone_pk = 0;
-
-            metas_rid[i].row_count = rid_f.len() as u64;
-            metas_rid[i].serialized_bytes = rid_bytes.len() as u64;
-
-            if metas_data[i].value_order_perm_pk != 0 {
-                let sort_column = SortColumn {
-                    values: data_f.clone(),
-                    options: None,
-                };
-                let indices = lexsort_to_indices(&[sort_column], None)?;
-                let perm_bytes = serialize_array(&indices)?;
-                puts.push(BatchPut::Raw {
-                    key: metas_data[i].value_order_perm_pk,
-                    bytes: perm_bytes,
-                });
-            }
+            metas_data[chunk_idx].row_count = new_data_arr.len() as u64;
+            metas_data[chunk_idx].serialized_bytes = new_data_bytes.len() as u64;
+            metas_rid[chunk_idx].row_count = new_rid_arr.len() as u64;
+            metas_rid[chunk_idx].serialized_bytes = new_rid_bytes.len() as u64;
         }
 
         self.rewrite_descriptor_pages(desc_pk_data, &mut descriptor_data, &mut metas_data, puts)?;
         self.rewrite_descriptor_pages(desc_pk_rid, &mut descriptor_rid, &mut metas_rid, puts)?;
 
-        Ok(())
+        Ok(rewritten_ids)
     }
 
     /// Rewrite all descriptor pages for a column and update totals.
@@ -892,8 +907,8 @@ where
                 let rb = by_pk.get(&metas_rid[k].chunk_pk).ok_or(Error::NotFound)?;
                 rid_parts.push(deserialize_array(rb.clone())?);
             }
-            let merged_data = concat_many(data_parts)?;
-            let merged_rid_any = concat_many(rid_parts)?;
+            let merged_data = concat_many(data_parts.iter().collect())?;
+            let merged_rid_any = concat_many(rid_parts.iter().collect())?;
 
             // Split merged run into ~target-sized chunks.
             let slices = split_to_target_bytes(&merged_data, TARGET_CHUNK_BYTES);
