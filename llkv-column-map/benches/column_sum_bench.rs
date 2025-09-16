@@ -23,7 +23,7 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
 
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 
 const NUM_ROWS_SIMPLE: usize = 1_000_000;
 const NUM_ROWS_FRAGMENTED: u64 = 1_000_000;
@@ -156,9 +156,9 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
                 }
 
                 // 2) Delete every 10th row (absolute row index).
-                let rows_to_delete: RoaringBitmap = (0..NUM_ROWS_FRAGMENTED)
+                let rows_to_delete: RoaringTreemap = (0..NUM_ROWS_FRAGMENTED)
                     .step_by(10)
-                    .map(|i| i as u32)
+                    // .map(|i| i as u32)
                     .collect();
                 store.delete_rows(field_id, &rows_to_delete).unwrap();
 

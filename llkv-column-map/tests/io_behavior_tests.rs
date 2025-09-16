@@ -3,7 +3,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::{InstrumentedPager, MemPager, Pager};
 use llkv_column_map::store::ColumnStore;
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -102,7 +102,7 @@ fn test_instrumented_paging_io_behavior() {
     // --- Phase 4: Compacting Delete ---
     // Delete a row. This triggers an in-place rewrite and then a compaction,
     // which *will* free the old, now-obsolete data pages.
-    let mut to_delete = RoaringBitmap::new();
+    let mut to_delete = RoaringTreemap::new();
     to_delete.insert(0); // Delete the row with global index 0 (value 10)
     store.delete_rows(fid, &to_delete).unwrap();
 
@@ -176,7 +176,7 @@ fn test_exact_io_counts_for_simple_append() {
 fn test_large_scale_churn_io() {
     // --- 1. Setup ---
     const NUM_ROWS: u64 = 1_000_000;
-    const NUM_DELETES: u32 = 10_000;
+    const NUM_DELETES: u64 = 10_000;
     const NUM_UPDATES: u64 = 100_000;
 
     // We append in smaller batches to create multiple chunks. This ensures
@@ -217,7 +217,7 @@ fn test_large_scale_churn_io() {
 
     // --- 3. Phase 2: Delete 10,000 Entries ---
     println!("\n--- Phase 2: Deleting 10,000 rows ---");
-    let mut to_delete = RoaringBitmap::new();
+    let mut to_delete = RoaringTreemap::new();
     // Delete the first 10,000 even-numbered global row indexes.
     for i in 0..(NUM_DELETES * 2) {
         if i % 2 == 0 {

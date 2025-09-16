@@ -3,7 +3,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -89,7 +89,7 @@ fn test_layout_integrity_under_churn() {
 
     // --- 4. Deletes ---
     // Delete 5 rows by their global index.
-    let mut to_delete = RoaringBitmap::new();
+    let mut to_delete = RoaringTreemap::new();
     to_delete.insert(5);
     to_delete.insert(50);
     to_delete.insert(500);

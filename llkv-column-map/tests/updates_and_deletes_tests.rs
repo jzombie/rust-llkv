@@ -21,7 +21,7 @@ use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
 
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -220,8 +220,8 @@ fn test_deletes_and_updates() {
     // shift global indexes, resolve its current global index first.
     let idx_40 = find_index_of_u64(&store, fid, 40).expect("value 40 should exist before delete");
 
-    let mut bm = RoaringBitmap::new();
-    bm.insert(u32::try_from(idx_40).expect("index must fit in u32"));
+    let mut bm = RoaringTreemap::new();
+    bm.insert(idx_40);
     store.delete_rows(fid, &bm).unwrap();
 
     // Collect and verify: we should have 9 rows now.

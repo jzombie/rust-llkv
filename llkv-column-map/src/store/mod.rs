@@ -17,7 +17,6 @@ use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
-use roaring::RoaringBitmap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::cmp::{Ordering, Reverse};
@@ -49,6 +48,23 @@ const MIN_CHUNK_BYTES: usize = TARGET_CHUNK_BYTES / 2; // ~512 KiB
 
 /// Upper bound on bytes coalesced per run, to cap rewrite cost.
 const MAX_MERGE_RUN_BYTES: usize = 16 * 1024 * 1024; // ~16 MiB
+
+/// Run-time configuration (no hidden constants).
+#[derive(Debug, Clone)]
+pub struct ColumnStoreConfig {
+    /// Fallback rows-per-slice for *exotic* variable-width arrays that don't
+    /// expose byte offsets we can use (e.g., List/Struct/Map). Used only as
+    /// a last resort to avoid pathological slices.
+    pub varwidth_fallback_rows_per_slice: usize,
+}
+
+impl Default for ColumnStoreConfig {
+    fn default() -> Self {
+        Self {
+            varwidth_fallback_rows_per_slice: 4096,
+        }
+    }
+}
 
 /// Statistics for a single descriptor page.
 #[derive(Debug, Clone)]
@@ -171,7 +187,11 @@ fn split_varlen_offsets64(
 /// Split array into ~target_bytes slices. Fixed-width uses bytes-based rows.
 /// For var-width (Utf8/Binary), we use offsets to target value-bytes per slice.
 /// For other exotic var-width types, we conservatively fall back to a row cap.
-fn split_to_target_bytes(arr: &ArrayRef, target_bytes: usize) -> Vec<ArrayRef> {
+fn split_to_target_bytes(
+    arr: &ArrayRef,
+    target_bytes: usize,
+    varwidth_fallback_rows_per_slice: usize,
+) -> Vec<ArrayRef> {
     let n = arr.len();
     if n == 0 {
         return vec![];
@@ -209,7 +229,7 @@ fn split_to_target_bytes(arr: &ArrayRef, target_bytes: usize) -> Vec<ArrayRef> {
         }
         // Fallback for other var-width types (e.g., List/Struct/Map): conservative row cap.
         _ => {
-            let rows_per = 4096usize; // last-resort cap to avoid pathological slices
+            let rows_per = varwidth_fallback_rows_per_slice; // configurable
             let mut out = Vec::with_capacity((n + rows_per - 1) / rows_per);
             let mut off = 0usize;
             while off < n {
@@ -225,6 +245,7 @@ fn split_to_target_bytes(arr: &ArrayRef, target_bytes: usize) -> Vec<ArrayRef> {
 pub struct ColumnStore<P: Pager> {
     pager: Arc<P>,
     catalog: RwLock<ColumnCatalog>,
+    cfg: ColumnStoreConfig,
 }
 
 impl<P> ColumnStore<P>
@@ -232,6 +253,10 @@ where
     P: Pager<Blob = EntryHandle>,
 {
     pub fn open(pager: Arc<P>) -> Result<Self> {
+        Self::open_with_config(pager, ColumnStoreConfig::default())
+    }
+
+    pub fn open_with_config(pager: Arc<P>, cfg: ColumnStoreConfig) -> Result<Self> {
         let catalog = match pager.get_raw(CATALOG_ROOT_PKEY)? {
             Some(blob) => ColumnCatalog::from_bytes(blob.as_ref())?,
             None => ColumnCatalog::default(),
@@ -239,6 +264,7 @@ where
         Ok(Self {
             pager,
             catalog: RwLock::new(catalog),
+            cfg,
         })
     }
 
@@ -347,7 +373,11 @@ where
             let (mut rid_descriptor, mut rid_tail_page) =
                 self.load_descriptor_state(rid_descriptor_pk, rid_fid)?;
 
-            let slices = split_to_target_bytes(array, TARGET_CHUNK_BYTES);
+            let slices = split_to_target_bytes(
+                array,
+                TARGET_CHUNK_BYTES,
+                self.cfg.varwidth_fallback_rows_per_slice,
+            );
             let mut row_off = 0usize;
 
             for s in slices {
@@ -557,11 +587,12 @@ where
             let data_after_delete = compute::filter(&old_data_arr, &keep_mask)?;
             let rid_after_delete = compute::filter(&old_rid_arr_any, &keep_mask)?;
 
-            let update_indices: Vec<u32> = rids_to_update
-                .iter()
-                .map(|rid| *incoming_ids_map.get(rid).unwrap() as u32)
-                .collect();
-            let update_indices_arr = UInt32Array::from(update_indices);
+            // Arrow `take` requires UInt32 indices; build directly without an intermediate Vec
+            let update_indices_arr =
+                UInt32Array::from_iter_values(rids_to_update.iter().map(|rid| {
+                    let idx = *incoming_ids_map.get(rid).expect("incoming id present");
+                    u32::try_from(idx).expect("incoming batch index exceeds u32::MAX (arrow take)")
+                }));
 
             let data_to_add = compute::take(incoming_data, &update_indices_arr, None)?;
             let rids_to_add = compute::take(incoming_row_ids, &update_indices_arr, None)?;
@@ -648,15 +679,21 @@ where
         Ok(())
     }
 
-    /// Explicit delete by global row indexes -> in-place chunk rewrite.
+    /// Explicit delete by global row **positions** (0-based, ascending, unique) -> in-place chunk rewrite.
     /// Then bounded compaction of small adjacent chunks.
-    pub fn delete_rows(
-        &self,
-        field_id: LogicalFieldId,
-        rows_to_delete: &RoaringBitmap,
-    ) -> Result<()> {
-        if rows_to_delete.is_empty() {
-            return Ok(());
+    ///
+    /// Precondition: `rows_to_delete` yields strictly increasing `u64` positions.
+    pub fn delete_rows<I>(&self, field_id: LogicalFieldId, rows_to_delete: I) -> Result<()>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        // Stream the iterator (no copies), while validating monotonicity.
+        let mut del_iter = rows_to_delete.into_iter();
+        let mut cur_del = del_iter.next();
+        let mut last_seen: Option<u64> = None;
+
+        if let Some(v) = cur_del {
+            last_seen = Some(v);
         }
 
         let catalog = self.catalog.read().unwrap();
@@ -695,33 +732,41 @@ where
 
         let mut puts = Vec::new();
 
-        // Single-pass walk over the delete bitmap.
-        let mut del_iter = rows_to_delete.iter();
-        let mut cur_del = del_iter.next();
-
         let mut cum_rows = 0u64;
 
         for (i, meta) in metas.iter_mut().enumerate() {
             let start_u64 = cum_rows;
             let end_u64 = start_u64 + meta.row_count;
 
-            let start = start_u64 as u32;
-            let end = end_u64 as u32;
-
+            // Advance deletes until they fall into [start, end).
             while let Some(d) = cur_del {
-                if d < start {
+                if d < start_u64 {
+                    // Enforce monotonicity (streaming check).
+                    if let Some(prev) = last_seen {
+                        if d < prev {
+                            return Err(Error::Internal(
+                                "rows_to_delete must be ascending/unique".into(),
+                            ));
+                        }
+                    }
+                    last_seen = Some(d);
                     cur_del = del_iter.next();
                 } else {
                     break;
                 }
             }
 
-            let mut del_local: FxHashSet<u32> = FxHashSet::default();
+            // Local indices are per-chunk; track them in `usize` (native index type).
+            let rows = meta.row_count as usize;
+
+            let mut del_local: FxHashSet<usize> = FxHashSet::default();
             while let Some(d) = cur_del {
-                if d >= end {
+                if d >= end_u64 {
                     break;
                 }
-                del_local.insert(d - start);
+                // local index is (d - start); fits in usize because it < meta.row_count
+                del_local.insert((d - start_u64) as usize);
+                last_seen = Some(d);
                 cur_del = del_iter.next();
             }
 
@@ -730,9 +775,7 @@ where
                 continue;
             }
 
-            let keep = BooleanArray::from_iter(
-                (0..meta.row_count as usize).map(|j| Some(!del_local.contains(&(j as u32)))),
-            );
+            let keep = BooleanArray::from_iter((0..rows).map(|j| Some(!del_local.contains(&j))));
 
             // Rewrite data chunk in place.
             let data_blob = self.pager.get_raw(meta.chunk_pk)?.ok_or(Error::NotFound)?;
@@ -996,7 +1039,11 @@ where
             let merged_rid_any = concat_many(rid_parts.iter().collect())?;
 
             // Split merged run into ~target-sized chunks.
-            let slices = split_to_target_bytes(&merged_data, TARGET_CHUNK_BYTES);
+            let slices = split_to_target_bytes(
+                &merged_data,
+                TARGET_CHUNK_BYTES,
+                self.cfg.varwidth_fallback_rows_per_slice,
+            );
             let mut rid_off = 0usize;
             let mut need_perms = false;
             for k in i..j {
