@@ -14,9 +14,9 @@
 
 use llkv_column_map::{
     ColumnStore,
-    storage::pager::{BatchGet, GetResult, InstrumentedPager, IoStats, MemPager, Pager},
-    store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorPageHeader},
-    types::{LogicalFieldId, Namespace, PhysicalKey},
+    debug::ColumnStoreDebug,
+    storage::pager::{InstrumentedPager, IoStats, MemPager},
+    types::{LogicalFieldId, Namespace},
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -255,113 +255,6 @@ fn print_read_report_scan(store: &ColumnStore<InstrumentedPager<MemPager>>) {
     println!();
 }
 
-const ROOT_PK: PhysicalKey = 0;
-
-fn render_storage_ascii<P: Pager>(pager: &P) -> String {
-    use llkv_column_map::store::catalog::ColumnCatalog;
-
-    let mut s = String::new();
-    let cat_blob = match pager
-        .batch_get(&[BatchGet::Raw { key: ROOT_PK }])
-        .unwrap()
-        .pop()
-    {
-        Some(GetResult::Raw { bytes, .. }) => bytes,
-        _ => return "Empty catalog".to_string(),
-    };
-
-    let catalog = ColumnCatalog::from_bytes(cat_blob.as_ref()).unwrap();
-    use std::fmt::Write;
-    writeln!(&mut s, "Catalog entries: {}", catalog.map.len()).unwrap();
-
-    for (fid, desc_pk) in catalog.map.iter() {
-        let desc_blob = pager
-            .batch_get(&[BatchGet::Raw { key: *desc_pk }])
-            .unwrap()
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .unwrap();
-        let desc = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-        writeln!(
-            &mut s,
-            "  Field {:?}: desc_pk={} rows={} chunks={}",
-            fid, desc_pk, desc.total_row_count, desc.total_chunk_count
-        )
-        .unwrap();
-
-        let mut page_pk = desc.head_page_pk;
-        let mut page_idx = 0usize;
-        while page_pk != 0 {
-            let page_blob = pager
-                .batch_get(&[BatchGet::Raw { key: page_pk }])
-                .unwrap()
-                .pop()
-                .and_then(|r| match r {
-                    GetResult::Raw { bytes, .. } => Some(bytes),
-                    _ => None,
-                })
-                .unwrap();
-            let bytes = page_blob.as_ref();
-            let hdr_sz = DescriptorPageHeader::DISK_SIZE;
-            let hd = DescriptorPageHeader::from_le_bytes(&bytes[..hdr_sz]);
-            writeln!(
-                &mut s,
-                "    page[{}] pk={} entries={}",
-                page_idx, page_pk, hd.entry_count
-            )
-            .unwrap();
-
-            let mut chunk_pks_to_fetch = Vec::new();
-            for i in 0..(hd.entry_count as usize) {
-                let off = hdr_sz + i * ChunkMetadata::DISK_SIZE;
-                let end = off + ChunkMetadata::DISK_SIZE;
-                let meta = ChunkMetadata::from_le_bytes(&bytes[off..end]);
-                chunk_pks_to_fetch.push(meta.chunk_pk);
-                if meta.value_order_perm_pk != 0 {
-                    chunk_pks_to_fetch.push(meta.value_order_perm_pk);
-                }
-            }
-
-            let gets: Vec<_> = chunk_pks_to_fetch
-                .iter()
-                .map(|pk| BatchGet::Raw { key: *pk })
-                .collect();
-            let results = pager.batch_get(&gets).unwrap();
-            let mut sizes = results
-                .into_iter()
-                .filter_map(|r| match r {
-                    GetResult::Raw { key, bytes } => Some((key, bytes.as_ref().len())),
-                    _ => None,
-                })
-                .collect::<std::collections::HashMap<_, _>>();
-
-            for i in 0..(hd.entry_count as usize) {
-                let off = hdr_sz + i * ChunkMetadata::DISK_SIZE;
-                let end = off + ChunkMetadata::DISK_SIZE;
-                let meta = ChunkMetadata::from_le_bytes(&bytes[off..end]);
-
-                let data_len = sizes.remove(&meta.chunk_pk).unwrap_or(0);
-                let perm_len = sizes.remove(&meta.value_order_perm_pk).unwrap_or(0);
-
-                writeln!(
-                    &mut s,
-                    "      chunk pk={} rows={} data={}B perm={}B",
-                    meta.chunk_pk, meta.row_count, data_len, perm_len
-                )
-                .unwrap();
-            }
-
-            page_pk = hd.next_page_pk;
-            page_idx += 1;
-        }
-    }
-
-    s
-}
-
 // -------- main walkthrough ---------------------------------------------------
 
 fn main() {
@@ -447,8 +340,8 @@ fn main() {
     {
         print_read_report_scan(&store);
 
-        let ascii = render_storage_ascii(pager_arc.as_ref());
-        println!("\n==== STORAGE ASCII ====\n{}", ascii);
+        let layout_table_str = store.render_storage_as_table();
+        println!("\n==== STORAGE LAYOUT ====\n{}", layout_table_str);
 
         show_phase("Phase 5: describe_storage + read report", &stats, &mut prev);
     }

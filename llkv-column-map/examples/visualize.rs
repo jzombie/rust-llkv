@@ -35,6 +35,7 @@ use std::time::Instant;
 
 use llkv_column_map::{
     ColumnStore,
+    debug::ColumnStoreDebug,
     storage::pager::{BatchGet, GetResult, MemPager, Pager},
     store::catalog::ColumnCatalog,
     store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorPageHeader},
@@ -471,27 +472,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ASCII summary of final layout (rough byte sizes per pk)
-    let ascii = {
-        use llkv_column_map::storage::pager::BatchGet;
-        use std::fmt::Write;
-        let mut s = String::new();
-        let all_pks = discover_all_pks(pager.as_ref());
-        let gets: Vec<BatchGet> = all_pks.iter().map(|&k| BatchGet::Raw { key: k }).collect();
-        let res = pager.batch_get(&gets).unwrap();
-        writeln!(&mut s, "==== STORAGE ASCII ====").unwrap();
-        for r in res {
-            match r {
-                llkv_column_map::storage::pager::GetResult::Raw { key, bytes, .. } => {
-                    writeln!(&mut s, "pk={} bytes={}", key, bytes.as_ref().len()).unwrap();
-                }
-                llkv_column_map::storage::pager::GetResult::Missing { key } => {
-                    writeln!(&mut s, "pk={} <missing>", key).unwrap();
-                }
-            }
-        }
-        s
-    };
-    println!("{}", ascii);
+    let layout_table_str = store.render_storage_as_table();
+    println!("\n==== STORAGE LAYOUT ====\n{}", layout_table_str);
 
     // ONE final DOT with batch-colored nodes
     let dot = render_one_colored_dot(pager.as_ref(), &created_in_batch);

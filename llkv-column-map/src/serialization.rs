@@ -33,10 +33,7 @@
 use std::convert::TryFrom;
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayData, ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Int32Array,
-    UInt32Array, UInt64Array, make_array,
-};
+use arrow::array::{Array, ArrayData, ArrayRef, FixedSizeListArray, Float32Array, make_array};
 use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field};
 use simd_r_drive_entry_handle::EntryHandle;

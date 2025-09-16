@@ -1,11 +1,14 @@
 pub mod error;
+pub mod serialization;
 pub mod storage;
 pub mod store;
 pub mod types;
 
-// Internal modules
 mod codecs;
-mod serialization;
 
 pub use error::{Error, Result};
 pub use store::ColumnStore;
+
+pub mod debug {
+    pub use super::store::debug::*;
+}

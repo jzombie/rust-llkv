@@ -25,6 +25,8 @@ use std::sync::{Arc, RwLock};
 pub mod catalog;
 pub mod descriptor;
 
+pub mod debug;
+
 const DESCRIPTOR_ENTRIES_PER_PAGE: usize = 256;
 
 /// Sets the shadow row_id tag on a LogicalFieldId using the Namespace enum.
