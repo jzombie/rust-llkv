@@ -340,7 +340,7 @@ fn main() {
     {
         print_read_report_scan(&store);
 
-        let layout_table_str = store.render_storage_as_table();
+        let layout_table_str = store.render_storage_as_formatted_string();
         println!("\n==== STORAGE LAYOUT ====\n{}", layout_table_str);
 
         show_phase("Phase 5: describe_storage + read report", &stats, &mut prev);
