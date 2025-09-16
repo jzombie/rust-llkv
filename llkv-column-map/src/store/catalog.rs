@@ -1,4 +1,3 @@
-// File: src/store/catalog.rs
 //! The top-level directory for all columns in the store.
 
 use crate::codecs::{get_u64, put_u64};
@@ -33,7 +32,8 @@ impl ColumnCatalog {
         let mut map = FxHashMap::with_capacity_and_hasher(entry_count, Default::default());
         let mut offset = 8;
         for _ in 0..entry_count {
-            let field_id = get_u64(&bytes[offset..offset + 8]);
+            // Read the u64 from bytes and convert it into the LogicalFieldId struct.
+            let field_id = LogicalFieldId::from(get_u64(&bytes[offset..offset + 8]));
             offset += 8;
             let desc_pk = get_u64(&bytes[offset..offset + 8]);
             offset += 8;
@@ -48,7 +48,9 @@ impl ColumnCatalog {
         let mut buf = Vec::with_capacity(8 + entry_count * 16);
         buf.extend_from_slice(&put_u64(entry_count as u64));
         for (&field_id, &desc_pk) in &self.map {
-            buf.extend_from_slice(&put_u64(field_id));
+            // Convert LogicalFieldId struct into a u64 for serialization.
+            let field_id_u64: u64 = field_id.into();
+            buf.extend_from_slice(&put_u64(field_id_u64));
             buf.extend_from_slice(&put_u64(desc_pk));
         }
         buf

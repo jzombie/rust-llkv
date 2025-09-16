@@ -37,7 +37,7 @@ use llkv_column_map::{
     storage::pager::{MemPager, Pager},
     store::catalog::ColumnCatalog,
     store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorPageHeader},
-    types::{LogicalFieldId, PhysicalKey},
+    types::{LogicalFieldId, Namespace, PhysicalKey},
 };
 
 // ---------------- Workload config (small, but shows batching clearly) --------
@@ -55,6 +55,14 @@ use arrow::array::{Array, ArrayRef, BinaryBuilder, UInt32Array, UInt64Array};
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+/// Helper to create a standard user-data LogicalFieldId.
+fn fid(id: u32) -> LogicalFieldId {
+    LogicalFieldId::new()
+        .with_namespace(Namespace::UserData)
+        .with_table_id(0)
+        .with_field_id(id)
+}
+
 fn build_put_for_col1(start: usize, end: usize) -> Option<(LogicalFieldId, ArrayRef)> {
     let s = start.min(C1_ROWS);
     let e = end.min(C1_ROWS);
@@ -62,7 +70,7 @@ fn build_put_for_col1(start: usize, end: usize) -> Option<(LogicalFieldId, Array
         return None;
     }
     let vals: Vec<u32> = (s..e).map(|i| i as u32).collect();
-    Some((1, Arc::new(UInt32Array::from(vals)) as ArrayRef))
+    Some((fid(1), Arc::new(UInt32Array::from(vals)) as ArrayRef))
 }
 
 fn build_put_for_col2(start: usize, end: usize) -> Option<(LogicalFieldId, ArrayRef)> {
@@ -77,7 +85,7 @@ fn build_put_for_col2(start: usize, end: usize) -> Option<(LogicalFieldId, Array
         let len = i % 21 + 1; // 1..21
         b.append_value(&vec![b'A' + (i % 26) as u8; len]);
     }
-    Some((2, Arc::new(b.finish()) as ArrayRef))
+    Some((fid(2), Arc::new(b.finish()) as ArrayRef))
 }
 
 fn build_put_for_col3(start: usize, end: usize) -> Option<(LogicalFieldId, ArrayRef)> {
@@ -87,7 +95,7 @@ fn build_put_for_col3(start: usize, end: usize) -> Option<(LogicalFieldId, Array
         return None;
     }
     let vals: Vec<u64> = (s..e).map(|_| 0x55u64).collect(); // width=8
-    Some((3, Arc::new(UInt64Array::from(vals)) as ArrayRef))
+    Some((fid(3), Arc::new(UInt64Array::from(vals)) as ArrayRef))
 }
 
 /// Build a RecordBatch from per-column arrays (same row count).
@@ -97,13 +105,26 @@ fn batch_from_pairs(pairs: &[(LogicalFieldId, ArrayRef)]) -> RecordBatch {
         .enumerate()
         .map(|(i, (fid, arr))| {
             let mut md = std::collections::HashMap::new();
-            md.insert("field_id".to_string(), fid.to_string());
+            md.insert("field_id".to_string(), u64::from(*fid).to_string());
             Field::new(&format!("c{}", i), arr.data_type().clone(), false).with_metadata(md)
         })
         .collect();
-    let schema = Arc::new(Schema::new(fields));
-    let arrays: Vec<ArrayRef> = pairs.iter().map(|(_, a)| Arc::clone(a)).collect();
-    RecordBatch::try_new(schema, arrays).unwrap()
+
+    // The store's append logic requires a `row_id` column.
+    let num_rows = if pairs.is_empty() {
+        0
+    } else {
+        pairs[0].1.len()
+    };
+    let row_id_field = Field::new("row_id", arrow::datatypes::DataType::UInt64, false);
+    let row_id_array = Arc::new(UInt64Array::from_iter_values(0..num_rows as u64)) as ArrayRef;
+    let mut final_fields = vec![row_id_field];
+    final_fields.extend(fields);
+    let mut final_arrays = vec![row_id_array];
+    final_arrays.extend(pairs.iter().map(|(_, a)| Arc::clone(a)));
+
+    let schema = Arc::new(Schema::new(final_fields));
+    RecordBatch::try_new(schema, final_arrays).unwrap()
 }
 
 // ---------------- DOT rendering with batch coloring -------------------------
@@ -205,7 +226,7 @@ fn render_one_colored_dot<P: Pager>(
             let dcol = color_for_batch(*created_in_batch.get(desc_pk).unwrap_or(&0));
             writeln!(
                 &mut s,
-                "  n{} [label=\"ColumnDescriptor pk={} field={} rows={} \
+                "  n{} [label=\"ColumnDescriptor pk={} field={:?} rows={} \
                  chunks={}\" style=filled fillcolor={}];",
                 desc_pk, desc_pk, fid, desc.total_row_count, desc.total_chunk_count, dcol
             )
@@ -376,14 +397,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Total ingest time: {:?}", t_total.elapsed());
 
     // Simple probes by counting rows per column via scan()
-    for fid in [1u64, 2, 3] {
+    for id in [1u32, 2, 3] {
+        let field_id = fid(id);
         let mut rows = 0usize;
-        if let Ok(it) = store.scan(fid) {
+        if let Ok(it) = store.scan(field_id) {
             for arr in it.flatten() {
                 rows += arr.len();
             }
         }
-        println!("col={} -> total rows scanned: {}", fid, rows);
+        println!("col={:?} -> total rows scanned: {}", field_id, rows);
     }
 
     // ASCII summary of final layout (rough byte sizes per pk)

@@ -13,23 +13,27 @@
 //! column.
 
 use llkv_column_map::{
-    ColumnStore, Result as LlResult,
-    storage::pager::{BatchGet, BatchPut, MemPager, Pager},
+    ColumnStore,
+    storage::pager::{InstrumentedPager, IoStats, MemPager, Pager},
     store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorPageHeader},
-    types::{LogicalFieldId, PhysicalKey},
+    types::{LogicalFieldId, Namespace, PhysicalKey},
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // -------- simple key/value generators ---------------------------------------
-//
-// The legacy example used explicit key/value pairs and a KV append path.
-// The new storage layout ingests Arrow arrays in RecordBatches, so we
-// synthesize per-column arrays here (fixed and variable width) while
-// preserving the same structure and phase breakdown.
 
 use arrow::array::{ArrayRef, BinaryBuilder, UInt64Array};
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
+
+/// Helper to create a standard user-data LogicalFieldId.
+fn fid(id: u32) -> LogicalFieldId {
+    LogicalFieldId::new()
+        .with_namespace(Namespace::UserData)
+        .with_table_id(0)
+        .with_field_id(id)
+}
 
 /// Build a fixed-width u64 column [0..rows) for `field_id`.
 fn build_fixed_u64(field_id: LogicalFieldId, rows: usize) -> (LogicalFieldId, ArrayRef) {
@@ -44,14 +48,15 @@ fn build_var_binary(
     max: usize,
 ) -> (LogicalFieldId, ArrayRef) {
     let mut b = BinaryBuilder::new();
+    let fid_u64 = u64::from(field_id);
     for i in 0..rows {
         let span = (max - min + 1) as u64;
         let mix = (i as u64)
             .wrapping_mul(1103515245)
-            .wrapping_add(field_id)
+            .wrapping_add(fid_u64)
             .rotate_left(13);
         let len = (min as u64 + (mix % span)) as usize;
-        let byte = (((i as LogicalFieldId).wrapping_add(field_id)) & 0xFF) as u8;
+        let byte = (((i as u64).wrapping_add(fid_u64)) & 0xFF) as u8;
         b.append_value(&vec![byte; len]);
     }
     (field_id, Arc::new(b.finish()) as ArrayRef)
@@ -63,111 +68,69 @@ fn batch_from_columns(cols: &[(LogicalFieldId, ArrayRef)]) -> RecordBatch {
         .enumerate()
         .map(|(i, (fid, arr))| {
             let mut md = std::collections::HashMap::new();
-            md.insert("field_id".to_string(), fid.to_string());
+            md.insert("field_id".to_string(), u64::from(*fid).to_string());
             Field::new(&format!("c{}", i), arr.data_type().clone(), false).with_metadata(md)
         })
         .collect();
-    let schema = Arc::new(Schema::new(fields));
-    let arrays: Vec<ArrayRef> = cols.iter().map(|(_, a)| Arc::clone(a)).collect();
-    RecordBatch::try_new(schema, arrays).unwrap()
+
+    // The store's append logic requires a `row_id` column.
+    let num_rows = if cols.is_empty() { 0 } else { cols[0].1.len() };
+    let row_id_field = Field::new("row_id", arrow::datatypes::DataType::UInt64, false);
+    // Use unique row IDs for each batch to avoid LWW updates in this example.
+    let start_row_id = NEXT_ROW_ID.fetch_add(num_rows as u64, Ordering::Relaxed);
+    let end_row_id = start_row_id + num_rows as u64;
+    let row_id_array =
+        Arc::new(UInt64Array::from_iter_values(start_row_id..end_row_id)) as ArrayRef;
+
+    let mut final_fields = vec![row_id_field];
+    final_fields.extend(fields);
+    let mut final_arrays = vec![row_id_array];
+    final_arrays.extend(cols.iter().map(|(_, a)| Arc::clone(a)));
+
+    let schema = Arc::new(Schema::new(final_fields));
+    RecordBatch::try_new(schema, final_arrays).unwrap()
 }
 
-// -------- I/O metric helpers (count wrapper over Pager) ----------------------
+// Global counter to ensure unique row_ids across batches.
+static NEXT_ROW_ID: AtomicU64 = AtomicU64::new(0);
 
-use std::sync::atomic::{AtomicU64, Ordering};
+// -------- I/O metric helpers -------------------------------------------------
 
-#[derive(Default)]
-struct IoStats {
-    batches: AtomicU64,
-    put_raw_ops: AtomicU64,
-    get_raw_ops: AtomicU64,
-    free_ops: AtomicU64,
-}
-
-#[derive(Clone)]
-struct CountingPager<P: Pager> {
-    inner: Arc<P>,
-    stats: Arc<IoStats>,
-}
-
-impl<P: Pager> CountingPager<P> {
-    fn new(inner: Arc<P>) -> Self {
-        Self {
-            inner,
-            stats: Arc::new(IoStats::default()),
-        }
-    }
-    fn snapshot(&self) -> Counts {
-        Counts {
-            batches: self.stats.batches.load(Ordering::Relaxed),
-            put_raw: self.stats.put_raw_ops.load(Ordering::Relaxed),
-            get_raw: self.stats.get_raw_ops.load(Ordering::Relaxed),
-            frees: self.stats.free_ops.load(Ordering::Relaxed),
-        }
-    }
-}
-
-impl<P: Pager> Pager for CountingPager<P> {
-    type Blob = P::Blob;
-
-    fn alloc_many(&self, n: usize) -> LlResult<Vec<PhysicalKey>> {
-        self.inner.alloc_many(n)
-    }
-
-    fn get_raw(&self, key: PhysicalKey) -> LlResult<Option<Self::Blob>> {
-        self.inner.get_raw(key)
-    }
-
-    fn batch_get(
-        &self,
-        gets: &[BatchGet],
-    ) -> LlResult<Vec<llkv_column_map::storage::pager::GetResult<Self::Blob>>> {
-        self.stats.batches.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .get_raw_ops
-            .fetch_add(gets.len() as u64, Ordering::Relaxed);
-        self.inner.batch_get(gets)
-    }
-
-    fn batch_put(&self, puts: &[BatchPut]) -> LlResult<()> {
-        self.stats.batches.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .put_raw_ops
-            .fetch_add(puts.len() as u64, Ordering::Relaxed);
-        self.inner.batch_put(puts)
-    }
-
-    fn free_many(&self, keys: &[PhysicalKey]) -> LlResult<()> {
-        self.stats.batches.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .free_ops
-            .fetch_add(keys.len() as u64, Ordering::Relaxed);
-        self.inner.free_many(keys)
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-struct Counts {
+#[derive(Clone, Copy, Default, Debug)]
+struct CountsSnapshot {
     batches: u64,
-    put_raw: u64,
-    get_raw: u64,
+    puts: u64,
+    gets: u64,
     frees: u64,
+    allocs: u64,
 }
 
-impl core::ops::Sub for Counts {
-    type Output = Counts;
-    fn sub(self, rhs: Counts) -> Counts {
-        Counts {
-            batches: self.batches.saturating_sub(rhs.batches),
-            put_raw: self.put_raw.saturating_sub(rhs.put_raw),
-            get_raw: self.get_raw.saturating_sub(rhs.get_raw),
-            frees: self.frees.saturating_sub(rhs.frees),
+impl From<&Arc<IoStats>> for CountsSnapshot {
+    fn from(stats: &Arc<IoStats>) -> Self {
+        Self {
+            batches: stats.get_batches.load(Ordering::Relaxed)
+                + stats.put_batches.load(Ordering::Relaxed)
+                + stats.free_batches.load(Ordering::Relaxed)
+                + stats.alloc_batches.load(Ordering::Relaxed),
+            puts: stats.physical_puts.load(Ordering::Relaxed),
+            gets: stats.physical_gets.load(Ordering::Relaxed),
+            frees: stats.physical_frees.load(Ordering::Relaxed),
+            allocs: stats.physical_allocs.load(Ordering::Relaxed),
         }
     }
 }
 
-fn read_counts<P: Pager>(pager: &CountingPager<P>) -> Counts {
-    pager.snapshot()
+impl core::ops::Sub for CountsSnapshot {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            batches: self.batches.saturating_sub(rhs.batches),
+            puts: self.puts.saturating_sub(rhs.puts),
+            gets: self.gets.saturating_sub(rhs.gets),
+            frees: self.frees.saturating_sub(rhs.frees),
+            allocs: self.allocs.saturating_sub(rhs.allocs),
+        }
+    }
 }
 
 // -------- “how much data did we write” summary -------------------------------
@@ -211,55 +174,58 @@ fn print_data_summary(label: &str, a: &AppendSummary) {
                 if i > 0 {
                     print!(", ");
                 }
-                print!("{}:{}", fid, n);
+                print!("{:?}:{}", fid, n);
             }
             println!("}} (total={})", a.total_cells);
         }
     }
 }
 
-fn show_phase_with_data<P: Pager>(
+fn show_phase_with_data(
     label: &str,
-    pager: &CountingPager<P>,
-    prev: &mut Counts,
+    stats: &Arc<IoStats>,
+    prev: &mut CountsSnapshot,
     summary: &AppendSummary,
 ) {
     print_data_summary(label, summary);
-    let now = read_counts(pager);
+    let now = CountsSnapshot::from(stats);
     let d = now - *prev;
     println!("  batches: {}", d.batches);
-    println!("  puts:   raw={}", d.put_raw);
-    println!("  gets:   raw={}", d.get_raw);
-    println!("  frees:  {}", d.frees);
+    println!("  puts:    {}", d.puts);
+    println!("  gets:    {}", d.gets);
+    println!("  frees:   {}", d.frees);
+    println!("  allocs:  {}", d.allocs);
     println!();
     *prev = now;
 }
 
-fn show_phase<P: Pager>(label: &str, pager: &CountingPager<P>, prev: &mut Counts) {
+fn show_phase(label: &str, stats: &Arc<IoStats>, prev: &mut CountsSnapshot) {
     println!("== {} ==", label);
-    let now = read_counts(pager);
+    let now = CountsSnapshot::from(stats);
     let d = now - *prev;
     println!("  batches: {}", d.batches);
-    println!("  puts:   raw={}", d.put_raw);
-    println!("  gets:   raw={}", d.get_raw);
-    println!("  frees:  {}", d.frees);
+    println!("  puts:    {}", d.puts);
+    println!("  gets:    {}", d.gets);
+    println!("  frees:   {}", d.frees);
+    println!("  allocs:  {}", d.allocs);
     println!();
     *prev = now;
 }
 
 // -------- sample read report + ASCII storage summary ------------------------
 
-fn print_read_report_scan(store: &ColumnStore<CountingPager<MemPager>>) {
+fn print_read_report_scan(store: &ColumnStore<InstrumentedPager<MemPager>>) {
     use arrow::array::{Array, UInt64Array};
 
     println!("-- Read report (scan sample) --");
-    for &fid in &[100u64, 200u64, 201u64, 300u64, 301u64, 999u64] {
+    for &id in &[100u32, 200, 201, 300, 301, 999] {
+        let field_id = fid(id);
         let mut seen = 0usize;
         let mut last_val: Option<u64> = None;
-        if let Ok(iter) = store.scan(fid) {
+        if let Ok(iter) = store.scan(field_id) {
             for arr in iter.flatten() {
                 if let Some(u) = arr.as_any().downcast_ref::<UInt64Array>() {
-                    if u.len() > 0 {
+                    if !u.is_empty() {
                         last_val = Some(u.value(u.len() - 1));
                     }
                 }
@@ -269,8 +235,8 @@ fn print_read_report_scan(store: &ColumnStore<CountingPager<MemPager>>) {
                 }
             }
             println!(
-                "col {}: first ~{} rows scanned; last_u64={:?}",
-                fid, seen, last_val
+                "col {:?}: first ~{} rows scanned; last_u64={:?}",
+                field_id, seen, last_val
             );
         }
     }
@@ -295,7 +261,7 @@ fn render_storage_ascii<P: Pager>(pager: &P) -> String {
         let desc = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
         writeln!(
             &mut s,
-            "  Field {}: desc_pk={} rows={} chunks={}",
+            "  Field {:?}: desc_pk={} rows={} chunks={}",
             fid, desc_pk, desc.total_row_count, desc.total_chunk_count
         )
         .unwrap();
@@ -356,54 +322,54 @@ fn render_storage_ascii<P: Pager>(pager: &P) -> String {
 // -------- main walkthrough ---------------------------------------------------
 
 fn main() {
-    let inner = Arc::new(MemPager::default());
-    let pager = Arc::new(CountingPager::new(inner));
-    let store = ColumnStore::open(Arc::clone(&pager)).unwrap();
+    let (pager, stats) = InstrumentedPager::new(MemPager::default());
+    let pager_arc = Arc::new(pager);
+    let store = ColumnStore::open(Arc::clone(&pager_arc)).unwrap();
 
-    let mut prev = read_counts(&pager);
+    let mut prev = CountsSnapshot::from(&stats);
 
-    show_phase("Phase 0: init (bootstrap + manifest)", &pager, &mut prev);
+    show_phase("Phase 0: init (bootstrap + manifest)", &stats, &mut prev);
 
     {
-        let c100 = build_fixed_u64(100, 10_000);
-        let c101 = build_fixed_u64(101, 10_000);
+        let c100 = build_fixed_u64(fid(100), 10_000);
+        let c101 = build_fixed_u64(fid(101), 10_000);
         let batch = batch_from_columns(&[c100.clone(), c101.clone()]);
         store.append(&batch).unwrap();
 
-        let summary = summarize_pairs(&[(c100.0, batch.num_rows()), (c101.0, batch.num_rows())]);
+        let summary = summarize_pairs(&[(c100.0, c100.1.len()), (c101.0, c101.1.len())]);
         show_phase_with_data(
             "Phase 1: append fixed-width cols 100 & 101",
-            &pager,
+            &stats,
             &mut prev,
             &summary,
         );
     }
 
     {
-        let c200 = build_var_binary(200, 12_345, 6, 18);
-        let c201 = build_var_binary(201, 12_345, 6, 18);
+        let c200 = build_var_binary(fid(200), 12_345, 6, 18);
+        let c201 = build_var_binary(fid(201), 12_345, 6, 18);
         let batch = batch_from_columns(&[c200.clone(), c201.clone()]);
         store.append(&batch).unwrap();
 
-        let summary = summarize_pairs(&[(c200.0, batch.num_rows()), (c201.0, batch.num_rows())]);
+        let summary = summarize_pairs(&[(c200.0, c200.1.len()), (c201.0, c201.1.len())]);
         show_phase_with_data(
             "Phase 2: append variable-width cols 200 & 201",
-            &pager,
+            &stats,
             &mut prev,
             &summary,
         );
     }
 
     {
-        let c300 = build_fixed_u64(300, 2_000);
-        let c301 = build_var_binary(301, 2_000, 10, 30);
+        let c300 = build_fixed_u64(fid(300), 2_000);
+        let c301 = build_var_binary(fid(301), 2_000, 10, 30);
         let batch = batch_from_columns(&[c300.clone(), c301.clone()]);
         store.append(&batch).unwrap();
 
-        let summary = summarize_pairs(&[(c300.0, batch.num_rows()), (c301.0, batch.num_rows())]);
+        let summary = summarize_pairs(&[(c300.0, c300.1.len()), (c301.0, c301.1.len())]);
         show_phase_with_data(
             "Phase 3: append new cols 300 (fixed) & 301 (var) — updates Manifest",
-            &pager,
+            &stats,
             &mut prev,
             &summary,
         );
@@ -411,7 +377,7 @@ fn main() {
 
     {
         let c100 = (
-            100,
+            fid(100),
             Arc::new(UInt64Array::from(vec![5u64, 7, 9])) as ArrayRef,
         );
         let b100 = batch_from_columns(&[c100.clone()]);
@@ -422,14 +388,14 @@ fn main() {
         for r in 1_000..1_000 + rows_999 as u64 {
             bb.append_value(&vec![0xAB; (r % 17 + 12) as usize]);
         }
-        let c999 = (999, Arc::new(bb.finish()) as ArrayRef);
+        let c999 = (fid(999), Arc::new(bb.finish()) as ArrayRef);
         let b999 = batch_from_columns(&[c999.clone()]);
         store.append(&b999).unwrap();
 
-        let summary = summarize_pairs(&[(100, 3), (999, rows_999)]);
+        let summary = summarize_pairs(&[(fid(100), 3), (fid(999), rows_999)]);
         show_phase_with_data(
             "Phase 4: mixed append (existing col 100 + new col 999)",
-            &pager,
+            &stats,
             &mut prev,
             &summary,
         );
@@ -438,9 +404,10 @@ fn main() {
     {
         print_read_report_scan(&store);
 
-        let ascii = render_storage_ascii(&*pager);
+        // FIX: Pass a reference to the pager *inside* the Arc, not the Arc itself.
+        let ascii = render_storage_ascii(pager_arc.as_ref());
         println!("\n==== STORAGE ASCII ====\n{}", ascii);
 
-        show_phase("Phase 5: describe_storage + read report", &pager, &mut prev);
+        show_phase("Phase 5: describe_storage + read report", &stats, &mut prev);
     }
 }

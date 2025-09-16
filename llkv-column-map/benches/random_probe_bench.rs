@@ -28,6 +28,7 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
+use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -36,20 +37,28 @@ const N_ROWS: usize = 1_000_000;
 const N_QUERIES: usize = 10_000;
 const SEED: u64 = 0xCBF2_A1B1_D3E4_F905;
 
+/// Test helper to create a standard user-data LogicalFieldId.
+fn fid(id: u32) -> LogicalFieldId {
+    LogicalFieldId::new()
+        .with_namespace(Namespace::UserData)
+        .with_table_id(0)
+        .with_field_id(id)
+}
+
 /// Build schema: row_id (u64, non-null) + data(u64 with field_id).
-fn schema_with_row_id(field_id: u64) -> Arc<Schema> {
+fn schema_with_row_id(field_id: LogicalFieldId) -> Arc<Schema> {
     let rid = Field::new("row_id", DataType::UInt64, false);
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), field_id.to_string());
+    md.insert("field_id".to_string(), u64::from(field_id).to_string());
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);
     Arc::new(Schema::new(vec![rid, data_f]))
 }
 
-fn seed_store_1m() -> (ColumnStore<MemPager>, u64) {
+fn seed_store_1m() -> (ColumnStore<MemPager>, LogicalFieldId) {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let field_id: u64 = 42;
+    let field_id = fid(42);
     let schema = schema_with_row_id(field_id);
 
     // row_id 0..N-1; values 0..N-1
@@ -77,7 +86,7 @@ fn make_queries() -> Vec<u64> {
 }
 
 /// Sorted plan: stream-join scan_sorted() against sorted queries.
-fn count_hits_stream_join(store: &ColumnStore<MemPager>, fid: u64, qs: &[u64]) -> usize {
+fn count_hits_stream_join(store: &ColumnStore<MemPager>, fid: LogicalFieldId, qs: &[u64]) -> usize {
     let mut queries = qs.to_vec();
     queries.sort_unstable();
 
@@ -107,7 +116,11 @@ fn count_hits_stream_join(store: &ColumnStore<MemPager>, fid: u64, qs: &[u64]) -
 
 /// Unsorted plan: multiset membership over scan().
 /// Counts duplicates by storing query frequencies.
-fn count_hits_multiset_scan(store: &ColumnStore<MemPager>, fid: u64, qs: &[u64]) -> usize {
+fn count_hits_multiset_scan(
+    store: &ColumnStore<MemPager>,
+    fid: LogicalFieldId,
+    qs: &[u64],
+) -> usize {
     let mut freq: HashMap<u64, u32> = HashMap::with_capacity(qs.len());
     for &q in qs {
         *freq.entry(q).or_insert(0) += 1;

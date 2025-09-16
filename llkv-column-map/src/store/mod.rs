@@ -7,8 +7,7 @@ use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
 };
-use crate::types::{CATALOG_ROOT_PKEY, LogicalFieldId, PhysicalKey};
-
+use crate::types::{CATALOG_ROOT_PKEY, LogicalFieldId, Namespace, PhysicalKey};
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, LargeBinaryArray, LargeStringArray,
     StringArray, UInt32Array, UInt64Array, make_array,
@@ -28,17 +27,14 @@ pub mod descriptor;
 
 const DESCRIPTOR_ENTRIES_PER_PAGE: usize = 256;
 
-/// High bit is reserved for per-field shadow row_id columns.
-const ROW_ID_TAG: u64 = 1u64 << 63;
-
+/// Sets the shadow row_id tag on a LogicalFieldId using the Namespace enum.
 fn rowid_fid(fid: LogicalFieldId) -> LogicalFieldId {
-    fid | ROW_ID_TAG
+    fid.with_namespace(Namespace::RowIdShadow)
 }
 
 /// Target byte size for descriptor pages. The pager may be mmapped, so page
 /// alignment helps. Used to avoid overgrowing tail pages.
 const TARGET_DESCRIPTOR_PAGE_BYTES: usize = 4096;
-
 /// Target size for data chunks coalesced by the bounded compactor and used
 /// on the ingest path when slicing big appends into multiple chunks.
 const TARGET_CHUNK_BYTES: usize = 1 * 1024 * 1024; // ~1 MiB
@@ -147,8 +143,12 @@ fn split_varlen_offsets32(
             }
             j += 1;
         }
-        out.push(arr.slice(i, j - i));
-        i = j;
+        // BUG FIX: The number of elements to take must not exceed the remaining
+        // elements in the array. `j` can become `len + 1` if the inner loop
+        // finishes, which would create an out-of-bounds slice.
+        let take = (j - i).min(len - i);
+        out.push(arr.slice(i, take));
+        i += take;
     }
     out
 }
@@ -178,8 +178,11 @@ fn split_varlen_offsets64(
             }
             j += 1;
         }
-        out.push(arr.slice(i, j - i));
-        i = j;
+        // BUG FIX: The number of elements to take must not exceed the remaining
+        // elements in the array.
+        let take = (j - i).min(len - i);
+        out.push(arr.slice(i, take));
+        i += take;
     }
     out
 }
@@ -273,7 +276,6 @@ where
         let row_id_idx = schema
             .index_of("row_id")
             .map_err(|_| Error::Internal("row_id column required".into()))?;
-
         let row_id_field = schema.field(row_id_idx);
         if row_id_field.data_type() != &DataType::UInt64 {
             return Err(Error::Internal("row_id must be UInt64".into()));
@@ -287,7 +289,6 @@ where
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| Error::Internal("row_id downcast failed".into()))?;
-
         let mut incoming_ids_map = FxHashMap::default();
         incoming_ids_map.reserve(row_id_arr.len());
         for i in 0..row_id_arr.len() {
@@ -298,7 +299,6 @@ where
         let mut catalog = self.catalog.write().unwrap();
         let mut puts_rewrites: Vec<BatchPut> = Vec::new();
         let mut all_rewritten_ids = FxHashSet::default();
-
         // --- LWW Phase: Perform all rewrites first ---
         for i in 0..batch.num_columns() {
             if i == row_id_idx {
@@ -306,9 +306,13 @@ where
             }
             let field = schema.field(i);
             if let Some(field_id_str) = field.metadata().get("field_id") {
+                // The application is responsible for providing a u64 that can be
+                // converted into the namespaced LogicalFieldId struct.
                 let field_id = field_id_str
-                    .parse::<LogicalFieldId>()
+                    .parse::<u64>()
+                    .map(LogicalFieldId::from)
                     .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
+
                 let rewritten = self.lww_rewrite_for_field(
                     &mut catalog,
                     field_id,
@@ -335,7 +339,6 @@ where
         } else {
             batch.clone()
         };
-
         if batch_to_append.num_rows() == 0 {
             return Ok(());
         }
@@ -345,7 +348,6 @@ where
         let append_row_id_idx = append_schema.index_of("row_id")?;
         let append_row_id_any: ArrayRef = Arc::clone(batch_to_append.column(append_row_id_idx));
         let mut puts_appends: Vec<BatchPut> = Vec::new();
-
         for (i, array) in batch_to_append.columns().iter().enumerate() {
             if i == append_row_id_idx {
                 continue;
@@ -355,7 +357,8 @@ where
                 .metadata()
                 .get("field_id")
                 .ok_or_else(|| Error::Internal("Missing field_id".into()))?
-                .parse::<LogicalFieldId>()
+                .parse::<u64>()
+                .map(LogicalFieldId::from)
                 .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
 
             let descriptor_pk = *catalog.map.entry(field_id).or_insert_with(|| {
@@ -367,12 +370,10 @@ where
                 catalog_dirty = true;
                 self.pager.alloc_many(1).unwrap()[0]
             });
-
             let (mut data_descriptor, mut data_tail_page) =
                 self.load_descriptor_state(descriptor_pk, field_id)?;
             let (mut rid_descriptor, mut rid_tail_page) =
                 self.load_descriptor_state(rid_descriptor_pk, rid_fid)?;
-
             let slices = split_to_target_bytes(
                 array,
                 TARGET_CHUNK_BYTES,
@@ -403,7 +404,6 @@ where
                     data_meta,
                     &mut puts_appends,
                 )?;
-
                 let rid_slice: ArrayRef = append_row_id_any.slice(row_off, rows);
                 let rid_norm = zero_offset(&rid_slice);
                 let rid_pk = self.pager.alloc_many(1)?[0];
@@ -426,7 +426,6 @@ where
                     rid_meta,
                     &mut puts_appends,
                 )?;
-
                 row_off += rows;
             }
 
@@ -484,13 +483,11 @@ where
             Some(pk) => *pk,
             None => return Ok(FxHashSet::default()),
         };
-
         let desc_blob_data = self.pager.get_raw(desc_pk_data)?.ok_or(Error::NotFound)?;
         let mut descriptor_data = ColumnDescriptor::from_le_bytes(desc_blob_data.as_ref());
 
         let desc_blob_rid = self.pager.get_raw(desc_pk_rid)?.ok_or(Error::NotFound)?;
         let mut descriptor_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
-
         let mut metas_data: Vec<ChunkMetadata> = Vec::new();
         let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
         for m in DescriptorIterator::new(self.pager.as_ref(), descriptor_data.head_page_pk) {
@@ -502,7 +499,6 @@ where
 
         let mut rewritten_ids = FxHashSet::default();
         let mut hit_chunks = FxHashMap::<usize, Vec<u64>>::default();
-
         let n = metas_data.len().min(metas_rid.len());
         if n > 0 {
             let mut gets_rid = Vec::with_capacity(n);
@@ -561,7 +557,6 @@ where
 
         for (chunk_idx, rids_in_chunk) in hit_chunks {
             let rids_to_update: FxHashSet<u64> = rids_in_chunk.into_iter().collect();
-
             let old_data_arr = deserialize_array(
                 blob_map
                     .get(&metas_data[chunk_idx].chunk_pk)
@@ -578,12 +573,10 @@ where
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .unwrap();
-
             let keep_mask = BooleanArray::from_iter(
                 (0..old_rid_arr.len())
                     .map(|j| Some(!rids_to_update.contains(&old_rid_arr.value(j)))),
             );
-
             let data_after_delete = compute::filter(&old_data_arr, &keep_mask)?;
             let rid_after_delete = compute::filter(&old_rid_arr_any, &keep_mask)?;
 
@@ -596,13 +589,11 @@ where
 
             let data_to_add = compute::take(incoming_data, &update_indices_arr, None)?;
             let rids_to_add = compute::take(incoming_row_ids, &update_indices_arr, None)?;
-
             let new_data_arr = concat_many(vec![&data_after_delete, &data_to_add])?;
             let new_rid_arr = concat_many(vec![&rid_after_delete, &rids_to_add])?;
 
             let new_data_bytes = serialize_array(&new_data_arr)?;
             let new_rid_bytes = serialize_array(&new_rid_arr)?;
-
             puts.push(BatchPut::Raw {
                 key: metas_data[chunk_idx].chunk_pk,
                 bytes: new_data_bytes,
@@ -611,7 +602,6 @@ where
                 key: metas_rid[chunk_idx].chunk_pk,
                 bytes: new_rid_bytes,
             });
-
             metas_data[chunk_idx].row_count = new_data_arr.len() as u64;
             metas_data[chunk_idx].serialized_bytes = new_data_arr.get_array_memory_size() as u64;
             metas_rid[chunk_idx].row_count = new_rid_arr.len() as u64;
@@ -620,7 +610,6 @@ where
 
         self.rewrite_descriptor_pages(desc_pk_data, &mut descriptor_data, &mut metas_data, puts)?;
         self.rewrite_descriptor_pages(desc_pk_rid, &mut descriptor_rid, &mut metas_rid, puts)?;
-
         Ok(rewritten_ids)
     }
 
@@ -642,7 +631,6 @@ where
                 .ok_or(Error::NotFound)?
                 .as_ref()
                 .to_vec();
-
             let header =
                 DescriptorPageHeader::from_le_bytes(&page_blob[..DescriptorPageHeader::DISK_SIZE]);
             let n_on_page = header.entry_count as usize;
@@ -655,12 +643,10 @@ where
 
             page_blob.truncate(DescriptorPageHeader::DISK_SIZE);
             page_blob.extend_from_slice(&new_page_data);
-
             puts.push(BatchPut::Raw {
                 key: current_page_pk,
                 bytes: page_blob,
             });
-
             current_page_pk = header.next_page_pk;
             page_start_idx = end_idx;
         }
@@ -670,12 +656,10 @@ where
             total_rows += m.row_count;
         }
         descriptor.total_row_count = total_rows;
-
         puts.push(BatchPut::Raw {
             key: descriptor_pk,
             bytes: descriptor.to_le_bytes(),
         });
-
         Ok(())
     }
 
@@ -691,7 +675,6 @@ where
         let mut del_iter = rows_to_delete.into_iter();
         let mut cur_del = del_iter.next();
         let mut last_seen: Option<u64> = None;
-
         if let Some(v) = cur_del {
             last_seen = Some(v);
         }
@@ -731,7 +714,6 @@ where
         }
 
         let mut puts = Vec::new();
-
         let mut cum_rows = 0u64;
 
         for (i, meta) in metas.iter_mut().enumerate() {
@@ -776,7 +758,6 @@ where
             }
 
             let keep = BooleanArray::from_iter((0..rows).map(|j| Some(!del_local.contains(&j))));
-
             // Rewrite data chunk in place.
             let data_blob = self.pager.get_raw(meta.chunk_pk)?.ok_or(Error::NotFound)?;
             let data_arr = deserialize_array(data_blob.clone())?;
@@ -786,7 +767,6 @@ where
                 key: meta.chunk_pk,
                 bytes: data_bytes,
             });
-
             meta.row_count = data_f.len() as u64;
             meta.serialized_bytes = data_f.get_array_memory_size() as u64;
 
@@ -800,7 +780,6 @@ where
                     key: rm.chunk_pk,
                     bytes: rid_bytes,
                 });
-
                 rm.row_count = rid_f.len() as u64;
                 rm.serialized_bytes = rid_f.get_array_memory_size() as u64;
             }
@@ -834,7 +813,6 @@ where
 
         // Drop the read lock before compacting (compaction edits catalog).
         drop(catalog);
-
         // Bounded local compaction (no full-field rewrite).
         self.compact_field_bounded(field_id)?;
 
@@ -870,7 +848,6 @@ where
         } else {
             (new_metas.len() + per - 1) / per
         };
-
         // If empty: free everything and clear counters.
         if need_pages == 0 {
             frees.extend(old_pages.iter().copied());
@@ -949,12 +926,10 @@ where
             Some(&pk) => pk,
             None => return Ok(()),
         };
-
         let desc_blob = self.pager.get_raw(desc_pk)?.ok_or(Error::NotFound)?;
         let mut desc = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
         let desc_blob_rid = self.pager.get_raw(desc_pk_rid)?.ok_or(Error::NotFound)?;
         let mut desc_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
-
         // Load metas.
         let mut metas = Vec::new();
         for m in DescriptorIterator::new(self.pager.as_ref(), desc.head_page_pk) {
@@ -970,14 +945,12 @@ where
 
         let mut puts: Vec<BatchPut> = Vec::new();
         let mut frees: Vec<PhysicalKey> = Vec::new();
-
         let mut new_metas: Vec<ChunkMetadata> = Vec::new();
         let mut new_rid_metas: Vec<ChunkMetadata> = Vec::new();
 
         let mut i = 0usize;
         while i < metas.len() {
             let sz = metas[i].serialized_bytes as usize;
-
             // Keep large chunks as-is.
             if sz >= MIN_CHUNK_BYTES {
                 new_metas.push(metas[i]);
@@ -1055,7 +1028,6 @@ where
 
             for s in slices {
                 let rows = s.len();
-
                 // Slice rid to match s (avoid double Arc).
                 let rid_ref: ArrayRef = merged_rid_any.slice(rid_off, rows);
                 let rid_norm = zero_offset(&rid_ref);
@@ -1065,7 +1037,6 @@ where
                 let data_pk = self.pager.alloc_many(1)?[0];
                 let s_norm = zero_offset(&s);
                 let data_bytes = serialize_array(s_norm.as_ref())?;
-
                 puts.push(BatchPut::Raw {
                     key: data_pk,
                     bytes: data_bytes,
@@ -1074,7 +1045,6 @@ where
                     key: rid_pk,
                     bytes: rid_bytes,
                 });
-
                 let mut meta = ChunkMetadata {
                     chunk_pk: data_pk,
                     value_order_perm_pk: 0,
@@ -1107,7 +1077,6 @@ where
                     min_val_u64: 0,
                     max_val_u64: u64::MAX,
                 };
-
                 new_metas.push(meta);
                 new_rid_metas.push(rid_meta);
                 rid_off += rows;
@@ -1154,7 +1123,6 @@ where
             &mut puts,
             &mut frees,
         )?;
-
         // Persist new/updated blobs and free the old ones.
         if !puts.is_empty() {
             self.pager.batch_put(&puts)?;
@@ -1176,7 +1144,6 @@ where
             Some(pk) => pk,
             None => return Ok(Box::new(std::iter::empty())),
         };
-
         let desc_blob = self.pager.get_raw(descriptor_pk)?.ok_or(Error::NotFound)?;
         let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
@@ -1266,7 +1233,6 @@ where
             let indices = lexsort_to_indices(&[sort_column], None)?;
             let perm_bytes = serialize_array(&indices)?;
             let perm_pk = self.pager.alloc_many(1)?[0];
-
             puts.push(BatchPut::Raw {
                 key: perm_pk,
                 bytes: perm_bytes,
@@ -1289,7 +1255,6 @@ where
             let chunks_on_this_page = header.entry_count as usize;
             let page_end_chunk_idx = page_start_chunk_idx + chunks_on_this_page;
             let updated_chunks = &all_chunk_metadata[page_start_chunk_idx..page_end_chunk_idx];
-
             let mut new_page_data = Vec::new();
             for chunk_meta in updated_chunks {
                 new_page_data.extend_from_slice(&chunk_meta.to_le_bytes());
@@ -1297,7 +1262,6 @@ where
 
             page_blob.truncate(DescriptorPageHeader::DISK_SIZE);
             page_blob.extend_from_slice(&new_page_data);
-
             puts.push(BatchPut::Raw {
                 key: current_page_pk,
                 bytes: page_blob,
@@ -1337,7 +1301,6 @@ where
             }
         }
         let get_results = self.pager.batch_get(&gets)?;
-
         let mut blobs_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
         for result in get_results {
             match result {
@@ -1400,7 +1363,6 @@ where
         let mut header = DescriptorPageHeader::from_le_bytes(
             &tail_page_bytes[..DescriptorPageHeader::DISK_SIZE],
         );
-
         if tail_page_bytes.len() + ChunkMetadata::DISK_SIZE <= TARGET_DESCRIPTOR_PAGE_BYTES
             && (header.entry_count as usize) < DESCRIPTOR_ENTRIES_PER_PAGE
         {
@@ -1415,14 +1377,12 @@ where
             header.next_page_pk = new_tail_pk;
             tail_page_bytes[..DescriptorPageHeader::DISK_SIZE]
                 .copy_from_slice(&header.to_le_bytes());
-
             // --- PERFORMANCE FIX: Move the full page's bytes instead of cloning ---
             let full_page_to_write = std::mem::take(tail_page_bytes);
             puts.push(BatchPut::Raw {
                 key: descriptor.tail_page_pk,
                 bytes: full_page_to_write,
             });
-
             // Create the new tail page.
             let new_header = DescriptorPageHeader {
                 next_page_pk: 0,
@@ -1431,7 +1391,6 @@ where
             };
             let mut new_page_bytes = new_header.to_le_bytes().to_vec();
             new_page_bytes.extend_from_slice(&meta.to_le_bytes());
-
             // Update our live state to point to the new tail.
             descriptor.tail_page_pk = new_tail_pk;
             *tail_page_bytes = new_page_bytes;
@@ -1460,10 +1419,9 @@ where
                 ))
             })?;
             let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-
             if descriptor.field_id != field_id {
                 return Err(Error::Internal(format!(
-                    "Descriptor at pk={} has wrong field_id: expected {}, got {}",
+                    "Descriptor at pk={} has wrong field_id: expected {:?}, got {:?}",
                     descriptor_pk, field_id, descriptor.field_id
                 )));
             }
@@ -1471,7 +1429,6 @@ where
             let mut actual_rows = 0;
             let mut actual_chunks = 0;
             let mut current_page_pk = descriptor.head_page_pk;
-
             while current_page_pk != 0 {
                 let page_blob = self.pager.get_raw(current_page_pk)?.ok_or_else(|| {
                     Error::Internal(format!(
@@ -1482,7 +1439,6 @@ where
                 let header = DescriptorPageHeader::from_le_bytes(
                     &page_blob.as_ref()[..DescriptorPageHeader::DISK_SIZE],
                 );
-
                 for i in 0..(header.entry_count as usize) {
                     let off = DescriptorPageHeader::DISK_SIZE + i * ChunkMetadata::DISK_SIZE;
                     let end = off + ChunkMetadata::DISK_SIZE;
@@ -1495,13 +1451,13 @@ where
 
             if descriptor.total_row_count != actual_rows {
                 return Err(Error::Internal(format!(
-                    "Row count mismatch for field {}: descriptor says {}, actual is {}",
+                    "Row count mismatch for field {:?}: descriptor says {}, actual is {}",
                     field_id, descriptor.total_row_count, actual_rows
                 )));
             }
             if descriptor.total_chunk_count != actual_chunks {
                 return Err(Error::Internal(format!(
-                    "Chunk count mismatch for field {}: descriptor says {}, actual is {}",
+                    "Chunk count mismatch for field {:?}: descriptor says {}, actual is {}",
                     field_id, descriptor.total_chunk_count, actual_chunks
                 )));
             }
@@ -1649,7 +1605,6 @@ impl MergeSortedIterator {
                 }
             }
         };
-
         let mut cursors = Vec::with_capacity(metadata.len());
         for meta in &metadata {
             if meta.row_count == 0 {
@@ -1657,7 +1612,6 @@ impl MergeSortedIterator {
             }
             let data_blob = blobs.get(&meta.chunk_pk).ok_or(Error::NotFound)?.clone();
             let data_arr = deserialize_array(data_blob)?;
-
             let perm_blob = blobs
                 .get(&meta.value_order_perm_pk)
                 .ok_or(Error::NotFound)?
@@ -1667,7 +1621,6 @@ impl MergeSortedIterator {
                 .as_any()
                 .downcast_ref::<UInt32Array>()
                 .ok_or(Error::Internal("perm not u32".into()))?;
-
             // Materialize the sorted view of the chunk's data.
             let sorted = compute::take(&data_arr, perm, None)?;
             cursors.push(ChunkCursor {
@@ -1700,16 +1653,13 @@ impl MergeSortedIterator {
 
 impl Iterator for MergeSortedIterator {
     type Item = Result<ArrayRef>;
-
     fn next(&mut self) -> Option<Self::Item> {
         // Pop the item with the smallest key from the heap.
         match self.heap.pop() {
             Some(Reverse(item)) => {
                 let cursor = &self.cursors[item.cursor_idx];
-
                 // Create a 1-element slice to return.
                 let output_slice = cursor.data_sorted.slice(item.data_idx, 1);
-
                 // If there are more elements in this chunk, push the next one onto the heap.
                 let next_data_idx = item.data_idx + 1;
                 if next_data_idx < cursor.len {

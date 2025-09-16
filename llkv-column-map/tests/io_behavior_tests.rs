@@ -3,23 +3,32 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::{InstrumentedPager, MemPager, Pager};
 use llkv_column_map::store::ColumnStore;
+use llkv_column_map::types::{LogicalFieldId, Namespace};
 use roaring::RoaringTreemap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+/// Test helper to create a standard user-data LogicalFieldId.
+fn fid(id: u32) -> LogicalFieldId {
+    LogicalFieldId::new()
+        .with_namespace(Namespace::UserData)
+        .with_table_id(0)
+        .with_field_id(id)
+}
+
 /// Helper to build a simple schema with "row_id" and one UInt64 data field.
-fn u64_schema_with_fid(fid: u64) -> Arc<Schema> {
+fn u64_schema_with_fid(fid: LogicalFieldId) -> Arc<Schema> {
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), fid.to_string());
+    md.insert("field_id".to_string(), u64::from(fid).to_string());
     let data_field = Field::new("data", DataType::UInt64, false).with_metadata(md);
     let row_id_field = Field::new("row_id", DataType::UInt64, false);
     Arc::new(Schema::new(vec![row_id_field, data_field]))
 }
 
 /// Generic helper to scan a u64 field into a Vec<u64> for any Pager type.
-fn scan_u64<P: Pager<Blob = EntryHandle>>(store: &ColumnStore<P>, fid: u64) -> Vec<u64> {
+fn scan_u64<P: Pager<Blob = EntryHandle>>(store: &ColumnStore<P>, fid: LogicalFieldId) -> Vec<u64> {
     let mut out = Vec::new();
     let it = store.scan(fid).unwrap();
     for arr_res in it {
@@ -39,13 +48,12 @@ fn scan_u64<P: Pager<Blob = EntryHandle>>(store: &ColumnStore<P>, fid: u64) -> V
 fn test_instrumented_paging_io_behavior() {
     // This test verifies the exact physical I/O counts during a series of
     // storage operations to catch regressions in storage behavior.
-
     // --- 1. Setup ---
     // Wrap the MemPager to track I/O operations.
     let (pager, stats) = InstrumentedPager::new(MemPager::new());
     let store = ColumnStore::open(Arc::new(pager)).unwrap();
-    let fid: u64 = 950;
-    let schema = u64_schema_with_fid(fid);
+    let field_id = fid(950);
+    let schema = u64_schema_with_fid(field_id);
 
     // --- Phase 2: Initial Append ---
     // This first append creates new pages for the catalog, descriptors, and data.
@@ -104,7 +112,7 @@ fn test_instrumented_paging_io_behavior() {
     // which *will* free the old, now-obsolete data pages.
     let mut to_delete = RoaringTreemap::new();
     to_delete.insert(0); // Delete the row with global index 0 (value 10)
-    store.delete_rows(fid, &to_delete).unwrap();
+    store.delete_rows(field_id, &to_delete).unwrap();
 
     let puts_after_delete = stats.physical_puts.load(Ordering::Relaxed);
     let gets_after_delete = stats.physical_gets.load(Ordering::Relaxed);
@@ -113,7 +121,6 @@ fn test_instrumented_paging_io_behavior() {
         "Stats after delete+compact: gets={}, puts={}, frees={}",
         gets_after_delete, puts_after_delete, frees_after_delete
     );
-
     // Assert that the delete/compaction process involved reads, writes (for new chunks), and frees (for old chunks).
     assert!(puts_after_delete > puts_after_lww);
     assert!(gets_after_delete > gets_after_lww);
@@ -121,7 +128,6 @@ fn test_instrumented_paging_io_behavior() {
         frees_after_delete > 0,
         "Compaction after delete should free obsolete pages"
     );
-
     println!("\nFinal IO Stats: {:?}", stats);
 }
 
@@ -131,11 +137,10 @@ fn test_exact_io_counts_for_simple_append() {
     // I/O operations for a simple, single-chunk append. This is useful for
     // catching subtle performance regressions but is more brittle to
     // implementation changes than relational checks.
-
     let (pager, stats) = InstrumentedPager::new(MemPager::new());
     let store = ColumnStore::open(Arc::new(pager)).unwrap();
-    let fid: u64 = 101;
-    let schema = u64_schema_with_fid(fid);
+    let field_id = fid(101);
+    let schema = u64_schema_with_fid(field_id);
 
     // --- The Operation ---
     // Append a single batch with 3 rows. This will create one data chunk
@@ -153,21 +158,18 @@ fn test_exact_io_counts_for_simple_append() {
         3,
         "Expected exactly 3 physical gets for the first append to a new store"
     );
-
     // Expected PUTS: 7
     assert_eq!(
         stats.physical_puts.load(Ordering::Relaxed),
         7,
         "Expected exactly 7 physical puts"
     );
-
     // Expected ALLOCS: 6
     assert_eq!(
         stats.physical_allocs.load(Ordering::Relaxed),
         6,
         "Expected exactly 6 physical allocs"
     );
-
     // Expected FREES: 0
     assert_eq!(stats.physical_frees.load(Ordering::Relaxed), 0);
 }
@@ -187,8 +189,8 @@ fn test_large_scale_churn_io() {
 
     let (pager, stats) = InstrumentedPager::new(MemPager::new());
     let store = ColumnStore::open(Arc::new(pager)).unwrap();
-    let fid: u64 = 1001;
-    let schema = u64_schema_with_fid(fid);
+    let field_id = fid(1001);
+    let schema = u64_schema_with_fid(field_id);
 
     // --- 2. Phase 1: Bulk Upsert (Insert) of 1M Entries in Batches ---
     println!(
@@ -224,7 +226,7 @@ fn test_large_scale_churn_io() {
             to_delete.insert(i);
         }
     }
-    store.delete_rows(fid, &to_delete).unwrap();
+    store.delete_rows(field_id, &to_delete).unwrap();
 
     let gets_after_delete = stats.get_batches.load(Ordering::Relaxed);
     let puts_after_delete = stats.put_batches.load(Ordering::Relaxed);
@@ -241,7 +243,7 @@ fn test_large_scale_churn_io() {
         "Deletes should trigger compaction and free pages"
     );
     assert_eq!(
-        scan_u64(&store, fid).len(),
+        scan_u64(&store, field_id).len(),
         (NUM_ROWS - NUM_DELETES as u64) as usize
     );
 
@@ -274,9 +276,8 @@ fn test_large_scale_churn_io() {
 
     // The number of rows should remain the same after an update of existing keys
     assert_eq!(
-        scan_u64(&store, fid).len(),
+        scan_u64(&store, field_id).len(),
         (NUM_ROWS - NUM_DELETES as u64) as usize
     );
-
     println!("\nTest Complete. Final IO Stats: {:?}", stats);
 }

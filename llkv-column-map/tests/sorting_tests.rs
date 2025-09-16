@@ -3,26 +3,33 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
+use llkv_column_map::types::{LogicalFieldId, Namespace};
 use rand::rng;
 use rand::seq::SliceRandom;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Test helper to create a standard user-data LogicalFieldId.
+fn fid(id: u32) -> LogicalFieldId {
+    LogicalFieldId::new()
+        .with_namespace(Namespace::UserData)
+        .with_table_id(0)
+        .with_field_id(id)
+}
 
 #[test]
 fn test_large_sort_u64() {
     const NUM_ROWS: usize = 1_000_000;
     const NUM_BATCHES: usize = 10;
     const BATCH_SIZE: usize = NUM_ROWS / NUM_BATCHES;
-    let field_id = 301;
+    let field_id = fid(301);
 
     // --- 1. Setup ---
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-
     let mut metadata = HashMap::new();
-    metadata.insert("field_id".to_string(), field_id.to_string());
+    metadata.insert("field_id".to_string(), u64::from(field_id).to_string());
     let data_field = Field::new("data", DataType::UInt64, false).with_metadata(metadata);
-
     // Add required row_id column to the schema.
     let row_id_field = Field::new("row_id", DataType::UInt64, false);
     let schema = Arc::new(Schema::new(vec![row_id_field, data_field]));
@@ -31,7 +38,6 @@ fn test_large_sort_u64() {
     println!("Generating and ingesting {} shuffled u64 rows...", NUM_ROWS);
     let mut data: Vec<u64> = (0..NUM_ROWS as u64).collect();
     data.shuffle(&mut rng());
-
     for i in 0..NUM_BATCHES {
         let start = i * BATCH_SIZE;
         let end = start + BATCH_SIZE;
@@ -81,16 +87,14 @@ fn test_large_sort_i32() {
     const NUM_ROWS: usize = 500_000;
     const NUM_BATCHES: usize = 5;
     const BATCH_SIZE: usize = NUM_ROWS / NUM_BATCHES;
-    let field_id = 302;
+    let field_id = fid(302);
 
     // --- 1. Setup ---
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-
     let mut metadata = HashMap::new();
-    metadata.insert("field_id".to_string(), field_id.to_string());
+    metadata.insert("field_id".to_string(), u64::from(field_id).to_string());
     let data_field = Field::new("data", DataType::Int32, false).with_metadata(metadata);
-
     // Add required row_id column to the schema.
     let row_id_field = Field::new("row_id", DataType::UInt64, false);
     let schema = Arc::new(Schema::new(vec![row_id_field, data_field]));

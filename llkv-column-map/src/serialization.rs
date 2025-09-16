@@ -6,21 +6,25 @@
 //! Supported layouts (non-null only for now):
 //! - Primitive: UInt64, Int32, UInt32, Float32
 //! - FixedSizeList<Float32> with constant list_size
+//! - Variable-length: Binary (NEW)
 //!
 //! Format (little-endian):
 //!   [0..4)   : b"ARR0"
-//!   [4]      : layout (0=primitive, 1=fsl_float32)
-//!   [5]      : type_code (UInt64=1, Int32=2, UInt32=3, Float32=4),
+//!   [4]      : layout (0=primitive, 1=fsl_float32, 2=varlen)
+//!   [5]      : type_code (UInt64=1, Int32=2, ... Binary=5),
 //!              for fsl this is ignored (kept as 0)
 //!   [6..8)   : reserved (0)
-//!   [8..16)  : len (u64) = number of elements (primitive) or lists (fsl)
+//!   [8..16)  : len (u64) = number of elements
 //!   [16..20) : extra_a (u32) -> primitive: values_len_bytes
 //!                                     fsl: list_size
+//!                                     varlen: offsets_len_bytes
 //!   [20..24) : extra_b (u32) -> primitive: reserved 0
 //!                                     fsl: child_values_len_bytes
+//!                                     varlen: values_len_bytes
 //!   payload:
 //!     primitive: [values_bytes]
 //!     fsl:       [child_values_bytes]
+//!     varlen:    [offsets_bytes][values_bytes]
 //!
 //! Note: we deliberately skip nulls to keep the format minimal and fast;
 //! your current tests/benches use non-null arrays. We can extend the
@@ -30,7 +34,8 @@ use std::convert::TryFrom;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, UInt32Array, UInt64Array,
+    Array, ArrayData, ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Int32Array,
+    UInt32Array, UInt64Array, make_array,
 };
 use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field};
@@ -44,6 +49,7 @@ const MAGIC: [u8; 4] = *b"ARR0";
 enum Layout {
     Primitive = 0,
     FslFloat32 = 1,
+    Varlen = 2, // NEW
 }
 
 #[repr(u8)]
@@ -52,6 +58,7 @@ enum PrimType {
     Int32 = 2,
     UInt32 = 3,
     Float32 = 4,
+    Binary = 5, // NEW
 }
 
 #[inline]
@@ -83,9 +90,9 @@ pub fn serialize_array(arr: &dyn Array) -> Result<Vec<u8>> {
         &DataType::Int32 => serialize_primitive(arr, PrimType::Int32),
         &DataType::UInt32 => serialize_primitive(arr, PrimType::UInt32),
         &DataType::Float32 => serialize_primitive(arr, PrimType::Float32),
+        &DataType::Binary => serialize_varlen(arr, PrimType::Binary),
 
         &DataType::FixedSizeList(ref child, list_size) => {
-            // Only support Float32 children now; matches your tests.
             if child.data_type() != &DataType::Float32 {
                 return Err(Error::Internal(
                     "Only FixedSizeList<Float32> supported".to_string(),
@@ -101,7 +108,6 @@ pub fn serialize_array(arr: &dyn Array) -> Result<Vec<u8>> {
 }
 
 fn serialize_primitive(arr: &dyn Array, code: PrimType) -> Result<Vec<u8>> {
-    // Non-null only for now.
     if arr.null_count() != 0 {
         return Err(Error::Internal(
             "nulls not supported in zero-copy format (yet)".to_string(),
@@ -130,8 +136,47 @@ fn serialize_primitive(arr: &dyn Array, code: PrimType) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn serialize_varlen(arr: &dyn Array, code: PrimType) -> Result<Vec<u8>> {
+    if arr.null_count() != 0 {
+        return Err(Error::Internal(
+            "nulls not supported in zero-copy format (yet)".to_string(),
+        ));
+    }
+
+    let data = arr.to_data();
+    let len = data.len() as u64;
+
+    let offsets_buf = data
+        .buffers()
+        .get(0)
+        .ok_or_else(|| Error::Internal("missing offsets buffer".into()))?;
+    let values_buf = data
+        .buffers()
+        .get(1)
+        .ok_or_else(|| Error::Internal("missing values buffer for varlen".into()))?;
+
+    let offsets_bytes = offsets_buf.as_slice();
+    let values_bytes = values_buf.as_slice();
+
+    let offsets_len = u32::try_from(offsets_bytes.len())
+        .map_err(|_| Error::Internal("offsets buffer too large".into()))?;
+    let values_len = u32::try_from(values_bytes.len())
+        .map_err(|_| Error::Internal("values buffer too large".into()))?;
+
+    let mut out = Vec::with_capacity(24 + offsets_bytes.len() + values_bytes.len());
+    out.extend_from_slice(&MAGIC);
+    out.push(Layout::Varlen as u8);
+    out.push(code as u8);
+    out.extend_from_slice(&[0u8; 2]); // reserved
+    put_u64_le(&mut out, len);
+    put_u32_le(&mut out, offsets_len); // extra_a = offsets_len_bytes
+    put_u32_le(&mut out, values_len); // extra_b = values_len_bytes
+    out.extend_from_slice(offsets_bytes);
+    out.extend_from_slice(values_bytes);
+    Ok(out)
+}
+
 fn serialize_fsl_float32(arr: &dyn Array, list_size: i32) -> Result<Vec<u8>> {
-    // Non-null only for now (both parent and child).
     if arr.null_count() != 0 {
         return Err(Error::Internal(
             "nulls not supported in zero-copy format (yet)".to_string(),
@@ -184,10 +229,8 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
     let extra_a = get_u32_le(raw, &mut o);
     let extra_b = get_u32_le(raw, &mut o);
 
-    // Build a Buffer that references the EntryHandle mmap directly, then
-    // slice to the payload. This is zero-copy via EntryHandle::as_arrow_buffer().
     let whole: Buffer = blob.as_arrow_buffer();
-    let payload: Buffer = whole.slice(o);
+    let payload: Buffer = whole.slice_with_length(o, whole.len() - o);
 
     match layout {
         x if x == Layout::Primitive as u8 => {
@@ -195,20 +238,20 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
             if payload.len() != values_len {
                 return Err(Error::Internal("primitive payload length mismatch".into()));
             }
-            let values = payload; // already exact length
-            let arr: ArrayRef = match type_code {
-                x if x == PrimType::UInt64 as u8 => Arc::new(UInt64Array::new(values.into(), None)),
-                x if x == PrimType::Int32 as u8 => Arc::new(Int32Array::new(values.into(), None)),
-                x if x == PrimType::UInt32 as u8 => Arc::new(UInt32Array::new(values.into(), None)),
-                x if x == PrimType::Float32 as u8 => {
-                    Arc::new(Float32Array::new(values.into(), None))
-                }
+
+            let data_type = match type_code {
+                x if x == PrimType::UInt64 as u8 => DataType::UInt64,
+                x if x == PrimType::Int32 as u8 => DataType::Int32,
+                x if x == PrimType::UInt32 as u8 => DataType::UInt32,
+                x if x == PrimType::Float32 as u8 => DataType::Float32,
                 _ => return Err(Error::Internal("unsupported primitive code".into())),
             };
-            if arr.len() != len {
-                return Err(Error::Internal("primitive length mismatch".into()));
-            }
-            Ok(arr)
+
+            let data = ArrayData::builder(data_type)
+                .len(len)
+                .add_buffer(payload)
+                .build()?;
+            Ok(make_array(data))
         }
 
         x if x == Layout::FslFloat32 as u8 => {
@@ -217,14 +260,44 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
             if payload.len() != child_values_len {
                 return Err(Error::Internal("fsl child length mismatch".into()));
             }
-            let child_values = payload; // already exact length
-            let child = Arc::new(Float32Array::new(child_values.into(), None)) as ArrayRef;
+            let child_values = payload;
+            let child_len = len * list_size as usize;
+            let child_data = ArrayData::builder(DataType::Float32)
+                .len(child_len)
+                .add_buffer(child_values)
+                .build()?;
+            let child = Arc::new(Float32Array::from(child_data)) as ArrayRef;
+
             let field = Arc::new(Field::new("item", DataType::Float32, false));
-            let arr = FixedSizeListArray::new(field, list_size, child, None);
-            if arr.len() != len {
-                return Err(Error::Internal("fsl length mismatch".into()));
+            let arr_data = ArrayData::builder(DataType::FixedSizeList(field, list_size))
+                .len(len)
+                .add_child_data(child.to_data())
+                .build()?;
+
+            Ok(Arc::new(FixedSizeListArray::from(arr_data)))
+        }
+
+        x if x == Layout::Varlen as u8 => {
+            let offsets_len = extra_a as usize;
+            let values_len = extra_b as usize;
+            if payload.len() != offsets_len + values_len {
+                return Err(Error::Internal("varlen payload length mismatch".into()));
             }
-            Ok(Arc::new(arr))
+
+            let offsets = payload.slice_with_length(0, offsets_len);
+            let values = payload.slice_with_length(offsets_len, values_len);
+
+            let data_type = match type_code {
+                x if x == PrimType::Binary as u8 => DataType::Binary,
+                _ => return Err(Error::Internal("unsupported varlen code".into())),
+            };
+
+            let data = ArrayData::builder(data_type)
+                .len(len)
+                .add_buffer(offsets)
+                .add_buffer(values)
+                .build()?;
+            Ok(make_array(data))
         }
 
         _ => Err(Error::Internal("unknown layout".into())),

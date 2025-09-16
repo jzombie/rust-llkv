@@ -82,7 +82,9 @@ impl ColumnDescriptor {
     /// Single allocation; append fields as LE without growth churn.
     pub fn to_le_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::DISK_SIZE);
-        buf.extend_from_slice(&self.field_id.to_le_bytes());
+        // Convert LogicalFieldId struct into a u64 for serialization.
+        let field_id_u64: u64 = self.field_id.into();
+        buf.extend_from_slice(&field_id_u64.to_le_bytes());
         buf.extend_from_slice(&self.head_page_pk.to_le_bytes());
         buf.extend_from_slice(&self.tail_page_pk.to_le_bytes());
         buf.extend_from_slice(&self.total_row_count.to_le_bytes());
@@ -97,7 +99,8 @@ impl ColumnDescriptor {
             *off += 8;
             v
         };
-        let field_id = rd(&mut o);
+        // Read the u64 from bytes and convert it into the LogicalFieldId struct.
+        let field_id = LogicalFieldId::from(rd(&mut o));
         let head_page_pk = rd(&mut o);
         let tail_page_pk = rd(&mut o);
         let total_row_count = rd(&mut o);
@@ -120,7 +123,7 @@ impl ColumnDescriptor {
 pub struct DescriptorPageHeader {
     pub next_page_pk: PhysicalKey, // Using 0 as None
     pub entry_count: u32,
-    pub _padding: [u8; 4], // FIX: Make field public
+    pub _padding: [u8; 4],
 }
 
 impl DescriptorPageHeader {

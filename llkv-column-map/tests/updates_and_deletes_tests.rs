@@ -13,17 +13,25 @@
 // - The store now performs in-place chunk rewrites for LWW and deletes,
 //   not tombstones. Tests still describe "tombstone" behavior but the
 //   observable results (only latest value survives) are the same.
-
 use arrow::array::{Array, Int32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
+use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use roaring::RoaringTreemap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+
+/// Test helper to create a standard user-data LogicalFieldId.
+fn fid(id: u32) -> LogicalFieldId {
+    LogicalFieldId::new()
+        .with_namespace(Namespace::UserData)
+        .with_table_id(0)
+        .with_field_id(id)
+}
 
 /// Helper: build a schema with "row_id" inserted at column 0.
 fn schema_with_row_id(mut fields: Vec<Field>) -> Arc<Schema> {
@@ -34,7 +42,7 @@ fn schema_with_row_id(mut fields: Vec<Field>) -> Arc<Schema> {
 
 /// Helper: scan a u64 field into a Vec<u64> (order is append order unless
 /// sorted; we just collect).
-fn scan_u64(store: &ColumnStore<MemPager>, fid: u64) -> Vec<u64> {
+fn scan_u64(store: &ColumnStore<MemPager>, fid: LogicalFieldId) -> Vec<u64> {
     let mut out = Vec::new();
     let it = store.scan(fid).unwrap();
     for arr_res in it {
@@ -51,7 +59,7 @@ fn scan_u64(store: &ColumnStore<MemPager>, fid: u64) -> Vec<u64> {
 }
 
 /// Helper: scan an i32 field into a Vec<i32>.
-fn scan_i32(store: &ColumnStore<MemPager>, fid: u64) -> Vec<i32> {
+fn scan_i32(store: &ColumnStore<MemPager>, fid: LogicalFieldId) -> Vec<i32> {
     let mut out = Vec::new();
     let it = store.scan(fid).unwrap();
     for arr_res in it {
@@ -70,7 +78,11 @@ fn scan_i32(store: &ColumnStore<MemPager>, fid: u64) -> Vec<i32> {
 /// Helper: find the current global row index of a specific u64 value in
 /// a field by scanning in append order. Returns None if not found.
 /// This is used because LWW rewrites can shift global indexes.
-fn find_index_of_u64(store: &ColumnStore<MemPager>, fid: u64, needle: u64) -> Option<u64> {
+fn find_index_of_u64(
+    store: &ColumnStore<MemPager>,
+    fid: LogicalFieldId,
+    needle: u64,
+) -> Option<u64> {
     let mut idx: u64 = 0;
     let it = store.scan(fid).unwrap();
     for arr_res in it {
@@ -93,13 +105,12 @@ fn test_lww_updates_single_field_u64() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let fid: u64 = 700;
+    let field_id = fid(700);
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), fid.to_string());
+    md.insert("field_id".to_string(), u64::from(field_id).to_string());
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);
 
     let schema = schema_with_row_id(vec![data_f]);
-
     // Initial 6 rows: row_id = 0..5, values are distinct.
     let rid0 = Arc::new(UInt64Array::from(vec![0, 1, 2, 3, 4, 5]));
     let v0 = Arc::new(UInt64Array::from(vec![10, 20, 30, 40, 50, 60]));
@@ -119,7 +130,7 @@ fn test_lww_updates_single_field_u64() {
     store.append(&b2).unwrap();
 
     // Collect all current values for fid=700 and verify winners.
-    let mut got = scan_u64(&store, fid);
+    let mut got = scan_u64(&store, field_id);
     got.sort_unstable();
 
     // Expected after LWW:
@@ -139,19 +150,18 @@ fn test_lww_per_field_isolation() {
     let store = ColumnStore::open(pager).unwrap();
 
     // Two fields with different logical ids.
-    let fida: u64 = 800;
-    let fidb: u64 = 801;
+    let fida = fid(800);
+    let fidb = fid(801);
 
     let mut mda = HashMap::new();
-    mda.insert("field_id".to_string(), fida.to_string());
+    mda.insert("field_id".to_string(), u64::from(fida).to_string());
     let fa = Field::new("a_data", DataType::UInt64, false).with_metadata(mda);
 
     let mut mdb = HashMap::new();
-    mdb.insert("field_id".to_string(), fidb.to_string());
+    mdb.insert("field_id".to_string(), u64::from(fidb).to_string());
     let fb = Field::new("b_data", DataType::Int32, false).with_metadata(mdb);
 
     let schema_ab = schema_with_row_id(vec![fa.clone(), fb.clone()]);
-
     // Ingest one batch with both fields populated for row_id 0..4.
     let r0 = Arc::new(UInt64Array::from(vec![0, 1, 2, 3, 4]));
     let a0 = Arc::new(UInt64Array::from(vec![10, 20, 30, 40, 50]));
@@ -163,7 +173,7 @@ fn test_lww_per_field_isolation() {
     // Use a schema that includes only row_id and field A, so the number
     // of arrays matches the number of fields.
     let mut mda2 = HashMap::new();
-    mda2.insert("field_id".to_string(), fida.to_string());
+    mda2.insert("field_id".to_string(), u64::from(fida).to_string());
     let fa2 = Field::new("a_data", DataType::UInt64, false).with_metadata(mda2);
     let schema_a_only = schema_with_row_id(vec![fa2]);
 
@@ -195,13 +205,12 @@ fn test_deletes_and_updates() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let fid: u64 = 820;
+    let field_id = fid(820);
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), fid.to_string());
+    md.insert("field_id".to_string(), u64::from(field_id).to_string());
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);
 
     let schema = schema_with_row_id(vec![data_f]);
-
     // Initial 10 rows: row_id 0..9, values 10x index.
     let rid0 = Arc::new(UInt64Array::from((0u64..10u64).collect::<Vec<u64>>()));
     let vals0 = Arc::new(UInt64Array::from(
@@ -218,14 +227,15 @@ fn test_deletes_and_updates() {
 
     // Now explicitly delete the row whose VALUE is 40. Because LWW can
     // shift global indexes, resolve its current global index first.
-    let idx_40 = find_index_of_u64(&store, fid, 40).expect("value 40 should exist before delete");
+    let idx_40 =
+        find_index_of_u64(&store, field_id, 40).expect("value 40 should exist before delete");
 
     let mut bm = RoaringTreemap::new();
     bm.insert(idx_40);
-    store.delete_rows(fid, &bm).unwrap();
+    store.delete_rows(field_id, &bm).unwrap();
 
     // Collect and verify: we should have 9 rows now.
-    let got = scan_u64(&store, fid);
+    let got = scan_u64(&store, field_id);
     assert_eq!(got.len(), 9);
 
     // Build the expected set by row_id:
@@ -246,7 +256,6 @@ fn test_deletes_and_updates() {
     // Check membership ignoring order.
     let mut expected: Vec<u64> = exp_map.values().copied().collect();
     expected.sort_unstable();
-
     let mut got_sorted = got.clone();
     got_sorted.sort_unstable();
 
