@@ -98,24 +98,27 @@ static NEXT_ROW_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Default, Debug)]
 struct CountsSnapshot {
-    batches: u64,
-    puts: u64,
-    gets: u64,
-    frees: u64,
-    allocs: u64,
+    get_batches: u64,
+    put_batches: u64,
+    free_batches: u64,
+    alloc_batches: u64,
+    physical_puts: u64,
+    physical_gets: u64,
+    physical_frees: u64,
+    physical_allocs: u64,
 }
 
 impl From<&Arc<IoStats>> for CountsSnapshot {
     fn from(stats: &Arc<IoStats>) -> Self {
         Self {
-            batches: stats.get_batches.load(Ordering::Relaxed)
-                + stats.put_batches.load(Ordering::Relaxed)
-                + stats.free_batches.load(Ordering::Relaxed)
-                + stats.alloc_batches.load(Ordering::Relaxed),
-            puts: stats.physical_puts.load(Ordering::Relaxed),
-            gets: stats.physical_gets.load(Ordering::Relaxed),
-            frees: stats.physical_frees.load(Ordering::Relaxed),
-            allocs: stats.physical_allocs.load(Ordering::Relaxed),
+            get_batches: stats.get_batches.load(Ordering::Relaxed),
+            put_batches: stats.put_batches.load(Ordering::Relaxed),
+            free_batches: stats.free_batches.load(Ordering::Relaxed),
+            alloc_batches: stats.alloc_batches.load(Ordering::Relaxed),
+            physical_puts: stats.physical_puts.load(Ordering::Relaxed),
+            physical_gets: stats.physical_gets.load(Ordering::Relaxed),
+            physical_frees: stats.physical_frees.load(Ordering::Relaxed),
+            physical_allocs: stats.physical_allocs.load(Ordering::Relaxed),
         }
     }
 }
@@ -124,11 +127,14 @@ impl core::ops::Sub for CountsSnapshot {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self {
         Self {
-            batches: self.batches.saturating_sub(rhs.batches),
-            puts: self.puts.saturating_sub(rhs.puts),
-            gets: self.gets.saturating_sub(rhs.gets),
-            frees: self.frees.saturating_sub(rhs.frees),
-            allocs: self.allocs.saturating_sub(rhs.allocs),
+            get_batches: self.get_batches.saturating_sub(rhs.get_batches),
+            put_batches: self.put_batches.saturating_sub(rhs.put_batches),
+            free_batches: self.free_batches.saturating_sub(rhs.free_batches),
+            alloc_batches: self.alloc_batches.saturating_sub(rhs.alloc_batches),
+            physical_puts: self.physical_puts.saturating_sub(rhs.physical_puts),
+            physical_gets: self.physical_gets.saturating_sub(rhs.physical_gets),
+            physical_frees: self.physical_frees.saturating_sub(rhs.physical_frees),
+            physical_allocs: self.physical_allocs.saturating_sub(rhs.physical_allocs),
         }
     }
 }
@@ -190,11 +196,14 @@ fn show_phase_with_data(
     print_data_summary(label, summary);
     let now = CountsSnapshot::from(stats);
     let d = now - *prev;
-    println!("  batches: {}", d.batches);
-    println!("  puts:    {}", d.puts);
-    println!("  gets:    {}", d.gets);
-    println!("  frees:   {}", d.frees);
-    println!("  allocs:  {}", d.allocs);
+    println!(
+        "  batch ops: gets={}, puts={}, frees={}, allocs={}",
+        d.get_batches, d.put_batches, d.free_batches, d.alloc_batches
+    );
+    println!(
+        "  phys ops:  gets={}, puts={}, frees={}, allocs={}",
+        d.physical_gets, d.physical_puts, d.physical_frees, d.physical_allocs
+    );
     println!();
     *prev = now;
 }
@@ -203,11 +212,14 @@ fn show_phase(label: &str, stats: &Arc<IoStats>, prev: &mut CountsSnapshot) {
     println!("== {} ==", label);
     let now = CountsSnapshot::from(stats);
     let d = now - *prev;
-    println!("  batches: {}", d.batches);
-    println!("  puts:    {}", d.puts);
-    println!("  gets:    {}", d.gets);
-    println!("  frees:   {}", d.frees);
-    println!("  allocs:  {}", d.allocs);
+    println!(
+        "  batch ops: gets={}, puts={}, frees={}, allocs={}",
+        d.get_batches, d.put_batches, d.free_batches, d.alloc_batches
+    );
+    println!(
+        "  phys ops:  gets={}, puts={}, frees={}, allocs={}",
+        d.physical_gets, d.physical_puts, d.physical_frees, d.physical_allocs
+    );
     println!();
     *prev = now;
 }
@@ -302,18 +314,18 @@ fn render_storage_ascii<P: Pager>(pager: &P) -> String {
             )
             .unwrap();
 
-            let mut chunk_pks = Vec::new();
+            let mut chunk_pks_to_fetch = Vec::new();
             for i in 0..(hd.entry_count as usize) {
                 let off = hdr_sz + i * ChunkMetadata::DISK_SIZE;
                 let end = off + ChunkMetadata::DISK_SIZE;
                 let meta = ChunkMetadata::from_le_bytes(&bytes[off..end]);
-                chunk_pks.push(meta.chunk_pk);
+                chunk_pks_to_fetch.push(meta.chunk_pk);
                 if meta.value_order_perm_pk != 0 {
-                    chunk_pks.push(meta.value_order_perm_pk);
+                    chunk_pks_to_fetch.push(meta.value_order_perm_pk);
                 }
             }
 
-            let gets: Vec<_> = chunk_pks
+            let gets: Vec<_> = chunk_pks_to_fetch
                 .iter()
                 .map(|pk| BatchGet::Raw { key: *pk })
                 .collect();
