@@ -1,4 +1,4 @@
-use arrow::array::{Array, UInt64Array};
+use arrow::array::UInt64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::MemPager;

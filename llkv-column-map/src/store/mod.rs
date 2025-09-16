@@ -23,9 +23,8 @@ use std::collections::BinaryHeap;
 use std::sync::{Arc, RwLock};
 
 pub mod catalog;
-pub mod descriptor;
-
 pub mod debug;
+pub mod descriptor;
 
 const DESCRIPTOR_ENTRIES_PER_PAGE: usize = 256;
 
@@ -1686,7 +1685,8 @@ struct HeapItem {
     cursor_idx: usize,
     /// The index into the `data_sorted` array for the current cursor.
     data_idx: usize,
-    // TODO: Why is this u128?
+    /// A normalized `u128` representation of the item's value, used for
+    /// sorting across different numeric types in the min-heap.
     key_u128: u128,
 }
 
@@ -1719,6 +1719,15 @@ enum KeyType {
     I32,
 }
 
+/// Encodes different numeric types into a common `u128` space where their natural
+/// sort order is preserved for the min-heap.
+///
+/// - **For `u64`**, this is a direct cast, as its sort order is already correct.
+/// - **For `i32`**, a simple cast would break sorting due to two's complement
+///   representation (e.g., `-1` would become a very large positive number).
+///   To fix this, we shift the entire `i32` range to be non-negative by
+///   subtracting `i32::MIN`. This ensures that if `a < b` in `i32`, their `u128`
+///   representations also satisfy `a' < b'`.
 #[inline]
 fn encode_key_u128(arr: &ArrayRef, idx: usize, kind: KeyType) -> u128 {
     match kind {

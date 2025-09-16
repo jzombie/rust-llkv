@@ -35,7 +35,7 @@ use std::time::Instant;
 
 use llkv_column_map::{
     ColumnStore,
-    storage::pager::{MemPager, Pager},
+    storage::pager::MemPager,
     store::debug::{ColumnStoreDebug, discover_all_pks},
     types::{LogicalFieldId, Namespace, PhysicalKey},
 };
