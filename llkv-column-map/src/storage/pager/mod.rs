@@ -6,6 +6,9 @@
 use crate::error::Result;
 use crate::types::PhysicalKey;
 
+pub mod instrumented_pager;
+pub use instrumented_pager::*;
+
 pub mod mem_pager;
 pub use mem_pager::*;
 
