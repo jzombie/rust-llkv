@@ -208,7 +208,8 @@ fn split_to_target_bytes(
         return out;
     }
 
-    // Handle common var-width types using their offsets, after zeroing slice offset.
+    // Handle common var-width types using their offsets, after zeroing slice
+    // offset.
     let arr0 = zero_offset(arr);
     match arr0.data_type() {
         DataType::Utf8 => {
@@ -227,7 +228,8 @@ fn split_to_target_bytes(
             let a = arr0.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
             split_varlen_offsets64(a.value_offsets(), n, &arr0, target_bytes)
         }
-        // Fallback for other var-width types (e.g., List/Struct/Map): conservative row cap.
+        // Fallback for other var-width types (e.g., List/Struct/Map):
+        // conservative row cap.
         _ => {
             let rows_per = varwidth_fallback_rows_per_slice; // configurable
             let mut out = Vec::with_capacity((n + rows_per - 1) / rows_per);
@@ -240,6 +242,60 @@ fn split_to_target_bytes(
             out
         }
     }
+}
+
+/// Per-chunk logical edit description used by delete and LWW upsert.
+/// - keep: optional boolean mask to filter the current rows.
+/// - inject_*: optional tail to append after filtering (for upserts).
+struct ChunkEdit {
+    keep: Option<BooleanArray>,
+    inject_data: Option<ArrayRef>,
+    inject_rids: Option<ArrayRef>,
+}
+
+impl ChunkEdit {
+    #[inline]
+    fn none() -> Self {
+        Self {
+            keep: None,
+            inject_data: None,
+            inject_rids: None,
+        }
+    }
+}
+
+/// Apply a ChunkEdit to in-memory arrays and return new arrays. No IO here.
+/// The caller is responsible for writing results and refreshing perms.
+#[inline]
+fn apply_edit_to_arrays(
+    data_arr: &ArrayRef,
+    rid_arr: Option<&ArrayRef>,
+    edit: &ChunkEdit,
+) -> Result<(ArrayRef, Option<ArrayRef>)> {
+    let mut out_data = if let Some(ref k) = edit.keep {
+        compute::filter(data_arr, k)?
+    } else {
+        data_arr.clone()
+    };
+
+    let mut out_rids = if let Some(r) = rid_arr {
+        if let Some(ref k) = edit.keep {
+            Some(compute::filter(r, k)?)
+        } else {
+            Some(r.clone())
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref inj) = edit.inject_data {
+        out_data = concat_many(vec![&out_data, inj])?;
+    }
+    if let (Some(ref inj_r), Some(ref r)) = (edit.inject_rids.as_ref(), out_rids.as_ref()) {
+        out_rids = Some(concat_many(vec![r, inj_r])?);
+    }
+
+    Ok((out_data, out_rids))
 }
 
 pub struct ColumnStore<P: Pager> {
@@ -302,6 +358,7 @@ where
         let mut catalog = self.catalog.write().unwrap();
         let mut puts_rewrites: Vec<BatchPut> = Vec::new();
         let mut all_rewritten_ids = FxHashSet::default();
+
         // --- LWW Phase: Perform all rewrites first ---
         for i in 0..batch.num_columns() {
             if i == row_id_idx {
@@ -346,11 +403,13 @@ where
             return Ok(());
         }
 
-        // Now, proceed with appending the correctly filtered batch
+        // Now, proceed with appending the correctly filtered batch.
+        // Drop nulls per field (treat null as delete: do not store it).
         let append_schema = batch_to_append.schema();
         let append_row_id_idx = append_schema.index_of("row_id")?;
         let append_row_id_any: ArrayRef = Arc::clone(batch_to_append.column(append_row_id_idx));
         let mut puts_appends: Vec<BatchPut> = Vec::new();
+
         for (i, array) in batch_to_append.columns().iter().enumerate() {
             if i == append_row_id_idx {
                 continue;
@@ -363,6 +422,20 @@ where
                 .parse::<u64>()
                 .map(LogicalFieldId::from)
                 .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
+
+            // Filter out nulls in this column and keep matching row_ids only.
+            let (array_clean, rids_clean) = if array.null_count() == 0 {
+                (array.clone(), append_row_id_any.clone())
+            } else {
+                let keep =
+                    BooleanArray::from_iter((0..array.len()).map(|j| Some(!array.is_null(j))));
+                let a = compute::filter(array, &keep)?;
+                let r = compute::filter(&append_row_id_any, &keep)?;
+                (a, r)
+            };
+            if array_clean.len() == 0 {
+                continue;
+            }
 
             let descriptor_pk = *catalog.map.entry(field_id).or_insert_with(|| {
                 catalog_dirty = true;
@@ -377,8 +450,10 @@ where
                 self.load_descriptor_state(descriptor_pk, field_id)?;
             let (mut rid_descriptor, mut rid_tail_page) =
                 self.load_descriptor_state(rid_descriptor_pk, rid_fid)?;
+
+            // Slice and append.
             let slices = split_to_target_bytes(
-                array,
+                &array_clean,
                 TARGET_CHUNK_BYTES,
                 self.cfg.varwidth_fallback_rows_per_slice,
             );
@@ -386,6 +461,8 @@ where
 
             for s in slices {
                 let rows = s.len();
+
+                // Data slice.
                 let data_pk = self.pager.alloc_many(1)?[0];
                 let s_norm = zero_offset(&s);
                 let data_bytes = serialize_array(s_norm.as_ref())?;
@@ -407,7 +484,9 @@ where
                     data_meta,
                     &mut puts_appends,
                 )?;
-                let rid_slice: ArrayRef = append_row_id_any.slice(row_off, rows);
+
+                // Row-id slice matched to this data slice.
+                let rid_slice: ArrayRef = rids_clean.slice(row_off, rows);
                 let rid_norm = zero_offset(&rid_slice);
                 let rid_pk = self.pager.alloc_many(1)?[0];
                 let rid_bytes = serialize_array(rid_norm.as_ref())?;
@@ -487,7 +566,7 @@ where
             None => return Ok(FxHashSet::default()),
         };
 
-        // This is a TRUE BATCHING scenario.
+        // Fetch both descriptors up front (true batching).
         let gets = vec![
             BatchGet::Raw { key: desc_pk_data },
             BatchGet::Raw { key: desc_pk_rid },
@@ -506,6 +585,7 @@ where
         let desc_blob_rid = blobs_by_pk.remove(&desc_pk_rid).ok_or(Error::NotFound)?;
         let mut descriptor_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
 
+        // Gather metas.
         let mut metas_data: Vec<ChunkMetadata> = Vec::new();
         let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
         for m in DescriptorIterator::new(self.pager.as_ref(), descriptor_data.head_page_pk) {
@@ -515,10 +595,30 @@ where
             metas_rid.push(m?);
         }
 
+        // Classify incoming as upserts vs deletes based on nulls.
+        let rid_in = incoming_row_ids
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::Internal("row_id must be u64".into()))?;
+        let mut ids_to_delete = FxHashSet::default();
+        let mut ids_to_upsert = FxHashSet::default();
+        for i in 0..rid_in.len() {
+            let rid = rid_in.value(i);
+            if incoming_data.is_null(i) {
+                ids_to_delete.insert(rid);
+            } else {
+                ids_to_upsert.insert(rid);
+            }
+        }
+
+        // Scan row-id chunks and partition hits per chunk idx.
         let mut rewritten_ids = FxHashSet::default();
-        let mut hit_chunks = FxHashMap::<usize, Vec<u64>>::default();
+        let mut hit_up: FxHashMap<usize, Vec<u64>> = FxHashMap::default();
+        let mut hit_del: FxHashMap<usize, Vec<u64>> = FxHashMap::default();
+
         let n = metas_data.len().min(metas_rid.len());
         if n > 0 {
+            // Batch fetch only rid chunks to locate hits.
             let mut gets_rid = Vec::with_capacity(n);
             for i in 0..n {
                 gets_rid.push(BatchGet::Raw {
@@ -543,7 +643,11 @@ where
                     for j in 0..rid_arr.len() {
                         let rid = rid_arr.value(j);
                         if incoming_ids.contains(&rid) {
-                            hit_chunks.entry(i).or_default().push(rid);
+                            if ids_to_delete.contains(&rid) {
+                                hit_del.entry(i).or_default().push(rid);
+                            } else {
+                                hit_up.entry(i).or_default().push(rid);
+                            }
                             rewritten_ids.insert(rid);
                         }
                     }
@@ -551,11 +655,16 @@ where
             }
         }
 
-        if hit_chunks.is_empty() {
+        if hit_up.is_empty() && hit_del.is_empty() {
             return Ok(rewritten_ids);
         }
 
-        let hit_idxs: Vec<usize> = hit_chunks.keys().copied().collect();
+        // Batch fetch data and rid chunks for all hit indices.
+        let mut hit_set = FxHashSet::default();
+        hit_set.extend(hit_up.keys().copied());
+        hit_set.extend(hit_del.keys().copied());
+        let hit_idxs: Vec<usize> = hit_set.into_iter().collect();
+
         let mut gets = Vec::with_capacity(hit_idxs.len() * 2);
         for &i in &hit_idxs {
             gets.push(BatchGet::Raw {
@@ -573,61 +682,100 @@ where
             }
         }
 
-        for (chunk_idx, rids_in_chunk) in hit_chunks {
-            let rids_to_update: FxHashSet<u64> = rids_in_chunk.into_iter().collect();
-            let old_data_arr = deserialize_array(
-                blob_map
-                    .get(&metas_data[chunk_idx].chunk_pk)
-                    .unwrap()
-                    .clone(),
-            )?;
-            let old_rid_arr_any = deserialize_array(
-                blob_map
-                    .get(&metas_rid[chunk_idx].chunk_pk)
-                    .unwrap()
-                    .clone(),
-            )?;
+        // Apply per-chunk edits and write back.
+        for i in hit_idxs {
+            let old_data_arr =
+                deserialize_array(blob_map.get(&metas_data[i].chunk_pk).unwrap().clone())?;
+            let old_rid_arr_any =
+                deserialize_array(blob_map.get(&metas_rid[i].chunk_pk).unwrap().clone())?;
             let old_rid_arr = old_rid_arr_any
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .unwrap();
-            let keep_mask = BooleanArray::from_iter(
-                (0..old_rid_arr.len())
-                    .map(|j| Some(!rids_to_update.contains(&old_rid_arr.value(j)))),
-            );
-            let data_after_delete = compute::filter(&old_data_arr, &keep_mask)?;
-            let rid_after_delete = compute::filter(&old_rid_arr_any, &keep_mask)?;
 
-            // Arrow `take` requires UInt32 indices; build directly without an intermediate Vec
-            let update_indices_arr =
-                UInt32Array::from_iter_values(rids_to_update.iter().map(|rid| {
+            let up_vec = hit_up.remove(&i).unwrap_or_default();
+            let del_vec = hit_del.remove(&i).unwrap_or_default();
+
+            // Build keep mask: drop rows to upsert and to delete.
+            let drop_set: FxHashSet<u64> = up_vec
+                .iter()
+                .copied()
+                .chain(del_vec.iter().copied())
+                .collect();
+            if drop_set.is_empty() {
+                continue;
+            }
+            let keep = BooleanArray::from_iter((0..old_rid_arr.len()).map(|j| {
+                let rid = old_rid_arr.value(j);
+                Some(!drop_set.contains(&rid))
+            }));
+
+            // Build injected tails only for upserts (non-null).
+            let update_indices_arr = if up_vec.is_empty() {
+                UInt32Array::from(Vec::<u32>::new())
+            } else {
+                UInt32Array::from_iter_values(up_vec.iter().map(|rid| {
                     let idx = *incoming_ids_map.get(rid).expect("incoming id present");
-                    u32::try_from(idx).expect("incoming batch index exceeds u32::MAX (arrow take)")
-                }));
+                    u32::try_from(idx).expect("index exceeds u32::MAX")
+                }))
+            };
+            let data_inj = if up_vec.is_empty() {
+                None
+            } else {
+                Some(compute::take(incoming_data, &update_indices_arr, None)?)
+            };
+            let rids_inj = if up_vec.is_empty() {
+                None
+            } else {
+                Some(compute::take(incoming_row_ids, &update_indices_arr, None)?)
+            };
 
-            let data_to_add = compute::take(incoming_data, &update_indices_arr, None)?;
-            let rids_to_add = compute::take(incoming_row_ids, &update_indices_arr, None)?;
-            let new_data_arr = concat_many(vec![&data_after_delete, &data_to_add])?;
-            let new_rid_arr = concat_many(vec![&rid_after_delete, &rids_to_add])?;
+            let mut edit = ChunkEdit::none();
+            edit.keep = Some(keep);
+            edit.inject_data = data_inj;
+            edit.inject_rids = rids_inj;
 
-            let new_data_bytes = serialize_array(&new_data_arr)?;
-            let new_rid_bytes = serialize_array(&new_rid_arr)?;
+            let (new_data_arr, new_rid_arr) =
+                apply_edit_to_arrays(&old_data_arr, Some(&old_rid_arr_any), &edit)?;
+
+            // Write back.
+            let data_bytes = serialize_array(&new_data_arr)?;
             puts.push(BatchPut::Raw {
-                key: metas_data[chunk_idx].chunk_pk,
-                bytes: new_data_bytes,
+                key: metas_data[i].chunk_pk,
+                bytes: data_bytes,
             });
-            puts.push(BatchPut::Raw {
-                key: metas_rid[chunk_idx].chunk_pk,
-                bytes: new_rid_bytes,
-            });
-            metas_data[chunk_idx].row_count = new_data_arr.len() as u64;
-            metas_data[chunk_idx].serialized_bytes = new_data_arr.get_array_memory_size() as u64;
-            metas_rid[chunk_idx].row_count = new_rid_arr.len() as u64;
-            metas_rid[chunk_idx].serialized_bytes = new_rid_arr.get_array_memory_size() as u64;
+            metas_data[i].row_count = new_data_arr.len() as u64;
+            metas_data[i].serialized_bytes = new_data_arr.get_array_memory_size() as u64;
+
+            if let Some(rids) = new_rid_arr {
+                let rid_bytes = serialize_array(&rids)?;
+                puts.push(BatchPut::Raw {
+                    key: metas_rid[i].chunk_pk,
+                    bytes: rid_bytes,
+                });
+                metas_rid[i].row_count = rids.len() as u64;
+                metas_rid[i].serialized_bytes = rids.get_array_memory_size() as u64;
+            }
+
+            // Refresh perm if present (values changed).
+            if metas_data[i].value_order_perm_pk != 0 {
+                let sort_col = SortColumn {
+                    values: new_data_arr,
+                    options: None,
+                };
+                let idx = lexsort_to_indices(&[sort_col], None)?;
+                let perm_bytes = serialize_array(&idx)?;
+                puts.push(BatchPut::Raw {
+                    key: metas_data[i].value_order_perm_pk,
+                    bytes: perm_bytes,
+                });
+            }
         }
 
+        // Rewrite descriptor pages (row counts changed).
         self.rewrite_descriptor_pages(desc_pk_data, &mut descriptor_data, &mut metas_data, puts)?;
         self.rewrite_descriptor_pages(desc_pk_rid, &mut descriptor_rid, &mut metas_rid, puts)?;
+
         Ok(rewritten_ids)
     }
 
@@ -693,10 +841,10 @@ where
         Ok(())
     }
 
-    /// Explicit delete by global row **positions** (0-based, ascending, unique) -> in-place chunk rewrite.
-    /// Then bounded compaction of small adjacent chunks.
+    /// Explicit delete by global row **positions** (0-based, ascending,
+    /// unique) -> in-place chunk rewrite.
     ///
-    /// Precondition: `rows_to_delete` yields strictly increasing `u64` positions.
+    /// Precondition: `rows_to_delete` yields strictly increasing positions.
     pub fn delete_rows<I>(&self, field_id: LogicalFieldId, rows_to_delete: I) -> Result<()>
     where
         I: IntoIterator<Item = u64>,
@@ -780,7 +928,7 @@ where
                 }
             }
 
-            // Local indices are per-chunk; track them in `usize` (native index type).
+            // Local indices are per-chunk; track them in `usize`.
             let rows = meta.row_count as usize;
 
             let mut del_local: FxHashSet<usize> = FxHashSet::default();
@@ -788,7 +936,6 @@ where
                 if d >= end_u64 {
                     break;
                 }
-                // local index is (d - start); fits in usize because it < meta.row_count
                 del_local.insert((d - start_u64) as usize);
                 last_seen = Some(d);
                 cur_del = del_iter.next();
@@ -799,9 +946,7 @@ where
                 continue;
             }
 
-            let keep = BooleanArray::from_iter((0..rows).map(|j| Some(!del_local.contains(&j))));
-
-            // Batch fetch the data and row_id chunks to be rewritten
+            // Batch fetch the data and row_id chunks to be rewritten.
             let mut chunk_gets = vec![BatchGet::Raw { key: meta.chunk_pk }];
             if let Some(rm) = metas_rid.get(i) {
                 chunk_gets.push(BatchGet::Raw { key: rm.chunk_pk });
@@ -814,36 +959,47 @@ where
                 }
             }
 
-            // Rewrite data chunk in place.
             let data_blob = chunk_blobs.remove(&meta.chunk_pk).ok_or(Error::NotFound)?;
             let data_arr = deserialize_array(data_blob)?;
-            let data_f = compute::filter(&data_arr, &keep)?;
-            let data_bytes = serialize_array(&data_f)?;
+            let rid_arr_any = if let Some(rm) = metas_rid.get(i) {
+                let rid_blob = chunk_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?;
+                Some(deserialize_array(rid_blob)?)
+            } else {
+                None
+            };
+
+            let keep = BooleanArray::from_iter((0..rows).map(|j| Some(!del_local.contains(&j))));
+
+            let mut edit = ChunkEdit::none();
+            edit.keep = Some(keep);
+
+            let (new_data_arr, new_rid_arr) =
+                apply_edit_to_arrays(&data_arr, rid_arr_any.as_ref(), &edit)?;
+
+            // Write back and update meta.
+            let data_bytes = serialize_array(&new_data_arr)?;
             puts.push(BatchPut::Raw {
                 key: meta.chunk_pk,
                 bytes: data_bytes,
             });
-            meta.row_count = data_f.len() as u64;
-            meta.serialized_bytes = data_f.get_array_memory_size() as u64;
+            meta.row_count = new_data_arr.len() as u64;
+            meta.serialized_bytes = new_data_arr.get_array_memory_size() as u64;
 
-            // Rewrite matching shadow row_id chunk, if present.
-            if let (Some(_), Some(rm)) = (desc_pk_rid, metas_rid.get_mut(i)) {
-                let rid_blob = chunk_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?;
-                let rid_arr = deserialize_array(rid_blob)?;
-                let rid_f = compute::filter(&rid_arr, &keep)?;
-                let rid_bytes = serialize_array(&rid_f)?;
+            if let (Some(_), Some(rids)) = (metas_rid.get_mut(i), new_rid_arr) {
+                let rm = metas_rid.get_mut(i).unwrap();
+                let rid_bytes = serialize_array(&rids)?;
                 puts.push(BatchPut::Raw {
                     key: rm.chunk_pk,
                     bytes: rid_bytes,
                 });
-                rm.row_count = rid_f.len() as u64;
-                rm.serialized_bytes = rid_f.get_array_memory_size() as u64;
+                rm.row_count = rids.len() as u64;
+                rm.serialized_bytes = rids.get_array_memory_size() as u64;
             }
 
             // If a sorted permutation exists for this chunk, refresh it.
             if meta.value_order_perm_pk != 0 {
                 let sort_column = SortColumn {
-                    values: data_f.clone(),
+                    values: new_data_arr,
                     options: None,
                 };
                 let indices = lexsort_to_indices(&[sort_column], None)?;
@@ -1197,7 +1353,7 @@ where
         self.write_descriptor_chain(
             desc_pk_rid,
             &mut desc_rid,
-            &mut new_rid_metas,
+            &new_rid_metas,
             &mut puts,
             &mut frees,
         )?;
@@ -1315,7 +1471,8 @@ where
         Ok(())
     }
 
-    /// (Internal) Loads the full state for a descriptor, creating it if it doesn't exist.
+    /// (Internal) Loads the full state for a descriptor, creating it if it
+    /// doesn't exist.
     fn load_descriptor_state(
         &self,
         descriptor_pk: PhysicalKey,
@@ -1363,8 +1520,8 @@ where
         }
     }
 
-    /// (Internal) Helper for batch appends. Appends metadata to the current in-memory
-    /// tail page, creating a new one if necessary.
+    /// (Internal) Helper for batch appends. Appends metadata to the current
+    /// in-memory tail page, creating a new one if necessary.
     fn append_meta_in_loop(
         &self,
         descriptor: &mut ColumnDescriptor,
@@ -1389,7 +1546,8 @@ where
             header.next_page_pk = new_tail_pk;
             tail_page_bytes[..DescriptorPageHeader::DISK_SIZE]
                 .copy_from_slice(&header.to_le_bytes());
-            // --- PERFORMANCE FIX: Move the full page's bytes instead of cloning ---
+            // --- PERFORMANCE FIX: Move the full page's bytes instead of
+            // cloning ---
             let full_page_to_write = std::mem::take(tail_page_bytes);
             puts.push(BatchPut::Raw {
                 key: descriptor.tail_page_pk,
@@ -1418,7 +1576,8 @@ where
     /// This check is useful for tests and debugging. It verifies:
     /// 1. The catalog can be read.
     /// 2. All descriptor chains are walkable.
-    /// 3. The row and chunk counts in the descriptors match the sum of the chunk metadata.
+    /// 3. The row and chunk counts in the descriptors match the sum of the
+    ///    chunk metadata.
     ///
     /// Returns `Ok(())` if consistent, otherwise returns an `Error`.
     pub fn verify_integrity(&self) -> Result<()> {
@@ -1441,7 +1600,8 @@ where
             let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
             if descriptor.field_id != field_id {
                 return Err(Error::Internal(format!(
-                    "Descriptor at pk={} has wrong field_id: expected {:?}, got {:?}",
+                    "Descriptor at pk={} has wrong field_id: expected {:?}, \
+                     got {:?}",
                     descriptor_pk, field_id, descriptor.field_id
                 )));
             }
@@ -1481,13 +1641,15 @@ where
 
             if descriptor.total_row_count != actual_rows {
                 return Err(Error::Internal(format!(
-                    "Row count mismatch for field {:?}: descriptor says {}, actual is {}",
+                    "Row count mismatch for field {:?}: descriptor says {}, \
+                     actual is {}",
                     field_id, descriptor.total_row_count, actual_rows
                 )));
             }
             if descriptor.total_chunk_count != actual_chunks {
                 return Err(Error::Internal(format!(
-                    "Chunk count mismatch for field {:?}: descriptor says {}, actual is {}",
+                    "Chunk count mismatch for field {:?}: descriptor says {}, \
+                     actual is {}",
                     field_id, descriptor.total_chunk_count, actual_chunks
                 )));
             }
@@ -1497,8 +1659,8 @@ where
 
     /// Gathers detailed statistics about the storage layout.
     ///
-    /// This method is designed for low-level analysis and debugging, allowing you to
-    /// check for under- or over-utilization of descriptor pages.
+    /// This method is designed for low-level analysis and debugging, allowing
+    /// you to check for under- or over-utilization of descriptor pages.
     pub fn get_layout_stats(&self) -> Result<Vec<ColumnLayoutStats>> {
         let catalog = self.catalog.read().unwrap();
         let mut all_stats = Vec::new();
