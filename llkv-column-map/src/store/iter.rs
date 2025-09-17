@@ -30,7 +30,6 @@ use crate::error::{Error, Result};
 use crate::serialization::deserialize_array;
 use crate::storage::pager::{BatchGet, GetResult, Pager};
 use crate::store::ColumnStore;
-use crate::store::catalog::ColumnCatalog; // only for visibility of module
 use crate::store::descriptor::{ChunkMetadata, DescriptorIterator};
 use crate::types::{LogicalFieldId, PhysicalKey};
 
@@ -95,7 +94,6 @@ impl<K: Ord + Copy> PartialEq for HeapItem<K> {
     }
 }
 impl<K: Ord + Copy> Eq for HeapItem<K> {}
-
 impl<K: Ord + Copy> PartialOrd for HeapItem<K> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -430,6 +428,13 @@ pub enum SortedMerge {
     I32(MergeI32),
 }
 
+/// Type-erased bound so call sites don't need matches.
+#[derive(Clone, Debug)]
+pub enum BoundValue {
+    U64(Bound<u64>),
+    I32(Bound<i32>),
+}
+
 impl SortedMerge {
     /// Build a new merge from chunk metadata and blobs. You must pass
     /// the same blobs map that contains each chunk's data and its perm.
@@ -474,22 +479,21 @@ impl SortedMerge {
         }
     }
 
-    /// Builder: set bounds for u64.
+    /// Builder: type-erased bounds (no match soup at call sites).
+    /// Returns an error if the bound type doesn't match the stream.
     #[inline]
-    pub fn with_u64_bounds(mut self, lo: Bound<u64>, hi: Bound<u64>) -> Self {
-        if let SortedMerge::U64(m) = &mut self {
-            m.set_bounds(lo, hi);
+    pub fn with_bounds(self, lo: BoundValue, hi: BoundValue) -> Result<Self> {
+        match (self, lo, hi) {
+            (SortedMerge::U64(mut m), BoundValue::U64(lo), BoundValue::U64(hi)) => {
+                m.set_bounds(lo, hi);
+                Ok(SortedMerge::U64(m))
+            }
+            (SortedMerge::I32(mut m), BoundValue::I32(lo), BoundValue::I32(hi)) => {
+                m.set_bounds(lo, hi);
+                Ok(SortedMerge::I32(m))
+            }
+            _ => Err(Error::Internal("bound type mismatch".into())),
         }
-        self
-    }
-
-    /// Builder: set bounds for i32.
-    #[inline]
-    pub fn with_i32_bounds(mut self, lo: Bound<i32>, hi: Bound<i32>) -> Self {
-        if let SortedMerge::I32(m) = &mut self {
-            m.set_bounds(lo, hi);
-        }
-        self
     }
 
     pub fn total_rows(&self) -> usize {
@@ -548,7 +552,7 @@ where
     }
 }
 
-// ------ ColumnStore shims: scan() and scan_sorted() ---------
+// ------ ColumnStore shims: scan() and sorted variants (back-compat + ergonomic) ---------
 
 impl<P> ColumnStore<P>
 where
@@ -646,5 +650,16 @@ where
         }
 
         SortedMerge::build(&metas, blobs, SortOptions::default())
+    }
+
+    /// Ergonomic: sorted scan + apply type-erased bounds in one call.
+    pub fn scan_sorted_with_bounds(
+        &self,
+        field_id: LogicalFieldId,
+        lo: BoundValue,
+        hi: BoundValue,
+    ) -> Result<SortedMerge> {
+        let it = self.scan_sorted(field_id)?;
+        it.with_bounds(lo, hi)
     }
 }

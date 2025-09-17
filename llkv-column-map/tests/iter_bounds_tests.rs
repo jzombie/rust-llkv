@@ -13,7 +13,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::{ColumnStore, Run};
+use llkv_column_map::store::{BoundValue, ColumnStore, Run};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use rand::rng;
@@ -87,7 +87,11 @@ fn collect_u64_in_bounds(
     lo: std::ops::Bound<u64>,
     hi: std::ops::Bound<u64>,
 ) -> Vec<u64> {
-    let mut m = store.scan_sorted(fid).unwrap().with_u64_bounds(lo, hi);
+    let mut m = store
+        .scan_sorted(fid)
+        .unwrap()
+        .with_bounds(BoundValue::U64(lo), BoundValue::U64(hi))
+        .unwrap();
     let mut out = Vec::new();
     while let Some(run) = m.next_run() {
         match run {
@@ -109,7 +113,11 @@ fn collect_i32_in_bounds(
     lo: std::ops::Bound<i32>,
     hi: std::ops::Bound<i32>,
 ) -> Vec<i32> {
-    let mut m = store.scan_sorted(fid).unwrap().with_i32_bounds(lo, hi);
+    let mut m = store
+        .scan_sorted(fid)
+        .unwrap()
+        .with_bounds(BoundValue::I32(lo), BoundValue::I32(hi))
+        .unwrap();
     let mut out = Vec::new();
     while let Some(run) = m.next_run() {
         match run {
