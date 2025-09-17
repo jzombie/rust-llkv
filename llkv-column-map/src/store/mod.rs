@@ -1388,7 +1388,7 @@ where
         Ok(())
     }
 
-    pub fn scan_sorted(&self, field_id: LogicalFieldId) -> Result<MergeSortedIterator> {
+    pub fn scan_sorted(&self, field_id: LogicalFieldId) -> Result<SortedMerge> {
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
 
@@ -1423,6 +1423,7 @@ where
                 )));
             }
         }
+
         let get_results = self.pager.batch_get(&gets)?;
         let mut blobs_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
         for result in get_results {
@@ -1434,7 +1435,11 @@ where
             }
         }
 
-        MergeSortedIterator::try_new(all_chunk_metadata, blobs_map)
+        let opts = SortOptions {
+            descending: false,
+            nulls_first: true,
+        };
+        SortedMerge::build(&all_chunk_metadata, blobs_map, opts)
     }
 
     /// (Internal) Loads the full state for a descriptor, creating it if it doesn't exist.

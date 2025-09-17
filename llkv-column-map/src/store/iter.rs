@@ -1,16 +1,20 @@
-//! K-way merge over pre-sorted chunks with monomorphized hot path.
+//! Ultra-fast k-way merge over pre-sorted chunks (brand-new API).
 //!
-//! Design:
-//! - One-time type dispatch at construction.
-//! - Hot loop compares native keys (no u128 widen).
-//! - Returned items remain `ArrayRef` 1-row slices (API unchanged).
+//! Design goals:
+//! - Pre-apply per-chunk UInt32 perms to build contiguous sorted buffers
+//!   (best locality; one take per chunk).
+//! - Binary heap + run coalescing: one pop/push per emitted run, not per
+//!   element.
+//! - Typed runs: return references to typed arrays + (start,len). Caller
+//!   can scan values directly without constructing new Arrow arrays.
+//! - Explicit sort semantics via SortOptions.
+//! - Ready to add more primitive types by one macro line.
 //!
-//! Note on copies: `compute::take` materializes a sorted view per chunk.
-//! For fixed-width types this is a single contiguous copy per chunk.
-//! No `Vec<u8>` cloning of underlying blob pages occurs here; buffers
-//! remain Arc-backed and zero-copy from your EntryHandle.
+//! Extend notes:
+//! - To emit row_id with values, add a second sorted array per chunk
+//!   (UInt64Array) and include it in Run enums. The merge logic does not
+//!   change.
 
-use super::zero_offset;
 use crate::error::{Error, Result};
 use crate::serialization::deserialize_array;
 use crate::store::descriptor::ChunkMetadata;
@@ -26,15 +30,63 @@ use simd_r_drive_entry_handle::EntryHandle;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
-// -----------------------------------------------------------------------------
-// Generic heap item keyed by a native scalar. Used with Reverse for min-heap.
-// -----------------------------------------------------------------------------
+// ----------------------------- Sort options -------------------------------
+
+#[derive(Clone, Copy, Debug)]
+pub struct SortOptions {
+    /// true => descending. false => ascending.
+    pub descending: bool,
+    /// true => nulls first. false => nulls last.
+    pub nulls_first: bool,
+}
+
+impl Default for SortOptions {
+    fn default() -> Self {
+        Self {
+            descending: false,
+            nulls_first: true,
+        }
+    }
+}
+
+// ------------------------------ Key & heap --------------------------------
+
+#[derive(Clone, Copy, Debug)]
+struct Key<K: Ord + Copy> {
+    null_rank: u8, // 0 or 1 (precomputed by nulls_first)
+    val: K,        // ignored if both sides are null
+    flip: bool,    // true => reverse value ordering
+}
+
+impl<K: Ord + Copy> PartialEq for Key<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.null_rank == other.null_rank && self.val == other.val
+    }
+}
+impl<K: Ord + Copy> Eq for Key<K> {}
+
+impl<K: Ord + Copy> PartialOrd for Key<K> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<K: Ord + Copy> Ord for Key<K> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let nr = self.null_rank.cmp(&other.null_rank);
+        if nr != Ordering::Equal {
+            return nr;
+        }
+        let v = self.val.cmp(&other.val);
+        if self.flip { v.reverse() } else { v }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct HeapItem<K: Ord + Copy> {
     cursor_idx: usize,
-    data_idx: usize,
-    key: K,
+    sorted_idx: usize, // index in the chunk's sorted payload
+    key: Key<K>,
 }
 
 impl<K: Ord + Copy> PartialEq for HeapItem<K> {
@@ -49,7 +101,6 @@ impl<K: Ord + Copy> PartialOrd for HeapItem<K> {
         Some(self.cmp(other))
     }
 }
-
 impl<K: Ord + Copy> Ord for HeapItem<K> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.key
@@ -58,47 +109,83 @@ impl<K: Ord + Copy> Ord for HeapItem<K> {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Typed cursor holding both Any view (for slicing) and typed array for keys.
-// We store the typed array by value (cheap clone). Underlying buffers remain
-// Arc-backed; no deep copy of payloads.
-// -----------------------------------------------------------------------------
+// ------------------------------- Cursors ----------------------------------
 
 struct Cursor<A> {
-    any: ArrayRef,
-    typed: A,
+    /// Sorted payload for this chunk (contiguous).
+    sorted_any: ArrayRef,
+    /// Typed view to load keys cheaply.
+    sorted: A,
+    /// Rows in chunk.
     len: usize,
 }
 
-// -----------------------------------------------------------------------------
-// Macro generates a monomorphized merge iterator for a given Arrow type.
-// `ArrTy` is the Arrow array type; `KeyTy` is the comparable key type.
-// -----------------------------------------------------------------------------
+// --------------------------- Public run types -----------------------------
+
+pub enum Run<'a> {
+    U64 {
+        arr: &'a UInt64Array,
+        start: usize,
+        len: usize,
+    },
+    I32 {
+        arr: &'a Int32Array,
+        start: usize,
+        len: usize,
+    },
+}
+
+impl<'a> Run<'a> {
+    /// Total values in this run.
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Run::U64 { len, .. } => *len,
+            Run::I32 { len, .. } => *len,
+        }
+    }
+    /// True if run has no rows.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+// ------------------- Monomorphized merge (primitive T) --------------------
 
 macro_rules! impl_merge_for_primitive {
-    ($Name:ident, $ArrTy:ty, $KeyTy:ty) => {
-        struct $Name {
+    ($Name:ident, $ArrTy:ty, $KeyTy:ty, $RunVariant:ident) => {
+        pub struct $Name {
             cursors: Vec<Cursor<$ArrTy>>,
             heap: BinaryHeap<Reverse<HeapItem<$KeyTy>>>,
+            /// Cached nulls_first as null rank function.
+            nulls_first: bool,
+            /// Flip value order for descending.
+            flip: bool,
+            /// Keep blobs alive (zero-copy backing).
             _blobs: FxHashMap<PhysicalKey, EntryHandle>,
         }
 
         impl $Name {
-            fn try_new(
-                metadata: Vec<ChunkMetadata>,
+            /// Build from chunk metadata and blobs containing:
+            /// - each chunk's data payload
+            /// - each chunk's UInt32 permutation
+            pub fn build(
+                metas: &[ChunkMetadata],
                 blobs: FxHashMap<PhysicalKey, EntryHandle>,
+                opts: SortOptions,
             ) -> Result<Self> {
-                let mut cursors = Vec::with_capacity(metadata.len());
+                let mut cursors = Vec::with_capacity(metas.len());
 
-                // Build typed, sorted cursors once per chunk.
-                for m in &metadata {
+                for m in metas {
                     if m.row_count == 0 {
                         continue;
                     }
-
+                    // Load data.
                     let data_blob = blobs.get(&m.chunk_pk).ok_or(Error::NotFound)?.clone();
                     let data_any = deserialize_array(data_blob)?;
 
+                    // Load perm.
                     let perm_blob = blobs
                         .get(&m.value_order_perm_pk)
                         .ok_or(Error::NotFound)?
@@ -109,139 +196,217 @@ macro_rules! impl_merge_for_primitive {
                         .downcast_ref::<UInt32Array>()
                         .ok_or_else(|| Error::Internal("perm not u32".into()))?;
 
-                    // Materialize sorted view for this chunk (contiguous copy).
+                    // Build contiguous sorted payload once.
                     let sorted_any = compute::take(&data_any, perm, None)?;
-                    let sorted_any = zero_offset(&sorted_any);
-
-                    // Cheap-clone typed array (shares buffers).
-                    let typed = sorted_any
+                    let sorted_typed = sorted_any
                         .as_any()
                         .downcast_ref::<$ArrTy>()
                         .ok_or_else(|| Error::Internal("typed downcast failed".into()))?
                         .clone();
 
                     cursors.push(Cursor::<$ArrTy> {
-                        any: sorted_any.clone(),
-                        typed,
+                        sorted_any: sorted_any.clone(),
+                        sorted: sorted_typed,
                         len: sorted_any.len(),
                     });
                 }
 
-                // Seed heap with first element from each cursor.
+                // Seed heap with first row from each cursor.
                 let mut heap: BinaryHeap<Reverse<HeapItem<$KeyTy>>> = BinaryHeap::new();
 
+                let nulls_first = opts.nulls_first;
+                let flip = opts.descending;
+
                 for (i, c) in cursors.iter().enumerate() {
-                    if c.len > 0 {
-                        let k: $KeyTy = c.typed.value(0) as $KeyTy;
-                        heap.push(Reverse(HeapItem {
-                            cursor_idx: i,
-                            data_idx: 0,
-                            key: k,
-                        }));
+                    if c.len == 0 {
+                        continue;
                     }
+                    let k = Self::key_at(c, 0, nulls_first, flip);
+                    heap.push(Reverse(HeapItem {
+                        cursor_idx: i,
+                        sorted_idx: 0,
+                        key: k,
+                    }));
                 }
 
                 Ok(Self {
                     cursors,
                     heap,
+                    nulls_first,
+                    flip,
                     _blobs: blobs,
                 })
             }
 
-            #[inline]
-            fn next_inner(&mut self) -> Option<Result<ArrayRef>> {
-                let Reverse(item) = self.heap.pop()?;
+            /// Return the next run from the same chunk, maximally coalesced.
+            /// When the heap is empty, returns None.
+            pub fn next_run<'a>(&'a mut self) -> Option<Run<'a>> {
+                let Reverse(mut top) = self.heap.pop()?;
 
-                let c = &self.cursors[item.cursor_idx];
-                let out = c.any.slice(item.data_idx, 1);
+                // Threshold is the best of the others (peek).
+                let thr = self.heap.peek().map(|x| x.0.key);
 
-                let next_idx = item.data_idx + 1;
-                if next_idx < c.len {
-                    let k: $KeyTy = c.typed.value(next_idx) as $KeyTy;
+                let cidx = top.cursor_idx;
+                let start = top.sorted_idx;
+
+                let c = &self.cursors[cidx];
+                let len = c.len;
+
+                // Advance within the winner while it stays <= threshold.
+                let mut end = start + 1;
+
+                // Fast paths:
+                // - If heap is empty, we can take the whole tail.
+                if thr.is_none() {
+                    end = len;
+                } else {
+                    let thr_key = thr.unwrap();
+                    while end < len {
+                        let k = Self::key_at(c, end, self.nulls_first, self.flip);
+                        // If next key would beat the threshold, stop.
+                        if k > thr_key {
+                            break;
+                        }
+                        end += 1;
+                    }
+                }
+
+                // Reinsert cursor with its next position (if any).
+                if end < len {
+                    let k = Self::key_at(c, end, self.nulls_first, self.flip);
                     self.heap.push(Reverse(HeapItem {
-                        cursor_idx: item.cursor_idx,
-                        data_idx: next_idx,
+                        cursor_idx: cidx,
+                        sorted_idx: end,
                         key: k,
                     }));
                 }
 
-                Some(Ok(out))
+                let c = &self.cursors[cidx];
+                Some(Run::$RunVariant {
+                    arr: &c.sorted,
+                    start,
+                    len: end - start,
+                })
             }
-        }
 
-        impl Iterator for $Name {
-            type Item = Result<ArrayRef>;
-            fn next(&mut self) -> Option<Self::Item> {
-                self.next_inner()
+            #[inline(always)]
+            fn key_at(
+                c: &Cursor<$ArrTy>,
+                idx: usize,
+                nulls_first: bool,
+                flip: bool,
+            ) -> Key<$KeyTy> {
+                let is_null = c.sorted.is_null(idx);
+                let null_rank = if nulls_first {
+                    if is_null { 0 } else { 1 }
+                } else {
+                    if is_null { 1 } else { 0 }
+                };
+                let v = if is_null {
+                    <$KeyTy as Default>::default()
+                } else {
+                    c.sorted.value(idx) as $KeyTy
+                };
+                Key {
+                    null_rank,
+                    val: v,
+                    flip,
+                }
+            }
+
+            /// Total rows across all chunks (after sorting).
+            pub fn total_rows(&self) -> usize {
+                self.cursors.iter().map(|c| c.len).sum()
+            }
+
+            /// Number of active cursors (non-empty chunks).
+            pub fn num_cursors(&self) -> usize {
+                self.cursors.len()
+            }
+
+            /// True when the merge is fully drained.
+            pub fn is_empty(&self) -> bool {
+                self.heap.is_empty()
             }
         }
     };
 }
 
-// Instantiate for currently supported types.
-// Extend by adding more lines (e.g., Int64Array/i64, UInt32Array/u32).
-impl_merge_for_primitive!(MergeU64, UInt64Array, u64);
-impl_merge_for_primitive!(MergeI32, Int32Array, i32);
+// Instantiate for the types you care about today.
+// Add more by repeating lines below (e.g., Int64Array/i64).
+impl_merge_for_primitive!(MergeU64, UInt64Array, u64, U64);
+impl_merge_for_primitive!(MergeI32, Int32Array, i32, I32);
 
-// -----------------------------------------------------------------------------
-// Public facade: preserves original API and surface area.
-// -----------------------------------------------------------------------------
+// ------------------------------ Type dispatch -----------------------------
 
-enum MergeInner {
+pub enum SortedMerge {
     U64(MergeU64),
     I32(MergeI32),
-    Empty,
 }
 
-pub struct MergeSortedIterator {
-    inner: MergeInner,
-}
-
-impl MergeSortedIterator {
-    /// Construct a merge iterator over value-sorted chunks.
-    ///
-    /// `metadata` must refer to chunks where `value_order_perm_pk` is set.
-    /// Keeps `blobs` alive to preserve zero-copy backing pages.
-    pub fn try_new(
-        metadata: Vec<ChunkMetadata>,
+impl SortedMerge {
+    /// Build a new merge from chunk metadata and blobs. You must pass
+    /// the same blobs map that contains each chunk's data and its perm.
+    pub fn build(
+        metas: &[ChunkMetadata],
         blobs: FxHashMap<PhysicalKey, EntryHandle>,
+        opts: SortOptions,
     ) -> Result<Self> {
-        // Find first non-empty chunk to detect the type.
-        let first = match metadata.iter().find(|m| m.row_count > 0) {
+        // Find first non-empty to choose the type.
+        let first = match metas.iter().find(|m| m.row_count > 0) {
             Some(m) => m,
             None => {
-                return Ok(Self {
-                    inner: MergeInner::Empty,
-                });
+                // Empty input. Default to u64 variant with zero cursors.
+                // Callers should check `is_empty()` anyway.
+                return Ok(SortedMerge::U64(MergeU64::build(&[], blobs, opts)?));
             }
         };
 
         let first_blob = blobs.get(&first.chunk_pk).ok_or(Error::NotFound)?.clone();
         let first_any = deserialize_array(first_blob)?;
 
-        let inner = match first_any.data_type() {
-            DataType::UInt64 => MergeInner::U64(MergeU64::try_new(metadata, blobs)?),
-            DataType::Int32 => MergeInner::I32(MergeI32::try_new(metadata, blobs)?),
-            other => {
-                return Err(Error::Internal(format!(
-                    "Unsupported sort type {:?}",
-                    other
-                )));
+        match first_any.data_type() {
+            DataType::UInt64 => {
+                let it = MergeU64::build(metas, blobs, opts)?;
+                Ok(SortedMerge::U64(it))
             }
-        };
-
-        Ok(Self { inner })
+            DataType::Int32 => {
+                let it = MergeI32::build(metas, blobs, opts)?;
+                Ok(SortedMerge::I32(it))
+            }
+            other => Err(Error::Internal(format!(
+                "Unsupported sort type {:?}",
+                other
+            ))),
+        }
     }
-}
 
-impl Iterator for MergeSortedIterator {
-    type Item = Result<ArrayRef>;
+    /// Drain one coalesced run. Returns None when finished.
+    pub fn next_run<'a>(&'a mut self) -> Option<Run<'a>> {
+        match self {
+            SortedMerge::U64(m) => m.next_run(),
+            SortedMerge::I32(m) => m.next_run(),
+        }
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.inner {
-            MergeInner::U64(it) => it.next(),
-            MergeInner::I32(it) => it.next(),
-            MergeInner::Empty => None,
+    pub fn total_rows(&self) -> usize {
+        match self {
+            SortedMerge::U64(m) => m.total_rows(),
+            SortedMerge::I32(m) => m.total_rows(),
+        }
+    }
+
+    pub fn num_cursors(&self) -> usize {
+        match self {
+            SortedMerge::U64(m) => m.num_cursors(),
+            SortedMerge::I32(m) => m.num_cursors(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            SortedMerge::U64(m) => m.is_empty(),
+            SortedMerge::I32(m) => m.is_empty(),
         }
     }
 }
