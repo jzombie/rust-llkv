@@ -1,19 +1,14 @@
-//! Random point-lookups on a 1M-row UInt64 column using the store API.
+//! Random point-lookups on a 1M-row UInt64 column using the new visitor API.
 //!
 //! Benchmarks:
-//!   - scan_unsorted_multiset: unsorted probe (dense counts)
-//!   - scan_sorted_stream_join: two-pointer over scan_sorted()
+//!   - scan_unsorted_multiset: unsorted probe (dense multiset counts)
+//!   - scan_sorted_stream_join: two-pointer over sorted scan (requires index)
 //!
-//! Build once per-iter: append one shuffled 1M-row chunk, then create the
-//! sort index. Timed regions reflect how the calls are actually used.
+//! Setup per-iteration: seed one shuffled 1M-row column and build the sort index.
+//! Storage uses MemPager; nothing is persisted to disk.
 //!
 //! Run:
 //!   cargo bench --bench random_probe_bench
-//!
-//! Dev-deps (Cargo.toml):
-//!   [dev-dependencies]
-//!   criterion = "0.5"
-//!   rand = "0.9"
 
 #![forbid(unsafe_code)]
 
@@ -21,14 +16,15 @@ use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
 
-use arrow::array::{Array, UInt64Array};
+use arrow::array::{UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
+use llkv_column_map::store::scan::{PrimitiveSortedVisitor, PrimitiveVisitor, PrimitiveWithRowIdsVisitor, PrimitiveSortedWithRowIdsVisitor, ScanOptions};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use rand::rngs::StdRng;
@@ -39,7 +35,6 @@ const N_ROWS: usize = 1_000_000;
 const N_QUERIES: usize = 10_000;
 const SEED: u64 = 0xCBF2_A1B1_D3E4_F905;
 
-/// Standard user-data LogicalFieldId.
 fn fid(id: u32) -> LogicalFieldId {
     LogicalFieldId::new()
         .with_namespace(Namespace::UserData)
@@ -47,7 +42,6 @@ fn fid(id: u32) -> LogicalFieldId {
         .with_field_id(id)
 }
 
-/// Schema: row_id (u64, non-null) + data (u64 with field_id).
 fn schema_with_row_id(field_id: LogicalFieldId) -> Arc<Schema> {
     let rid = Field::new("row_id", DataType::UInt64, false);
     let mut md = HashMap::new();
@@ -83,75 +77,66 @@ fn make_queries() -> Vec<u64> {
     let mut rng = StdRng::seed_from_u64(SEED);
     let bound = (N_ROWS as u64) * 2;
     let mut q = Vec::with_capacity(N_QUERIES);
-    for _ in 0..N_QUERIES {
-        q.push(rng.random_range(0..bound));
-    }
+    for _ in 0..N_QUERIES { q.push(rng.random_range(0..bound)); }
     q
 }
 
 /// Unsorted probe: multiset membership via dense counts (small domain).
-/// Domain is 0..2*N_ROWS in this bench.
-fn count_hits_multiset_scan(
-    store: &ColumnStore<MemPager>,
-    fid: LogicalFieldId,
-    qs: &[u64],
-) -> usize {
+fn count_hits_multiset_scan(store: &ColumnStore<MemPager>, fid: LogicalFieldId, qs: &[u64]) -> usize {
     let mut freq = vec![0u32; 2 * N_ROWS];
-    for &q in qs {
-        let idx = q as usize;
-        if idx < freq.len() { freq[idx] = freq[idx].saturating_add(1); }
-    }
+    for &q in qs { let idx = q as usize; if idx < freq.len() { freq[idx] = freq[idx].saturating_add(1); } }
 
-    use std::cell::Cell;
-    let hits = Cell::new(0usize);
-    store
-        .scan_visit_fn(
-            fid,
-            |u: &UInt64Array| {
-                let mut h = hits.get();
-                for i in 0..u.len() {
-                    let v = u.value(i) as usize;
-                    if v < freq.len() {
-                        let k = freq[v];
-                        if k != 0 { h += k as usize; freq[v] = 0; }
-                    }
+    struct Probe<'a> { freq: &'a mut [u32], hits: usize }
+    impl<'a> PrimitiveVisitor for Probe<'a> {
+        fn u64_chunk(&mut self, a: &UInt64Array) {
+            let f = &mut self.freq;
+            let mut h = self.hits;
+            for i in 0..a.len() {
+                let v = a.value(i) as usize;
+                if v < f.len() {
+                    let k = f[v];
+                    if k != 0 { h += k as usize; f[v] = 0; }
                 }
-                hits.set(h);
-            },
-            |_i: &arrow::array::Int32Array| {},
-        )
-        .unwrap();
-    hits.get()
+            }
+            self.hits = h;
+        }
+    }
+    impl<'a> PrimitiveSortedVisitor for Probe<'a> {}
+    impl<'a> PrimitiveWithRowIdsVisitor for Probe<'a> {}
+    impl<'a> PrimitiveSortedWithRowIdsVisitor for Probe<'a> {}
+
+    let mut v = Probe { freq: &mut freq, hits: 0 };
+    store.scan(fid, ScanOptions { sorted: false, reverse: false, with_row_ids: false, row_id_field: None }, &mut v).unwrap();
+    v.hits
 }
 
-/// Sorted probe: two-pointer merge over scan_sorted().
+/// Sorted probe: two-pointer merge over sorted scan.
 fn count_hits_stream_join(store: &ColumnStore<MemPager>, fid: LogicalFieldId, qs: &[u64]) -> usize {
     let mut queries = qs.to_vec();
     queries.sort_unstable();
+    struct Join<'a> { q: &'a [u64], qi: usize, hits: usize }
+    impl<'a> PrimitiveSortedVisitor for Join<'a> {
+        fn u64_run(&mut self, a: &UInt64Array, s: usize, l: usize) {
+            let e = s + l;
+            let q = self.q;
+            let mut qi = self.qi;
+            let mut h = self.hits;
+            for i in s..e {
+                let v = a.value(i);
+                while qi < q.len() && q[qi] < v { qi += 1; }
+                while qi < q.len() && q[qi] == v { h += 1; qi += 1; }
+                if qi >= q.len() { break; }
+            }
+            self.qi = qi; self.hits = h;
+        }
+    }
+    impl<'a> PrimitiveVisitor for Join<'a> {}
+    impl<'a> PrimitiveWithRowIdsVisitor for Join<'a> {}
+    impl<'a> PrimitiveSortedWithRowIdsVisitor for Join<'a> {}
 
-    let mut qi = 0usize;
-    let mut hits = 0usize;
-
-    // Sorted scan via visitor closures (no type knowledge at callsite).
-    store
-        .scan_sorted_visit_fn(
-            fid,
-            |arr: &UInt64Array, start, len| {
-                let end = start + len;
-                for i in start..end {
-                    let v = arr.value(i);
-                    while qi < queries.len() && queries[qi] < v { qi += 1; }
-                    while qi < queries.len() && queries[qi] == v { hits += 1; qi += 1; }
-                    if qi >= queries.len() { break; }
-                }
-            },
-            |_arr_i32: &arrow::array::Int32Array, _start, _len| {
-                // This bench expects a UInt64 column; i32 not used here.
-            },
-        )
-        .unwrap();
-
-    hits
+    let mut v = Join { q: &queries, qi: 0, hits: 0 };
+    store.scan(fid, ScanOptions { sorted: true, reverse: false, with_row_ids: false, row_id_field: None }, &mut v).unwrap();
+    v.hits
 }
 
 fn bench_random_probe(c: &mut Criterion) {
@@ -191,3 +176,4 @@ fn bench_random_probe(c: &mut Criterion) {
 
 criterion_group!(benches, bench_random_probe);
 criterion_main!(benches);
+
