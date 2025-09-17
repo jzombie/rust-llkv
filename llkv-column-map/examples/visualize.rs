@@ -197,16 +197,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("Total ingest time: {:?}", t_total.elapsed());
 
-    // Simple probes by counting rows per column via scan()
+    // Simple probes by counting rows per column via scan() for primitive integer columns.
+    use llkv_column_map::store::scan::{
+        PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+        PrimitiveWithRowIdsVisitor, ScanOptions,
+    };
+    struct Count; // sums lengths for any primitive typed chunk
+    impl PrimitiveVisitor for Count {
+        fn u64_chunk(&mut self, a: &UInt64Array) {
+            ROWS.fetch_add(a.len() as u64, Ordering::Relaxed);
+        }
+        fn u32_chunk(&mut self, a: &UInt32Array) {
+            ROWS.fetch_add(a.len() as u64, Ordering::Relaxed);
+        }
+        // fn u16_chunk(&mut self, a: &arrow::array::UInt16Array) { ROWS.fetch_add(a.len() as u64, Ordering::Relaxed); }
+        // fn u8_chunk(&mut self, a: &arrow::array::UInt8Array) { ROWS.fetch_add(a.len() as u64, Ordering::Relaxed); }
+        // fn i64_chunk(&mut self, a: &arrow::array::Int64Array) { ROWS.fetch_add(a.len() as u64, Ordering::Relaxed); }
+        // fn i32_chunk(&mut self, a: &arrow::array::Int32Array) { ROWS.fetch_add(a.len() as u64, Ordering::Relaxed); }
+        // fn i16_chunk(&mut self, a: &arrow::array::Int16Array) { ROWS.fetch_add(a.len() as u64, Ordering::Relaxed); }
+        // fn i8_chunk(&mut self, a: &arrow::array::Int8Array) { ROWS.fetch_add(a.len() as u64, Ordering::Relaxed); }
+    }
+    impl PrimitiveSortedVisitor for Count {}
+    impl PrimitiveWithRowIdsVisitor for Count {}
+    impl PrimitiveSortedWithRowIdsVisitor for Count {}
+    static ROWS: AtomicU64 = AtomicU64::new(0);
     for id in [1u32, 2, 3] {
         let field_id = fid(id);
-        let mut rows = 0usize;
-        if let Ok(it) = store.scan(field_id) {
-            for arr in it.flatten() {
-                rows += arr.len();
+        ROWS.store(0, Ordering::Relaxed);
+        let mut v = Count;
+        match store.scan(field_id, ScanOptions::default(), &mut v) {
+            Ok(()) => {
+                let rows = ROWS.load(Ordering::Relaxed) as usize;
+                println!(
+                    "col={:?} -> total primitive rows scanned: {}",
+                    field_id, rows
+                );
+            }
+            Err(_) => {
+                println!(
+                    "col={:?} -> scan not supported for this dtype in this example",
+                    field_id
+                );
             }
         }
-        println!("col={:?} -> total rows scanned: {}", field_id, rows);
     }
 
     // ASCII summary of final layout using the new trait method.

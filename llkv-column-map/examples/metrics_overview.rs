@@ -227,29 +227,57 @@ fn show_phase(label: &str, stats: &Arc<IoStats>, prev: &mut CountsSnapshot) {
 // -------- sample read report + ASCII storage summary ------------------------
 
 fn print_read_report_scan(store: &ColumnStore<InstrumentedPager<MemPager>>) {
-    use arrow::array::{Array, UInt64Array};
+    use arrow::array::UInt64Array;
+    use llkv_column_map::store::scan::{PrimitiveVisitor, ScanOptions};
 
     println!("-- Read report (scan sample) --");
     for &id in &[100u32, 200, 201, 300, 301, 999] {
         let field_id = fid(id);
-        let mut seen = 0usize;
-        let mut last_val: Option<u64> = None;
-        if let Ok(iter) = store.scan(field_id) {
-            for arr in iter.flatten() {
-                if let Some(u) = arr.as_any().downcast_ref::<UInt64Array>() {
-                    if !u.is_empty() {
-                        last_val = Some(u.value(u.len() - 1));
-                    }
+        // Visitor to count up to a small budget and capture last u64 value if applicable.
+        struct Sample {
+            seen: usize,
+            last_u64: Option<u64>,
+            budget: usize,
+        }
+        impl PrimitiveVisitor for Sample {
+            fn u64_chunk(&mut self, a: &UInt64Array) {
+                if a.len() > 0 {
+                    self.last_u64 = Some(a.value(a.len() - 1));
                 }
-                seen += arr.len();
-                if seen >= 16 {
-                    break;
-                }
+                self.seen = (self.seen + a.len()).min(self.budget);
             }
-            println!(
-                "col {:?}: first ~{} rows scanned; last_u64={:?}",
-                field_id, seen, last_val
-            );
+            // fn u32_chunk(&mut self, a: &arrow::array::UInt32Array) {
+            //     self.seen = (self.seen + a.len()).min(self.budget);
+            // }
+            // fn u16_chunk(&mut self, a: &arrow::array::UInt16Array) { self.seen = (self.seen + a.len()).min(self.budget); }
+            // fn u8_chunk(&mut self, a: &arrow::array::UInt8Array) { self.seen = (self.seen + a.len()).min(self.budget); }
+            // fn i64_chunk(&mut self, a: &arrow::array::Int64Array) { self.seen = (self.seen + a.len()).min(self.budget); }
+            // fn i32_chunk(&mut self, a: &arrow::array::Int32Array) { self.seen = (self.seen + a.len()).min(self.budget); }
+            // fn i16_chunk(&mut self, a: &arrow::array::Int16Array) { self.seen = (self.seen + a.len()).min(self.budget); }
+            // fn i8_chunk(&mut self, a: &arrow::array::Int8Array) { self.seen = (self.seen + a.len()).min(self.budget); }
+        }
+        impl llkv_column_map::store::scan::PrimitiveSortedVisitor for Sample {}
+        impl llkv_column_map::store::scan::PrimitiveWithRowIdsVisitor for Sample {}
+        impl llkv_column_map::store::scan::PrimitiveSortedWithRowIdsVisitor for Sample {}
+        let mut v = Sample {
+            seen: 0,
+            last_u64: None,
+            budget: 16,
+        };
+        match store.scan(field_id, ScanOptions::default(), &mut v) {
+            Ok(()) => {
+                println!(
+                    "col {:?}: scanned primitive ints (~{} rows); last_u64={:?}",
+                    field_id, v.seen, v.last_u64
+                );
+            }
+            Err(_) => {
+                // Non-integer columns are not handled by the primitive scan API here.
+                println!(
+                    "col {:?}: scan not supported for this dtype in this example",
+                    field_id
+                );
+            }
         }
     }
     println!();

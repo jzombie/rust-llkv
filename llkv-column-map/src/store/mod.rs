@@ -9,9 +9,8 @@ use crate::store::descriptor::{
 };
 use crate::types::{CATALOG_ROOT_PKEY, LogicalFieldId, Namespace, PhysicalKey};
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array,
-    LargeBinaryArray, LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array, make_array,
+    Array, ArrayRef, BinaryArray, BooleanArray, LargeBinaryArray, LargeStringArray, StringArray,
+    UInt32Array, UInt64Array, make_array,
 };
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;

@@ -30,38 +30,86 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 /// Unsorted primitive visitor: one callback per chunk per type.
 pub trait PrimitiveVisitor {
-    fn u64_chunk(&mut self, _a: &UInt64Array) {}
-    fn u32_chunk(&mut self, _a: &UInt32Array) {}
-    fn u16_chunk(&mut self, _a: &UInt16Array) {}
-    fn u8_chunk(&mut self, _a: &UInt8Array) {}
-    fn i64_chunk(&mut self, _a: &Int64Array) {}
-    fn i32_chunk(&mut self, _a: &Int32Array) {}
-    fn i16_chunk(&mut self, _a: &Int16Array) {}
-    fn i8_chunk(&mut self, _a: &Int8Array) {}
+    fn u64_chunk(&mut self, _a: &UInt64Array) {
+        unimplemented!("`u64_chunk` not implemented")
+    }
+    fn u32_chunk(&mut self, _a: &UInt32Array) {
+        unimplemented!("`u32_chunk` not implemented")
+    }
+    fn u16_chunk(&mut self, _a: &UInt16Array) {
+        unimplemented!("`u16_chunk` not implemented")
+    }
+    fn u8_chunk(&mut self, _a: &UInt8Array) {
+        unimplemented!("`u8_chunk` not implemented")
+    }
+    fn i64_chunk(&mut self, _a: &Int64Array) {
+        unimplemented!("`i64_chunk` not implemented")
+    }
+    fn i32_chunk(&mut self, _a: &Int32Array) {
+        unimplemented!("`i32_chunk` not implemented")
+    }
+    fn i16_chunk(&mut self, _a: &Int16Array) {
+        unimplemented!("`i16_chunk` not implemented")
+    }
+    fn i8_chunk(&mut self, _a: &Int8Array) {
+        unimplemented!("`i8_chunk` not implemented")
+    }
 }
 
 /// Unsorted primitive visitor with row ids (u64).
 pub trait PrimitiveWithRowIdsVisitor {
-    fn u64_chunk_with_rids(&mut self, _v: &UInt64Array, _r: &UInt64Array) {}
-    fn u32_chunk_with_rids(&mut self, _v: &UInt32Array, _r: &UInt64Array) {}
-    fn u16_chunk_with_rids(&mut self, _v: &UInt16Array, _r: &UInt64Array) {}
-    fn u8_chunk_with_rids(&mut self, _v: &UInt8Array, _r: &UInt64Array) {}
-    fn i64_chunk_with_rids(&mut self, _v: &Int64Array, _r: &UInt64Array) {}
-    fn i32_chunk_with_rids(&mut self, _v: &Int32Array, _r: &UInt64Array) {}
-    fn i16_chunk_with_rids(&mut self, _v: &Int16Array, _r: &UInt64Array) {}
-    fn i8_chunk_with_rids(&mut self, _v: &Int8Array, _r: &UInt64Array) {}
+    fn u64_chunk_with_rids(&mut self, _v: &UInt64Array, _r: &UInt64Array) {
+        unimplemented!("`u64_chunk_with_rids` not implemented")
+    }
+    fn u32_chunk_with_rids(&mut self, _v: &UInt32Array, _r: &UInt64Array) {
+        unimplemented!("`u32_chunk_with_rids` not implemented")
+    }
+    fn u16_chunk_with_rids(&mut self, _v: &UInt16Array, _r: &UInt64Array) {
+        unimplemented!("`u16_chunk_with_rids` not implemented")
+    }
+    fn u8_chunk_with_rids(&mut self, _v: &UInt8Array, _r: &UInt64Array) {
+        unimplemented!("`u8_chunk_with_rids` not implemented")
+    }
+    fn i64_chunk_with_rids(&mut self, _v: &Int64Array, _r: &UInt64Array) {
+        unimplemented!("`i64_chunk_with_rids` not implemented")
+    }
+    fn i32_chunk_with_rids(&mut self, _v: &Int32Array, _r: &UInt64Array) {
+        unimplemented!("`i32_chunk_with_rids` not implemented")
+    }
+    fn i16_chunk_with_rids(&mut self, _v: &Int16Array, _r: &UInt64Array) {
+        unimplemented!("`i16_chunk_with_rids` not implemented")
+    }
+    fn i8_chunk_with_rids(&mut self, _v: &Int8Array, _r: &UInt64Array) {
+        unimplemented!("`i8_chunk_with_rids` not implemented")
+    }
 }
 
 /// Sorted visitor fed with coalesced runs (start,len) within a typed array.
 pub trait PrimitiveSortedVisitor {
-    fn u64_run(&mut self, _a: &UInt64Array, _start: usize, _len: usize) {}
-    fn u32_run(&mut self, _a: &UInt32Array, _start: usize, _len: usize) {}
-    fn u16_run(&mut self, _a: &UInt16Array, _start: usize, _len: usize) {}
-    fn u8_run(&mut self, _a: &UInt8Array, _start: usize, _len: usize) {}
-    fn i64_run(&mut self, _a: &Int64Array, _start: usize, _len: usize) {}
-    fn i32_run(&mut self, _a: &Int32Array, _start: usize, _len: usize) {}
-    fn i16_run(&mut self, _a: &Int16Array, _start: usize, _len: usize) {}
-    fn i8_run(&mut self, _a: &Int8Array, _start: usize, _len: usize) {}
+    fn u64_run(&mut self, _a: &UInt64Array, _start: usize, _len: usize) {
+        unimplemented!("`u64_run` not implemented")
+    }
+    fn u32_run(&mut self, _a: &UInt32Array, _start: usize, _len: usize) {
+        unimplemented!("`u32_run` not implemented")
+    }
+    fn u16_run(&mut self, _a: &UInt16Array, _start: usize, _len: usize) {
+        unimplemented!("`u16_run` not implemented")
+    }
+    fn u8_run(&mut self, _a: &UInt8Array, _start: usize, _len: usize) {
+        unimplemented!("`u8_run` not implemented")
+    }
+    fn i64_run(&mut self, _a: &Int64Array, _start: usize, _len: usize) {
+        unimplemented!("`i64_run` not implemented")
+    }
+    fn i32_run(&mut self, _a: &Int32Array, _start: usize, _len: usize) {
+        unimplemented!("`i32_run` not implemented")
+    }
+    fn i16_run(&mut self, _a: &Int16Array, _start: usize, _len: usize) {
+        unimplemented!("`i16_run` not implemented")
+    }
+    fn i8_run(&mut self, _a: &Int8Array, _start: usize, _len: usize) {
+        unimplemented!("`i8_run` not implemented")
+    }
 }
 
 /// Sorted visitor with row ids.
@@ -608,7 +656,7 @@ fn kmerge_coalesced_rev<T, A, FLen, FGet, FEmit>(
     while let Some(h) = heap.pop() {
         let c = h.c;
         let a = &arrays[c];
-        let mut e = h.i; // inclusive end
+        let e = h.i; // inclusive end
         let mut s = e; // inclusive start, will decrease
         let thr = heap.peek().map(|x| x.v);
         if let Some(t) = thr {
@@ -640,7 +688,7 @@ fn kmerge_coalesced_rev<T, A, FLen, FGet, FEmit>(
 macro_rules! sorted_visit_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident) => {
         pub fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
-            pager: &P,
+            _pager: &P,
             metas: &[ChunkMetadata],
             blobs: &FxHashMap<PhysicalKey, EntryHandle>,
             visitor: &mut V,
@@ -683,7 +731,7 @@ macro_rules! sorted_visit_impl {
             Ok(())
         }
         pub fn $name_rev<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
-            pager: &P,
+            _pager: &P,
             metas: &[ChunkMetadata],
             blobs: &FxHashMap<PhysicalKey, EntryHandle>,
             visitor: &mut V,
@@ -739,7 +787,7 @@ sorted_visit_impl!(sorted_visit_i8, sorted_visit_i8_rev, Int8Array, i8_run);
 macro_rules! sorted_with_rids_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident) => {
         pub fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedWithRowIdsVisitor>(
-            pager: &P,
+            _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
@@ -795,7 +843,7 @@ macro_rules! sorted_with_rids_impl {
             Ok(())
         }
         pub fn $name_rev<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedWithRowIdsVisitor>(
-            pager: &P,
+            _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
@@ -918,7 +966,7 @@ pub struct ScanOptions {
 use std::ops::{Bound, RangeBounds};
 
 #[derive(Default, Clone, Copy)]
-struct IntRanges {
+pub struct IntRanges {
     u64_r: Option<(Bound<u64>, Bound<u64>)>,
     u32_r: Option<(Bound<u32>, Bound<u32>)>,
     u16_r: Option<(Bound<u16>, Bound<u16>)>,
@@ -1409,7 +1457,7 @@ fn upper_idx_by<T: Ord, F: Fn(usize) -> T>(
 macro_rules! sorted_visit_bounds_impl {
     ($name:ident, $ArrTy:ty, $ty:ty, $visit:ident) => {
         fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
-            pager: &P,
+            _pager: &P,
             metas: &[ChunkMetadata],
             blobs: &FxHashMap<PhysicalKey, EntryHandle>,
             bounds: (Bound<$ty>, Bound<$ty>),
@@ -1481,7 +1529,7 @@ macro_rules! sorted_visit_bounds_impl {
 macro_rules! sorted_with_rids_bounds_impl {
     ($name:ident, $ArrTy:ty, $ty:ty, $visit:ident) => {
         fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedWithRowIdsVisitor>(
-            pager: &P,
+            _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
@@ -1665,7 +1713,7 @@ where
         }
     }
 
-    let (rid_desc_opt, metas_rid): (
+    let (_rid_desc_opt, metas_rid): (
         Option<crate::store::descriptor::ColumnDescriptor>,
         Vec<ChunkMetadata>,
     ) = if opts.with_row_ids {
