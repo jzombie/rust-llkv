@@ -43,14 +43,8 @@ enum PrimType {
     UInt8 = 10,
 }
 
-#[inline]
-fn put_u32_le(dst: &mut Vec<u8>, v: u32) { dst.extend_from_slice(&v.to_le_bytes()); }
-#[inline]
-fn put_u64_le(dst: &mut Vec<u8>, v: u64) { dst.extend_from_slice(&v.to_le_bytes()); }
-#[inline]
-fn get_u32_le(src: &[u8], o: &mut usize) -> u32 { let v = u32::from_le_bytes(src[*o..*o+4].try_into().unwrap()); *o+=4; v }
-#[inline]
-fn get_u64_le(src: &[u8], o: &mut usize) -> u64 { let v = u64::from_le_bytes(src[*o..*o+8].try_into().unwrap()); *o+=8; v }
+// Re-export convenience helpers from codecs to keep call sites tidy.
+use crate::codecs::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 
 /// Serialize array buffers with a minimal header (no nulls supported yet).
 pub fn serialize_array(arr: &dyn Array) -> Result<Vec<u8>> {
@@ -89,9 +83,9 @@ fn serialize_primitive(arr: &dyn Array, code: PrimType) -> Result<Vec<u8>> {
     out.push(Layout::Primitive as u8);
     out.push(code as u8);
     out.extend_from_slice(&[0u8; 2]);
-    put_u64_le(&mut out, len);
-    put_u32_le(&mut out, values_len);
-    put_u32_le(&mut out, 0);
+    write_u64_le(&mut out, len);
+    write_u32_le(&mut out, values_len);
+    write_u32_le(&mut out, 0);
     out.extend_from_slice(values_bytes);
     Ok(out)
 }
@@ -111,9 +105,9 @@ fn serialize_varlen(arr: &dyn Array, code: PrimType) -> Result<Vec<u8>> {
     out.push(Layout::Varlen as u8);
     out.push(code as u8);
     out.extend_from_slice(&[0u8; 2]);
-    put_u64_le(&mut out, len);
-    put_u32_le(&mut out, offsets_len);
-    put_u32_le(&mut out, values_len);
+    write_u64_le(&mut out, len);
+    write_u32_le(&mut out, offsets_len);
+    write_u32_le(&mut out, values_len);
     out.extend_from_slice(offsets_bytes);
     out.extend_from_slice(values_bytes);
     Ok(out)
@@ -135,9 +129,9 @@ fn serialize_fsl_float32(arr: &dyn Array, list_size: i32) -> Result<Vec<u8>> {
     out.push(Layout::FslFloat32 as u8);
     out.push(0);
     out.extend_from_slice(&[0u8; 2]);
-    put_u64_le(&mut out, fsl.len() as u64);
-    put_u32_le(&mut out, u32::try_from(list_size).unwrap());
-    put_u32_le(&mut out, child_len);
+    write_u64_le(&mut out, fsl.len() as u64);
+    write_u32_le(&mut out, u32::try_from(list_size).unwrap());
+    write_u32_le(&mut out, child_len);
     out.extend_from_slice(child_bytes);
     Ok(out)
 }
@@ -149,9 +143,9 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
     let layout = raw[4];
     let type_code = raw[5];
     let mut o = 8usize;
-    let len = get_u64_le(raw, &mut o) as usize;
-    let extra_a = get_u32_le(raw, &mut o);
-    let extra_b = get_u32_le(raw, &mut o);
+    let len = read_u64_le(raw, &mut o) as usize;
+    let extra_a = read_u32_le(raw, &mut o);
+    let extra_b = read_u32_le(raw, &mut o);
     let whole: Buffer = blob.as_arrow_buffer();
     let payload: Buffer = whole.slice_with_length(o, whole.len() - o);
     match layout {
@@ -201,4 +195,3 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
         _ => Err(Error::Internal("unknown layout".into())),
     }
 }
-

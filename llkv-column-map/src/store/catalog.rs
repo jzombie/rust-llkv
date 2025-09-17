@@ -1,6 +1,6 @@
 //! The top-level directory for all columns in the store.
 
-use crate::codecs::{get_u64, put_u64};
+use crate::codecs::{read_u64_le, write_u64_le};
 use crate::error::{Error, Result};
 use crate::types::{LogicalFieldId, PhysicalKey};
 use rustc_hash::FxHashMap;
@@ -21,7 +21,11 @@ impl ColumnCatalog {
                 "Invalid catalog blob: too short".to_string(),
             ));
         }
-        let entry_count = get_u64(&bytes[0..8]) as usize;
+        let mut o = 0usize;
+        if bytes.len() < 8 {
+            return Err(Error::Internal("Invalid catalog blob: too short".to_string()));
+        }
+        let entry_count = read_u64_le(bytes, &mut o) as usize;
         let expected_len = 8 + entry_count * 16;
         if bytes.len() < expected_len {
             return Err(Error::Internal(
@@ -30,13 +34,10 @@ impl ColumnCatalog {
         }
 
         let mut map = FxHashMap::with_capacity_and_hasher(entry_count, Default::default());
-        let mut offset = 8;
         for _ in 0..entry_count {
             // Read the u64 from bytes and convert it into the LogicalFieldId struct.
-            let field_id = LogicalFieldId::from(get_u64(&bytes[offset..offset + 8]));
-            offset += 8;
-            let desc_pk = get_u64(&bytes[offset..offset + 8]);
-            offset += 8;
+            let field_id = LogicalFieldId::from(read_u64_le(bytes, &mut o));
+            let desc_pk = read_u64_le(bytes, &mut o);
             map.insert(field_id, desc_pk);
         }
         Ok(Self { map })
@@ -46,12 +47,12 @@ impl ColumnCatalog {
     pub fn to_bytes(&self) -> Vec<u8> {
         let entry_count = self.map.len();
         let mut buf = Vec::with_capacity(8 + entry_count * 16);
-        buf.extend_from_slice(&put_u64(entry_count as u64));
+        write_u64_le(&mut buf, entry_count as u64);
         for (&field_id, &desc_pk) in &self.map {
             // Convert LogicalFieldId struct into a u64 for serialization.
             let field_id_u64: u64 = field_id.into();
-            buf.extend_from_slice(&put_u64(field_id_u64));
-            buf.extend_from_slice(&put_u64(desc_pk));
+            write_u64_le(&mut buf, field_id_u64);
+            write_u64_le(&mut buf, desc_pk);
         }
         buf
     }

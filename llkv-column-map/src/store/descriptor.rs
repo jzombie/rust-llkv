@@ -3,7 +3,7 @@
 //! This module avoids deserialization by defining fixed-layout structs that
 //! can be interpreted directly from byte buffers provided by the pager.
 
-use crate::codecs::{get_u32, get_u64, put_u32, put_u64};
+use crate::codecs::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use crate::error::{Error, Result};
 use crate::storage::pager::{BatchGet, GetResult, Pager};
 use crate::types::{LogicalFieldId, PhysicalKey};
@@ -30,28 +30,23 @@ impl ChunkMetadata {
     /// Single allocation; append fields as LE without growth churn.
     pub fn to_le_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::DISK_SIZE);
-        buf.extend_from_slice(&self.chunk_pk.to_le_bytes());
-        buf.extend_from_slice(&self.value_order_perm_pk.to_le_bytes());
-        buf.extend_from_slice(&self.row_count.to_le_bytes());
-        buf.extend_from_slice(&self.serialized_bytes.to_le_bytes());
-        buf.extend_from_slice(&self.min_val_u64.to_le_bytes());
-        buf.extend_from_slice(&self.max_val_u64.to_le_bytes());
+        write_u64_le(&mut buf, self.chunk_pk);
+        write_u64_le(&mut buf, self.value_order_perm_pk);
+        write_u64_le(&mut buf, self.row_count);
+        write_u64_le(&mut buf, self.serialized_bytes);
+        write_u64_le(&mut buf, self.min_val_u64);
+        write_u64_le(&mut buf, self.max_val_u64);
         buf
     }
 
     pub fn from_le_bytes(bytes: &[u8]) -> Self {
         let mut o = 0usize;
-        let rd = |off: &mut usize| {
-            let v = get_u64(&bytes[*off..*off + 8]);
-            *off += 8;
-            v
-        };
-        let chunk_pk = rd(&mut o);
-        let value_order_perm_pk = rd(&mut o);
-        let row_count = rd(&mut o);
-        let serialized_bytes = rd(&mut o);
-        let min_val_u64 = rd(&mut o);
-        let max_val_u64 = rd(&mut o);
+        let chunk_pk = read_u64_le(bytes, &mut o);
+        let value_order_perm_pk = read_u64_le(bytes, &mut o);
+        let row_count = read_u64_le(bytes, &mut o);
+        let serialized_bytes = read_u64_le(bytes, &mut o);
+        let min_val_u64 = read_u64_le(bytes, &mut o);
+        let max_val_u64 = read_u64_le(bytes, &mut o);
 
         Self {
             chunk_pk,
@@ -87,35 +82,30 @@ impl ColumnDescriptor {
         let mut buf = Vec::with_capacity(Self::DISK_SIZE);
         // Convert LogicalFieldId struct into a u64 for serialization.
         let field_id_u64: u64 = self.field_id.into();
-        buf.extend_from_slice(&field_id_u64.to_le_bytes());
-        buf.extend_from_slice(&self.head_page_pk.to_le_bytes());
-        buf.extend_from_slice(&self.tail_page_pk.to_le_bytes());
-        buf.extend_from_slice(&self.total_row_count.to_le_bytes());
-        buf.extend_from_slice(&self.total_chunk_count.to_le_bytes());
-        buf.extend_from_slice(&put_u32(self.data_type_code));
-        buf.extend_from_slice(&put_u32(self._padding as u32));
+        write_u64_le(&mut buf, field_id_u64);
+        write_u64_le(&mut buf, self.head_page_pk);
+        write_u64_le(&mut buf, self.tail_page_pk);
+        write_u64_le(&mut buf, self.total_row_count);
+        write_u64_le(&mut buf, self.total_chunk_count);
+        write_u32_le(&mut buf, self.data_type_code);
+        write_u32_le(&mut buf, self._padding as u32);
         buf
     }
 
     pub fn from_le_bytes(bytes: &[u8]) -> Self {
         let mut o = 0usize;
-        let rd = |off: &mut usize| {
-            let v = get_u64(&bytes[*off..*off + 8]);
-            *off += 8;
-            v
-        };
         // Read the u64 from bytes and convert it into the LogicalFieldId struct.
-        let field_id = LogicalFieldId::from(rd(&mut o));
-        let head_page_pk = rd(&mut o);
-        let tail_page_pk = rd(&mut o);
-        let total_row_count = rd(&mut o);
-        let total_chunk_count = rd(&mut o);
+        let field_id = LogicalFieldId::from(read_u64_le(bytes, &mut o));
+        let head_page_pk = read_u64_le(bytes, &mut o);
+        let tail_page_pk = read_u64_le(bytes, &mut o);
+        let total_row_count = read_u64_le(bytes, &mut o);
+        let total_chunk_count = read_u64_le(bytes, &mut o);
         // Optional trailer (added in newer versions): [u32 type_code][u32 padding]
         let mut data_type_code = 0u32;
         let mut padding = 0u32;
         if bytes.len() >= o + 8 {
-            data_type_code = get_u32(&bytes[o..o + 4]);
-            padding = get_u32(&bytes[o + 4..o + 8]);
+            data_type_code = read_u32_le(bytes, &mut o);
+            padding = read_u32_le(bytes, &mut o);
         }
 
         Self {
@@ -145,15 +135,21 @@ impl DescriptorPageHeader {
     pub const DISK_SIZE: usize = mem::size_of::<Self>();
 
     pub fn to_le_bytes(&self) -> [u8; Self::DISK_SIZE] {
+        let mut v = Vec::with_capacity(Self::DISK_SIZE);
+        write_u64_le(&mut v, self.next_page_pk);
+        write_u32_le(&mut v, self.entry_count);
+        if v.len() < Self::DISK_SIZE {
+            v.extend(std::iter::repeat(0u8).take(Self::DISK_SIZE - v.len()));
+        }
         let mut buf = [0u8; Self::DISK_SIZE];
-        buf[0..8].copy_from_slice(&put_u64(self.next_page_pk));
-        buf[8..12].copy_from_slice(&put_u32(self.entry_count));
+        buf.copy_from_slice(&v);
         buf
     }
 
     pub fn from_le_bytes(bytes: &[u8]) -> Self {
-        let next_page_pk = get_u64(&bytes[0..8]);
-        let entry_count = get_u32(&bytes[8..12]);
+        let mut o = 0usize;
+        let next_page_pk = read_u64_le(bytes, &mut o);
+        let entry_count = read_u32_le(bytes, &mut o);
         Self {
             next_page_pk,
             entry_count,
