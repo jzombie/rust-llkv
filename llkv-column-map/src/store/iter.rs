@@ -29,6 +29,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
+use std::ops::Bound;
 
 // ----------------------------- Sort options -------------------------------
 
@@ -37,6 +38,7 @@ pub struct SortOptions {
     /// true => descending. false => ascending.
     pub descending: bool,
     /// true => nulls first. false => nulls last.
+    /// Not used: the store never writes nulls.
     pub nulls_first: bool,
 }
 
@@ -53,14 +55,13 @@ impl Default for SortOptions {
 
 #[derive(Clone, Copy, Debug)]
 struct Key<K: Ord + Copy> {
-    null_rank: u8, // 0 or 1 (precomputed by nulls_first)
-    val: K,        // ignored if both sides are null
-    flip: bool,    // true => reverse value ordering
+    val: K,     // value for ordering
+    flip: bool, // true => reverse order
 }
 
 impl<K: Ord + Copy> PartialEq for Key<K> {
     fn eq(&self, other: &Self) -> bool {
-        self.null_rank == other.null_rank && self.val == other.val
+        self.val == other.val
     }
 }
 impl<K: Ord + Copy> Eq for Key<K> {}
@@ -73,10 +74,6 @@ impl<K: Ord + Copy> PartialOrd for Key<K> {
 
 impl<K: Ord + Copy> Ord for Key<K> {
     fn cmp(&self, other: &Self) -> Ordering {
-        let nr = self.null_rank.cmp(&other.null_rank);
-        if nr != Ordering::Equal {
-            return nr;
-        }
         let v = self.val.cmp(&other.val);
         if self.flip { v.reverse() } else { v }
     }
@@ -112,8 +109,6 @@ impl<K: Ord + Copy> Ord for HeapItem<K> {
 // ------------------------------- Cursors ----------------------------------
 
 struct Cursor<A> {
-    /// Sorted payload for this chunk (contiguous).
-    sorted_any: ArrayRef,
     /// Typed view to load keys cheaply.
     sorted: A,
     /// Rows in chunk.
@@ -217,13 +212,13 @@ macro_rules! impl_merge_for_primitive {
         pub struct $Name {
             cursors: Vec<Cursor<$ArrTy>>,
             heap: BinaryHeap<Reverse<HeapItem<$KeyTy>>>,
-            /// Cached nulls_first as null rank function.
-            nulls_first: bool,
             /// Flip value order for descending.
             flip: bool,
-            /// Optional inclusive lower/upper bounds on values.
-            bound_lo: Option<$KeyTy>,
-            bound_hi: Option<$KeyTy>,
+            /// Bounds on values (inclusive/exclusive/unbounded).
+            bound_lo: Bound<$KeyTy>,
+            bound_hi: Bound<$KeyTy>,
+            /// Fast flag: any bound active?
+            bounds_active: bool,
             /// Keep blobs alive (zero-copy backing).
             _blobs: FxHashMap<PhysicalKey, EntryHandle>,
         }
@@ -243,6 +238,7 @@ macro_rules! impl_merge_for_primitive {
                     if m.row_count == 0 {
                         continue;
                     }
+
                     // Load data.
                     let data_blob = blobs.get(&m.chunk_pk).ok_or(Error::NotFound)?.clone();
                     let data_any = deserialize_array(data_blob)?;
@@ -267,7 +263,6 @@ macro_rules! impl_merge_for_primitive {
                         .clone();
 
                     cursors.push(Cursor::<$ArrTy> {
-                        sorted_any: sorted_any.clone(),
                         sorted: sorted_typed,
                         len: sorted_any.len(),
                     });
@@ -276,14 +271,13 @@ macro_rules! impl_merge_for_primitive {
                 // Seed heap with first row from each cursor.
                 let mut heap: BinaryHeap<Reverse<HeapItem<$KeyTy>>> = BinaryHeap::new();
 
-                let nulls_first = opts.nulls_first;
                 let flip = opts.descending;
 
                 for (i, c) in cursors.iter().enumerate() {
                     if c.len == 0 {
                         continue;
                     }
-                    let k = Self::key_at(c, 0, nulls_first, flip);
+                    let k = Self::key_at(c, 0, flip);
                     heap.push(Reverse(HeapItem {
                         cursor_idx: i,
                         sorted_idx: 0,
@@ -294,18 +288,18 @@ macro_rules! impl_merge_for_primitive {
                 Ok(Self {
                     cursors,
                     heap,
-                    nulls_first,
                     flip,
-                    bound_lo: None,
-                    bound_hi: None,
+                    bound_lo: Bound::Unbounded,
+                    bound_hi: Bound::Unbounded,
+                    bounds_active: false,
                     _blobs: blobs,
                 })
             }
 
-            /// Return the next run from the same chunk, maximally coalesced.
-            /// When the heap is empty, returns None.
+            /// Return the next run from the same chunk, maximally
+            /// coalesced. When the heap is empty, returns None.
+            #[inline(always)]
             pub fn next_run<'a>(&'a mut self) -> Option<Run<'a>> {
-                // Keep popping until we can emit a non-empty (clamped) run.
                 loop {
                     let Reverse(top) = self.heap.pop()?;
 
@@ -314,31 +308,26 @@ macro_rules! impl_merge_for_primitive {
 
                     let cidx = top.cursor_idx;
                     let start = top.sorted_idx;
-
                     let c = &self.cursors[cidx];
                     let len = c.len;
 
-                    // Advance within the winner while it stays <= threshold.
+                    // Advance within the winner while it stays <= thr.
                     let mut end = start + 1;
-
-                    // Fast paths:
-                    // - If heap is empty, we can take the whole tail.
-                    if thr.is_none() {
-                        end = len;
-                    } else {
-                        let thr_key = thr.unwrap();
+                    if let Some(thr_key) = thr {
                         while end < len {
-                            let k = Self::key_at(c, end, self.nulls_first, self.flip);
+                            let k = Self::key_at(c, end, self.flip);
                             if k > thr_key {
                                 break;
                             }
                             end += 1;
                         }
+                    } else {
+                        end = len;
                     }
 
                     // Reinsert cursor with its next position (if any).
                     if end < len {
-                        let k = Self::key_at(c, end, self.nulls_first, self.flip);
+                        let k = Self::key_at(c, end, self.flip);
                         self.heap.push(Reverse(HeapItem {
                             cursor_idx: cidx,
                             sorted_idx: end,
@@ -346,27 +335,53 @@ macro_rules! impl_merge_for_primitive {
                         }));
                     }
 
-                    // Clamp [s,e) by optional bounds using typed array.
+                    // Fast path: no bounds.
+                    if !self.bounds_active {
+                        let c = &self.cursors[cidx];
+                        return Some(Run::$RunVariant {
+                            arr: &c.sorted,
+                            start,
+                            len: end - start,
+                        });
+                    }
+
+                    // Clamp [s,e) by bounds using the typed array.
                     let arr = &c.sorted;
                     let mut s = start;
                     let mut e = end;
 
-                    if let Some(lo) = self.bound_lo {
-                        s = $lower_fn(arr, s, e, lo);
-                        if s >= e {
-                            // Entire run < lo; try next.
-                            continue;
+                    // Lower bound:
+                    // - Included(x) => first idx with val >= x
+                    // - Excluded(x) => first idx with val >  x
+                    // - Unbounded   => unchanged
+                    match self.bound_lo {
+                        Bound::Unbounded => {}
+                        Bound::Included(x) => {
+                            s = $lower_fn(arr, s, e, x);
+                        }
+                        Bound::Excluded(x) => {
+                            s = $upper_fn(arr, s, e, x);
                         }
                     }
-                    if let Some(hi) = self.bound_hi {
-                        // If first value already > hi, discard this run.
-                        if arr.value(s) > hi {
-                            continue;
+                    if s >= e {
+                        continue;
+                    }
+
+                    // Upper bound:
+                    // - Included(x) => first idx with val >  x
+                    // - Excluded(x) => first idx with val >= x
+                    // - Unbounded   => unchanged
+                    match self.bound_hi {
+                        Bound::Unbounded => {}
+                        Bound::Included(x) => {
+                            e = $upper_fn(arr, s, e, x);
                         }
-                        e = $upper_fn(arr, s, e, hi);
-                        if s >= e {
-                            continue;
+                        Bound::Excluded(x) => {
+                            e = $lower_fn(arr, s, e, x);
                         }
+                    }
+                    if s >= e {
+                        continue;
                     }
 
                     let c = &self.cursors[cidx];
@@ -379,26 +394,9 @@ macro_rules! impl_merge_for_primitive {
             }
 
             #[inline(always)]
-            fn key_at(
-                c: &Cursor<$ArrTy>,
-                idx: usize,
-                nulls_first: bool,
-                flip: bool,
-            ) -> Key<$KeyTy> {
-                let is_null = c.sorted.is_null(idx);
-                let null_rank = if nulls_first {
-                    if is_null { 0 } else { 1 }
-                } else {
-                    if is_null { 1 } else { 0 }
-                };
-                let v = if is_null {
-                    <$KeyTy as Default>::default()
-                } else {
-                    c.sorted.value(idx) as $KeyTy
-                };
+            fn key_at(c: &Cursor<$ArrTy>, idx: usize, flip: bool) -> Key<$KeyTy> {
                 Key {
-                    null_rank,
-                    val: v,
+                    val: c.sorted.value(idx) as $KeyTy,
                     flip,
                 }
             }
@@ -492,22 +490,24 @@ impl SortedMerge {
         }
     }
 
-    /// Set inclusive value bounds for u64 streams. No-op for other types.
+    /// Set range bounds for u64 streams.
     #[inline]
-    pub fn with_u64_bounds(mut self, lo: Option<u64>, hi: Option<u64>) -> Self {
+    pub fn with_u64_range(mut self, lo: Bound<u64>, hi: Bound<u64>) -> Self {
         if let SortedMerge::U64(m) = &mut self {
             m.bound_lo = lo;
             m.bound_hi = hi;
+            m.bounds_active = !matches!(lo, Bound::Unbounded) || !matches!(hi, Bound::Unbounded);
         }
         self
     }
 
-    /// Set inclusive value bounds for i32 streams. No-op for others.
+    /// Set range bounds for i32 streams.
     #[inline]
-    pub fn with_i32_bounds(mut self, lo: Option<i32>, hi: Option<i32>) -> Self {
+    pub fn with_i32_range(mut self, lo: Bound<i32>, hi: Bound<i32>) -> Self {
         if let SortedMerge::I32(m) = &mut self {
             m.bound_lo = lo;
             m.bound_hi = hi;
+            m.bounds_active = !matches!(lo, Bound::Unbounded) || !matches!(hi, Bound::Unbounded);
         }
         self
     }

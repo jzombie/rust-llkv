@@ -273,6 +273,7 @@ where
         })
     }
 
+    // TODO: Convert all nulls to deletes (don't store them)
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         let schema = batch.schema();
         let row_id_idx = schema

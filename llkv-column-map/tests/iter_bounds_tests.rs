@@ -1,9 +1,10 @@
 //! Bounds tests for SortedMerge over pre-sorted chunks.
 //!
 //! Each test ingests shuffled data across batches, builds the sort
-//! index, then scans with inclusive lo/hi bounds and validates output.
+//! index, then scans with bounds and validates output.
 
 use std::collections::HashMap;
+use std::ops::Bound::{Included, Unbounded};
 use std::sync::Arc;
 
 use arrow::array::{Int32Array, UInt64Array};
@@ -106,10 +107,10 @@ fn ingest_i32(
 fn collect_u64_in_bounds(
     store: &ColumnStore<MemPager>,
     fid: LogicalFieldId,
-    lo: Option<u64>,
-    hi: Option<u64>,
+    lo: std::ops::Bound<u64>,
+    hi: std::ops::Bound<u64>,
 ) -> Vec<u64> {
-    let mut m = store.scan_sorted(fid).unwrap().with_u64_bounds(lo, hi);
+    let mut m = store.scan_sorted(fid).unwrap().with_u64_range(lo, hi);
     let mut out = Vec::new();
     while let Some(run) = m.next_run() {
         match run {
@@ -128,10 +129,10 @@ fn collect_u64_in_bounds(
 fn collect_i32_in_bounds(
     store: &ColumnStore<MemPager>,
     fid: LogicalFieldId,
-    lo: Option<i32>,
-    hi: Option<i32>,
+    lo: std::ops::Bound<i32>,
+    hi: std::ops::Bound<i32>,
 ) -> Vec<i32> {
-    let mut m = store.scan_sorted(fid).unwrap().with_i32_bounds(lo, hi);
+    let mut m = store.scan_sorted(fid).unwrap().with_i32_range(lo, hi);
     let mut out = Vec::new();
     while let Some(run) = m.next_run() {
         match run {
@@ -157,7 +158,7 @@ fn u64_bounds_inclusive_middle() {
 
     let lo = 12_345u64;
     let hi = 54_321u64;
-    let got = collect_u64_in_bounds(&store, fid, Some(lo), Some(hi));
+    let got = collect_u64_in_bounds(&store, fid, Included(lo), Included(hi));
 
     let exp: Vec<u64> = (lo..=hi).collect();
     assert_eq!(got.len(), exp.len());
@@ -174,13 +175,13 @@ fn u64_bounds_open_ends() {
 
     // Only hi bound
     let hi = 10_000u64;
-    let got_hi = collect_u64_in_bounds(&store, fid, None, Some(hi));
+    let got_hi = collect_u64_in_bounds(&store, fid, Unbounded, Included(hi));
     let exp_hi: Vec<u64> = (0..=hi).collect();
     assert_eq!(got_hi, exp_hi);
 
     // Only lo bound
     let lo = 42_000u64;
-    let got_lo = collect_u64_in_bounds(&store, fid, Some(lo), None);
+    let got_lo = collect_u64_in_bounds(&store, fid, Included(lo), Unbounded);
     let exp_lo: Vec<u64> = (lo..N as u64).collect();
     assert_eq!(got_lo, exp_lo);
 }
@@ -194,15 +195,20 @@ fn u64_bounds_empty_ranges() {
     let store = ingest_u64(N, B, fid);
 
     // Case 1: closed range entirely above the domain [N+10, N+20].
-    let got1 = collect_u64_in_bounds(&store, fid, Some(N as u64 + 10), Some(N as u64 + 20));
+    let got1 = collect_u64_in_bounds(
+        &store,
+        fid,
+        Included(N as u64 + 10),
+        Included(N as u64 + 20),
+    );
     assert!(got1.is_empty());
 
     // Case 2: lo above max with open hi.
-    let got2 = collect_u64_in_bounds(&store, fid, Some(N as u64 + 1), None);
+    let got2 = collect_u64_in_bounds(&store, fid, Included(N as u64 + 1), Unbounded);
     assert!(got2.is_empty());
 
     // Case 3: lo > hi inside the domain.
-    let got3 = collect_u64_in_bounds(&store, fid, Some(10_000), Some(9_999));
+    let got3 = collect_u64_in_bounds(&store, fid, Included(10_000), Included(9_999));
     assert!(got3.is_empty());
 }
 
@@ -217,7 +223,7 @@ fn i32_bounds_cross_zero() {
     // Data covers [-N/2, N/2). Choose a band across zero.
     let lo = -1234i32;
     let hi = 3456i32;
-    let got = collect_i32_in_bounds(&store, fid, Some(lo), Some(hi));
+    let got = collect_i32_in_bounds(&store, fid, Included(lo), Included(hi));
     let exp: Vec<i32> = (lo..=hi).collect();
 
     assert_eq!(got.len(), exp.len());
