@@ -129,7 +129,7 @@ fn bench_scan_builder(c: &mut Criterion) {
                 let mut v = SumU64 { acc: &acc };
                 ScanBuilder::new(&store, fid_u64)
                     .options(ScanOptions { sorted: true, reverse: false, with_row_ids: false, row_id_field: None })
-                    .range_u64(100_000..=900_000)
+                    .with_range::<u64,_>(100_000..=900_000)
                     .run(&mut v)
                     .unwrap();
                 black_box(acc.get());
@@ -157,7 +157,7 @@ fn bench_scan_builder(c: &mut Criterion) {
                 let rid_fid = rid_fid_from_value(fid_u64);
                 ScanBuilder::new(&store, fid_u64)
                     .options(ScanOptions { sorted: true, reverse: false, with_row_ids: true, row_id_field: Some(rid_fid) })
-                    .range_u64(100_000..=900_000)
+                    .with_range::<u64,_>(100_000..=900_000)
                     .run(&mut v)
                     .unwrap();
                 black_box(acc.get());

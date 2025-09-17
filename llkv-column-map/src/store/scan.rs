@@ -18,13 +18,13 @@ use arrow::datatypes::DataType;
 
 use rustc_hash::FxHashMap;
 
+use super::ColumnStore;
 use crate::error::{Error, Result};
 use crate::serialization::deserialize_array;
 use crate::storage::pager::{BatchGet, GetResult, Pager};
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::types::{LogicalFieldId, PhysicalKey};
 use simd_r_drive_entry_handle::EntryHandle;
-use super::ColumnStore;
 
 // ---------------------------- Visitor Traits ----------------------------
 
@@ -569,29 +569,56 @@ fn kmerge_coalesced_rev<T, A, FLen, FGet, FEmit>(
     FEmit: FnMut(usize, usize, usize), // (chunk_idx, start, len) but start..start+len iterates descending via get
 {
     #[derive(Clone, Copy, Debug)]
-    struct H<T> { v: T, c: usize, i: usize }
-    impl<T: Ord> PartialEq for H<T> { fn eq(&self, o: &Self) -> bool { self.v == o.v && self.c == o.c && self.i == o.i } }
+    struct H<T> {
+        v: T,
+        c: usize,
+        i: usize,
+    }
+    impl<T: Ord> PartialEq for H<T> {
+        fn eq(&self, o: &Self) -> bool {
+            self.v == o.v && self.c == o.c && self.i == o.i
+        }
+    }
     impl<T: Ord> Eq for H<T> {}
-    impl<T: Ord> PartialOrd for H<T> { fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(o)) } }
+    impl<T: Ord> PartialOrd for H<T> {
+        fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(o))
+        }
+    }
     // Max-heap by value (natural ordering)
-    impl<T: Ord> Ord for H<T> { fn cmp(&self, o: &Self) -> std::cmp::Ordering { self.v.cmp(&o.v).then_with(|| self.c.cmp(&o.c)) } }
+    impl<T: Ord> Ord for H<T> {
+        fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+            self.v.cmp(&o.v).then_with(|| self.c.cmp(&o.c))
+        }
+    }
 
     let mut heap: BinaryHeap<H<T>> = BinaryHeap::new();
     for (ci, a) in arrays.iter().enumerate() {
         let al = len_of(a);
-        if al > 0 { let idx = al - 1; heap.push(H { v: get(a, idx), c: ci, i: idx }); }
+        if al > 0 {
+            let idx = al - 1;
+            heap.push(H {
+                v: get(a, idx),
+                c: ci,
+                i: idx,
+            });
+        }
     }
 
     while let Some(h) = heap.pop() {
         let c = h.c;
         let a = &arrays[c];
         let mut e = h.i; // inclusive end
-        let mut s = e;   // inclusive start, will decrease
+        let mut s = e; // inclusive start, will decrease
         let thr = heap.peek().map(|x| x.v);
         if let Some(t) = thr {
             while s > 0 {
                 let p = s - 1;
-                if get(a, p) >= t { s = p; } else { break; }
+                if get(a, p) >= t {
+                    s = p;
+                } else {
+                    break;
+                }
             }
         } else {
             // drain remaining
@@ -601,7 +628,11 @@ fn kmerge_coalesced_rev<T, A, FLen, FGet, FEmit>(
         emit(c, s, e - s + 1);
         if s > 0 {
             let next = s - 1;
-            heap.push(H { v: get(a, next), c, i: next });
+            heap.push(H {
+                v: get(a, next),
+                c,
+                i: next,
+            });
         }
     }
 }
@@ -660,14 +691,29 @@ macro_rules! sorted_visit_impl {
             // Materialize sorted arrays per chunk by applying the permutation.
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for m in metas {
-                let data_any = deserialize_array(blobs.get(&m.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm_any = deserialize_array(blobs.get(&m.value_order_perm_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm = perm_any.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| Error::Internal("perm not u32".into()))?;
+                let data_any =
+                    deserialize_array(blobs.get(&m.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let perm_any = deserialize_array(
+                    blobs
+                        .get(&m.value_order_perm_pk)
+                        .ok_or(Error::NotFound)?
+                        .clone(),
+                )?;
+                let perm = perm_any
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| Error::Internal("perm not u32".into()))?;
                 let taken_any = compute::take(&data_any, perm, None)?;
-                let arr = taken_any.as_any().downcast_ref::<$ArrTy>().ok_or_else(|| Error::Internal("sorted downcast".into()))?.clone();
+                let arr = taken_any
+                    .as_any()
+                    .downcast_ref::<$ArrTy>()
+                    .ok_or_else(|| Error::Internal("sorted downcast".into()))?
+                    .clone();
                 arrays.push(arr);
             }
-            if arrays.is_empty() { return Ok(()); }
+            if arrays.is_empty() {
+                return Ok(());
+            }
             kmerge_coalesced_rev::<_, _, _, _, _>(
                 &arrays,
                 |a: &$ArrTy| a.len(),
@@ -682,11 +728,11 @@ macro_rules! sorted_visit_impl {
 sorted_visit_impl!(sorted_visit_u64, sorted_visit_u64_rev, UInt64Array, u64_run);
 sorted_visit_impl!(sorted_visit_u32, sorted_visit_u32_rev, UInt32Array, u32_run);
 sorted_visit_impl!(sorted_visit_u16, sorted_visit_u16_rev, UInt16Array, u16_run);
-sorted_visit_impl!(sorted_visit_u8,  sorted_visit_u8_rev,  UInt8Array,  u8_run);
-sorted_visit_impl!(sorted_visit_i64, sorted_visit_i64_rev, Int64Array,  i64_run);
-sorted_visit_impl!(sorted_visit_i32, sorted_visit_i32_rev, Int32Array,  i32_run);
-sorted_visit_impl!(sorted_visit_i16, sorted_visit_i16_rev, Int16Array,  i16_run);
-sorted_visit_impl!(sorted_visit_i8,  sorted_visit_i8_rev,  Int8Array,   i8_run);
+sorted_visit_impl!(sorted_visit_u8, sorted_visit_u8_rev, UInt8Array, u8_run);
+sorted_visit_impl!(sorted_visit_i64, sorted_visit_i64_rev, Int64Array, i64_run);
+sorted_visit_impl!(sorted_visit_i32, sorted_visit_i32_rev, Int32Array, i32_run);
+sorted_visit_impl!(sorted_visit_i16, sorted_visit_i16_rev, Int16Array, i16_run);
+sorted_visit_impl!(sorted_visit_i8, sorted_visit_i8_rev, Int8Array, i8_run);
 
 // Note: A sorted-with-row-ids variant can be added similarly if needed.
 
@@ -700,22 +746,46 @@ macro_rules! sorted_with_rids_impl {
             rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
             visitor: &mut V,
         ) -> Result<()> {
-            if metas_val.len() != metas_rid.len() { return Err(Error::Internal("sorted_with_rids: chunk count mismatch".into())); }
+            if metas_val.len() != metas_rid.len() {
+                return Err(Error::Internal(
+                    "sorted_with_rids: chunk count mismatch".into(),
+                ));
+            }
             let mut vals: Vec<$ArrTy> = Vec::with_capacity(metas_val.len());
             let mut rids: Vec<UInt64Array> = Vec::with_capacity(metas_val.len());
             for (mv, mr) in metas_val.iter().zip(metas_rid.iter()) {
-                let data_any = deserialize_array(vblobs.get(&mv.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm_any = deserialize_array(vblobs.get(&mv.value_order_perm_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm = perm_any.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| Error::Internal("perm not u32".into()))?;
+                let data_any =
+                    deserialize_array(vblobs.get(&mv.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let perm_any = deserialize_array(
+                    vblobs
+                        .get(&mv.value_order_perm_pk)
+                        .ok_or(Error::NotFound)?
+                        .clone(),
+                )?;
+                let perm = perm_any
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| Error::Internal("perm not u32".into()))?;
                 let taken_any = compute::take(&data_any, perm, None)?;
-                let arr = taken_any.as_any().downcast_ref::<$ArrTy>().ok_or_else(|| Error::Internal("sorted downcast".into()))?.clone();
+                let arr = taken_any
+                    .as_any()
+                    .downcast_ref::<$ArrTy>()
+                    .ok_or_else(|| Error::Internal("sorted downcast".into()))?
+                    .clone();
                 vals.push(arr);
-                let rid_any = deserialize_array(rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let rid_any =
+                    deserialize_array(rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone())?;
                 let taken_rid_any = compute::take(&rid_any, perm, None)?;
-                let rid = taken_rid_any.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| Error::Internal("row_id downcast".into()))?.clone();
+                let rid = taken_rid_any
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::Internal("row_id downcast".into()))?
+                    .clone();
                 rids.push(rid);
             }
-            if vals.is_empty() { return Ok(()); }
+            if vals.is_empty() {
+                return Ok(());
+            }
             kmerge_coalesced::<_, _, _, _, _>(
                 &vals,
                 |a: &$ArrTy| a.len(),
@@ -732,22 +802,46 @@ macro_rules! sorted_with_rids_impl {
             rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
             visitor: &mut V,
         ) -> Result<()> {
-            if metas_val.len() != metas_rid.len() { return Err(Error::Internal("sorted_with_rids: chunk count mismatch".into())); }
+            if metas_val.len() != metas_rid.len() {
+                return Err(Error::Internal(
+                    "sorted_with_rids: chunk count mismatch".into(),
+                ));
+            }
             let mut vals: Vec<$ArrTy> = Vec::with_capacity(metas_val.len());
             let mut rids: Vec<UInt64Array> = Vec::with_capacity(metas_val.len());
             for (mv, mr) in metas_val.iter().zip(metas_rid.iter()) {
-                let data_any = deserialize_array(vblobs.get(&mv.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm_any = deserialize_array(vblobs.get(&mv.value_order_perm_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm = perm_any.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| Error::Internal("perm not u32".into()))?;
+                let data_any =
+                    deserialize_array(vblobs.get(&mv.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let perm_any = deserialize_array(
+                    vblobs
+                        .get(&mv.value_order_perm_pk)
+                        .ok_or(Error::NotFound)?
+                        .clone(),
+                )?;
+                let perm = perm_any
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| Error::Internal("perm not u32".into()))?;
                 let taken_any = compute::take(&data_any, perm, None)?;
-                let arr = taken_any.as_any().downcast_ref::<$ArrTy>().ok_or_else(|| Error::Internal("sorted downcast".into()))?.clone();
+                let arr = taken_any
+                    .as_any()
+                    .downcast_ref::<$ArrTy>()
+                    .ok_or_else(|| Error::Internal("sorted downcast".into()))?
+                    .clone();
                 vals.push(arr);
-                let rid_any = deserialize_array(rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let rid_any =
+                    deserialize_array(rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone())?;
                 let taken_rid_any = compute::take(&rid_any, perm, None)?;
-                let rid = taken_rid_any.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| Error::Internal("row_id downcast".into()))?.clone();
+                let rid = taken_rid_any
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::Internal("row_id downcast".into()))?
+                    .clone();
                 rids.push(rid);
             }
-            if vals.is_empty() { return Ok(()); }
+            if vals.is_empty() {
+                return Ok(());
+            }
             kmerge_coalesced_rev::<_, _, _, _, _>(
                 &vals,
                 |a: &$ArrTy| a.len(),
@@ -759,14 +853,54 @@ macro_rules! sorted_with_rids_impl {
     };
 }
 
-sorted_with_rids_impl!(sorted_visit_with_rids_u64, sorted_visit_with_rids_u64_rev, UInt64Array, u64_run_with_rids);
-sorted_with_rids_impl!(sorted_visit_with_rids_u32, sorted_visit_with_rids_u32_rev, UInt32Array, u32_run_with_rids);
-sorted_with_rids_impl!(sorted_visit_with_rids_u16, sorted_visit_with_rids_u16_rev, UInt16Array, u16_run_with_rids);
-sorted_with_rids_impl!(sorted_visit_with_rids_u8,  sorted_visit_with_rids_u8_rev,  UInt8Array,  u8_run_with_rids);
-sorted_with_rids_impl!(sorted_visit_with_rids_i64, sorted_visit_with_rids_i64_rev, Int64Array,  i64_run_with_rids);
-sorted_with_rids_impl!(sorted_visit_with_rids_i32, sorted_visit_with_rids_i32_rev, Int32Array,  i32_run_with_rids);
-sorted_with_rids_impl!(sorted_visit_with_rids_i16, sorted_visit_with_rids_i16_rev, Int16Array,  i16_run_with_rids);
-sorted_with_rids_impl!(sorted_visit_with_rids_i8,  sorted_visit_with_rids_i8_rev,  Int8Array,   i8_run_with_rids);
+sorted_with_rids_impl!(
+    sorted_visit_with_rids_u64,
+    sorted_visit_with_rids_u64_rev,
+    UInt64Array,
+    u64_run_with_rids
+);
+sorted_with_rids_impl!(
+    sorted_visit_with_rids_u32,
+    sorted_visit_with_rids_u32_rev,
+    UInt32Array,
+    u32_run_with_rids
+);
+sorted_with_rids_impl!(
+    sorted_visit_with_rids_u16,
+    sorted_visit_with_rids_u16_rev,
+    UInt16Array,
+    u16_run_with_rids
+);
+sorted_with_rids_impl!(
+    sorted_visit_with_rids_u8,
+    sorted_visit_with_rids_u8_rev,
+    UInt8Array,
+    u8_run_with_rids
+);
+sorted_with_rids_impl!(
+    sorted_visit_with_rids_i64,
+    sorted_visit_with_rids_i64_rev,
+    Int64Array,
+    i64_run_with_rids
+);
+sorted_with_rids_impl!(
+    sorted_visit_with_rids_i32,
+    sorted_visit_with_rids_i32_rev,
+    Int32Array,
+    i32_run_with_rids
+);
+sorted_with_rids_impl!(
+    sorted_visit_with_rids_i16,
+    sorted_visit_with_rids_i16_rev,
+    Int16Array,
+    i16_run_with_rids
+);
+sorted_with_rids_impl!(
+    sorted_visit_with_rids_i8,
+    sorted_visit_with_rids_i8_rev,
+    Int8Array,
+    i8_run_with_rids
+);
 
 // ------------------------ Options + Builders ----------------------------
 
@@ -807,25 +941,54 @@ where
     P: Pager<Blob = EntryHandle>,
 {
     pub fn new(store: &'a ColumnStore<P>, field_id: LogicalFieldId) -> Self {
-        Self { store, field_id, opts: ScanOptions::default(), ir: IntRanges::default() }
+        Self {
+            store,
+            field_id,
+            opts: ScanOptions::default(),
+            ir: IntRanges::default(),
+        }
     }
-    pub fn options(mut self, opts: ScanOptions) -> Self { self.opts = opts; self }
+    pub fn options(mut self, opts: ScanOptions) -> Self {
+        self.opts = opts;
+        self
+    }
     pub fn with_row_ids(mut self, row_id_field: LogicalFieldId) -> Self {
         self.opts.with_row_ids = true;
         self.opts.row_id_field = Some(row_id_field);
         self
     }
-    pub fn sorted(mut self, sorted: bool) -> Self { self.opts.sorted = sorted; self }
-    pub fn reverse(mut self, reverse: bool) -> Self { self.opts.reverse = reverse; self }
+    pub fn sorted(mut self, sorted: bool) -> Self {
+        self.opts.sorted = sorted;
+        self
+    }
+    pub fn reverse(mut self, reverse: bool) -> Self {
+        self.opts.reverse = reverse;
+        self
+    }
 
-    pub fn range_u64<R: RangeBounds<u64>>(mut self, r: R) -> Self { self.ir.u64_r = Some((r.start_bound().cloned(), r.end_bound().cloned())); self }
-    pub fn range_u32<R: RangeBounds<u32>>(mut self, r: R) -> Self { self.ir.u32_r = Some((r.start_bound().cloned(), r.end_bound().cloned())); self }
-    pub fn range_u16<R: RangeBounds<u16>>(mut self, r: R) -> Self { self.ir.u16_r = Some((r.start_bound().cloned(), r.end_bound().cloned())); self }
-    pub fn range_u8<R: RangeBounds<u8>>(mut self, r: R) -> Self { self.ir.u8_r = Some((r.start_bound().cloned(), r.end_bound().cloned())); self }
-    pub fn range_i64<R: RangeBounds<i64>>(mut self, r: R) -> Self { self.ir.i64_r = Some((r.start_bound().cloned(), r.end_bound().cloned())); self }
-    pub fn range_i32<R: RangeBounds<i32>>(mut self, r: R) -> Self { self.ir.i32_r = Some((r.start_bound().cloned(), r.end_bound().cloned())); self }
-    pub fn range_i16<R: RangeBounds<i16>>(mut self, r: R) -> Self { self.ir.i16_r = Some((r.start_bound().cloned(), r.end_bound().cloned())); self }
-    pub fn range_i8<R: RangeBounds<i8>>(mut self, r: R) -> Self { self.ir.i8_r = Some((r.start_bound().cloned(), r.end_bound().cloned())); self }
+    // Generic, monomorphized range setter (no perf impact):
+    // Usage: builder.with_range::<u64,_>(2000..=8000)
+    pub fn with_range<T, R>(mut self, r: R) -> Self
+    where
+        T: RangeKey + Copy,
+        R: RangeBounds<T>,
+    {
+        let lb_ref = r.start_bound();
+        let ub_ref = r.end_bound();
+        // Copy out of Bound<&T> into Bound<T> (T: Copy)
+        let lb = match lb_ref {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(&x) => Bound::Included(x),
+            Bound::Excluded(&x) => Bound::Excluded(x),
+        };
+        let ub = match ub_ref {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(&x) => Bound::Included(x),
+            Bound::Excluded(&x) => Bound::Excluded(x),
+        };
+        T::store(&mut self.ir, lb, ub);
+        self
+    }
 
     pub fn run<V>(self, visitor: &mut V) -> Result<()>
     where
@@ -861,43 +1024,93 @@ where
         where
             V: crate::store::scan::PrimitiveVisitor,
         {
-            fn u64_chunk(&mut self, a: &UInt64Array) { self.inner.u64_chunk(a) }
-            fn u32_chunk(&mut self, a: &UInt32Array) { self.inner.u32_chunk(a) }
-            fn u16_chunk(&mut self, a: &UInt16Array) { self.inner.u16_chunk(a) }
-            fn u8_chunk(&mut self, a: &UInt8Array) { self.inner.u8_chunk(a) }
-            fn i64_chunk(&mut self, a: &Int64Array) { self.inner.i64_chunk(a) }
-            fn i32_chunk(&mut self, a: &Int32Array) { self.inner.i32_chunk(a) }
-            fn i16_chunk(&mut self, a: &Int16Array) { self.inner.i16_chunk(a) }
-            fn i8_chunk(&mut self, a: &Int8Array) { self.inner.i8_chunk(a) }
+            fn u64_chunk(&mut self, a: &UInt64Array) {
+                self.inner.u64_chunk(a)
+            }
+            fn u32_chunk(&mut self, a: &UInt32Array) {
+                self.inner.u32_chunk(a)
+            }
+            fn u16_chunk(&mut self, a: &UInt16Array) {
+                self.inner.u16_chunk(a)
+            }
+            fn u8_chunk(&mut self, a: &UInt8Array) {
+                self.inner.u8_chunk(a)
+            }
+            fn i64_chunk(&mut self, a: &Int64Array) {
+                self.inner.i64_chunk(a)
+            }
+            fn i32_chunk(&mut self, a: &Int32Array) {
+                self.inner.i32_chunk(a)
+            }
+            fn i16_chunk(&mut self, a: &Int16Array) {
+                self.inner.i16_chunk(a)
+            }
+            fn i8_chunk(&mut self, a: &Int8Array) {
+                self.inner.i8_chunk(a)
+            }
         }
         impl<'v, V> crate::store::scan::PrimitiveWithRowIdsVisitor for RangeAdapter<'v, V>
         where
             V: crate::store::scan::PrimitiveWithRowIdsVisitor,
         {
-            fn u64_chunk_with_rids(&mut self, v: &UInt64Array, r: &UInt64Array) { self.inner.u64_chunk_with_rids(v, r) }
-            fn u32_chunk_with_rids(&mut self, v: &UInt32Array, r: &UInt64Array) { self.inner.u32_chunk_with_rids(v, r) }
-            fn u16_chunk_with_rids(&mut self, v: &UInt16Array, r: &UInt64Array) { self.inner.u16_chunk_with_rids(v, r) }
-            fn u8_chunk_with_rids(&mut self, v: &UInt8Array, r: &UInt64Array) { self.inner.u8_chunk_with_rids(v, r) }
-            fn i64_chunk_with_rids(&mut self, v: &Int64Array, r: &UInt64Array) { self.inner.i64_chunk_with_rids(v, r) }
-            fn i32_chunk_with_rids(&mut self, v: &Int32Array, r: &UInt64Array) { self.inner.i32_chunk_with_rids(v, r) }
-            fn i16_chunk_with_rids(&mut self, v: &Int16Array, r: &UInt64Array) { self.inner.i16_chunk_with_rids(v, r) }
-            fn i8_chunk_with_rids(&mut self, v: &Int8Array, r: &UInt64Array) { self.inner.i8_chunk_with_rids(v, r) }
+            fn u64_chunk_with_rids(&mut self, v: &UInt64Array, r: &UInt64Array) {
+                self.inner.u64_chunk_with_rids(v, r)
+            }
+            fn u32_chunk_with_rids(&mut self, v: &UInt32Array, r: &UInt64Array) {
+                self.inner.u32_chunk_with_rids(v, r)
+            }
+            fn u16_chunk_with_rids(&mut self, v: &UInt16Array, r: &UInt64Array) {
+                self.inner.u16_chunk_with_rids(v, r)
+            }
+            fn u8_chunk_with_rids(&mut self, v: &UInt8Array, r: &UInt64Array) {
+                self.inner.u8_chunk_with_rids(v, r)
+            }
+            fn i64_chunk_with_rids(&mut self, v: &Int64Array, r: &UInt64Array) {
+                self.inner.i64_chunk_with_rids(v, r)
+            }
+            fn i32_chunk_with_rids(&mut self, v: &Int32Array, r: &UInt64Array) {
+                self.inner.i32_chunk_with_rids(v, r)
+            }
+            fn i16_chunk_with_rids(&mut self, v: &Int16Array, r: &UInt64Array) {
+                self.inner.i16_chunk_with_rids(v, r)
+            }
+            fn i8_chunk_with_rids(&mut self, v: &Int8Array, r: &UInt64Array) {
+                self.inner.i8_chunk_with_rids(v, r)
+            }
         }
 
         // Binary search helpers for sorted runs
         #[inline]
-        fn lower_idx<T: Ord, F: Fn(usize) -> T>(mut lo: usize, mut hi: usize, pred: &T, get: F) -> usize {
+        fn lower_idx<T: Ord, F: Fn(usize) -> T>(
+            mut lo: usize,
+            mut hi: usize,
+            pred: &T,
+            get: F,
+        ) -> usize {
             while lo < hi {
                 let mid = (lo + hi) >> 1;
-                if get(mid) < *pred { lo = mid + 1; } else { hi = mid; }
+                if get(mid) < *pred {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
             }
             lo
         }
         #[inline]
-        fn upper_idx<T: Ord, F: Fn(usize) -> T>(mut lo: usize, mut hi: usize, pred: &T, get: F) -> usize {
+        fn upper_idx<T: Ord, F: Fn(usize) -> T>(
+            mut lo: usize,
+            mut hi: usize,
+            pred: &T,
+            get: F,
+        ) -> usize {
             while lo < hi {
                 let mid = (lo + hi) >> 1;
-                if get(mid) <= *pred { lo = mid + 1; } else { hi = mid; }
+                if get(mid) <= *pred {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
             }
             lo
         }
@@ -908,59 +1121,155 @@ where
         {
             fn u64_run(&mut self, a: &UInt64Array, s: usize, l: usize) {
                 if let Some((lb, ub)) = self.ir.u64_r {
-                    let start = match lb { Bound::Unbounded => s, Bound::Included(x) => lower_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => upper_idx(s, s+l, &x, |i| a.value(i)) };
-                    let end = match ub { Bound::Unbounded => s + l, Bound::Included(x) => upper_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => lower_idx(s, s+l, &x, |i| a.value(i)) };
-                    if start < end { self.inner.u64_run(a, start, end - start); }
-                } else { self.inner.u64_run(a, s, l); }
+                    let start = match lb {
+                        Bound::Unbounded => s,
+                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    let end = match ub {
+                        Bound::Unbounded => s + l,
+                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    if start < end {
+                        self.inner.u64_run(a, start, end - start);
+                    }
+                } else {
+                    self.inner.u64_run(a, s, l);
+                }
             }
             fn u32_run(&mut self, a: &UInt32Array, s: usize, l: usize) {
                 if let Some((lb, ub)) = self.ir.u32_r {
-                    let start = match lb { Bound::Unbounded => s, Bound::Included(x) => lower_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => upper_idx(s, s+l, &x, |i| a.value(i)) };
-                    let end = match ub { Bound::Unbounded => s + l, Bound::Included(x) => upper_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => lower_idx(s, s+l, &x, |i| a.value(i)) };
-                    if start < end { self.inner.u32_run(a, start, end - start); }
-                } else { self.inner.u32_run(a, s, l); }
+                    let start = match lb {
+                        Bound::Unbounded => s,
+                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    let end = match ub {
+                        Bound::Unbounded => s + l,
+                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    if start < end {
+                        self.inner.u32_run(a, start, end - start);
+                    }
+                } else {
+                    self.inner.u32_run(a, s, l);
+                }
             }
             fn u16_run(&mut self, a: &UInt16Array, s: usize, l: usize) {
                 if let Some((lb, ub)) = self.ir.u16_r {
-                    let start = match lb { Bound::Unbounded => s, Bound::Included(x) => lower_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => upper_idx(s, s+l, &x, |i| a.value(i)) };
-                    let end = match ub { Bound::Unbounded => s + l, Bound::Included(x) => upper_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => lower_idx(s, s+l, &x, |i| a.value(i)) };
-                    if start < end { self.inner.u16_run(a, start, end - start); }
-                } else { self.inner.u16_run(a, s, l); }
+                    let start = match lb {
+                        Bound::Unbounded => s,
+                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    let end = match ub {
+                        Bound::Unbounded => s + l,
+                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    if start < end {
+                        self.inner.u16_run(a, start, end - start);
+                    }
+                } else {
+                    self.inner.u16_run(a, s, l);
+                }
             }
             fn u8_run(&mut self, a: &UInt8Array, s: usize, l: usize) {
                 if let Some((lb, ub)) = self.ir.u8_r {
-                    let start = match lb { Bound::Unbounded => s, Bound::Included(x) => lower_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => upper_idx(s, s+l, &x, |i| a.value(i)) };
-                    let end = match ub { Bound::Unbounded => s + l, Bound::Included(x) => upper_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => lower_idx(s, s+l, &x, |i| a.value(i)) };
-                    if start < end { self.inner.u8_run(a, start, end - start); }
-                } else { self.inner.u8_run(a, s, l); }
+                    let start = match lb {
+                        Bound::Unbounded => s,
+                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    let end = match ub {
+                        Bound::Unbounded => s + l,
+                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    if start < end {
+                        self.inner.u8_run(a, start, end - start);
+                    }
+                } else {
+                    self.inner.u8_run(a, s, l);
+                }
             }
             fn i64_run(&mut self, a: &Int64Array, s: usize, l: usize) {
                 if let Some((lb, ub)) = self.ir.i64_r {
-                    let start = match lb { Bound::Unbounded => s, Bound::Included(x) => lower_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => upper_idx(s, s+l, &x, |i| a.value(i)) };
-                    let end = match ub { Bound::Unbounded => s + l, Bound::Included(x) => upper_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => lower_idx(s, s+l, &x, |i| a.value(i)) };
-                    if start < end { self.inner.i64_run(a, start, end - start); }
-                } else { self.inner.i64_run(a, s, l); }
+                    let start = match lb {
+                        Bound::Unbounded => s,
+                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    let end = match ub {
+                        Bound::Unbounded => s + l,
+                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    if start < end {
+                        self.inner.i64_run(a, start, end - start);
+                    }
+                } else {
+                    self.inner.i64_run(a, s, l);
+                }
             }
             fn i32_run(&mut self, a: &Int32Array, s: usize, l: usize) {
                 if let Some((lb, ub)) = self.ir.i32_r {
-                    let start = match lb { Bound::Unbounded => s, Bound::Included(x) => lower_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => upper_idx(s, s+l, &x, |i| a.value(i)) };
-                    let end = match ub { Bound::Unbounded => s + l, Bound::Included(x) => upper_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => lower_idx(s, s+l, &x, |i| a.value(i)) };
-                    if start < end { self.inner.i32_run(a, start, end - start); }
-                } else { self.inner.i32_run(a, s, l); }
+                    let start = match lb {
+                        Bound::Unbounded => s,
+                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    let end = match ub {
+                        Bound::Unbounded => s + l,
+                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    if start < end {
+                        self.inner.i32_run(a, start, end - start);
+                    }
+                } else {
+                    self.inner.i32_run(a, s, l);
+                }
             }
             fn i16_run(&mut self, a: &Int16Array, s: usize, l: usize) {
                 if let Some((lb, ub)) = self.ir.i16_r {
-                    let start = match lb { Bound::Unbounded => s, Bound::Included(x) => lower_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => upper_idx(s, s+l, &x, |i| a.value(i)) };
-                    let end = match ub { Bound::Unbounded => s + l, Bound::Included(x) => upper_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => lower_idx(s, s+l, &x, |i| a.value(i)) };
-                    if start < end { self.inner.i16_run(a, start, end - start); }
-                } else { self.inner.i16_run(a, s, l); }
+                    let start = match lb {
+                        Bound::Unbounded => s,
+                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    let end = match ub {
+                        Bound::Unbounded => s + l,
+                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    if start < end {
+                        self.inner.i16_run(a, start, end - start);
+                    }
+                } else {
+                    self.inner.i16_run(a, s, l);
+                }
             }
             fn i8_run(&mut self, a: &Int8Array, s: usize, l: usize) {
                 if let Some((lb, ub)) = self.ir.i8_r {
-                    let start = match lb { Bound::Unbounded => s, Bound::Included(x) => lower_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => upper_idx(s, s+l, &x, |i| a.value(i)) };
-                    let end = match ub { Bound::Unbounded => s + l, Bound::Included(x) => upper_idx(s, s+l, &x, |i| a.value(i)), Bound::Excluded(x) => lower_idx(s, s+l, &x, |i| a.value(i)) };
-                    if start < end { self.inner.i8_run(a, start, end - start); }
-                } else { self.inner.i8_run(a, s, l); }
+                    let start = match lb {
+                        Bound::Unbounded => s,
+                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    let end = match ub {
+                        Bound::Unbounded => s + l,
+                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
+                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
+                    };
+                    if start < end {
+                        self.inner.i8_run(a, start, end - start);
+                    }
+                } else {
+                    self.inner.i8_run(a, s, l);
+                }
             }
         }
         impl<'v, V> crate::store::scan::PrimitiveSortedWithRowIdsVisitor for RangeAdapter<'v, V>
@@ -969,41 +1278,130 @@ where
         {
             fn u64_run_with_rids(&mut self, v: &UInt64Array, r: &UInt64Array, s: usize, l: usize) {
                 if let Some((lb, ub)) = self.ir.u64_r {
-                    let start = match lb { Bound::Unbounded => s, Bound::Included(x) => lower_idx(s, s+l, &x, |i| v.value(i)), Bound::Excluded(x) => upper_idx(s, s+l, &x, |i| v.value(i)) };
-                    let end = match ub { Bound::Unbounded => s + l, Bound::Included(x) => upper_idx(s, s+l, &x, |i| v.value(i)), Bound::Excluded(x) => lower_idx(s, s+l, &x, |i| v.value(i)) };
-                    if start < end { self.inner.u64_run_with_rids(v, r, start, end - start); }
-                } else { self.inner.u64_run_with_rids(v, r, s, l); }
+                    let start = match lb {
+                        Bound::Unbounded => s,
+                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| v.value(i)),
+                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| v.value(i)),
+                    };
+                    let end = match ub {
+                        Bound::Unbounded => s + l,
+                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| v.value(i)),
+                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| v.value(i)),
+                    };
+                    if start < end {
+                        self.inner.u64_run_with_rids(v, r, start, end - start);
+                    }
+                } else {
+                    self.inner.u64_run_with_rids(v, r, s, l);
+                }
             }
             fn i32_run_with_rids(&mut self, v: &Int32Array, r: &UInt64Array, s: usize, l: usize) {
                 if let Some((lb, ub)) = self.ir.i32_r {
-                    let start = match lb { Bound::Unbounded => s, Bound::Included(x) => lower_idx(s, s+l, &x, |i| v.value(i)), Bound::Excluded(x) => upper_idx(s, s+l, &x, |i| v.value(i)) };
-                    let end = match ub { Bound::Unbounded => s + l, Bound::Included(x) => upper_idx(s, s+l, &x, |i| v.value(i)), Bound::Excluded(x) => lower_idx(s, s+l, &x, |i| v.value(i)) };
-                    if start < end { self.inner.i32_run_with_rids(v, r, start, end - start); }
-                } else { self.inner.i32_run_with_rids(v, r, s, l); }
+                    let start = match lb {
+                        Bound::Unbounded => s,
+                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| v.value(i)),
+                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| v.value(i)),
+                    };
+                    let end = match ub {
+                        Bound::Unbounded => s + l,
+                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| v.value(i)),
+                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| v.value(i)),
+                    };
+                    if start < end {
+                        self.inner.i32_run_with_rids(v, r, start, end - start);
+                    }
+                } else {
+                    self.inner.i32_run_with_rids(v, r, s, l);
+                }
             }
             // For brevity, other integer widths with row ids fall back to pass-through.
         }
 
-        let mut adapter = RangeAdapter { inner: visitor, ir: self.ir };
+        let mut adapter = RangeAdapter {
+            inner: visitor,
+            ir: self.ir,
+        };
         self.store.scan(self.field_id, self.opts, &mut adapter)
     }
 }
 
 // ---------------------- Sorted range windowing (builder) ----------------------
+// Internal helper trait mapping a scalar type to the appropriate IntRanges slot.
+pub trait RangeKey: Sized {
+    fn store(ir: &mut IntRanges, lb: Bound<Self>, ub: Bound<Self>);
+}
+impl RangeKey for u64 {
+    fn store(ir: &mut IntRanges, lb: Bound<u64>, ub: Bound<u64>) {
+        ir.u64_r = Some((lb, ub));
+    }
+}
+impl RangeKey for u32 {
+    fn store(ir: &mut IntRanges, lb: Bound<u32>, ub: Bound<u32>) {
+        ir.u32_r = Some((lb, ub));
+    }
+}
+impl RangeKey for u16 {
+    fn store(ir: &mut IntRanges, lb: Bound<u16>, ub: Bound<u16>) {
+        ir.u16_r = Some((lb, ub));
+    }
+}
+impl RangeKey for u8 {
+    fn store(ir: &mut IntRanges, lb: Bound<u8>, ub: Bound<u8>) {
+        ir.u8_r = Some((lb, ub));
+    }
+}
+impl RangeKey for i64 {
+    fn store(ir: &mut IntRanges, lb: Bound<i64>, ub: Bound<i64>) {
+        ir.i64_r = Some((lb, ub));
+    }
+}
+impl RangeKey for i32 {
+    fn store(ir: &mut IntRanges, lb: Bound<i32>, ub: Bound<i32>) {
+        ir.i32_r = Some((lb, ub));
+    }
+}
+impl RangeKey for i16 {
+    fn store(ir: &mut IntRanges, lb: Bound<i16>, ub: Bound<i16>) {
+        ir.i16_r = Some((lb, ub));
+    }
+}
+impl RangeKey for i8 {
+    fn store(ir: &mut IntRanges, lb: Bound<i8>, ub: Bound<i8>) {
+        ir.i8_r = Some((lb, ub));
+    }
+}
 
 #[inline]
-fn lower_idx_by<T: Ord, F: Fn(usize) -> T>(mut lo: usize, mut hi: usize, pred: &T, get: F) -> usize {
+fn lower_idx_by<T: Ord, F: Fn(usize) -> T>(
+    mut lo: usize,
+    mut hi: usize,
+    pred: &T,
+    get: F,
+) -> usize {
     while lo < hi {
         let mid = (lo + hi) >> 1;
-        if get(mid) < *pred { lo = mid + 1; } else { hi = mid; }
+        if get(mid) < *pred {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
     lo
 }
 #[inline]
-fn upper_idx_by<T: Ord, F: Fn(usize) -> T>(mut lo: usize, mut hi: usize, pred: &T, get: F) -> usize {
+fn upper_idx_by<T: Ord, F: Fn(usize) -> T>(
+    mut lo: usize,
+    mut hi: usize,
+    pred: &T,
+    get: F,
+) -> usize {
     while lo < hi {
         let mid = (lo + hi) >> 1;
-        if get(mid) <= *pred { lo = mid + 1; } else { hi = mid; }
+        if get(mid) <= *pred {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
     lo
 }
@@ -1019,24 +1417,62 @@ macro_rules! sorted_visit_bounds_impl {
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for m in metas {
-                let data_any = deserialize_array(blobs.get(&m.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm_any = deserialize_array(blobs.get(&m.value_order_perm_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm = perm_any.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| Error::Internal("perm not u32".into()))?;
-                let arr_any = data_any.as_any().downcast_ref::<$ArrTy>().ok_or_else(|| Error::Internal("downcast".into()))?;
+                let data_any =
+                    deserialize_array(blobs.get(&m.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let perm_any = deserialize_array(
+                    blobs
+                        .get(&m.value_order_perm_pk)
+                        .ok_or(Error::NotFound)?
+                        .clone(),
+                )?;
+                let perm = perm_any
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| Error::Internal("perm not u32".into()))?;
+                let arr_any = data_any
+                    .as_any()
+                    .downcast_ref::<$ArrTy>()
+                    .ok_or_else(|| Error::Internal("downcast".into()))?;
                 let plen = perm.len();
-                if plen == 0 { continue; }
-                let get = |i: usize| -> $ty { let idx = perm.value(i) as usize; arr_any.value(idx) as $ty };
+                if plen == 0 {
+                    continue;
+                }
+                let get = |i: usize| -> $ty {
+                    let idx = perm.value(i) as usize;
+                    arr_any.value(idx) as $ty
+                };
                 let (lb, ub) = bounds.clone();
-                let s = match lb { Bound::Unbounded => 0, Bound::Included(x) => lower_idx_by(0, plen, &x, &get), Bound::Excluded(x) => upper_idx_by(0, plen, &x, &get) };
-                let e = match ub { Bound::Unbounded => plen, Bound::Included(x) => upper_idx_by(0, plen, &x, &get), Bound::Excluded(x) => lower_idx_by(0, plen, &x, &get) };
-                if s >= e { continue; }
+                let s = match lb {
+                    Bound::Unbounded => 0,
+                    Bound::Included(x) => lower_idx_by(0, plen, &x, &get),
+                    Bound::Excluded(x) => upper_idx_by(0, plen, &x, &get),
+                };
+                let e = match ub {
+                    Bound::Unbounded => plen,
+                    Bound::Included(x) => upper_idx_by(0, plen, &x, &get),
+                    Bound::Excluded(x) => lower_idx_by(0, plen, &x, &get),
+                };
+                if s >= e {
+                    continue;
+                }
                 let pw = perm.slice(s, e - s);
                 let taken_any = compute::take(&data_any, &pw, None)?;
-                let a = taken_any.as_any().downcast_ref::<$ArrTy>().ok_or_else(|| Error::Internal("sorted downcast".into()))?.clone();
+                let a = taken_any
+                    .as_any()
+                    .downcast_ref::<$ArrTy>()
+                    .ok_or_else(|| Error::Internal("sorted downcast".into()))?
+                    .clone();
                 arrays.push(a);
             }
-            if arrays.is_empty() { return Ok(()); }
-            kmerge_coalesced::<_, _, _, _, _>(&arrays, |a: &$ArrTy| a.len(), |a: &$ArrTy, i: usize| a.value(i), |c,s,l| visitor.$visit(&arrays[c], s, l));
+            if arrays.is_empty() {
+                return Ok(());
+            }
+            kmerge_coalesced::<_, _, _, _, _>(
+                &arrays,
+                |a: &$ArrTy| a.len(),
+                |a: &$ArrTy, i: usize| a.value(i),
+                |c, s, l| visitor.$visit(&arrays[c], s, l),
+            );
             Ok(())
         }
     };
@@ -1053,31 +1489,79 @@ macro_rules! sorted_with_rids_bounds_impl {
             bounds: (Bound<$ty>, Bound<$ty>),
             visitor: &mut V,
         ) -> Result<()> {
-            if metas_val.len() != metas_rid.len() { return Err(Error::Internal("sorted_with_rids: chunk count mismatch".into())); }
+            if metas_val.len() != metas_rid.len() {
+                return Err(Error::Internal(
+                    "sorted_with_rids: chunk count mismatch".into(),
+                ));
+            }
             let mut vals: Vec<$ArrTy> = Vec::with_capacity(metas_val.len());
             let mut rids: Vec<UInt64Array> = Vec::with_capacity(metas_val.len());
             for (mv, mr) in metas_val.iter().zip(metas_rid.iter()) {
-                let data_any = deserialize_array(vblobs.get(&mv.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm_any = deserialize_array(vblobs.get(&mv.value_order_perm_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm = perm_any.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| Error::Internal("perm not u32".into()))?;
-                let arr_any = data_any.as_any().downcast_ref::<$ArrTy>().ok_or_else(|| Error::Internal("downcast".into()))?;
-                let plen = perm.len(); if plen == 0 { continue; }
-                let get = |i: usize| -> $ty { let idx = perm.value(i) as usize; arr_any.value(idx) as $ty };
+                let data_any =
+                    deserialize_array(vblobs.get(&mv.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let perm_any = deserialize_array(
+                    vblobs
+                        .get(&mv.value_order_perm_pk)
+                        .ok_or(Error::NotFound)?
+                        .clone(),
+                )?;
+                let perm = perm_any
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| Error::Internal("perm not u32".into()))?;
+                let arr_any = data_any
+                    .as_any()
+                    .downcast_ref::<$ArrTy>()
+                    .ok_or_else(|| Error::Internal("downcast".into()))?;
+                let plen = perm.len();
+                if plen == 0 {
+                    continue;
+                }
+                let get = |i: usize| -> $ty {
+                    let idx = perm.value(i) as usize;
+                    arr_any.value(idx) as $ty
+                };
                 let (lb, ub) = bounds.clone();
-                let s = match lb { Bound::Unbounded => 0, Bound::Included(x) => lower_idx_by(0, plen, &x, &get), Bound::Excluded(x) => upper_idx_by(0, plen, &x, &get) };
-                let e = match ub { Bound::Unbounded => plen, Bound::Included(x) => upper_idx_by(0, plen, &x, &get), Bound::Excluded(x) => lower_idx_by(0, plen, &x, &get) };
-                if s >= e { continue; }
+                let s = match lb {
+                    Bound::Unbounded => 0,
+                    Bound::Included(x) => lower_idx_by(0, plen, &x, &get),
+                    Bound::Excluded(x) => upper_idx_by(0, plen, &x, &get),
+                };
+                let e = match ub {
+                    Bound::Unbounded => plen,
+                    Bound::Included(x) => upper_idx_by(0, plen, &x, &get),
+                    Bound::Excluded(x) => lower_idx_by(0, plen, &x, &get),
+                };
+                if s >= e {
+                    continue;
+                }
                 let pw = perm.slice(s, e - s);
                 let taken_any = compute::take(&data_any, &pw, None)?;
-                let a = taken_any.as_any().downcast_ref::<$ArrTy>().ok_or_else(|| Error::Internal("sorted downcast".into()))?.clone();
+                let a = taken_any
+                    .as_any()
+                    .downcast_ref::<$ArrTy>()
+                    .ok_or_else(|| Error::Internal("sorted downcast".into()))?
+                    .clone();
                 vals.push(a);
-                let rid_any = deserialize_array(rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let rid_any =
+                    deserialize_array(rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone())?;
                 let taken_rid_any = compute::take(&rid_any, &pw, None)?;
-                let ra = taken_rid_any.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| Error::Internal("rid downcast".into()))?.clone();
+                let ra = taken_rid_any
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::Internal("rid downcast".into()))?
+                    .clone();
                 rids.push(ra);
             }
-            if vals.is_empty() { return Ok(()); }
-            kmerge_coalesced::<_, _, _, _, _>(&vals, |a: &$ArrTy| a.len(), |a: &$ArrTy, i: usize| a.value(i), |c,s,l| visitor.$visit(&vals[c], &rids[c], s, l));
+            if vals.is_empty() {
+                return Ok(());
+            }
+            kmerge_coalesced::<_, _, _, _, _>(
+                &vals,
+                |a: &$ArrTy| a.len(),
+                |a: &$ArrTy, i: usize| a.value(i),
+                |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
+            );
             Ok(())
         }
     };
@@ -1086,20 +1570,60 @@ macro_rules! sorted_with_rids_bounds_impl {
 sorted_visit_bounds_impl!(sorted_visit_u64_bounds, UInt64Array, u64, u64_run);
 sorted_visit_bounds_impl!(sorted_visit_u32_bounds, UInt32Array, u32, u32_run);
 sorted_visit_bounds_impl!(sorted_visit_u16_bounds, UInt16Array, u16, u16_run);
-sorted_visit_bounds_impl!(sorted_visit_u8_bounds,  UInt8Array,  u8,  u8_run);
-sorted_visit_bounds_impl!(sorted_visit_i64_bounds, Int64Array,  i64, i64_run);
-sorted_visit_bounds_impl!(sorted_visit_i32_bounds, Int32Array,  i32, i32_run);
-sorted_visit_bounds_impl!(sorted_visit_i16_bounds, Int16Array,  i16, i16_run);
-sorted_visit_bounds_impl!(sorted_visit_i8_bounds,  Int8Array,   i8,  i8_run);
+sorted_visit_bounds_impl!(sorted_visit_u8_bounds, UInt8Array, u8, u8_run);
+sorted_visit_bounds_impl!(sorted_visit_i64_bounds, Int64Array, i64, i64_run);
+sorted_visit_bounds_impl!(sorted_visit_i32_bounds, Int32Array, i32, i32_run);
+sorted_visit_bounds_impl!(sorted_visit_i16_bounds, Int16Array, i16, i16_run);
+sorted_visit_bounds_impl!(sorted_visit_i8_bounds, Int8Array, i8, i8_run);
 
-sorted_with_rids_bounds_impl!(sorted_visit_with_rids_u64_bounds, UInt64Array, u64, u64_run_with_rids);
-sorted_with_rids_bounds_impl!(sorted_visit_with_rids_u32_bounds, UInt32Array, u32, u32_run_with_rids);
-sorted_with_rids_bounds_impl!(sorted_visit_with_rids_u16_bounds, UInt16Array, u16, u16_run_with_rids);
-sorted_with_rids_bounds_impl!(sorted_visit_with_rids_u8_bounds,  UInt8Array,  u8,  u8_run_with_rids);
-sorted_with_rids_bounds_impl!(sorted_visit_with_rids_i64_bounds, Int64Array,  i64, i64_run_with_rids);
-sorted_with_rids_bounds_impl!(sorted_visit_with_rids_i32_bounds, Int32Array,  i32, i32_run_with_rids);
-sorted_with_rids_bounds_impl!(sorted_visit_with_rids_i16_bounds, Int16Array,  i16, i16_run_with_rids);
-sorted_with_rids_bounds_impl!(sorted_visit_with_rids_i8_bounds,  Int8Array,   i8,  i8_run_with_rids);
+sorted_with_rids_bounds_impl!(
+    sorted_visit_with_rids_u64_bounds,
+    UInt64Array,
+    u64,
+    u64_run_with_rids
+);
+sorted_with_rids_bounds_impl!(
+    sorted_visit_with_rids_u32_bounds,
+    UInt32Array,
+    u32,
+    u32_run_with_rids
+);
+sorted_with_rids_bounds_impl!(
+    sorted_visit_with_rids_u16_bounds,
+    UInt16Array,
+    u16,
+    u16_run_with_rids
+);
+sorted_with_rids_bounds_impl!(
+    sorted_visit_with_rids_u8_bounds,
+    UInt8Array,
+    u8,
+    u8_run_with_rids
+);
+sorted_with_rids_bounds_impl!(
+    sorted_visit_with_rids_i64_bounds,
+    Int64Array,
+    i64,
+    i64_run_with_rids
+);
+sorted_with_rids_bounds_impl!(
+    sorted_visit_with_rids_i32_bounds,
+    Int32Array,
+    i32,
+    i32_run_with_rids
+);
+sorted_with_rids_bounds_impl!(
+    sorted_visit_with_rids_i16_bounds,
+    Int16Array,
+    i16,
+    i16_run_with_rids
+);
+sorted_with_rids_bounds_impl!(
+    sorted_visit_with_rids_i8_bounds,
+    Int8Array,
+    i8,
+    i8_run_with_rids
+);
 
 fn range_sorted_dispatch<P, V>(
     store: &ColumnStore<P>,
@@ -1109,8 +1633,11 @@ fn range_sorted_dispatch<P, V>(
     visitor: &mut V,
 ) -> Result<()>
 where
-    P: Pager<Blob = EntryHandle,>,
-    V: PrimitiveVisitor + PrimitiveSortedVisitor + PrimitiveWithRowIdsVisitor + PrimitiveSortedWithRowIdsVisitor,
+    P: Pager<Blob = EntryHandle>,
+    V: PrimitiveVisitor
+        + PrimitiveSortedVisitor
+        + PrimitiveWithRowIdsVisitor
+        + PrimitiveSortedWithRowIdsVisitor,
 {
     // Load descriptor metas and blobs (values, perms, and rids when needed)
     let catalog = store.catalog.read().unwrap();
@@ -1119,67 +1646,269 @@ where
         .pager
         .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
         .pop()
-        .and_then(|r| match r { GetResult::Raw { bytes, .. } => Some(bytes), _ => None })
+        .and_then(|r| match r {
+            GetResult::Raw { bytes, .. } => Some(bytes),
+            _ => None,
+        })
         .ok_or(Error::NotFound)?;
     let desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
     let mut metas_val: Vec<ChunkMetadata> = Vec::new();
-    for m in crate::store::descriptor::DescriptorIterator::new(store.pager.as_ref(), desc.head_page_pk) { let meta=m?; if meta.row_count>0 { if meta.value_order_perm_pk==0 { return Err(Error::NotFound); } metas_val.push(meta); } }
+    for m in
+        crate::store::descriptor::DescriptorIterator::new(store.pager.as_ref(), desc.head_page_pk)
+    {
+        let meta = m?;
+        if meta.row_count > 0 {
+            if meta.value_order_perm_pk == 0 {
+                return Err(Error::NotFound);
+            }
+            metas_val.push(meta);
+        }
+    }
 
-    let (rid_desc_opt, metas_rid): (Option<crate::store::descriptor::ColumnDescriptor>, Vec<ChunkMetadata>) = if opts.with_row_ids {
-        let rid_fid = opts.row_id_field.ok_or_else(|| Error::Internal("row_id field id required when with_row_ids=true".into()))?;
+    let (rid_desc_opt, metas_rid): (
+        Option<crate::store::descriptor::ColumnDescriptor>,
+        Vec<ChunkMetadata>,
+    ) = if opts.with_row_ids {
+        let rid_fid = opts.row_id_field.ok_or_else(|| {
+            Error::Internal("row_id field id required when with_row_ids=true".into())
+        })?;
         let rid_pk = *catalog.map.get(&rid_fid).ok_or(Error::NotFound)?;
         let rid_desc_blob = store
             .pager
             .batch_get(&[BatchGet::Raw { key: rid_pk }])?
             .pop()
-            .and_then(|r| match r { GetResult::Raw { bytes, .. } => Some(bytes), _ => None })
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
             .ok_or(Error::NotFound)?;
-        let rid_desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(rid_desc_blob.as_ref());
+        let rid_desc =
+            crate::store::descriptor::ColumnDescriptor::from_le_bytes(rid_desc_blob.as_ref());
         let mut mr = Vec::new();
-        for m in crate::store::descriptor::DescriptorIterator::new(store.pager.as_ref(), rid_desc.head_page_pk) { let meta=m?; if meta.row_count>0 { mr.push(meta); } }
+        for m in crate::store::descriptor::DescriptorIterator::new(
+            store.pager.as_ref(),
+            rid_desc.head_page_pk,
+        ) {
+            let meta = m?;
+            if meta.row_count > 0 {
+                mr.push(meta);
+            }
+        }
         (Some(rid_desc), mr)
-    } else { (None, Vec::new()) };
+    } else {
+        (None, Vec::new())
+    };
     drop(catalog);
 
-    if metas_val.is_empty() { return Ok(()); }
+    if metas_val.is_empty() {
+        return Ok(());
+    }
 
     // Batch gets
-    let mut gets: Vec<BatchGet> = Vec::with_capacity(metas_val.len() * if opts.with_row_ids {3} else {2});
+    let mut gets: Vec<BatchGet> =
+        Vec::with_capacity(metas_val.len() * if opts.with_row_ids { 3 } else { 2 });
     for (i, mv) in metas_val.iter().enumerate() {
         gets.push(BatchGet::Raw { key: mv.chunk_pk });
-        gets.push(BatchGet::Raw { key: mv.value_order_perm_pk });
-        if opts.with_row_ids { gets.push(BatchGet::Raw { key: metas_rid[i].chunk_pk }); }
+        gets.push(BatchGet::Raw {
+            key: mv.value_order_perm_pk,
+        });
+        if opts.with_row_ids {
+            gets.push(BatchGet::Raw {
+                key: metas_rid[i].chunk_pk,
+            });
+        }
     }
     let results = store.pager.batch_get(&gets)?;
     let mut vblobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
     let mut rblobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-    for r in results { if let GetResult::Raw{key,bytes} = r { if opts.with_row_ids && metas_rid.iter().any(|m| m.chunk_pk==key) { rblobs.insert(key, bytes); } else { vblobs.insert(key, bytes); } } }
-    let first_any = deserialize_array(vblobs.get(&metas_val[0].chunk_pk).ok_or(Error::NotFound)?.clone())?;
+    for r in results {
+        if let GetResult::Raw { key, bytes } = r {
+            if opts.with_row_ids && metas_rid.iter().any(|m| m.chunk_pk == key) {
+                rblobs.insert(key, bytes);
+            } else {
+                vblobs.insert(key, bytes);
+            }
+        }
+    }
+    let first_any = deserialize_array(
+        vblobs
+            .get(&metas_val[0].chunk_pk)
+            .ok_or(Error::NotFound)?
+            .clone(),
+    )?;
 
     // Dispatch by dtype + bounds for this dtype only
     if opts.with_row_ids {
         return match first_any.data_type() {
-            DataType::UInt64 => { let (lb,ub)=ir.u64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_with_rids_u64_bounds(store.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, (lb,ub), visitor) }
-            DataType::UInt32 => { let (lb,ub)=ir.u32_r.unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_with_rids_u32_bounds(store.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, (lb,ub), visitor) }
-            DataType::UInt16 => { let (lb,ub)=ir.u16_r.unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_with_rids_u16_bounds(store.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, (lb,ub), visitor) }
-            DataType::UInt8  => { let (lb,ub)=ir.u8_r .unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_with_rids_u8_bounds (store.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, (lb,ub), visitor) }
-            DataType::Int64  => { let (lb,ub)=ir.i64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_with_rids_i64_bounds(store.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, (lb,ub), visitor) }
-            DataType::Int32  => { let (lb,ub)=ir.i32_r.unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_with_rids_i32_bounds(store.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, (lb,ub), visitor) }
-            DataType::Int16  => { let (lb,ub)=ir.i16_r.unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_with_rids_i16_bounds(store.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, (lb,ub), visitor) }
-            DataType::Int8   => { let (lb,ub)=ir.i8_r .unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_with_rids_i8_bounds (store.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, (lb,ub), visitor) }
-            _ => Err(Error::Internal("unsupported sorted dtype (builder)".into()))
+            DataType::UInt64 => {
+                let (lb, ub) = ir.u64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_with_rids_u64_bounds(
+                    store.pager.as_ref(),
+                    &metas_val,
+                    &metas_rid,
+                    &vblobs,
+                    &rblobs,
+                    (lb, ub),
+                    visitor,
+                )
+            }
+            DataType::UInt32 => {
+                let (lb, ub) = ir.u32_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_with_rids_u32_bounds(
+                    store.pager.as_ref(),
+                    &metas_val,
+                    &metas_rid,
+                    &vblobs,
+                    &rblobs,
+                    (lb, ub),
+                    visitor,
+                )
+            }
+            DataType::UInt16 => {
+                let (lb, ub) = ir.u16_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_with_rids_u16_bounds(
+                    store.pager.as_ref(),
+                    &metas_val,
+                    &metas_rid,
+                    &vblobs,
+                    &rblobs,
+                    (lb, ub),
+                    visitor,
+                )
+            }
+            DataType::UInt8 => {
+                let (lb, ub) = ir.u8_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_with_rids_u8_bounds(
+                    store.pager.as_ref(),
+                    &metas_val,
+                    &metas_rid,
+                    &vblobs,
+                    &rblobs,
+                    (lb, ub),
+                    visitor,
+                )
+            }
+            DataType::Int64 => {
+                let (lb, ub) = ir.i64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_with_rids_i64_bounds(
+                    store.pager.as_ref(),
+                    &metas_val,
+                    &metas_rid,
+                    &vblobs,
+                    &rblobs,
+                    (lb, ub),
+                    visitor,
+                )
+            }
+            DataType::Int32 => {
+                let (lb, ub) = ir.i32_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_with_rids_i32_bounds(
+                    store.pager.as_ref(),
+                    &metas_val,
+                    &metas_rid,
+                    &vblobs,
+                    &rblobs,
+                    (lb, ub),
+                    visitor,
+                )
+            }
+            DataType::Int16 => {
+                let (lb, ub) = ir.i16_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_with_rids_i16_bounds(
+                    store.pager.as_ref(),
+                    &metas_val,
+                    &metas_rid,
+                    &vblobs,
+                    &rblobs,
+                    (lb, ub),
+                    visitor,
+                )
+            }
+            DataType::Int8 => {
+                let (lb, ub) = ir.i8_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_with_rids_i8_bounds(
+                    store.pager.as_ref(),
+                    &metas_val,
+                    &metas_rid,
+                    &vblobs,
+                    &rblobs,
+                    (lb, ub),
+                    visitor,
+                )
+            }
+            _ => Err(Error::Internal("unsupported sorted dtype (builder)".into())),
         };
     } else {
         return match first_any.data_type() {
-            DataType::UInt64 => { let (lb,ub)=ir.u64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_u64_bounds(store.pager.as_ref(), &metas_val, &vblobs, (lb,ub), visitor) }
-            DataType::UInt32 => { let (lb,ub)=ir.u32_r.unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_u32_bounds(store.pager.as_ref(), &metas_val, &vblobs, (lb,ub), visitor) }
-            DataType::UInt16 => { let (lb,ub)=ir.u16_r.unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_u16_bounds(store.pager.as_ref(), &metas_val, &vblobs, (lb,ub), visitor) }
-            DataType::UInt8  => { let (lb,ub)=ir.u8_r .unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_u8_bounds (store.pager.as_ref(), &metas_val, &vblobs, (lb,ub), visitor) }
-            DataType::Int64  => { let (lb,ub)=ir.i64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_i64_bounds(store.pager.as_ref(), &metas_val, &vblobs, (lb,ub), visitor) }
-            DataType::Int32  => { let (lb,ub)=ir.i32_r.unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_i32_bounds(store.pager.as_ref(), &metas_val, &vblobs, (lb,ub), visitor) }
-            DataType::Int16  => { let (lb,ub)=ir.i16_r.unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_i16_bounds(store.pager.as_ref(), &metas_val, &vblobs, (lb,ub), visitor) }
-            DataType::Int8   => { let (lb,ub)=ir.i8_r .unwrap_or((Bound::Unbounded, Bound::Unbounded)); sorted_visit_i8_bounds (store.pager.as_ref(), &metas_val, &vblobs, (lb,ub), visitor) }
-            _ => Err(Error::Internal("unsupported sorted dtype (builder)".into()))
+            DataType::UInt64 => {
+                let (lb, ub) = ir.u64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_u64_bounds(
+                    store.pager.as_ref(),
+                    &metas_val,
+                    &vblobs,
+                    (lb, ub),
+                    visitor,
+                )
+            }
+            DataType::UInt32 => {
+                let (lb, ub) = ir.u32_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_u32_bounds(
+                    store.pager.as_ref(),
+                    &metas_val,
+                    &vblobs,
+                    (lb, ub),
+                    visitor,
+                )
+            }
+            DataType::UInt16 => {
+                let (lb, ub) = ir.u16_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_u16_bounds(
+                    store.pager.as_ref(),
+                    &metas_val,
+                    &vblobs,
+                    (lb, ub),
+                    visitor,
+                )
+            }
+            DataType::UInt8 => {
+                let (lb, ub) = ir.u8_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_u8_bounds(store.pager.as_ref(), &metas_val, &vblobs, (lb, ub), visitor)
+            }
+            DataType::Int64 => {
+                let (lb, ub) = ir.i64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_i64_bounds(
+                    store.pager.as_ref(),
+                    &metas_val,
+                    &vblobs,
+                    (lb, ub),
+                    visitor,
+                )
+            }
+            DataType::Int32 => {
+                let (lb, ub) = ir.i32_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_i32_bounds(
+                    store.pager.as_ref(),
+                    &metas_val,
+                    &vblobs,
+                    (lb, ub),
+                    visitor,
+                )
+            }
+            DataType::Int16 => {
+                let (lb, ub) = ir.i16_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_i16_bounds(
+                    store.pager.as_ref(),
+                    &metas_val,
+                    &vblobs,
+                    (lb, ub),
+                    visitor,
+                )
+            }
+            DataType::Int8 => {
+                let (lb, ub) = ir.i8_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                sorted_visit_i8_bounds(store.pager.as_ref(), &metas_val, &vblobs, (lb, ub), visitor)
+            }
+            _ => Err(Error::Internal("unsupported sorted dtype (builder)".into())),
         };
     }
 }
@@ -1211,34 +1940,77 @@ where
             .pager
             .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
             .pop()
-            .and_then(|r| match r { GetResult::Raw { bytes, .. } => Some(bytes), _ => None })
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
             .ok_or(Error::NotFound)?;
         let desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
         drop(catalog);
 
         let mut metas: Vec<crate::store::descriptor::ChunkMetadata> = Vec::new();
-        for m in crate::store::descriptor::DescriptorIterator::new(self.pager.as_ref(), desc.head_page_pk) {
-            let meta = m?; if meta.row_count == 0 { continue; }
-            if meta.value_order_perm_pk == 0 { return Err(Error::NotFound); }
+        for m in crate::store::descriptor::DescriptorIterator::new(
+            self.pager.as_ref(),
+            desc.head_page_pk,
+        ) {
+            let meta = m?;
+            if meta.row_count == 0 {
+                continue;
+            }
+            if meta.value_order_perm_pk == 0 {
+                return Err(Error::NotFound);
+            }
             metas.push(meta);
         }
-        if metas.is_empty() { return Ok(()); }
-        let mut gets: Vec<BatchGet> = Vec::with_capacity(metas.len()*2);
-        for m in &metas { gets.push(BatchGet::Raw{key:m.chunk_pk}); gets.push(BatchGet::Raw{key:m.value_order_perm_pk}); }
+        if metas.is_empty() {
+            return Ok(());
+        }
+        let mut gets: Vec<BatchGet> = Vec::with_capacity(metas.len() * 2);
+        for m in &metas {
+            gets.push(BatchGet::Raw { key: m.chunk_pk });
+            gets.push(BatchGet::Raw {
+                key: m.value_order_perm_pk,
+            });
+        }
         let results = self.pager.batch_get(&gets)?;
         let mut blobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-        for r in results { if let GetResult::Raw{key,bytes} = r { blobs.insert(key, bytes); } }
+        for r in results {
+            if let GetResult::Raw { key, bytes } = r {
+                blobs.insert(key, bytes);
+            }
+        }
 
-        let first_any = crate::serialization::deserialize_array(blobs.get(&metas[0].chunk_pk).ok_or(Error::NotFound)?.clone())?;
+        let first_any = crate::serialization::deserialize_array(
+            blobs
+                .get(&metas[0].chunk_pk)
+                .ok_or(Error::NotFound)?
+                .clone(),
+        )?;
         match first_any.data_type() {
-            DataType::UInt64 => crate::store::scan::sorted_visit_u64(self.pager.as_ref(), &metas, &blobs, visitor),
-            DataType::UInt32 => crate::store::scan::sorted_visit_u32(self.pager.as_ref(), &metas, &blobs, visitor),
-            DataType::UInt16 => crate::store::scan::sorted_visit_u16(self.pager.as_ref(), &metas, &blobs, visitor),
-            DataType::UInt8  => crate::store::scan::sorted_visit_u8 (self.pager.as_ref(), &metas, &blobs, visitor),
-            DataType::Int64  => crate::store::scan::sorted_visit_i64(self.pager.as_ref(), &metas, &blobs, visitor),
-            DataType::Int32  => crate::store::scan::sorted_visit_i32(self.pager.as_ref(), &metas, &blobs, visitor),
-            DataType::Int16  => crate::store::scan::sorted_visit_i16(self.pager.as_ref(), &metas, &blobs, visitor),
-            DataType::Int8   => crate::store::scan::sorted_visit_i8 (self.pager.as_ref(), &metas, &blobs, visitor),
+            DataType::UInt64 => {
+                crate::store::scan::sorted_visit_u64(self.pager.as_ref(), &metas, &blobs, visitor)
+            }
+            DataType::UInt32 => {
+                crate::store::scan::sorted_visit_u32(self.pager.as_ref(), &metas, &blobs, visitor)
+            }
+            DataType::UInt16 => {
+                crate::store::scan::sorted_visit_u16(self.pager.as_ref(), &metas, &blobs, visitor)
+            }
+            DataType::UInt8 => {
+                crate::store::scan::sorted_visit_u8(self.pager.as_ref(), &metas, &blobs, visitor)
+            }
+            DataType::Int64 => {
+                crate::store::scan::sorted_visit_i64(self.pager.as_ref(), &metas, &blobs, visitor)
+            }
+            DataType::Int32 => {
+                crate::store::scan::sorted_visit_i32(self.pager.as_ref(), &metas, &blobs, visitor)
+            }
+            DataType::Int16 => {
+                crate::store::scan::sorted_visit_i16(self.pager.as_ref(), &metas, &blobs, visitor)
+            }
+            DataType::Int8 => {
+                crate::store::scan::sorted_visit_i8(self.pager.as_ref(), &metas, &blobs, visitor)
+            }
             _ => Err(Error::Internal("unsupported sorted dtype".into())),
         }
     }
@@ -1255,41 +2027,113 @@ where
             .pager
             .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
             .pop()
-            .and_then(|r| match r { GetResult::Raw { bytes, .. } => Some(bytes), _ => None })
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
             .ok_or(Error::NotFound)?;
         let desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
         drop(catalog);
 
         let mut metas: Vec<crate::store::descriptor::ChunkMetadata> = Vec::new();
-        for m in crate::store::descriptor::DescriptorIterator::new(self.pager.as_ref(), desc.head_page_pk) {
-            let meta = m?; if meta.row_count == 0 { continue; }
-            if meta.value_order_perm_pk == 0 { return Err(Error::NotFound); }
+        for m in crate::store::descriptor::DescriptorIterator::new(
+            self.pager.as_ref(),
+            desc.head_page_pk,
+        ) {
+            let meta = m?;
+            if meta.row_count == 0 {
+                continue;
+            }
+            if meta.value_order_perm_pk == 0 {
+                return Err(Error::NotFound);
+            }
             metas.push(meta);
         }
-        if metas.is_empty() { return Ok(()); }
-        let mut gets: Vec<BatchGet> = Vec::with_capacity(metas.len()*2);
-        for m in &metas { gets.push(BatchGet::Raw{key:m.chunk_pk}); gets.push(BatchGet::Raw{key:m.value_order_perm_pk}); }
+        if metas.is_empty() {
+            return Ok(());
+        }
+        let mut gets: Vec<BatchGet> = Vec::with_capacity(metas.len() * 2);
+        for m in &metas {
+            gets.push(BatchGet::Raw { key: m.chunk_pk });
+            gets.push(BatchGet::Raw {
+                key: m.value_order_perm_pk,
+            });
+        }
         let results = self.pager.batch_get(&gets)?;
         let mut blobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-        for r in results { if let GetResult::Raw{key,bytes} = r { blobs.insert(key, bytes); } }
+        for r in results {
+            if let GetResult::Raw { key, bytes } = r {
+                blobs.insert(key, bytes);
+            }
+        }
 
-        let first_any = crate::serialization::deserialize_array(blobs.get(&metas[0].chunk_pk).ok_or(Error::NotFound)?.clone())?;
+        let first_any = crate::serialization::deserialize_array(
+            blobs
+                .get(&metas[0].chunk_pk)
+                .ok_or(Error::NotFound)?
+                .clone(),
+        )?;
         match first_any.data_type() {
-            DataType::UInt64 => crate::store::scan::sorted_visit_u64_rev(self.pager.as_ref(), &metas, &blobs, visitor),
-            DataType::UInt32 => crate::store::scan::sorted_visit_u32_rev(self.pager.as_ref(), &metas, &blobs, visitor),
-            DataType::UInt16 => crate::store::scan::sorted_visit_u16_rev(self.pager.as_ref(), &metas, &blobs, visitor),
-            DataType::UInt8  => crate::store::scan::sorted_visit_u8_rev (self.pager.as_ref(), &metas, &blobs, visitor),
-            DataType::Int64  => crate::store::scan::sorted_visit_i64_rev(self.pager.as_ref(), &metas, &blobs, visitor),
-            DataType::Int32  => crate::store::scan::sorted_visit_i32_rev(self.pager.as_ref(), &metas, &blobs, visitor),
-            DataType::Int16  => crate::store::scan::sorted_visit_i16_rev(self.pager.as_ref(), &metas, &blobs, visitor),
-            DataType::Int8   => crate::store::scan::sorted_visit_i8_rev (self.pager.as_ref(), &metas, &blobs, visitor),
+            DataType::UInt64 => crate::store::scan::sorted_visit_u64_rev(
+                self.pager.as_ref(),
+                &metas,
+                &blobs,
+                visitor,
+            ),
+            DataType::UInt32 => crate::store::scan::sorted_visit_u32_rev(
+                self.pager.as_ref(),
+                &metas,
+                &blobs,
+                visitor,
+            ),
+            DataType::UInt16 => crate::store::scan::sorted_visit_u16_rev(
+                self.pager.as_ref(),
+                &metas,
+                &blobs,
+                visitor,
+            ),
+            DataType::UInt8 => crate::store::scan::sorted_visit_u8_rev(
+                self.pager.as_ref(),
+                &metas,
+                &blobs,
+                visitor,
+            ),
+            DataType::Int64 => crate::store::scan::sorted_visit_i64_rev(
+                self.pager.as_ref(),
+                &metas,
+                &blobs,
+                visitor,
+            ),
+            DataType::Int32 => crate::store::scan::sorted_visit_i32_rev(
+                self.pager.as_ref(),
+                &metas,
+                &blobs,
+                visitor,
+            ),
+            DataType::Int16 => crate::store::scan::sorted_visit_i16_rev(
+                self.pager.as_ref(),
+                &metas,
+                &blobs,
+                visitor,
+            ),
+            DataType::Int8 => crate::store::scan::sorted_visit_i8_rev(
+                self.pager.as_ref(),
+                &metas,
+                &blobs,
+                visitor,
+            ),
             _ => Err(Error::Internal("unsupported sorted dtype".into())),
         }
     }
 
     /// Unified scan entrypoint configured by ScanOptions.
     /// Requires `V` to implement both unsorted and sorted visitor traits; methods are no-ops by default.
-    pub fn scan<V>(&self, field_id: LogicalFieldId, opts: ScanOptions, visitor: &mut V) -> Result<()>
+    pub fn scan<V>(
+        &self,
+        field_id: LogicalFieldId,
+        opts: ScanOptions,
+        visitor: &mut V,
+    ) -> Result<()>
     where
         V: crate::store::scan::PrimitiveVisitor
             + crate::store::scan::PrimitiveSortedVisitor
@@ -1298,9 +2142,9 @@ where
     {
         if !opts.sorted {
             if opts.with_row_ids {
-                let row_fid = opts
-                    .row_id_field
-                    .ok_or_else(|| Error::Internal("row_id field id required when with_row_ids=true".into()))?;
+                let row_fid = opts.row_id_field.ok_or_else(|| {
+                    Error::Internal("row_id field id required when with_row_ids=true".into())
+                })?;
                 let catalog = self.catalog.read().unwrap();
                 return crate::store::scan::unsorted_with_row_ids_visit(
                     self.pager.as_ref(),
@@ -1314,9 +2158,9 @@ where
         }
 
         if opts.with_row_ids {
-            let row_fid = opts
-                .row_id_field
-                .ok_or_else(|| Error::Internal("row_id field id required when with_row_ids=true".into()))?;
+            let row_fid = opts.row_id_field.ok_or_else(|| {
+                Error::Internal("row_id field id required when with_row_ids=true".into())
+            })?;
             // Prepare value metas and blobs
             let catalog = self.catalog.read().unwrap();
             let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
@@ -1324,79 +2168,235 @@ where
                 .pager
                 .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
                 .pop()
-                .and_then(|r| match r { GetResult::Raw { bytes, .. } => Some(bytes), _ => None })
+                .and_then(|r| match r {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
                 .ok_or(Error::NotFound)?;
-            let desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+            let desc =
+                crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
             let rid_descriptor_pk = *catalog.map.get(&row_fid).ok_or(Error::NotFound)?;
             let rid_desc_blob = self
                 .pager
-                .batch_get(&[BatchGet::Raw { key: rid_descriptor_pk }])?
+                .batch_get(&[BatchGet::Raw {
+                    key: rid_descriptor_pk,
+                }])?
                 .pop()
-                .and_then(|r| match r { GetResult::Raw { bytes, .. } => Some(bytes), _ => None })
+                .and_then(|r| match r {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
                 .ok_or(Error::NotFound)?;
-            let rid_desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(rid_desc_blob.as_ref());
+            let rid_desc =
+                crate::store::descriptor::ColumnDescriptor::from_le_bytes(rid_desc_blob.as_ref());
             drop(catalog);
 
             let mut metas_val: Vec<crate::store::descriptor::ChunkMetadata> = Vec::new();
-            for m in crate::store::descriptor::DescriptorIterator::new(self.pager.as_ref(), desc.head_page_pk) {
-                let meta = m?; if meta.row_count == 0 { continue; }
-                if meta.value_order_perm_pk == 0 { return Err(Error::NotFound); }
+            for m in crate::store::descriptor::DescriptorIterator::new(
+                self.pager.as_ref(),
+                desc.head_page_pk,
+            ) {
+                let meta = m?;
+                if meta.row_count == 0 {
+                    continue;
+                }
+                if meta.value_order_perm_pk == 0 {
+                    return Err(Error::NotFound);
+                }
                 metas_val.push(meta);
             }
             let mut metas_rid: Vec<crate::store::descriptor::ChunkMetadata> = Vec::new();
-            for m in crate::store::descriptor::DescriptorIterator::new(self.pager.as_ref(), rid_desc.head_page_pk) {
-                let meta = m?; if meta.row_count == 0 { continue; }
+            for m in crate::store::descriptor::DescriptorIterator::new(
+                self.pager.as_ref(),
+                rid_desc.head_page_pk,
+            ) {
+                let meta = m?;
+                if meta.row_count == 0 {
+                    continue;
+                }
                 metas_rid.push(meta);
             }
-            if metas_val.is_empty() { return Ok(()); }
-            if metas_val.len() != metas_rid.len() { return Err(Error::Internal("sorted_with_row_ids: chunk count mismatch".into())); }
+            if metas_val.is_empty() {
+                return Ok(());
+            }
+            if metas_val.len() != metas_rid.len() {
+                return Err(Error::Internal(
+                    "sorted_with_row_ids: chunk count mismatch".into(),
+                ));
+            }
 
             // Batch get: values (chunks + perms) and rids (chunks)
-            let mut gets: Vec<BatchGet> = Vec::with_capacity(metas_val.len()*3);
+            let mut gets: Vec<BatchGet> = Vec::with_capacity(metas_val.len() * 3);
             for (mv, mr) in metas_val.iter().zip(metas_rid.iter()) {
-                gets.push(BatchGet::Raw{key: mv.chunk_pk});
-                gets.push(BatchGet::Raw{key: mv.value_order_perm_pk});
-                gets.push(BatchGet::Raw{key: mr.chunk_pk});
+                gets.push(BatchGet::Raw { key: mv.chunk_pk });
+                gets.push(BatchGet::Raw {
+                    key: mv.value_order_perm_pk,
+                });
+                gets.push(BatchGet::Raw { key: mr.chunk_pk });
             }
             let results = self.pager.batch_get(&gets)?;
             let mut vblobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
             let mut rblobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
             for r in results {
-                if let GetResult::Raw{key,bytes} = r {
+                if let GetResult::Raw { key, bytes } = r {
                     // Heuristic: key in rid metas => rid blob, else value blob
-                    if metas_rid.iter().any(|m| m.chunk_pk==key) { rblobs.insert(key, bytes); }
-                    else { vblobs.insert(key, bytes); }
+                    if metas_rid.iter().any(|m| m.chunk_pk == key) {
+                        rblobs.insert(key, bytes);
+                    } else {
+                        vblobs.insert(key, bytes);
+                    }
                 }
             }
-            let first_any = crate::serialization::deserialize_array(vblobs.get(&metas_val[0].chunk_pk).ok_or(Error::NotFound)?.clone())?;
+            let first_any = crate::serialization::deserialize_array(
+                vblobs
+                    .get(&metas_val[0].chunk_pk)
+                    .ok_or(Error::NotFound)?
+                    .clone(),
+            )?;
             if opts.reverse {
                 match first_any.data_type() {
-                    DataType::UInt64 => sorted_visit_with_rids_u64_rev(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
-                    DataType::UInt32 => sorted_visit_with_rids_u32_rev(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
-                    DataType::UInt16 => sorted_visit_with_rids_u16_rev(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
-                    DataType::UInt8  => sorted_visit_with_rids_u8_rev (self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
-                    DataType::Int64  => sorted_visit_with_rids_i64_rev(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
-                    DataType::Int32  => sorted_visit_with_rids_i32_rev(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
-                    DataType::Int16  => sorted_visit_with_rids_i16_rev(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
-                    DataType::Int8   => sorted_visit_with_rids_i8_rev (self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
+                    DataType::UInt64 => sorted_visit_with_rids_u64_rev(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
+                    DataType::UInt32 => sorted_visit_with_rids_u32_rev(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
+                    DataType::UInt16 => sorted_visit_with_rids_u16_rev(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
+                    DataType::UInt8 => sorted_visit_with_rids_u8_rev(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
+                    DataType::Int64 => sorted_visit_with_rids_i64_rev(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
+                    DataType::Int32 => sorted_visit_with_rids_i32_rev(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
+                    DataType::Int16 => sorted_visit_with_rids_i16_rev(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
+                    DataType::Int8 => sorted_visit_with_rids_i8_rev(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
                     _ => Err(Error::Internal("unsupported sorted dtype".into())),
                 }
             } else {
                 match first_any.data_type() {
-                    DataType::UInt64 => sorted_visit_with_rids_u64(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
-                    DataType::UInt32 => sorted_visit_with_rids_u32(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
-                    DataType::UInt16 => sorted_visit_with_rids_u16(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
-                    DataType::UInt8  => sorted_visit_with_rids_u8 (self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
-                    DataType::Int64  => sorted_visit_with_rids_i64(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
-                    DataType::Int32  => sorted_visit_with_rids_i32(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
-                    DataType::Int16  => sorted_visit_with_rids_i16(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
-                    DataType::Int8   => sorted_visit_with_rids_i8 (self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
+                    DataType::UInt64 => sorted_visit_with_rids_u64(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
+                    DataType::UInt32 => sorted_visit_with_rids_u32(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
+                    DataType::UInt16 => sorted_visit_with_rids_u16(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
+                    DataType::UInt8 => sorted_visit_with_rids_u8(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
+                    DataType::Int64 => sorted_visit_with_rids_i64(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
+                    DataType::Int32 => sorted_visit_with_rids_i32(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
+                    DataType::Int16 => sorted_visit_with_rids_i16(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
+                    DataType::Int8 => sorted_visit_with_rids_i8(
+                        self.pager.as_ref(),
+                        &metas_val,
+                        &metas_rid,
+                        &vblobs,
+                        &rblobs,
+                        visitor,
+                    ),
                     _ => Err(Error::Internal("unsupported sorted dtype".into())),
                 }
             }
         } else {
-            if opts.reverse { self.scan_sorted_visit_reverse(field_id, visitor) } else { self.scan_sorted_visit(field_id, visitor) }
+            if opts.reverse {
+                self.scan_sorted_visit_reverse(field_id, visitor)
+            } else {
+                self.scan_sorted_visit(field_id, visitor)
+            }
         }
     }
 }

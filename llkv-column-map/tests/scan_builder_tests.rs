@@ -56,7 +56,7 @@ fn scan_builder_sorted_range_u64() {
     let mut coll = Collect { out: Vec::new() };
     ScanBuilder::new(&store, field_id)
         .options(ScanOptions { sorted: true, reverse: false, with_row_ids: false, row_id_field: None })
-        .range_u64(2000..=8000)
+        .with_range::<u64,_>(2000..=8000)
         .run(&mut coll)
         .unwrap();
     assert!(coll.out.windows(2).all(|w| w[0] <= w[1]));
@@ -101,7 +101,7 @@ fn scan_builder_sorted_with_row_ids() {
     let rid_fid = field_id.with_namespace(Namespace::RowIdShadow);
     ScanBuilder::new(&store, field_id)
         .options(ScanOptions { sorted: true, reverse: false, with_row_ids: true, row_id_field: Some(rid_fid) })
-        .range_u64(10_000..=20_000)
+        .with_range::<u64,_>(10_000..=20_000)
         .run(&mut coll)
         .unwrap();
     assert!(!coll.out.is_empty());
