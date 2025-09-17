@@ -1,179 +1,48 @@
-//! Ultra-fast k-way merge over pre-sorted chunks (brand-new API).
+//! Ultra-fast k-way merge over pre-sorted chunks and a simple unsorted
+//! streaming iterator.
 //!
-//! Design goals:
-//! - Pre-apply per-chunk UInt32 perms to build contiguous sorted buffers
-//!   (best locality; one take per chunk).
+//! Design goals for sorted merge:
+//! - Pre-apply per-chunk UInt32 perms to build contiguous sorted buffers.
 //! - Binary heap + run coalescing: one pop/push per emitted run, not per
 //!   element.
 //! - Typed runs: return references to typed arrays + (start,len). Caller
-//!   can scan values directly without constructing new Arrow arrays.
-//! - Explicit sort semantics via SortOptions.
-//! - Ready to add more primitive types by one macro line.
+//!   scans values directly without constructing new Arrow arrays.
+//! - Explicit sort semantics via SortOptions (descending supported).
+//! - Bounds via std::ops::Bound, clamped with generic binary search.
 //!
-//! Extend notes:
-//! - To emit row_id with values, add a second sorted array per chunk
-//!   (UInt64Array) and include it in Run enums. The merge logic does not
-//!   change.
-
-use super::ColumnStore;
-use crate::error::{Error, Result};
-use crate::serialization::deserialize_array;
-use crate::storage::{BatchGet, GetResult, Pager};
-use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
-use crate::types::{LogicalFieldId, PhysicalKey};
-
-use arrow::array::{Array, ArrayRef, Int32Array, UInt32Array, UInt64Array};
-use arrow::compute;
-use arrow::datatypes::DataType;
-
-use rustc_hash::FxHashMap;
-use simd_r_drive_entry_handle::EntryHandle;
+//! Notes:
+//! - Nulls are not stored (they are treated as deletes), so no null
+//!   checks in the hot path.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::ops::Bound;
+use std::sync::Arc;
 
-impl<P> ColumnStore<P>
-where
-    P: Pager<Blob = EntryHandle>,
-{
-    /// Scan returns arrays in append order (no tombstones).
-    pub fn scan(
-        &self,
-        field_id: LogicalFieldId,
-    ) -> Result<Box<dyn Iterator<Item = Result<ArrayRef>>>> {
-        let catalog = self.catalog.read().unwrap();
-        let &descriptor_pk = match catalog.map.get(&field_id) {
-            Some(pk) => pk,
-            None => return Ok(Box::new(std::iter::empty())),
-        };
+use arrow::array::{Array, ArrayRef, Int32Array, PrimitiveArray, UInt32Array, UInt64Array};
+use arrow::compute;
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Int32Type, UInt64Type};
 
-        let desc_blob = self
-            .pager
-            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?;
-        let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+use rustc_hash::FxHashMap;
+use simd_r_drive_entry_handle::EntryHandle;
 
-        let mut metas = Vec::new();
-        for meta in DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk) {
-            metas.push(meta?);
-        }
-        if metas.is_empty() {
-            return Ok(Box::new(std::iter::empty()));
-        }
-
-        // Fast path: single chunk
-        if metas.len() == 1 {
-            let blob = self
-                .pager
-                .batch_get(&[BatchGet::Raw {
-                    key: metas[0].chunk_pk,
-                }])?
-                .pop()
-                .and_then(|r| match r {
-                    GetResult::Raw { bytes, .. } => Some(bytes),
-                    _ => None,
-                })
-                .ok_or(Error::NotFound)?;
-
-            let arr = deserialize_array(blob)?;
-            return Ok(Box::new(std::iter::once(Ok(arr))));
-        }
-
-        // Multi-chunk: batch_get and map
-        let mut gets = Vec::with_capacity(metas.len());
-        for m in &metas {
-            gets.push(BatchGet::Raw { key: m.chunk_pk });
-        }
-        let results = self.pager.batch_get(&gets)?;
-
-        let mut blobs_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-        for r in results {
-            match r {
-                GetResult::Raw { key, bytes } => {
-                    blobs_map.insert(key, bytes);
-                }
-                GetResult::Missing { .. } => return Err(Error::NotFound),
-            }
-        }
-
-        let it = metas.into_iter().map(move |m| {
-            let blob = blobs_map.get(&m.chunk_pk).ok_or(Error::NotFound)?;
-            let array = deserialize_array(blob.clone())?;
-            Ok(array)
-        });
-
-        Ok(Box::new(it))
-    }
-
-    pub fn scan_sorted(&self, field_id: LogicalFieldId) -> Result<SortedMerge> {
-        let catalog = self.catalog.read().unwrap();
-        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
-
-        let desc_blob = self
-            .pager
-            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?;
-        let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-
-        let mut all_chunk_metadata = Vec::new();
-        let meta_iter = DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk);
-        for meta_result in meta_iter {
-            all_chunk_metadata.push(meta_result?);
-        }
-
-        let mut gets = Vec::new();
-        for meta in &all_chunk_metadata {
-            gets.push(BatchGet::Raw { key: meta.chunk_pk });
-            if meta.value_order_perm_pk != 0 {
-                gets.push(BatchGet::Raw {
-                    key: meta.value_order_perm_pk,
-                });
-            } else {
-                return Err(Error::Internal(format!(
-                    "Chunk {} is not sorted",
-                    meta.chunk_pk
-                )));
-            }
-        }
-
-        let get_results = self.pager.batch_get(&gets)?;
-        let mut blobs_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-        for result in get_results {
-            match result {
-                GetResult::Raw { key, bytes } => {
-                    blobs_map.insert(key, bytes);
-                }
-                GetResult::Missing { .. } => return Err(Error::NotFound),
-            }
-        }
-
-        let opts = SortOptions {
-            descending: false,
-            nulls_first: true,
-        };
-        SortedMerge::build(&all_chunk_metadata, blobs_map, opts)
-    }
-}
+use crate::error::{Error, Result};
+use crate::serialization::deserialize_array;
+use crate::storage::pager::{BatchGet, GetResult, Pager};
+use crate::store::ColumnStore;
+use crate::store::catalog::ColumnCatalog; // only for visibility of module
+use crate::store::descriptor::{ChunkMetadata, DescriptorIterator};
+use crate::types::{LogicalFieldId, PhysicalKey};
 
 // ----------------------------- Sort options -------------------------------
 
+/// SortOptions is kept source-compatible. We ignore nulls_* at runtime,
+/// because nulls are not stored (deleted at ingest).
 #[derive(Clone, Copy, Debug)]
 pub struct SortOptions {
-    /// true => descending. false => ascending.
+    /// true => descending, false => ascending.
     pub descending: bool,
-    /// true => nulls first. false => nulls last.
-    /// Not used: the store never writes nulls.
+    /// Kept for API compatibility (not used on hot path).
     pub nulls_first: bool,
 }
 
@@ -190,8 +59,8 @@ impl Default for SortOptions {
 
 #[derive(Clone, Copy, Debug)]
 struct Key<K: Ord + Copy> {
-    val: K,     // value for ordering
-    flip: bool, // true => reverse order
+    val: K,
+    flip: bool, // true => reverse value ordering
 }
 
 impl<K: Ord + Copy> PartialEq for Key<K> {
@@ -206,7 +75,6 @@ impl<K: Ord + Copy> PartialOrd for Key<K> {
         Some(self.cmp(other))
     }
 }
-
 impl<K: Ord + Copy> Ord for Key<K> {
     fn cmp(&self, other: &Self) -> Ordering {
         let v = self.val.cmp(&other.val);
@@ -244,7 +112,7 @@ impl<K: Ord + Copy> Ord for HeapItem<K> {
 // ------------------------------- Cursors ----------------------------------
 
 struct Cursor<A> {
-    /// Typed view to load keys cheaply.
+    /// Typed view to load keys cheaply (already permuted/sorted).
     sorted: A,
     /// Rows in chunk.
     len: usize,
@@ -281,10 +149,19 @@ impl<'a> Run<'a> {
     }
 }
 
-// -------------------- Binary search helpers for clamping ------------------
+// ------------------ Generic binary search (primitive T) -------------------
 
-#[inline]
-fn lower_bound_u64(arr: &UInt64Array, mut lo: usize, mut hi: usize, key: u64) -> usize {
+#[inline(always)]
+fn lower_bound_prim<T>(
+    arr: &PrimitiveArray<T>,
+    mut lo: usize,
+    mut hi: usize,
+    key: T::Native,
+) -> usize
+where
+    T: ArrowPrimitiveType,
+    T::Native: Ord + Copy,
+{
     while lo < hi {
         let mid = (lo + hi) >> 1;
         if arr.value(mid) < key {
@@ -296,34 +173,17 @@ fn lower_bound_u64(arr: &UInt64Array, mut lo: usize, mut hi: usize, key: u64) ->
     lo
 }
 
-#[inline]
-fn upper_bound_u64(arr: &UInt64Array, mut lo: usize, mut hi: usize, key: u64) -> usize {
-    while lo < hi {
-        let mid = (lo + hi) >> 1;
-        if arr.value(mid) <= key {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
-}
-
-#[inline]
-fn lower_bound_i32(arr: &Int32Array, mut lo: usize, mut hi: usize, key: i32) -> usize {
-    while lo < hi {
-        let mid = (lo + hi) >> 1;
-        if arr.value(mid) < key {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
-}
-
-#[inline]
-fn upper_bound_i32(arr: &Int32Array, mut lo: usize, mut hi: usize, key: i32) -> usize {
+#[inline(always)]
+fn upper_bound_prim<T>(
+    arr: &PrimitiveArray<T>,
+    mut lo: usize,
+    mut hi: usize,
+    key: T::Native,
+) -> usize
+where
+    T: ArrowPrimitiveType,
+    T::Native: Ord + Copy,
+{
     while lo < hi {
         let mid = (lo + hi) >> 1;
         if arr.value(mid) <= key {
@@ -340,20 +200,17 @@ fn upper_bound_i32(arr: &Int32Array, mut lo: usize, mut hi: usize, key: i32) -> 
 macro_rules! impl_merge_for_primitive {
     ($Name:ident,
      $ArrTy:ty,
+     $PrimTy:ty,
      $KeyTy:ty,
-     $RunVariant:ident,
-     $lower_fn:ident,
-     $upper_fn:ident) => {
+     $RunVariant:ident) => {
         pub struct $Name {
             cursors: Vec<Cursor<$ArrTy>>,
             heap: BinaryHeap<Reverse<HeapItem<$KeyTy>>>,
-            /// Flip value order for descending.
+            /// Reverse value order for descending.
             flip: bool,
-            /// Bounds on values (inclusive/exclusive/unbounded).
+            /// Inclusive/exclusive bounds (per stream).
             bound_lo: Bound<$KeyTy>,
             bound_hi: Bound<$KeyTy>,
-            /// Fast flag: any bound active?
-            bounds_active: bool,
             /// Keep blobs alive (zero-copy backing).
             _blobs: FxHashMap<PhysicalKey, EntryHandle>,
         }
@@ -373,12 +230,11 @@ macro_rules! impl_merge_for_primitive {
                     if m.row_count == 0 {
                         continue;
                     }
-
                     // Load data.
                     let data_blob = blobs.get(&m.chunk_pk).ok_or(Error::NotFound)?.clone();
                     let data_any = deserialize_array(data_blob)?;
 
-                    // Load perm.
+                    // Load perm (must exist for sorted scan).
                     let perm_blob = blobs
                         .get(&m.value_order_perm_pk)
                         .ok_or(Error::NotFound)?
@@ -426,14 +282,27 @@ macro_rules! impl_merge_for_primitive {
                     flip,
                     bound_lo: Bound::Unbounded,
                     bound_hi: Bound::Unbounded,
-                    bounds_active: false,
                     _blobs: blobs,
                 })
             }
 
-            /// Return the next run from the same chunk, maximally
-            /// coalesced. When the heap is empty, returns None.
-            #[inline(always)]
+            /// Set bounds (builder-style).
+            #[inline]
+            pub fn with_bounds(mut self, lo: Bound<$KeyTy>, hi: Bound<$KeyTy>) -> Self {
+                self.bound_lo = lo;
+                self.bound_hi = hi;
+                self
+            }
+
+            /// Set bounds (mut-style).
+            #[inline]
+            pub fn set_bounds(&mut self, lo: Bound<$KeyTy>, hi: Bound<$KeyTy>) {
+                self.bound_lo = lo;
+                self.bound_hi = hi;
+            }
+
+            /// Drain one coalesced run (clamped by bounds). Returns None
+            /// when fully drained.
             pub fn next_run<'a>(&'a mut self) -> Option<Run<'a>> {
                 loop {
                     let Reverse(top) = self.heap.pop()?;
@@ -443,6 +312,7 @@ macro_rules! impl_merge_for_primitive {
 
                     let cidx = top.cursor_idx;
                     let start = top.sorted_idx;
+
                     let c = &self.cursors[cidx];
                     let len = c.len;
 
@@ -457,6 +327,7 @@ macro_rules! impl_merge_for_primitive {
                             end += 1;
                         }
                     } else {
+                        // Heap empty => take the whole tail.
                         end = len;
                     }
 
@@ -470,53 +341,49 @@ macro_rules! impl_merge_for_primitive {
                         }));
                     }
 
-                    // Fast path: no bounds.
-                    if !self.bounds_active {
-                        let c = &self.cursors[cidx];
-                        return Some(Run::$RunVariant {
-                            arr: &c.sorted,
-                            start,
-                            len: end - start,
-                        });
-                    }
-
-                    // Clamp [s,e) by bounds using the typed array.
+                    // Clamp [start,end) by bounds using typed array.
                     let arr = &c.sorted;
                     let mut s = start;
                     let mut e = end;
 
-                    // Lower bound:
-                    // - Included(x) => first idx with val >= x
-                    // - Excluded(x) => first idx with val >  x
-                    // - Unbounded   => unchanged
+                    // Lower bound clamp.
                     match self.bound_lo {
                         Bound::Unbounded => {}
-                        Bound::Included(x) => {
-                            s = $lower_fn(arr, s, e, x);
+                        Bound::Included(lo) => {
+                            s = lower_bound_prim::<$PrimTy>(arr, s, e, lo);
+                            if s >= e {
+                                continue;
+                            }
                         }
-                        Bound::Excluded(x) => {
-                            s = $upper_fn(arr, s, e, x);
+                        Bound::Excluded(lo) => {
+                            s = upper_bound_prim::<$PrimTy>(arr, s, e, lo);
+                            if s >= e {
+                                continue;
+                            }
                         }
-                    }
-                    if s >= e {
-                        continue;
                     }
 
-                    // Upper bound:
-                    // - Included(x) => first idx with val >  x
-                    // - Excluded(x) => first idx with val >= x
-                    // - Unbounded   => unchanged
+                    // Upper bound clamp.
                     match self.bound_hi {
                         Bound::Unbounded => {}
-                        Bound::Included(x) => {
-                            e = $upper_fn(arr, s, e, x);
+                        Bound::Included(hi) => {
+                            if arr.value(s) > hi {
+                                continue;
+                            }
+                            e = upper_bound_prim::<$PrimTy>(arr, s, e, hi);
+                            if s >= e {
+                                continue;
+                            }
                         }
-                        Bound::Excluded(x) => {
-                            e = $lower_fn(arr, s, e, x);
+                        Bound::Excluded(hi) => {
+                            if arr.value(s) >= hi {
+                                continue;
+                            }
+                            e = lower_bound_prim::<$PrimTy>(arr, s, e, hi);
+                            if s >= e {
+                                continue;
+                            }
                         }
-                    }
-                    if s >= e {
-                        continue;
                     }
 
                     let c = &self.cursors[cidx];
@@ -530,10 +397,8 @@ macro_rules! impl_merge_for_primitive {
 
             #[inline(always)]
             fn key_at(c: &Cursor<$ArrTy>, idx: usize, flip: bool) -> Key<$KeyTy> {
-                Key {
-                    val: c.sorted.value(idx) as $KeyTy,
-                    flip,
-                }
+                let v = c.sorted.value(idx) as $KeyTy;
+                Key { val: v, flip }
             }
 
             /// Total rows across all chunks (after sorting).
@@ -555,23 +420,8 @@ macro_rules! impl_merge_for_primitive {
 }
 
 // Instantiate for the types you care about today.
-// Add more by repeating lines below (e.g., Int64Array/i64).
-impl_merge_for_primitive!(
-    MergeU64,
-    UInt64Array,
-    u64,
-    U64,
-    lower_bound_u64,
-    upper_bound_u64
-);
-impl_merge_for_primitive!(
-    MergeI32,
-    Int32Array,
-    i32,
-    I32,
-    lower_bound_i32,
-    upper_bound_i32
-);
+impl_merge_for_primitive!(MergeU64, UInt64Array, UInt64Type, u64, U64);
+impl_merge_for_primitive!(MergeI32, Int32Array, Int32Type, i32, I32);
 
 // ------------------------------ Type dispatch -----------------------------
 
@@ -593,7 +443,6 @@ impl SortedMerge {
             Some(m) => m,
             None => {
                 // Empty input. Default to u64 variant with zero cursors.
-                // Callers should check `is_empty()` anyway.
                 return Ok(SortedMerge::U64(MergeU64::build(&[], blobs, opts)?));
             }
         };
@@ -625,24 +474,20 @@ impl SortedMerge {
         }
     }
 
-    /// Set range bounds for u64 streams.
+    /// Builder: set bounds for u64.
     #[inline]
-    pub fn with_u64_range(mut self, lo: Bound<u64>, hi: Bound<u64>) -> Self {
+    pub fn with_u64_bounds(mut self, lo: Bound<u64>, hi: Bound<u64>) -> Self {
         if let SortedMerge::U64(m) = &mut self {
-            m.bound_lo = lo;
-            m.bound_hi = hi;
-            m.bounds_active = !matches!(lo, Bound::Unbounded) || !matches!(hi, Bound::Unbounded);
+            m.set_bounds(lo, hi);
         }
         self
     }
 
-    /// Set range bounds for i32 streams.
+    /// Builder: set bounds for i32.
     #[inline]
-    pub fn with_i32_range(mut self, lo: Bound<i32>, hi: Bound<i32>) -> Self {
+    pub fn with_i32_bounds(mut self, lo: Bound<i32>, hi: Bound<i32>) -> Self {
         if let SortedMerge::I32(m) = &mut self {
-            m.bound_lo = lo;
-            m.bound_hi = hi;
-            m.bounds_active = !matches!(lo, Bound::Unbounded) || !matches!(hi, Bound::Unbounded);
+            m.set_bounds(lo, hi);
         }
         self
     }
@@ -666,5 +511,140 @@ impl SortedMerge {
             SortedMerge::U64(m) => m.is_empty(),
             SortedMerge::I32(m) => m.is_empty(),
         }
+    }
+}
+
+// ------------------------------ Unsorted scan -----------------------------
+
+pub struct UnsortedScan<P: Pager<Blob = EntryHandle>> {
+    pager: Arc<P>,
+    metas: Vec<ChunkMetadata>,
+    idx: usize,
+}
+
+impl<P> Iterator for UnsortedScan<P>
+where
+    P: Pager<Blob = EntryHandle>,
+{
+    type Item = Result<ArrayRef>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx >= self.metas.len() {
+            return None;
+        }
+        let m = self.metas[self.idx];
+        self.idx += 1;
+
+        let res = self.pager.batch_get(&[BatchGet::Raw { key: m.chunk_pk }]);
+        let blob = match res {
+            Ok(mut v) => match v.pop() {
+                Some(GetResult::Raw { bytes, .. }) => bytes,
+                _ => return Some(Err(Error::NotFound)),
+            },
+            Err(e) => return Some(Err(e)),
+        };
+        let arr = deserialize_array(blob);
+        Some(arr)
+    }
+}
+
+// ------ ColumnStore shims: scan() and scan_sorted() ---------
+
+impl<P> ColumnStore<P>
+where
+    P: Pager<Blob = EntryHandle>,
+{
+    /// Unsorted streaming scan over the column's chunks.
+    pub fn scan(&self, field_id: LogicalFieldId) -> Result<UnsortedScan<P>> {
+        // Look up descriptor pk
+        let catalog = self.catalog.read().unwrap();
+        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+
+        // Load ColumnDescriptor to get head_page_pk
+        let desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
+        let desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+
+        // Walk the descriptor pages to gather metas
+        let mut metas: Vec<ChunkMetadata> = Vec::new();
+        for m in DescriptorIterator::new(self.pager.as_ref(), desc.head_page_pk) {
+            let meta = m?;
+            if meta.row_count > 0 {
+                metas.push(meta);
+            }
+        }
+
+        Ok(UnsortedScan {
+            pager: Arc::clone(&self.pager),
+            metas,
+            idx: 0,
+        })
+    }
+
+    /// Sorted scan via k-way merge over pre-sorted chunks. Requires that
+    /// `create_sort_index(field_id)` has been called (perms must exist).
+    pub fn scan_sorted(&self, field_id: LogicalFieldId) -> Result<SortedMerge> {
+        // Look up descriptor pk
+        let catalog = self.catalog.read().unwrap();
+        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+
+        // Load ColumnDescriptor to get head_page_pk
+        let desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
+        let desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+
+        // Gather metas from the page chain (require perm for sorted scans)
+        let mut metas: Vec<ChunkMetadata> = Vec::new();
+        for m in DescriptorIterator::new(self.pager.as_ref(), desc.head_page_pk) {
+            let meta = m?;
+            if meta.row_count == 0 {
+                continue;
+            }
+            if meta.value_order_perm_pk == 0 {
+                return Err(Error::NotFound);
+            }
+            metas.push(meta);
+        }
+
+        if metas.is_empty() {
+            // Build an empty iterator with correct variant
+            return SortedMerge::build(&[], FxHashMap::default(), SortOptions::default());
+        }
+
+        // Batch get all data and perm blobs in one go.
+        let mut gets: Vec<BatchGet> = Vec::with_capacity(metas.len() * 2);
+        for m in &metas {
+            gets.push(BatchGet::Raw { key: m.chunk_pk });
+            gets.push(BatchGet::Raw {
+                key: m.value_order_perm_pk,
+            });
+        }
+        let results = self.pager.batch_get(&gets)?;
+
+        let mut blobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
+        for r in results {
+            match r {
+                GetResult::Raw { key, bytes } => {
+                    blobs.insert(key, bytes);
+                }
+                _ => return Err(Error::NotFound),
+            }
+        }
+
+        SortedMerge::build(&metas, blobs, SortOptions::default())
     }
 }
