@@ -26,19 +26,7 @@ rand.workspace = true
 [[bench]]
 name = "column_sum_bench"
 harness = false
-
-[[bench]]
-name = "random_probe_bench"
-harness = false
-
-[[bench]]
-name = "scan_rowid_bench"
-harness = false
-
-[[bench]]
-name = "visitor_dispatch_bench"
-harness = false
-
+path = "benches/column_sum_bench.rs"
 
 [features]
 legacy_api = []

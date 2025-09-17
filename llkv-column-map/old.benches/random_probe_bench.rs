@@ -99,30 +99,29 @@ fn count_hits_multiset_scan(
     let mut freq = vec![0u32; 2 * N_ROWS];
     for &q in qs {
         let idx = q as usize;
-        if idx < freq.len() {
-            let x = freq[idx];
-            freq[idx] = x.saturating_add(1);
-        }
+        if idx < freq.len() { freq[idx] = freq[idx].saturating_add(1); }
     }
 
-    let mut hits = 0usize;
-    let it = store.scan(fid).unwrap();
-
-    for arr_res in it {
-        let arr = arr_res.unwrap();
-        let u = arr.as_any().downcast_ref::<UInt64Array>().unwrap();
-        for i in 0..u.len() {
-            let v = u.value(i) as usize;
-            if v < freq.len() {
-                let k = freq[v];
-                if k != 0 {
-                    hits += k as usize;
-                    freq[v] = 0;
+    use std::cell::Cell;
+    let hits = Cell::new(0usize);
+    store
+        .scan_visit_fn(
+            fid,
+            |u: &UInt64Array| {
+                let mut h = hits.get();
+                for i in 0..u.len() {
+                    let v = u.value(i) as usize;
+                    if v < freq.len() {
+                        let k = freq[v];
+                        if k != 0 { h += k as usize; freq[v] = 0; }
+                    }
                 }
-            }
-        }
-    }
-    hits
+                hits.set(h);
+            },
+            |_i: &arrow::array::Int32Array| {},
+        )
+        .unwrap();
+    hits.get()
 }
 
 /// Sorted probe: two-pointer merge over scan_sorted().
@@ -133,17 +132,24 @@ fn count_hits_stream_join(store: &ColumnStore<MemPager>, fid: LogicalFieldId, qs
     let mut qi = 0usize;
     let mut hits = 0usize;
 
-    let mut m = store.scan_sorted(fid).unwrap();
-    while let Some((arr_dyn, start, len)) = m.next_run() {
-        let arr = arr_dyn.as_any().downcast_ref::<UInt64Array>().unwrap();
-        let end = start + len;
-        for i in start..end {
-            let v = arr.value(i);
-            while qi < queries.len() && queries[qi] < v { qi += 1; }
-            while qi < queries.len() && queries[qi] == v { hits += 1; qi += 1; }
-            if qi >= queries.len() { return hits; }
-        }
-    }
+    // Sorted scan via visitor closures (no type knowledge at callsite).
+    store
+        .scan_sorted_visit_fn(
+            fid,
+            |arr: &UInt64Array, start, len| {
+                let end = start + len;
+                for i in start..end {
+                    let v = arr.value(i);
+                    while qi < queries.len() && queries[qi] < v { qi += 1; }
+                    while qi < queries.len() && queries[qi] == v { hits += 1; qi += 1; }
+                    if qi >= queries.len() { break; }
+                }
+            },
+            |_arr_i32: &arrow::array::Int32Array, _start, _len| {
+                // This bench expects a UInt64 column; i32 not used here.
+            },
+        )
+        .unwrap();
 
     hits
 }

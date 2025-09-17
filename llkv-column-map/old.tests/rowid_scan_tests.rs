@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::UInt64Array;
+use arrow::array::{Int32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -77,20 +77,22 @@ fn unsorted_scan_with_row_ids_is_correct() {
     // Verify by checking value->row_id mapping per element against the known inverse perm.
     let rid_fid = field_id.with_namespace(Namespace::RowIdShadow);
     let mut seen = 0usize;
-    for res in store.scan_with_row_ids(field_id, rid_fid).unwrap() {
-        let (vals_any, rids_arr) = res.unwrap();
-        let vals = vals_any
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("values must be UInt64");
-        assert_eq!(vals.len(), rids_arr.len());
-        for i in 0..vals.len() {
-            let v = vals.value(i) as usize;
-            let rid = rids_arr.value(i) as usize;
-            assert_eq!(rid, inv[v]);
+    struct Check<'a> { inv: &'a [usize], seen: usize }
+    impl llkv_column_map::store::iter::PrimitiveWithRowIdsVisitor for Check<'_> {
+        fn u64_chunk(&mut self, vals: &UInt64Array, rids: &UInt64Array) {
+            assert_eq!(vals.len(), rids.len());
+            for i in 0..vals.len() {
+                let v = vals.value(i) as usize;
+                let rid = rids.value(i) as usize;
+                assert_eq!(rid, self.inv[v]);
+            }
+            self.seen += vals.len();
         }
-        seen += vals.len();
+        fn i32_chunk(&mut self, _vals: &Int32Array, _rids: &UInt64Array) {}
     }
+    let mut chk = Check { inv: &inv, seen: 0 };
+    store.scan_with_row_ids_visit(field_id, rid_fid, &mut chk).unwrap();
+    seen = chk.seen;
     assert_eq!(seen, N);
 }
 
@@ -106,19 +108,24 @@ fn sorted_scan_with_row_ids_is_correct() {
     let mut count = 0usize;
     let mut prev: Option<u64> = None;
 
-    let mut m = store.scan_sorted_with_row_ids(field_id, rid_fid).unwrap();
-    while let Some((vals_dyn, rids, start, len)) = m.next_run() {
-        let vals = vals_dyn.as_any().downcast_ref::<UInt64Array>().unwrap();
-        let end = start + len;
-        for i in start..end {
-            let v = vals.value(i);
-            if let Some(p) = prev { assert!(v >= p, "values must be non-decreasing in sorted scan"); }
-            prev = Some(v);
-            let rid = rids.value(i) as usize;
-            assert_eq!(rid, inv[v as usize]);
+    struct SortedCheck<'a> { inv: &'a [usize], prev: Option<u64>, count: usize }
+    impl llkv_column_map::store::iter::PrimitiveSortedWithRowIdsVisitor for SortedCheck<'_> {
+        fn u64_run_with_rids(&mut self, vals: &UInt64Array, rids: &UInt64Array, s: usize, l: usize) {
+            let e = s + l;
+            for i in s..e {
+                let v = vals.value(i);
+                if let Some(p) = self.prev { assert!(v >= p); }
+                self.prev = Some(v);
+                let rid = rids.value(i) as usize;
+                assert_eq!(rid, self.inv[v as usize]);
+            }
+            self.count += l;
         }
-        count += len;
+        fn i32_run_with_rids(&mut self, _v: &Int32Array, _r: &UInt64Array, _s: usize, _l: usize) {}
     }
+    let mut sc = SortedCheck { inv: &inv, prev: None, count: 0 };
+    store.scan_sorted_with_row_ids_visit(field_id, rid_fid, &mut sc).unwrap();
+    count = sc.count;
 
     assert_eq!(count, N);
 }

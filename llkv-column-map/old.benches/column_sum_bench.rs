@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, UInt64Array};
+use arrow::array::{Array, Int32Array, UInt64Array};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -22,7 +22,6 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use roaring::RoaringTreemap;
@@ -76,25 +75,13 @@ fn bench_column_store_sum(c: &mut Criterion) {
                 (store, field_id)
             },
             |(store, fid)| {
-                use llkv_column_map::store::scan::{PrimitiveVisitor, PrimitiveSortedVisitor, PrimitiveWithRowIdsVisitor, PrimitiveSortedWithRowIdsVisitor};
-                struct SumU64<'a> { out: &'a std::cell::Cell<u128> }
-                impl<'a> PrimitiveVisitor for SumU64<'a> {
-                    fn u64_chunk(&mut self, a: &UInt64Array) {
-                        if let Some(s) = compute::sum(a) {
-                            self.out.set(self.out.get() + s as u128);
-                        }
-                    }
-                }
-                impl<'a> PrimitiveSortedVisitor for SumU64<'a> {}
-                impl<'a> PrimitiveWithRowIdsVisitor for SumU64<'a> {}
-                impl<'a> PrimitiveSortedWithRowIdsVisitor for SumU64<'a> {}
-                let acc = std::cell::Cell::new(0u128);
-                let mut v = SumU64 { out: &acc };
+                use std::cell::Cell;
+                let acc = Cell::new(0u128);
                 store
-                    .scan(
+                    .scan_visit_fn(
                         fid,
-                        ScanOptions { sorted: false, reverse: false, with_row_ids: false, row_id_field: None },
-                        &mut v,
+                        |u: &UInt64Array| { if let Some(s) = compute::sum(u) { acc.set(acc.get() + s as u128); } },
+                        |_i: &Int32Array| {},
                     )
                     .unwrap();
                 black_box(acc.get());
@@ -128,25 +115,13 @@ fn bench_column_store_sum(c: &mut Criterion) {
                 (store, field_id)
             },
             |(store, fid)| {
-                use llkv_column_map::store::scan::{PrimitiveVisitor, PrimitiveSortedVisitor, PrimitiveWithRowIdsVisitor, PrimitiveSortedWithRowIdsVisitor};
-                struct SumI32<'a> { out: &'a std::cell::Cell<i128> }
-                impl<'a> PrimitiveVisitor for SumI32<'a> {
-                    fn i32_chunk(&mut self, a: &Int32Array) {
-                        if let Some(s) = compute::sum(a) {
-                            self.out.set(self.out.get() + s as i128);
-                        }
-                    }
-                }
-                impl<'a> PrimitiveSortedVisitor for SumI32<'a> {}
-                impl<'a> PrimitiveWithRowIdsVisitor for SumI32<'a> {}
-                impl<'a> PrimitiveSortedWithRowIdsVisitor for SumI32<'a> {}
-                let acc = std::cell::Cell::new(0i128);
-                let mut v = SumI32 { out: &acc };
+                use std::cell::Cell;
+                let acc = Cell::new(0i128);
                 store
-                    .scan(
+                    .scan_visit_fn(
                         fid,
-                        ScanOptions { sorted: false, reverse: false, with_row_ids: false, row_id_field: None },
-                        &mut v,
+                        |_u: &UInt64Array| {},
+                        |i: &Int32Array| { if let Some(s) = compute::sum(i) { acc.set(acc.get() + s as i128); } },
                     )
                     .unwrap();
                 black_box(acc.get());
@@ -223,25 +198,13 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
                 (store, field_id, expected_final_sum)
             },
             |(store, fid, expected_sum)| {
-                use llkv_column_map::store::scan::{PrimitiveVisitor, PrimitiveSortedVisitor, PrimitiveWithRowIdsVisitor, PrimitiveSortedWithRowIdsVisitor};
-                struct SumU64<'a> { out: &'a std::cell::Cell<u128> }
-                impl<'a> PrimitiveVisitor for SumU64<'a> {
-                    fn u64_chunk(&mut self, a: &UInt64Array) {
-                        if let Some(s) = compute::sum(a) {
-                            self.out.set(self.out.get() + s as u128);
-                        }
-                    }
-                }
-                impl<'a> PrimitiveSortedVisitor for SumU64<'a> {}
-                impl<'a> PrimitiveWithRowIdsVisitor for SumU64<'a> {}
-                impl<'a> PrimitiveSortedWithRowIdsVisitor for SumU64<'a> {}
-                let acc = std::cell::Cell::new(0u128);
-                let mut v = SumU64 { out: &acc };
+                use std::cell::Cell;
+                let acc = Cell::new(0u128);
                 store
-                    .scan(
+                    .scan_visit_fn(
                         fid,
-                        ScanOptions { sorted: false, reverse: false, with_row_ids: false, row_id_field: None },
-                        &mut v,
+                        |u: &UInt64Array| { if let Some(s) = compute::sum(u) { acc.set(acc.get() + s as u128); } },
+                        |_i: &Int32Array| {},
                     )
                     .unwrap();
                 assert_eq!(acc.get(), expected_sum);

@@ -24,6 +24,7 @@ use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughpu
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
+use llkv_column_map::store::iter::{PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use rand::rngs::StdRng;
@@ -103,18 +104,20 @@ fn bench_scans(c: &mut Criterion) {
         b.iter_batched(
             || seed_store_1m(),
             |(store, fid)| {
+                use llkv_column_map::store::iter::PrimitiveWithRowIdsVisitor;
                 let rid_fid = fid.with_namespace(Namespace::RowIdShadow);
-                let mut acc: u128 = 0;
-                let mut acc_r: u128 = 0;
-                for res in store.scan_with_row_ids(fid, rid_fid).unwrap() {
-                    let (val_any, rids) = res.unwrap();
-                    let vals = val_any.as_any().downcast_ref::<UInt64Array>().unwrap();
-                    for i in 0..vals.len() {
-                        acc += vals.value(i) as u128;
-                        acc_r += rids.value(i) as u128;
+                struct Acc(u128, u128);
+                impl PrimitiveWithRowIdsVisitor for Acc {
+                    fn u64_chunk(&mut self, vals: &UInt64Array, rids: &UInt64Array) {
+                        for i in 0..vals.len() { self.0 += vals.value(i) as u128; self.1 += rids.value(i) as u128; }
+                    }
+                    fn i32_chunk(&mut self, vals: &arrow::array::Int32Array, rids: &UInt64Array) {
+                        for i in 0..vals.len() { self.0 += vals.value(i) as i128 as u128; self.1 += rids.value(i) as u128; }
                     }
                 }
-                black_box(acc ^ acc_r);
+                let mut acc = Acc(0, 0);
+                store.scan_with_row_ids_visit(fid, rid_fid, &mut acc).unwrap();
+                black_box(acc.0 ^ acc.1);
             },
             BatchSize::SmallInput,
         );
@@ -125,14 +128,24 @@ fn bench_scans(c: &mut Criterion) {
         b.iter_batched(
             || seed_store_1m(),
             |(store, fid)| {
-                let mut acc: u128 = 0;
-                let mut m = store.scan_sorted(fid).unwrap();
-                while let Some((arr_dyn, start, len)) = m.next_run() {
-                    let arr = arr_dyn.as_any().downcast_ref::<UInt64Array>().unwrap();
-                    let end = start + len;
-                    for i in start..end { acc += arr.value(i) as u128; }
-                }
-                black_box(acc);
+                use std::cell::Cell;
+                let acc = Cell::new(0u128);
+                store
+                    .scan_sorted_visit_fn(
+                        fid,
+                        |a: &UInt64Array, s, l| {
+                            let e = s + l; let mut sum = acc.get();
+                            for i in s..e { sum += a.value(i) as u128; }
+                            acc.set(sum);
+                        },
+                        |a: &arrow::array::Int32Array, s, l| {
+                            let e = s + l; let mut sum = acc.get();
+                            for i in s..e { sum += a.value(i) as i128 as u128; }
+                            acc.set(sum);
+                        },
+                    )
+                    .unwrap();
+                black_box(acc.get());
             },
             BatchSize::SmallInput,
         );
@@ -144,15 +157,26 @@ fn bench_scans(c: &mut Criterion) {
             || seed_store_1m(),
             |(store, fid)| {
                 let rid_fid = fid.with_namespace(Namespace::RowIdShadow);
-                let mut acc: u128 = 0;
-                let mut acc_r: u128 = 0;
-                let mut m = store.scan_sorted_with_row_ids(fid, rid_fid).unwrap();
-                while let Some((vals_dyn, rids, start, len)) = m.next_run() {
-                    let vals = vals_dyn.as_any().downcast_ref::<UInt64Array>().unwrap();
-                    let end = start + len;
-                    for i in start..end { acc += vals.value(i) as u128; acc_r += rids.value(i) as u128; }
-                }
-                black_box(acc ^ acc_r);
+                use std::cell::Cell;
+                let acc = Cell::new(0u128);
+                let acc_r = Cell::new(0u128);
+                store
+                    .scan_sorted_with_row_ids_visit_fn(
+                        fid,
+                        rid_fid,
+                        |v: &UInt64Array, r: &UInt64Array, s, l| {
+                            let e = s + l; let mut sv = acc.get(); let mut sr = acc_r.get();
+                            for i in s..e { sv += v.value(i) as u128; sr += r.value(i) as u128; }
+                            acc.set(sv); acc_r.set(sr);
+                        },
+                        |v: &arrow::array::Int32Array, r: &UInt64Array, s, l| {
+                            let e = s + l; let mut sv = acc.get(); let mut sr = acc_r.get();
+                            for i in s..e { sv += v.value(i) as i128 as u128; sr += r.value(i) as u128; }
+                            acc.set(sv); acc_r.set(sr);
+                        },
+                    )
+                    .unwrap();
+                black_box(acc.get() ^ acc_r.get());
             },
             BatchSize::SmallInput,
         );

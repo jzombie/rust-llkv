@@ -69,8 +69,8 @@ fn test_large_sort_u64() {
     let mut merge = store.scan_sorted(field_id).unwrap();
 
     let mut collected_results = Vec::with_capacity(NUM_ROWS);
-    while let Some((arr, start, len)) = merge.next_run() {
-        let a = arr.as_any().downcast_ref::<UInt64Array>().unwrap();
+    while let Some((arr_dyn, start, len)) = merge.next_run() {
+        let a = arr_dyn.as_any().downcast_ref::<UInt64Array>().unwrap();
         let end = start + len;
         for i in start..end { collected_results.push(a.value(i)); }
     }
@@ -134,8 +134,8 @@ fn test_large_sort_i32() {
     let mut merge = store.scan_sorted(field_id).unwrap();
 
     let mut collected_results = Vec::with_capacity(NUM_ROWS);
-    while let Some((arr, start, len)) = merge.next_run() {
-        let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+    while let Some((arr_dyn, start, len)) = merge.next_run() {
+        let a = arr_dyn.as_any().downcast_ref::<Int32Array>().unwrap();
         let end = start + len;
         for i in start..end { collected_results.push(a.value(i)); }
     }
