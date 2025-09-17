@@ -1,13 +1,17 @@
-use std::collections::HashMap;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array, UInt8Array};
+use arrow::array::{
+    Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
+use llkv_column_map::store::scan::{PrimitiveSortedVisitor, ScanOptions};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use rand::seq::SliceRandom;
@@ -113,76 +117,296 @@ fn scan_all_integer_types_sorted_and_ranges() {
         store.create_sort_index(field_id).unwrap();
 
         // Validate ascending order and collect using visitor
-        use llkv_column_map::store::scan::{PrimitiveSortedVisitor, ScanOptions};
         let asc: RefCell<Vec<i128>> = RefCell::new(Vec::with_capacity(N));
-        struct CollectAsc<'a> { out: &'a RefCell<Vec<i128>> }
+        struct CollectAsc<'a> {
+            out: &'a RefCell<Vec<i128>>,
+        }
         impl<'a> llkv_column_map::store::scan::PrimitiveVisitor for CollectAsc<'a> {}
         impl<'a> llkv_column_map::store::scan::PrimitiveWithRowIdsVisitor for CollectAsc<'a> {}
         impl<'a> llkv_column_map::store::scan::PrimitiveSortedWithRowIdsVisitor for CollectAsc<'a> {}
         impl<'a> PrimitiveSortedVisitor for CollectAsc<'a> {
-            fn u64_run(&mut self, a: &UInt64Array, s: usize, l: usize) { let e=s+l; let mut v=self.out.borrow_mut(); for i in s..e { v.push(a.value(i) as i128); } }
-            fn u32_run(&mut self, a: &UInt32Array, s: usize, l: usize) { let e=s+l; let mut v=self.out.borrow_mut(); for i in s..e { v.push(a.value(i) as i128); } }
-            fn u16_run(&mut self, a: &UInt16Array, s: usize, l: usize) { let e=s+l; let mut v=self.out.borrow_mut(); for i in s..e { v.push(a.value(i) as i128); } }
-            fn u8_run(&mut self,  a: &UInt8Array,  s: usize, l: usize) { let e=s+l; let mut v=self.out.borrow_mut(); for i in s..e { v.push(a.value(i) as i128); } }
-            fn i64_run(&mut self, a: &Int64Array,  s: usize, l: usize) { let e=s+l; let mut v=self.out.borrow_mut(); for i in s..e { v.push(a.value(i) as i128); } }
-            fn i32_run(&mut self, a: &Int32Array,  s: usize, l: usize) { let e=s+l; let mut v=self.out.borrow_mut(); for i in s..e { v.push(a.value(i) as i128); } }
-            fn i16_run(&mut self, a: &Int16Array,  s: usize, l: usize) { let e=s+l; let mut v=self.out.borrow_mut(); for i in s..e { v.push(a.value(i) as i128); } }
-            fn i8_run(&mut self,  a: &Int8Array,   s: usize, l: usize) { let e=s+l; let mut v=self.out.borrow_mut(); for i in s..e { v.push(a.value(i) as i128); } }
+            fn u64_run(&mut self, a: &UInt64Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut v = self.out.borrow_mut();
+                for i in s..e {
+                    v.push(a.value(i) as i128);
+                }
+            }
+            fn u32_run(&mut self, a: &UInt32Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut v = self.out.borrow_mut();
+                for i in s..e {
+                    v.push(a.value(i) as i128);
+                }
+            }
+            fn u16_run(&mut self, a: &UInt16Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut v = self.out.borrow_mut();
+                for i in s..e {
+                    v.push(a.value(i) as i128);
+                }
+            }
+            fn u8_run(&mut self, a: &UInt8Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut v = self.out.borrow_mut();
+                for i in s..e {
+                    v.push(a.value(i) as i128);
+                }
+            }
+            fn i64_run(&mut self, a: &Int64Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut v = self.out.borrow_mut();
+                for i in s..e {
+                    v.push(a.value(i) as i128);
+                }
+            }
+            fn i32_run(&mut self, a: &Int32Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut v = self.out.borrow_mut();
+                for i in s..e {
+                    v.push(a.value(i) as i128);
+                }
+            }
+            fn i16_run(&mut self, a: &Int16Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut v = self.out.borrow_mut();
+                for i in s..e {
+                    v.push(a.value(i) as i128);
+                }
+            }
+            fn i8_run(&mut self, a: &Int8Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut v = self.out.borrow_mut();
+                for i in s..e {
+                    v.push(a.value(i) as i128);
+                }
+            }
         }
         let mut visitor = CollectAsc { out: &asc };
-        store.scan(field_id, ScanOptions{ sorted: true, reverse: false, with_row_ids: false, row_id_field: None }, &mut visitor).unwrap();
+        store
+            .scan(
+                field_id,
+                ScanOptions {
+                    sorted: true,
+                    reverse: false,
+                    with_row_ids: false,
+                    row_id_field: None,
+                },
+                &mut visitor,
+            )
+            .unwrap();
         let asc = asc.into_inner();
         // Accept that non-matching closures are no-ops for other types (we used typed append above)
         // Verify ascending is sorted
         assert!(asc.windows(2).all(|w| w[0] <= w[1]));
 
         // Reverse check using store's reverse scanner
-        use llkv_column_map::store::scan::PrimitiveSortedVisitor as _;
         let desc: RefCell<Vec<i128>> = RefCell::new(Vec::with_capacity(N));
-        struct CollectDesc<'a> { out: &'a RefCell<Vec<i128>> }
+        struct CollectDesc<'a> {
+            out: &'a RefCell<Vec<i128>>,
+        }
         impl<'a> llkv_column_map::store::scan::PrimitiveVisitor for CollectDesc<'a> {}
         impl<'a> llkv_column_map::store::scan::PrimitiveWithRowIdsVisitor for CollectDesc<'a> {}
         impl<'a> llkv_column_map::store::scan::PrimitiveSortedWithRowIdsVisitor for CollectDesc<'a> {}
         impl<'a> PrimitiveSortedVisitor for CollectDesc<'a> {
-            fn u64_run(&mut self, a: &UInt64Array, s: usize, l: usize) { let mut v=self.out.borrow_mut(); let mut i=s+l; while i> s { i-=1; v.push(a.value(i) as i128); } }
-            fn u32_run(&mut self, a: &UInt32Array, s: usize, l: usize) { let mut v=self.out.borrow_mut(); let mut i=s+l; while i> s { i-=1; v.push(a.value(i) as i128); } }
-            fn u16_run(&mut self, a: &UInt16Array, s: usize, l: usize) { let mut v=self.out.borrow_mut(); let mut i=s+l; while i> s { i-=1; v.push(a.value(i) as i128); } }
-            fn u8_run(&mut self,  a: &UInt8Array,  s: usize, l: usize) { let mut v=self.out.borrow_mut(); let mut i=s+l; while i> s { i-=1; v.push(a.value(i) as i128); } }
-            fn i64_run(&mut self, a: &Int64Array,  s: usize, l: usize) { let mut v=self.out.borrow_mut(); let mut i=s+l; while i> s { i-=1; v.push(a.value(i) as i128); } }
-            fn i32_run(&mut self, a: &Int32Array,  s: usize, l: usize) { let mut v=self.out.borrow_mut(); let mut i=s+l; while i> s { i-=1; v.push(a.value(i) as i128); } }
-            fn i16_run(&mut self, a: &Int16Array,  s: usize, l: usize) { let mut v=self.out.borrow_mut(); let mut i=s+l; while i> s { i-=1; v.push(a.value(i) as i128); } }
-            fn i8_run(&mut self,  a: &Int8Array,   s: usize, l: usize) { let mut v=self.out.borrow_mut(); let mut i=s+l; while i> s { i-=1; v.push(a.value(i) as i128); } }
+            fn u64_run(&mut self, a: &UInt64Array, s: usize, l: usize) {
+                let mut v = self.out.borrow_mut();
+                let mut i = s + l;
+                while i > s {
+                    i -= 1;
+                    v.push(a.value(i) as i128);
+                }
+            }
+            fn u32_run(&mut self, a: &UInt32Array, s: usize, l: usize) {
+                let mut v = self.out.borrow_mut();
+                let mut i = s + l;
+                while i > s {
+                    i -= 1;
+                    v.push(a.value(i) as i128);
+                }
+            }
+            fn u16_run(&mut self, a: &UInt16Array, s: usize, l: usize) {
+                let mut v = self.out.borrow_mut();
+                let mut i = s + l;
+                while i > s {
+                    i -= 1;
+                    v.push(a.value(i) as i128);
+                }
+            }
+            fn u8_run(&mut self, a: &UInt8Array, s: usize, l: usize) {
+                let mut v = self.out.borrow_mut();
+                let mut i = s + l;
+                while i > s {
+                    i -= 1;
+                    v.push(a.value(i) as i128);
+                }
+            }
+            fn i64_run(&mut self, a: &Int64Array, s: usize, l: usize) {
+                let mut v = self.out.borrow_mut();
+                let mut i = s + l;
+                while i > s {
+                    i -= 1;
+                    v.push(a.value(i) as i128);
+                }
+            }
+            fn i32_run(&mut self, a: &Int32Array, s: usize, l: usize) {
+                let mut v = self.out.borrow_mut();
+                let mut i = s + l;
+                while i > s {
+                    i -= 1;
+                    v.push(a.value(i) as i128);
+                }
+            }
+            fn i16_run(&mut self, a: &Int16Array, s: usize, l: usize) {
+                let mut v = self.out.borrow_mut();
+                let mut i = s + l;
+                while i > s {
+                    i -= 1;
+                    v.push(a.value(i) as i128);
+                }
+            }
+            fn i8_run(&mut self, a: &Int8Array, s: usize, l: usize) {
+                let mut v = self.out.borrow_mut();
+                let mut i = s + l;
+                while i > s {
+                    i -= 1;
+                    v.push(a.value(i) as i128);
+                }
+            }
         }
         let mut visitor_desc = CollectDesc { out: &desc };
-        store.scan(field_id, ScanOptions{ sorted: true, reverse: true, with_row_ids: false, row_id_field: None }, &mut visitor_desc).unwrap();
+        store
+            .scan(
+                field_id,
+                ScanOptions {
+                    sorted: true,
+                    reverse: true,
+                    with_row_ids: false,
+                    row_id_field: None,
+                },
+                &mut visitor_desc,
+            )
+            .unwrap();
         let desc = desc.into_inner();
         assert_eq!(desc.len(), N);
         // desc should be strictly descending (allow equals for duplicate values)
         assert!(desc.windows(2).all(|w| w[0] >= w[1]));
         // And is the reverse of asc
-        let mut asc_r = asc.clone(); asc_r.reverse();
+        let mut asc_r = asc.clone();
+        asc_r.reverse();
         assert_eq!(desc, asc_r);
 
         // Range scan emulation via closure (phase 1): lo..=hi
-        let lo = asc[N/3];
-        let hi = asc[2*N/3];
+        let lo = asc[N / 3];
+        let hi = asc[2 * N / 3];
         let ranged: RefCell<Vec<i128>> = RefCell::new(Vec::new());
-        struct CollectRange<'a> { out: &'a RefCell<Vec<i128>>, lo: i128, hi: i128 }
+        struct CollectRange<'a> {
+            out: &'a RefCell<Vec<i128>>,
+            lo: i128,
+            hi: i128,
+        }
         impl<'a> llkv_column_map::store::scan::PrimitiveVisitor for CollectRange<'a> {}
         impl<'a> llkv_column_map::store::scan::PrimitiveWithRowIdsVisitor for CollectRange<'a> {}
         impl<'a> llkv_column_map::store::scan::PrimitiveSortedWithRowIdsVisitor for CollectRange<'a> {}
         impl<'a> PrimitiveSortedVisitor for CollectRange<'a> {
-            fn u64_run(&mut self, a: &UInt64Array, s: usize, l: usize) { let e=s+l; let mut w=self.out.borrow_mut(); for i in s..e { let v=a.value(i) as i128; if v>=self.lo && v<=self.hi { w.push(v); } } }
-            fn u32_run(&mut self, a: &UInt32Array, s: usize, l: usize) { let e=s+l; let mut w=self.out.borrow_mut(); for i in s..e { let v=a.value(i) as i128; if v>=self.lo && v<=self.hi { w.push(v); } } }
-            fn u16_run(&mut self, a: &UInt16Array, s: usize, l: usize) { let e=s+l; let mut w=self.out.borrow_mut(); for i in s..e { let v=a.value(i) as i128; if v>=self.lo && v<=self.hi { w.push(v); } } }
-            fn u8_run(&mut self,  a: &UInt8Array,  s: usize, l: usize) { let e=s+l; let mut w=self.out.borrow_mut(); for i in s..e { let v=a.value(i) as i128; if v>=self.lo && v<=self.hi { w.push(v); } } }
-            fn i64_run(&mut self, a: &Int64Array,  s: usize, l: usize) { let e=s+l; let mut w=self.out.borrow_mut(); for i in s..e { let v=a.value(i) as i128; if v>=self.lo && v<=self.hi { w.push(v); } } }
-            fn i32_run(&mut self, a: &Int32Array,  s: usize, l: usize) { let e=s+l; let mut w=self.out.borrow_mut(); for i in s..e { let v=a.value(i) as i128; if v>=self.lo && v<=self.hi { w.push(v); } } }
-            fn i16_run(&mut self, a: &Int16Array,  s: usize, l: usize) { let e=s+l; let mut w=self.out.borrow_mut(); for i in s..e { let v=a.value(i) as i128; if v>=self.lo && v<=self.hi { w.push(v); } } }
-            fn i8_run(&mut self,  a: &Int8Array,   s: usize, l: usize) { let e=s+l; let mut w=self.out.borrow_mut(); for i in s..e { let v=a.value(i) as i128; if v>=self.lo && v<=self.hi { w.push(v); } } }
+            fn u64_run(&mut self, a: &UInt64Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut w = self.out.borrow_mut();
+                for i in s..e {
+                    let v = a.value(i) as i128;
+                    if v >= self.lo && v <= self.hi {
+                        w.push(v);
+                    }
+                }
+            }
+            fn u32_run(&mut self, a: &UInt32Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut w = self.out.borrow_mut();
+                for i in s..e {
+                    let v = a.value(i) as i128;
+                    if v >= self.lo && v <= self.hi {
+                        w.push(v);
+                    }
+                }
+            }
+            fn u16_run(&mut self, a: &UInt16Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut w = self.out.borrow_mut();
+                for i in s..e {
+                    let v = a.value(i) as i128;
+                    if v >= self.lo && v <= self.hi {
+                        w.push(v);
+                    }
+                }
+            }
+            fn u8_run(&mut self, a: &UInt8Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut w = self.out.borrow_mut();
+                for i in s..e {
+                    let v = a.value(i) as i128;
+                    if v >= self.lo && v <= self.hi {
+                        w.push(v);
+                    }
+                }
+            }
+            fn i64_run(&mut self, a: &Int64Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut w = self.out.borrow_mut();
+                for i in s..e {
+                    let v = a.value(i) as i128;
+                    if v >= self.lo && v <= self.hi {
+                        w.push(v);
+                    }
+                }
+            }
+            fn i32_run(&mut self, a: &Int32Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut w = self.out.borrow_mut();
+                for i in s..e {
+                    let v = a.value(i) as i128;
+                    if v >= self.lo && v <= self.hi {
+                        w.push(v);
+                    }
+                }
+            }
+            fn i16_run(&mut self, a: &Int16Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut w = self.out.borrow_mut();
+                for i in s..e {
+                    let v = a.value(i) as i128;
+                    if v >= self.lo && v <= self.hi {
+                        w.push(v);
+                    }
+                }
+            }
+            fn i8_run(&mut self, a: &Int8Array, s: usize, l: usize) {
+                let e = s + l;
+                let mut w = self.out.borrow_mut();
+                for i in s..e {
+                    let v = a.value(i) as i128;
+                    if v >= self.lo && v <= self.hi {
+                        w.push(v);
+                    }
+                }
+            }
         }
-        let mut visitor2 = CollectRange { out: &ranged, lo, hi };
-        store.scan(field_id, ScanOptions{ sorted: true, reverse: false, with_row_ids: false, row_id_field: None }, &mut visitor2).unwrap();
+        let mut visitor2 = CollectRange {
+            out: &ranged,
+            lo,
+            hi,
+        };
+        store
+            .scan(
+                field_id,
+                ScanOptions {
+                    sorted: true,
+                    reverse: false,
+                    with_row_ids: false,
+                    row_id_field: None,
+                },
+                &mut visitor2,
+            )
+            .unwrap();
         let ranged = ranged.into_inner();
         assert!(ranged.windows(2).all(|w| w[0] <= w[1]));
         assert!(ranged.first().unwrap() >= &lo && ranged.last().unwrap() <= &hi);
@@ -191,7 +415,9 @@ fn scan_all_integer_types_sorted_and_ranges() {
     // Generators per dtype
     let mut gen_signed = |n: usize, bits: u32| -> Vec<i128> {
         let range = 1i128 << (bits - 1);
-        (0..n).map(|i| ((i as i128 % (2*range)) - range)).collect()
+        (0..n)
+            .map(|i| ((i as i128 % (2 * range)) - range))
+            .collect()
     };
     let mut gen_unsigned = |n: usize, bits: u32| -> Vec<i128> {
         let max = 1i128 << bits;
@@ -199,11 +425,11 @@ fn scan_all_integer_types_sorted_and_ranges() {
     };
 
     // Exercise all integer types
-    test_type(DataType::Int8,  &mut |n| gen_signed(n, 8));
+    test_type(DataType::Int8, &mut |n| gen_signed(n, 8));
     test_type(DataType::Int16, &mut |n| gen_signed(n, 16));
     test_type(DataType::Int32, &mut |n| gen_signed(n, 32));
     test_type(DataType::Int64, &mut |n| gen_signed(n, 64));
-    test_type(DataType::UInt8,  &mut |n| gen_unsigned(n, 8));
+    test_type(DataType::UInt8, &mut |n| gen_unsigned(n, 8));
     test_type(DataType::UInt16, &mut |n| gen_unsigned(n, 16));
     test_type(DataType::UInt32, &mut |n| gen_unsigned(n, 32));
     test_type(DataType::UInt64, &mut |n| gen_unsigned(n, 64));
