@@ -518,6 +518,40 @@ impl SortedMerge {
     }
 }
 
+// --------------------- Arrow-only wrappers (public) ----------------------
+
+/// Arrow-only wrapper over `SortedMerge` that yields `(ArrayRef, start, len)`.
+pub struct SortedRunsAny {
+    inner: SortedMerge,
+}
+
+impl SortedRunsAny {
+    pub fn new(inner: SortedMerge) -> Self { Self { inner } }
+
+    /// Type-erased bounds passthrough.
+    pub fn with_bounds(self, lo: BoundValue, hi: BoundValue) -> Result<Self> {
+        Ok(SortedRunsAny { inner: self.inner.with_bounds(lo, hi)? })
+    }
+
+    /// Drain one coalesced run as a borrowed Arrow array and range.
+    pub fn next_run<'a>(&'a mut self) -> Option<(&'a dyn Array, usize, usize)> {
+        match &mut self.inner {
+            SortedMerge::U64(m) => m.next_run().map(|r| match r {
+                Run::U64 { arr, start, len } => (arr as &dyn Array, start, len),
+                _ => unreachable!(),
+            }),
+            SortedMerge::I32(m) => m.next_run().map(|r| match r {
+                Run::I32 { arr, start, len } => (arr as &dyn Array, start, len),
+                _ => unreachable!(),
+            }),
+        }
+    }
+
+    pub fn total_rows(&self) -> usize { self.inner.total_rows() }
+    pub fn num_cursors(&self) -> usize { self.inner.num_cursors() }
+    pub fn is_empty(&self) -> bool { self.inner.is_empty() }
+}
+
 // ------------------------------ Unsorted scan -----------------------------
 
 pub struct UnsortedScan<P: Pager<Blob = EntryHandle>> {
@@ -745,7 +779,7 @@ where
 
     /// Sorted scan via k-way merge over pre-sorted chunks. Requires that
     /// `create_sort_index(field_id)` has been called (perms must exist).
-    pub fn scan_sorted(&self, field_id: LogicalFieldId) -> Result<SortedMerge> {
+    pub fn scan_sorted(&self, field_id: LogicalFieldId) -> Result<SortedRunsAny> {
         // Look up descriptor pk
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
@@ -776,8 +810,9 @@ where
         }
 
         if metas.is_empty() {
-            // Build an empty iterator with correct variant
-            return SortedMerge::build(&[], FxHashMap::default(), SortOptions::default());
+            // Build an empty iterator with correct variant and wrap.
+            let empty = SortedMerge::build(&[], FxHashMap::default(), SortOptions::default())?;
+            return Ok(SortedRunsAny::new(empty));
         }
 
         // Batch get all data and perm blobs in one go.
@@ -800,7 +835,7 @@ where
             }
         }
 
-        SortedMerge::build(&metas, blobs, SortOptions::default())
+        SortedMerge::build(&metas, blobs, SortOptions::default()).map(SortedRunsAny::new)
     }
 
     /// Ergonomic: sorted scan + apply type-erased bounds in one call.
@@ -809,7 +844,7 @@ where
         field_id: LogicalFieldId,
         lo: BoundValue,
         hi: BoundValue,
-    ) -> Result<SortedMerge> {
+    ) -> Result<SortedRunsAny> {
         let it = self.scan_sorted(field_id)?;
         it.with_bounds(lo, hi)
     }
@@ -820,7 +855,7 @@ where
         &self,
         value_fid: LogicalFieldId,
         rowid_fid: LogicalFieldId,
-    ) -> Result<SortedMergeWithRowIds> {
+    ) -> Result<SortedRunsAnyWithRowIds> {
         // value descriptor / metas
         let descriptor_pk_val = {
             let catalog = self.catalog.read().unwrap();
@@ -942,7 +977,7 @@ where
                     blobs_rid,
                     SortOptions::default(),
                 )?;
-                Ok(SortedMergeWithRowIds::U64(it))
+                Ok(SortedRunsAnyWithRowIds::new(SortedMergeWithRowIds::U64(it)))
             }
             DataType::Int32 => {
                 let it = MergeI32WithRowIds::build(
@@ -952,7 +987,7 @@ where
                     blobs_rid,
                     SortOptions::default(),
                 )?;
-                Ok(SortedMergeWithRowIds::I32(it))
+                Ok(SortedRunsAnyWithRowIds::new(SortedMergeWithRowIds::I32(it)))
             }
             other => Err(Error::Internal(format!(
                 "Unsupported sort type {:?}",
@@ -1288,6 +1323,42 @@ impl SortedMergeWithRowIds {
             SortedMergeWithRowIds::I32(m) => m.is_empty(),
         }
     }
+}
+
+/// Arrow-only wrapper over `SortedMergeWithRowIds` that yields `(values, row_ids, start, len)`.
+pub struct SortedRunsAnyWithRowIds {
+    inner: SortedMergeWithRowIds,
+}
+
+impl SortedRunsAnyWithRowIds {
+    pub fn new(inner: SortedMergeWithRowIds) -> Self { Self { inner } }
+
+    pub fn with_bounds(self, lo: BoundValue, hi: BoundValue) -> Result<Self> {
+        Ok(SortedRunsAnyWithRowIds { inner: self.inner.with_bounds(lo, hi)? })
+    }
+
+    pub fn next_run<'a>(
+        &'a mut self,
+    ) -> Option<(&'a dyn Array, &'a UInt64Array, usize, usize)> {
+        match &mut self.inner {
+            SortedMergeWithRowIds::U64(m) => m.next_run().map(|r| match r {
+                RunWithRowIds::U64 { vals, rids, start, len } => {
+                    (vals as &dyn Array, rids, start, len)
+                }
+                _ => unreachable!(),
+            }),
+            SortedMergeWithRowIds::I32(m) => m.next_run().map(|r| match r {
+                RunWithRowIds::I32 { vals, rids, start, len } => {
+                    (vals as &dyn Array, rids, start, len)
+                }
+                _ => unreachable!(),
+            }),
+        }
+    }
+
+    pub fn total_rows(&self) -> usize { self.inner.total_rows() }
+    pub fn num_cursors(&self) -> usize { self.inner.num_cursors() }
+    pub fn is_empty(&self) -> bool { self.inner.is_empty() }
 }
 
 // ------------------------------- Visitor traits -------------------------------

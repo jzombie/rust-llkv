@@ -23,7 +23,7 @@ use arrow::record_batch::RecordBatch;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::{ColumnStore, Run, SortedMerge, SortedMergeWithRowIds};
+use llkv_column_map::store::ColumnStore;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use rand::rngs::StdRng;
@@ -126,20 +126,11 @@ fn bench_scans(c: &mut Criterion) {
             || seed_store_1m(),
             |(store, fid)| {
                 let mut acc: u128 = 0;
-                match store.scan_sorted(fid).unwrap() {
-                    SortedMerge::U64(mut m) => {
-                        while let Some(run) = m.next_run() {
-                            let (arr, start, len) = match run {
-                                Run::U64 { arr, start, len } => (arr, start, len),
-                                _ => unreachable!("merge variant mismatch"),
-                            };
-                            let end = start + len;
-                            for i in start..end {
-                                acc += arr.value(i) as u128;
-                            }
-                        }
-                    }
-                    SortedMerge::I32(_) => unreachable!("expected u64"),
+                let mut m = store.scan_sorted(fid).unwrap();
+                while let Some((arr_dyn, start, len)) = m.next_run() {
+                    let arr = arr_dyn.as_any().downcast_ref::<UInt64Array>().unwrap();
+                    let end = start + len;
+                    for i in start..end { acc += arr.value(i) as u128; }
                 }
                 black_box(acc);
             },
@@ -155,22 +146,11 @@ fn bench_scans(c: &mut Criterion) {
                 let rid_fid = fid.with_namespace(Namespace::RowIdShadow);
                 let mut acc: u128 = 0;
                 let mut acc_r: u128 = 0;
-                match store.scan_sorted_with_row_ids(fid, rid_fid).unwrap() {
-                    SortedMergeWithRowIds::U64(mut m) => {
-                        while let Some(run) = m.next_run() {
-                            match run {
-                                llkv_column_map::store::RunWithRowIds::U64 { vals, rids, start, len } => {
-                                    let end = start + len;
-                                    for i in start..end {
-                                        acc += vals.value(i) as u128;
-                                        acc_r += rids.value(i) as u128;
-                                    }
-                                }
-                                _ => unreachable!("merge variant mismatch"),
-                            }
-                        }
-                    }
-                    SortedMergeWithRowIds::I32(_) => unreachable!("expected u64"),
+                let mut m = store.scan_sorted_with_row_ids(fid, rid_fid).unwrap();
+                while let Some((vals_dyn, rids, start, len)) = m.next_run() {
+                    let vals = vals_dyn.as_any().downcast_ref::<UInt64Array>().unwrap();
+                    let end = start + len;
+                    for i in start..end { acc += vals.value(i) as u128; acc_r += rids.value(i) as u128; }
                 }
                 black_box(acc ^ acc_r);
             },
@@ -183,4 +163,3 @@ fn bench_scans(c: &mut Criterion) {
 
 criterion_group!(benches, bench_scans);
 criterion_main!(benches);
-

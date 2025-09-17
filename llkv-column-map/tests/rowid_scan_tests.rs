@@ -6,7 +6,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::{ColumnStore, Run, SortedMergeWithRowIds};
+use llkv_column_map::store::ColumnStore;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use rand::rngs::StdRng;
@@ -106,33 +106,19 @@ fn sorted_scan_with_row_ids_is_correct() {
     let mut count = 0usize;
     let mut prev: Option<u64> = None;
 
-    match store
-        .scan_sorted_with_row_ids(field_id, rid_fid)
-        .unwrap()
-    {
-        SortedMergeWithRowIds::U64(mut m) => {
-            while let Some(run) = m.next_run() {
-                match run {
-                    llkv_column_map::store::RunWithRowIds::U64 { vals, rids, start, len } => {
-                        let end = start + len;
-                        for i in start..end {
-                            let v = vals.value(i);
-                            if let Some(p) = prev {
-                                assert!(v >= p, "values must be non-decreasing in sorted scan");
-                            }
-                            prev = Some(v);
-                            let rid = rids.value(i) as usize;
-                            assert_eq!(rid, inv[v as usize]);
-                        }
-                        count += len;
-                    }
-                    _ => panic!("unexpected merge variant for u64 test"),
-                }
-            }
+    let mut m = store.scan_sorted_with_row_ids(field_id, rid_fid).unwrap();
+    while let Some((vals_dyn, rids, start, len)) = m.next_run() {
+        let vals = vals_dyn.as_any().downcast_ref::<UInt64Array>().unwrap();
+        let end = start + len;
+        for i in start..end {
+            let v = vals.value(i);
+            if let Some(p) = prev { assert!(v >= p, "values must be non-decreasing in sorted scan"); }
+            prev = Some(v);
+            let rid = rids.value(i) as usize;
+            assert_eq!(rid, inv[v as usize]);
         }
-        _ => panic!("expected u64 variant"),
+        count += len;
     }
 
     assert_eq!(count, N);
 }
-

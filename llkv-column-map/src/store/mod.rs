@@ -1929,28 +1929,24 @@ where
     ) -> Result<()> {
         let dt = self.dtype_for_field(field_id)?;
         match dt {
-            DataType::UInt64 => match self.scan_sorted(field_id)? {
-                SortedMerge::U64(mut m) => {
-                    while let Some(run) = m.next_run() {
-                        if let Run::U64 { arr, start, len } = run {
-                            visitor.u64_run(arr, start, len);
-                        }
-                    }
-                    Ok(())
+            DataType::UInt64 => {
+                let mut m = self.scan_sorted(field_id)?;
+                while let Some((arr_any, start, len)) = m.next_run() {
+                    let arr = arr_any.as_any().downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| Error::Internal("expected UInt64".into()))?;
+                    visitor.u64_run(arr, start, len);
                 }
-                _ => Err(Error::Internal("unexpected merge variant".into())),
-            },
-            DataType::Int32 => match self.scan_sorted(field_id)? {
-                SortedMerge::I32(mut m) => {
-                    while let Some(run) = m.next_run() {
-                        if let Run::I32 { arr, start, len } = run {
-                            visitor.i32_run(arr, start, len);
-                        }
-                    }
-                    Ok(())
+                Ok(())
+            }
+            DataType::Int32 => {
+                let mut m = self.scan_sorted(field_id)?;
+                while let Some((arr_any, start, len)) = m.next_run() {
+                    let arr = arr_any.as_any().downcast_ref::<Int32Array>()
+                        .ok_or_else(|| Error::Internal("expected Int32".into()))?;
+                    visitor.i32_run(arr, start, len);
                 }
-                _ => Err(Error::Internal("unexpected merge variant".into())),
-            },
+                Ok(())
+            }
             _ => Err(Error::Internal("unsupported sorted scan dtype".into())),
         }
     }
@@ -1966,32 +1962,24 @@ where
     ) -> Result<()> {
         let dt = self.dtype_for_field(value_fid)?;
         match dt {
-            DataType::UInt64 => match self.scan_sorted_with_row_ids(value_fid, rowid_fid)? {
-                SortedMergeWithRowIds::U64(mut m) => {
-                    while let Some(run) = m.next_run() {
-                        if let crate::store::iter::RunWithRowIds::U64 { vals, rids, start, len } =
-                            run
-                        {
-                            visitor.u64_run_with_rids(vals, rids, start, len);
-                        }
-                    }
-                    Ok(())
+            DataType::UInt64 => {
+                let mut m = self.scan_sorted_with_row_ids(value_fid, rowid_fid)?;
+                while let Some((vals_any, rids, start, len)) = m.next_run() {
+                    let vals = vals_any.as_any().downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| Error::Internal("expected UInt64".into()))?;
+                    visitor.u64_run_with_rids(vals, &rids, start, len);
                 }
-                _ => Err(Error::Internal("unexpected merge variant".into())),
-            },
-            DataType::Int32 => match self.scan_sorted_with_row_ids(value_fid, rowid_fid)? {
-                SortedMergeWithRowIds::I32(mut m) => {
-                    while let Some(run) = m.next_run() {
-                        if let crate::store::iter::RunWithRowIds::I32 { vals, rids, start, len } =
-                            run
-                        {
-                            visitor.i32_run_with_rids(vals, rids, start, len);
-                        }
-                    }
-                    Ok(())
+                Ok(())
+            }
+            DataType::Int32 => {
+                let mut m = self.scan_sorted_with_row_ids(value_fid, rowid_fid)?;
+                while let Some((vals_any, rids, start, len)) = m.next_run() {
+                    let vals = vals_any.as_any().downcast_ref::<Int32Array>()
+                        .ok_or_else(|| Error::Internal("expected Int32".into()))?;
+                    visitor.i32_run_with_rids(vals, &rids, start, len);
                 }
-                _ => Err(Error::Internal("unexpected merge variant".into())),
-            },
+                Ok(())
+            }
             _ => Err(Error::Internal("unsupported sorted scan dtype".into())),
         }
     }

@@ -9,14 +9,14 @@ use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, UInt64Array};
+use arrow::array::{Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::{self, ColumnStore, Run, SortedMerge, SortedMergeWithRowIds};
+use llkv_column_map::store::{self, ColumnStore};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use rand::rngs::StdRng;
@@ -190,15 +190,10 @@ fn bench_dispatch_overhead(c: &mut Criterion) {
             || seed_store_1m_u64(),
             |(store, fid)| {
                 let mut acc: u128 = 0;
-                match store.scan_sorted(fid).unwrap() {
-                    SortedMerge::U64(mut m) => {
-                        while let Some(run) = m.next_run() {
-                            if let Run::U64 { arr, start, len } = run {
-                                let e = start + len; for i in start..e { acc += arr.value(i) as u128; }
-                            }
-                        }
-                    }
-                    _ => unreachable!(),
+                let mut m = store.scan_sorted(fid).unwrap();
+                while let Some((arr_dyn, start, len)) = m.next_run() {
+                    let arr = arr_dyn.as_any().downcast_ref::<UInt64Array>().unwrap();
+                    let e = start + len; for i in start..e { acc += arr.value(i) as u128; }
                 }
                 black_box(acc);
             },
@@ -226,18 +221,10 @@ fn bench_dispatch_overhead(c: &mut Criterion) {
             |(store, fid)| {
                 let rid_fid = fid.with_namespace(Namespace::RowIdShadow);
                 let mut sv: u128 = 0; let mut sr: u128 = 0;
-                match store.scan_sorted_with_row_ids(fid, rid_fid).unwrap() {
-                    SortedMergeWithRowIds::U64(mut m) => {
-                        while let Some(run) = m.next_run() {
-                            match run {
-                                llkv_column_map::store::RunWithRowIds::U64 { vals, rids, start, len } => {
-                                    let e = start + len; for i in start..e { sv += vals.value(i) as u128; sr += rids.value(i) as u128; }
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
-                    }
-                    _ => unreachable!(),
+                let mut m = store.scan_sorted_with_row_ids(fid, rid_fid).unwrap();
+                while let Some((vals_dyn, rids, start, len)) = m.next_run() {
+                    let vals = vals_dyn.as_any().downcast_ref::<UInt64Array>().unwrap();
+                    let e = start + len; for i in start..e { sv += vals.value(i) as u128; sr += rids.value(i) as u128; }
                 }
                 black_box(sv ^ sr);
             },
@@ -266,4 +253,3 @@ fn bench_dispatch_overhead(c: &mut Criterion) {
 
 criterion_group!(benches, bench_dispatch_overhead);
 criterion_main!(benches);
-

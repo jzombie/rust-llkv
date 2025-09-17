@@ -13,7 +13,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::{BoundValue, ColumnStore, Run};
+use llkv_column_map::store::{BoundValue, ColumnStore};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use rand::rng;
@@ -93,16 +93,10 @@ fn collect_u64_in_bounds(
         .with_bounds(BoundValue::U64(lo), BoundValue::U64(hi))
         .unwrap();
     let mut out = Vec::new();
-    while let Some(run) = m.next_run() {
-        match run {
-            Run::U64 { arr, start, len } => {
-                let end = start + len;
-                for i in start..end {
-                    out.push(arr.value(i));
-                }
-            }
-            _ => panic!("unexpected run type for u64"),
-        }
+    while let Some((arr_dyn, start, len)) = m.next_run() {
+        let arr = arr_dyn.as_any().downcast_ref::<UInt64Array>().unwrap();
+        let end = start + len;
+        for i in start..end { out.push(arr.value(i)); }
     }
     out
 }
@@ -119,16 +113,10 @@ fn collect_i32_in_bounds(
         .with_bounds(BoundValue::I32(lo), BoundValue::I32(hi))
         .unwrap();
     let mut out = Vec::new();
-    while let Some(run) = m.next_run() {
-        match run {
-            Run::I32 { arr, start, len } => {
-                let end = start + len;
-                for i in start..end {
-                    out.push(arr.value(i));
-                }
-            }
-            _ => panic!("unexpected run type for i32"),
-        }
+    while let Some((arr_dyn, start, len)) = m.next_run() {
+        let arr = arr_dyn.as_any().downcast_ref::<Int32Array>().unwrap();
+        let end = start + len;
+        for i in start..end { out.push(arr.value(i)); }
     }
     out
 }

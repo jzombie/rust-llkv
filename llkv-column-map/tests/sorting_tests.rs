@@ -3,7 +3,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::{ColumnStore, Run};
+use llkv_column_map::store::ColumnStore;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use rand::rng;
@@ -69,16 +69,10 @@ fn test_large_sort_u64() {
     let mut merge = store.scan_sorted(field_id).unwrap();
 
     let mut collected_results = Vec::with_capacity(NUM_ROWS);
-    while let Some(run) = merge.next_run() {
-        match run {
-            Run::U64 { arr, start, len } => {
-                let end = start + len;
-                for i in start..end {
-                    collected_results.push(arr.value(i));
-                }
-            }
-            _ => panic!("unexpected run type for u64 test"),
-        }
+    while let Some((arr, start, len)) = merge.next_run() {
+        let a = arr.as_any().downcast_ref::<UInt64Array>().unwrap();
+        let end = start + len;
+        for i in start..end { collected_results.push(a.value(i)); }
     }
     println!("Scan complete.");
 
@@ -140,16 +134,10 @@ fn test_large_sort_i32() {
     let mut merge = store.scan_sorted(field_id).unwrap();
 
     let mut collected_results = Vec::with_capacity(NUM_ROWS);
-    while let Some(run) = merge.next_run() {
-        match run {
-            Run::I32 { arr, start, len } => {
-                let end = start + len;
-                for i in start..end {
-                    collected_results.push(arr.value(i));
-                }
-            }
-            _ => panic!("unexpected run type for i32 test"),
-        }
+    while let Some((arr, start, len)) = merge.next_run() {
+        let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+        let end = start + len;
+        for i in start..end { collected_results.push(a.value(i)); }
     }
     println!("Scan complete.");
 
