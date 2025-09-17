@@ -1289,3 +1289,32 @@ impl SortedMergeWithRowIds {
         }
     }
 }
+
+// ------------------------------- Visitor traits -------------------------------
+
+/// Visitor for unsorted primitive chunks. Default methods are no-ops so an
+/// implementation may override only what it needs.
+pub trait PrimitiveVisitor {
+    fn u64_chunk(&mut self, _a: &UInt64Array) {}
+    fn i32_chunk(&mut self, _a: &Int32Array) {}
+    fn any_chunk(&mut self, _a: &ArrayRef) {}
+}
+
+/// Visitor for unsorted primitive chunks with row ids.
+pub trait PrimitiveWithRowIdsVisitor {
+    fn u64_chunk(&mut self, _vals: &UInt64Array, _rids: &UInt64Array) {}
+    fn i32_chunk(&mut self, _vals: &Int32Array, _rids: &UInt64Array) {}
+    fn any_chunk_with_row_ids(&mut self, _vals: &ArrayRef, _rids: &UInt64Array) {}
+}
+
+/// Visitor for sorted primitive runs.
+pub trait PrimitiveSortedVisitor {
+    fn u64_run(&mut self, _a: &UInt64Array, _start: usize, _len: usize) {}
+    fn i32_run(&mut self, _a: &Int32Array, _start: usize, _len: usize) {}
+}
+
+/// Visitor for sorted primitive runs with row ids.
+pub trait PrimitiveSortedWithRowIdsVisitor {
+    fn u64_run_with_rids(&mut self, _vals: &UInt64Array, _rids: &UInt64Array, _start: usize, _len: usize) {}
+    fn i32_run_with_rids(&mut self, _vals: &Int32Array, _rids: &UInt64Array, _start: usize, _len: usize) {}
+}

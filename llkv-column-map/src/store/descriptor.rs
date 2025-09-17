@@ -74,6 +74,9 @@ pub struct ColumnDescriptor {
     pub tail_page_pk: PhysicalKey,
     pub total_row_count: u64,
     pub total_chunk_count: u64,
+    /// Optional Arrow data type code (0 => unknown). Persisted to avoid peeking chunks.
+    pub data_type_code: u32,
+    pub _padding: u32,
 }
 
 impl ColumnDescriptor {
@@ -89,6 +92,8 @@ impl ColumnDescriptor {
         buf.extend_from_slice(&self.tail_page_pk.to_le_bytes());
         buf.extend_from_slice(&self.total_row_count.to_le_bytes());
         buf.extend_from_slice(&self.total_chunk_count.to_le_bytes());
+        buf.extend_from_slice(&put_u32(self.data_type_code));
+        buf.extend_from_slice(&put_u32(self._padding as u32));
         buf
     }
 
@@ -105,12 +110,22 @@ impl ColumnDescriptor {
         let tail_page_pk = rd(&mut o);
         let total_row_count = rd(&mut o);
         let total_chunk_count = rd(&mut o);
+        // Optional trailer (added in newer versions): [u32 type_code][u32 padding]
+        let mut data_type_code = 0u32;
+        let mut padding = 0u32;
+        if bytes.len() >= o + 8 {
+            data_type_code = get_u32(&bytes[o..o + 4]);
+            padding = get_u32(&bytes[o + 4..o + 8]);
+        }
+
         Self {
             field_id,
             head_page_pk,
             tail_page_pk,
             total_row_count,
             total_chunk_count,
+            data_type_code,
+            _padding: padding,
         }
     }
 }

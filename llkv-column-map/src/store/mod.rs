@@ -9,8 +9,8 @@ use crate::store::descriptor::{
 };
 use crate::types::{CATALOG_ROOT_PKEY, LogicalFieldId, Namespace, PhysicalKey};
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, LargeBinaryArray, LargeStringArray, StringArray,
-    UInt32Array, UInt64Array, make_array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, LargeBinaryArray, LargeStringArray,
+    StringArray, UInt32Array, UInt64Array, make_array,
 };
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;
@@ -302,6 +302,8 @@ pub struct ColumnStore<P: Pager> {
     pager: Arc<P>,
     catalog: RwLock<ColumnCatalog>,
     cfg: ColumnStoreConfig,
+    /// In-memory cache of Arrow DataType per field id (not persisted).
+    dtype_cache: RwLock<FxHashMap<LogicalFieldId, DataType>>,
 }
 
 impl<P> ColumnStore<P>
@@ -326,6 +328,7 @@ where
             pager,
             catalog: RwLock::new(catalog),
             cfg,
+            dtype_cache: RwLock::new(FxHashMap::default()),
         })
     }
 
@@ -423,6 +426,12 @@ where
                 .map(LogicalFieldId::from)
                 .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
 
+            // Warm the dtype cache from schema; avoids a later chunk peek in this process.
+            self.dtype_cache
+                .write()
+                .unwrap()
+                .insert(field_id, field.data_type().clone());
+
             // Filter out nulls in this column and keep matching row_ids only.
             let (array_clean, rids_clean) = if array.null_count() == 0 {
                 (array.clone(), append_row_id_any.clone())
@@ -450,6 +459,12 @@ where
                 self.load_descriptor_state(descriptor_pk, field_id)?;
             let (mut rid_descriptor, mut rid_tail_page) =
                 self.load_descriptor_state(rid_descriptor_pk, rid_fid)?;
+
+            // Persist/refresh dtype fingerprint for both data and row-id descriptors.
+            let fp_data = Self::dtype_fingerprint(field.data_type());
+            Self::set_desc_dtype_fingerprint(&mut data_descriptor, fp_data);
+            let fp_rid = Self::dtype_fingerprint(&DataType::UInt64);
+            Self::set_desc_dtype_fingerprint(&mut rid_descriptor, fp_rid);
 
             // Slice and append.
             let slices = split_to_target_bytes(
@@ -1508,6 +1523,8 @@ where
                     tail_page_pk: first_page_pk,
                     total_row_count: 0,
                     total_chunk_count: 0,
+                    data_type_code: 0,
+                    _padding: 0,
                 };
                 let header = DescriptorPageHeader {
                     next_page_pk: 0,
@@ -1710,5 +1727,272 @@ where
             });
         }
         Ok(all_stats)
+    }
+
+    // -------------------------- Introspection/caching --------------------------
+
+    /// Stable FNV-1a 64-bit over the Debug representation of DataType.
+    #[inline]
+    fn dtype_fingerprint(dt: &DataType) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let s = format!("{:?}", dt);
+        let mut hash = FNV_OFFSET;
+        for b in s.as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    #[inline]
+    fn desc_dtype_fingerprint(desc: &ColumnDescriptor) -> u64 {
+        ((desc._padding as u64) << 32) | (desc.data_type_code as u64)
+    }
+
+    #[inline]
+    fn set_desc_dtype_fingerprint(desc: &mut ColumnDescriptor, fp: u64) {
+        desc.data_type_code = (fp & 0xFFFF_FFFF) as u32;
+        desc._padding = ((fp >> 32) & 0xFFFF_FFFF) as u32;
+    }
+
+    /// Returns and caches the Arrow DataType for a given field id.
+    pub fn dtype_for_field(&self, field_id: LogicalFieldId) -> Result<DataType> {
+        // Fast path: cached
+        if let Some(dt) = self.dtype_cache.read().unwrap().get(&field_id).cloned() {
+            return Ok(dt);
+        }
+
+        // Lookup descriptor pk
+        let descriptor_pk = {
+            let catalog = self.catalog.read().unwrap();
+            *catalog.map.get(&field_id).ok_or(Error::NotFound)?
+        };
+
+        // Load descriptor to gather first non-empty meta
+        let desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
+        let mut desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+
+        // If descriptor carries a fingerprint, try to fast-path known monomorphized types.
+        let fp = Self::desc_dtype_fingerprint(&desc);
+        if fp != 0 {
+            if fp == Self::dtype_fingerprint(&DataType::UInt64) {
+                let dt = DataType::UInt64;
+                self.dtype_cache.write().unwrap().insert(field_id, dt.clone());
+                return Ok(dt);
+            }
+            if fp == Self::dtype_fingerprint(&DataType::Int32) {
+                let dt = DataType::Int32;
+                self.dtype_cache.write().unwrap().insert(field_id, dt.clone());
+                return Ok(dt);
+            }
+            // Unknown fingerprint; fall back to peeking one chunk to get exact DataType.
+        }
+
+        let mut first_chunk_pk: Option<PhysicalKey> = None;
+        for m in DescriptorIterator::new(self.pager.as_ref(), desc.head_page_pk) {
+            let meta = m?;
+            if meta.row_count > 0 {
+                first_chunk_pk = Some(meta.chunk_pk);
+                break;
+            }
+        }
+        let chunk_pk = first_chunk_pk.ok_or(Error::NotFound)?;
+
+        // Fetch the chunk and inspect dtype
+        let blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: chunk_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
+        let any = deserialize_array(blob)?;
+        let dt = any.data_type().clone();
+
+        // Persist fingerprint for future opens.
+        let fp_new = Self::dtype_fingerprint(&dt);
+        if fp_new != fp {
+            Self::set_desc_dtype_fingerprint(&mut desc, fp_new);
+            let updated = desc.to_le_bytes();
+            let _ = self
+                .pager
+                .batch_put(&[BatchPut::Raw { key: descriptor_pk, bytes: updated }]);
+        }
+
+        // Cache and return
+        self.dtype_cache
+            .write()
+            .unwrap()
+            .insert(field_id, dt.clone());
+        Ok(dt)
+    }
+
+    // ------------------------------- Visitor API -------------------------------
+
+    /// Unsorted scan with typed visitor callbacks per chunk.
+    pub fn scan_visit<V: crate::store::iter::PrimitiveVisitor>(
+        &self,
+        field_id: LogicalFieldId,
+        visitor: &mut V,
+    ) -> Result<()> {
+        let dt = self.dtype_for_field(field_id)?;
+        match dt {
+            DataType::UInt64 => {
+                for arr_res in self.scan(field_id)? {
+                    let arr = arr_res?;
+                    let u = arr
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| Error::Internal("expected UInt64".into()))?;
+                    visitor.u64_chunk(u);
+                }
+                Ok(())
+            }
+            DataType::Int32 => {
+                for arr_res in self.scan(field_id)? {
+                    let arr = arr_res?;
+                    let u = arr
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .ok_or_else(|| Error::Internal("expected Int32".into()))?;
+                    visitor.i32_chunk(u);
+                }
+                Ok(())
+            }
+            _ => {
+                for arr_res in self.scan(field_id)? {
+                    let arr = arr_res?;
+                    visitor.any_chunk(&arr);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Unsorted scan with row ids and typed visitor callbacks per chunk.
+    pub fn scan_with_row_ids_visit<V: crate::store::iter::PrimitiveWithRowIdsVisitor>(
+        &self,
+        value_fid: LogicalFieldId,
+        rowid_fid: LogicalFieldId,
+        visitor: &mut V,
+    ) -> Result<()> {
+        let dt = self.dtype_for_field(value_fid)?;
+        match dt {
+            DataType::UInt64 => {
+                for res in self.scan_with_row_ids(value_fid, rowid_fid)? {
+                    let (vals_any, rids) = res?;
+                    let vals = vals_any
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| Error::Internal("expected UInt64".into()))?;
+                    visitor.u64_chunk(vals, &rids);
+                }
+                Ok(())
+            }
+            DataType::Int32 => {
+                for res in self.scan_with_row_ids(value_fid, rowid_fid)? {
+                    let (vals_any, rids) = res?;
+                    let vals = vals_any
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .ok_or_else(|| Error::Internal("expected Int32".into()))?;
+                    visitor.i32_chunk(vals, &rids);
+                }
+                Ok(())
+            }
+            _ => {
+                for res in self.scan_with_row_ids(value_fid, rowid_fid)? {
+                    let (vals, rids) = res?;
+                    visitor.any_chunk_with_row_ids(&vals, &rids);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Sorted scan with typed visitor callbacks over coalesced runs.
+    pub fn scan_sorted_visit<V: crate::store::iter::PrimitiveSortedVisitor>(
+        &self,
+        field_id: LogicalFieldId,
+        visitor: &mut V,
+    ) -> Result<()> {
+        let dt = self.dtype_for_field(field_id)?;
+        match dt {
+            DataType::UInt64 => match self.scan_sorted(field_id)? {
+                SortedMerge::U64(mut m) => {
+                    while let Some(run) = m.next_run() {
+                        if let Run::U64 { arr, start, len } = run {
+                            visitor.u64_run(arr, start, len);
+                        }
+                    }
+                    Ok(())
+                }
+                _ => Err(Error::Internal("unexpected merge variant".into())),
+            },
+            DataType::Int32 => match self.scan_sorted(field_id)? {
+                SortedMerge::I32(mut m) => {
+                    while let Some(run) = m.next_run() {
+                        if let Run::I32 { arr, start, len } = run {
+                            visitor.i32_run(arr, start, len);
+                        }
+                    }
+                    Ok(())
+                }
+                _ => Err(Error::Internal("unexpected merge variant".into())),
+            },
+            _ => Err(Error::Internal("unsupported sorted scan dtype".into())),
+        }
+    }
+
+    /// Sorted scan with row ids and typed visitor callbacks over coalesced runs.
+    pub fn scan_sorted_with_row_ids_visit<
+        V: crate::store::iter::PrimitiveSortedWithRowIdsVisitor,
+    >(
+        &self,
+        value_fid: LogicalFieldId,
+        rowid_fid: LogicalFieldId,
+        visitor: &mut V,
+    ) -> Result<()> {
+        let dt = self.dtype_for_field(value_fid)?;
+        match dt {
+            DataType::UInt64 => match self.scan_sorted_with_row_ids(value_fid, rowid_fid)? {
+                SortedMergeWithRowIds::U64(mut m) => {
+                    while let Some(run) = m.next_run() {
+                        if let crate::store::iter::RunWithRowIds::U64 { vals, rids, start, len } =
+                            run
+                        {
+                            visitor.u64_run_with_rids(vals, rids, start, len);
+                        }
+                    }
+                    Ok(())
+                }
+                _ => Err(Error::Internal("unexpected merge variant".into())),
+            },
+            DataType::Int32 => match self.scan_sorted_with_row_ids(value_fid, rowid_fid)? {
+                SortedMergeWithRowIds::I32(mut m) => {
+                    while let Some(run) = m.next_run() {
+                        if let crate::store::iter::RunWithRowIds::I32 { vals, rids, start, len } =
+                            run
+                        {
+                            visitor.i32_run_with_rids(vals, rids, start, len);
+                        }
+                    }
+                    Ok(())
+                }
+                _ => Err(Error::Internal("unexpected merge variant".into())),
+            },
+            _ => Err(Error::Internal("unsupported sorted scan dtype".into())),
+        }
     }
 }

@@ -35,6 +35,10 @@ harness = false
 name = "scan_rowid_bench"
 harness = false
 
+[[bench]]
+name = "visitor_dispatch_bench"
+harness = false
+
 
 [features]
 legacy_api = []
