@@ -31,6 +31,10 @@ harness = false
 name = "random_probe_bench"
 harness = false
 
+[[bench]]
+name = "scan_rowid_bench"
+harness = false
+
 
 [features]
 legacy_api = []
