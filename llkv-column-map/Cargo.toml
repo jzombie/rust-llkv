@@ -21,17 +21,17 @@ thiserror = "2.0.16"
 criterion.workspace = true
 rand.workspace = true
 
-# Legacy benches disabled. Kept only columnar benches.
-
 [[bench]]
 name = "column_sum_bench"
 harness = false
-path = "benches/column_sum_bench.rs"
 
 [[bench]]
 name = "scan_builder_bench"
 harness = false
-path = "benches/scan_builder_bench.rs"
+
+[[bench]]
+name = "sort_index_bench"
+harness = false
 
 [features]
 legacy_api = []
