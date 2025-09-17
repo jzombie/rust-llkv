@@ -26,6 +26,10 @@ name = "column_sum_bench"
 harness = false
 
 [[bench]]
+name = "ingest_bench"
+harness = false
+
+[[bench]]
 name = "random_probe_bench"
 harness = false
 
