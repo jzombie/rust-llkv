@@ -151,10 +151,69 @@ impl<'a> Run<'a> {
     }
 }
 
+// -------------------- Binary search helpers for clamping ------------------
+
+#[inline]
+fn lower_bound_u64(arr: &UInt64Array, mut lo: usize, mut hi: usize, key: u64) -> usize {
+    while lo < hi {
+        let mid = (lo + hi) >> 1;
+        if arr.value(mid) < key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+#[inline]
+fn upper_bound_u64(arr: &UInt64Array, mut lo: usize, mut hi: usize, key: u64) -> usize {
+    while lo < hi {
+        let mid = (lo + hi) >> 1;
+        if arr.value(mid) <= key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+#[inline]
+fn lower_bound_i32(arr: &Int32Array, mut lo: usize, mut hi: usize, key: i32) -> usize {
+    while lo < hi {
+        let mid = (lo + hi) >> 1;
+        if arr.value(mid) < key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+#[inline]
+fn upper_bound_i32(arr: &Int32Array, mut lo: usize, mut hi: usize, key: i32) -> usize {
+    while lo < hi {
+        let mid = (lo + hi) >> 1;
+        if arr.value(mid) <= key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 // ------------------- Monomorphized merge (primitive T) --------------------
 
 macro_rules! impl_merge_for_primitive {
-    ($Name:ident, $ArrTy:ty, $KeyTy:ty, $RunVariant:ident) => {
+    ($Name:ident,
+     $ArrTy:ty,
+     $KeyTy:ty,
+     $RunVariant:ident,
+     $lower_fn:ident,
+     $upper_fn:ident) => {
         pub struct $Name {
             cursors: Vec<Cursor<$ArrTy>>,
             heap: BinaryHeap<Reverse<HeapItem<$KeyTy>>>,
@@ -162,6 +221,9 @@ macro_rules! impl_merge_for_primitive {
             nulls_first: bool,
             /// Flip value order for descending.
             flip: bool,
+            /// Optional inclusive lower/upper bounds on values.
+            bound_lo: Option<$KeyTy>,
+            bound_hi: Option<$KeyTy>,
             /// Keep blobs alive (zero-copy backing).
             _blobs: FxHashMap<PhysicalKey, EntryHandle>,
         }
@@ -234,6 +296,8 @@ macro_rules! impl_merge_for_primitive {
                     heap,
                     nulls_first,
                     flip,
+                    bound_lo: None,
+                    bound_hi: None,
                     _blobs: blobs,
                 })
             }
@@ -241,52 +305,77 @@ macro_rules! impl_merge_for_primitive {
             /// Return the next run from the same chunk, maximally coalesced.
             /// When the heap is empty, returns None.
             pub fn next_run<'a>(&'a mut self) -> Option<Run<'a>> {
-                let Reverse(mut top) = self.heap.pop()?;
+                // Keep popping until we can emit a non-empty (clamped) run.
+                loop {
+                    let Reverse(top) = self.heap.pop()?;
 
-                // Threshold is the best of the others (peek).
-                let thr = self.heap.peek().map(|x| x.0.key);
+                    // Threshold is the best of the others (peek).
+                    let thr = self.heap.peek().map(|x| x.0.key);
 
-                let cidx = top.cursor_idx;
-                let start = top.sorted_idx;
+                    let cidx = top.cursor_idx;
+                    let start = top.sorted_idx;
 
-                let c = &self.cursors[cidx];
-                let len = c.len;
+                    let c = &self.cursors[cidx];
+                    let len = c.len;
 
-                // Advance within the winner while it stays <= threshold.
-                let mut end = start + 1;
+                    // Advance within the winner while it stays <= threshold.
+                    let mut end = start + 1;
 
-                // Fast paths:
-                // - If heap is empty, we can take the whole tail.
-                if thr.is_none() {
-                    end = len;
-                } else {
-                    let thr_key = thr.unwrap();
-                    while end < len {
-                        let k = Self::key_at(c, end, self.nulls_first, self.flip);
-                        // If next key would beat the threshold, stop.
-                        if k > thr_key {
-                            break;
+                    // Fast paths:
+                    // - If heap is empty, we can take the whole tail.
+                    if thr.is_none() {
+                        end = len;
+                    } else {
+                        let thr_key = thr.unwrap();
+                        while end < len {
+                            let k = Self::key_at(c, end, self.nulls_first, self.flip);
+                            if k > thr_key {
+                                break;
+                            }
+                            end += 1;
                         }
-                        end += 1;
                     }
-                }
 
-                // Reinsert cursor with its next position (if any).
-                if end < len {
-                    let k = Self::key_at(c, end, self.nulls_first, self.flip);
-                    self.heap.push(Reverse(HeapItem {
-                        cursor_idx: cidx,
-                        sorted_idx: end,
-                        key: k,
-                    }));
-                }
+                    // Reinsert cursor with its next position (if any).
+                    if end < len {
+                        let k = Self::key_at(c, end, self.nulls_first, self.flip);
+                        self.heap.push(Reverse(HeapItem {
+                            cursor_idx: cidx,
+                            sorted_idx: end,
+                            key: k,
+                        }));
+                    }
 
-                let c = &self.cursors[cidx];
-                Some(Run::$RunVariant {
-                    arr: &c.sorted,
-                    start,
-                    len: end - start,
-                })
+                    // Clamp [s,e) by optional bounds using typed array.
+                    let arr = &c.sorted;
+                    let mut s = start;
+                    let mut e = end;
+
+                    if let Some(lo) = self.bound_lo {
+                        s = $lower_fn(arr, s, e, lo);
+                        if s >= e {
+                            // Entire run < lo; try next.
+                            continue;
+                        }
+                    }
+                    if let Some(hi) = self.bound_hi {
+                        // If first value already > hi, discard this run.
+                        if arr.value(s) > hi {
+                            continue;
+                        }
+                        e = $upper_fn(arr, s, e, hi);
+                        if s >= e {
+                            continue;
+                        }
+                    }
+
+                    let c = &self.cursors[cidx];
+                    return Some(Run::$RunVariant {
+                        arr: &c.sorted,
+                        start: s,
+                        len: e - s,
+                    });
+                }
             }
 
             #[inline(always)]
@@ -334,8 +423,22 @@ macro_rules! impl_merge_for_primitive {
 
 // Instantiate for the types you care about today.
 // Add more by repeating lines below (e.g., Int64Array/i64).
-impl_merge_for_primitive!(MergeU64, UInt64Array, u64, U64);
-impl_merge_for_primitive!(MergeI32, Int32Array, i32, I32);
+impl_merge_for_primitive!(
+    MergeU64,
+    UInt64Array,
+    u64,
+    U64,
+    lower_bound_u64,
+    upper_bound_u64
+);
+impl_merge_for_primitive!(
+    MergeI32,
+    Int32Array,
+    i32,
+    I32,
+    lower_bound_i32,
+    upper_bound_i32
+);
 
 // ------------------------------ Type dispatch -----------------------------
 
@@ -387,6 +490,26 @@ impl SortedMerge {
             SortedMerge::U64(m) => m.next_run(),
             SortedMerge::I32(m) => m.next_run(),
         }
+    }
+
+    /// Set inclusive value bounds for u64 streams. No-op for other types.
+    #[inline]
+    pub fn with_u64_bounds(mut self, lo: Option<u64>, hi: Option<u64>) -> Self {
+        if let SortedMerge::U64(m) = &mut self {
+            m.bound_lo = lo;
+            m.bound_hi = hi;
+        }
+        self
+    }
+
+    /// Set inclusive value bounds for i32 streams. No-op for others.
+    #[inline]
+    pub fn with_i32_bounds(mut self, lo: Option<i32>, hi: Option<i32>) -> Self {
+        if let SortedMerge::I32(m) = &mut self {
+            m.bound_lo = lo;
+            m.bound_hi = hi;
+        }
+        self
     }
 
     pub fn total_rows(&self) -> usize {
