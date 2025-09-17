@@ -61,7 +61,7 @@ fn scan_all_integer_types_sorted_and_ranges() {
     let mut rng = rand::rng();
 
     // Helper to test one type end-to-end
-    let mut test_type = |dt: DataType, r#gen: &mut dyn FnMut(usize) -> Vec<i128>| {
+    let mut test_type = |dt: DataType, gen_fn: &mut dyn FnMut(usize) -> Vec<i128>| {
         let field_id = fid(match dt {
             DataType::Int8 => 1,
             DataType::Int16 => 2,
@@ -73,7 +73,7 @@ fn scan_all_integer_types_sorted_and_ranges() {
             DataType::UInt64 => 8,
             _ => 999,
         });
-        let mut vals_i128 = r#gen(N);
+        let mut vals_i128 = gen_fn(N);
         vals_i128.as_mut_slice().shuffle(&mut rng);
 
         // Append as concrete array
