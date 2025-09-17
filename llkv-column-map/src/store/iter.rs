@@ -15,10 +15,12 @@
 //!   (UInt64Array) and include it in Run enums. The merge logic does not
 //!   change.
 
+use super::ColumnStore;
 use crate::error::{Error, Result};
 use crate::serialization::deserialize_array;
-use crate::store::descriptor::ChunkMetadata;
-use crate::types::PhysicalKey;
+use crate::storage::{BatchGet, GetResult, Pager};
+use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
+use crate::types::{LogicalFieldId, PhysicalKey};
 
 use arrow::array::{Array, ArrayRef, Int32Array, UInt32Array, UInt64Array};
 use arrow::compute;
@@ -30,6 +32,139 @@ use simd_r_drive_entry_handle::EntryHandle;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::ops::Bound;
+
+impl<P> ColumnStore<P>
+where
+    P: Pager<Blob = EntryHandle>,
+{
+    /// Scan returns arrays in append order (no tombstones).
+    pub fn scan(
+        &self,
+        field_id: LogicalFieldId,
+    ) -> Result<Box<dyn Iterator<Item = Result<ArrayRef>>>> {
+        let catalog = self.catalog.read().unwrap();
+        let &descriptor_pk = match catalog.map.get(&field_id) {
+            Some(pk) => pk,
+            None => return Ok(Box::new(std::iter::empty())),
+        };
+
+        let desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
+        let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+
+        let mut metas = Vec::new();
+        for meta in DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk) {
+            metas.push(meta?);
+        }
+        if metas.is_empty() {
+            return Ok(Box::new(std::iter::empty()));
+        }
+
+        // Fast path: single chunk
+        if metas.len() == 1 {
+            let blob = self
+                .pager
+                .batch_get(&[BatchGet::Raw {
+                    key: metas[0].chunk_pk,
+                }])?
+                .pop()
+                .and_then(|r| match r {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
+                .ok_or(Error::NotFound)?;
+
+            let arr = deserialize_array(blob)?;
+            return Ok(Box::new(std::iter::once(Ok(arr))));
+        }
+
+        // Multi-chunk: batch_get and map
+        let mut gets = Vec::with_capacity(metas.len());
+        for m in &metas {
+            gets.push(BatchGet::Raw { key: m.chunk_pk });
+        }
+        let results = self.pager.batch_get(&gets)?;
+
+        let mut blobs_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
+        for r in results {
+            match r {
+                GetResult::Raw { key, bytes } => {
+                    blobs_map.insert(key, bytes);
+                }
+                GetResult::Missing { .. } => return Err(Error::NotFound),
+            }
+        }
+
+        let it = metas.into_iter().map(move |m| {
+            let blob = blobs_map.get(&m.chunk_pk).ok_or(Error::NotFound)?;
+            let array = deserialize_array(blob.clone())?;
+            Ok(array)
+        });
+
+        Ok(Box::new(it))
+    }
+
+    pub fn scan_sorted(&self, field_id: LogicalFieldId) -> Result<SortedMerge> {
+        let catalog = self.catalog.read().unwrap();
+        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+
+        let desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
+        let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+
+        let mut all_chunk_metadata = Vec::new();
+        let meta_iter = DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk);
+        for meta_result in meta_iter {
+            all_chunk_metadata.push(meta_result?);
+        }
+
+        let mut gets = Vec::new();
+        for meta in &all_chunk_metadata {
+            gets.push(BatchGet::Raw { key: meta.chunk_pk });
+            if meta.value_order_perm_pk != 0 {
+                gets.push(BatchGet::Raw {
+                    key: meta.value_order_perm_pk,
+                });
+            } else {
+                return Err(Error::Internal(format!(
+                    "Chunk {} is not sorted",
+                    meta.chunk_pk
+                )));
+            }
+        }
+
+        let get_results = self.pager.batch_get(&gets)?;
+        let mut blobs_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
+        for result in get_results {
+            match result {
+                GetResult::Raw { key, bytes } => {
+                    blobs_map.insert(key, bytes);
+                }
+                GetResult::Missing { .. } => return Err(Error::NotFound),
+            }
+        }
+
+        let opts = SortOptions {
+            descending: false,
+            nulls_first: true,
+        };
+        SortedMerge::build(&all_chunk_metadata, blobs_map, opts)
+    }
+}
 
 // ----------------------------- Sort options -------------------------------
 
