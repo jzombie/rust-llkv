@@ -191,6 +191,8 @@ fn scan_all_integer_types_sorted_and_ranges() {
                     reverse: false,
                     with_row_ids: false,
                     row_id_field: None,
+                    limit: None,
+                    offset: 0,
                 },
                 &mut visitor,
             )
@@ -283,6 +285,8 @@ fn scan_all_integer_types_sorted_and_ranges() {
                     reverse: true,
                     with_row_ids: false,
                     row_id_field: None,
+                    limit: None,
+                    offset: 0,
                 },
                 &mut visitor_desc,
             )
@@ -403,6 +407,8 @@ fn scan_all_integer_types_sorted_and_ranges() {
                     reverse: false,
                     with_row_ids: false,
                     row_id_field: None,
+                    limit: None,
+                    offset: 0,
                 },
                 &mut visitor2,
             )

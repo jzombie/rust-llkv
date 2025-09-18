@@ -76,8 +76,13 @@ fn bench_column_store_sum(c: &mut Criterion) {
                 (store, field_id)
             },
             |(store, fid)| {
-                use llkv_column_map::store::scan::{PrimitiveVisitor, PrimitiveSortedVisitor, PrimitiveWithRowIdsVisitor, PrimitiveSortedWithRowIdsVisitor};
-                struct SumU64<'a> { out: &'a std::cell::Cell<u128> }
+                use llkv_column_map::store::scan::{
+                    PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+                    PrimitiveWithRowIdsVisitor,
+                };
+                struct SumU64<'a> {
+                    out: &'a std::cell::Cell<u128>,
+                }
                 impl<'a> PrimitiveVisitor for SumU64<'a> {
                     fn u64_chunk(&mut self, a: &UInt64Array) {
                         if let Some(s) = compute::sum(a) {
@@ -93,7 +98,14 @@ fn bench_column_store_sum(c: &mut Criterion) {
                 store
                     .scan(
                         fid,
-                        ScanOptions { sorted: false, reverse: false, with_row_ids: false, row_id_field: None },
+                        ScanOptions {
+                            sorted: false,
+                            reverse: false,
+                            with_row_ids: false,
+                            row_id_field: None,
+                            limit: None,
+                            offset: 0,
+                        },
                         &mut v,
                     )
                     .unwrap();
@@ -128,8 +140,13 @@ fn bench_column_store_sum(c: &mut Criterion) {
                 (store, field_id)
             },
             |(store, fid)| {
-                use llkv_column_map::store::scan::{PrimitiveVisitor, PrimitiveSortedVisitor, PrimitiveWithRowIdsVisitor, PrimitiveSortedWithRowIdsVisitor};
-                struct SumI32<'a> { out: &'a std::cell::Cell<i128> }
+                use llkv_column_map::store::scan::{
+                    PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+                    PrimitiveWithRowIdsVisitor,
+                };
+                struct SumI32<'a> {
+                    out: &'a std::cell::Cell<i128>,
+                }
                 impl<'a> PrimitiveVisitor for SumI32<'a> {
                     fn i32_chunk(&mut self, a: &Int32Array) {
                         if let Some(s) = compute::sum(a) {
@@ -145,7 +162,14 @@ fn bench_column_store_sum(c: &mut Criterion) {
                 store
                     .scan(
                         fid,
-                        ScanOptions { sorted: false, reverse: false, with_row_ids: false, row_id_field: None },
+                        ScanOptions {
+                            sorted: false,
+                            reverse: false,
+                            with_row_ids: false,
+                            row_id_field: None,
+                            limit: None,
+                            offset: 0,
+                        },
                         &mut v,
                     )
                     .unwrap();
@@ -223,8 +247,13 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
                 (store, field_id, expected_final_sum)
             },
             |(store, fid, expected_sum)| {
-                use llkv_column_map::store::scan::{PrimitiveVisitor, PrimitiveSortedVisitor, PrimitiveWithRowIdsVisitor, PrimitiveSortedWithRowIdsVisitor};
-                struct SumU64<'a> { out: &'a std::cell::Cell<u128> }
+                use llkv_column_map::store::scan::{
+                    PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+                    PrimitiveWithRowIdsVisitor,
+                };
+                struct SumU64<'a> {
+                    out: &'a std::cell::Cell<u128>,
+                }
                 impl<'a> PrimitiveVisitor for SumU64<'a> {
                     fn u64_chunk(&mut self, a: &UInt64Array) {
                         if let Some(s) = compute::sum(a) {
@@ -240,7 +269,14 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
                 store
                     .scan(
                         fid,
-                        ScanOptions { sorted: false, reverse: false, with_row_ids: false, row_id_field: None },
+                        ScanOptions {
+                            sorted: false,
+                            reverse: false,
+                            with_row_ids: false,
+                            row_id_field: None,
+                            limit: None,
+                            offset: 0,
+                        },
                         &mut v,
                     )
                     .unwrap();

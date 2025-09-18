@@ -43,9 +43,9 @@ use std::sync::Arc;
 use arrow::array::{Int32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use rand::{SeedableRng, rngs::StdRng};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::seq::SliceRandom;
+use rand::{SeedableRng, rngs::StdRng};
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
@@ -152,20 +152,31 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
     const HI: u64 = 250_000;
 
     // Visitors
-    use llkv_column_map::store::scan::{PrimitiveVisitor, PrimitiveSortedVisitor, PrimitiveWithRowIdsVisitor, PrimitiveSortedWithRowIdsVisitor};
-    struct SortedSum { s: u128 }
+    use llkv_column_map::store::scan::{
+        PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+        PrimitiveWithRowIdsVisitor,
+    };
+    struct SortedSum {
+        s: u128,
+    }
     impl PrimitiveSortedVisitor for SortedSum {
         fn u64_run(&mut self, a: &UInt64Array, s0: usize, l: usize) {
             let e = s0 + l;
-            for i in s0..e { self.s += a.value(i) as u128; }
+            for i in s0..e {
+                self.s += a.value(i) as u128;
+            }
         }
     }
     impl PrimitiveVisitor for SortedSum {}
     impl PrimitiveWithRowIdsVisitor for SortedSum {}
     impl PrimitiveSortedWithRowIdsVisitor for SortedSum {}
-    struct Collect { v: Vec<u64> }
+    struct Collect {
+        v: Vec<u64>,
+    }
     impl PrimitiveVisitor for Collect {
-        fn u64_chunk(&mut self, a: &UInt64Array) { self.v.extend((0..a.len()).map(|i| a.value(i))); }
+        fn u64_chunk(&mut self, a: &UInt64Array) {
+            self.v.extend((0..a.len()).map(|i| a.value(i)));
+        }
     }
     impl PrimitiveSortedVisitor for Collect {}
     impl PrimitiveWithRowIdsVisitor for Collect {}
@@ -174,15 +185,56 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
     // Low fragmentation (single append), Full scan
     group.bench_function("lowfrag/full/with_index", |b| {
         b.iter_batched(
-            || { let (s, fid, _) = seed_store_1m(); s.create_sort_index(fid).unwrap(); (s, fid) },
-            |(store, fid)| { let mut v = SortedSum { s: 0 }; store.scan(fid, ScanOptions { sorted: true, reverse: false, with_row_ids: false, row_id_field: None }, &mut v).unwrap(); black_box(v.s); },
+            || {
+                let (s, fid, _) = seed_store_1m();
+                s.create_sort_index(fid).unwrap();
+                (s, fid)
+            },
+            |(store, fid)| {
+                let mut v = SortedSum { s: 0 };
+                store
+                    .scan(
+                        fid,
+                        ScanOptions {
+                            sorted: true,
+                            reverse: false,
+                            with_row_ids: false,
+                            row_id_field: None,
+                            limit: None,
+                            offset: 0,
+                        },
+                        &mut v,
+                    )
+                    .unwrap();
+                black_box(v.s);
+            },
             BatchSize::SmallInput,
         )
     });
     group.bench_function("lowfrag/full/without_index", |b| {
         b.iter_batched(
             || seed_store_1m(),
-            |(store, fid, _)| { let mut c = Collect { v: Vec::with_capacity(N_ROWS) }; store.scan(fid, ScanOptions { sorted: false, reverse: false, with_row_ids: false, row_id_field: None }, &mut c).unwrap(); c.v.sort_unstable(); black_box(c.v.len()); },
+            |(store, fid, _)| {
+                let mut c = Collect {
+                    v: Vec::with_capacity(N_ROWS),
+                };
+                store
+                    .scan(
+                        fid,
+                        ScanOptions {
+                            sorted: false,
+                            reverse: false,
+                            with_row_ids: false,
+                            row_id_field: None,
+                            limit: None,
+                            offset: 0,
+                        },
+                        &mut c,
+                    )
+                    .unwrap();
+                c.v.sort_unstable();
+                black_box(c.v.len());
+            },
             BatchSize::SmallInput,
         )
     });
@@ -191,15 +243,48 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
     group.bench_function("lowfrag/range/with_index", |b| {
         use llkv_column_map::store::scan::ScanBuilder;
         b.iter_batched(
-            || { let (s, fid, _) = seed_store_1m(); s.create_sort_index(fid).unwrap(); (s, fid) },
-            |(store, fid)| { let mut v = SortedSum { s: 0 }; ScanBuilder::new(&store, fid).sorted(true).with_range::<u64,_>(LO..=HI).run(&mut v).unwrap(); black_box(v.s); },
+            || {
+                let (s, fid, _) = seed_store_1m();
+                s.create_sort_index(fid).unwrap();
+                (s, fid)
+            },
+            |(store, fid)| {
+                let mut v = SortedSum { s: 0 };
+                ScanBuilder::new(&store, fid)
+                    .sorted(true)
+                    .with_range::<u64, _>(LO..=HI)
+                    .run(&mut v)
+                    .unwrap();
+                black_box(v.s);
+            },
             BatchSize::SmallInput,
         )
     });
     group.bench_function("lowfrag/range/without_index", |b| {
         b.iter_batched(
             || seed_store_1m(),
-            |(store, fid, _)| { let mut c = Collect { v: Vec::with_capacity(60_000) }; store.scan(fid, ScanOptions { sorted: false, reverse: false, with_row_ids: false, row_id_field: None }, &mut c).unwrap(); c.v.retain(|&x| x>=LO && x<=HI); c.v.sort_unstable(); black_box(c.v.len()); },
+            |(store, fid, _)| {
+                let mut c = Collect {
+                    v: Vec::with_capacity(60_000),
+                };
+                store
+                    .scan(
+                        fid,
+                        ScanOptions {
+                            sorted: false,
+                            reverse: false,
+                            with_row_ids: false,
+                            row_id_field: None,
+                            limit: None,
+                            offset: 0,
+                        },
+                        &mut c,
+                    )
+                    .unwrap();
+                c.v.retain(|&x| x >= LO && x <= HI);
+                c.v.sort_unstable();
+                black_box(c.v.len());
+            },
             BatchSize::SmallInput,
         )
     });
@@ -207,15 +292,56 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
     // High fragmentation, Full scan
     group.bench_function("highfrag/full/with_index", |b| {
         b.iter_batched(
-            || { let (s, fid) = seed_store_1m_fragmented_random(128); s.create_sort_index(fid).unwrap(); (s, fid) },
-            |(store, fid)| { let mut v = SortedSum { s: 0 }; store.scan(fid, ScanOptions { sorted: true, reverse: false, with_row_ids: false, row_id_field: None }, &mut v).unwrap(); black_box(v.s); },
+            || {
+                let (s, fid) = seed_store_1m_fragmented_random(128);
+                s.create_sort_index(fid).unwrap();
+                (s, fid)
+            },
+            |(store, fid)| {
+                let mut v = SortedSum { s: 0 };
+                store
+                    .scan(
+                        fid,
+                        ScanOptions {
+                            sorted: true,
+                            reverse: false,
+                            with_row_ids: false,
+                            row_id_field: None,
+                            limit: None,
+                            offset: 0,
+                        },
+                        &mut v,
+                    )
+                    .unwrap();
+                black_box(v.s);
+            },
             BatchSize::SmallInput,
         )
     });
     group.bench_function("highfrag/full/without_index", |b| {
         b.iter_batched(
             || seed_store_1m_fragmented_random(128),
-            |(store, fid)| { let mut c = Collect { v: Vec::with_capacity(N_ROWS) }; store.scan(fid, ScanOptions { sorted: false, reverse: false, with_row_ids: false, row_id_field: None }, &mut c).unwrap(); c.v.sort_unstable(); black_box(c.v.len()); },
+            |(store, fid)| {
+                let mut c = Collect {
+                    v: Vec::with_capacity(N_ROWS),
+                };
+                store
+                    .scan(
+                        fid,
+                        ScanOptions {
+                            sorted: false,
+                            reverse: false,
+                            with_row_ids: false,
+                            row_id_field: None,
+                            limit: None,
+                            offset: 0,
+                        },
+                        &mut c,
+                    )
+                    .unwrap();
+                c.v.sort_unstable();
+                black_box(c.v.len());
+            },
             BatchSize::SmallInput,
         )
     });
@@ -224,15 +350,48 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
     group.bench_function("highfrag/range/with_index", |b| {
         use llkv_column_map::store::scan::ScanBuilder;
         b.iter_batched(
-            || { let (s, fid) = seed_store_1m_fragmented_random(128); s.create_sort_index(fid).unwrap(); (s, fid) },
-            |(store, fid)| { let mut v = SortedSum { s: 0 }; ScanBuilder::new(&store, fid).sorted(true).with_range::<u64,_>(LO..=HI).run(&mut v).unwrap(); black_box(v.s); },
+            || {
+                let (s, fid) = seed_store_1m_fragmented_random(128);
+                s.create_sort_index(fid).unwrap();
+                (s, fid)
+            },
+            |(store, fid)| {
+                let mut v = SortedSum { s: 0 };
+                ScanBuilder::new(&store, fid)
+                    .sorted(true)
+                    .with_range::<u64, _>(LO..=HI)
+                    .run(&mut v)
+                    .unwrap();
+                black_box(v.s);
+            },
             BatchSize::SmallInput,
         )
     });
     group.bench_function("highfrag/range/without_index", |b| {
         b.iter_batched(
             || seed_store_1m_fragmented_random(128),
-            |(store, fid)| { let mut c = Collect { v: Vec::with_capacity(60_000) }; store.scan(fid, ScanOptions { sorted: false, reverse: false, with_row_ids: false, row_id_field: None }, &mut c).unwrap(); c.v.retain(|&x| x>=LO && x<=HI); c.v.sort_unstable(); black_box(c.v.len()); },
+            |(store, fid)| {
+                let mut c = Collect {
+                    v: Vec::with_capacity(60_000),
+                };
+                store
+                    .scan(
+                        fid,
+                        ScanOptions {
+                            sorted: false,
+                            reverse: false,
+                            with_row_ids: false,
+                            row_id_field: None,
+                            limit: None,
+                            offset: 0,
+                        },
+                        &mut c,
+                    )
+                    .unwrap();
+                c.v.retain(|&x| x >= LO && x <= HI);
+                c.v.sort_unstable();
+                black_box(c.v.len());
+            },
             BatchSize::SmallInput,
         )
     });

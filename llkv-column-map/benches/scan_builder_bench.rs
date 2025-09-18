@@ -11,18 +11,15 @@ use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
-use rand::{SeedableRng, rngs::StdRng};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use rand::seq::SliceRandom;
+use rand::{SeedableRng, rngs::StdRng};
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::{
-    PrimitiveVisitor,
-    PrimitiveSortedVisitor,
-    PrimitiveWithRowIdsVisitor,
-    PrimitiveSortedWithRowIdsVisitor,
-    ScanBuilder, ScanOptions
+    PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+    PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
@@ -30,7 +27,10 @@ const N_ROWS: usize = 1_000_000;
 const SEED: u64 = 0xC0FF_EEF0_0DD1_5EA5;
 
 fn fid_user(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new().with_namespace(Namespace::UserData).with_table_id(0).with_field_id(id)
+    LogicalFieldId::new()
+        .with_namespace(Namespace::UserData)
+        .with_table_id(0)
+        .with_field_id(id)
 }
 
 fn rid_fid_from_value(fid: LogicalFieldId) -> LogicalFieldId {
@@ -90,9 +90,15 @@ fn bench_scan_builder(c: &mut Criterion) {
         b.iter_batched(
             || seed_store_1m(),
             |(store, fid_u64, _)| {
-                struct SumU64<'a> { acc: &'a std::cell::Cell<u128> }
+                struct SumU64<'a> {
+                    acc: &'a std::cell::Cell<u128>,
+                }
                 impl<'a> PrimitiveVisitor for SumU64<'a> {
-                    fn u64_chunk(&mut self, a: &UInt64Array) { if let Some(s) = compute::sum(a) { self.acc.set(self.acc.get() + s as u128); } }
+                    fn u64_chunk(&mut self, a: &UInt64Array) {
+                        if let Some(s) = compute::sum(a) {
+                            self.acc.set(self.acc.get() + s as u128);
+                        }
+                    }
                 }
                 impl<'a> PrimitiveSortedVisitor for SumU64<'a> {}
                 impl<'a> PrimitiveWithRowIdsVisitor for SumU64<'a> {}
@@ -100,7 +106,14 @@ fn bench_scan_builder(c: &mut Criterion) {
                 let acc = std::cell::Cell::new(0u128);
                 let mut v = SumU64 { acc: &acc };
                 ScanBuilder::new(&store, fid_u64)
-                    .options(ScanOptions { sorted: false, reverse: false, with_row_ids: false, row_id_field: None })
+                    .options(ScanOptions {
+                        sorted: false,
+                        reverse: false,
+                        with_row_ids: false,
+                        row_id_field: None,
+                        limit: None,
+                        offset: 0,
+                    })
                     .run(&mut v)
                     .unwrap();
                 black_box(acc.get());
@@ -114,12 +127,16 @@ fn bench_scan_builder(c: &mut Criterion) {
         b.iter_batched(
             || seed_store_1m(),
             |(store, fid_u64, _)| {
-                struct SumU64<'a> { acc: &'a std::cell::Cell<u128> }
+                struct SumU64<'a> {
+                    acc: &'a std::cell::Cell<u128>,
+                }
                 impl<'a> PrimitiveSortedVisitor for SumU64<'a> {
                     fn u64_run(&mut self, a: &UInt64Array, s: usize, l: usize) {
                         let sl = a.slice(s, l);
                         let arr = sl.as_any().downcast_ref::<UInt64Array>().unwrap();
-                        if let Some(sv) = compute::sum(arr) { self.acc.set(self.acc.get() + sv as u128); }
+                        if let Some(sv) = compute::sum(arr) {
+                            self.acc.set(self.acc.get() + sv as u128);
+                        }
                     }
                 }
                 impl<'a> PrimitiveVisitor for SumU64<'a> {}
@@ -128,8 +145,15 @@ fn bench_scan_builder(c: &mut Criterion) {
                 let acc = std::cell::Cell::new(0u128);
                 let mut v = SumU64 { acc: &acc };
                 ScanBuilder::new(&store, fid_u64)
-                    .options(ScanOptions { sorted: true, reverse: false, with_row_ids: false, row_id_field: None })
-                    .with_range::<u64,_>(100_000..=900_000)
+                    .options(ScanOptions {
+                        sorted: true,
+                        reverse: false,
+                        with_row_ids: false,
+                        row_id_field: None,
+                        limit: None,
+                        offset: 0,
+                    })
+                    .with_range::<u64, _>(100_000..=900_000)
                     .run(&mut v)
                     .unwrap();
                 black_box(acc.get());
@@ -143,10 +167,23 @@ fn bench_scan_builder(c: &mut Criterion) {
         b.iter_batched(
             || seed_store_1m(),
             |(store, fid_u64, _)| {
-                struct SumRids<'a> { acc: &'a std::cell::Cell<u128> }
+                struct SumRids<'a> {
+                    acc: &'a std::cell::Cell<u128>,
+                }
                 impl<'a> PrimitiveSortedWithRowIdsVisitor for SumRids<'a> {
-                    fn u64_run_with_rids(&mut self, _v: &UInt64Array, r: &UInt64Array, s: usize, l: usize) {
-                        let e = s + l; let mut sum = 0u128; for i in s..e { sum += r.value(i) as u128; } self.acc.set(self.acc.get() + sum);
+                    fn u64_run_with_rids(
+                        &mut self,
+                        _v: &UInt64Array,
+                        r: &UInt64Array,
+                        s: usize,
+                        l: usize,
+                    ) {
+                        let e = s + l;
+                        let mut sum = 0u128;
+                        for i in s..e {
+                            sum += r.value(i) as u128;
+                        }
+                        self.acc.set(self.acc.get() + sum);
                     }
                 }
                 impl<'a> PrimitiveVisitor for SumRids<'a> {}
@@ -156,8 +193,15 @@ fn bench_scan_builder(c: &mut Criterion) {
                 let mut v = SumRids { acc: &acc };
                 let rid_fid = rid_fid_from_value(fid_u64);
                 ScanBuilder::new(&store, fid_u64)
-                    .options(ScanOptions { sorted: true, reverse: false, with_row_ids: true, row_id_field: Some(rid_fid) })
-                    .with_range::<u64,_>(100_000..=900_000)
+                    .options(ScanOptions {
+                        sorted: true,
+                        reverse: false,
+                        with_row_ids: true,
+                        row_id_field: Some(rid_fid),
+                        limit: None,
+                        offset: 0,
+                    })
+                    .with_range::<u64, _>(100_000..=900_000)
                     .run(&mut v)
                     .unwrap();
                 black_box(acc.get());

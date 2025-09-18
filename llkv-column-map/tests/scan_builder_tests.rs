@@ -55,7 +55,7 @@ fn scan_builder_sorted_range_u64() {
     }
     let mut coll = Collect { out: Vec::new() };
     ScanBuilder::new(&store, field_id)
-        .options(ScanOptions { sorted: true, reverse: false, with_row_ids: false, row_id_field: None })
+        .options(ScanOptions { sorted: true, reverse: false, with_row_ids: false, row_id_field: None, limit: None, offset: 0 })
         .with_range::<u64,_>(2000..=8000)
         .run(&mut coll)
         .unwrap();
@@ -100,7 +100,7 @@ fn scan_builder_sorted_with_row_ids() {
     let mut coll = CollectRids { out: Vec::new() };
     let rid_fid = field_id.with_namespace(Namespace::RowIdShadow);
     ScanBuilder::new(&store, field_id)
-        .options(ScanOptions { sorted: true, reverse: false, with_row_ids: true, row_id_field: Some(rid_fid) })
+        .options(ScanOptions { sorted: true, reverse: false, with_row_ids: true, row_id_field: Some(rid_fid), limit: None, offset: 0 })
         .with_range::<u64,_>(10_000..=20_000)
         .run(&mut coll)
         .unwrap();

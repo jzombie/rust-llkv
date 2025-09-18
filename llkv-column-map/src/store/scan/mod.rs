@@ -275,21 +275,46 @@ where
             + crate::store::scan::PrimitiveWithRowIdsVisitor
             + crate::store::scan::PrimitiveSortedWithRowIdsVisitor,
     {
+        let paginate = opts.offset > 0 || opts.limit.is_some();
         if !opts.sorted {
             if opts.with_row_ids {
                 let row_fid = opts.row_id_field.ok_or_else(|| {
                     Error::Internal("row_id field id required when with_row_ids=true".into())
                 })?;
                 let catalog = self.catalog.read().unwrap();
-                return crate::store::scan::unsorted_with_row_ids_visit(
-                    self.pager.as_ref(),
-                    &catalog.map,
-                    field_id,
-                    row_fid,
-                    visitor,
-                );
+                if paginate {
+                    let mut pv = crate::store::scan::PaginateVisitor::new(
+                        visitor,
+                        opts.offset,
+                        opts.limit,
+                    );
+                    return crate::store::scan::unsorted_with_row_ids_visit(
+                        self.pager.as_ref(),
+                        &catalog.map,
+                        field_id,
+                        row_fid,
+                        &mut pv,
+                    );
+                } else {
+                    return crate::store::scan::unsorted_with_row_ids_visit(
+                        self.pager.as_ref(),
+                        &catalog.map,
+                        field_id,
+                        row_fid,
+                        visitor,
+                    );
+                }
             }
-            return self.scan_visit(field_id, visitor);
+            if paginate {
+                let mut pv = crate::store::scan::PaginateVisitor::new(
+                    visitor,
+                    opts.offset,
+                    opts.limit,
+                );
+                return self.scan_visit(field_id, &mut pv);
+            } else {
+                return self.scan_visit(field_id, visitor);
+            }
         }
 
         if opts.with_row_ids {
@@ -390,147 +415,318 @@ where
                     .clone(),
             )?;
             if opts.reverse {
-                match first_any.data_type() {
-                    DataType::UInt64 => sorted_visit_with_rids_u64_rev(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
+                if paginate {
+                    let mut pv = crate::store::scan::PaginateVisitor::new_with_reverse(
                         visitor,
-                    ),
-                    DataType::UInt32 => sorted_visit_with_rids_u32_rev(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::UInt16 => sorted_visit_with_rids_u16_rev(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::UInt8 => sorted_visit_with_rids_u8_rev(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int64 => sorted_visit_with_rids_i64_rev(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int32 => sorted_visit_with_rids_i32_rev(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int16 => sorted_visit_with_rids_i16_rev(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int8 => sorted_visit_with_rids_i8_rev(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    _ => Err(Error::Internal("unsupported sorted dtype".into())),
+                        opts.offset,
+                        opts.limit,
+                        true,
+                    );
+                    match first_any.data_type() {
+                        DataType::UInt64 => sorted_visit_with_rids_u64_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        DataType::UInt32 => sorted_visit_with_rids_u32_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        DataType::UInt16 => sorted_visit_with_rids_u16_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        DataType::UInt8 => sorted_visit_with_rids_u8_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        DataType::Int64 => sorted_visit_with_rids_i64_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        DataType::Int32 => sorted_visit_with_rids_i32_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        DataType::Int16 => sorted_visit_with_rids_i16_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        DataType::Int8 => sorted_visit_with_rids_i8_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        _ => Err(Error::Internal("unsupported sorted dtype".into())),
+                    }
+                } else {
+                    match first_any.data_type() {
+                        DataType::UInt64 => sorted_visit_with_rids_u64_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        DataType::UInt32 => sorted_visit_with_rids_u32_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        DataType::UInt16 => sorted_visit_with_rids_u16_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        DataType::UInt8 => sorted_visit_with_rids_u8_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        DataType::Int64 => sorted_visit_with_rids_i64_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        DataType::Int32 => sorted_visit_with_rids_i32_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        DataType::Int16 => sorted_visit_with_rids_i16_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        DataType::Int8 => sorted_visit_with_rids_i8_rev(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        _ => Err(Error::Internal("unsupported sorted dtype".into())),
+                    }
                 }
             } else {
-                match first_any.data_type() {
-                    DataType::UInt64 => sorted_visit_with_rids_u64(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
+                if paginate {
+                    let mut pv = crate::store::scan::PaginateVisitor::new(
                         visitor,
-                    ),
-                    DataType::UInt32 => sorted_visit_with_rids_u32(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::UInt16 => sorted_visit_with_rids_u16(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::UInt8 => sorted_visit_with_rids_u8(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int64 => sorted_visit_with_rids_i64(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int32 => sorted_visit_with_rids_i32(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int16 => sorted_visit_with_rids_i16(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int8 => sorted_visit_with_rids_i8(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    _ => Err(Error::Internal("unsupported sorted dtype".into())),
+                        opts.offset,
+                        opts.limit,
+                    );
+                    match first_any.data_type() {
+                        DataType::UInt64 => sorted_visit_with_rids_u64(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        DataType::UInt32 => sorted_visit_with_rids_u32(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        DataType::UInt16 => sorted_visit_with_rids_u16(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        DataType::UInt8 => sorted_visit_with_rids_u8(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        DataType::Int64 => sorted_visit_with_rids_i64(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        DataType::Int32 => sorted_visit_with_rids_i32(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        DataType::Int16 => sorted_visit_with_rids_i16(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        DataType::Int8 => sorted_visit_with_rids_i8(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        ),
+                        _ => Err(Error::Internal("unsupported sorted dtype".into())),
+                    }
+                } else {
+                    match first_any.data_type() {
+                        DataType::UInt64 => sorted_visit_with_rids_u64(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        DataType::UInt32 => sorted_visit_with_rids_u32(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        DataType::UInt16 => sorted_visit_with_rids_u16(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        DataType::UInt8 => sorted_visit_with_rids_u8(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        DataType::Int64 => sorted_visit_with_rids_i64(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        DataType::Int32 => sorted_visit_with_rids_i32(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        DataType::Int16 => sorted_visit_with_rids_i16(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        DataType::Int8 => sorted_visit_with_rids_i8(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        ),
+                        _ => Err(Error::Internal("unsupported sorted dtype".into())),
+                    }
                 }
             }
         } else {
             if opts.reverse {
-                self.scan_sorted_visit_reverse(field_id, visitor)
+                if paginate {
+                    let mut pv = crate::store::scan::PaginateVisitor::new_with_reverse(
+                        visitor,
+                        opts.offset,
+                        opts.limit,
+                        true,
+                    );
+                    self.scan_sorted_visit_reverse(field_id, &mut pv)
+                } else {
+                    self.scan_sorted_visit_reverse(field_id, visitor)
+                }
             } else {
-                self.scan_sorted_visit(field_id, visitor)
+                if paginate {
+                    let mut pv = crate::store::scan::PaginateVisitor::new_with_reverse(
+                        visitor,
+                        opts.offset,
+                        opts.limit,
+                        false,
+                    );
+                    self.scan_sorted_visit(field_id, &mut pv)
+                } else {
+                    self.scan_sorted_visit(field_id, visitor)
+                }
             }
         }
     }

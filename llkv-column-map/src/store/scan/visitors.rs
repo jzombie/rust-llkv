@@ -119,3 +119,206 @@ pub trait PrimitiveSortedWithRowIdsVisitor {
     }
     fn i8_run_with_rids(&mut self, _v: &Int8Array, _r: &UInt64Array, _start: usize, _len: usize) {}
 }
+
+// Pagination adapter: enforces offset/limit across chunks (unsorted)
+// and across coalesced runs (sorted). It wraps an inner visitor that
+// implements the same traits and forwards appropriately.
+pub struct PaginateVisitor<'a, V> {
+    pub inner: &'a mut V,
+    // items to skip before emitting
+    skip: usize,
+    // remaining items to emit (None => unbounded)
+    remaining: Option<usize>,
+    // when true, interpret sorted runs as descending
+    reverse: bool,
+}
+
+impl<'a, V> PaginateVisitor<'a, V> {
+    pub fn new(inner: &'a mut V, offset: usize, limit: Option<usize>) -> Self {
+        Self {
+            inner,
+            skip: offset,
+            remaining: limit,
+            reverse: false,
+        }
+    }
+
+    pub fn new_with_reverse(
+        inner: &'a mut V,
+        offset: usize,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> Self {
+        Self {
+            inner,
+            skip: offset,
+            remaining: limit,
+            reverse,
+        }
+    }
+
+    #[inline]
+    fn split_len(&mut self, len: usize) -> Option<(usize, usize)> {
+        // Apply skip first
+        if self.skip >= len {
+            self.skip -= len;
+            return None;
+        }
+        let start = self.skip;
+        let mut take = len - self.skip;
+        self.skip = 0;
+        if let Some(rem) = self.remaining.as_mut() {
+            if *rem == 0 {
+                return None;
+            }
+            if take > *rem {
+                take = *rem;
+            }
+            *rem -= take;
+        }
+        Some((start, take))
+    }
+
+    #[inline]
+    fn done(&self) -> bool {
+        matches!(self.remaining, Some(0))
+    }
+}
+
+macro_rules! impl_unsorted_paginate_for_type {
+    ($meth:ident, $ArrTy:ty) => {
+        fn $meth(&mut self, a: &$ArrTy) {
+            if self.done() {
+                return;
+            }
+            let len = a.len();
+            if let Some((s, l)) = self.split_len(len) {
+                if s == 0 && self.remaining.is_none() {
+                    // No slicing needed; forward full array
+                    self.inner.$meth(a);
+                } else {
+                    // Typed slice returns a new array view of the same type
+                    let sa: $ArrTy = a.slice(s, l);
+                    self.inner.$meth(&sa);
+                }
+            }
+        }
+    };
+}
+
+impl<'a, V> PrimitiveVisitor for PaginateVisitor<'a, V>
+where
+    V: PrimitiveVisitor,
+{
+    impl_unsorted_paginate_for_type!(u64_chunk, UInt64Array);
+    impl_unsorted_paginate_for_type!(u32_chunk, UInt32Array);
+    impl_unsorted_paginate_for_type!(u16_chunk, UInt16Array);
+    impl_unsorted_paginate_for_type!(u8_chunk, UInt8Array);
+    impl_unsorted_paginate_for_type!(i64_chunk, Int64Array);
+    impl_unsorted_paginate_for_type!(i32_chunk, Int32Array);
+    impl_unsorted_paginate_for_type!(i16_chunk, Int16Array);
+    impl_unsorted_paginate_for_type!(i8_chunk, Int8Array);
+}
+
+macro_rules! impl_unsorted_with_rids_paginate_for_type {
+    ($meth:ident, $ArrTy:ty) => {
+        fn $meth(&mut self, v: &$ArrTy, r: &UInt64Array) {
+            if self.done() {
+                return;
+            }
+            let len = v.len();
+            if len != r.len() {
+                panic!("value/rowid length mismatch");
+            }
+            if let Some((s, l)) = self.split_len(len) {
+                let va: $ArrTy = v.slice(s, l);
+                let ra: UInt64Array = r.slice(s, l);
+                self.inner.$meth(&va, &ra);
+            }
+        }
+    };
+}
+
+impl<'a, V> PrimitiveWithRowIdsVisitor for PaginateVisitor<'a, V>
+where
+    V: PrimitiveWithRowIdsVisitor,
+{
+    impl_unsorted_with_rids_paginate_for_type!(u64_chunk_with_rids, UInt64Array);
+    impl_unsorted_with_rids_paginate_for_type!(u32_chunk_with_rids, UInt32Array);
+    impl_unsorted_with_rids_paginate_for_type!(u16_chunk_with_rids, UInt16Array);
+    impl_unsorted_with_rids_paginate_for_type!(u8_chunk_with_rids, UInt8Array);
+    impl_unsorted_with_rids_paginate_for_type!(i64_chunk_with_rids, Int64Array);
+    impl_unsorted_with_rids_paginate_for_type!(i32_chunk_with_rids, Int32Array);
+    impl_unsorted_with_rids_paginate_for_type!(i16_chunk_with_rids, Int16Array);
+    impl_unsorted_with_rids_paginate_for_type!(i8_chunk_with_rids, Int8Array);
+}
+
+macro_rules! impl_sorted_paginate_for_type {
+    ($meth:ident, $ArrTy:ty) => {
+        fn $meth(&mut self, a: &$ArrTy, start: usize, len: usize) {
+            if self.done() {
+                return;
+            }
+            if let Some((delta, take)) = self.split_len(len) {
+                if take > 0 {
+                    if self.reverse {
+                        // For descending semantics, take from the end of the run.
+                        // The first items to emit correspond to the last indices.
+                        let adj_start = start + (len - (delta + take));
+                        self.inner.$meth(a, adj_start, take);
+                    } else {
+                        self.inner.$meth(a, start + delta, take);
+                    }
+                }
+            }
+        }
+    };
+}
+
+impl<'a, V> PrimitiveSortedVisitor for PaginateVisitor<'a, V>
+where
+    V: PrimitiveSortedVisitor,
+{
+    impl_sorted_paginate_for_type!(u64_run, UInt64Array);
+    impl_sorted_paginate_for_type!(u32_run, UInt32Array);
+    impl_sorted_paginate_for_type!(u16_run, UInt16Array);
+    impl_sorted_paginate_for_type!(u8_run, UInt8Array);
+    impl_sorted_paginate_for_type!(i64_run, Int64Array);
+    impl_sorted_paginate_for_type!(i32_run, Int32Array);
+    impl_sorted_paginate_for_type!(i16_run, Int16Array);
+    impl_sorted_paginate_for_type!(i8_run, Int8Array);
+}
+
+macro_rules! impl_sorted_with_rids_paginate_for_type {
+    ($meth:ident, $ArrTy:ty) => {
+        fn $meth(&mut self, v: &$ArrTy, r: &UInt64Array, start: usize, len: usize) {
+            if self.done() {
+                return;
+            }
+            if let Some((delta, take)) = self.split_len(len) {
+                if take > 0 {
+                    if self.reverse {
+                        let adj_start = start + (len - (delta + take));
+                        self.inner.$meth(v, r, adj_start, take);
+                    } else {
+                        self.inner.$meth(v, r, start + delta, take);
+                    }
+                }
+            }
+        }
+    };
+}
+
+impl<'a, V> PrimitiveSortedWithRowIdsVisitor for PaginateVisitor<'a, V>
+where
+    V: PrimitiveSortedWithRowIdsVisitor,
+{
+    impl_sorted_with_rids_paginate_for_type!(u64_run_with_rids, UInt64Array);
+    impl_sorted_with_rids_paginate_for_type!(u32_run_with_rids, UInt32Array);
+    impl_sorted_with_rids_paginate_for_type!(u16_run_with_rids, UInt16Array);
+    impl_sorted_with_rids_paginate_for_type!(u8_run_with_rids, UInt8Array);
+    impl_sorted_with_rids_paginate_for_type!(i64_run_with_rids, Int64Array);
+    impl_sorted_with_rids_paginate_for_type!(i32_run_with_rids, Int32Array);
+    impl_sorted_with_rids_paginate_for_type!(i16_run_with_rids, Int16Array);
+    impl_sorted_with_rids_paginate_for_type!(i8_run_with_rids, Int8Array);
+}
