@@ -98,7 +98,7 @@ fn build_batch_for_range(
     start: usize,
     end: usize,
 ) -> RecordBatch {
-    let n = end - start;
+    // let n = end - start;
     // row_id 0..N_ROWS-1
     let rid: Vec<u64> = (start as u64..end as u64).collect();
     let rid_arr = Arc::new(UInt64Array::from(rid));

@@ -30,6 +30,9 @@ use simd_r_drive_entry_handle::EntryHandle;
 pub mod builder;
 pub use builder::*;
 
+pub mod kmerge;
+pub use kmerge::*;
+
 pub mod options;
 pub use options::*;
 

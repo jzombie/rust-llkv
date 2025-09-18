@@ -413,13 +413,13 @@ fn scan_all_integer_types_sorted_and_ranges() {
     };
 
     // Generators per dtype
-    let mut gen_signed = |n: usize, bits: u32| -> Vec<i128> {
+    let gen_signed = |n: usize, bits: u32| -> Vec<i128> {
         let range = 1i128 << (bits - 1);
         (0..n)
             .map(|i| ((i as i128 % (2 * range)) - range))
             .collect()
     };
-    let mut gen_unsigned = |n: usize, bits: u32| -> Vec<i128> {
+    let gen_unsigned = |n: usize, bits: u32| -> Vec<i128> {
         let max = 1i128 << bits;
         (0..n).map(|i| (i as i128 % max)).collect()
     };

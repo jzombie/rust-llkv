@@ -8,16 +8,16 @@ use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::{
-    PrimitiveVisitor,
-    PrimitiveSortedVisitor,
-    PrimitiveWithRowIdsVisitor,
-    PrimitiveSortedWithRowIdsVisitor,
-    ScanOptions, ScanBuilder,
+    PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+    PrimitiveWithRowIdsVisitor, ScanOptions,
 };
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 fn fid_user(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new().with_namespace(Namespace::UserData).with_table_id(0).with_field_id(id)
+    LogicalFieldId::new()
+        .with_namespace(Namespace::UserData)
+        .with_table_id(0)
+        .with_field_id(id)
 }
 
 #[test]
@@ -41,10 +41,16 @@ fn unsorted_scan_works_without_index_u64() {
     let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
     store.append(&batch).unwrap();
 
-    struct SumU64<'a> { acc: &'a std::cell::Cell<u128> }
+    struct SumU64<'a> {
+        acc: &'a std::cell::Cell<u128>,
+    }
     impl<'a> PrimitiveVisitor for SumU64<'a> {
         fn u64_chunk(&mut self, a: &UInt64Array) {
-            let mut s = 0u128; for i in 0..a.len() { s += a.value(i) as u128; } self.acc.set(self.acc.get() + s);
+            let mut s = 0u128;
+            for i in 0..a.len() {
+                s += a.value(i) as u128;
+            }
+            self.acc.set(self.acc.get() + s);
         }
     }
     impl<'a> PrimitiveSortedVisitor for SumU64<'a> {}
@@ -54,7 +60,18 @@ fn unsorted_scan_works_without_index_u64() {
     let acc = std::cell::Cell::new(0u128);
     let mut v = SumU64 { acc: &acc };
     // No index created; unsorted scan should still work
-    store.scan(fid, ScanOptions { sorted: false, reverse: false, with_row_ids: false, row_id_field: None }, &mut v).unwrap();
+    store
+        .scan(
+            fid,
+            ScanOptions {
+                sorted: false,
+                reverse: false,
+                with_row_ids: false,
+                row_id_field: None,
+            },
+            &mut v,
+        )
+        .unwrap();
     assert!(acc.get() > 0);
 }
 
@@ -79,9 +96,13 @@ fn unsorted_with_row_ids_works_without_index() {
     let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
     store.append(&batch).unwrap();
 
-    struct Count<'a> { cnt: &'a std::cell::Cell<usize> }
+    struct Count<'a> {
+        cnt: &'a std::cell::Cell<usize>,
+    }
     impl<'a> PrimitiveWithRowIdsVisitor for Count<'a> {
-        fn i32_chunk_with_rids(&mut self, _v: &Int32Array, r: &UInt64Array) { self.cnt.set(self.cnt.get() + r.len()); }
+        fn i32_chunk_with_rids(&mut self, _v: &Int32Array, r: &UInt64Array) {
+            self.cnt.set(self.cnt.get() + r.len());
+        }
     }
     impl<'a> PrimitiveVisitor for Count<'a> {}
     impl<'a> PrimitiveSortedVisitor for Count<'a> {}
@@ -93,7 +114,12 @@ fn unsorted_with_row_ids_works_without_index() {
     store
         .scan(
             fid,
-            ScanOptions { sorted: false, reverse: false, with_row_ids: true, row_id_field: Some(rid_fid) },
+            ScanOptions {
+                sorted: false,
+                reverse: false,
+                with_row_ids: true,
+                row_id_field: Some(rid_fid),
+            },
             &mut v,
         )
         .unwrap();
@@ -125,7 +151,15 @@ fn sorted_scan_without_index_returns_error() {
     impl PrimitiveSortedWithRowIdsVisitor for Noop {}
 
     let mut v = Noop;
-    let res = store.scan(fid, ScanOptions { sorted: true, reverse: false, with_row_ids: false, row_id_field: None }, &mut v);
+    let res = store.scan(
+        fid,
+        ScanOptions {
+            sorted: true,
+            reverse: false,
+            with_row_ids: false,
+            row_id_field: None,
+        },
+        &mut v,
+    );
     assert!(res.is_err());
 }
-
