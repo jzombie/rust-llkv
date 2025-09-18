@@ -1,9 +1,4 @@
-//! Table: a column-store-backed table with row-based ingest.
-//!
-//! Goals:
-//! - No B+Tree, no rayon.
-//! - Row-based inserts -> column_map append_many.
-//! - Scans delegate to column_map read_scan utilities.
+// TODO: Look into https://docs.rs/arrow-row/56.1.0/arrow_row/
 
 // TODO: Replace internal `HashMap` and `HashSet` with `Fx` equivalents
 // TODO: Implement `Display` trait for CLI views
@@ -15,11 +10,11 @@ use std::sync::Arc;
 
 use crossbeam_channel as xchan;
 
-use llkv_column_map::ColumnStore;
 use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ScanError, ValueScanOpts};
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, ValueMode};
 use llkv_column_map::views::ValueSlice;
+use llkv_column_map::ColumnStore;
 
 use crate::expr::{Expr, Filter, Operator};
 use crate::types::{FieldId, RowId, RowPatch};
