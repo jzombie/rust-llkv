@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::Namespace;
 
 macro_rules! sorted_visit_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident) => {
@@ -528,9 +529,7 @@ where
         Option<crate::store::descriptor::ColumnDescriptor>,
         Vec<ChunkMetadata>,
     ) = if opts.with_row_ids {
-        let rid_fid = opts.row_id_field.ok_or_else(|| {
-            Error::Internal("row_id field id required when with_row_ids=true".into())
-        })?;
+        let rid_fid = field_id.with_namespace(Namespace::RowIdShadow);
         let rid_pk = *catalog.map.get(&rid_fid).ok_or(Error::NotFound)?;
         let rid_desc_blob = store
             .pager

@@ -24,7 +24,7 @@ use crate::error::{Error, Result};
 use crate::serialization::deserialize_array;
 use crate::storage::pager::{BatchGet, GetResult, Pager};
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
-use crate::types::{LogicalFieldId, PhysicalKey};
+use crate::types::{LogicalFieldId, Namespace, PhysicalKey};
 use simd_r_drive_entry_handle::EntryHandle;
 
 pub mod builder;
@@ -278,16 +278,40 @@ where
         let paginate = opts.offset > 0 || opts.limit.is_some();
         if !opts.sorted {
             if opts.with_row_ids {
-                let row_fid = opts.row_id_field.ok_or_else(|| {
-                    Error::Internal("row_id field id required when with_row_ids=true".into())
-                })?;
+                let row_fid = field_id.with_namespace(Namespace::RowIdShadow);
                 let catalog = self.catalog.read().unwrap();
+                if opts.include_nulls {
+                    let anchor_fid = opts.anchor_row_id_field.unwrap_or(row_fid);
+                    if paginate {
+                        let mut pv = crate::store::scan::PaginateVisitor::new(
+                            visitor,
+                            opts.offset,
+                            opts.limit,
+                        );
+                        return crate::store::scan::unsorted_with_row_ids_and_nulls_visit(
+                            self.pager.as_ref(),
+                            &catalog.map,
+                            field_id,
+                            row_fid,
+                            anchor_fid,
+                            opts.nulls_first,
+                            &mut pv,
+                        );
+                    } else {
+                        return crate::store::scan::unsorted_with_row_ids_and_nulls_visit(
+                            self.pager.as_ref(),
+                            &catalog.map,
+                            field_id,
+                            row_fid,
+                            anchor_fid,
+                            opts.nulls_first,
+                            visitor,
+                        );
+                    }
+                }
                 if paginate {
-                    let mut pv = crate::store::scan::PaginateVisitor::new(
-                        visitor,
-                        opts.offset,
-                        opts.limit,
-                    );
+                    let mut pv =
+                        crate::store::scan::PaginateVisitor::new(visitor, opts.offset, opts.limit);
                     return crate::store::scan::unsorted_with_row_ids_visit(
                         self.pager.as_ref(),
                         &catalog.map,
@@ -306,11 +330,8 @@ where
                 }
             }
             if paginate {
-                let mut pv = crate::store::scan::PaginateVisitor::new(
-                    visitor,
-                    opts.offset,
-                    opts.limit,
-                );
+                let mut pv =
+                    crate::store::scan::PaginateVisitor::new(visitor, opts.offset, opts.limit);
                 return self.scan_visit(field_id, &mut pv);
             } else {
                 return self.scan_visit(field_id, visitor);
@@ -318,9 +339,7 @@ where
         }
 
         if opts.with_row_ids {
-            let row_fid = opts.row_id_field.ok_or_else(|| {
-                Error::Internal("row_id field id required when with_row_ids=true".into())
-            })?;
+            let row_fid = field_id.with_namespace(Namespace::RowIdShadow);
             // Prepare value metas and blobs
             let catalog = self.catalog.read().unwrap();
             let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
@@ -422,7 +441,7 @@ where
                         opts.limit,
                         true,
                     );
-                    match first_any.data_type() {
+                    let vals_res = match first_any.data_type() {
                         DataType::UInt64 => sorted_visit_with_rids_u64_rev(
                             self.pager.as_ref(),
                             &metas_val,
@@ -488,6 +507,211 @@ where
                             &mut pv,
                         ),
                         _ => Err(Error::Internal("unsupported sorted dtype".into())),
+                    };
+                    if opts.include_nulls {
+                        let anchor_fid = opts.anchor_row_id_field.unwrap_or(row_fid);
+                        let catalog = self.catalog.read().unwrap();
+                        let anchor_desc_pk =
+                            *catalog.map.get(&anchor_fid).ok_or(Error::NotFound)?;
+                        let anchor_desc_blob = self
+                            .pager
+                            .batch_get(&[BatchGet::Raw {
+                                key: anchor_desc_pk,
+                            }])?
+                            .pop()
+                            .and_then(|r| match r {
+                                GetResult::Raw { bytes, .. } => Some(bytes),
+                                _ => None,
+                            })
+                            .ok_or(Error::NotFound)?;
+                        let anchor_desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(
+                            anchor_desc_blob.as_ref(),
+                        );
+                        drop(catalog);
+                        let mut anchor_rids: Vec<UInt64Array> = Vec::new();
+                        let mut get_keys: Vec<BatchGet> = Vec::new();
+                        let mut anchor_metas: Vec<crate::store::descriptor::ChunkMetadata> =
+                            Vec::new();
+                        for m in crate::store::descriptor::DescriptorIterator::new(
+                            self.pager.as_ref(),
+                            anchor_desc.head_page_pk,
+                        ) {
+                            let mm = m?;
+                            if mm.row_count == 0 {
+                                continue;
+                            }
+                            anchor_metas.push(mm);
+                            get_keys.push(BatchGet::Raw { key: mm.chunk_pk });
+                        }
+                        if !anchor_metas.is_empty() {
+                            let res = self.pager.batch_get(&get_keys)?;
+                            for r in res {
+                                if let GetResult::Raw { bytes, .. } = r {
+                                    let any = deserialize_array(bytes)?;
+                                    let arr = any
+                                        .as_any()
+                                        .downcast_ref::<UInt64Array>()
+                                        .ok_or_else(|| {
+                                            Error::Internal("anchor rid not u64".into())
+                                        })?
+                                        .clone();
+                                    anchor_rids.push(arr);
+                                }
+                            }
+                        }
+                        let mut present_rids: Vec<UInt64Array> = Vec::new();
+                        for mr in &metas_rid {
+                            let any = deserialize_array(
+                                rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone(),
+                            )?;
+                            let arr = any
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .ok_or_else(|| Error::Internal("rid not u64".into()))?
+                                .clone();
+                            present_rids.push(arr);
+                        }
+                        let mut ai = anchor_rids.len();
+                        let mut aj: isize = -1; // reverse traversal
+                        let mut pi = present_rids.len();
+                        let mut pj: isize = -1;
+                        let mut buf: Vec<u64> = Vec::new();
+                        let mut flush = |v: &mut Vec<u64>| -> Result<()> {
+                            if v.is_empty() {
+                                return Ok(());
+                            }
+                            let arr = UInt64Array::from(std::mem::take(v));
+                            let len = arr.len();
+                            pv.null_run(&arr, 0, len);
+                            Ok(())
+                        };
+                        // Emit order: nulls_first => nulls then values; else values then nulls
+                        if opts.nulls_first {
+                            // Emit nulls first (descending rid order)
+                            if ai > 0 {
+                                ai -= 1;
+                                aj = anchor_rids[ai].len() as isize - 1;
+                            }
+                            if pi > 0 {
+                                pi -= 1;
+                                pj = present_rids[pi].len() as isize - 1;
+                            }
+                            while ai < anchor_rids.len() {
+                                // ai unsigned; exit when wrap logic ends
+                                let a = &anchor_rids[ai];
+                                while aj >= 0 {
+                                    let av = a.value(aj as usize);
+                                    // advance present down to <= av
+                                    while pi < present_rids.len() {
+                                        let p = &present_rids[pi];
+                                        if pj < 0 {
+                                            if pi == 0 {
+                                                break;
+                                            }
+                                            pi -= 1;
+                                            pj = present_rids[pi].len() as isize - 1;
+                                            continue;
+                                        }
+                                        let pv2 = p.value(pj as usize);
+                                        if pv2 > av {
+                                            pj -= 1;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    let present_eq = if pi < present_rids.len() {
+                                        let p = &present_rids[pi];
+                                        if pj >= 0 {
+                                            p.value(pj as usize) == av
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    };
+                                    if !present_eq {
+                                        buf.push(av);
+                                    }
+                                    if present_eq {
+                                        pj -= 1;
+                                    }
+                                    aj -= 1;
+                                    if buf.len() >= 4096 {
+                                        flush(&mut buf)?;
+                                    }
+                                }
+                                if ai == 0 {
+                                    break;
+                                }
+                                ai -= 1;
+                                aj = anchor_rids[ai].len() as isize - 1;
+                            }
+                            flush(&mut buf)?;
+                            vals_res
+                        } else {
+                            vals_res.and_then(|_| {
+                                if ai > 0 {
+                                    ai -= 1;
+                                    aj = anchor_rids[ai].len() as isize - 1;
+                                }
+                                if pi > 0 {
+                                    pi -= 1;
+                                    pj = present_rids[pi].len() as isize - 1;
+                                }
+                                while ai < anchor_rids.len() {
+                                    let a = &anchor_rids[ai];
+                                    while aj >= 0 {
+                                        let av = a.value(aj as usize);
+                                        while pi < present_rids.len() {
+                                            let p = &present_rids[pi];
+                                            if pj < 0 {
+                                                if pi == 0 {
+                                                    break;
+                                                }
+                                                pi -= 1;
+                                                pj = present_rids[pi].len() as isize - 1;
+                                                continue;
+                                            }
+                                            let pv2 = p.value(pj as usize);
+                                            if pv2 > av {
+                                                pj -= 1;
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        let present_eq = if pi < present_rids.len() {
+                                            let p = &present_rids[pi];
+                                            if pj >= 0 {
+                                                p.value(pj as usize) == av
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        };
+                                        if !present_eq {
+                                            buf.push(av);
+                                        }
+                                        if present_eq {
+                                            pj -= 1;
+                                        }
+                                        aj -= 1;
+                                        if buf.len() >= 4096 {
+                                            flush(&mut buf)?;
+                                        }
+                                    }
+                                    if ai == 0 {
+                                        break;
+                                    }
+                                    ai -= 1;
+                                    aj = anchor_rids[ai].len() as isize - 1;
+                                }
+                                flush(&mut buf)?;
+                                Ok(())
+                            })
+                        }
+                    } else {
+                        vals_res
                     }
                 } else {
                     match first_any.data_type() {
@@ -560,12 +784,9 @@ where
                 }
             } else {
                 if paginate {
-                    let mut pv = crate::store::scan::PaginateVisitor::new(
-                        visitor,
-                        opts.offset,
-                        opts.limit,
-                    );
-                    match first_any.data_type() {
+                    let mut pv =
+                        crate::store::scan::PaginateVisitor::new(visitor, opts.offset, opts.limit);
+                    let vals_res = match first_any.data_type() {
                         DataType::UInt64 => sorted_visit_with_rids_u64(
                             self.pager.as_ref(),
                             &metas_val,
@@ -631,74 +852,523 @@ where
                             &mut pv,
                         ),
                         _ => Err(Error::Internal("unsupported sorted dtype".into())),
+                    };
+                    if opts.include_nulls {
+                        // nulls_first not meaningful without with_row_ids
+                        let anchor_fid = opts.anchor_row_id_field.unwrap_or(row_fid);
+                        // Build anchor rid arrays (ascending)
+                        let catalog = self.catalog.read().unwrap();
+                        let anchor_desc_pk =
+                            *catalog.map.get(&anchor_fid).ok_or(Error::NotFound)?;
+                        let anchor_desc_blob = self
+                            .pager
+                            .batch_get(&[BatchGet::Raw {
+                                key: anchor_desc_pk,
+                            }])?
+                            .pop()
+                            .and_then(|r| match r {
+                                GetResult::Raw { bytes, .. } => Some(bytes),
+                                _ => None,
+                            })
+                            .ok_or(Error::NotFound)?;
+                        let anchor_desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(
+                            anchor_desc_blob.as_ref(),
+                        );
+                        drop(catalog);
+                        let mut anchor_rids: Vec<UInt64Array> = Vec::new();
+                        let mut get_keys: Vec<BatchGet> = Vec::new();
+                        let mut anchor_metas: Vec<crate::store::descriptor::ChunkMetadata> =
+                            Vec::new();
+                        for m in crate::store::descriptor::DescriptorIterator::new(
+                            self.pager.as_ref(),
+                            anchor_desc.head_page_pk,
+                        ) {
+                            let mm = m?;
+                            if mm.row_count == 0 {
+                                continue;
+                            }
+                            anchor_metas.push(mm);
+                            get_keys.push(BatchGet::Raw { key: mm.chunk_pk });
+                        }
+                        if !anchor_metas.is_empty() {
+                            let res = self.pager.batch_get(&get_keys)?;
+                            for r in res {
+                                if let GetResult::Raw { bytes, .. } = r {
+                                    let any = deserialize_array(bytes)?;
+                                    let arr = any
+                                        .as_any()
+                                        .downcast_ref::<UInt64Array>()
+                                        .ok_or_else(|| {
+                                            Error::Internal("anchor rid not u64".into())
+                                        })?
+                                        .clone();
+                                    anchor_rids.push(arr);
+                                }
+                            }
+                        }
+                        // Build present rids from metas_rid/rblobs
+                        let mut present_rids: Vec<UInt64Array> = Vec::new();
+                        for mr in &metas_rid {
+                            let any = deserialize_array(
+                                rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone(),
+                            )?;
+                            let arr = any
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .ok_or_else(|| Error::Internal("rid not u64".into()))?
+                                .clone();
+                            present_rids.push(arr);
+                        }
+                        // Two-pointer set-difference to get null rids (ascending)
+                        let mut ai = 0usize;
+                        let mut aj = 0usize; // anchor chunk/idx
+                        let mut pi = 0usize;
+                        let mut pj = 0usize; // present chunk/idx
+                        let mut buf: Vec<u64> = Vec::new();
+                        let mut flush = |v: &mut Vec<u64>| -> Result<()> {
+                            if v.is_empty() {
+                                return Ok(());
+                            }
+                            let arr = UInt64Array::from(std::mem::take(v));
+                            let len = arr.len();
+                            pv.null_run(&arr, 0, len);
+                            Ok(())
+                        };
+                        // Emit order: nulls_first => nulls then values; else values then nulls
+                        if opts.nulls_first {
+                            // Emit nulls first
+                            while ai < anchor_rids.len() {
+                                let a = &anchor_rids[ai];
+                                while aj < a.len() {
+                                    let av = a.value(aj);
+                                    // Advance present to >= av
+                                    while pi < present_rids.len() {
+                                        let p = &present_rids[pi];
+                                        if pj >= p.len() {
+                                            pi += 1;
+                                            pj = 0;
+                                            continue;
+                                        }
+                                        let pv2 = p.value(pj);
+                                        if pv2 < av {
+                                            pj += 1;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    let present_eq = if pi < present_rids.len() {
+                                        let p = &present_rids[pi];
+                                        if pj < p.len() {
+                                            p.value(pj) == av
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    };
+                                    if !present_eq {
+                                        buf.push(av);
+                                    }
+                                    if present_eq {
+                                        pj += 1;
+                                    }
+                                    aj += 1;
+                                    if buf.len() >= 4096 {
+                                        flush(&mut buf)?;
+                                    }
+                                }
+                                ai += 1;
+                                aj = 0;
+                            }
+                            flush(&mut buf)?;
+                            vals_res
+                        } else {
+                            vals_res.and_then(|_| {
+                                while ai < anchor_rids.len() {
+                                    let a = &anchor_rids[ai];
+                                    while aj < a.len() {
+                                        let av = a.value(aj);
+                                        while pi < present_rids.len() {
+                                            let p = &present_rids[pi];
+                                            if pj >= p.len() {
+                                                pi += 1;
+                                                pj = 0;
+                                                continue;
+                                            }
+                                            let pv2 = p.value(pj);
+                                            if pv2 < av {
+                                                pj += 1;
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        let present_eq = if pi < present_rids.len() {
+                                            let p = &present_rids[pi];
+                                            if pj < p.len() {
+                                                p.value(pj) == av
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        };
+                                        if !present_eq {
+                                            buf.push(av);
+                                        }
+                                        if present_eq {
+                                            pj += 1;
+                                        }
+                                        aj += 1;
+                                        if buf.len() >= 4096 {
+                                            flush(&mut buf)?;
+                                        }
+                                    }
+                                    ai += 1;
+                                    aj = 0;
+                                }
+                                flush(&mut buf)?;
+                                Ok(())
+                            })
+                        }
+                    } else {
+                        vals_res
                     }
                 } else {
-                    match first_any.data_type() {
-                        DataType::UInt64 => sorted_visit_with_rids_u64(
+                    if opts.include_nulls && opts.nulls_first {
+                        let anchor_fid = opts.anchor_row_id_field.ok_or_else(|| {
+                            Error::Internal(
+                                "anchor_row_id_field required when include_nulls=true".into(),
+                            )
+                        })?;
+                        let catalog = self.catalog.read().unwrap();
+                        let anchor_desc_pk =
+                            *catalog.map.get(&anchor_fid).ok_or(Error::NotFound)?;
+                        let anchor_desc_blob = self
+                            .pager
+                            .batch_get(&[BatchGet::Raw {
+                                key: anchor_desc_pk,
+                            }])?
+                            .pop()
+                            .and_then(|r| match r {
+                                GetResult::Raw { bytes, .. } => Some(bytes),
+                                _ => None,
+                            })
+                            .ok_or(Error::NotFound)?;
+                        let anchor_desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(
+                            anchor_desc_blob.as_ref(),
+                        );
+                        drop(catalog);
+                        let mut anchor_rids: Vec<UInt64Array> = Vec::new();
+                        let mut get_keys: Vec<BatchGet> = Vec::new();
+                        let mut anchor_metas: Vec<crate::store::descriptor::ChunkMetadata> =
+                            Vec::new();
+                        for m in crate::store::descriptor::DescriptorIterator::new(
                             self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::UInt32 => sorted_visit_with_rids_u32(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::UInt16 => sorted_visit_with_rids_u16(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::UInt8 => sorted_visit_with_rids_u8(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::Int64 => sorted_visit_with_rids_i64(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::Int32 => sorted_visit_with_rids_i32(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::Int16 => sorted_visit_with_rids_i16(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::Int8 => sorted_visit_with_rids_i8(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        _ => Err(Error::Internal("unsupported sorted dtype".into())),
+                            anchor_desc.head_page_pk,
+                        ) {
+                            let mm = m?;
+                            if mm.row_count == 0 {
+                                continue;
+                            }
+                            anchor_metas.push(mm);
+                            get_keys.push(BatchGet::Raw { key: mm.chunk_pk });
+                        }
+                        if !anchor_metas.is_empty() {
+                            let res = self.pager.batch_get(&get_keys)?;
+                            for r in res {
+                                if let GetResult::Raw { bytes, .. } = r {
+                                    let any = deserialize_array(bytes)?;
+                                    let arr = any
+                                        .as_any()
+                                        .downcast_ref::<UInt64Array>()
+                                        .ok_or_else(|| {
+                                            Error::Internal("anchor rid not u64".into())
+                                        })?
+                                        .clone();
+                                    anchor_rids.push(arr);
+                                }
+                            }
+                        }
+                        let mut present_rids: Vec<UInt64Array> = Vec::new();
+                        for mr in &metas_rid {
+                            let any = deserialize_array(
+                                rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone(),
+                            )?;
+                            let arr = any
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .ok_or_else(|| Error::Internal("rid not u64".into()))?
+                                .clone();
+                            present_rids.push(arr);
+                        }
+                        // Emit nulls first
+                        let mut ai = 0usize;
+                        let mut aj = 0usize;
+                        let mut pi = 0usize;
+                        let mut pj = 0usize;
+                        let mut buf: Vec<u64> = Vec::new();
+                        let mut flush = |v: &mut Vec<u64>| -> Result<()> {
+                            if v.is_empty() {
+                                return Ok(());
+                            }
+                            let arr = UInt64Array::from(std::mem::take(v));
+                            let len = arr.len();
+                            visitor.null_run(&arr, 0, len);
+                            Ok(())
+                        };
+                        while ai < anchor_rids.len() {
+                            let a = &anchor_rids[ai];
+                            while aj < a.len() {
+                                let av = a.value(aj);
+                                while pi < present_rids.len() {
+                                    let p = &present_rids[pi];
+                                    if pj >= p.len() {
+                                        pi += 1;
+                                        pj = 0;
+                                        continue;
+                                    }
+                                    let pv2 = p.value(pj);
+                                    if pv2 < av {
+                                        pj += 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                let present_eq = if pi < present_rids.len() {
+                                    let p = &present_rids[pi];
+                                    if pj < p.len() {
+                                        p.value(pj) == av
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+                                if !present_eq {
+                                    buf.push(av);
+                                }
+                                if present_eq {
+                                    pj += 1;
+                                }
+                                aj += 1;
+                                if buf.len() >= 4096 {
+                                    flush(&mut buf)?;
+                                }
+                            }
+                            ai += 1;
+                            aj = 0;
+                        }
+                        flush(&mut buf)?;
+                        // Then emit values
+                        match first_any.data_type() {
+                            DataType::UInt64 => sorted_visit_with_rids_u64(
+                                self.pager.as_ref(),
+                                &metas_val,
+                                &metas_rid,
+                                &vblobs,
+                                &rblobs,
+                                visitor,
+                            ),
+                            DataType::UInt32 => sorted_visit_with_rids_u32(
+                                self.pager.as_ref(),
+                                &metas_val,
+                                &metas_rid,
+                                &vblobs,
+                                &rblobs,
+                                visitor,
+                            ),
+                            DataType::UInt16 => sorted_visit_with_rids_u16(
+                                self.pager.as_ref(),
+                                &metas_val,
+                                &metas_rid,
+                                &vblobs,
+                                &rblobs,
+                                visitor,
+                            ),
+                            DataType::UInt8 => sorted_visit_with_rids_u8(
+                                self.pager.as_ref(),
+                                &metas_val,
+                                &metas_rid,
+                                &vblobs,
+                                &rblobs,
+                                visitor,
+                            ),
+                            DataType::Int64 => sorted_visit_with_rids_i64(
+                                self.pager.as_ref(),
+                                &metas_val,
+                                &metas_rid,
+                                &vblobs,
+                                &rblobs,
+                                visitor,
+                            ),
+                            DataType::Int32 => sorted_visit_with_rids_i32(
+                                self.pager.as_ref(),
+                                &metas_val,
+                                &metas_rid,
+                                &vblobs,
+                                &rblobs,
+                                visitor,
+                            ),
+                            DataType::Int16 => sorted_visit_with_rids_i16(
+                                self.pager.as_ref(),
+                                &metas_val,
+                                &metas_rid,
+                                &vblobs,
+                                &rblobs,
+                                visitor,
+                            ),
+                            DataType::Int8 => sorted_visit_with_rids_i8(
+                                self.pager.as_ref(),
+                                &metas_val,
+                                &metas_rid,
+                                &vblobs,
+                                &rblobs,
+                                visitor,
+                            ),
+                            _ => Err(Error::Internal("unsupported sorted dtype".into())),
+                        }
+                    } else {
+                        // Values first
+                        // let res_vals = match first_any.data_type() {
+                        //     DataType::UInt64 => sorted_visit_with_rids_u64(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
+                        //     DataType::UInt32 => sorted_visit_with_rids_u32(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
+                        //     DataType::UInt16 => sorted_visit_with_rids_u16(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
+                        //     DataType::UInt8 => sorted_visit_with_rids_u8(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
+                        //     DataType::Int64 => sorted_visit_with_rids_i64(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
+                        //     DataType::Int32 => sorted_visit_with_rids_i32(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
+                        //     DataType::Int16 => sorted_visit_with_rids_i16(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
+                        //     DataType::Int8 => sorted_visit_with_rids_i8(self.pager.as_ref(), &metas_val, &metas_rid, &vblobs, &rblobs, visitor),
+                        //     _ => Err(Error::Internal("unsupported sorted dtype".into())),
+                        // }?;
+                        if opts.include_nulls {
+                            let anchor_fid = opts.anchor_row_id_field.ok_or_else(|| {
+                                Error::Internal(
+                                    "anchor_row_id_field required when include_nulls=true".into(),
+                                )
+                            })?;
+                            let catalog = self.catalog.read().unwrap();
+                            let anchor_desc_pk =
+                                *catalog.map.get(&anchor_fid).ok_or(Error::NotFound)?;
+                            let anchor_desc_blob = self
+                                .pager
+                                .batch_get(&[BatchGet::Raw {
+                                    key: anchor_desc_pk,
+                                }])?
+                                .pop()
+                                .and_then(|r| match r {
+                                    GetResult::Raw { bytes, .. } => Some(bytes),
+                                    _ => None,
+                                })
+                                .ok_or(Error::NotFound)?;
+                            let anchor_desc =
+                                crate::store::descriptor::ColumnDescriptor::from_le_bytes(
+                                    anchor_desc_blob.as_ref(),
+                                );
+                            drop(catalog);
+                            let mut anchor_rids: Vec<UInt64Array> = Vec::new();
+                            let mut get_keys: Vec<BatchGet> = Vec::new();
+                            let mut anchor_metas: Vec<crate::store::descriptor::ChunkMetadata> =
+                                Vec::new();
+                            for m in crate::store::descriptor::DescriptorIterator::new(
+                                self.pager.as_ref(),
+                                anchor_desc.head_page_pk,
+                            ) {
+                                let mm = m?;
+                                if mm.row_count == 0 {
+                                    continue;
+                                }
+                                anchor_metas.push(mm);
+                                get_keys.push(BatchGet::Raw { key: mm.chunk_pk });
+                            }
+                            if !anchor_metas.is_empty() {
+                                let res = self.pager.batch_get(&get_keys)?;
+                                for r in res {
+                                    if let GetResult::Raw { bytes, .. } = r {
+                                        let any = deserialize_array(bytes)?;
+                                        let arr = any
+                                            .as_any()
+                                            .downcast_ref::<UInt64Array>()
+                                            .ok_or_else(|| {
+                                                Error::Internal("anchor rid not u64".into())
+                                            })?
+                                            .clone();
+                                        anchor_rids.push(arr);
+                                    }
+                                }
+                            }
+                            let mut present_rids: Vec<UInt64Array> = Vec::new();
+                            for mr in &metas_rid {
+                                let any = deserialize_array(
+                                    rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone(),
+                                )?;
+                                let arr = any
+                                    .as_any()
+                                    .downcast_ref::<UInt64Array>()
+                                    .ok_or_else(|| Error::Internal("rid not u64".into()))?
+                                    .clone();
+                                present_rids.push(arr);
+                            }
+                            let mut ai = 0usize;
+                            let mut aj = 0usize;
+                            let mut pi = 0usize;
+                            let mut pj = 0usize;
+                            let mut buf: Vec<u64> = Vec::new();
+                            let mut flush = |v: &mut Vec<u64>| -> Result<()> {
+                                if v.is_empty() {
+                                    return Ok(());
+                                }
+                                let arr = UInt64Array::from(std::mem::take(v));
+                                let len = arr.len();
+                                visitor.null_run(&arr, 0, len);
+                                Ok(())
+                            };
+                            while ai < anchor_rids.len() {
+                                let a = &anchor_rids[ai];
+                                while aj < a.len() {
+                                    let av = a.value(aj);
+                                    while pi < present_rids.len() {
+                                        let p = &present_rids[pi];
+                                        if pj >= p.len() {
+                                            pi += 1;
+                                            pj = 0;
+                                            continue;
+                                        }
+                                        let pv2 = p.value(pj);
+                                        if pv2 < av {
+                                            pj += 1;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    let present_eq = if pi < present_rids.len() {
+                                        let p = &present_rids[pi];
+                                        if pj < p.len() {
+                                            p.value(pj) == av
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    };
+                                    if !present_eq {
+                                        buf.push(av);
+                                    }
+                                    if present_eq {
+                                        pj += 1;
+                                    }
+                                    aj += 1;
+                                    if buf.len() >= 4096 {
+                                        flush(&mut buf)?;
+                                    }
+                                }
+                                ai += 1;
+                                aj = 0;
+                            }
+                            flush(&mut buf)?;
+                            Ok(())
+                        } else {
+                            Ok(())
+                        }
                     }
                 }
             }

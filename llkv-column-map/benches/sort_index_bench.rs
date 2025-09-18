@@ -199,9 +199,12 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             sorted: true,
                             reverse: false,
                             with_row_ids: false,
-                            row_id_field: None,
+                            
                             limit: None,
                             offset: 0,
+                            include_nulls: false,
+                            nulls_first: false,
+                            anchor_row_id_field: None,
                         },
                         &mut v,
                     )
@@ -225,9 +228,12 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             sorted: false,
                             reverse: false,
                             with_row_ids: false,
-                            row_id_field: None,
+                            
                             limit: None,
                             offset: 0,
+                            include_nulls: false,
+                            nulls_first: false,
+                            anchor_row_id_field: None,
                         },
                         &mut c,
                     )
@@ -274,9 +280,12 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             sorted: false,
                             reverse: false,
                             with_row_ids: false,
-                            row_id_field: None,
+                            
                             limit: None,
                             offset: 0,
+                            include_nulls: false,
+                            nulls_first: false,
+                            anchor_row_id_field: None,
                         },
                         &mut c,
                     )
@@ -306,9 +315,12 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             sorted: true,
                             reverse: false,
                             with_row_ids: false,
-                            row_id_field: None,
+                            
                             limit: None,
                             offset: 0,
+                            include_nulls: false,
+                            nulls_first: false,
+                            anchor_row_id_field: None,
                         },
                         &mut v,
                     )
@@ -332,9 +344,12 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             sorted: false,
                             reverse: false,
                             with_row_ids: false,
-                            row_id_field: None,
+                            
                             limit: None,
                             offset: 0,
+                            include_nulls: false,
+                            nulls_first: false,
+                            anchor_row_id_field: None,
                         },
                         &mut c,
                     )
@@ -381,9 +396,12 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             sorted: false,
                             reverse: false,
                             with_row_ids: false,
-                            row_id_field: None,
+                            
                             limit: None,
                             offset: 0,
+                            include_nulls: false,
+                            nulls_first: false,
+                            anchor_row_id_field: None,
                         },
                         &mut c,
                     )

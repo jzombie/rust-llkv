@@ -309,6 +309,100 @@ impl<P> ColumnStore<P>
 where
     P: Pager<Blob = EntryHandle>,
 {
+    /// Fast presence check using the presence index (row-id permutation) if available.
+    /// Returns true if `row_id` exists in the column; false otherwise.
+    pub fn has_row_id(&self, field_id: LogicalFieldId, row_id: u64) -> Result<bool> {
+        let rid_fid = rowid_fid(field_id);
+        let catalog = self.catalog.read().unwrap();
+        let rid_desc_pk = *catalog.map.get(&rid_fid).ok_or(Error::NotFound)?;
+        let rid_desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: rid_desc_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
+        let rid_desc = ColumnDescriptor::from_le_bytes(rid_desc_blob.as_ref());
+        drop(catalog);
+
+        // Walk metas; prune by min/max when available.
+        for m in DescriptorIterator::new(self.pager.as_ref(), rid_desc.head_page_pk) {
+            let meta = m?;
+            if meta.row_count == 0 {
+                continue;
+            }
+            if meta.min_val_u64 != 0 || meta.max_val_u64 != 0 {
+                if row_id < meta.min_val_u64 || row_id > meta.max_val_u64 {
+                    continue;
+                }
+            }
+            // Fetch rid chunk and, if present, the presence perm
+            let mut gets = vec![BatchGet::Raw { key: meta.chunk_pk }];
+            if meta.value_order_perm_pk != 0 {
+                gets.push(BatchGet::Raw {
+                    key: meta.value_order_perm_pk,
+                });
+            }
+            let results = self.pager.batch_get(&gets)?;
+            let mut rid_blob: Option<EntryHandle> = None;
+            let mut perm_blob: Option<EntryHandle> = None;
+            for r in results {
+                if let GetResult::Raw { key, bytes } = r {
+                    if key == meta.chunk_pk {
+                        rid_blob = Some(bytes);
+                    } else if key == meta.value_order_perm_pk {
+                        perm_blob = Some(bytes);
+                    }
+                }
+            }
+            // If the rid blob for this chunk is missing, treat as absent and continue
+            let Some(rid_blob) = rid_blob else { continue };
+            let rid_any = deserialize_array(rid_blob)?;
+            let rids = rid_any
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("rid downcast".into()))?;
+            if let Some(pblob) = perm_blob {
+                let perm_any = deserialize_array(pblob)?;
+                let perm = perm_any
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| Error::Internal("perm not u32".into()))?;
+                // Binary search over sorted-by-perm view
+                let mut lo: isize = 0;
+                let mut hi: isize = (perm.len() as isize) - 1;
+                while lo <= hi {
+                    let mid = ((lo + hi) >> 1) as usize;
+                    let rid = rids.value(perm.value(mid) as usize);
+                    if rid == row_id {
+                        return Ok(true);
+                    } else if rid < row_id {
+                        lo = mid as isize + 1;
+                    } else {
+                        hi = mid as isize - 1;
+                    }
+                }
+            } else {
+                // Assume rid chunk is sorted ascending (common for appends/compaction) and binary search
+                let mut lo: isize = 0;
+                let mut hi: isize = (rids.len() as isize) - 1;
+                while lo <= hi {
+                    let mid = ((lo + hi) >> 1) as usize;
+                    let rid = rids.value(mid);
+                    if rid == row_id {
+                        return Ok(true);
+                    } else if rid < row_id {
+                        lo = mid as isize + 1;
+                    } else {
+                        hi = mid as isize - 1;
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
     pub fn open(pager: Arc<P>) -> Result<Self> {
         Self::open_with_config(pager, ColumnStoreConfig::default())
     }
@@ -333,6 +427,54 @@ where
 
     // TODO: Convert all nulls to deletes (don't store them)
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
+        // Ensure we append rows in ascending row_id order to keep row_id chunks
+        // naturally sorted and avoid building presence permutations later.
+        // Do this up front on the incoming batch.
+        let working_batch: RecordBatch;
+        let batch = {
+            let schema = batch.schema();
+            let row_id_idx = schema
+                .index_of("row_id")
+                .map_err(|_| Error::Internal("row_id column required".into()))?;
+            let row_id_any = batch.column(row_id_idx).clone();
+            let row_id_arr = row_id_any
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("row_id downcast failed".into()))?;
+            // Quick ascending check
+            let mut sorted = true;
+            let mut prev = 0u64;
+            for i in 0..row_id_arr.len() {
+                let v = row_id_arr.value(i);
+                if i > 0 && v < prev {
+                    sorted = false;
+                    break;
+                }
+                prev = v;
+            }
+            if sorted {
+                batch.clone()
+            } else {
+                // Build sort indices by row_id and reorder all columns
+                let sort_col = SortColumn {
+                    values: row_id_any,
+                    options: None,
+                };
+                let idx = lexsort_to_indices(&[sort_col], None)?;
+                let perm = idx
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| Error::Internal("perm not u32".into()))?;
+                let mut cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+                for i in 0..batch.num_columns() {
+                    cols.push(compute::take(batch.column(i), perm, None)?);
+                }
+                working_batch = RecordBatch::try_new(schema.clone(), cols)
+                    .map_err(|e| Error::Internal(format!("record batch rebuild: {e}")))?;
+                working_batch
+            }
+        };
+
         let schema = batch.schema();
         let row_id_idx = schema
             .index_of("row_id")
@@ -397,7 +539,7 @@ where
                 .map(|i| !all_rewritten_ids.contains(&row_id_arr.value(i)))
                 .collect();
             let keep_array = BooleanArray::from(keep_mask);
-            compute::filter_record_batch(batch, &keep_array)?
+            compute::filter_record_batch(&batch, &keep_array)?
         } else {
             batch.clone()
         };
@@ -508,13 +650,44 @@ where
                     key: rid_pk,
                     bytes: rid_bytes,
                 });
+                // Compute min/max and detect if row_ids are already sorted ascending
+                let rid_any = rid_norm.clone();
+                let rids = rid_any
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::Internal("row_id downcast".into()))?;
+                let mut min = u64::MAX;
+                let mut max = 0u64;
+                let mut sorted = true;
+                let mut last = 0u64;
+                for i in 0..rids.len() {
+                    let v = rids.value(i);
+                    if i == 0 {
+                        last = v;
+                    } else if v < last {
+                        sorted = false;
+                    } else {
+                        last = v;
+                    }
+                    if v < min { min = v; }
+                    if v > max { max = v; }
+                }
+                let mut rid_perm_pk = 0u64;
+                if !sorted {
+                    // Build presence index (perm over row_ids)
+                    let sort_col = SortColumn { values: rid_any, options: None };
+                    let rid_idx = lexsort_to_indices(&[sort_col], None)?;
+                    let perm_bytes = serialize_array(&rid_idx)?;
+                    rid_perm_pk = self.pager.alloc_many(1)?[0];
+                    puts_appends.push(BatchPut::Raw { key: rid_perm_pk, bytes: perm_bytes });
+                }
                 let rid_meta = ChunkMetadata {
                     chunk_pk: rid_pk,
-                    value_order_perm_pk: 0,
+                    value_order_perm_pk: rid_perm_pk,
                     row_count: rows as u64,
                     serialized_bytes: rid_norm.get_array_memory_size() as u64,
-                    min_val_u64: 0,
-                    max_val_u64: u64::MAX,
+                    min_val_u64: if rows > 0 { min } else { 0 },
+                    max_val_u64: if rows > 0 { max } else { 0 },
                 };
                 self.append_meta_in_loop(
                     &mut rid_descriptor,
@@ -769,6 +942,40 @@ where
                 });
                 metas_rid[i].row_count = rids.len() as u64;
                 metas_rid[i].serialized_bytes = rids.get_array_memory_size() as u64;
+                // Refresh presence index (perm) and min/max for rid chunk
+                let rid_any: ArrayRef = rids.into();
+                let r = rid_any
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::Internal("rid downcast".into()))?;
+                let mut min = u64::MAX;
+                let mut max = 0u64;
+                let mut sorted = true;
+                let mut last = 0u64;
+                for j in 0..r.len() {
+                    let v = r.value(j);
+                    if j == 0 { last = v; } else if v < last { sorted = false; } else { last = v; }
+                    if v < min { min = v; }
+                    if v > max { max = v; }
+                }
+                metas_rid[i].min_val_u64 = if metas_rid[i].row_count > 0 { min } else { 0 };
+                metas_rid[i].max_val_u64 = if metas_rid[i].row_count > 0 { max } else { 0 };
+                if sorted {
+                    // Free old perm if it existed and we no longer need it
+                    let old = metas_rid[i].value_order_perm_pk;
+                    metas_rid[i].value_order_perm_pk = 0;
+                    if old != 0 { self.pager.free_many(&[old])?; }
+                } else {
+                    let sort_col = SortColumn { values: make_array(rid_any.to_data()), options: None };
+                    let idx = lexsort_to_indices(&[sort_col], None)?;
+                    let perm_bytes = serialize_array(&idx)?;
+                    let perm_pk = self.pager.alloc_many(1)?[0];
+                    puts.push(BatchPut::Raw { key: perm_pk, bytes: perm_bytes });
+                    // Free old and install new
+                    let old = metas_rid[i].value_order_perm_pk;
+                    metas_rid[i].value_order_perm_pk = perm_pk;
+                    if old != 0 { self.pager.free_many(&[old])?; }
+                }
             }
 
             // Refresh perm if present (values changed).
@@ -1317,13 +1524,37 @@ where
                     meta.value_order_perm_pk = perm_pk;
                 }
 
+                // Build presence index for rids and min/max
+                let rid_any = rid_norm.clone();
+                let rids = rid_any
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::Internal("rid downcast".into()))?;
+                let mut min = u64::MAX;
+                let mut max = 0u64;
+                let mut sorted_rids = true;
+                let mut last_v = 0u64;
+                for ii in 0..rids.len() {
+                    let v = rids.value(ii);
+                    if ii == 0 { last_v = v; } else if v < last_v { sorted_rids = false; } else { last_v = v; }
+                    if v < min { min = v; }
+                    if v > max { max = v; }
+                }
+                let mut rid_perm_pk = 0u64;
+                if !sorted_rids {
+                    let rid_sort_col = SortColumn { values: rid_any, options: None };
+                    let rid_idx = lexsort_to_indices(&[rid_sort_col], None)?;
+                    let rid_perm_bytes = serialize_array(&rid_idx)?;
+                    rid_perm_pk = self.pager.alloc_many(1)?[0];
+                    puts.push(BatchPut::Raw { key: rid_perm_pk, bytes: rid_perm_bytes });
+                }
                 let rid_meta = ChunkMetadata {
                     chunk_pk: rid_pk,
-                    value_order_perm_pk: 0,
+                    value_order_perm_pk: rid_perm_pk,
                     row_count: rows as u64,
                     serialized_bytes: rid_norm.get_array_memory_size() as u64,
-                    min_val_u64: 0,
-                    max_val_u64: u64::MAX,
+                    min_val_u64: if rows > 0 { min } else { 0 },
+                    max_val_u64: if rows > 0 { max } else { 0 },
                 };
                 new_metas.push(meta);
                 new_rid_metas.push(rid_meta);
@@ -1337,6 +1568,9 @@ where
                     frees.push(metas[k].value_order_perm_pk);
                 }
                 frees.push(metas_rid[k].chunk_pk);
+                if metas_rid[k].value_order_perm_pk != 0 {
+                    frees.push(metas_rid[k].value_order_perm_pk);
+                }
             }
 
             i = j;

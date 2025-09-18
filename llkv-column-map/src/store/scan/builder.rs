@@ -23,9 +23,8 @@ where
         self.opts = opts;
         self
     }
-    pub fn with_row_ids(mut self, row_id_field: LogicalFieldId) -> Self {
+    pub fn with_row_ids(mut self, _row_id_field: LogicalFieldId) -> Self {
         self.opts.with_row_ids = true;
-        self.opts.row_id_field = Some(row_id_field);
         self
     }
     pub fn sorted(mut self, sorted: bool) -> Self {

@@ -118,6 +118,8 @@ pub trait PrimitiveSortedWithRowIdsVisitor {
     fn i16_run_with_rids(&mut self, _v: &Int16Array, _r: &UInt64Array, _start: usize, _len: usize) {
     }
     fn i8_run_with_rids(&mut self, _v: &Int8Array, _r: &UInt64Array, _start: usize, _len: usize) {}
+    /// Null-only run: values are missing; emits only row_ids.
+    fn null_run(&mut self, _r: &UInt64Array, _start: usize, _len: usize) {}
 }
 
 // Pagination adapter: enforces offset/limit across chunks (unsorted)
@@ -321,4 +323,20 @@ where
     impl_sorted_with_rids_paginate_for_type!(i32_run_with_rids, Int32Array);
     impl_sorted_with_rids_paginate_for_type!(i16_run_with_rids, Int16Array);
     impl_sorted_with_rids_paginate_for_type!(i8_run_with_rids, Int8Array);
+    fn null_run(&mut self, r: &UInt64Array, start: usize, len: usize) {
+        if self.done() {
+            return;
+        }
+        if let Some((delta, take)) = self.split_len(len) {
+            if take > 0 {
+                if self.reverse {
+                    // For reverse, take from the end of the run
+                    let adj_start = start + (len - (delta + take));
+                    self.inner.null_run(r, adj_start, take);
+                } else {
+                    self.inner.null_run(r, start + delta, take);
+                }
+            }
+        }
+    }
 }

@@ -190,9 +190,12 @@ fn scan_all_integer_types_sorted_and_ranges() {
                     sorted: true,
                     reverse: false,
                     with_row_ids: false,
-                    row_id_field: None,
+                    
                     limit: None,
                     offset: 0,
+                    include_nulls: false,
+                    nulls_first: false,
+                    anchor_row_id_field: None,
                 },
                 &mut visitor,
             )
@@ -284,9 +287,12 @@ fn scan_all_integer_types_sorted_and_ranges() {
                     sorted: true,
                     reverse: true,
                     with_row_ids: false,
-                    row_id_field: None,
+                    
                     limit: None,
                     offset: 0,
+                    include_nulls: false,
+                    nulls_first: false,
+                    anchor_row_id_field: None,
                 },
                 &mut visitor_desc,
             )
@@ -406,9 +412,12 @@ fn scan_all_integer_types_sorted_and_ranges() {
                     sorted: true,
                     reverse: false,
                     with_row_ids: false,
-                    row_id_field: None,
+                    
                     limit: None,
                     offset: 0,
+                    include_nulls: false,
+                    nulls_first: false,
+                    anchor_row_id_field: None,
                 },
                 &mut visitor2,
             )

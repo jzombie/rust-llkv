@@ -67,9 +67,12 @@ fn unsorted_scan_works_without_index_u64() {
                 sorted: false,
                 reverse: false,
                 with_row_ids: false,
-                row_id_field: None,
+                
                 limit: None,
                 offset: 0,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut v,
         )
@@ -120,9 +123,12 @@ fn unsorted_with_row_ids_works_without_index() {
                 sorted: false,
                 reverse: false,
                 with_row_ids: true,
-                row_id_field: Some(rid_fid),
+                
                 limit: None,
                 offset: 0,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut v,
         )
@@ -161,9 +167,12 @@ fn sorted_scan_without_index_returns_error() {
             sorted: true,
             reverse: false,
             with_row_ids: false,
-            row_id_field: None,
+            
             limit: None,
             offset: 0,
+            include_nulls: false,
+            nulls_first: false,
+            anchor_row_id_field: None,
         },
         &mut v,
     );

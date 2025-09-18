@@ -1,23 +1,23 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{UInt64Array};
+use arrow::array::UInt64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::{
-    PrimitiveVisitor,
-    PrimitiveSortedVisitor,
-    PrimitiveWithRowIdsVisitor,
-    PrimitiveSortedWithRowIdsVisitor,
-    ScanBuilder, ScanOptions
+    PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+    PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new().with_namespace(Namespace::UserData).with_table_id(0).with_field_id(id)
+    LogicalFieldId::new()
+        .with_namespace(Namespace::UserData)
+        .with_table_id(0)
+        .with_field_id(id)
 }
 
 #[test]
@@ -44,19 +44,33 @@ fn scan_builder_sorted_range_u64() {
     store.create_sort_index(field_id).unwrap();
 
     // Range [2000, 8000]
-    struct Collect { out: Vec<u64> }
+    struct Collect {
+        out: Vec<u64>,
+    }
     impl PrimitiveVisitor for Collect {}
     impl PrimitiveWithRowIdsVisitor for Collect {}
     impl PrimitiveSortedWithRowIdsVisitor for Collect {}
     impl PrimitiveSortedVisitor for Collect {
         fn u64_run(&mut self, a: &UInt64Array, s: usize, l: usize) {
-            let e = s + l; for i in s..e { self.out.push(a.value(i)); }
+            let e = s + l;
+            for i in s..e {
+                self.out.push(a.value(i));
+            }
         }
     }
     let mut coll = Collect { out: Vec::new() };
     ScanBuilder::new(&store, field_id)
-        .options(ScanOptions { sorted: true, reverse: false, with_row_ids: false, row_id_field: None, limit: None, offset: 0 })
-        .with_range::<u64,_>(2000..=8000)
+        .options(ScanOptions {
+            sorted: true,
+            reverse: false,
+            with_row_ids: false,
+            limit: None,
+            offset: 0,
+            include_nulls: false,
+            nulls_first: false,
+            anchor_row_id_field: None,
+        })
+        .with_range::<u64, _>(2000..=8000)
         .run(&mut coll)
         .unwrap();
     assert!(coll.out.windows(2).all(|w| w[0] <= w[1]));
@@ -87,10 +101,15 @@ fn scan_builder_sorted_with_row_ids() {
     store.create_sort_index(field_id).unwrap();
 
     // Collect row ids for a range
-    struct CollectRids { out: Vec<u64> }
+    struct CollectRids {
+        out: Vec<u64>,
+    }
     impl PrimitiveSortedWithRowIdsVisitor for CollectRids {
         fn u64_run_with_rids(&mut self, _v: &UInt64Array, r: &UInt64Array, s: usize, l: usize) {
-            let e = s + l; for i in s..e { self.out.push(r.value(i)); }
+            let e = s + l;
+            for i in s..e {
+                self.out.push(r.value(i));
+            }
         }
     }
     impl PrimitiveVisitor for CollectRids {}
@@ -98,10 +117,18 @@ fn scan_builder_sorted_with_row_ids() {
     impl PrimitiveWithRowIdsVisitor for CollectRids {}
 
     let mut coll = CollectRids { out: Vec::new() };
-    let rid_fid = field_id.with_namespace(Namespace::RowIdShadow);
     ScanBuilder::new(&store, field_id)
-        .options(ScanOptions { sorted: true, reverse: false, with_row_ids: true, row_id_field: Some(rid_fid), limit: None, offset: 0 })
-        .with_range::<u64,_>(10_000..=20_000)
+        .options(ScanOptions {
+            sorted: true,
+            reverse: false,
+            with_row_ids: true,
+            limit: None,
+            offset: 0,
+            include_nulls: false,
+            nulls_first: false,
+            anchor_row_id_field: None,
+        })
+        .with_range::<u64, _>(10_000..=20_000)
         .run(&mut coll)
         .unwrap();
     assert!(!coll.out.is_empty());

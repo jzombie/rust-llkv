@@ -136,9 +136,12 @@ fn count_hits_multiset_scan(
                 sorted: false,
                 reverse: false,
                 with_row_ids: false,
-                row_id_field: None,
+                
                 limit: None,
                 offset: 0,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut v,
         )
@@ -194,9 +197,12 @@ fn count_hits_stream_join(store: &ColumnStore<MemPager>, fid: LogicalFieldId, qs
                 sorted: true,
                 reverse: false,
                 with_row_ids: false,
-                row_id_field: None,
+                
                 limit: None,
                 offset: 0,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut v,
         )

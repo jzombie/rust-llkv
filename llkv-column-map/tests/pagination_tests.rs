@@ -68,9 +68,12 @@ fn pagination_unsorted_u64() {
                 sorted: false,
                 reverse: false,
                 with_row_ids: false,
-                row_id_field: None,
+                
                 limit: None,
                 offset: 0,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut vis,
         )
@@ -90,9 +93,12 @@ fn pagination_unsorted_u64() {
                 sorted: false,
                 reverse: false,
                 with_row_ids: false,
-                row_id_field: None,
+                
                 limit: Some(k),
                 offset: 0,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut vis,
         )
@@ -111,9 +117,12 @@ fn pagination_unsorted_u64() {
                 sorted: false,
                 reverse: false,
                 with_row_ids: false,
-                row_id_field: None,
+                
                 limit: None,
                 offset: off,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut vis,
         )
@@ -133,9 +142,12 @@ fn pagination_unsorted_u64() {
                 sorted: false,
                 reverse: false,
                 with_row_ids: false,
-                row_id_field: None,
+                
                 limit: Some(lim),
                 offset: off,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut vis,
         )
@@ -189,9 +201,12 @@ fn pagination_sorted_u64() {
                 sorted: true,
                 reverse: false,
                 with_row_ids: false,
-                row_id_field: None,
+                
                 limit: None,
                 offset: 0,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut vis,
         )
@@ -212,9 +227,12 @@ fn pagination_sorted_u64() {
                 sorted: true,
                 reverse: false,
                 with_row_ids: false,
-                row_id_field: None,
+                
                 limit: Some(lim),
                 offset: off,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut vis,
         )
@@ -250,9 +268,12 @@ fn pagination_sorted_u64() {
                 sorted: true,
                 reverse: true,
                 with_row_ids: false,
-                row_id_field: None,
+                
                 limit: None,
                 offset: 0,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut vis,
         )
@@ -272,9 +293,12 @@ fn pagination_sorted_u64() {
                 sorted: true,
                 reverse: true,
                 with_row_ids: false,
-                row_id_field: None,
+                
                 limit: Some(lim),
                 offset: 0,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut vis,
         )
@@ -282,4 +306,3 @@ fn pagination_sorted_u64() {
     let desc_take = desc_take.into_inner();
     assert_eq!(desc_take, desc_all[..lim].to_vec());
 }
-

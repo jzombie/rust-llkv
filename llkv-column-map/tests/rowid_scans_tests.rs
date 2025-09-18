@@ -97,9 +97,12 @@ fn row_ids_unsorted_and_sorted_paths_u64() {
                 sorted: false,
                 reverse: false,
                 with_row_ids: true,
-                row_id_field: Some(rid_fid),
+                
                 limit: None,
                 offset: 0,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut u,
         )
@@ -136,9 +139,12 @@ fn row_ids_unsorted_and_sorted_paths_u64() {
                 sorted: true,
                 reverse: false,
                 with_row_ids: true,
-                row_id_field: Some(rid_fid),
+                
                 limit: None,
                 offset: 0,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut sa,
         )
@@ -179,9 +185,12 @@ fn row_ids_unsorted_and_sorted_paths_u64() {
                 sorted: true,
                 reverse: true,
                 with_row_ids: true,
-                row_id_field: Some(rid_fid),
+                
                 limit: None,
                 offset: 0,
+                include_nulls: false,
+                nulls_first: false,
+                anchor_row_id_field: None,
             },
             &mut sd,
         )
@@ -218,9 +227,11 @@ fn row_ids_unsorted_and_sorted_paths_u64() {
             sorted: true,
             reverse: false,
             with_row_ids: true,
-            row_id_field: Some(rid_fid),
             limit: None,
             offset: 0,
+            include_nulls: false,
+            nulls_first: false,
+            anchor_row_id_field: None,
         })
         .with_range::<u64, _>(10_000..=20_000)
         .run(&mut rc)

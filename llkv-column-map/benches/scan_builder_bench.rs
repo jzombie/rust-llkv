@@ -33,10 +33,6 @@ fn fid_user(id: u32) -> LogicalFieldId {
         .with_field_id(id)
 }
 
-fn rid_fid_from_value(fid: LogicalFieldId) -> LogicalFieldId {
-    fid.with_namespace(Namespace::RowIdShadow)
-}
-
 fn seed_store_1m() -> (ColumnStore<MemPager>, LogicalFieldId, LogicalFieldId) {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
@@ -110,9 +106,12 @@ fn bench_scan_builder(c: &mut Criterion) {
                         sorted: false,
                         reverse: false,
                         with_row_ids: false,
-                        row_id_field: None,
+
                         limit: None,
                         offset: 0,
+                        include_nulls: false,
+                        nulls_first: false,
+                        anchor_row_id_field: None,
                     })
                     .run(&mut v)
                     .unwrap();
@@ -149,9 +148,12 @@ fn bench_scan_builder(c: &mut Criterion) {
                         sorted: true,
                         reverse: false,
                         with_row_ids: false,
-                        row_id_field: None,
+
                         limit: None,
                         offset: 0,
+                        include_nulls: false,
+                        nulls_first: false,
+                        anchor_row_id_field: None,
                     })
                     .with_range::<u64, _>(100_000..=900_000)
                     .run(&mut v)
@@ -191,15 +193,17 @@ fn bench_scan_builder(c: &mut Criterion) {
                 impl<'a> PrimitiveWithRowIdsVisitor for SumRids<'a> {}
                 let acc = std::cell::Cell::new(0u128);
                 let mut v = SumRids { acc: &acc };
-                let rid_fid = rid_fid_from_value(fid_u64);
                 ScanBuilder::new(&store, fid_u64)
                     .options(ScanOptions {
                         sorted: true,
                         reverse: false,
                         with_row_ids: true,
-                        row_id_field: Some(rid_fid),
+
                         limit: None,
                         offset: 0,
+                        include_nulls: false,
+                        nulls_first: false,
+                        anchor_row_id_field: None,
                     })
                     .with_range::<u64, _>(100_000..=900_000)
                     .run(&mut v)
