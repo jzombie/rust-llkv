@@ -275,6 +275,7 @@ mod tests {
         }
 
         {
+            // Re-assert state after reinitializing store
             let store = SimdRDriveStore::new(&path);
             assert!(!store.contains_key(&1001).unwrap());
             assert!(store.contains_key(&1002).unwrap());

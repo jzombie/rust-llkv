@@ -1,12 +1,14 @@
-pub mod bloom;
-pub mod bounds;
-pub mod codecs;
-pub mod column_index;
-pub mod constants;
-pub mod layout;
+pub mod error;
+pub mod serialization;
 pub mod storage;
+pub mod store;
 pub mod types;
-pub mod views;
 
-pub mod column_store;
-pub use column_store::*;
+mod codecs;
+
+pub use error::{Error, Result};
+pub use store::ColumnStore;
+
+pub mod debug {
+    pub use super::store::debug::*;
+}

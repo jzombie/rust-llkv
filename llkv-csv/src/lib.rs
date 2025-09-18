@@ -1,18 +1,33 @@
 //! CSV ingest for llkv-table (FS-agnostic).
 //!
 //! Parses CSV rows from any `Read` and batches `Table::insert_many`.
-//! The mapping closure returns an optional `RowPatch`. Returning `None`
-//! skips that row. Only the example binary should touch the filesystem.
+//! The mapping closure returns an optional `RowPatch<'static>`.
+//! Returning `None` skips that row. Only the example binary should
+//! touch the filesystem.
 
 #![forbid(unsafe_code)]
 
 use csv::{ReaderBuilder, StringRecord};
-use llkv_table::types::{RootId, RowPatch};
-use llkv_table::{
-    Table,
-    btree::{errors::Error, pager::Pager},
-};
+use llkv_table::Table;
+use llkv_table::types::RowPatch;
 use std::io::Read;
+
+/// Simple error type for this crate.
+#[derive(Debug)]
+pub enum CsvError {
+    /// CSV parsing failed.
+    Parse,
+}
+
+impl std::fmt::Display for CsvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CsvError::Parse => write!(f, "csv parse error"),
+        }
+    }
+}
+
+impl std::error::Error for CsvError {}
 
 /// CSV parser configuration.
 #[derive(Clone, Debug)]
@@ -60,45 +75,41 @@ impl<R: Read> CsvSource<R> {
 /// Stream CSV rows into a `Table` using a mapping closure.
 ///
 /// The `map` closure converts each CSV record into an optional
-/// `RowPatch`. Return `None` to skip a malformed or unwanted row.
-///
-/// CSV parse errors are mapped to `Error::Corrupt("csv parse error")`.
+/// `RowPatch<'static>`. Return `None` to skip malformed rows.
 /// Insertions are batched; the last partial batch is flushed at end.
-pub fn load_into_table<R, P, F>(
+pub fn load_into_table<R, F>(
     reader: R,
     cfg: &CsvConfig,
-    table: &Table<P>,
+    table: &Table,
     mut map: F,
-) -> Result<(), Error>
+) -> Result<(), CsvError>
 where
     R: Read,
-    P: Pager<Id = RootId> + Clone + Send + Sync + 'static,
-    <P as Pager>::Page: Send + Sync + 'static,
-    // NOTE: take the record by value, return an OWNED RowPatch
     F: FnMut(StringRecord) -> Option<RowPatch<'static>>,
 {
     let mut src = CsvSource::from_reader(reader, cfg);
-    let mut buf: Vec<RowPatch> = Vec::with_capacity(cfg.insert_batch);
 
-    // TODO: Don't buffer entire thing at once!
+    // Only batch-sized buffering. Never loads the whole file.
+    let mut buf: Vec<RowPatch<'static>> = Vec::with_capacity(cfg.insert_batch);
+
     for rec_res in src.records() {
         let rec = match rec_res {
             Ok(r) => r,
-            Err(_) => return Err(Error::Corrupt("csv parse error")),
+            Err(_e) => return Err(CsvError::Parse),
         };
 
-        // Move `rec` into the mapper; mapper must build an owned RowPatch.
         if let Some(row_patch) = map(rec) {
             buf.push(row_patch);
-            if buf.len() == cfg.insert_batch {
-                table.insert_many(&buf)?;
+            if buf.len() >= cfg.insert_batch {
+                table.insert_many(&buf);
                 buf.clear();
             }
         }
     }
 
     if !buf.is_empty() {
-        table.insert_many(&buf)?;
+        table.insert_many(&buf);
     }
+
     Ok(())
 }

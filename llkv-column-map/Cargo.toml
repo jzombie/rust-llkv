@@ -6,17 +6,23 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+autobenches = false
 
 [dependencies]
-bitcode.workspace = true
+arrow = { version = "56.1.0", default-features = false, features = ["prettyprint"] }
+arrow-ord = "56.1.0"
+modular-bitfield = "0.12.0"
+roaring = "0.11.2"
 rustc-hash.workspace = true
+simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
+thiserror = "2.0.16"
 
 [dev-dependencies]
 criterion.workspace = true
 rand.workspace = true
 
 [[bench]]
-name = "indexing_bench"
+name = "column_sum_bench"
 harness = false
 
 [[bench]]
@@ -24,9 +30,22 @@ name = "ingest_bench"
 harness = false
 
 [[bench]]
-name = "read_bench"
+name = "random_probe_bench"
 harness = false
 
 [[bench]]
-name = "segment_scan_bench"
+name = "scan_builder_bench"
 harness = false
+
+[[bench]]
+name = "sort_index_bench"
+harness = false
+
+[features]
+legacy_api = []
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
