@@ -2,10 +2,10 @@ name: Rust Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     tags: ["v*"]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 jobs:
   test:
