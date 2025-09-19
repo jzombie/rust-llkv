@@ -1,4 +1,5 @@
 pub mod error;
+pub mod indexing;
 pub mod serialization;
 pub mod storage;
 pub mod store;

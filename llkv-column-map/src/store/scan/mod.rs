@@ -339,6 +339,21 @@ where
         }
 
         if opts.with_row_ids {
+            // Fast-path: delegate to bounds-based dispatcher for the simple case.
+            if opts.sorted
+                && !opts.reverse
+                && opts.offset == 0
+                && opts.limit.is_none()
+                && !opts.include_nulls
+            {
+                return crate::store::scan::sorted::range_sorted_dispatch(
+                    self,
+                    field_id,
+                    opts,
+                    crate::store::scan::IntRanges::default(),
+                    visitor,
+                );
+            }
             let row_fid = field_id.with_namespace(Namespace::RowIdShadow);
             // Prepare value metas and blobs
             let catalog = self.catalog.read().unwrap();
@@ -396,6 +411,11 @@ where
                 }
                 metas_rid.push(meta);
             }
+            eprintln!(
+                "scan: metas_val={}, metas_rid={}",
+                metas_val.len(),
+                metas_rid.len()
+            );
             if metas_val.is_empty() {
                 return Ok(());
             }
@@ -715,7 +735,22 @@ where
                     }
                 } else {
                     match first_any.data_type() {
-                        DataType::UInt64 => sorted_visit_with_rids_u64_rev(
+                        DataType::UInt64 => {
+                            eprintln!(
+                                "call: fwd non-rev metas_val={}, metas_rid={}",
+                                metas_val.len(),
+                                metas_rid.len()
+                            );
+                            sorted_visit_with_rids_u64(
+                                self.pager.as_ref(),
+                                &metas_val,
+                                &metas_rid,
+                                &vblobs,
+                                &rblobs,
+                                visitor,
+                            )
+                        }
+                        DataType::UInt32 => sorted_visit_with_rids_u32(
                             self.pager.as_ref(),
                             &metas_val,
                             &metas_rid,
@@ -723,7 +758,7 @@ where
                             &rblobs,
                             visitor,
                         ),
-                        DataType::UInt32 => sorted_visit_with_rids_u32_rev(
+                        DataType::UInt16 => sorted_visit_with_rids_u16(
                             self.pager.as_ref(),
                             &metas_val,
                             &metas_rid,
@@ -731,7 +766,7 @@ where
                             &rblobs,
                             visitor,
                         ),
-                        DataType::UInt16 => sorted_visit_with_rids_u16_rev(
+                        DataType::UInt8 => sorted_visit_with_rids_u8(
                             self.pager.as_ref(),
                             &metas_val,
                             &metas_rid,
@@ -739,7 +774,7 @@ where
                             &rblobs,
                             visitor,
                         ),
-                        DataType::UInt8 => sorted_visit_with_rids_u8_rev(
+                        DataType::Int64 => sorted_visit_with_rids_i64(
                             self.pager.as_ref(),
                             &metas_val,
                             &metas_rid,
@@ -747,7 +782,7 @@ where
                             &rblobs,
                             visitor,
                         ),
-                        DataType::Int64 => sorted_visit_with_rids_i64_rev(
+                        DataType::Int32 => sorted_visit_with_rids_i32(
                             self.pager.as_ref(),
                             &metas_val,
                             &metas_rid,
@@ -755,7 +790,7 @@ where
                             &rblobs,
                             visitor,
                         ),
-                        DataType::Int32 => sorted_visit_with_rids_i32_rev(
+                        DataType::Int16 => sorted_visit_with_rids_i16(
                             self.pager.as_ref(),
                             &metas_val,
                             &metas_rid,
@@ -763,15 +798,7 @@ where
                             &rblobs,
                             visitor,
                         ),
-                        DataType::Int16 => sorted_visit_with_rids_i16_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::Int8 => sorted_visit_with_rids_i8_rev(
+                        DataType::Int8 => sorted_visit_with_rids_i8(
                             self.pager.as_ref(),
                             &metas_val,
                             &metas_rid,

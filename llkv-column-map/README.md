@@ -6,6 +6,7 @@ Prototype B+Tree replacement with batch-only pager I/O for the [LLKV](https://gi
 
 ## Features
 
+- Uses Apache Arrow.
 - Physical/Logical key separation (batched writes of many logical keys can consume far less physical keys than writing directly to storage keys).
 - Logical keys namespaced per field.
 - Supports variable and fixed width keys.

@@ -1,19 +1,18 @@
 //! Streamable, paged metadata for a single column.
 //!
+//!
 //! This module avoids deserialization by defining fixed-layout structs that
 //! can be interpreted directly from byte buffers provided by the pager.
-
 use crate::codecs::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use crate::error::{Error, Result};
 use crate::storage::pager::{BatchGet, GetResult, Pager};
 use crate::types::{LogicalFieldId, PhysicalKey};
 use std::mem;
-
 // All values are stored as little-endian.
 
 /// Fixed-size metadata for a single Arrow array chunk.
 /// This struct's memory layout IS the on-disk format.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct ChunkMetadata {
     pub chunk_pk: PhysicalKey,
@@ -26,7 +25,6 @@ pub struct ChunkMetadata {
 
 impl ChunkMetadata {
     pub const DISK_SIZE: usize = mem::size_of::<Self>();
-
     /// Single allocation; append fields as LE without growth churn.
     pub fn to_le_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::DISK_SIZE);
@@ -47,7 +45,6 @@ impl ChunkMetadata {
         let serialized_bytes = read_u64_le(bytes, &mut o);
         let min_val_u64 = read_u64_le(bytes, &mut o);
         let max_val_u64 = read_u64_le(bytes, &mut o);
-
         Self {
             chunk_pk,
             value_order_perm_pk,
@@ -76,7 +73,6 @@ pub struct ColumnDescriptor {
 
 impl ColumnDescriptor {
     pub const DISK_SIZE: usize = mem::size_of::<Self>();
-
     /// Single allocation; append fields as LE without growth churn.
     pub fn to_le_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::DISK_SIZE);
@@ -180,7 +176,6 @@ impl<'a, P: Pager> DescriptorIterator<'a, P> {
 
 impl<'a, P: Pager> Iterator for DescriptorIterator<'a, P> {
     type Item = Result<ChunkMetadata>;
-
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             // If we do not have a page loaded, try to load one.

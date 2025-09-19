@@ -1,6 +1,8 @@
 //! The main ColumnStore API.
 
 use crate::error::{Error, Result};
+use crate::indexing::traits;
+use crate::indexing::{DefaultIndexManager, presence::PresenceIndex, traits::IndexManager};
 use crate::serialization::{deserialize_array, serialize_array};
 use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::store::catalog::ColumnCatalog;
@@ -27,9 +29,8 @@ pub mod scan;
 pub use scan::*;
 
 const DESCRIPTOR_ENTRIES_PER_PAGE: usize = 256;
-
 /// Sets the shadow row_id tag on a LogicalFieldId using the Namespace enum.
-fn rowid_fid(fid: LogicalFieldId) -> LogicalFieldId {
+pub(crate) fn rowid_fid(fid: LogicalFieldId) -> LogicalFieldId {
     fid.with_namespace(Namespace::RowIdShadow)
 }
 
@@ -82,7 +83,7 @@ pub struct ColumnLayoutStats {
 
 /// Normalize an array so its offset is zero without copying buffers.
 #[inline]
-fn zero_offset(arr: &ArrayRef) -> ArrayRef {
+pub(crate) fn zero_offset(arr: &ArrayRef) -> ArrayRef {
     if arr.offset() == 0 {
         return arr.clone();
     }
@@ -230,7 +231,8 @@ fn split_to_target_bytes(
         // Fallback for other var-width types (e.g., List/Struct/Map):
         // conservative row cap.
         _ => {
-            let rows_per = varwidth_fallback_rows_per_slice; // configurable
+            let rows_per = varwidth_fallback_rows_per_slice;
+            // configurable
             let mut out = Vec::with_capacity((n + rows_per - 1) / rows_per);
             let mut off = 0usize;
             while off < n {
@@ -276,7 +278,6 @@ fn apply_edit_to_arrays(
     } else {
         data_arr.clone()
     };
-
     let mut out_rids = if let Some(r) = rid_arr {
         if let Some(ref k) = edit.keep {
             Some(compute::filter(r, k)?)
@@ -286,7 +287,6 @@ fn apply_edit_to_arrays(
     } else {
         None
     };
-
     if let Some(ref inj) = edit.inject_data {
         out_data = concat_many(vec![&out_data, inj])?;
     }
@@ -303,12 +303,63 @@ pub struct ColumnStore<P: Pager> {
     cfg: ColumnStoreConfig,
     /// In-memory cache of Arrow DataType per field id (not persisted).
     dtype_cache: RwLock<FxHashMap<LogicalFieldId, DataType>>,
+    index_manager: RwLock<DefaultIndexManager>,
 }
 
 impl<P> ColumnStore<P>
 where
     P: Pager<Blob = EntryHandle>,
 {
+    /// Returns the list of persisted indexes that are active for a field.
+    ///
+    /// This inspects on-disk metadata only (catalog and descriptors). It does
+    /// not rely on in-memory registration state.
+    ///
+    /// Currently reported index names:
+    /// - "presence": a shadow RowId column exists for the field in the catalog.
+    /// - "sort": at least one chunk metadata has a non-zero `value_order_perm_pk`.
+    pub fn list_persisted_indexes(&self, field_id: LogicalFieldId) -> Result<Vec<&'static str>> {
+        let mut out: Vec<&'static str> = Vec::new();
+
+        // Read catalog once.
+        let catalog = self.catalog.read().unwrap();
+
+        // Presence: existence of the shadow RowId field in catalog mapping.
+        let rid_fid = rowid_fid(field_id);
+        if catalog.map.contains_key(&rid_fid) {
+            out.push("presence");
+        }
+
+        // Sort: check data column's metas for a non-zero permutation key.
+        if let Some(&descriptor_pk) = catalog.map.get(&field_id) {
+            let desc_blob = self
+                .pager
+                .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+                .pop()
+                .and_then(|r| match r {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
+                .ok_or(Error::NotFound)?;
+            let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+
+            for m in DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk) {
+                let meta = m?;
+                if meta.value_order_perm_pk != 0 {
+                    out.push("sort");
+                    break;
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Convenience: returns true if the named persisted index is active.
+    pub fn has_persisted_index(&self, field_id: LogicalFieldId, index_name: &str) -> Result<bool> {
+        let list = self.list_persisted_indexes(field_id)?;
+        Ok(list.iter().any(|&n| n == index_name))
+    }
     /// Fast presence check using the presence index (row-id permutation) if available.
     /// Returns true if `row_id` exists in the column; false otherwise.
     pub fn has_row_id(&self, field_id: LogicalFieldId, row_id: u64) -> Result<bool> {
@@ -417,11 +468,16 @@ where
             Some(GetResult::Raw { bytes, .. }) => ColumnCatalog::from_bytes(bytes.as_ref())?,
             _ => ColumnCatalog::default(),
         };
+
+        let mut index_manager = DefaultIndexManager::new();
+        index_manager.register_index(Box::new(PresenceIndex::new()));
+
         Ok(Self {
             pager,
             catalog: RwLock::new(catalog),
             cfg,
             dtype_cache: RwLock::new(FxHashMap::default()),
+            index_manager: RwLock::new(index_manager),
         })
     }
 
@@ -474,7 +530,6 @@ where
                 working_batch
             }
         };
-
         let schema = batch.schema();
         let row_id_idx = schema
             .index_of("row_id")
@@ -502,7 +557,6 @@ where
         let mut catalog = self.catalog.write().unwrap();
         let mut puts_rewrites: Vec<BatchPut> = Vec::new();
         let mut all_rewritten_ids = FxHashSet::default();
-
         // --- LWW Phase: Perform all rewrites first ---
         for i in 0..batch.num_columns() {
             if i == row_id_idx {
@@ -516,7 +570,6 @@ where
                     .parse::<u64>()
                     .map(LogicalFieldId::from)
                     .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
-
                 let rewritten = self.lww_rewrite_for_field(
                     &mut catalog,
                     field_id,
@@ -553,7 +606,7 @@ where
         let append_row_id_idx = append_schema.index_of("row_id")?;
         let append_row_id_any: ArrayRef = Arc::clone(batch_to_append.column(append_row_id_idx));
         let mut puts_appends: Vec<BatchPut> = Vec::new();
-
+        let mut frees_index: Vec<PhysicalKey> = Vec::new();
         for (i, array) in batch_to_append.columns().iter().enumerate() {
             if i == append_row_id_idx {
                 continue;
@@ -566,15 +619,20 @@ where
                 .parse::<u64>()
                 .map(LogicalFieldId::from)
                 .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
-
             // Warm the dtype cache from schema; avoids a later chunk peek in this process.
             self.dtype_cache
                 .write()
                 .unwrap()
                 .insert(field_id, field.data_type().clone());
 
+            // Ensure presence index is enabled for this field.
+            // Safe to call repeatedly; it simply records the mapping.
+            self.index_manager
+                .write()
+                .unwrap()
+                .enable_index_for_field(field_id, "presence")?;
             // Filter out nulls in this column and keep matching row_ids only.
-            let (array_clean, rids_clean) = if array.null_count() == 0 {
+            let (array_clean, _rids_clean) = if array.null_count() == 0 {
                 (array.clone(), append_row_id_any.clone())
             } else {
                 let keep =
@@ -591,21 +649,12 @@ where
                 catalog_dirty = true;
                 self.pager.alloc_many(1).unwrap()[0]
             });
-            let rid_fid = rowid_fid(field_id);
-            let rid_descriptor_pk = *catalog.map.entry(rid_fid).or_insert_with(|| {
-                catalog_dirty = true;
-                self.pager.alloc_many(1).unwrap()[0]
-            });
+
             let (mut data_descriptor, mut data_tail_page) =
                 self.load_descriptor_state(descriptor_pk, field_id)?;
-            let (mut rid_descriptor, mut rid_tail_page) =
-                self.load_descriptor_state(rid_descriptor_pk, rid_fid)?;
-
-            // Persist/refresh dtype fingerprint for both data and row-id descriptors.
+            // Persist/refresh dtype fingerprint
             let fp_data = Self::dtype_fingerprint(field.data_type());
             Self::set_desc_dtype_fingerprint(&mut data_descriptor, fp_data);
-            let fp_rid = Self::dtype_fingerprint(&DataType::UInt64);
-            Self::set_desc_dtype_fingerprint(&mut rid_descriptor, fp_rid);
 
             // Slice and append.
             let slices = split_to_target_bytes(
@@ -613,11 +662,11 @@ where
                 TARGET_CHUNK_BYTES,
                 self.cfg.varwidth_fallback_rows_per_slice,
             );
-            let mut row_off = 0usize;
-
+            // Prepare pairs for index manager: (data_meta, matching rid slice)
+            let mut new_chunks_for_index: Vec<(ChunkMetadata, ArrayRef)> = Vec::new();
+            let mut rid_off = 0usize;
             for s in slices {
                 let rows = s.len();
-
                 // Data slice.
                 let data_pk = self.pager.alloc_many(1)?[0];
                 let s_norm = zero_offset(&s);
@@ -640,62 +689,22 @@ where
                     data_meta,
                     &mut puts_appends,
                 )?;
+                // Matching rid slice for this data slice
+                let rid_slice: ArrayRef = append_row_id_any.slice(rid_off, rows);
+                new_chunks_for_index.push((data_meta, rid_slice));
+                rid_off += rows;
+            }
 
-                // Row-id slice matched to this data slice.
-                let rid_slice: ArrayRef = rids_clean.slice(row_off, rows);
-                let rid_norm = zero_offset(&rid_slice);
-                let rid_pk = self.pager.alloc_many(1)?[0];
-                let rid_bytes = serialize_array(rid_norm.as_ref())?;
-                puts_appends.push(BatchPut::Raw {
-                    key: rid_pk,
-                    bytes: rid_bytes,
-                });
-                // Compute min/max and detect if row_ids are already sorted ascending
-                let rid_any = rid_norm.clone();
-                let rids = rid_any
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("row_id downcast".into()))?;
-                let mut min = u64::MAX;
-                let mut max = 0u64;
-                let mut sorted = true;
-                let mut last = 0u64;
-                for i in 0..rids.len() {
-                    let v = rids.value(i);
-                    if i == 0 {
-                        last = v;
-                    } else if v < last {
-                        sorted = false;
-                    } else {
-                        last = v;
-                    }
-                    if v < min { min = v; }
-                    if v > max { max = v; }
-                }
-                let mut rid_perm_pk = 0u64;
-                if !sorted {
-                    // Build presence index (perm over row_ids)
-                    let sort_col = SortColumn { values: rid_any, options: None };
-                    let rid_idx = lexsort_to_indices(&[sort_col], None)?;
-                    let perm_bytes = serialize_array(&rid_idx)?;
-                    rid_perm_pk = self.pager.alloc_many(1)?[0];
-                    puts_appends.push(BatchPut::Raw { key: rid_perm_pk, bytes: perm_bytes });
-                }
-                let rid_meta = ChunkMetadata {
-                    chunk_pk: rid_pk,
-                    value_order_perm_pk: rid_perm_pk,
-                    row_count: rows as u64,
-                    serialized_bytes: rid_norm.get_array_memory_size() as u64,
-                    min_val_u64: if rows > 0 { min } else { 0 },
-                    max_val_u64: if rows > 0 { max } else { 0 },
+            // Dispatch append to index manager with rid slices per chunk
+            {
+                let mut mgr = self.index_manager.write().unwrap();
+                let mut ctx = traits::IndexOpContext {
+                    pager: self.pager.as_ref(),
+                    catalog: &mut catalog,
+                    puts: &mut puts_appends,
+                    frees: &mut frees_index,
                 };
-                self.append_meta_in_loop(
-                    &mut rid_descriptor,
-                    &mut rid_tail_page,
-                    rid_meta,
-                    &mut puts_appends,
-                )?;
-                row_off += rows;
+                mgr.dispatch_append(&mut ctx, field_id, &new_chunks_for_index)?;
             }
 
             puts_appends.push(BatchPut::Raw {
@@ -706,25 +715,19 @@ where
                 key: descriptor_pk,
                 bytes: data_descriptor.to_le_bytes(),
             });
-            puts_appends.push(BatchPut::Raw {
-                key: rid_descriptor.tail_page_pk,
-                bytes: rid_tail_page,
-            });
-            puts_appends.push(BatchPut::Raw {
-                key: rid_descriptor_pk,
-                bytes: rid_descriptor.to_le_bytes(),
-            });
         }
 
-        if catalog_dirty {
-            puts_appends.push(BatchPut::Raw {
-                key: CATALOG_ROOT_PKEY,
-                bytes: catalog.to_bytes(),
-            });
-        }
+        // Persist catalog: presence index may have added shadow rid descriptors.
+        puts_appends.push(BatchPut::Raw {
+            key: CATALOG_ROOT_PKEY,
+            bytes: catalog.to_bytes(),
+        });
 
         if !puts_appends.is_empty() {
             self.pager.batch_put(&puts_appends)?;
+        }
+        if !frees_index.is_empty() {
+            self.pager.free_many(&frees_index)?;
         }
         Ok(())
     }
@@ -752,7 +755,6 @@ where
             Some(pk) => *pk,
             None => return Ok(FxHashSet::default()),
         };
-
         // Fetch both descriptors up front (true batching).
         let gets = vec![
             BatchGet::Raw { key: desc_pk_data },
@@ -770,7 +772,7 @@ where
         let mut descriptor_data = ColumnDescriptor::from_le_bytes(desc_blob_data.as_ref());
 
         let desc_blob_rid = blobs_by_pk.remove(&desc_pk_rid).ok_or(Error::NotFound)?;
-        let mut descriptor_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
+        let descriptor_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
 
         // Gather metas.
         let mut metas_data: Vec<ChunkMetadata> = Vec::new();
@@ -802,7 +804,6 @@ where
         let mut rewritten_ids = FxHashSet::default();
         let mut hit_up: FxHashMap<usize, Vec<u64>> = FxHashMap::default();
         let mut hit_del: FxHashMap<usize, Vec<u64>> = FxHashMap::default();
-
         let n = metas_data.len().min(metas_rid.len());
         if n > 0 {
             // Batch fetch only rid chunks to locate hits.
@@ -879,7 +880,6 @@ where
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .unwrap();
-
             let up_vec = hit_up.remove(&i).unwrap_or_default();
             let del_vec = hit_del.remove(&i).unwrap_or_default();
 
@@ -896,7 +896,6 @@ where
                 let rid = old_rid_arr.value(j);
                 Some(!drop_set.contains(&rid))
             }));
-
             // Build injected tails only for upserts (non-null).
             let update_indices_arr = if up_vec.is_empty() {
                 UInt32Array::from(Vec::<u32>::new())
@@ -916,15 +915,12 @@ where
             } else {
                 Some(compute::take(incoming_row_ids, &update_indices_arr, None)?)
             };
-
             let mut edit = ChunkEdit::none();
             edit.keep = Some(keep);
             edit.inject_data = data_inj;
             edit.inject_rids = rids_inj;
-
-            let (new_data_arr, new_rid_arr) =
+            let (new_data_arr, _new_rid_arr) =
                 apply_edit_to_arrays(&old_data_arr, Some(&old_rid_arr_any), &edit)?;
-
             // Write back.
             let data_bytes = serialize_array(&new_data_arr)?;
             puts.push(BatchPut::Raw {
@@ -934,49 +930,8 @@ where
             metas_data[i].row_count = new_data_arr.len() as u64;
             metas_data[i].serialized_bytes = new_data_arr.get_array_memory_size() as u64;
 
-            if let Some(rids) = new_rid_arr {
-                let rid_bytes = serialize_array(&rids)?;
-                puts.push(BatchPut::Raw {
-                    key: metas_rid[i].chunk_pk,
-                    bytes: rid_bytes,
-                });
-                metas_rid[i].row_count = rids.len() as u64;
-                metas_rid[i].serialized_bytes = rids.get_array_memory_size() as u64;
-                // Refresh presence index (perm) and min/max for rid chunk
-                let rid_any: ArrayRef = rids.into();
-                let r = rid_any
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("rid downcast".into()))?;
-                let mut min = u64::MAX;
-                let mut max = 0u64;
-                let mut sorted = true;
-                let mut last = 0u64;
-                for j in 0..r.len() {
-                    let v = r.value(j);
-                    if j == 0 { last = v; } else if v < last { sorted = false; } else { last = v; }
-                    if v < min { min = v; }
-                    if v > max { max = v; }
-                }
-                metas_rid[i].min_val_u64 = if metas_rid[i].row_count > 0 { min } else { 0 };
-                metas_rid[i].max_val_u64 = if metas_rid[i].row_count > 0 { max } else { 0 };
-                if sorted {
-                    // Free old perm if it existed and we no longer need it
-                    let old = metas_rid[i].value_order_perm_pk;
-                    metas_rid[i].value_order_perm_pk = 0;
-                    if old != 0 { self.pager.free_many(&[old])?; }
-                } else {
-                    let sort_col = SortColumn { values: make_array(rid_any.to_data()), options: None };
-                    let idx = lexsort_to_indices(&[sort_col], None)?;
-                    let perm_bytes = serialize_array(&idx)?;
-                    let perm_pk = self.pager.alloc_many(1)?[0];
-                    puts.push(BatchPut::Raw { key: perm_pk, bytes: perm_bytes });
-                    // Free old and install new
-                    let old = metas_rid[i].value_order_perm_pk;
-                    metas_rid[i].value_order_perm_pk = perm_pk;
-                    if old != 0 { self.pager.free_many(&[old])?; }
-                }
-            }
+            // **NEW: Dispatch rewrite to index manager**
+            // self.index_manager.write().unwrap().dispatch_rewrite(...)
 
             // Refresh perm if present (values changed).
             if metas_data[i].value_order_perm_pk != 0 {
@@ -995,8 +950,6 @@ where
 
         // Rewrite descriptor pages (row counts changed).
         self.rewrite_descriptor_pages(desc_pk_data, &mut descriptor_data, &mut metas_data, puts)?;
-        self.rewrite_descriptor_pages(desc_pk_rid, &mut descriptor_rid, &mut metas_rid, puts)?;
-
         Ok(rewritten_ids)
     }
 
@@ -1026,7 +979,6 @@ where
                 .ok_or(Error::NotFound)?
                 .as_ref()
                 .to_vec();
-
             let header =
                 DescriptorPageHeader::from_le_bytes(&page_blob[..DescriptorPageHeader::DISK_SIZE]);
             let n_on_page = header.entry_count as usize;
@@ -1113,14 +1065,12 @@ where
 
         // Optional: corresponding shadow row_id descriptor + metas.
         let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
-        let mut descriptor_rid: Option<ColumnDescriptor> = None;
         if let Some(pk) = desc_pk_rid {
             if let Some(desc_blob_rid) = blobs_by_pk.remove(&pk) {
                 let d_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
                 for m in DescriptorIterator::new(self.pager.as_ref(), d_rid.head_page_pk) {
                     metas_rid.push(m?);
                 }
-                descriptor_rid = Some(d_rid);
             }
         }
 
@@ -1188,15 +1138,12 @@ where
             } else {
                 None
             };
-
             let keep = BooleanArray::from_iter((0..rows).map(|j| Some(!del_local.contains(&j))));
 
             let mut edit = ChunkEdit::none();
             edit.keep = Some(keep);
-
-            let (new_data_arr, new_rid_arr) =
+            let (new_data_arr, _new_rid_arr) =
                 apply_edit_to_arrays(&data_arr, rid_arr_any.as_ref(), &edit)?;
-
             // Write back and update meta.
             let data_bytes = serialize_array(&new_data_arr)?;
             puts.push(BatchPut::Raw {
@@ -1206,16 +1153,9 @@ where
             meta.row_count = new_data_arr.len() as u64;
             meta.serialized_bytes = new_data_arr.get_array_memory_size() as u64;
 
-            if let (Some(_), Some(rids)) = (metas_rid.get_mut(i), new_rid_arr) {
-                let rm = metas_rid.get_mut(i).unwrap();
-                let rid_bytes = serialize_array(&rids)?;
-                puts.push(BatchPut::Raw {
-                    key: rm.chunk_pk,
-                    bytes: rid_bytes,
-                });
-                rm.row_count = rids.len() as u64;
-                rm.serialized_bytes = rids.get_array_memory_size() as u64;
-            }
+            // TODO: Wire up
+            // **NEW: Dispatch rewrite to index manager**
+            // self.index_manager.write().unwrap().dispatch_rewrite(...)
 
             // If a sorted permutation exists for this chunk, refresh it.
             if meta.value_order_perm_pk != 0 {
@@ -1235,9 +1175,6 @@ where
         }
 
         self.rewrite_descriptor_pages(descriptor_pk, &mut descriptor, &mut metas, &mut puts)?;
-        if let (Some(pk), Some(mut d_rid)) = (desc_pk_rid, descriptor_rid) {
-            self.rewrite_descriptor_pages(pk, &mut d_rid, &mut metas_rid, &mut puts)?;
-        }
 
         // Persist in-place rewrites before compaction.
         if !puts.is_empty() {
@@ -1367,7 +1304,6 @@ where
             Some(&pk) => pk,
             None => return Ok(()),
         };
-
         // True batching for the two descriptor reads.
         let gets = vec![
             BatchGet::Raw { key: desc_pk },
@@ -1401,7 +1337,6 @@ where
         let mut puts: Vec<BatchPut> = Vec::new();
         let mut frees: Vec<PhysicalKey> = Vec::new();
         let mut new_metas: Vec<ChunkMetadata> = Vec::new();
-        let mut new_rid_metas: Vec<ChunkMetadata> = Vec::new();
 
         let mut i = 0usize;
         while i < metas.len() {
@@ -1409,7 +1344,6 @@ where
             // Keep large chunks as-is.
             if sz >= MIN_CHUNK_BYTES {
                 new_metas.push(metas[i]);
-                new_rid_metas.push(metas_rid[i]);
                 i += 1;
                 continue;
             }
@@ -1430,7 +1364,6 @@ where
             }
             if j == i + 1 && sz >= MIN_CHUNK_BYTES {
                 new_metas.push(metas[i]);
-                new_rid_metas.push(metas_rid[i]);
                 i += 1;
                 continue;
             }
@@ -1484,10 +1417,7 @@ where
             for s in slices {
                 let rows = s.len();
                 // Slice rid to match s (avoid double Arc).
-                let rid_ref: ArrayRef = merged_rid_any.slice(rid_off, rows);
-                let rid_norm = zero_offset(&rid_ref);
-                let rid_pk = self.pager.alloc_many(1)?[0];
-                let rid_bytes = serialize_array(rid_norm.as_ref())?;
+                let _rid_ref: ArrayRef = merged_rid_any.slice(rid_off, rows);
 
                 let data_pk = self.pager.alloc_many(1)?[0];
                 let s_norm = zero_offset(&s);
@@ -1496,10 +1426,7 @@ where
                     key: data_pk,
                     bytes: data_bytes,
                 });
-                puts.push(BatchPut::Raw {
-                    key: rid_pk,
-                    bytes: rid_bytes,
-                });
+
                 let mut meta = ChunkMetadata {
                     chunk_pk: data_pk,
                     value_order_perm_pk: 0,
@@ -1524,40 +1451,7 @@ where
                     meta.value_order_perm_pk = perm_pk;
                 }
 
-                // Build presence index for rids and min/max
-                let rid_any = rid_norm.clone();
-                let rids = rid_any
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("rid downcast".into()))?;
-                let mut min = u64::MAX;
-                let mut max = 0u64;
-                let mut sorted_rids = true;
-                let mut last_v = 0u64;
-                for ii in 0..rids.len() {
-                    let v = rids.value(ii);
-                    if ii == 0 { last_v = v; } else if v < last_v { sorted_rids = false; } else { last_v = v; }
-                    if v < min { min = v; }
-                    if v > max { max = v; }
-                }
-                let mut rid_perm_pk = 0u64;
-                if !sorted_rids {
-                    let rid_sort_col = SortColumn { values: rid_any, options: None };
-                    let rid_idx = lexsort_to_indices(&[rid_sort_col], None)?;
-                    let rid_perm_bytes = serialize_array(&rid_idx)?;
-                    rid_perm_pk = self.pager.alloc_many(1)?[0];
-                    puts.push(BatchPut::Raw { key: rid_perm_pk, bytes: rid_perm_bytes });
-                }
-                let rid_meta = ChunkMetadata {
-                    chunk_pk: rid_pk,
-                    value_order_perm_pk: rid_perm_pk,
-                    row_count: rows as u64,
-                    serialized_bytes: rid_norm.get_array_memory_size() as u64,
-                    min_val_u64: if rows > 0 { min } else { 0 },
-                    max_val_u64: if rows > 0 { max } else { 0 },
-                };
                 new_metas.push(meta);
-                new_rid_metas.push(rid_meta);
                 rid_off += rows;
             }
 
@@ -1598,13 +1492,10 @@ where
 
         // Rewrite descriptor chains to match the new meta lists.
         self.write_descriptor_chain(desc_pk, &mut desc, &new_metas, &mut puts, &mut frees)?;
-        self.write_descriptor_chain(
-            desc_pk_rid,
-            &mut desc_rid,
-            &new_rid_metas,
-            &mut puts,
-            &mut frees,
-        )?;
+
+        // **NEW: Dispatch compact to index manager**
+        // self.index_manager.write().unwrap().dispatch_compact(...)
+
         // Persist new/updated blobs and free the old ones.
         if !puts.is_empty() {
             self.pager.batch_put(&puts)?;
@@ -1691,7 +1582,6 @@ where
                 .ok_or(Error::NotFound)?
                 .as_ref()
                 .to_vec();
-
             let header =
                 DescriptorPageHeader::from_le_bytes(&page_blob[..DescriptorPageHeader::DISK_SIZE]);
             let chunks_on_this_page = header.entry_count as usize;
@@ -2014,7 +1904,6 @@ where
             .ok_or(Error::NotFound)?;
         let mut desc =
             crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-
         // If descriptor carries a fingerprint, try to fast-path known monomorphized types.
         let fp = Self::desc_dtype_fingerprint(&desc);
         if fp != 0 {
@@ -2046,7 +1935,6 @@ where
             }
         }
         let chunk_pk = first_chunk_pk.ok_or(Error::NotFound)?;
-
         // Fetch the chunk and inspect dtype
         let blob = self
             .pager

@@ -416,6 +416,7 @@ macro_rules! sorted_with_rids_bounds_impl {
             if vals.is_empty() {
                 return Ok(());
             }
+            // lengths must match across values and rids
             kmerge_coalesced::<_, _, _, _, _>(
                 &vals,
                 |a: &$ArrTy| a.len(),
