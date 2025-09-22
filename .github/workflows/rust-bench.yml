@@ -26,13 +26,13 @@ jobs:
 
       # Build all benches in the workspace with instrumentation
       - name: Build CodSpeed benchmarks (workspace)
-        run: cargo codspeed build --workspace --all-features --release
+        run: cargo codspeed build --workspace --all-features
 
       # Run all benches in the workspace and upload results to CodSpeed
       - name: Run CodSpeed benchmarks
         uses: CodSpeedHQ/action@v4
         with:
           mode: instrumentation
-          run: cargo codspeed run --workspace --all-features --release
+          run: cargo codspeed run --workspace --all-features
           # Required for private repos; optional for public
           token: ${{ secrets.CODSPEED_TOKEN }}
