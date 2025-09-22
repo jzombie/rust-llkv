@@ -44,4 +44,6 @@ jobs:
         run: cargo build --workspace --all-targets ${{ matrix.flags }}
 
       - name: Test
-        run: cargo test --workspace --all-targets --verbose ${{ matrix.flags }} -- --include-ignored
+        # run: cargo test --workspace --all-targets --verbose ${{ matrix.flags }} -- --include-ignored
+        # Explicitly ignore benches (workaround for CodSpeed benches running for default)
+        run: cargo test --workspace --all-features --verbose --lib --bins --tests --examples -- --include-ignored
