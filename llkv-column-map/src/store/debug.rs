@@ -289,31 +289,30 @@ impl<P: Pager> ColumnStoreDebug for ColumnStore<P> {
                                 writeln!(&mut s, "  n{} -> n{};", page_pk, meta.chunk_pk).unwrap();
                             }
 
-                            if meta.value_order_perm_pk != 0 {
-                                if let Some(GetResult::Raw { bytes: b, .. }) = pager
+                            if meta.value_order_perm_pk != 0
+                                && let Some(GetResult::Raw { bytes: b, .. }) = pager
                                     .batch_get(&[BatchGet::Raw {
                                         key: meta.value_order_perm_pk,
                                     }])
                                     .unwrap()
                                     .pop()
-                                {
-                                    let len = b.as_ref().len();
-                                    let col = color_for_batch(
-                                        *batch_colors.get(&meta.value_order_perm_pk).unwrap_or(&0),
-                                    );
-                                    writeln!(
+                            {
+                                let len = b.as_ref().len();
+                                let col = color_for_batch(
+                                    *batch_colors.get(&meta.value_order_perm_pk).unwrap_or(&0),
+                                );
+                                writeln!(
                                         &mut s,
                                         "  n{} [label=\"Perm pk={} bytes={}\" style=filled fillcolor={}];",
                                         meta.value_order_perm_pk, meta.value_order_perm_pk, len, col
                                     )
                                     .unwrap();
-                                    writeln!(
-                                        &mut s,
-                                        "  n{} -> n{};",
-                                        page_pk, meta.value_order_perm_pk
-                                    )
-                                    .unwrap();
-                                }
+                                writeln!(
+                                    &mut s,
+                                    "  n{} -> n{};",
+                                    page_pk, meta.value_order_perm_pk
+                                )
+                                .unwrap();
                             }
                         }
                         prev_page = Some(page_pk);

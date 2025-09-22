@@ -1,3 +1,4 @@
+use line_ending::LineEnding;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -22,22 +23,22 @@ pub fn canonicalize_dot(dot: &str) -> String {
         } else {
             (None, None, 0, lines.len())
         };
-    let mut body: Vec<&str> = lines[body_start..body_end].iter().copied().collect();
+    let mut body: Vec<&str> = lines[body_start..body_end].to_vec();
     // Strip empty lines and sort for stability.
     body.retain(|l| !l.trim().is_empty());
     body.sort_unstable();
     let mut out = String::new();
     if let Some(h) = head {
         out.push_str(h);
-        out.push('\n');
+        out.push_str(LineEnding::from_current_platform().as_str());
     }
     for l in body {
         out.push_str(l);
-        out.push('\n');
+        out.push_str(LineEnding::from_current_platform().as_str());
     }
     if let Some(t) = tail {
         out.push_str(t);
-        out.push('\n');
+        out.push_str(LineEnding::from_current_platform().as_str());
     }
     out
 }
@@ -63,7 +64,7 @@ pub fn assert_matches_golden(content: &str, rel_path: &str) {
         .unwrap()
         .read_to_string(&mut existing)
         .unwrap();
-    if existing != content {
+    if LineEnding::normalize(&existing) != LineEnding::normalize(content) {
         panic!("snapshot mismatch: {}", path.display());
     }
 }

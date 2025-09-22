@@ -68,7 +68,7 @@ fn seed_u64_perm(
 #[test]
 fn row_ids_unsorted_and_sorted_paths_u64() {
     const N: usize = 50_000;
-    let (store, fid, rid_fid, vals, pos) = seed_u64_perm(N, 0xABCD_EF01_2345_6789);
+    let (store, fid, _rid_fid, vals, pos) = seed_u64_perm(N, 0xABCD_EF01_2345_6789);
 
     // Unsorted with row ids: should emit in append order, rids 0..N-1 and values == vals
     struct UnsortedCheck {
@@ -97,7 +97,7 @@ fn row_ids_unsorted_and_sorted_paths_u64() {
                 sorted: false,
                 reverse: false,
                 with_row_ids: true,
-                
+
                 limit: None,
                 offset: 0,
                 include_nulls: false,
@@ -139,7 +139,7 @@ fn row_ids_unsorted_and_sorted_paths_u64() {
                 sorted: true,
                 reverse: false,
                 with_row_ids: true,
-                
+
                 limit: None,
                 offset: 0,
                 include_nulls: false,
@@ -151,9 +151,9 @@ fn row_ids_unsorted_and_sorted_paths_u64() {
         .unwrap();
     assert!(sa.v.len() == N && sa.r.len() == N);
     assert!(sa.v.windows(2).all(|w| w[0] <= w[1]));
-    for i in 0..N {
+    for (i, pos_loc) in pos.iter().enumerate().take(N) {
         assert_eq!(sa.v[i] as usize, i);
-        assert_eq!(sa.r[i] as usize, pos[i]);
+        assert_eq!(sa.r[i] as usize, *pos_loc);
     }
 
     // Sorted descending with row ids: values N-1..0; rids equal to position of each value
@@ -185,7 +185,7 @@ fn row_ids_unsorted_and_sorted_paths_u64() {
                 sorted: true,
                 reverse: true,
                 with_row_ids: true,
-                
+
                 limit: None,
                 offset: 0,
                 include_nulls: false,

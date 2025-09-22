@@ -26,6 +26,9 @@ pub mod descriptor;
 pub mod scan;
 pub use scan::*;
 
+mod dtype_cache;
+use dtype_cache::DTypeCache;
+
 const DESCRIPTOR_ENTRIES_PER_PAGE: usize = 256;
 
 /// Sets the shadow row_id tag on a LogicalFieldId using the Namespace enum.
@@ -36,9 +39,10 @@ fn rowid_fid(fid: LogicalFieldId) -> LogicalFieldId {
 /// Target byte size for descriptor pages. The pager may be mmapped, so page
 /// alignment helps. Used to avoid overgrowing tail pages.
 const TARGET_DESCRIPTOR_PAGE_BYTES: usize = 4096;
+
 /// Target size for data chunks coalesced by the bounded compactor and used
 /// on the ingest path when slicing big appends into multiple chunks.
-const TARGET_CHUNK_BYTES: usize = 1 * 1024 * 1024; // ~1 MiB
+const TARGET_CHUNK_BYTES: usize = 1024 * 1024; // ~1 MiB
 
 /// Merge only chunks smaller than this threshold.
 const MIN_CHUNK_BYTES: usize = TARGET_CHUNK_BYTES / 2; // ~512 KiB
@@ -197,7 +201,7 @@ fn split_to_target_bytes(
     }
     if let Some(bpv) = fixed_width_bpv(arr.data_type()) {
         let rows_per = (target_bytes / bpv).max(1);
-        let mut out = Vec::with_capacity((n + rows_per - 1) / rows_per);
+        let mut out = Vec::with_capacity(n.div_ceil(rows_per));
         let mut off = 0usize;
         while off < n {
             let take = (n - off).min(rows_per);
@@ -231,7 +235,7 @@ fn split_to_target_bytes(
         // conservative row cap.
         _ => {
             let rows_per = varwidth_fallback_rows_per_slice; // configurable
-            let mut out = Vec::with_capacity((n + rows_per - 1) / rows_per);
+            let mut out = Vec::with_capacity(n.div_ceil(rows_per));
             let mut off = 0usize;
             while off < n {
                 let take = (n - off).min(rows_per);
@@ -290,7 +294,7 @@ fn apply_edit_to_arrays(
     if let Some(ref inj) = edit.inject_data {
         out_data = concat_many(vec![&out_data, inj])?;
     }
-    if let (Some(ref inj_r), Some(ref r)) = (edit.inject_rids.as_ref(), out_rids.as_ref()) {
+    if let (Some(inj_r), Some(r)) = (edit.inject_rids.as_ref(), out_rids.as_ref()) {
         out_rids = Some(concat_many(vec![r, inj_r])?);
     }
 
@@ -299,16 +303,38 @@ fn apply_edit_to_arrays(
 
 pub struct ColumnStore<P: Pager> {
     pager: Arc<P>,
-    catalog: RwLock<ColumnCatalog>,
+    catalog: Arc<RwLock<ColumnCatalog>>,
     cfg: ColumnStoreConfig,
-    /// In-memory cache of Arrow DataType per field id (not persisted).
-    dtype_cache: RwLock<FxHashMap<LogicalFieldId, DataType>>,
+    dtype_cache: DTypeCache<P>,
 }
 
 impl<P> ColumnStore<P>
 where
-    P: Pager<Blob = EntryHandle>,
+    P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    pub fn open(pager: Arc<P>) -> Result<Self> {
+        let cfg = ColumnStoreConfig::default();
+
+        let catalog = match pager
+            .batch_get(&[BatchGet::Raw {
+                key: CATALOG_ROOT_PKEY,
+            }])?
+            .pop()
+        {
+            Some(GetResult::Raw { bytes, .. }) => ColumnCatalog::from_bytes(bytes.as_ref())?,
+            _ => ColumnCatalog::default(),
+        };
+
+        let arc_catalog = Arc::new(RwLock::new(catalog));
+
+        Ok(Self {
+            pager: Arc::clone(&pager),
+            catalog: Arc::clone(&arc_catalog),
+            cfg,
+            dtype_cache: DTypeCache::new(Arc::clone(&pager), Arc::clone(&arc_catalog)),
+        })
+    }
+
     /// Fast presence check using the presence index (row-id permutation) if available.
     /// Returns true if `row_id` exists in the column; false otherwise.
     pub fn has_row_id(&self, field_id: LogicalFieldId, row_id: u64) -> Result<bool> {
@@ -333,10 +359,10 @@ where
             if meta.row_count == 0 {
                 continue;
             }
-            if meta.min_val_u64 != 0 || meta.max_val_u64 != 0 {
-                if row_id < meta.min_val_u64 || row_id > meta.max_val_u64 {
-                    continue;
-                }
+            if (meta.min_val_u64 != 0 || meta.max_val_u64 != 0) && row_id < meta.min_val_u64
+                || row_id > meta.max_val_u64
+            {
+                continue;
             }
             // Fetch rid chunk and, if present, the presence perm
             let mut gets = vec![BatchGet::Raw { key: meta.chunk_pk }];
@@ -402,26 +428,6 @@ where
             }
         }
         Ok(false)
-    }
-
-    pub fn open(pager: Arc<P>) -> Result<Self> {
-        let cfg = ColumnStoreConfig::default();
-
-        let catalog = match pager
-            .batch_get(&[BatchGet::Raw {
-                key: CATALOG_ROOT_PKEY,
-            }])?
-            .pop()
-        {
-            Some(GetResult::Raw { bytes, .. }) => ColumnCatalog::from_bytes(bytes.as_ref())?,
-            _ => ColumnCatalog::default(),
-        };
-        Ok(Self {
-            pager,
-            catalog: RwLock::new(catalog),
-            cfg,
-            dtype_cache: RwLock::new(FxHashMap::default()),
-        })
     }
 
     // TODO: Convert all nulls to deletes (don't store them)
@@ -567,10 +573,7 @@ where
                 .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
 
             // Warm the dtype cache from schema; avoids a later chunk peek in this process.
-            self.dtype_cache
-                .write()
-                .unwrap()
-                .insert(field_id, field.data_type().clone());
+            self.dtype_cache.insert(field_id, field.data_type().clone());
 
             // Filter out nulls in this column and keep matching row_ids only.
             let (array_clean, rids_clean) = if array.null_count() == 0 {
@@ -582,7 +585,7 @@ where
                 let r = compute::filter(&append_row_id_any, &keep)?;
                 (a, r)
             };
-            if array_clean.len() == 0 {
+            if array_clean.is_empty() {
                 continue;
             }
 
@@ -601,10 +604,10 @@ where
                 self.load_descriptor_state(rid_descriptor_pk, rid_fid)?;
 
             // Persist/refresh dtype fingerprint for both data and row-id descriptors.
-            let fp_data = Self::dtype_fingerprint(field.data_type());
-            Self::set_desc_dtype_fingerprint(&mut data_descriptor, fp_data);
-            let fp_rid = Self::dtype_fingerprint(&DataType::UInt64);
-            Self::set_desc_dtype_fingerprint(&mut rid_descriptor, fp_rid);
+            // let fp_data = DTypeCache::<P>::dtype_fingerprint(field.data_type());
+            // DTypeCache::<P>::set_desc_dtype_fingerprint(&mut data_descriptor, fp_data);
+            // let fp_rid = DTypeCache::<P>::dtype_fingerprint(&DataType::UInt64);
+            // DTypeCache::<P>::set_desc_dtype_fingerprint(&mut rid_descriptor, fp_rid);
 
             // Slice and append.
             let slices = split_to_target_bytes(
@@ -816,9 +819,9 @@ where
         if n > 0 {
             // Batch fetch only rid chunks to locate hits.
             let mut gets_rid = Vec::with_capacity(n);
-            for i in 0..n {
+            for meta_rid in metas_rid.iter().take(n) {
                 gets_rid.push(BatchGet::Raw {
-                    key: metas_rid[i].chunk_pk,
+                    key: meta_rid.chunk_pk,
                 });
             }
             let rid_results = self.pager.batch_get(&gets_rid)?;
@@ -829,8 +832,8 @@ where
                 }
             }
 
-            for i in 0..n {
-                if let Some(rid_blob) = rid_blobs.get(&metas_rid[i].chunk_pk) {
+            for (i, meta_rid) in metas_rid.iter().enumerate().take(n) {
+                if let Some(rid_blob) = rid_blobs.get(&meta_rid.chunk_pk) {
                     let rid_arr = deserialize_array(rid_blob.clone())?;
                     let rid_arr = rid_arr
                         .as_any()
@@ -952,7 +955,7 @@ where
                 metas_rid[i].row_count = rids.len() as u64;
                 metas_rid[i].serialized_bytes = rids.get_array_memory_size() as u64;
                 // Refresh presence index (perm) and min/max for rid chunk
-                let rid_any: ArrayRef = rids.into();
+                let rid_any: ArrayRef = rids;
                 let r = rid_any
                     .as_any()
                     .downcast_ref::<UInt64Array>()
@@ -1143,14 +1146,14 @@ where
         // Optional: corresponding shadow row_id descriptor + metas.
         let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
         let mut descriptor_rid: Option<ColumnDescriptor> = None;
-        if let Some(pk) = desc_pk_rid {
-            if let Some(desc_blob_rid) = blobs_by_pk.remove(&pk) {
-                let d_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
-                for m in DescriptorIterator::new(self.pager.as_ref(), d_rid.head_page_pk) {
-                    metas_rid.push(m?);
-                }
-                descriptor_rid = Some(d_rid);
+        if let Some(pk) = desc_pk_rid
+            && let Some(desc_blob_rid) = blobs_by_pk.remove(&pk)
+        {
+            let d_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
+            for m in DescriptorIterator::new(self.pager.as_ref(), d_rid.head_page_pk) {
+                metas_rid.push(m?);
             }
+            descriptor_rid = Some(d_rid);
         }
 
         let mut puts = Vec::new();
@@ -1164,12 +1167,12 @@ where
             while let Some(d) = cur_del {
                 if d < start_u64 {
                     // Enforce monotonicity (streaming check).
-                    if let Some(prev) = last_seen {
-                        if d < prev {
-                            return Err(Error::Internal(
-                                "rows_to_delete must be ascending/unique".into(),
-                            ));
-                        }
+                    if let Some(prev) = last_seen
+                        && d < prev
+                    {
+                        return Err(Error::Internal(
+                            "rows_to_delete must be ascending/unique".into(),
+                        ));
                     }
                     last_seen = Some(d);
                     cur_del = del_iter.next();
@@ -1316,7 +1319,7 @@ where
         let need_pages = if new_metas.is_empty() {
             0
         } else {
-            (new_metas.len() + per - 1) / per
+            new_metas.len().div_ceil(per)
         };
         // If empty: free everything and clear counters.
         if need_pages == 0 {
@@ -1502,13 +1505,7 @@ where
                 self.cfg.varwidth_fallback_rows_per_slice,
             );
             let mut rid_off = 0usize;
-            let mut need_perms = false;
-            for k in i..j {
-                if metas[k].value_order_perm_pk != 0 {
-                    need_perms = true;
-                    break;
-                }
-            }
+            let need_perms = metas[i..j].iter().any(|m| m.value_order_perm_pk != 0);
 
             for s in slices {
                 let rows = s.len();
@@ -2005,122 +2002,5 @@ where
             });
         }
         Ok(all_stats)
-    }
-
-    // -------------------------- Introspection/caching --------------------------
-
-    /// Stable FNV-1a 64-bit over the Debug representation of DataType.
-    #[inline]
-    fn dtype_fingerprint(dt: &DataType) -> u64 {
-        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-        const FNV_PRIME: u64 = 0x100000001b3;
-        let s = format!("{:?}", dt);
-        let mut hash = FNV_OFFSET;
-        for b in s.as_bytes() {
-            hash ^= *b as u64;
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-        hash
-    }
-
-    #[inline]
-    fn desc_dtype_fingerprint(desc: &ColumnDescriptor) -> u64 {
-        ((desc._padding as u64) << 32) | (desc.data_type_code as u64)
-    }
-
-    #[inline]
-    fn set_desc_dtype_fingerprint(desc: &mut ColumnDescriptor, fp: u64) {
-        desc.data_type_code = (fp & 0xFFFF_FFFF) as u32;
-        desc._padding = ((fp >> 32) & 0xFFFF_FFFF) as u32;
-    }
-
-    /// Returns and caches the Arrow DataType for a given field id.
-    pub fn dtype_for_field(&self, field_id: LogicalFieldId) -> Result<DataType> {
-        // Fast path: cached
-        if let Some(dt) = self.dtype_cache.read().unwrap().get(&field_id).cloned() {
-            return Ok(dt);
-        }
-
-        // Lookup descriptor pk
-        let descriptor_pk = {
-            let catalog = self.catalog.read().unwrap();
-            *catalog.map.get(&field_id).ok_or(Error::NotFound)?
-        };
-
-        // Load descriptor to gather first non-empty meta
-        let desc_blob = self
-            .pager
-            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?;
-        let mut desc =
-            crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-
-        // If descriptor carries a fingerprint, try to fast-path known monomorphized types.
-        let fp = Self::desc_dtype_fingerprint(&desc);
-        if fp != 0 {
-            if fp == Self::dtype_fingerprint(&DataType::UInt64) {
-                let dt = DataType::UInt64;
-                self.dtype_cache
-                    .write()
-                    .unwrap()
-                    .insert(field_id, dt.clone());
-                return Ok(dt);
-            }
-            if fp == Self::dtype_fingerprint(&DataType::Int32) {
-                let dt = DataType::Int32;
-                self.dtype_cache
-                    .write()
-                    .unwrap()
-                    .insert(field_id, dt.clone());
-                return Ok(dt);
-            }
-            // Unknown fingerprint; fall back to peeking one chunk to get exact DataType.
-        }
-
-        let mut first_chunk_pk: Option<PhysicalKey> = None;
-        for m in DescriptorIterator::new(self.pager.as_ref(), desc.head_page_pk) {
-            let meta = m?;
-            if meta.row_count > 0 {
-                first_chunk_pk = Some(meta.chunk_pk);
-                break;
-            }
-        }
-        let chunk_pk = first_chunk_pk.ok_or(Error::NotFound)?;
-
-        // Fetch the chunk and inspect dtype
-        let blob = self
-            .pager
-            .batch_get(&[BatchGet::Raw { key: chunk_pk }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?;
-        let any = deserialize_array(blob)?;
-        let dt = any.data_type().clone();
-
-        // Persist fingerprint for future opens.
-        let fp_new = Self::dtype_fingerprint(&dt);
-        if fp_new != fp {
-            Self::set_desc_dtype_fingerprint(&mut desc, fp_new);
-            let updated = desc.to_le_bytes();
-            let _ = self.pager.batch_put(&[BatchPut::Raw {
-                key: descriptor_pk,
-                bytes: updated,
-            }]);
-        }
-
-        // Cache and return
-        self.dtype_cache
-            .write()
-            .unwrap()
-            .insert(field_id, dt.clone());
-        Ok(dt)
     }
 }

@@ -7,11 +7,17 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::store::scan::{PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor, PrimitiveWithRowIdsVisitor, ScanOptions};
+use llkv_column_map::store::scan::{
+    PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+    PrimitiveWithRowIdsVisitor, ScanOptions,
+};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new().with_namespace(Namespace::UserData).with_table_id(0).with_field_id(id)
+    LogicalFieldId::new()
+        .with_namespace(Namespace::UserData)
+        .with_table_id(0)
+        .with_field_id(id)
 }
 
 #[test]
@@ -28,7 +34,14 @@ fn sorted_with_nulls_last_pagination() {
         Field::new("data", DataType::UInt64, false).with_metadata(md_anchor),
     ]));
     let r0: Vec<u64> = (0..100).collect();
-    let a0 = RecordBatch::try_new(schema_anchor.clone(), vec![Arc::new(UInt64Array::from(r0.clone())), Arc::new(UInt64Array::from(r0.clone()))]).unwrap();
+    let a0 = RecordBatch::try_new(
+        schema_anchor.clone(),
+        vec![
+            Arc::new(UInt64Array::from(r0.clone())),
+            Arc::new(UInt64Array::from(r0.clone())),
+        ],
+    )
+    .unwrap();
     store.append(&a0).unwrap();
 
     // Target column: only even row_ids present
@@ -41,35 +54,67 @@ fn sorted_with_nulls_last_pagination() {
     ]));
     let t_rids: Vec<u64> = (0..100).filter(|x| x % 2 == 0).collect();
     let t_vals: Vec<u64> = t_rids.iter().map(|x| x * 10).collect();
-    let t0 = RecordBatch::try_new(schema_t.clone(), vec![Arc::new(UInt64Array::from(t_rids)), Arc::new(UInt64Array::from(t_vals))]).unwrap();
+    let t0 = RecordBatch::try_new(
+        schema_t.clone(),
+        vec![
+            Arc::new(UInt64Array::from(t_rids)),
+            Arc::new(UInt64Array::from(t_vals)),
+        ],
+    )
+    .unwrap();
     store.append(&t0).unwrap();
     store.create_sort_index(target_fid).unwrap();
 
-    struct Collect<'a> { vals: &'a std::cell::RefCell<Vec<u64>>, rids: &'a std::cell::RefCell<Vec<u64>> }
+    struct Collect<'a> {
+        vals: &'a std::cell::RefCell<Vec<u64>>,
+        rids: &'a std::cell::RefCell<Vec<u64>>,
+    }
     impl<'a> PrimitiveVisitor for Collect<'a> {}
     impl<'a> PrimitiveWithRowIdsVisitor for Collect<'a> {}
     impl<'a> PrimitiveSortedVisitor for Collect<'a> {}
     impl<'a> PrimitiveSortedWithRowIdsVisitor for Collect<'a> {
         fn u64_run_with_rids(&mut self, v: &UInt64Array, r: &UInt64Array, s: usize, l: usize) {
-            let e = s + l; let mut vv = self.vals.borrow_mut(); let mut rr = self.rids.borrow_mut();
-            for i in s..e { vv.push(v.value(i)); rr.push(r.value(i)); }
+            let e = s + l;
+            let mut vv = self.vals.borrow_mut();
+            let mut rr = self.rids.borrow_mut();
+            for i in s..e {
+                vv.push(v.value(i));
+                rr.push(r.value(i));
+            }
         }
         fn null_run(&mut self, r: &UInt64Array, s: usize, l: usize) {
-            let e = s + l; let mut rr = self.rids.borrow_mut();
-            for i in s..e { rr.push(r.value(i)); }
+            let e = s + l;
+            let mut rr = self.rids.borrow_mut();
+            for i in s..e {
+                rr.push(r.value(i));
+            }
         }
     }
 
     let vals = std::cell::RefCell::new(Vec::new());
     let rids = std::cell::RefCell::new(Vec::new());
-    let mut c = Collect { vals: &vals, rids: &rids };
+    let mut c = Collect {
+        vals: &vals,
+        rids: &rids,
+    };
 
     // Page with offset crossing into nulls (evens are values, odds are nulls)
-    store.scan(
-        target_fid,
-        ScanOptions { sorted: true, reverse: false, with_row_ids: true, limit: Some(15), offset: 10, include_nulls: true, nulls_first: false, anchor_row_id_field: Some(anchor_fid.with_namespace(Namespace::RowIdShadow)) },
-        &mut c,
-    ).unwrap();
+    store
+        .scan(
+            target_fid,
+            ScanOptions {
+                sorted: true,
+                reverse: false,
+                with_row_ids: true,
+                limit: Some(15),
+                offset: 10,
+                include_nulls: true,
+                nulls_first: false,
+                anchor_row_id_field: Some(anchor_fid.with_namespace(Namespace::RowIdShadow)),
+            },
+            &mut c,
+        )
+        .unwrap();
 
     let vv = vals.into_inner();
     let rr = rids.into_inner();

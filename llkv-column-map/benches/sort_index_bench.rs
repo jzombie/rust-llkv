@@ -128,7 +128,7 @@ fn seed_store_1m_fragmented_random(chunks: usize) -> (ColumnStore<MemPager>, Log
     let mut rng = StdRng::seed_from_u64(SEED ^ 0xDEAD_BEEF_DEAD_BEEF);
     vals.as_mut_slice().shuffle(&mut rng);
 
-    let chunk_rows = (N_ROWS + chunks - 1) / chunks;
+    let chunk_rows = N_ROWS.div_ceil(chunks);
     let mut off = 0usize;
     while off < N_ROWS {
         let take = (N_ROWS - off).min(chunk_rows);
@@ -199,7 +199,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             sorted: true,
                             reverse: false,
                             with_row_ids: false,
-                            
+
                             limit: None,
                             offset: 0,
                             include_nulls: false,
@@ -216,7 +216,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
     });
     group.bench_function("lowfrag/full/without_index", |b| {
         b.iter_batched(
-            || seed_store_1m(),
+            seed_store_1m,
             |(store, fid, _)| {
                 let mut c = Collect {
                     v: Vec::with_capacity(N_ROWS),
@@ -228,7 +228,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             sorted: false,
                             reverse: false,
                             with_row_ids: false,
-                            
+
                             limit: None,
                             offset: 0,
                             include_nulls: false,
@@ -268,7 +268,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
     });
     group.bench_function("lowfrag/range/without_index", |b| {
         b.iter_batched(
-            || seed_store_1m(),
+            seed_store_1m,
             |(store, fid, _)| {
                 let mut c = Collect {
                     v: Vec::with_capacity(60_000),
@@ -280,7 +280,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             sorted: false,
                             reverse: false,
                             with_row_ids: false,
-                            
+
                             limit: None,
                             offset: 0,
                             include_nulls: false,
@@ -290,7 +290,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                         &mut c,
                     )
                     .unwrap();
-                c.v.retain(|&x| x >= LO && x <= HI);
+                c.v.retain(|&x| (LO..=HI).contains(&x));
                 c.v.sort_unstable();
                 black_box(c.v.len());
             },
@@ -315,7 +315,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             sorted: true,
                             reverse: false,
                             with_row_ids: false,
-                            
+
                             limit: None,
                             offset: 0,
                             include_nulls: false,
@@ -344,7 +344,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             sorted: false,
                             reverse: false,
                             with_row_ids: false,
-                            
+
                             limit: None,
                             offset: 0,
                             include_nulls: false,
@@ -396,7 +396,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             sorted: false,
                             reverse: false,
                             with_row_ids: false,
-                            
+
                             limit: None,
                             offset: 0,
                             include_nulls: false,
@@ -406,7 +406,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                         &mut c,
                     )
                     .unwrap();
-                c.v.retain(|&x| x >= LO && x <= HI);
+                c.v.retain(|&x| (LO..=HI).contains(&x));
                 c.v.sort_unstable();
                 black_box(c.v.len());
             },

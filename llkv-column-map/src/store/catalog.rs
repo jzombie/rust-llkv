@@ -23,7 +23,9 @@ impl ColumnCatalog {
         }
         let mut o = 0usize;
         if bytes.len() < 8 {
-            return Err(Error::Internal("Invalid catalog blob: too short".to_string()));
+            return Err(Error::Internal(
+                "Invalid catalog blob: too short".to_string(),
+            ));
         }
         let entry_count = read_u64_le(bytes, &mut o) as usize;
         let expected_len = 8 + entry_count * 16;

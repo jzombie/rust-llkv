@@ -597,7 +597,7 @@ where
 
     // Dispatch by dtype + bounds for this dtype only
     if opts.with_row_ids {
-        return match first_any.data_type() {
+        match first_any.data_type() {
             DataType::UInt64 => {
                 let (lb, ub) = ir.u64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
                 sorted_visit_with_rids_u64_bounds(
@@ -695,9 +695,9 @@ where
                 )
             }
             _ => Err(Error::Internal("unsupported sorted dtype (builder)".into())),
-        };
+        }
     } else {
-        return match first_any.data_type() {
+        match first_any.data_type() {
             DataType::UInt64 => {
                 let (lb, ub) = ir.u64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
                 sorted_visit_u64_bounds(
@@ -767,6 +767,6 @@ where
                 sorted_visit_i8_bounds(store.pager.as_ref(), &metas_val, &vblobs, (lb, ub), visitor)
             }
             _ => Err(Error::Internal("unsupported sorted dtype (builder)".into())),
-        };
+        }
     }
 }

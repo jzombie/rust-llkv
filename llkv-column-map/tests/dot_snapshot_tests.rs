@@ -75,7 +75,7 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     for r in 0..25u64 {
         let len = 5 + ((r as usize * 3) % 8);
         let byte = (0x40u8).wrapping_add((r % 26) as u8);
-        bb.append_value(&vec![byte; len]);
+        bb.append_value(vec![byte; len]);
     }
     let rb3 = RecordBatch::try_new(
         schema3,
@@ -96,7 +96,10 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     let vals4: Vec<u64> = (0..30u64).map(|x| x * 2 + 1).collect();
     let rb4 = RecordBatch::try_new(
         schema4,
-        vec![Arc::new(UInt64Array::from(rid4)), Arc::new(UInt64Array::from(vals4))],
+        vec![
+            Arc::new(UInt64Array::from(rid4)),
+            Arc::new(UInt64Array::from(vals4)),
+        ],
     )
     .unwrap();
     store.append(&rb4).unwrap();
@@ -112,7 +115,10 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     let vals5: Vec<i32> = (0..15i32).map(|x| x * x - 3).collect();
     let rb5 = RecordBatch::try_new(
         schema5,
-        vec![Arc::new(UInt64Array::from(rid5)), Arc::new(Int32Array::from(vals5))],
+        vec![
+            Arc::new(UInt64Array::from(rid5)),
+            Arc::new(Int32Array::from(vals5)),
+        ],
     )
     .unwrap();
     store.append(&rb5).unwrap();
@@ -129,7 +135,10 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     let vals6: Vec<u64> = (100..110u64).collect();
     let rb6 = RecordBatch::try_new(
         schema6,
-        vec![Arc::new(UInt64Array::from(rid6)), Arc::new(UInt64Array::from(vals6))],
+        vec![
+            Arc::new(UInt64Array::from(rid6)),
+            Arc::new(UInt64Array::from(vals6)),
+        ],
     )
     .unwrap();
     store.append(&rb6).unwrap();

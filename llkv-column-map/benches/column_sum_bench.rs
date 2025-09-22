@@ -102,7 +102,7 @@ fn bench_column_store_sum(c: &mut Criterion) {
                             sorted: false,
                             reverse: false,
                             with_row_ids: false,
-                            
+
                             limit: None,
                             offset: 0,
                             include_nulls: false,
@@ -169,7 +169,7 @@ fn bench_column_store_sum(c: &mut Criterion) {
                             sorted: false,
                             reverse: false,
                             with_row_ids: false,
-                            
+
                             limit: None,
                             offset: 0,
                             include_nulls: false,
@@ -208,8 +208,8 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
                 // 1) Ingest in many small, fragmented chunks.
                 // row_id is global 0..N-1 to keep absolute indices stable.
                 for i in 0..NUM_CHUNKS_FRAGMENTED {
-                    let start = (i * CHUNK_SIZE_FRAGMENTED) as u64;
-                    let end = start + CHUNK_SIZE_FRAGMENTED as u64;
+                    let start = i * CHUNK_SIZE_FRAGMENTED;
+                    let end = start + CHUNK_SIZE_FRAGMENTED;
 
                     let rid: Vec<u64> = (start..end).collect();
                     let vals: Vec<u64> = (start..end).collect();
@@ -279,7 +279,7 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
                             sorted: false,
                             reverse: false,
                             with_row_ids: false,
-                            
+
                             limit: None,
                             offset: 0,
                             include_nulls: false,
