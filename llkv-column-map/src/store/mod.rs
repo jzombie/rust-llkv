@@ -26,6 +26,9 @@ pub mod descriptor;
 pub mod scan;
 pub use scan::*;
 
+mod dtype_cache;
+use dtype_cache::DTypeCache;
+
 const DESCRIPTOR_ENTRIES_PER_PAGE: usize = 256;
 
 /// Sets the shadow row_id tag on a LogicalFieldId using the Namespace enum.
@@ -299,16 +302,38 @@ fn apply_edit_to_arrays(
 
 pub struct ColumnStore<P: Pager> {
     pager: Arc<P>,
-    catalog: RwLock<ColumnCatalog>,
+    catalog: Arc<RwLock<ColumnCatalog>>,
     cfg: ColumnStoreConfig,
-    /// In-memory cache of Arrow DataType per field id (not persisted).
-    dtype_cache: RwLock<FxHashMap<LogicalFieldId, DataType>>,
+    dtype_cache: DTypeCache<P>,
 }
 
 impl<P> ColumnStore<P>
 where
-    P: Pager<Blob = EntryHandle>,
+    P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    pub fn open(pager: Arc<P>) -> Result<Self> {
+        let cfg = ColumnStoreConfig::default();
+
+        let catalog = match pager
+            .batch_get(&[BatchGet::Raw {
+                key: CATALOG_ROOT_PKEY,
+            }])?
+            .pop()
+        {
+            Some(GetResult::Raw { bytes, .. }) => ColumnCatalog::from_bytes(bytes.as_ref())?,
+            _ => ColumnCatalog::default(),
+        };
+
+        let arc_catalog = Arc::new(RwLock::new(catalog));
+
+        Ok(Self {
+            pager: Arc::clone(&pager),
+            catalog: Arc::clone(&arc_catalog),
+            cfg,
+            dtype_cache: DTypeCache::new(Arc::clone(&pager), Arc::clone(&arc_catalog)),
+        })
+    }
+
     /// Fast presence check using the presence index (row-id permutation) if available.
     /// Returns true if `row_id` exists in the column; false otherwise.
     pub fn has_row_id(&self, field_id: LogicalFieldId, row_id: u64) -> Result<bool> {
@@ -402,26 +427,6 @@ where
             }
         }
         Ok(false)
-    }
-
-    pub fn open(pager: Arc<P>) -> Result<Self> {
-        let cfg = ColumnStoreConfig::default();
-
-        let catalog = match pager
-            .batch_get(&[BatchGet::Raw {
-                key: CATALOG_ROOT_PKEY,
-            }])?
-            .pop()
-        {
-            Some(GetResult::Raw { bytes, .. }) => ColumnCatalog::from_bytes(bytes.as_ref())?,
-            _ => ColumnCatalog::default(),
-        };
-        Ok(Self {
-            pager,
-            catalog: RwLock::new(catalog),
-            cfg,
-            dtype_cache: RwLock::new(FxHashMap::default()),
-        })
     }
 
     // TODO: Convert all nulls to deletes (don't store them)
@@ -567,10 +572,7 @@ where
                 .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
 
             // Warm the dtype cache from schema; avoids a later chunk peek in this process.
-            self.dtype_cache
-                .write()
-                .unwrap()
-                .insert(field_id, field.data_type().clone());
+            self.dtype_cache.insert(field_id, field.data_type().clone());
 
             // Filter out nulls in this column and keep matching row_ids only.
             let (array_clean, rids_clean) = if array.null_count() == 0 {
@@ -601,10 +603,10 @@ where
                 self.load_descriptor_state(rid_descriptor_pk, rid_fid)?;
 
             // Persist/refresh dtype fingerprint for both data and row-id descriptors.
-            let fp_data = Self::dtype_fingerprint(field.data_type());
-            Self::set_desc_dtype_fingerprint(&mut data_descriptor, fp_data);
-            let fp_rid = Self::dtype_fingerprint(&DataType::UInt64);
-            Self::set_desc_dtype_fingerprint(&mut rid_descriptor, fp_rid);
+            let fp_data = DTypeCache::<P>::dtype_fingerprint(field.data_type());
+            DTypeCache::<P>::set_desc_dtype_fingerprint(&mut data_descriptor, fp_data);
+            let fp_rid = DTypeCache::<P>::dtype_fingerprint(&DataType::UInt64);
+            DTypeCache::<P>::set_desc_dtype_fingerprint(&mut rid_descriptor, fp_rid);
 
             // Slice and append.
             let slices = split_to_target_bytes(
@@ -2005,122 +2007,5 @@ where
             });
         }
         Ok(all_stats)
-    }
-
-    // -------------------------- Introspection/caching --------------------------
-
-    /// Stable FNV-1a 64-bit over the Debug representation of DataType.
-    #[inline]
-    fn dtype_fingerprint(dt: &DataType) -> u64 {
-        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-        const FNV_PRIME: u64 = 0x100000001b3;
-        let s = format!("{:?}", dt);
-        let mut hash = FNV_OFFSET;
-        for b in s.as_bytes() {
-            hash ^= *b as u64;
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-        hash
-    }
-
-    #[inline]
-    fn desc_dtype_fingerprint(desc: &ColumnDescriptor) -> u64 {
-        ((desc._padding as u64) << 32) | (desc.data_type_code as u64)
-    }
-
-    #[inline]
-    fn set_desc_dtype_fingerprint(desc: &mut ColumnDescriptor, fp: u64) {
-        desc.data_type_code = (fp & 0xFFFF_FFFF) as u32;
-        desc._padding = ((fp >> 32) & 0xFFFF_FFFF) as u32;
-    }
-
-    /// Returns and caches the Arrow DataType for a given field id.
-    pub fn dtype_for_field(&self, field_id: LogicalFieldId) -> Result<DataType> {
-        // Fast path: cached
-        if let Some(dt) = self.dtype_cache.read().unwrap().get(&field_id).cloned() {
-            return Ok(dt);
-        }
-
-        // Lookup descriptor pk
-        let descriptor_pk = {
-            let catalog = self.catalog.read().unwrap();
-            *catalog.map.get(&field_id).ok_or(Error::NotFound)?
-        };
-
-        // Load descriptor to gather first non-empty meta
-        let desc_blob = self
-            .pager
-            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?;
-        let mut desc =
-            crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-
-        // If descriptor carries a fingerprint, try to fast-path known monomorphized types.
-        let fp = Self::desc_dtype_fingerprint(&desc);
-        if fp != 0 {
-            if fp == Self::dtype_fingerprint(&DataType::UInt64) {
-                let dt = DataType::UInt64;
-                self.dtype_cache
-                    .write()
-                    .unwrap()
-                    .insert(field_id, dt.clone());
-                return Ok(dt);
-            }
-            if fp == Self::dtype_fingerprint(&DataType::Int32) {
-                let dt = DataType::Int32;
-                self.dtype_cache
-                    .write()
-                    .unwrap()
-                    .insert(field_id, dt.clone());
-                return Ok(dt);
-            }
-            // Unknown fingerprint; fall back to peeking one chunk to get exact DataType.
-        }
-
-        let mut first_chunk_pk: Option<PhysicalKey> = None;
-        for m in DescriptorIterator::new(self.pager.as_ref(), desc.head_page_pk) {
-            let meta = m?;
-            if meta.row_count > 0 {
-                first_chunk_pk = Some(meta.chunk_pk);
-                break;
-            }
-        }
-        let chunk_pk = first_chunk_pk.ok_or(Error::NotFound)?;
-
-        // Fetch the chunk and inspect dtype
-        let blob = self
-            .pager
-            .batch_get(&[BatchGet::Raw { key: chunk_pk }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?;
-        let any = deserialize_array(blob)?;
-        let dt = any.data_type().clone();
-
-        // Persist fingerprint for future opens.
-        let fp_new = Self::dtype_fingerprint(&dt);
-        if fp_new != fp {
-            Self::set_desc_dtype_fingerprint(&mut desc, fp_new);
-            let updated = desc.to_le_bytes();
-            let _ = self.pager.batch_put(&[BatchPut::Raw {
-                key: descriptor_pk,
-                bytes: updated,
-            }]);
-        }
-
-        // Cache and return
-        self.dtype_cache
-            .write()
-            .unwrap()
-            .insert(field_id, dt.clone());
-        Ok(dt)
     }
 }
