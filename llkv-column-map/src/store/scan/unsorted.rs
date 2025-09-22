@@ -398,7 +398,10 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
         let b = pager
             .batch_get(&[BatchGet::Raw { key: v_pk }])?
             .pop()
-            .and_then(|r| match r { GetResult::Raw { bytes, .. } => Some(bytes), _ => None })
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
             .ok_or(Error::NotFound)?;
         ColumnDescriptor::from_le_bytes(b.as_ref())
     };
@@ -406,7 +409,10 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
         let b = pager
             .batch_get(&[BatchGet::Raw { key: r_pk }])?
             .pop()
-            .and_then(|r| match r { GetResult::Raw { bytes, .. } => Some(bytes), _ => None })
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
             .ok_or(Error::NotFound)?;
         ColumnDescriptor::from_le_bytes(b.as_ref())
     };
@@ -414,7 +420,10 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
         let b = pager
             .batch_get(&[BatchGet::Raw { key: a_pk }])?
             .pop()
-            .and_then(|r| match r { GetResult::Raw { bytes, .. } => Some(bytes), _ => None })
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
             .ok_or(Error::NotFound)?;
         ColumnDescriptor::from_le_bytes(b.as_ref())
     };
@@ -445,7 +454,9 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
         return Ok(());
     }
     if v_metas.len() != r_metas.len() {
-        return Err(Error::Internal("unsorted_with_nulls: chunk count mismatch".into()));
+        return Err(Error::Internal(
+            "unsorted_with_nulls: chunk count mismatch".into(),
+        ));
     }
 
     // Batch get
@@ -474,26 +485,51 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
     }
 
     // Determine dtype
-    let first_any = deserialize_array(vblobs.get(&v_metas[0].chunk_pk).ok_or(Error::NotFound)?.clone())?;
+    let first_any = deserialize_array(
+        vblobs
+            .get(&v_metas[0].chunk_pk)
+            .ok_or(Error::NotFound)?
+            .clone(),
+    )?;
     match first_any.data_type() {
         DataType::UInt64 => {
-            let mut ai = 0usize; let mut aj = 0usize;
-            let mut pi = 0usize; let mut pj = 0usize;
+            let mut ai = 0usize;
+            let mut aj = 0usize;
+            let mut pi = 0usize;
+            let mut pj = 0usize;
             // Materialize typed arrays
             let mut vals: Vec<UInt64Array> = Vec::with_capacity(v_metas.len());
             let mut prids: Vec<UInt64Array> = Vec::with_capacity(r_metas.len());
             let mut anchors: Vec<UInt64Array> = Vec::with_capacity(a_metas.len());
             for vm in &v_metas {
-                let any = deserialize_array(vblobs.get(&vm.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                vals.push(any.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| Error::Internal("downcast".into()))?.clone());
+                let any =
+                    deserialize_array(vblobs.get(&vm.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                vals.push(
+                    any.as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| Error::Internal("downcast".into()))?
+                        .clone(),
+                );
             }
             for rm in &r_metas {
-                let any = deserialize_array(rblobs.get(&rm.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                prids.push(any.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| Error::Internal("downcast".into()))?.clone());
+                let any =
+                    deserialize_array(rblobs.get(&rm.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                prids.push(
+                    any.as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| Error::Internal("downcast".into()))?
+                        .clone(),
+                );
             }
             for am in &a_metas {
-                let any = deserialize_array(ablobs.get(&am.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                anchors.push(any.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| Error::Internal("downcast".into()))?.clone());
+                let any =
+                    deserialize_array(ablobs.get(&am.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                anchors.push(
+                    any.as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| Error::Internal("downcast".into()))?
+                        .clone(),
+                );
             }
             let mut null_buf: Vec<u64> = Vec::new();
             while ai < anchors.len() {
@@ -503,18 +539,32 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
                     // advance pres to >= av
                     while pi < prids.len() {
                         let p = &prids[pi];
-                        if pj >= p.len() { pi += 1; pj = 0; continue; }
+                        if pj >= p.len() {
+                            pi += 1;
+                            pj = 0;
+                            continue;
+                        }
                         let pv = p.value(pj);
-                        if pv < av { pj += 1; } else { break; }
+                        if pv < av {
+                            pj += 1;
+                        } else {
+                            break;
+                        }
                     }
-                    let present_eq = if pi < prids.len() { let p = &prids[pi]; pj < p.len() && p.value(pj) == av } else { false };
+                    let present_eq = if pi < prids.len() {
+                        let p = &prids[pi];
+                        pj < p.len() && p.value(pj) == av
+                    } else {
+                        false
+                    };
                     if present_eq {
                         if !null_buf.is_empty() {
                             let arr = UInt64Array::from(std::mem::take(&mut null_buf));
                             visitor.null_run(&arr, 0, arr.len());
                         }
                         // emit single present value slice
-                        let v = &vals[pi]; let r = &prids[pi];
+                        let v = &vals[pi];
+                        let r = &prids[pi];
                         let sref_v = v.slice(pj, 1);
                         let sref_r = r.slice(pj, 1);
                         let sv = sref_v.as_any().downcast_ref::<UInt64Array>().unwrap();
@@ -530,7 +580,8 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
                     }
                     aj += 1;
                 }
-                ai += 1; aj = 0;
+                ai += 1;
+                aj = 0;
             }
             if !null_buf.is_empty() {
                 let arr = UInt64Array::from(std::mem::take(&mut null_buf));
@@ -539,6 +590,8 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
             Ok(())
         }
         // Fallback: emit present in chunk order and nulls interleaved as found; for other dtypes, we can map to u64 anchor
-        _ => Err(Error::Internal("unsorted_with_nulls: dtype not supported".into())),
+        _ => Err(Error::Internal(
+            "unsorted_with_nulls: dtype not supported".into(),
+        )),
     }
 }

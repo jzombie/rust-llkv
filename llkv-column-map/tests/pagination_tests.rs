@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{UInt64Array};
+use arrow::array::UInt64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -68,7 +68,7 @@ fn pagination_unsorted_u64() {
                 sorted: false,
                 reverse: false,
                 with_row_ids: false,
-                
+
                 limit: None,
                 offset: 0,
                 include_nulls: false,
@@ -93,7 +93,7 @@ fn pagination_unsorted_u64() {
                 sorted: false,
                 reverse: false,
                 with_row_ids: false,
-                
+
                 limit: Some(k),
                 offset: 0,
                 include_nulls: false,
@@ -117,7 +117,7 @@ fn pagination_unsorted_u64() {
                 sorted: false,
                 reverse: false,
                 with_row_ids: false,
-                
+
                 limit: None,
                 offset: off,
                 include_nulls: false,
@@ -142,7 +142,7 @@ fn pagination_unsorted_u64() {
                 sorted: false,
                 reverse: false,
                 with_row_ids: false,
-                
+
                 limit: Some(lim),
                 offset: off,
                 include_nulls: false,
@@ -201,7 +201,7 @@ fn pagination_sorted_u64() {
                 sorted: true,
                 reverse: false,
                 with_row_ids: false,
-                
+
                 limit: None,
                 offset: 0,
                 include_nulls: false,
@@ -227,7 +227,7 @@ fn pagination_sorted_u64() {
                 sorted: true,
                 reverse: false,
                 with_row_ids: false,
-                
+
                 limit: Some(lim),
                 offset: off,
                 include_nulls: false,
@@ -268,7 +268,7 @@ fn pagination_sorted_u64() {
                 sorted: true,
                 reverse: true,
                 with_row_ids: false,
-                
+
                 limit: None,
                 offset: 0,
                 include_nulls: false,
@@ -293,7 +293,7 @@ fn pagination_sorted_u64() {
                 sorted: true,
                 reverse: true,
                 with_row_ids: false,
-                
+
                 limit: Some(lim),
                 offset: 0,
                 include_nulls: false,

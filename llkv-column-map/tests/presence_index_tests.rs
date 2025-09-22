@@ -44,7 +44,10 @@ fn presence_index_cross_column_queries() {
     let a_v0: Vec<u64> = a_r0.iter().map(|x| x * 10).collect();
     let a_b0 = RecordBatch::try_new(
         schema_a.clone(),
-        vec![Arc::new(UInt64Array::from(a_r0)), Arc::new(UInt64Array::from(a_v0))],
+        vec![
+            Arc::new(UInt64Array::from(a_r0)),
+            Arc::new(UInt64Array::from(a_v0)),
+        ],
     )
     .unwrap();
     store.append(&a_b0).unwrap();
@@ -53,7 +56,10 @@ fn presence_index_cross_column_queries() {
     let a_v1: Vec<u64> = a_r1.iter().map(|x| x * 10).collect();
     let a_b1 = RecordBatch::try_new(
         schema_a,
-        vec![Arc::new(UInt64Array::from(a_r1)), Arc::new(UInt64Array::from(a_v1))],
+        vec![
+            Arc::new(UInt64Array::from(a_r1)),
+            Arc::new(UInt64Array::from(a_v1)),
+        ],
     )
     .unwrap();
     store.append(&a_b1).unwrap();
@@ -63,7 +69,10 @@ fn presence_index_cross_column_queries() {
     let b_v0: Vec<u64> = b_r0.iter().map(|x| x * 7).collect();
     let b_b0 = RecordBatch::try_new(
         schema_b.clone(),
-        vec![Arc::new(UInt64Array::from(b_r0)), Arc::new(UInt64Array::from(b_v0))],
+        vec![
+            Arc::new(UInt64Array::from(b_r0)),
+            Arc::new(UInt64Array::from(b_v0)),
+        ],
     )
     .unwrap();
     store.append(&b_b0).unwrap();
@@ -72,7 +81,10 @@ fn presence_index_cross_column_queries() {
     let b_v1: Vec<u64> = b_r1.iter().map(|x| x * 7).collect();
     let b_b1 = RecordBatch::try_new(
         schema_b,
-        vec![Arc::new(UInt64Array::from(b_r1)), Arc::new(UInt64Array::from(b_v1))],
+        vec![
+            Arc::new(UInt64Array::from(b_r1)),
+            Arc::new(UInt64Array::from(b_v1)),
+        ],
     )
     .unwrap();
     store.append(&b_b1).unwrap();
