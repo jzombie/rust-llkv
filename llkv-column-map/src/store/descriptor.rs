@@ -61,8 +61,7 @@ impl ChunkMetadata {
 
 /// The root metadata object for a single column.
 /// Points to the head/tail of a linked list of DescriptorPages.
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
+#[derive(Clone, Debug)]
 pub struct ColumnDescriptor {
     pub field_id: LogicalFieldId,
     pub head_page_pk: PhysicalKey,
@@ -72,15 +71,33 @@ pub struct ColumnDescriptor {
     /// Optional Arrow data type code (0 => unknown). Persisted to avoid peeking chunks.
     pub data_type_code: u32,
     pub _padding: u32,
+    /// Serialized index metadata.
+    pub index_metadata: Vec<u8>,
+}
+
+impl Default for ColumnDescriptor {
+    fn default() -> Self {
+        Self {
+            field_id: LogicalFieldId::default(),
+            head_page_pk: 0,
+            tail_page_pk: 0,
+            total_row_count: 0,
+            total_chunk_count: 0,
+            data_type_code: 0,
+            _padding: 0,
+            index_metadata: Vec::new(),
+        }
+    }
 }
 
 impl ColumnDescriptor {
-    pub const DISK_SIZE: usize = mem::size_of::<Self>();
+    pub const FIXED_DISK_SIZE_WITHOUT_INDEX_META: usize = 48;
+    pub const FIXED_DISK_SIZE: usize = Self::FIXED_DISK_SIZE_WITHOUT_INDEX_META + 4; // + index_meta_len
 
     /// Single allocation; append fields as LE without growth churn.
     pub fn to_le_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(Self::DISK_SIZE);
-        // Convert LogicalFieldId struct into a u64 for serialization.
+        let index_meta_len = self.index_metadata.len() as u32;
+        let mut buf = Vec::with_capacity(Self::FIXED_DISK_SIZE + self.index_metadata.len());
         let field_id_u64: u64 = self.field_id.into();
         write_u64_le(&mut buf, field_id_u64);
         write_u64_le(&mut buf, self.head_page_pk);
@@ -89,24 +106,34 @@ impl ColumnDescriptor {
         write_u64_le(&mut buf, self.total_chunk_count);
         write_u32_le(&mut buf, self.data_type_code);
         write_u32_le(&mut buf, self._padding);
+        write_u32_le(&mut buf, index_meta_len);
+        buf.extend_from_slice(&self.index_metadata);
         buf
     }
 
     pub fn from_le_bytes(bytes: &[u8]) -> Self {
         let mut o = 0usize;
-        // Read the u64 from bytes and convert it into the LogicalFieldId struct.
         let field_id = LogicalFieldId::from(read_u64_le(bytes, &mut o));
         let head_page_pk = read_u64_le(bytes, &mut o);
         let tail_page_pk = read_u64_le(bytes, &mut o);
         let total_row_count = read_u64_le(bytes, &mut o);
         let total_chunk_count = read_u64_le(bytes, &mut o);
-        // Optional trailer (added in newer versions): [u32 type_code][u32 padding]
-        let mut data_type_code = 0u32;
-        let mut padding = 0u32;
-        if bytes.len() >= o + 8 {
-            data_type_code = read_u32_le(bytes, &mut o);
-            padding = read_u32_le(bytes, &mut o);
-        }
+
+        // For forwards compatibility, check if the newer fields exist.
+        let (data_type_code, padding, index_meta_len) = if bytes.len() >= o + 12 {
+            let dtc = read_u32_le(bytes, &mut o);
+            let pad = read_u32_le(bytes, &mut o);
+            let iml = read_u32_le(bytes, &mut o) as usize;
+            (dtc, pad, iml)
+        } else {
+            (0, 0, 0)
+        };
+
+        let index_metadata = if index_meta_len > 0 && bytes.len() >= o + index_meta_len {
+            bytes[o..o + index_meta_len].to_vec()
+        } else {
+            Vec::new()
+        };
 
         Self {
             field_id,
@@ -116,7 +143,54 @@ impl ColumnDescriptor {
             total_chunk_count,
             data_type_code,
             _padding: padding,
+            index_metadata,
         }
+    }
+
+    /// Deserializes index names from metadata using a custom format.
+    /// Format: [num_indexes: u32_le] [[len1: u32_le] [string1_bytes]]...
+    pub fn get_indexes(&self) -> Result<Vec<String>> {
+        if self.index_metadata.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut o = 0usize;
+        let data = &self.index_metadata;
+        if data.len() < 4 {
+            return Err(Error::Internal("Invalid index metadata: too short".into()));
+        }
+        let num_indexes = read_u32_le(data, &mut o) as usize;
+        let mut indexes = Vec::with_capacity(num_indexes);
+        for _ in 0..num_indexes {
+            if data.len() < o + 4 {
+                return Err(Error::Internal(
+                    "Invalid index metadata: unexpected eof".into(),
+                ));
+            }
+            let len = read_u32_le(data, &mut o) as usize;
+            if data.len() < o + len {
+                return Err(Error::Internal(
+                    "Invalid index metadata: string data truncated".into(),
+                ));
+            }
+            let s = std::str::from_utf8(&data[o..o + len])
+                .map_err(|e| Error::Internal(format!("Invalid UTF-8 in index name: {}", e)))?
+                .to_string();
+            indexes.push(s);
+            o += len;
+        }
+        Ok(indexes)
+    }
+
+    /// Serializes and sets index names to metadata using a custom format.
+    pub fn set_indexes(&mut self, indexes: &[String]) -> Result<()> {
+        let mut buf = Vec::new();
+        write_u32_le(&mut buf, indexes.len() as u32);
+        for index in indexes {
+            write_u32_le(&mut buf, index.len() as u32);
+            buf.extend_from_slice(index.as_bytes());
+        }
+        self.index_metadata = buf;
+        Ok(())
     }
 }
 

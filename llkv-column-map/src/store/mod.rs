@@ -23,11 +23,14 @@ use std::sync::{Arc, RwLock};
 pub mod catalog;
 pub mod debug;
 pub mod descriptor;
+
 pub mod scan;
 pub use scan::*;
 
 mod dtype_cache;
 use dtype_cache::DTypeCache;
+
+mod indexing;
 
 const DESCRIPTOR_ENTRIES_PER_PAGE: usize = 256;
 
@@ -335,6 +338,25 @@ where
         })
     }
 
+    /// Lists the names of all persisted indexes for a given column.
+    pub fn list_persisted_indexes(&self, field_id: LogicalFieldId) -> Result<Vec<String>> {
+        let catalog = self.catalog.read().unwrap();
+        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+
+        let desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
+
+        let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+        descriptor.get_indexes()
+    }
+
     /// Fast presence check using the presence index (row-id permutation) if available.
     /// Returns true if `row_id` exists in the column; false otherwise.
     pub fn has_row_id(&self, field_id: LogicalFieldId, row_id: u64) -> Result<bool> {
@@ -617,6 +639,8 @@ where
             );
             let mut row_off = 0usize;
 
+            let mut presence_index_created = false;
+
             for s in slices {
                 let rows = s.len();
 
@@ -680,6 +704,7 @@ where
                 }
                 let mut rid_perm_pk = 0u64;
                 if !sorted {
+                    presence_index_created = true;
                     // Build presence index (perm over row_ids)
                     let sort_col = SortColumn {
                         values: rid_any,
@@ -708,6 +733,14 @@ where
                     &mut puts_appends,
                 )?;
                 row_off += rows;
+            }
+
+            // TODO: Improve
+            // A column with a row_id shadow always has a presence index.
+            let mut indexes = data_descriptor.get_indexes()?;
+            if !indexes.contains(&"presence".to_string()) {
+                indexes.push("presence".to_string());
+                data_descriptor.set_indexes(&indexes)?;
             }
 
             puts_appends.push(BatchPut::Raw {
@@ -1146,8 +1179,8 @@ where
         // Optional: corresponding shadow row_id descriptor + metas.
         let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
         let mut descriptor_rid: Option<ColumnDescriptor> = None;
-        if let Some(pk) = desc_pk_rid
-            && let Some(desc_blob_rid) = blobs_by_pk.remove(&pk)
+        if let (Some(pk), Some(desc_blob_rid)) =
+            (desc_pk_rid, blobs_by_pk.remove(&desc_pk_rid.unwrap()))
         {
             let d_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
             for m in DescriptorIterator::new(self.pager.as_ref(), d_rid.head_page_pk) {
@@ -1671,7 +1704,7 @@ where
                 _ => None,
             })
             .ok_or(Error::NotFound)?;
-        let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+        let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
         let mut all_chunk_metadata = Vec::new();
         let meta_iter = DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk);
@@ -1757,6 +1790,18 @@ where
             page_start_chunk_idx = page_end_chunk_idx;
         }
 
+        // TODO: Improve
+        // Register the "sort" index in the descriptor.
+        let mut indexes = descriptor.get_indexes()?;
+        if !indexes.contains(&"sort".to_string()) {
+            indexes.push("sort".to_string());
+            descriptor.set_indexes(&indexes)?;
+        }
+        puts.push(BatchPut::Raw {
+            key: descriptor_pk,
+            bytes: descriptor.to_le_bytes(),
+        });
+
         self.pager.batch_put(&puts)?;
         Ok(())
     }
@@ -1796,10 +1841,7 @@ where
                     field_id,
                     head_page_pk: first_page_pk,
                     tail_page_pk: first_page_pk,
-                    total_row_count: 0,
-                    total_chunk_count: 0,
-                    data_type_code: 0,
-                    _padding: 0,
+                    ..Default::default()
                 };
                 let header = DescriptorPageHeader {
                     next_page_pk: 0,
