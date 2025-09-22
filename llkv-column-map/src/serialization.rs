@@ -1,16 +1,6 @@
 //! Zero-copy array persistence for fixed/var width Arrow arrays used by the store.
-//!
-//! Format (little-endian):
-//!   [0..4)   : b"ARR0"
-//!   [4]      : layout (0=primitive, 1=fsl_float32, 2=varlen)
-//!   [5]      : type_code (UInt64=1, Int32=2, ... Binary=5, etc.)
-//!   [6..8)   : reserved (0)
-//!   [8..16)  : len (u64) = number of elements
-//!   [16..20) : extra_a (u32) -> primitive: values_len_bytes; fsl: list_size; varlen: offsets_len_bytes
-//!   [20..24) : extra_b (u32) -> primitive: reserved 0;      fsl: child_values_len_bytes; varlen: values_len_bytes
-//!   payload  : primitive: [values]
-//!              fsl      : [child_values]
-//!              varlen   : [offsets][values]
+
+// TODO: Document layout
 
 use std::convert::TryFrom;
 use std::sync::Arc;
