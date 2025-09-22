@@ -1,6 +1,6 @@
 use super::*;
 use crate::error::{Error, Result};
-use crate::types::{CATALOG_ROOT_PKEY, PhysicalKey};
+use crate::types::{CONFIG_ROOT_PKEY, PhysicalKey};
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{
@@ -24,7 +24,7 @@ impl Default for MemPager {
 impl MemPager {
     pub fn new() -> Self {
         Self {
-            next_key: AtomicU64::new(CATALOG_ROOT_PKEY + 1),
+            next_key: AtomicU64::new(CONFIG_ROOT_PKEY + 1), // Start after well-known keys
             blobs: RwLock::new(FxHashMap::default()),
         }
     }
@@ -32,7 +32,6 @@ impl MemPager {
 
 impl Pager for MemPager {
     type Blob = EntryHandle;
-
     fn alloc_many(&self, n: usize) -> Result<Vec<PhysicalKey>> {
         let n_u64 = n as u64;
         let start = self
@@ -52,8 +51,8 @@ impl Pager for MemPager {
         for p in puts {
             match p {
                 BatchPut::Raw { key, bytes } => {
-                    // One O(len) copy on write into an anonymous mmap; reads are
-                    // zero-copy via EntryHandle::as_slice().
+                    // One O(len) copy on write into an anonymous mmap;
+                    // reads are zero-copy via EntryHandle::as_slice().
                     let eh = EntryHandle::from_owned_bytes_anon(bytes, *key)
                         .map_err(|e| Error::Internal(format!("anon mmap failed: {e:?}")))?;
                     map.insert(*key, eh);

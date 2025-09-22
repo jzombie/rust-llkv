@@ -1,23 +1,22 @@
+//!
 //! Centralized, extensible indexing for the ColumnStore.
 
 pub mod presence;
+pub mod sort;
 pub mod traits;
 
 use crate::error::{Error, Result};
-use crate::storage::pager::Pager;
-use crate::store::descriptor::ChunkMetadata;
 use crate::types::LogicalFieldId;
 use arrow::array::ArrayRef;
 use rustc_hash::FxHashMap;
-use simd_r_drive_entry_handle::EntryHandle;
-use traits::{Index, IndexManager, IndexOpContext};
+use traits::{BackfillContext, Index, IndexPlan};
 
-/// A concrete implementation of `IndexManager`.
+/// A concrete implementation of an index manager that plans work synchronously.
 pub struct DefaultIndexManager {
     /// Maps an index name to an instance of that index.
     indexes: FxHashMap<String, Box<dyn Index>>,
     /// Maps a field_id to the list of index names active on it.
-    field_indexes: FxHashMap<LogicalFieldId, Vec<String>>,
+    pub(crate) field_indexes: FxHashMap<LogicalFieldId, Vec<String>>,
 }
 
 impl Default for DefaultIndexManager {
@@ -34,76 +33,59 @@ impl DefaultIndexManager {
         }
     }
 
-    /// Activates an index for a specific field.
-    pub fn enable_index_for_field(
-        &mut self,
-        field_id: LogicalFieldId,
-        index_name: &str,
-    ) -> Result<()> {
-        if !self.indexes.contains_key(index_name) {
-            return Err(Error::Internal(format!(
-                "Index '{}' not registered",
-                index_name
-            )));
-        }
-        self.field_indexes
-            .entry(field_id)
-            .or_default()
-            .push(index_name.to_string());
-        Ok(())
-    }
-}
-
-impl IndexManager for DefaultIndexManager {
-    fn register_index(&mut self, index: Box<dyn Index>) {
+    /// Registers a new index type.
+    pub fn register_index(&mut self, index: Box<dyn Index>) {
         self.indexes.insert(index.name().to_string(), index);
     }
 
-    fn dispatch_append(
-        &mut self,
-        context: &mut IndexOpContext<'_>,
-        field_id: LogicalFieldId,
-        new_chunks: &[(ChunkMetadata, ArrayRef)],
-    ) -> Result<()> {
-        if let Some(active_indexes) = self.field_indexes.get(&field_id) {
-            for index_name in active_indexes {
-                if let Some(index) = self.indexes.get_mut(index_name) {
-                    index.on_append(context, field_id, new_chunks)?;
-                }
-            }
+    /// Activates an index for a specific field.
+    pub fn enable_index_for_field(&mut self, field_id: LogicalFieldId, index_name: &str) {
+        // Avoid duplicates
+        let entry = self.field_indexes.entry(field_id).or_default();
+        if !entry.iter().any(|n| n == index_name) {
+            entry.push(index_name.to_string());
         }
-        Ok(())
     }
 
-    fn dispatch_rewrite(
-        &mut self,
-        context: &mut IndexOpContext<'_>,
+    /// For a given field and new data, returns a list of plans for all active indexes.
+    /// The plans contain the raw bytes and metadata for the new index segments.
+    pub fn plan_append_for_field(
+        &self,
         field_id: LogicalFieldId,
-        rewritten_chunks: &[(ChunkMetadata, ArrayRef)],
-    ) -> Result<()> {
+        data_for_chunk: &ArrayRef,
+        rids_for_chunk: &ArrayRef,
+    ) -> Result<Vec<(&str, IndexPlan)>> {
+        let mut plans = Vec::new();
         if let Some(active_indexes) = self.field_indexes.get(&field_id) {
             for index_name in active_indexes {
-                if let Some(index) = self.indexes.get_mut(index_name) {
-                    index.on_rewrite(context, field_id, rewritten_chunks)?;
+                if let Some(index) = self.indexes.get(index_name.as_str()) {
+                    if let Some(plan) = index.plan_append(data_for_chunk, rids_for_chunk)? {
+                        plans.push((index.name(), plan));
+                    }
                 }
             }
         }
-        Ok(())
+        Ok(plans)
     }
 
-    fn dispatch_compact(
-        &mut self,
-        context: &mut IndexOpContext<'_>,
+    /// Dispatches a backfill operation to a specific index implementation.
+    pub fn backfill_index(
+        &self,
+        context: &mut BackfillContext<'_>,
         field_id: LogicalFieldId,
-        new_metas: &[ChunkMetadata],
+        index_name: &str,
     ) -> Result<()> {
-        if let Some(active_indexes) = self.field_indexes.get(&field_id) {
-            for index_name in active_indexes {
-                if let Some(index) = self.indexes.get_mut(index_name) {
-                    index.on_compact(context, field_id, new_metas)?;
-                }
-            }
+        if let Some(index) = self.indexes.get(index_name) {
+            index.backfill(context, field_id)
+        } else {
+            Err(Error::InvalidArgumentError(format!(
+                "Index '{}' not registered",
+                index_name
+            )))
         }
-        Ok(())
+    }
+
+    pub fn registered_indexes(&self) -> impl Iterator<Item = &Box<dyn Index>> {
+        self.indexes.values()
     }
 }

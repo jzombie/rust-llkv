@@ -7,12 +7,12 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::{BatchGet, GetResult, MemPager, Pager};
 use llkv_column_map::store::ColumnStore;
+use llkv_column_map::store::catalog::ColumnCatalog;
+use llkv_column_map::store::descriptor::{ColumnDescriptor, DescriptorIterator};
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
-use llkv_column_map::store::descriptor::{ColumnDescriptor, DescriptorIterator};
-use llkv_column_map::store::catalog::ColumnCatalog;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 fn fid(id: u32) -> LogicalFieldId {
@@ -122,7 +122,7 @@ fn indices_persist_after_drop_and_reopen() {
 
         // Verify persisted indexes using the high-level API (no low-level digging).
         let idx = store.list_persisted_indexes(target_fid).unwrap();
-        assert!(idx.iter().any(|&n| n == "presence"));
-        assert!(idx.iter().any(|&n| n == "sort"));
+        assert!(idx.iter().any(|n| n == "presence"));
+        assert!(idx.iter().any(|n| n == "sort"));
     }
 }

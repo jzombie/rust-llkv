@@ -5,7 +5,6 @@ use modular_bitfield::prelude::*;
 /// Opaque 64-bit address in the pager namespace.
 /// Treated as an opaque handle by higher layers.
 pub type PhysicalKey = u64;
-
 /// Defines the category of data a `LogicalFieldId` refers to.
 /// This enum uses 3 bits, allowing for up to 8 distinct namespaces.
 #[derive(Specifier, Debug, PartialEq, Eq, Clone, Copy)]
@@ -37,5 +36,6 @@ pub struct LogicalFieldId {
     pub namespace: Namespace,
 }
 
-// Well-known key for the root ColumnCatalog.
+// Well-known keys for root objects.
 pub(crate) const CATALOG_ROOT_PKEY: PhysicalKey = 0;
+pub(crate) const CONFIG_ROOT_PKEY: PhysicalKey = 1;

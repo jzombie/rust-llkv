@@ -1,6 +1,5 @@
 //! Streamable, paged metadata for a single column.
 //!
-//!
 //! This module avoids deserialization by defining fixed-layout structs that
 //! can be interpreted directly from byte buffers provided by the pager.
 use crate::codecs::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
@@ -156,14 +155,14 @@ impl DescriptorPageHeader {
 
 /// An iterator that streams `ChunkMetadata` by walking the descriptor page
 /// chain. It only holds one page blob in memory at a time.
-pub struct DescriptorIterator<'a, P: Pager> {
+pub struct DescriptorIterator<'a, P: Pager + ?Sized> {
     pager: &'a P,
     current_page_pk: PhysicalKey,
-    current_blob: Option<P::Blob>,
+    current_blob: Option<<P as Pager>::Blob>,
     cursor_in_page: usize,
 }
 
-impl<'a, P: Pager> DescriptorIterator<'a, P> {
+impl<'a, P: Pager + ?Sized> DescriptorIterator<'a, P> {
     pub fn new(pager: &'a P, head_page_pk: PhysicalKey) -> Self {
         Self {
             pager,
@@ -174,7 +173,7 @@ impl<'a, P: Pager> DescriptorIterator<'a, P> {
     }
 }
 
-impl<'a, P: Pager> Iterator for DescriptorIterator<'a, P> {
+impl<'a, P: Pager + ?Sized> Iterator for DescriptorIterator<'a, P> {
     type Item = Result<ChunkMetadata>;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
