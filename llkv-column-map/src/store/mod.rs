@@ -343,6 +343,11 @@ where
         })
     }
 
+    /// Registers an index for a given column.
+    pub fn register_index(&self, field_id: LogicalFieldId, index_name: &str) -> Result<()> {
+        self.index_manager.register_index(field_id, index_name)
+    }
+
     /// Unregisters a persisted index from a given column.
     pub fn unregister_index(&self, field_id: LogicalFieldId, index_name: &str) -> Result<()> {
         self.index_manager.unregister_index(field_id, index_name)
@@ -635,6 +640,7 @@ where
             let (mut rid_descriptor, mut rid_tail_page) =
                 self.load_descriptor_state(rid_descriptor_pk, rid_fid)?;
 
+            // TODO: Remove?
             // Persist/refresh dtype fingerprint for both data and row-id descriptors.
             // let fp_data = DTypeCache::<P>::dtype_fingerprint(field.data_type());
             // DTypeCache::<P>::set_desc_dtype_fingerprint(&mut data_descriptor, fp_data);
@@ -1816,6 +1822,7 @@ where
         Ok(())
     }
 
+    // TODO: Move to `descriptor` and separate between `data` and `rid` states?
     /// (Internal) Loads the full state for a descriptor, creating it if it
     /// doesn't exist.
     fn load_descriptor_state(

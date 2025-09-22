@@ -63,9 +63,13 @@ impl<P: Pager> IndexManager<P> {
     /// Registers an index for a given column.
     pub fn register_index(&self, field_id: LogicalFieldId, index_name: &str) -> Result<()> {
         self.update_indexes(field_id, |indexes| {
-            if !indexes.contains(&index_name.to_string()) {
-                indexes.push(index_name.to_string());
+            if indexes.contains(&index_name.to_string()) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "Index '{}' already exists for this column.",
+                    index_name
+                )));
             }
+            indexes.push(index_name.to_string());
             Ok(())
         })
     }
@@ -73,7 +77,14 @@ impl<P: Pager> IndexManager<P> {
     /// Unregisters an index from a given column.
     pub fn unregister_index(&self, field_id: LogicalFieldId, index_name: &str) -> Result<()> {
         self.update_indexes(field_id, |indexes| {
+            let original_len = indexes.len();
             indexes.retain(|name| name != index_name);
+            if indexes.len() == original_len {
+                return Err(Error::InvalidArgumentError(format!(
+                    "Index '{}' not found for this column.",
+                    index_name
+                )));
+            }
             Ok(())
         })
     }
