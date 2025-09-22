@@ -67,7 +67,7 @@ fn unsorted_scan_works_without_index_u64() {
                 sorted: false,
                 reverse: false,
                 with_row_ids: false,
-                
+
                 limit: None,
                 offset: 0,
                 include_nulls: false,
@@ -115,7 +115,6 @@ fn unsorted_with_row_ids_works_without_index() {
 
     let cnt = std::cell::Cell::new(0usize);
     let mut v = Count { cnt: &cnt };
-    let rid_fid = fid.with_namespace(Namespace::RowIdShadow);
     store
         .scan(
             fid,
@@ -123,7 +122,7 @@ fn unsorted_with_row_ids_works_without_index() {
                 sorted: false,
                 reverse: false,
                 with_row_ids: true,
-                
+
                 limit: None,
                 offset: 0,
                 include_nulls: false,
@@ -167,7 +166,7 @@ fn sorted_scan_without_index_returns_error() {
             sorted: true,
             reverse: false,
             with_row_ids: false,
-            
+
             limit: None,
             offset: 0,
             include_nulls: false,

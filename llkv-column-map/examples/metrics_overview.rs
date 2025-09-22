@@ -57,7 +57,7 @@ fn build_var_binary(
             .rotate_left(13);
         let len = (min as u64 + (mix % span)) as usize;
         let byte = (((i as u64).wrapping_add(fid_u64)) & 0xFF) as u8;
-        b.append_value(&vec![byte; len]);
+        b.append_value(vec![byte; len]);
     }
     (field_id, Arc::new(b.finish()) as ArrayRef)
 }

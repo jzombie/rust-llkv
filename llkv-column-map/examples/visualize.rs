@@ -86,7 +86,7 @@ fn build_put_for_col2(start: usize, end: usize) -> Option<(LogicalFieldId, Array
     let mut b = BinaryBuilder::new();
     for i in s..e {
         let len = i % 21 + 1; // 1..21
-        b.append_value(&vec![b'A' + (i % 26) as u8; len]);
+        b.append_value(vec![b'A' + (i % 26) as u8; len]);
     }
     Some((fid(2), Arc::new(b.finish()) as ArrayRef))
 }
@@ -109,7 +109,7 @@ fn batch_from_pairs(pairs: &[(LogicalFieldId, ArrayRef)]) -> RecordBatch {
         .map(|(i, (fid, arr))| {
             let mut md = std::collections::HashMap::new();
             md.insert("field_id".to_string(), u64::from(*fid).to_string());
-            Field::new(&format!("c{}", i), arr.data_type().clone(), false).with_metadata(md)
+            Field::new(format!("c{i}"), arr.data_type().clone(), false).with_metadata(md)
         })
         .collect();
 
