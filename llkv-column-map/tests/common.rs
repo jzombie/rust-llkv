@@ -64,7 +64,7 @@ pub fn assert_matches_golden(content: &str, rel_path: &str) {
         .unwrap()
         .read_to_string(&mut existing)
         .unwrap();
-    if existing != content {
+    if LineEnding::normalize(&existing) != LineEnding::normalize(content) {
         panic!("snapshot mismatch: {}", path.display());
     }
 }
