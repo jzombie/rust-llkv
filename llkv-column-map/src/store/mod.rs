@@ -403,11 +403,10 @@ where
         }
         Ok(false)
     }
-    pub fn open(pager: Arc<P>) -> Result<Self> {
-        Self::open_with_config(pager, ColumnStoreConfig::default())
-    }
 
-    pub fn open_with_config(pager: Arc<P>, cfg: ColumnStoreConfig) -> Result<Self> {
+    pub fn open(pager: Arc<P>) -> Result<Self> {
+        let cfg = ColumnStoreConfig::default();
+
         let catalog = match pager
             .batch_get(&[BatchGet::Raw {
                 key: CATALOG_ROOT_PKEY,
@@ -669,17 +668,27 @@ where
                     } else {
                         last = v;
                     }
-                    if v < min { min = v; }
-                    if v > max { max = v; }
+                    if v < min {
+                        min = v;
+                    }
+                    if v > max {
+                        max = v;
+                    }
                 }
                 let mut rid_perm_pk = 0u64;
                 if !sorted {
                     // Build presence index (perm over row_ids)
-                    let sort_col = SortColumn { values: rid_any, options: None };
+                    let sort_col = SortColumn {
+                        values: rid_any,
+                        options: None,
+                    };
                     let rid_idx = lexsort_to_indices(&[sort_col], None)?;
                     let perm_bytes = serialize_array(&rid_idx)?;
                     rid_perm_pk = self.pager.alloc_many(1)?[0];
-                    puts_appends.push(BatchPut::Raw { key: rid_perm_pk, bytes: perm_bytes });
+                    puts_appends.push(BatchPut::Raw {
+                        key: rid_perm_pk,
+                        bytes: perm_bytes,
+                    });
                 }
                 let rid_meta = ChunkMetadata {
                     chunk_pk: rid_pk,
@@ -954,9 +963,19 @@ where
                 let mut last = 0u64;
                 for j in 0..r.len() {
                     let v = r.value(j);
-                    if j == 0 { last = v; } else if v < last { sorted = false; } else { last = v; }
-                    if v < min { min = v; }
-                    if v > max { max = v; }
+                    if j == 0 {
+                        last = v;
+                    } else if v < last {
+                        sorted = false;
+                    } else {
+                        last = v;
+                    }
+                    if v < min {
+                        min = v;
+                    }
+                    if v > max {
+                        max = v;
+                    }
                 }
                 metas_rid[i].min_val_u64 = if metas_rid[i].row_count > 0 { min } else { 0 };
                 metas_rid[i].max_val_u64 = if metas_rid[i].row_count > 0 { max } else { 0 };
@@ -964,17 +983,27 @@ where
                     // Free old perm if it existed and we no longer need it
                     let old = metas_rid[i].value_order_perm_pk;
                     metas_rid[i].value_order_perm_pk = 0;
-                    if old != 0 { self.pager.free_many(&[old])?; }
+                    if old != 0 {
+                        self.pager.free_many(&[old])?;
+                    }
                 } else {
-                    let sort_col = SortColumn { values: make_array(rid_any.to_data()), options: None };
+                    let sort_col = SortColumn {
+                        values: make_array(rid_any.to_data()),
+                        options: None,
+                    };
                     let idx = lexsort_to_indices(&[sort_col], None)?;
                     let perm_bytes = serialize_array(&idx)?;
                     let perm_pk = self.pager.alloc_many(1)?[0];
-                    puts.push(BatchPut::Raw { key: perm_pk, bytes: perm_bytes });
+                    puts.push(BatchPut::Raw {
+                        key: perm_pk,
+                        bytes: perm_bytes,
+                    });
                     // Free old and install new
                     let old = metas_rid[i].value_order_perm_pk;
                     metas_rid[i].value_order_perm_pk = perm_pk;
-                    if old != 0 { self.pager.free_many(&[old])?; }
+                    if old != 0 {
+                        self.pager.free_many(&[old])?;
+                    }
                 }
             }
 
@@ -1536,17 +1565,33 @@ where
                 let mut last_v = 0u64;
                 for ii in 0..rids.len() {
                     let v = rids.value(ii);
-                    if ii == 0 { last_v = v; } else if v < last_v { sorted_rids = false; } else { last_v = v; }
-                    if v < min { min = v; }
-                    if v > max { max = v; }
+                    if ii == 0 {
+                        last_v = v;
+                    } else if v < last_v {
+                        sorted_rids = false;
+                    } else {
+                        last_v = v;
+                    }
+                    if v < min {
+                        min = v;
+                    }
+                    if v > max {
+                        max = v;
+                    }
                 }
                 let mut rid_perm_pk = 0u64;
                 if !sorted_rids {
-                    let rid_sort_col = SortColumn { values: rid_any, options: None };
+                    let rid_sort_col = SortColumn {
+                        values: rid_any,
+                        options: None,
+                    };
                     let rid_idx = lexsort_to_indices(&[rid_sort_col], None)?;
                     let rid_perm_bytes = serialize_array(&rid_idx)?;
                     rid_perm_pk = self.pager.alloc_many(1)?[0];
-                    puts.push(BatchPut::Raw { key: rid_perm_pk, bytes: rid_perm_bytes });
+                    puts.push(BatchPut::Raw {
+                        key: rid_perm_pk,
+                        bytes: rid_perm_bytes,
+                    });
                 }
                 let rid_meta = ChunkMetadata {
                     chunk_pk: rid_pk,
