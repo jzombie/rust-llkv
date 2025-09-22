@@ -18,7 +18,7 @@ simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
 thiserror = "2.0.16"
 
 [dev-dependencies]
-criterion.workspace = true
+criterion = { version = "3.0.5", package = "codspeed-criterion-compat" }
 line-ending.workspace = true
 rand.workspace = true
 
