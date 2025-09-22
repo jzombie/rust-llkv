@@ -136,8 +136,8 @@ fn build_batch_for_range(
                 let fid_u64 = u64::from(fid_user(fid));
                 for r in start as u64..end as u64 {
                     let len = var_len_for(r, fid_u64, 5, 25);
-                    let byte = (((r as u64).wrapping_add(fid_u64)) & 0xFF) as u8;
-                    b.append_value(&vec![byte; len]);
+                    let byte = (((r).wrapping_add(fid_u64)) & 0xFF) as u8;
+                    b.append_value(vec![byte; len]);
                 }
                 arrays.push(Arc::new(b.finish()));
             }
@@ -165,7 +165,7 @@ fn bench_ingest_mixed_columns(c: &mut Criterion) {
                     let pager = Arc::new(MemPager::new());
                     let store = ColumnStore::open(pager).unwrap();
 
-                    let rows_per = (N_ROWS + batches - 1) / batches;
+                    let rows_per = N_ROWS.div_ceil(batches);
                     let mut off = 0usize;
                     while off < N_ROWS {
                         let end = (off + rows_per).min(N_ROWS);

@@ -136,7 +136,7 @@ fn count_hits_multiset_scan(
                 sorted: false,
                 reverse: false,
                 with_row_ids: false,
-                
+
                 limit: None,
                 offset: 0,
                 include_nulls: false,
@@ -197,7 +197,7 @@ fn count_hits_stream_join(store: &ColumnStore<MemPager>, fid: LogicalFieldId, qs
                 sorted: true,
                 reverse: false,
                 with_row_ids: false,
-                
+
                 limit: None,
                 offset: 0,
                 include_nulls: false,
@@ -220,7 +220,7 @@ fn bench_random_probe(c: &mut Criterion) {
 
     g.bench_function("scan_unsorted_multiset", |b| {
         b.iter_batched(
-            || seed_store_1m(),
+            seed_store_1m,
             |(store, fid)| {
                 let hits = count_hits_multiset_scan(&store, fid, &queries);
                 assert_eq!(hits, expected);
@@ -232,7 +232,7 @@ fn bench_random_probe(c: &mut Criterion) {
 
     g.bench_function("scan_sorted_stream_join", |b| {
         b.iter_batched(
-            || seed_store_1m(),
+            seed_store_1m,
             |(store, fid)| {
                 let hits = count_hits_stream_join(&store, fid, &queries);
                 assert_eq!(hits, expected);

@@ -39,9 +39,10 @@ fn rowid_fid(fid: LogicalFieldId) -> LogicalFieldId {
 /// Target byte size for descriptor pages. The pager may be mmapped, so page
 /// alignment helps. Used to avoid overgrowing tail pages.
 const TARGET_DESCRIPTOR_PAGE_BYTES: usize = 4096;
+
 /// Target size for data chunks coalesced by the bounded compactor and used
 /// on the ingest path when slicing big appends into multiple chunks.
-const TARGET_CHUNK_BYTES: usize = 1 * 1024 * 1024; // ~1 MiB
+const TARGET_CHUNK_BYTES: usize = 1024 * 1024; // ~1 MiB
 
 /// Merge only chunks smaller than this threshold.
 const MIN_CHUNK_BYTES: usize = TARGET_CHUNK_BYTES / 2; // ~512 KiB
@@ -200,7 +201,7 @@ fn split_to_target_bytes(
     }
     if let Some(bpv) = fixed_width_bpv(arr.data_type()) {
         let rows_per = (target_bytes / bpv).max(1);
-        let mut out = Vec::with_capacity((n + rows_per - 1) / rows_per);
+        let mut out = Vec::with_capacity(n.div_ceil(rows_per));
         let mut off = 0usize;
         while off < n {
             let take = (n - off).min(rows_per);
@@ -234,7 +235,7 @@ fn split_to_target_bytes(
         // conservative row cap.
         _ => {
             let rows_per = varwidth_fallback_rows_per_slice; // configurable
-            let mut out = Vec::with_capacity((n + rows_per - 1) / rows_per);
+            let mut out = Vec::with_capacity(n.div_ceil(rows_per));
             let mut off = 0usize;
             while off < n {
                 let take = (n - off).min(rows_per);
@@ -293,7 +294,7 @@ fn apply_edit_to_arrays(
     if let Some(ref inj) = edit.inject_data {
         out_data = concat_many(vec![&out_data, inj])?;
     }
-    if let (Some(ref inj_r), Some(ref r)) = (edit.inject_rids.as_ref(), out_rids.as_ref()) {
+    if let (Some(inj_r), Some(r)) = (edit.inject_rids.as_ref(), out_rids.as_ref()) {
         out_rids = Some(concat_many(vec![r, inj_r])?);
     }
 
@@ -358,10 +359,10 @@ where
             if meta.row_count == 0 {
                 continue;
             }
-            if meta.min_val_u64 != 0 || meta.max_val_u64 != 0 {
-                if row_id < meta.min_val_u64 || row_id > meta.max_val_u64 {
-                    continue;
-                }
+            if (meta.min_val_u64 != 0 || meta.max_val_u64 != 0) && row_id < meta.min_val_u64
+                || row_id > meta.max_val_u64
+            {
+                continue;
             }
             // Fetch rid chunk and, if present, the presence perm
             let mut gets = vec![BatchGet::Raw { key: meta.chunk_pk }];
@@ -584,7 +585,7 @@ where
                 let r = compute::filter(&append_row_id_any, &keep)?;
                 (a, r)
             };
-            if array_clean.len() == 0 {
+            if array_clean.is_empty() {
                 continue;
             }
 
@@ -603,10 +604,10 @@ where
                 self.load_descriptor_state(rid_descriptor_pk, rid_fid)?;
 
             // Persist/refresh dtype fingerprint for both data and row-id descriptors.
-            let fp_data = DTypeCache::<P>::dtype_fingerprint(field.data_type());
-            DTypeCache::<P>::set_desc_dtype_fingerprint(&mut data_descriptor, fp_data);
-            let fp_rid = DTypeCache::<P>::dtype_fingerprint(&DataType::UInt64);
-            DTypeCache::<P>::set_desc_dtype_fingerprint(&mut rid_descriptor, fp_rid);
+            // let fp_data = DTypeCache::<P>::dtype_fingerprint(field.data_type());
+            // DTypeCache::<P>::set_desc_dtype_fingerprint(&mut data_descriptor, fp_data);
+            // let fp_rid = DTypeCache::<P>::dtype_fingerprint(&DataType::UInt64);
+            // DTypeCache::<P>::set_desc_dtype_fingerprint(&mut rid_descriptor, fp_rid);
 
             // Slice and append.
             let slices = split_to_target_bytes(
@@ -818,9 +819,9 @@ where
         if n > 0 {
             // Batch fetch only rid chunks to locate hits.
             let mut gets_rid = Vec::with_capacity(n);
-            for i in 0..n {
+            for meta_rid in metas_rid.iter().take(n) {
                 gets_rid.push(BatchGet::Raw {
-                    key: metas_rid[i].chunk_pk,
+                    key: meta_rid.chunk_pk,
                 });
             }
             let rid_results = self.pager.batch_get(&gets_rid)?;
@@ -831,8 +832,8 @@ where
                 }
             }
 
-            for i in 0..n {
-                if let Some(rid_blob) = rid_blobs.get(&metas_rid[i].chunk_pk) {
+            for (i, meta_rid) in metas_rid.iter().enumerate().take(n) {
+                if let Some(rid_blob) = rid_blobs.get(&meta_rid.chunk_pk) {
                     let rid_arr = deserialize_array(rid_blob.clone())?;
                     let rid_arr = rid_arr
                         .as_any()
@@ -954,7 +955,7 @@ where
                 metas_rid[i].row_count = rids.len() as u64;
                 metas_rid[i].serialized_bytes = rids.get_array_memory_size() as u64;
                 // Refresh presence index (perm) and min/max for rid chunk
-                let rid_any: ArrayRef = rids.into();
+                let rid_any: ArrayRef = rids;
                 let r = rid_any
                     .as_any()
                     .downcast_ref::<UInt64Array>()
@@ -1145,14 +1146,14 @@ where
         // Optional: corresponding shadow row_id descriptor + metas.
         let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
         let mut descriptor_rid: Option<ColumnDescriptor> = None;
-        if let Some(pk) = desc_pk_rid {
-            if let Some(desc_blob_rid) = blobs_by_pk.remove(&pk) {
-                let d_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
-                for m in DescriptorIterator::new(self.pager.as_ref(), d_rid.head_page_pk) {
-                    metas_rid.push(m?);
-                }
-                descriptor_rid = Some(d_rid);
+        if let Some(pk) = desc_pk_rid
+            && let Some(desc_blob_rid) = blobs_by_pk.remove(&pk)
+        {
+            let d_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
+            for m in DescriptorIterator::new(self.pager.as_ref(), d_rid.head_page_pk) {
+                metas_rid.push(m?);
             }
+            descriptor_rid = Some(d_rid);
         }
 
         let mut puts = Vec::new();
@@ -1166,12 +1167,12 @@ where
             while let Some(d) = cur_del {
                 if d < start_u64 {
                     // Enforce monotonicity (streaming check).
-                    if let Some(prev) = last_seen {
-                        if d < prev {
-                            return Err(Error::Internal(
-                                "rows_to_delete must be ascending/unique".into(),
-                            ));
-                        }
+                    if let Some(prev) = last_seen
+                        && d < prev
+                    {
+                        return Err(Error::Internal(
+                            "rows_to_delete must be ascending/unique".into(),
+                        ));
                     }
                     last_seen = Some(d);
                     cur_del = del_iter.next();
@@ -1318,7 +1319,7 @@ where
         let need_pages = if new_metas.is_empty() {
             0
         } else {
-            (new_metas.len() + per - 1) / per
+            new_metas.len().div_ceil(per)
         };
         // If empty: free everything and clear counters.
         if need_pages == 0 {
@@ -1504,13 +1505,7 @@ where
                 self.cfg.varwidth_fallback_rows_per_slice,
             );
             let mut rid_off = 0usize;
-            let mut need_perms = false;
-            for k in i..j {
-                if metas[k].value_order_perm_pk != 0 {
-                    need_perms = true;
-                    break;
-                }
-            }
+            let need_perms = metas[i..j].iter().any(|m| m.value_order_perm_pk != 0);
 
             for s in slices {
                 let rows = s.len();

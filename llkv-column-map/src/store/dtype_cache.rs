@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::serialization::{deserialize_array, serialize_array};
+use crate::serialization::deserialize_array;
 use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{ColumnDescriptor, DescriptorIterator};
@@ -34,6 +34,7 @@ where
 
     /// Stable FNV-1a 64-bit over the Debug representation of DataType.
     #[inline]
+    #[allow(dead_code)] // TODO: Keep?
     pub(crate) fn dtype_fingerprint(dt: &DataType) -> u64 {
         const FNV_OFFSET: u64 = 0xcbf29ce484222325;
         const FNV_PRIME: u64 = 0x100000001b3;
@@ -47,17 +48,20 @@ where
     }
 
     #[inline]
+    #[allow(dead_code)] // TODO: Keep?
     pub(crate) fn desc_dtype_fingerprint(desc: &ColumnDescriptor) -> u64 {
         ((desc._padding as u64) << 32) | (desc.data_type_code as u64)
     }
 
     #[inline]
+    #[allow(dead_code)] // TODO: Keep?
     pub(crate) fn set_desc_dtype_fingerprint(desc: &mut ColumnDescriptor, fp: u64) {
         desc.data_type_code = (fp & 0xFFFF_FFFF) as u32;
         desc._padding = ((fp >> 32) & 0xFFFF_FFFF) as u32;
     }
 
     /// Returns and caches the Arrow DataType for a given field id.
+    #[allow(dead_code)] // TODO: Keep
     pub fn dtype_for_field(&self, field_id: LogicalFieldId) -> Result<DataType> {
         // Fast path: cached
         if let Some(dt) = self.cache.read().unwrap().get(&field_id).cloned() {

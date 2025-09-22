@@ -327,15 +327,15 @@ where
         if self.done() {
             return;
         }
-        if let Some((delta, take)) = self.split_len(len) {
-            if take > 0 {
-                if self.reverse {
-                    // For reverse, take from the end of the run
-                    let adj_start = start + (len - (delta + take));
-                    self.inner.null_run(r, adj_start, take);
-                } else {
-                    self.inner.null_run(r, start + delta, take);
-                }
+        if let Some((delta, take)) = self.split_len(len)
+            && take > 0
+        {
+            if self.reverse {
+                // For reverse, take from the end of the run
+                let adj_start = start + (len - (delta + take));
+                self.inner.null_run(r, adj_start, take);
+            } else {
+                self.inner.null_run(r, start + delta, take);
             }
         }
     }

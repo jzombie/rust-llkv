@@ -88,7 +88,7 @@ impl ColumnDescriptor {
         write_u64_le(&mut buf, self.total_row_count);
         write_u64_le(&mut buf, self.total_chunk_count);
         write_u32_le(&mut buf, self.data_type_code);
-        write_u32_le(&mut buf, self._padding as u32);
+        write_u32_le(&mut buf, self._padding);
         buf
     }
 
@@ -139,7 +139,7 @@ impl DescriptorPageHeader {
         write_u64_le(&mut v, self.next_page_pk);
         write_u32_le(&mut v, self.entry_count);
         if v.len() < Self::DISK_SIZE {
-            v.extend(std::iter::repeat(0u8).take(Self::DISK_SIZE - v.len()));
+            v.extend(std::iter::repeat_n(0u8, Self::DISK_SIZE - v.len()));
         }
         let mut buf = [0u8; Self::DISK_SIZE];
         buf.copy_from_slice(&v);
@@ -199,7 +199,7 @@ impl<'a, P: Pager> Iterator for DescriptorIterator<'a, P> {
                         Some(GetResult::Missing { .. }) => return Some(Err(Error::NotFound)),
                         None => return Some(Err(Error::Internal("batch_get empty result".into()))),
                     },
-                    Err(e) => return Some(Err(e.into())),
+                    Err(e) => return Some(Err(e)),
                 }
             }
 

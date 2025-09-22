@@ -22,7 +22,7 @@ pub fn canonicalize_dot(dot: &str) -> String {
         } else {
             (None, None, 0, lines.len())
         };
-    let mut body: Vec<&str> = lines[body_start..body_end].iter().copied().collect();
+    let mut body: Vec<&str> = lines[body_start..body_end].to_vec();
     // Strip empty lines and sort for stability.
     body.retain(|l| !l.trim().is_empty());
     body.sort_unstable();

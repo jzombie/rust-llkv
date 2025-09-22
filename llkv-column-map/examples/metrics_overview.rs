@@ -69,7 +69,7 @@ fn batch_from_columns(cols: &[(LogicalFieldId, ArrayRef)]) -> RecordBatch {
         .map(|(i, (fid, arr))| {
             let mut md = std::collections::HashMap::new();
             md.insert("field_id".to_string(), u64::from(*fid).to_string());
-            Field::new(&format!("c{}", i), arr.data_type().clone(), false).with_metadata(md)
+            Field::new(format!("c{i}"), arr.data_type().clone(), false).with_metadata(md)
         })
         .collect();
 
@@ -241,7 +241,7 @@ fn print_read_report_scan(store: &ColumnStore<InstrumentedPager<MemPager>>) {
         }
         impl PrimitiveVisitor for Sample {
             fn u64_chunk(&mut self, a: &UInt64Array) {
-                if a.len() > 0 {
+                if a.is_empty() {
                     self.last_u64 = Some(a.value(a.len() - 1));
                 }
                 self.seen = (self.seen + a.len()).min(self.budget);
@@ -344,16 +344,16 @@ fn main() {
             fid(100),
             Arc::new(UInt64Array::from(vec![5u64, 7, 9])) as ArrayRef,
         );
-        let b100 = batch_from_columns(&[c100.clone()]);
+        let b100 = batch_from_columns(std::slice::from_ref(&c100));
         store.append(&b100).unwrap();
 
         let rows_999 = 10usize;
         let mut bb = BinaryBuilder::new();
         for r in 1_000..1_000 + rows_999 as u64 {
-            bb.append_value(&vec![0xAB; (r % 17 + 12) as usize]);
+            bb.append_value(vec![0xAB; (r % 17 + 12) as usize]);
         }
         let c999 = (fid(999), Arc::new(bb.finish()) as ArrayRef);
-        let b999 = batch_from_columns(&[c999.clone()]);
+        let b999 = batch_from_columns(std::slice::from_ref(&c999));
         store.append(&b999).unwrap();
 
         let summary = summarize_pairs(&[(fid(100), 3), (fid(999), rows_999)]);

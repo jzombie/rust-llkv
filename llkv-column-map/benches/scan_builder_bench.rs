@@ -84,7 +84,7 @@ fn bench_scan_builder(c: &mut Criterion) {
     // Unsorted sum u64 via builder
     g.bench_function("unsorted_sum_u64", |b| {
         b.iter_batched(
-            || seed_store_1m(),
+            seed_store_1m,
             |(store, fid_u64, _)| {
                 struct SumU64<'a> {
                     acc: &'a std::cell::Cell<u128>,
@@ -124,7 +124,7 @@ fn bench_scan_builder(c: &mut Criterion) {
     // Sorted range sum u64 via builder
     g.bench_function("sorted_range_u64", |b| {
         b.iter_batched(
-            || seed_store_1m(),
+            seed_store_1m,
             |(store, fid_u64, _)| {
                 struct SumU64<'a> {
                     acc: &'a std::cell::Cell<u128>,
@@ -167,7 +167,7 @@ fn bench_scan_builder(c: &mut Criterion) {
     // Sorted with row ids: just sum rids to exercise path
     g.bench_function("sorted_with_row_ids_u64", |b| {
         b.iter_batched(
-            || seed_store_1m(),
+            seed_store_1m,
             |(store, fid_u64, _)| {
                 struct SumRids<'a> {
                     acc: &'a std::cell::Cell<u128>,
