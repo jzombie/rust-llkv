@@ -45,7 +45,3 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets --verbose ${{ matrix.flags }} -- --include-ignored
-
-      # Added step to ensure benchmarks compile. `--no-run` is important.
-      - name: Check benchmarks compile
-        run: cargo bench --workspace --no-run ${{ matrix.flags }}
