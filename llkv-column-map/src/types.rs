@@ -1,5 +1,11 @@
 //! Core type definitions for the storage engine.
 
+// FIXME: Since upgrading to `rustc 1.90.0 (1159e78c4 2025-09-14)`, this seems
+// to be needed to workaround parenthesis errors in `LogicalFieldId`, which
+// creep up regardless of comments being added or not. This is possibly a bug
+// with Clippy or `modular_bitfield`, or a small incompatibility issue.
+#![allow(unused_parens)]
+
 use modular_bitfield::prelude::*;
 
 /// Opaque 64-bit address in the pager namespace.

@@ -127,7 +127,7 @@ fn build_batch_for_range(
             }
             ColKind::I8(fid) => {
                 let vals: Vec<i8> = (start..end)
-                    .map(|i| ((((i as u64) ^ (fid as u64)) & 0x7F) as i8))
+                    .map(|i| (((i as u64) ^ (fid as u64)) & 0x7F) as i8)
                     .collect();
                 arrays.push(Arc::new(Int8Array::from(vals)));
             }

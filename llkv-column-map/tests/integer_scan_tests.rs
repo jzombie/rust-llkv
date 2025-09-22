@@ -190,7 +190,7 @@ fn scan_all_integer_types_sorted_and_ranges() {
                     sorted: true,
                     reverse: false,
                     with_row_ids: false,
-                    
+
                     limit: None,
                     offset: 0,
                     include_nulls: false,
@@ -287,7 +287,7 @@ fn scan_all_integer_types_sorted_and_ranges() {
                     sorted: true,
                     reverse: true,
                     with_row_ids: false,
-                    
+
                     limit: None,
                     offset: 0,
                     include_nulls: false,
@@ -412,7 +412,7 @@ fn scan_all_integer_types_sorted_and_ranges() {
                     sorted: true,
                     reverse: false,
                     with_row_ids: false,
-                    
+
                     limit: None,
                     offset: 0,
                     include_nulls: false,
@@ -430,13 +430,11 @@ fn scan_all_integer_types_sorted_and_ranges() {
     // Generators per dtype
     let gen_signed = |n: usize, bits: u32| -> Vec<i128> {
         let range = 1i128 << (bits - 1);
-        (0..n)
-            .map(|i| ((i as i128 % (2 * range)) - range))
-            .collect()
+        (0..n).map(|i| i as i128 % (2 * range) - range).collect()
     };
     let gen_unsigned = |n: usize, bits: u32| -> Vec<i128> {
         let max = 1i128 << bits;
-        (0..n).map(|i| (i as i128 % max)).collect()
+        (0..n).map(|i| i as i128 % max).collect()
     };
 
     // Exercise all integer types
