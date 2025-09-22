@@ -11,6 +11,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install tools
+        # TODO: Use `cargo-binstall`? (https://github.com/cargo-bins/cargo-binstall)
         run: |
           cargo install cargo-deny
           cargo install cargo-audit
