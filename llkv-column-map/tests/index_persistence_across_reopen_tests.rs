@@ -124,6 +124,12 @@ fn indices_persist_after_drop_and_reopen() {
         let idx = store.list_persisted_indexes(target_fid).unwrap();
         assert!(idx.iter().any(|n| n == "presence"));
         assert!(idx.iter().any(|n| n == "sort"));
+
+        // TODO: Evaluate a column that has had different indexes applied
+
+        // TODO: Evaluate a column that has not had any indexes applied
+
+        // TODO: Evaluate a column that does not exist
     }
 }
 
