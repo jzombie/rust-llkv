@@ -1,3 +1,4 @@
+use line_ending::LineEnding;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -29,15 +30,15 @@ pub fn canonicalize_dot(dot: &str) -> String {
     let mut out = String::new();
     if let Some(h) = head {
         out.push_str(h);
-        out.push('\n');
+        out.push_str(LineEnding::from_current_platform().as_str());
     }
     for l in body {
         out.push_str(l);
-        out.push('\n');
+        out.push_str(LineEnding::from_current_platform().as_str());
     }
     if let Some(t) = tail {
         out.push_str(t);
-        out.push('\n');
+        out.push_str(LineEnding::from_current_platform().as_str());
     }
     out
 }

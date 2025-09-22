@@ -19,6 +19,7 @@ thiserror = "2.0.16"
 
 [dev-dependencies]
 criterion.workspace = true
+line-ending.workspace = true
 rand.workspace = true
 
 [[bench]]
