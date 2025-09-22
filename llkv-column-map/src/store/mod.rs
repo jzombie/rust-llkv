@@ -30,7 +30,8 @@ pub use scan::*;
 mod dtype_cache;
 use dtype_cache::DTypeCache;
 
-mod indexing;
+pub mod indexing;
+pub use indexing::*;
 
 const DESCRIPTOR_ENTRIES_PER_PAGE: usize = 256;
 
@@ -309,6 +310,7 @@ pub struct ColumnStore<P: Pager> {
     catalog: Arc<RwLock<ColumnCatalog>>,
     cfg: ColumnStoreConfig,
     dtype_cache: DTypeCache<P>,
+    index_manager: IndexManager<P>,
 }
 
 impl<P> ColumnStore<P>
@@ -330,12 +332,20 @@ where
 
         let arc_catalog = Arc::new(RwLock::new(catalog));
 
+        let index_manager = IndexManager::new(Arc::clone(&pager), Arc::clone(&arc_catalog)); // Add this line
+
         Ok(Self {
             pager: Arc::clone(&pager),
             catalog: Arc::clone(&arc_catalog),
             cfg,
             dtype_cache: DTypeCache::new(Arc::clone(&pager), Arc::clone(&arc_catalog)),
+            index_manager,
         })
+    }
+
+    /// Unregisters a persisted index from a given column.
+    pub fn unregister_index(&self, field_id: LogicalFieldId, index_name: &str) -> Result<()> {
+        self.index_manager.unregister_index(field_id, index_name)
     }
 
     /// Lists the names of all persisted indexes for a given column.

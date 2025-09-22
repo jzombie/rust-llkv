@@ -133,4 +133,55 @@ fn indices_persist_after_drop_and_reopen() {
     }
 }
 
-// TODO: Add test to ensure index can be removed from a column, and changes are persisted
+#[test]
+fn index_can_be_removed_and_persists() {
+    let pager = Arc::new(MemPager::new());
+    let target_fid = fid(50);
+
+    // Scope 1: Create store, seed data, create an index, then remove it.
+    {
+        let store = ColumnStore::open(pager.clone()).unwrap();
+
+        // Seed some data for the target column
+        let mut md_t = HashMap::new();
+        md_t.insert("field_id".to_string(), u64::from(target_fid).to_string());
+        let schema_t = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new("data", DataType::UInt64, false).with_metadata(md_t),
+        ]));
+        let t_r: Vec<u64> = (0..50).collect();
+        let b_target = RecordBatch::try_new(
+            schema_t,
+            vec![
+                Arc::new(UInt64Array::from(t_r.clone())),
+                Arc::new(UInt64Array::from(t_r)),
+            ],
+        )
+        .unwrap();
+        store.append(&b_target).unwrap();
+
+        // 1. Create the sort index and verify it's there.
+        store.create_sort_index(target_fid).unwrap();
+        let idx_before = store.list_persisted_indexes(target_fid).unwrap();
+        assert!(idx_before.contains(&"sort".to_string()));
+        assert!(idx_before.contains(&"presence".to_string()));
+
+        // 2. Unregister the sort index.
+        store.unregister_index(target_fid, "sort").unwrap();
+
+        // 3. Verify it's gone within the same session.
+        let idx_after = store.list_persisted_indexes(target_fid).unwrap();
+        assert!(!idx_after.contains(&"sort".to_string()));
+        assert!(idx_after.contains(&"presence".to_string())); // Presence should remain
+    }
+
+    // Scope 2: Reopen the store and verify the removal persisted.
+    {
+        let store = ColumnStore::open(pager.clone()).unwrap();
+
+        // 4. Verify the index is still gone after reopening.
+        let idx_reopened = store.list_persisted_indexes(target_fid).unwrap();
+        assert!(!idx_reopened.contains(&"sort".to_string()));
+        assert!(idx_reopened.contains(&"presence".to_string()));
+    }
+}
