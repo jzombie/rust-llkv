@@ -6,6 +6,7 @@
 use crate::codecs::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use crate::error::{Error, Result};
 use crate::storage::pager::{BatchGet, GetResult, Pager};
+use crate::store::indexing::IndexKind;
 use crate::types::{LogicalFieldId, PhysicalKey};
 use std::mem;
 use std::sync::Arc;
@@ -180,9 +181,9 @@ impl ColumnDescriptor {
         }
     }
 
-    /// Deserializes index names from metadata using a custom format.
-    /// Format: \[num_indexes: u32_le\] \[\[len1: u32_le\] \[string1_bytes\]\]...
-    pub(crate) fn get_indexes(&self) -> Result<Vec<String>> {
+    /// Deserializes index kinds from metadata using a simple byte format.
+    /// Format: [num_indexes: u32_le] [kind1: u8] [kind2: u8]...
+    pub(crate) fn get_indexes(&self) -> Result<Vec<IndexKind>> {
         if self.index_metadata.is_empty() {
             return Ok(Vec::new());
         }
@@ -192,35 +193,29 @@ impl ColumnDescriptor {
             return Err(Error::Internal("Invalid index metadata: too short".into()));
         }
         let num_indexes = read_u32_le(data, &mut o) as usize;
+        let expected_len = 4 + num_indexes;
+        if data.len() < expected_len {
+            return Err(Error::Internal(
+                "Invalid index metadata: unexpected eof".into(),
+            ));
+        }
+
         let mut indexes = Vec::with_capacity(num_indexes);
         for _ in 0..num_indexes {
-            if data.len() < o + 4 {
-                return Err(Error::Internal(
-                    "Invalid index metadata: unexpected eof".into(),
-                ));
-            }
-            let len = read_u32_le(data, &mut o) as usize;
-            if data.len() < o + len {
-                return Err(Error::Internal(
-                    "Invalid index metadata: string data truncated".into(),
-                ));
-            }
-            let s = std::str::from_utf8(&data[o..o + len])
-                .map_err(|e| Error::Internal(format!("Invalid UTF-8 in index name: {}", e)))?
-                .to_string();
-            indexes.push(s);
-            o += len;
+            let kind_u8 = data[o];
+            indexes.push(IndexKind::try_from(kind_u8)?);
+            o += 1;
         }
         Ok(indexes)
     }
 
-    /// Serializes and sets index names to metadata using a custom format.
-    pub(crate) fn set_indexes(&mut self, indexes: &[String]) -> Result<()> {
-        let mut buf = Vec::new();
+    /// Serializes and sets index kinds to metadata.
+    pub(crate) fn set_indexes(&mut self, indexes: &[IndexKind]) -> Result<()> {
+        // Allocate enough space for the count (u32) and one byte per kind.
+        let mut buf = Vec::with_capacity(4 + indexes.len());
         write_u32_le(&mut buf, indexes.len() as u32);
         for index in indexes {
-            write_u32_le(&mut buf, index.len() as u32);
-            buf.extend_from_slice(index.as_bytes());
+            buf.push(u8::from(*index));
         }
         self.index_metadata = buf;
         Ok(())

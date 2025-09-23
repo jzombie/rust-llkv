@@ -17,8 +17,8 @@ pub mod sort;
 
 /// Marker trait carried by concrete index types.
 pub trait Index {
-    /// Stable name of the index (e.g., "sort", "presence").
-    fn name(&self) -> &'static str;
+    /// Stable kind of the index (e.g., `IndexKind::Sort`, `IndexKind::Presence`).
+    fn kind(&self) -> IndexKind;
 }
 
 /* ========== Manager: register / unregister / list (generic Pager) ====== */
@@ -36,28 +36,28 @@ impl<P: Pager> IndexManager<P> {
     }
 
     /// Registers an index name for a given column.
-    pub fn register_index(&self, field_id: LogicalFieldId, index_name: &str) -> Result<()> {
+    pub fn register_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
         self.update_indexes(field_id, |indexes| {
-            if indexes.contains(&index_name.to_string()) {
+            if indexes.contains(&kind) {
                 return Err(Error::InvalidArgumentError(format!(
-                    "Index '{}' already exists for this column.",
-                    index_name
+                    "Index '{:?}' already exists for this column.",
+                    kind
                 )));
             }
-            indexes.push(index_name.to_string());
+            indexes.push(kind);
             Ok(())
         })
     }
 
     /// Unregisters an index name from a given column.
-    pub fn unregister_index(&self, field_id: LogicalFieldId, index_name: &str) -> Result<()> {
+    pub fn unregister_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
         self.update_indexes(field_id, |indexes| {
             let original_len = indexes.len();
-            indexes.retain(|name| name != index_name);
+            indexes.retain(|loc_kind| *loc_kind != kind);
             if indexes.len() == original_len {
                 return Err(Error::InvalidArgumentError(format!(
-                    "Index '{}' not found for this column.",
-                    index_name
+                    "Index '{:?}' not found for this column.",
+                    kind
                 )));
             }
             Ok(())
@@ -68,7 +68,7 @@ impl<P: Pager> IndexManager<P> {
     pub fn get_column_indexes(
         &self,
         field_ids: &[LogicalFieldId],
-    ) -> Result<FxHashMap<LogicalFieldId, Vec<String>>> {
+    ) -> Result<FxHashMap<LogicalFieldId, Vec<IndexKind>>> {
         let catalog = self.catalog.read().unwrap();
         let mut gets = Vec::new();
         let mut pk_to_fid = FxHashMap::default();
@@ -102,7 +102,7 @@ impl<P: Pager> IndexManager<P> {
     /// Helper to load, modify, and save descriptor indexes.
     fn update_indexes<F>(&self, field_id: LogicalFieldId, mut modifier: F) -> Result<()>
     where
-        F: FnMut(&mut Vec<String>) -> Result<()>,
+        F: FnMut(&mut Vec<IndexKind>) -> Result<()>,
     {
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
@@ -136,6 +136,29 @@ impl<P: Pager> IndexManager<P> {
 pub enum IndexKind {
     Sort,
     Presence,
+}
+
+// 1. Enum -> integer (infallible)
+impl From<IndexKind> for u8 {
+    fn from(kind: IndexKind) -> Self {
+        match kind {
+            IndexKind::Presence => 0,
+            IndexKind::Sort => 1,
+        }
+    }
+}
+
+// 2. Integer -> Enum (fallible, so we use TryFrom)
+impl TryFrom<u8> for IndexKind {
+    type Error = crate::error::Error; // Error type for invalid integer
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(IndexKind::Presence),
+            1 => Ok(IndexKind::Sort),
+            _ => Err(Error::Internal("Invalid IndexKind integer!".to_string())),
+        }
+    }
 }
 
 /// Hints for incremental updates to an index.

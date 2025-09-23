@@ -6,11 +6,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
+use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 fn fid(id: u32) -> LogicalFieldId {
@@ -85,7 +85,7 @@ fn indices_persist_after_drop_and_reopen() {
         store.append(&b_target).unwrap();
 
         // Build sort index for target column.
-        store.create_sort_index(target_fid).unwrap();
+        store.register_index(target_fid, IndexKind::Sort).unwrap();
 
         // Presence index should be enabled by append: verify some membership.
         assert!(store.has_row_id(target_fid, 0).unwrap()); // present
@@ -120,8 +120,8 @@ fn indices_persist_after_drop_and_reopen() {
 
         // Verify persisted indexes using the high-level API (no low-level digging).
         let idx = store.list_persisted_indexes(target_fid).unwrap();
-        assert!(idx.iter().any(|n| n == "presence"));
-        assert!(idx.iter().any(|n| n == "sort"));
+        assert!(idx.contains(&IndexKind::Presence));
+        assert!(idx.contains(&IndexKind::Sort));
 
         // TODO: Evaluate a column that has had different indexes applied
 
@@ -159,18 +159,18 @@ fn index_can_be_removed_and_persists() {
         store.append(&b_target).unwrap();
 
         // 1. Create the sort index and verify it's there.
-        store.create_sort_index(target_fid).unwrap();
+        store.register_index(target_fid, IndexKind::Sort).unwrap();
         let idx_before = store.list_persisted_indexes(target_fid).unwrap();
-        assert!(idx_before.contains(&"sort".to_string()));
-        assert!(idx_before.contains(&"presence".to_string()));
+        assert!(idx_before.contains(&IndexKind::Sort));
+        assert!(idx_before.contains(&IndexKind::Presence));
 
         // 2. Unregister the sort index.
-        store.unregister_index(target_fid, "sort").unwrap();
+        store.unregister_index(target_fid, IndexKind::Sort).unwrap();
 
         // 3. Verify it's gone within the same session.
         let idx_after = store.list_persisted_indexes(target_fid).unwrap();
-        assert!(!idx_after.contains(&"sort".to_string()));
-        assert!(idx_after.contains(&"presence".to_string())); // Presence should remain
+        assert!(!idx_after.contains(&IndexKind::Sort));
+        assert!(idx_after.contains(&IndexKind::Presence)); // Presence should remain
     }
 
     // Scope 2: Reopen the store and verify the removal persisted.
@@ -179,7 +179,7 @@ fn index_can_be_removed_and_persists() {
 
         // 4. Verify the index is still gone after reopening.
         let idx_reopened = store.list_persisted_indexes(target_fid).unwrap();
-        assert!(!idx_reopened.contains(&"sort".to_string()));
-        assert!(idx_reopened.contains(&"presence".to_string()));
+        assert!(!idx_reopened.contains(&IndexKind::Sort));
+        assert!(idx_reopened.contains(&IndexKind::Presence));
     }
 }

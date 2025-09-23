@@ -1,5 +1,6 @@
 //! Sort index: type and ops live here.
 
+use super::IndexKind;
 use crate::error::{Error, Result};
 use crate::serialization::{deserialize_array, serialize_array};
 use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
@@ -25,8 +26,8 @@ impl SortIndex {
 }
 
 impl Index for SortIndex {
-    fn name(&self) -> &'static str {
-        "sort"
+    fn kind(&self) -> IndexKind {
+        IndexKind::Sort
     }
 }
 

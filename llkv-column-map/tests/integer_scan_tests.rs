@@ -10,8 +10,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::{PrimitiveSortedVisitor, ScanOptions};
+use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use rand::seq::SliceRandom;
@@ -114,7 +114,7 @@ fn scan_all_integer_types_sorted_and_ranges() {
         }
 
         // Sort index
-        store.create_sort_index(field_id).unwrap();
+        store.register_index(field_id, IndexKind::Sort).unwrap();
 
         // Validate ascending order and collect using visitor
         let asc: RefCell<Vec<i128>> = RefCell::new(Vec::with_capacity(N));

@@ -1,5 +1,6 @@
 //! Presence index: type and ops live here.
 
+use super::IndexKind;
 use crate::error::Result;
 use crate::storage::pager::Pager;
 use crate::store::catalog::ColumnCatalog;
@@ -18,8 +19,8 @@ impl PresenceIndex {
 }
 
 impl Index for PresenceIndex {
-    fn name(&self) -> &'static str {
-        "presence"
+    fn kind(&self) -> IndexKind {
+        IndexKind::Presence
     }
 }
 

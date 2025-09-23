@@ -6,11 +6,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
+use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 fn fid(id: u32) -> LogicalFieldId {
@@ -60,7 +60,7 @@ fn seed_anchor_and_target() -> (ColumnStore<MemPager>, LogicalFieldId, LogicalFi
     )
     .unwrap();
     store.append(&tb).unwrap();
-    store.create_sort_index(target_fid).unwrap();
+    store.register_index(target_fid, IndexKind::Sort).unwrap();
     (store, anchor_fid, target_fid)
 }
 

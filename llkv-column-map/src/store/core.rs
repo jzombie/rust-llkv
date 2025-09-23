@@ -55,17 +55,20 @@ where
     }
 
     /// Registers an index for a given column.
-    pub fn register_index(&self, field_id: LogicalFieldId, index_name: &str) -> Result<()> {
-        self.index_manager.register_index(field_id, index_name)
+    pub fn register_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
+        self.index_manager.build_index(kind, field_id)?;
+
+        // TODO: Auto-build when registering
+        self.index_manager.register_index(field_id, kind)
     }
 
     /// Unregisters a persisted index from a given column.
-    pub fn unregister_index(&self, field_id: LogicalFieldId, index_name: &str) -> Result<()> {
-        self.index_manager.unregister_index(field_id, index_name)
+    pub fn unregister_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
+        self.index_manager.unregister_index(field_id, kind)
     }
 
     /// Lists the names of all persisted indexes for a given column.
-    pub fn list_persisted_indexes(&self, field_id: LogicalFieldId) -> Result<Vec<String>> {
+    pub fn list_persisted_indexes(&self, field_id: LogicalFieldId) -> Result<Vec<IndexKind>> {
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
 
@@ -78,9 +81,11 @@ where
                 _ => None,
             })
             .ok_or(Error::NotFound)?;
-
         let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-        descriptor.get_indexes()
+
+        // Get the IndexKind enums and convert them to Strings for the caller.
+        let kinds = descriptor.get_indexes()?;
+        Ok(kinds)
     }
 
     /// Fast presence check using the presence index (row-id permutation) if available.
@@ -468,8 +473,8 @@ where
             // TODO: Improve
             // A column with a row_id shadow always has a presence index.
             let mut indexes = data_descriptor.get_indexes()?;
-            if !indexes.contains(&"presence".to_string()) {
-                indexes.push("presence".to_string());
+            if !indexes.contains(&IndexKind::Presence) {
+                indexes.push(IndexKind::Presence);
                 data_descriptor.set_indexes(&indexes)?;
             }
 
@@ -1339,21 +1344,6 @@ where
         if !frees.is_empty() {
             self.pager.free_many(&frees)?;
         }
-
-        Ok(())
-    }
-
-    /// Builds (or rebuilds) the sort index by delegating to the indexing
-    /// module, then registers the "sort" index name on the descriptor.
-    /// This preserves the external behavior while moving the heavy work
-    /// out of core.
-    pub fn create_sort_index(&self, field_id: LogicalFieldId) -> Result<()> {
-        // 1) Build physical index (per-chunk permutations, page rewrites).
-        self.index_manager.build_index(IndexKind::Sort, field_id)?;
-
-        // 2) Register the logical index name on the descriptor.
-        //    (Persists inside this call.)
-        self.register_index(field_id, "sort")?;
 
         Ok(())
     }
