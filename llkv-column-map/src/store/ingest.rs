@@ -1,4 +1,7 @@
 use super::*;
+use crate::error::Result;
+use arrow::array::{ArrayRef, BooleanArray};
+use arrow::compute;
 
 /// Per-chunk logical edit description used by delete and LWW upsert.
 /// - keep: optional boolean mask to filter the current rows.
