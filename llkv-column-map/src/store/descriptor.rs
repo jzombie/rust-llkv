@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 /// Fixed-size metadata for a single Arrow array chunk.
 /// This struct's memory layout IS the on-disk format.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub(crate) struct ChunkMetadata {
     pub(crate) chunk_pk: PhysicalKey,

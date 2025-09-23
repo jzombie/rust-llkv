@@ -2,134 +2,20 @@
 //! Concrete indexes live in their own files.
 
 use crate::error::{Error, Result};
-use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
-use crate::store::catalog::ColumnCatalog;
-use crate::store::descriptor::ColumnDescriptor;
-use crate::types::LogicalFieldId;
-use rustc_hash::FxHashMap;
+use crate::storage::pager::{BatchPut, Pager};
+use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor};
+use crate::types::{LogicalFieldId, PhysicalKey};
 use simd_r_drive_entry_handle::EntryHandle;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 pub mod presence;
 pub mod sort;
-
-/* ======================= Public discovery surface ====================== */
 
 /// Marker trait carried by concrete index types.
 pub trait Index {
     /// Stable kind of the index (e.g., `IndexKind::Sort`, `IndexKind::Presence`).
     fn kind(&self) -> IndexKind;
 }
-
-/* ========== Manager: register / unregister / list (generic Pager) ====== */
-
-/// Manages registration and discovery of indexes on columns.
-pub struct IndexManager<P: Pager> {
-    pub(crate) pager: Arc<P>,
-    pub(crate) catalog: Arc<RwLock<ColumnCatalog>>,
-}
-
-impl<P: Pager> IndexManager<P> {
-    /// Creates a new `IndexManager`.
-    pub fn new(pager: Arc<P>, catalog: Arc<RwLock<ColumnCatalog>>) -> Self {
-        Self { pager, catalog }
-    }
-
-    /// Registers an index name for a given column.
-    pub fn register_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
-        self.update_indexes(field_id, |indexes| {
-            if indexes.contains(&kind) {
-                return Err(Error::InvalidArgumentError(format!(
-                    "Index '{:?}' already exists for this column.",
-                    kind
-                )));
-            }
-            indexes.push(kind);
-            Ok(())
-        })
-    }
-
-    /// Unregisters an index name from a given column.
-    pub fn unregister_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
-        self.update_indexes(field_id, |indexes| {
-            let original_len = indexes.len();
-            indexes.retain(|loc_kind| *loc_kind != kind);
-            if indexes.len() == original_len {
-                return Err(Error::InvalidArgumentError(format!(
-                    "Index '{:?}' not found for this column.",
-                    kind
-                )));
-            }
-            Ok(())
-        })
-    }
-
-    /// Retrieves the names of registered indexes for the given columns.
-    pub fn get_column_indexes(
-        &self,
-        field_ids: &[LogicalFieldId],
-    ) -> Result<FxHashMap<LogicalFieldId, Vec<IndexKind>>> {
-        let catalog = self.catalog.read().unwrap();
-        let mut gets = Vec::new();
-        let mut pk_to_fid = FxHashMap::default();
-
-        for &field_id in field_ids {
-            if let Some(&pk) = catalog.map.get(&field_id) {
-                gets.push(BatchGet::Raw { key: pk });
-                pk_to_fid.insert(pk, field_id);
-            }
-        }
-
-        if gets.is_empty() {
-            return Ok(FxHashMap::default());
-        }
-
-        let results = self.pager.batch_get(&gets)?;
-        let mut all_indexes = FxHashMap::default();
-
-        for result in results {
-            if let GetResult::Raw { key, bytes } = result
-                && let Some(&field_id) = pk_to_fid.get(&key)
-            {
-                let descriptor = ColumnDescriptor::from_le_bytes(bytes.as_ref());
-                all_indexes.insert(field_id, descriptor.get_indexes()?);
-            }
-        }
-
-        Ok(all_indexes)
-    }
-
-    /// Helper to load, modify, and save descriptor indexes.
-    fn update_indexes<F>(&self, field_id: LogicalFieldId, mut modifier: F) -> Result<()>
-    where
-        F: FnMut(&mut Vec<IndexKind>) -> Result<()>,
-    {
-        let catalog = self.catalog.read().unwrap();
-        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
-
-        let desc_blob = self
-            .pager
-            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?;
-
-        let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-        let mut indexes = descriptor.get_indexes()?;
-        modifier(&mut indexes)?;
-        descriptor.set_indexes(&indexes)?;
-
-        self.pager.batch_put(&[BatchPut::Raw {
-            key: descriptor_pk,
-            bytes: descriptor.to_le_bytes(),
-        }])
-    }
-}
-
-/* ======================= Uniform execution interface =================== */
 
 /// Kinds of indexes supported by the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,7 +24,6 @@ pub enum IndexKind {
     Presence,
 }
 
-// 1. Enum -> integer (infallible)
 impl From<IndexKind> for u8 {
     fn from(kind: IndexKind) -> Self {
         match kind {
@@ -148,9 +33,8 @@ impl From<IndexKind> for u8 {
     }
 }
 
-// 2. Integer -> Enum (fallible, so we use TryFrom)
 impl TryFrom<u8> for IndexKind {
-    type Error = crate::error::Error; // Error type for invalid integer
+    type Error = crate::error::Error;
 
     fn try_from(value: u8) -> Result<Self> {
         match value {
@@ -161,83 +45,127 @@ impl TryFrom<u8> for IndexKind {
     }
 }
 
-/// Hints for incremental updates to an index.
-#[derive(Clone, Debug, Default)]
-pub struct IndexUpdateHint {
-    /// Recompute only these chunk pages. Empty => unknown/all.
-    pub changed_chunk_pks: Vec<crate::types::PhysicalKey>,
-    /// If true, builder may ignore hints and rebuild all.
-    pub full_rebuild_ok: bool,
-}
-
 /// Uniform ops each concrete index must implement.
-///
-/// These do the physical work (compute/alloc/write). They DO NOT change
-/// descriptor index-name lists; call register/unregister separately.
-pub trait IndexOps<P: Pager> {
-    fn build_all(
+pub(crate) trait IndexOps<P: Pager>: Send + Sync {
+    /// Stages the necessary updates for a brand new chunk being added during an append.
+    fn stage_update_for_new_chunk(
         &self,
         pager: &Arc<P>,
-        catalog: &Arc<RwLock<ColumnCatalog>>,
-        field: LogicalFieldId,
+        value_slice: &arrow::array::ArrayRef,
+        rid_slice: &arrow::array::ArrayRef,
+        value_meta: &mut ChunkMetadata,
+        rid_meta: &mut ChunkMetadata,
+        puts: &mut Vec<BatchPut>,
     ) -> Result<()>;
 
-    fn update(
+    /// Stages a full index build from existing data.
+    fn stage_build_all(
         &self,
         pager: &Arc<P>,
-        catalog: &Arc<RwLock<ColumnCatalog>>,
-        field: LogicalFieldId,
-        hint: &IndexUpdateHint,
-    ) -> Result<()>;
+        metas: &mut [ChunkMetadata],
+        chunk_blobs: &rustc_hash::FxHashMap<PhysicalKey, P::Blob>,
+    ) -> Result<Vec<BatchPut>>;
 
-    fn drop_index(
+    /// Stages the removal of a physical index.
+    fn stage_drop_index(
         &self,
         pager: &Arc<P>,
-        catalog: &Arc<RwLock<ColumnCatalog>>,
-        field: LogicalFieldId,
-    ) -> Result<()>;
+        metas: &mut [ChunkMetadata],
+    ) -> Result<Vec<PhysicalKey>>;
 }
 
-/* ===== Dispatcher: requires Pager blobs to be EntryHandle for sort ===== */
+/// A container for the store's index implementations.
+pub struct IndexManager<P: Pager> {
+    pub(crate) pager: Arc<P>,
+    pub(crate) presence_ops: presence::PresenceIndexOps,
+    pub(crate) sort_ops: sort::SortIndexOps,
+}
 
-impl<P> IndexManager<P>
-where
-    P: Pager<Blob = EntryHandle>,
-{
-    /// Build from scratch for a populated column.
-    pub fn build_index(&self, kind: IndexKind, field_id: LogicalFieldId) -> Result<()> {
-        match kind {
-            IndexKind::Sort => sort::SortIndexOps.build_all(&self.pager, &self.catalog, field_id),
-            IndexKind::Presence => {
-                presence::PresenceIndexOps.build_all(&self.pager, &self.catalog, field_id)
-            }
+impl<P: Pager> IndexManager<P> {
+    pub fn new(pager: Arc<P>) -> Self {
+        Self {
+            pager,
+            presence_ops: presence::PresenceIndexOps,
+            sort_ops: sort::SortIndexOps,
         }
     }
 
-    /// Incrementally update an existing index.
-    pub fn update_index(
+    /// Dispatches updates for a new data chunk to all registered indexes for that column.
+    /// Called by `append` to make index maintenance automatic.
+    #[allow(clippy::too_many_arguments)] // TODO: Refactor
+    pub(crate) fn stage_updates_for_new_chunk(
         &self,
-        kind: IndexKind,
-        field_id: LogicalFieldId,
-        hint: &IndexUpdateHint,
-    ) -> Result<()> {
-        match kind {
-            IndexKind::Sort => {
-                sort::SortIndexOps.update(&self.pager, &self.catalog, field_id, hint)
-            }
-            IndexKind::Presence => {
-                presence::PresenceIndexOps.update(&self.pager, &self.catalog, field_id, hint)
+        _field_id: LogicalFieldId,
+        descriptor: &ColumnDescriptor,
+        value_slice: &arrow::array::ArrayRef,
+        rid_slice: &arrow::array::ArrayRef,
+        value_meta: &mut ChunkMetadata,
+        rid_meta: &mut ChunkMetadata,
+        puts: &mut Vec<BatchPut>,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+    {
+        // Get the list of logically active indexes from the descriptor.
+        let active_indexes = descriptor.get_indexes()?;
+
+        for index_kind in active_indexes {
+            match index_kind {
+                IndexKind::Presence => {
+                    self.presence_ops.stage_update_for_new_chunk(
+                        &self.pager,
+                        value_slice,
+                        rid_slice,
+                        value_meta,
+                        rid_meta,
+                        puts,
+                    )?;
+                }
+                IndexKind::Sort => {
+                    self.sort_ops.stage_update_for_new_chunk(
+                        &self.pager,
+                        value_slice,
+                        rid_slice,
+                        value_meta,
+                        rid_meta,
+                        puts,
+                    )?;
+                }
             }
         }
+        Ok(())
     }
 
-    /// Remove the index and its metadata from the descriptor.
-    pub fn drop_index(&self, kind: IndexKind, field_id: LogicalFieldId) -> Result<()> {
-        match kind {
-            IndexKind::Sort => sort::SortIndexOps.drop_index(&self.pager, &self.catalog, field_id),
-            IndexKind::Presence => {
-                presence::PresenceIndexOps.drop_index(&self.pager, &self.catalog, field_id)
-            }
+    /// Prepares the logical registration of an index on an in-memory descriptor.
+    pub(crate) fn stage_index_registration(
+        &self,
+        descriptor: &mut ColumnDescriptor,
+        kind: IndexKind,
+    ) -> Result<()> {
+        let mut indexes = descriptor.get_indexes()?;
+        if !indexes.contains(&kind) {
+            indexes.push(kind);
+            descriptor.set_indexes(&indexes)?;
         }
+        Ok(())
+    }
+
+    /// Prepares the logical un-registration of an index on an in-memory descriptor.
+    pub(crate) fn stage_index_unregistration(
+        &self,
+        descriptor: &mut ColumnDescriptor,
+        kind: IndexKind,
+    ) -> Result<()> {
+        let mut indexes = descriptor.get_indexes()?;
+        let original_len = indexes.len();
+        indexes.retain(|&k| k != kind);
+        if indexes.len() == original_len {
+            return Err(Error::InvalidArgumentError(format!(
+                "Index '{:?}' not found for this column.",
+                kind
+            )));
+        }
+        descriptor.set_indexes(&indexes)?;
+        Ok(())
     }
 }

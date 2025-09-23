@@ -1,27 +1,18 @@
 //! Sort index: type and ops live here.
 
-use super::IndexKind;
+use super::{Index, IndexKind, IndexOps};
 use crate::error::{Error, Result};
 use crate::serialization::{deserialize_array, serialize_array};
-use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
-use crate::store::catalog::ColumnCatalog;
-use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
-use crate::store::indexing::{Index, IndexOps, IndexUpdateHint};
-use crate::types::{LogicalFieldId, PhysicalKey};
+use crate::storage::pager::{BatchPut, Pager};
+use crate::store::descriptor::ChunkMetadata;
+use crate::types::PhysicalKey;
 use arrow::compute::{SortColumn, lexsort_to_indices};
-use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// Public marker type for the sort index.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct SortIndex;
-
-impl SortIndex {
-    pub fn new() -> Self {
-        Self
-    }
-}
 
 impl Index for SortIndex {
     fn kind(&self) -> IndexKind {
@@ -30,71 +21,48 @@ impl Index for SortIndex {
 }
 
 /// Concrete implementation of sort index operations.
+#[derive(Default)]
 pub struct SortIndexOps;
 
-impl Default for SortIndexOps {
-    fn default() -> Self {
-        SortIndexOps
-    }
-}
-
-impl<P> IndexOps<P> for SortIndexOps
-where
-    P: Pager<Blob = EntryHandle>,
-{
-    fn build_all(
+impl<P: Pager<Blob = EntryHandle>> IndexOps<P> for SortIndexOps {
+    /// For the Sort index, this operates on the value chunk.
+    fn stage_update_for_new_chunk(
         &self,
         pager: &Arc<P>,
-        catalog: &Arc<RwLock<ColumnCatalog>>,
-        field: LogicalFieldId,
+        value_slice: &arrow::array::ArrayRef,
+        _rid_slice: &arrow::array::ArrayRef, // Sort index ignores row IDs
+        value_meta: &mut ChunkMetadata,
+        _rid_meta: &mut ChunkMetadata,
+        puts: &mut Vec<BatchPut>,
     ) -> Result<()> {
-        // Resolve descriptor pk for the data column.
-        let cat = catalog.read().unwrap();
-        let descriptor_pk = *cat.map.get(&field).ok_or(Error::NotFound)?;
-        drop(cat);
+        let sort_col = SortColumn {
+            values: value_slice.clone(),
+            options: None,
+        };
+        let perm_indices = lexsort_to_indices(&[sort_col], None)?;
+        let perm_bytes = serialize_array(&perm_indices)?;
+        let perm_pk = pager.alloc_many(1)?[0];
+        puts.push(BatchPut::Raw {
+            key: perm_pk,
+            bytes: perm_bytes,
+        });
+        value_meta.value_order_perm_pk = perm_pk;
+        Ok(())
+    }
 
-        // Load descriptor.
-        let desc_blob = pager
-            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?;
-        let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-
-        // Gather all chunk metadata.
-        let mut metas: Vec<ChunkMetadata> = Vec::new();
-        for m in DescriptorIterator::new(pager.as_ref(), descriptor.head_page_pk) {
-            metas.push(m?);
-        }
-        if metas.is_empty() {
-            return Ok(());
-        }
-
-        // Fetch all data chunks in one batch.
-        let gets: Vec<BatchGet> = metas
-            .iter()
-            .map(|m| BatchGet::Raw { key: m.chunk_pk })
-            .collect();
-        let results = pager.batch_get(&gets)?;
-
-        let mut chunks: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-        for r in results {
-            match r {
-                GetResult::Raw { key, bytes } => {
-                    chunks.insert(key, bytes);
-                }
-                GetResult::Missing { .. } => return Err(Error::NotFound),
-            }
-        }
-
-        let mut puts: Vec<BatchPut> = Vec::new();
-
-        // Compute and persist per-chunk permutations.
+    /// Builds the sort index for all provided data chunks.
+    fn stage_build_all(
+        &self,
+        pager: &Arc<P>,
+        metas: &mut [ChunkMetadata],
+        chunk_blobs: &rustc_hash::FxHashMap<PhysicalKey, P::Blob>,
+    ) -> Result<Vec<BatchPut>> {
+        let mut puts = Vec::new();
         for meta in metas.iter_mut() {
-            let blob = chunks.get(&meta.chunk_pk).ok_or(Error::NotFound)?.clone();
+            let blob = chunk_blobs
+                .get(&meta.chunk_pk)
+                .ok_or(Error::NotFound)?
+                .clone();
             let arr = deserialize_array(blob)?;
 
             let sort_col = SortColumn {
@@ -109,159 +77,24 @@ where
                 key: perm_pk,
                 bytes: perm_bytes,
             });
-
             meta.value_order_perm_pk = perm_pk;
         }
-
-        // Rewrite descriptor pages with updated metas.
-        descriptor.rewrite_pages(Arc::clone(pager), descriptor_pk, &mut metas, &mut puts)?;
-
-        // Persist perms and page rewrites.
-        if !puts.is_empty() {
-            pager.batch_put(&puts)?;
-        }
-        Ok(())
+        Ok(puts)
     }
 
-    fn update(
+    /// Clears sort permutations from the data column's metadata.
+    fn stage_drop_index(
         &self,
-        pager: &Arc<P>,
-        catalog: &Arc<RwLock<ColumnCatalog>>,
-        field: LogicalFieldId,
-        hint: &IndexUpdateHint,
-    ) -> Result<()> {
-        // If no hints or full rebuild allowed, just rebuild all.
-        if hint.full_rebuild_ok || hint.changed_chunk_pks.is_empty() {
-            return self.build_all(pager, catalog, field);
-        }
-
-        // Resolve descriptor pk and load descriptor.
-        let cat = catalog.read().unwrap();
-        let descriptor_pk = *cat.map.get(&field).ok_or(Error::NotFound)?;
-        drop(cat);
-
-        let desc_blob = pager
-            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?;
-        let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-
-        // Gather metas.
-        let mut metas: Vec<ChunkMetadata> = Vec::new();
-        for m in DescriptorIterator::new(pager.as_ref(), descriptor.head_page_pk) {
-            metas.push(m?);
-        }
-        if metas.is_empty() {
-            return Ok(());
-        }
-
-        // Filter target chunks by the hint.
-        let mut target: FxHashMap<PhysicalKey, ()> = FxHashMap::default();
-        for k in hint.changed_chunk_pks.iter().copied() {
-            target.insert(k, ());
-        }
-
-        let mut gets: Vec<BatchGet> = Vec::new();
-        let mut idxs: Vec<usize> = Vec::new();
-        for (i, m) in metas.iter().enumerate() {
-            if target.contains_key(&m.chunk_pk) {
-                gets.push(BatchGet::Raw { key: m.chunk_pk });
-                idxs.push(i);
-            }
-        }
-        if gets.is_empty() {
-            return Ok(());
-        }
-
-        let results = pager.batch_get(&gets)?;
-        let mut by_pk: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-        for r in results {
-            if let GetResult::Raw { key, bytes } = r {
-                by_pk.insert(key, bytes);
-            }
-        }
-
-        let mut puts: Vec<BatchPut> = Vec::new();
-
-        // Recompute and write perms for targeted chunks.
-        for &i in &idxs {
-            let m = &mut metas[i];
-            let blob = by_pk.get(&m.chunk_pk).ok_or(Error::NotFound)?.clone();
-            let arr = deserialize_array(blob)?;
-
-            let sort_col = SortColumn {
-                values: arr,
-                options: None,
-            };
-            let idx = lexsort_to_indices(&[sort_col], None)?;
-            let perm_bytes = serialize_array(&idx)?;
-
-            // Allocate if none; otherwise overwrite existing page.
-            if m.value_order_perm_pk == 0 {
-                m.value_order_perm_pk = pager.alloc_many(1)?[0];
-            }
-            puts.push(BatchPut::Raw {
-                key: m.value_order_perm_pk,
-                bytes: perm_bytes,
-            });
-        }
-
-        // Rewrite descriptor pages to persist updated metas.
-        descriptor.rewrite_pages(Arc::clone(pager), descriptor_pk, &mut metas, &mut puts)?;
-
-        if !puts.is_empty() {
-            pager.batch_put(&puts)?;
-        }
-        Ok(())
-    }
-
-    fn drop_index(
-        &self,
-        pager: &Arc<P>,
-        catalog: &Arc<RwLock<ColumnCatalog>>,
-        field: LogicalFieldId,
-    ) -> Result<()> {
-        // Resolve descriptor pk and load descriptor.
-        let cat = catalog.read().unwrap();
-        let descriptor_pk = *cat.map.get(&field).ok_or(Error::NotFound)?;
-        drop(cat);
-
-        let desc_blob = pager
-            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?;
-        let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-
-        // Gather metas.
-        let mut metas: Vec<ChunkMetadata> = Vec::new();
-        for m in DescriptorIterator::new(pager.as_ref(), descriptor.head_page_pk) {
-            metas.push(m?);
-        }
-        if metas.is_empty() {
-            return Ok(());
-        }
-
-        // Clear per-chunk permutation references.
+        _pager: &Arc<P>,
+        metas: &mut [ChunkMetadata],
+    ) -> Result<Vec<PhysicalKey>> {
+        let mut frees = Vec::new();
         for m in metas.iter_mut() {
-            m.value_order_perm_pk = 0;
+            if m.value_order_perm_pk != 0 {
+                frees.push(m.value_order_perm_pk);
+                m.value_order_perm_pk = 0;
+            }
         }
-
-        let mut puts: Vec<BatchPut> = Vec::new();
-
-        // Rewrite descriptor pages with cleared refs and persist.
-        descriptor.rewrite_pages(Arc::clone(pager), descriptor_pk, &mut metas, &mut puts)?;
-
-        if !puts.is_empty() {
-            pager.batch_put(&puts)?;
-        }
-        Ok(())
+        Ok(frees)
     }
 }

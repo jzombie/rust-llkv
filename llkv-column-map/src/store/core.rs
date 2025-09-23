@@ -9,7 +9,6 @@ use crate::store::descriptor::{
 use crate::types::{CATALOG_ROOT_PKEY, LogicalFieldId, PhysicalKey};
 use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, UInt64Array};
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
-use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -30,7 +29,6 @@ where
 {
     pub fn open(pager: Arc<P>) -> Result<Self> {
         let cfg = ColumnStoreConfig::default();
-
         let catalog = match pager
             .batch_get(&[BatchGet::Raw {
                 key: CATALOG_ROOT_PKEY,
@@ -40,10 +38,9 @@ where
             Some(GetResult::Raw { bytes, .. }) => ColumnCatalog::from_bytes(bytes.as_ref())?,
             _ => ColumnCatalog::default(),
         };
-
         let arc_catalog = Arc::new(RwLock::new(catalog));
 
-        let index_manager = IndexManager::new(Arc::clone(&pager), Arc::clone(&arc_catalog)); // Add this line
+        let index_manager = IndexManager::new(Arc::clone(&pager));
 
         Ok(Self {
             pager: Arc::clone(&pager),
@@ -54,24 +51,126 @@ where
         })
     }
 
-    /// Registers an index for a given column, building it for existing data.
+    /// Registers an index for a given column, building it for existing data atomically.
     pub fn register_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
-        // TODO: Combine these ops in the indexing manager
+        // 1. --- PREPARE & READ PHASE (Coordinator's Job) ---
+        let catalog = self.catalog.read().unwrap();
+        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
 
-        // First, build the physical index data for any data already in the column.
-        self.index_manager.build_index(kind, field_id)?;
+        let desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
+        let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
-        // Then, register its name in the column descriptor so future operations know about it.
-        self.index_manager.register_index(field_id, kind)
+        let mut metas: Vec<ChunkMetadata> =
+            DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk)
+                .collect::<Result<_>>()?;
+
+        let gets: Vec<BatchGet> = metas
+            .iter()
+            .map(|m| BatchGet::Raw { key: m.chunk_pk })
+            .collect();
+        let results = self.pager.batch_get(&gets)?;
+        let mut chunk_blobs = FxHashMap::default();
+        for r in results {
+            if let GetResult::Raw { key, bytes } = r {
+                chunk_blobs.insert(key, bytes);
+            } else {
+                return Err(Error::NotFound); // A chunk is missing
+            }
+        }
+        drop(catalog);
+
+        // 2. --- STAGING PHASE (Call the Specialist) ---
+        let mut puts = match kind {
+            IndexKind::Sort => self.index_manager.sort_ops.stage_build_all(
+                &self.pager,
+                &mut metas,
+                &chunk_blobs,
+            )?,
+            IndexKind::Presence => self.index_manager.presence_ops.stage_build_all(
+                &self.pager,
+                &mut metas,
+                &chunk_blobs,
+            )?,
+        };
+
+        self.index_manager
+            .stage_index_registration(&mut descriptor, kind)?;
+        descriptor.rewrite_pages(
+            Arc::clone(&self.pager),
+            descriptor_pk,
+            &mut metas,
+            &mut puts,
+        )?;
+        puts.push(BatchPut::Raw {
+            key: descriptor_pk,
+            bytes: descriptor.to_le_bytes(),
+        });
+
+        // 3. --- COMMIT PHASE (Coordinator's Job) ---
+        self.pager.batch_put(&puts)?;
+        Ok(())
     }
 
-    /// Unregisters a persisted index from a given column.
+    /// Unregisters a persisted index from a given column atomically.
     pub fn unregister_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
-        // TODO: Combine these ops in the manager
+        // 1. --- PREPARE & READ PHASE ---
+        let catalog = self.catalog.read().unwrap();
+        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+        let desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
+        let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+        let mut metas: Vec<ChunkMetadata> =
+            DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk)
+                .collect::<Result<_>>()?;
+        drop(catalog);
 
-        self.index_manager.drop_index(kind, field_id)?;
+        // 2. --- STAGING PHASE ---
+        let frees = match kind {
+            IndexKind::Sort => self
+                .index_manager
+                .sort_ops
+                .stage_drop_index(&self.pager, &mut metas)?,
+            IndexKind::Presence => self
+                .index_manager
+                .presence_ops
+                .stage_drop_index(&self.pager, &mut metas)?,
+        };
 
-        self.index_manager.unregister_index(field_id, kind)
+        let mut puts = Vec::new();
+        self.index_manager
+            .stage_index_unregistration(&mut descriptor, kind)?;
+        descriptor.rewrite_pages(
+            Arc::clone(&self.pager),
+            descriptor_pk,
+            &mut metas,
+            &mut puts,
+        )?;
+        puts.push(BatchPut::Raw {
+            key: descriptor_pk,
+            bytes: descriptor.to_le_bytes(),
+        });
+
+        // 3. --- COMMIT PHASE ---
+        self.pager.batch_put(&puts)?;
+        if !frees.is_empty() {
+            self.pager.free_many(&frees)?;
+        }
+        Ok(())
     }
 
     /// Lists the names of all persisted indexes for a given column.
@@ -90,7 +189,6 @@ where
             .ok_or(Error::NotFound)?;
         let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
-        // Get the IndexKind enums and convert them to Strings for the caller.
         let kinds = descriptor.get_indexes()?;
         Ok(kinds)
     }
@@ -192,11 +290,13 @@ where
 
     #[allow(unused_variables, unused_assignments)] // TODO: Keep `presence_index_created`?
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
-        // Ensure we append rows in ascending row_id order to keep row_id chunks
-        // naturally sorted and avoid building presence permutations later.
-        // Do this up front on the incoming batch.
+        // --- PHASE 1: PRE-PROCESSING THE INCOMING BATCH ---
+        // The `append` logic relies on row IDs being processed in ascending order to handle
+        // metadata updates efficiently and to ensure the shadow row_id chunks are naturally sorted.
+        // This block checks if the incoming batch is already sorted by `row_id`. If not, it creates a
+        // new, sorted `RecordBatch` to work with for the rest of the function.
         let working_batch: RecordBatch;
-        let batch = {
+        let batch_ref = {
             let schema = batch.schema();
             let row_id_idx = schema
                 .index_of("row_id")
@@ -206,21 +306,26 @@ where
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .ok_or_else(|| Error::Internal("row_id downcast failed".into()))?;
-            // Quick ascending check
-            let mut sorted = true;
-            let mut prev = 0u64;
-            for i in 0..row_id_arr.len() {
-                let v = row_id_arr.value(i);
-                if i > 0 && v < prev {
-                    sorted = false;
-                    break;
+
+            // Manually check if the row_id column is sorted.
+            let mut is_sorted = true;
+            if !row_id_arr.is_empty() {
+                let mut last = row_id_arr.value(0);
+                for i in 1..row_id_arr.len() {
+                    let current = row_id_arr.value(i);
+                    if current < last {
+                        is_sorted = false;
+                        break;
+                    }
+                    last = current;
                 }
-                prev = v;
             }
-            if sorted {
-                batch.clone()
+
+            // If sorted, we can use the original batch directly.
+            // Otherwise, we compute a permutation and reorder all columns.
+            if is_sorted {
+                batch
             } else {
-                // Build sort indices by row_id and reorder all columns
                 let sort_col = SortColumn {
                     values: row_id_any,
                     options: None,
@@ -236,23 +341,21 @@ where
                 }
                 working_batch = RecordBatch::try_new(schema.clone(), cols)
                     .map_err(|e| Error::Internal(format!("record batch rebuild: {e}")))?;
-                working_batch
+                &working_batch
             }
         };
 
-        let schema = batch.schema();
+        // --- PHASE 2: LAST-WRITER-WINS (LWW) REWRITE ---
+        // This phase handles updates. It identifies any rows in the incoming batch that
+        // already exist in the store and rewrites them in-place. This is a separate
+        // transaction that happens before the main append of new rows.
+        let schema = batch_ref.schema();
         let row_id_idx = schema
             .index_of("row_id")
             .map_err(|_| Error::Internal("row_id column required".into()))?;
-        let row_id_field = schema.field(row_id_idx);
-        if row_id_field.data_type() != &DataType::UInt64 {
-            return Err(Error::Internal("row_id must be UInt64".into()));
-        }
-        if row_id_field.is_nullable() {
-            return Err(Error::Internal("row_id must be non-null".into()));
-        }
 
-        let row_id_arr = batch
+        // Create a quick lookup map of incoming row IDs to their positions in the batch.
+        let row_id_arr = batch_ref
             .column(row_id_idx)
             .as_any()
             .downcast_ref::<UInt64Array>()
@@ -263,67 +366,76 @@ where
             incoming_ids_map.insert(row_id_arr.value(i), i);
         }
 
+        // These variables will track the state of the LWW transaction.
         let mut catalog_dirty = false;
         let mut puts_rewrites: Vec<BatchPut> = Vec::new();
         let mut all_rewritten_ids = FxHashSet::default();
 
-        // --- LWW Phase: Perform all rewrites first ---
-        let mut catalog = self.catalog.write().unwrap();
-        for i in 0..batch.num_columns() {
+        // Iterate through each column in the batch (except row_id) to perform rewrites.
+        let mut catalog_lock = self.catalog.write().unwrap();
+        for i in 0..batch_ref.num_columns() {
             if i == row_id_idx {
                 continue;
             }
             let field = schema.field(i);
             if let Some(field_id_str) = field.metadata().get("field_id") {
-                // The application is responsible for providing a u64 that can be
-                // converted into the namespaced LogicalFieldId struct.
                 let field_id = field_id_str
                     .parse::<u64>()
                     .map(LogicalFieldId::from)
                     .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
 
+                // `lww_rewrite_for_field` finds overlapping row IDs and rewrites the data chunks.
+                // It returns the set of row IDs that were updated.
                 let rewritten = self.lww_rewrite_for_field(
-                    &mut catalog,
+                    &mut catalog_lock,
                     field_id,
                     &incoming_ids_map,
-                    batch.column(i),
-                    batch.column(row_id_idx),
+                    batch_ref.column(i),
+                    batch_ref.column(row_id_idx),
                     &mut puts_rewrites,
                 )?;
                 all_rewritten_ids.extend(rewritten);
             }
         }
-        drop(catalog);
+        drop(catalog_lock);
 
+        // Commit the LWW changes to the pager immediately.
         if !puts_rewrites.is_empty() {
             self.pager.batch_put(&puts_rewrites)?;
         }
 
-        // --- Append Phase: Filter the batch to only include NEW rows ---
+        // --- PHASE 3: FILTERING FOR NEW ROWS ---
+        // After handling updates, we filter the incoming batch to remove the rows that were
+        // just rewritten. The remaining rows are guaranteed to be new additions to the store.
         let batch_to_append = if !all_rewritten_ids.is_empty() {
             let keep_mask: Vec<bool> = (0..row_id_arr.len())
                 .map(|i| !all_rewritten_ids.contains(&row_id_arr.value(i)))
                 .collect();
             let keep_array = BooleanArray::from(keep_mask);
-            compute::filter_record_batch(&batch, &keep_array)?
+            compute::filter_record_batch(batch_ref, &keep_array)?
         } else {
-            batch.clone()
+            batch_ref.clone()
         };
+
+        // If no new rows are left, we are done.
         if batch_to_append.num_rows() == 0 {
             return Ok(());
         }
 
-        // Now, proceed with appending the correctly filtered batch.
-        // Drop nulls per field (treat null as delete: do not store it).
+        // --- PHASE 4: APPENDING NEW DATA ---
+        // This is the main append transaction. All writes generated in this phase will be
+        // collected and committed atomically at the very end.
         let append_schema = batch_to_append.schema();
         let append_row_id_idx = append_schema.index_of("row_id")?;
         let append_row_id_any: ArrayRef = Arc::clone(batch_to_append.column(append_row_id_idx));
         let mut puts_appends: Vec<BatchPut> = Vec::new();
 
+        // Loop through each column of the filtered batch to append its data.
         for (i, array) in batch_to_append.columns().iter().enumerate() {
             if i == append_row_id_idx {
                 continue;
             }
+
             let field = append_schema.field(i);
             let field_id = field
                 .metadata()
@@ -333,10 +445,13 @@ where
                 .map(LogicalFieldId::from)
                 .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
 
-            // Warm the dtype cache from schema; avoids a later chunk peek in this process.
+            // **** THIS IS THE RESTORED LINE ****
+            // Populate the data type cache for this column. This is a performance optimization
+            // to avoid reading a chunk from storage later just to determine its type.
             self.dtype_cache.insert(field_id, field.data_type().clone());
 
-            // Filter out nulls in this column and keep matching row_ids only.
+            // Null values are treated as deletions, so we filter them out. The `rids_clean`
+            // array contains the row IDs corresponding to the non-null values.
             let (array_clean, rids_clean) = if array.null_count() == 0 {
                 (array.clone(), append_row_id_any.clone())
             } else {
@@ -346,20 +461,29 @@ where
                 let r = compute::filter(&append_row_id_any, &keep)?;
                 (a, r)
             };
+
             if array_clean.is_empty() {
                 continue;
             }
 
-            let mut catalog = self.catalog.write().unwrap();
-            let descriptor_pk = *catalog.map.entry(field_id).or_insert_with(|| {
-                catalog_dirty = true;
-                self.pager.alloc_many(1).unwrap()[0]
-            });
-            let rid_fid = rowid_fid(field_id);
-            let rid_descriptor_pk = *catalog.map.entry(rid_fid).or_insert_with(|| {
-                catalog_dirty = true;
-                self.pager.alloc_many(1).unwrap()[0]
-            });
+            // Get or create the physical keys for the column's data descriptor and its
+            // shadow row_id descriptor from the catalog.
+            let (descriptor_pk, rid_descriptor_pk, rid_fid) = {
+                let mut catalog = self.catalog.write().unwrap();
+                let pk1 = *catalog.map.entry(field_id).or_insert_with(|| {
+                    catalog_dirty = true;
+                    self.pager.alloc_many(1).unwrap()[0]
+                });
+                let r_fid = rowid_fid(field_id);
+                let pk2 = *catalog.map.entry(r_fid).or_insert_with(|| {
+                    catalog_dirty = true;
+                    self.pager.alloc_many(1).unwrap()[0]
+                });
+                (pk1, pk2, r_fid)
+            };
+
+            // Load the descriptors and their tail metadata pages into memory.
+            // If they don't exist, `load_or_create` will initialize new ones.
             let (mut data_descriptor, mut data_tail_page) =
                 ColumnDescriptor::load_or_create(Arc::clone(&self.pager), descriptor_pk, field_id)?;
             let (mut rid_descriptor, mut rid_tail_page) = ColumnDescriptor::load_or_create(
@@ -367,16 +491,14 @@ where
                 rid_descriptor_pk,
                 rid_fid,
             )?;
-            drop(catalog);
 
-            // TODO: Remove?
-            // Persist/refresh dtype fingerprint for both data and row-id descriptors.
-            // let fp_data = DTypeCache::<P>::dtype_fingerprint(field.data_type());
-            // DTypeCache::<P>::set_desc_dtype_fingerprint(&mut data_descriptor, fp_data);
-            // let fp_rid = DTypeCache::<P>::dtype_fingerprint(&DataType::UInt64);
-            // DTypeCache::<P>::set_desc_dtype_fingerprint(&mut rid_descriptor, fp_rid);
+            // Logically register the Presence index on the main data descriptor. This ensures
+            // that even if no physical index chunks are created (because data arrived sorted),
+            // the system knows a Presence index is conceptually active for this column.
+            self.index_manager
+                .stage_index_registration(&mut data_descriptor, IndexKind::Presence)?;
 
-            // Slice and append.
+            // Split the data to be appended into chunks of a target size.
             let slices = split_to_target_bytes(
                 &array_clean,
                 TARGET_CHUNK_BYTES,
@@ -384,12 +506,10 @@ where
             );
             let mut row_off = 0usize;
 
-            let mut presence_index_created = false;
-
+            // Loop through each new slice to create and stage its chunks.
             for s in slices {
                 let rows = s.len();
-
-                // Data slice.
+                // Create and stage the data chunk.
                 let data_pk = self.pager.alloc_many(1)?[0];
                 let s_norm = zero_offset(&s);
                 let data_bytes = serialize_array(s_norm.as_ref())?;
@@ -397,22 +517,8 @@ where
                     key: data_pk,
                     bytes: data_bytes,
                 });
-                let data_meta = ChunkMetadata {
-                    chunk_pk: data_pk,
-                    value_order_perm_pk: 0,
-                    row_count: rows as u64,
-                    serialized_bytes: s_norm.get_array_memory_size() as u64,
-                    min_val_u64: 0,
-                    max_val_u64: u64::MAX,
-                };
-                self.append_meta_in_loop(
-                    &mut data_descriptor,
-                    &mut data_tail_page,
-                    data_meta,
-                    &mut puts_appends,
-                )?;
 
-                // Row-id slice matched to this data slice.
+                // Create and stage the corresponding row_id chunk.
                 let rid_slice: ArrayRef = rids_clean.slice(row_off, rows);
                 let rid_norm = zero_offset(&rid_slice);
                 let rid_pk = self.pager.alloc_many(1)?[0];
@@ -421,56 +527,67 @@ where
                     key: rid_pk,
                     bytes: rid_bytes,
                 });
-                // Compute min/max and detect if row_ids are already sorted ascending
-                let rid_any = rid_norm.clone();
-                let rids = rid_any
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("row_id downcast".into()))?;
-                let mut min = u64::MAX;
-                let mut max = 0u64;
-                let mut sorted = true;
-                let mut last = 0u64;
-                for i in 0..rids.len() {
-                    let v = rids.value(i);
-                    if i == 0 {
-                        last = v;
-                    } else if v < last {
-                        sorted = false;
-                    } else {
-                        last = v;
+
+                // Compute min/max for the row_id chunk to enable pruning during scans.
+                let rids_for_meta = rid_norm.as_any().downcast_ref::<UInt64Array>().unwrap();
+                let (min, max) = if !rids_for_meta.is_empty() {
+                    let mut min_val = rids_for_meta.value(0);
+                    let mut max_val = rids_for_meta.value(0);
+                    for i in 1..rids_for_meta.len() {
+                        let v = rids_for_meta.value(i);
+                        if v < min_val {
+                            min_val = v;
+                        }
+                        if v > max_val {
+                            max_val = v;
+                        }
                     }
-                    if v < min {
-                        min = v;
-                    }
-                    if v > max {
-                        max = v;
-                    }
-                }
-                let mut rid_perm_pk = 0u64;
-                if !sorted {
-                    presence_index_created = true;
-                    // Build presence index (perm over row_ids)
-                    let sort_col = SortColumn {
-                        values: rid_any,
-                        options: None,
-                    };
-                    let rid_idx = lexsort_to_indices(&[sort_col], None)?;
-                    let perm_bytes = serialize_array(&rid_idx)?;
-                    rid_perm_pk = self.pager.alloc_many(1)?[0];
-                    puts_appends.push(BatchPut::Raw {
-                        key: rid_perm_pk,
-                        bytes: perm_bytes,
-                    });
-                }
-                let rid_meta = ChunkMetadata {
+                    (min_val, max_val)
+                } else {
+                    (0, 0)
+                };
+
+                // Create the initial metadata for both chunks.
+                // The `value_order_perm_pk` is initialized to 0 (None).
+                let mut data_meta = ChunkMetadata {
+                    chunk_pk: data_pk,
+                    value_order_perm_pk: 0,
+                    row_count: rows as u64,
+                    serialized_bytes: s_norm.get_array_memory_size() as u64,
+                    min_val_u64: 0,
+                    max_val_u64: u64::MAX,
+                };
+                let mut rid_meta = ChunkMetadata {
                     chunk_pk: rid_pk,
-                    value_order_perm_pk: rid_perm_pk,
+                    value_order_perm_pk: 0,
                     row_count: rows as u64,
                     serialized_bytes: rid_norm.get_array_memory_size() as u64,
-                    min_val_u64: if rows > 0 { min } else { 0 },
-                    max_val_u64: if rows > 0 { max } else { 0 },
+                    min_val_u64: min,
+                    max_val_u64: max,
                 };
+
+                // **GENERIC INDEX UPDATE DISPATCH**
+                // This is the single, index-agnostic call. The IndexManager will look up all
+                // active indexes for this column (e.g., Presence, Sort) and call their respective
+                // `stage_update_for_new_chunk` methods. This is where the physical index data
+                // (like permutation blobs) is created and staged.
+                self.index_manager.stage_updates_for_new_chunk(
+                    field_id,
+                    &data_descriptor,
+                    &s_norm,
+                    &rid_norm,
+                    &mut data_meta,
+                    &mut rid_meta,
+                    &mut puts_appends,
+                )?;
+
+                // Append the (potentially modified) metadata to their respective descriptor chains.
+                self.append_meta_in_loop(
+                    &mut data_descriptor,
+                    &mut data_tail_page,
+                    data_meta,
+                    &mut puts_appends,
+                )?;
                 self.append_meta_in_loop(
                     &mut rid_descriptor,
                     &mut rid_tail_page,
@@ -480,15 +597,8 @@ where
                 row_off += rows;
             }
 
-            // TODO: Improve
-            // A column with a row_id shadow always has a presence index.
-            let mut indexes = data_descriptor.get_indexes()?;
-            if !indexes.contains(&IndexKind::Presence) {
-                indexes.push(IndexKind::Presence);
-                data_descriptor.set_indexes(&indexes)?;
-            }
-            // self.register_index(field_id, IndexKind::Presence)?;
-
+            // After processing all slices, stage the final writes for the updated tail pages
+            // and the root descriptor objects themselves.
             puts_appends.push(BatchPut::Raw {
                 key: data_descriptor.tail_page_pk,
                 bytes: data_tail_page,
@@ -507,6 +617,8 @@ where
             });
         }
 
+        // --- PHASE 5: FINAL ATOMIC COMMIT ---
+        // If the catalog was modified (e.g., new columns were created), stage its write.
         if catalog_dirty {
             let catalog = self.catalog.read().unwrap();
             puts_appends.push(BatchPut::Raw {
@@ -515,12 +627,14 @@ where
             });
         }
 
+        // Commit all staged puts (new data chunks, new row_id chunks, new index permutations,
+        // updated descriptor pages, updated root descriptors, and the updated catalog)
+        // in a single atomic operation.
         if !puts_appends.is_empty() {
             self.pager.batch_put(&puts_appends)?;
         }
         Ok(())
     }
-
     fn lww_rewrite_for_field(
         &self,
         catalog: &mut ColumnCatalog,
