@@ -715,72 +715,15 @@ where
         }
 
         // Rewrite descriptor chains/totals for both columns.
-        self.rewrite_descriptor_pages(desc_pk_data, &mut descriptor_data, &mut metas_data, puts)?;
-        self.rewrite_descriptor_pages(desc_pk_rid, &mut descriptor_rid, &mut metas_rid, puts)?;
+        descriptor_data.rewrite_pages(
+            Arc::clone(&self.pager),
+            desc_pk_data,
+            &mut metas_data,
+            puts,
+        )?;
+        descriptor_rid.rewrite_pages(Arc::clone(&self.pager), desc_pk_rid, &mut metas_rid, puts)?;
 
         Ok(rewritten_ids)
-    }
-
-    /// Rewrite all descriptor pages for a column and update totals.
-    fn rewrite_descriptor_pages(
-        &self,
-        descriptor_pk: PhysicalKey,
-        descriptor: &mut ColumnDescriptor,
-        metas: &mut [ChunkMetadata],
-        puts: &mut Vec<BatchPut>,
-    ) -> Result<()> {
-        let mut current_page_pk = descriptor.head_page_pk;
-        let mut page_start_idx = 0usize;
-
-        while current_page_pk != 0 {
-            // This is a sequential walk, so a single-item batch is appropriate.
-            let page_blob = self
-                .pager
-                .batch_get(&[BatchGet::Raw {
-                    key: current_page_pk,
-                }])?
-                .pop()
-                .and_then(|res| match res {
-                    GetResult::Raw { bytes, .. } => Some(bytes),
-                    _ => None,
-                })
-                .ok_or(Error::NotFound)?
-                .as_ref()
-                .to_vec();
-
-            let header =
-                DescriptorPageHeader::from_le_bytes(&page_blob[..DescriptorPageHeader::DISK_SIZE]);
-            let n_on_page = header.entry_count as usize;
-            let end_idx = page_start_idx + n_on_page;
-
-            let mut new_page_data = Vec::new();
-            for m in &metas[page_start_idx..end_idx] {
-                new_page_data.extend_from_slice(&m.to_le_bytes());
-            }
-
-            let mut final_page_bytes =
-                Vec::with_capacity(DescriptorPageHeader::DISK_SIZE + new_page_data.len());
-            final_page_bytes.extend_from_slice(&header.to_le_bytes());
-            final_page_bytes.extend_from_slice(&new_page_data);
-
-            puts.push(BatchPut::Raw {
-                key: current_page_pk,
-                bytes: final_page_bytes,
-            });
-            current_page_pk = header.next_page_pk;
-            page_start_idx = end_idx;
-        }
-
-        let mut total_rows = 0u64;
-        for m in metas.iter() {
-            total_rows += m.row_count;
-        }
-        descriptor.total_row_count = total_rows;
-        puts.push(BatchPut::Raw {
-            key: descriptor_pk,
-            bytes: descriptor.to_le_bytes(),
-        });
-        Ok(())
     }
 
     // TODO: Remove pre-condition; accept vector of row ids instead
@@ -962,9 +905,9 @@ where
         }
 
         // Rewrite descriptor chains/totals and commit.
-        self.rewrite_descriptor_pages(desc_pk, &mut descriptor, &mut metas, &mut puts)?;
+        descriptor.rewrite_pages(Arc::clone(&self.pager), desc_pk, &mut metas, &mut puts)?;
         if let (Some(rid_pk), Some(mut rid_desc)) = (desc_pk_rid, descriptor_rid) {
-            self.rewrite_descriptor_pages(rid_pk, &mut rid_desc, &mut metas_rid, &mut puts)?;
+            rid_desc.rewrite_pages(Arc::clone(&self.pager), rid_pk, &mut metas_rid, &mut puts)?;
         }
         if !puts.is_empty() {
             self.pager.batch_put(&puts)?;

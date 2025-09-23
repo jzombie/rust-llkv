@@ -5,7 +5,7 @@
 
 use crate::codecs::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use crate::error::{Error, Result};
-use crate::storage::pager::{BatchGet, GetResult, Pager};
+use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::store::indexing::IndexKind;
 use crate::types::{LogicalFieldId, PhysicalKey};
 use std::mem;
@@ -126,6 +126,67 @@ impl ColumnDescriptor {
                 Ok((descriptor, tail_page_bytes))
             }
         }
+    }
+
+    /// Rewrite all descriptor pages for a column and update totals.
+    pub(crate) fn rewrite_pages<P: Pager>(
+        &mut self,
+        pager: Arc<P>,
+        descriptor_pk: PhysicalKey,
+        metas: &mut [ChunkMetadata],
+        puts: &mut Vec<BatchPut>,
+    ) -> Result<()> {
+        let mut current_page_pk = self.head_page_pk;
+        let mut page_start_idx = 0usize;
+
+        while current_page_pk != 0 {
+            // This is a sequential walk, so a single-item batch is appropriate.
+            let page_blob = pager
+                .batch_get(&[BatchGet::Raw {
+                    key: current_page_pk,
+                }])?
+                .pop()
+                .and_then(|res| match res {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
+                .ok_or(Error::NotFound)?
+                .as_ref()
+                .to_vec();
+
+            let header =
+                DescriptorPageHeader::from_le_bytes(&page_blob[..DescriptorPageHeader::DISK_SIZE]);
+            let n_on_page = header.entry_count as usize;
+            let end_idx = page_start_idx + n_on_page;
+
+            let mut new_page_data = Vec::new();
+            for m in &metas[page_start_idx..end_idx] {
+                new_page_data.extend_from_slice(&m.to_le_bytes());
+            }
+
+            let mut final_page_bytes =
+                Vec::with_capacity(DescriptorPageHeader::DISK_SIZE + new_page_data.len());
+            final_page_bytes.extend_from_slice(&header.to_le_bytes());
+            final_page_bytes.extend_from_slice(&new_page_data);
+
+            puts.push(BatchPut::Raw {
+                key: current_page_pk,
+                bytes: final_page_bytes,
+            });
+            current_page_pk = header.next_page_pk;
+            page_start_idx = end_idx;
+        }
+
+        let mut total_rows = 0u64;
+        for m in metas.iter() {
+            total_rows += m.row_count;
+        }
+        self.total_row_count = total_rows;
+        puts.push(BatchPut::Raw {
+            key: descriptor_pk,
+            bytes: self.to_le_bytes(),
+        });
+        Ok(())
     }
 
     /// Single allocation; append fields as LE without growth churn.

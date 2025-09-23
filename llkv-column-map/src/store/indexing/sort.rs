@@ -5,9 +5,7 @@ use crate::error::{Error, Result};
 use crate::serialization::{deserialize_array, serialize_array};
 use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::store::catalog::ColumnCatalog;
-use crate::store::descriptor::{
-    ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
-};
+use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::store::indexing::{Index, IndexOps, IndexUpdateHint};
 use crate::types::{LogicalFieldId, PhysicalKey};
 use arrow::compute::{SortColumn, lexsort_to_indices};
@@ -32,10 +30,6 @@ impl Index for SortIndex {
 }
 
 /// Concrete implementation of sort index operations.
-///
-/// This is a direct migration of the logic previously in
-/// `core.rs::create_sort_index`, structured under the uniform
-/// `IndexOps` trait.
 pub struct SortIndexOps;
 
 impl Default for SortIndexOps {
@@ -120,7 +114,7 @@ where
         }
 
         // Rewrite descriptor pages with updated metas.
-        rewrite_descriptor_pages(pager, descriptor_pk, &mut descriptor, &mut metas, &mut puts)?;
+        descriptor.rewrite_pages(Arc::clone(pager), descriptor_pk, &mut metas, &mut puts)?;
 
         // Persist perms and page rewrites.
         if !puts.is_empty() {
@@ -217,7 +211,7 @@ where
         }
 
         // Rewrite descriptor pages to persist updated metas.
-        rewrite_descriptor_pages(pager, descriptor_pk, &mut descriptor, &mut metas, &mut puts)?;
+        descriptor.rewrite_pages(Arc::clone(pager), descriptor_pk, &mut metas, &mut puts)?;
 
         if !puts.is_empty() {
             pager.batch_put(&puts)?;
@@ -263,80 +257,11 @@ where
         let mut puts: Vec<BatchPut> = Vec::new();
 
         // Rewrite descriptor pages with cleared refs and persist.
-        rewrite_descriptor_pages(pager, descriptor_pk, &mut descriptor, &mut metas, &mut puts)?;
+        descriptor.rewrite_pages(Arc::clone(pager), descriptor_pk, &mut metas, &mut puts)?;
 
         if !puts.is_empty() {
             pager.batch_put(&puts)?;
         }
         Ok(())
     }
-}
-
-/* ============================== helpers =============================== */
-
-fn rewrite_descriptor_pages<P>(
-    pager: &Arc<P>,
-    descriptor_pk: PhysicalKey,
-    descriptor: &mut ColumnDescriptor,
-    metas: &mut [ChunkMetadata],
-    puts: &mut Vec<BatchPut>,
-) -> Result<()>
-where
-    P: Pager<Blob = EntryHandle>,
-{
-    let mut current_page_pk = descriptor.head_page_pk;
-    let mut page_start_idx = 0usize;
-
-    while current_page_pk != 0 {
-        let page_blob = pager
-            .batch_get(&[BatchGet::Raw {
-                key: current_page_pk,
-            }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?
-            .as_ref()
-            .to_vec();
-
-        let header =
-            DescriptorPageHeader::from_le_bytes(&page_blob[..DescriptorPageHeader::DISK_SIZE]);
-
-        let n_on_page = header.entry_count as usize;
-        let end_idx = page_start_idx + n_on_page;
-
-        let mut new_page_data = Vec::new();
-        for m in &metas[page_start_idx..end_idx] {
-            new_page_data.extend_from_slice(&m.to_le_bytes());
-        }
-
-        let mut final_page_bytes =
-            Vec::with_capacity(DescriptorPageHeader::DISK_SIZE + new_page_data.len());
-        final_page_bytes.extend_from_slice(&header.to_le_bytes());
-        final_page_bytes.extend_from_slice(&new_page_data);
-
-        puts.push(BatchPut::Raw {
-            key: current_page_pk,
-            bytes: final_page_bytes,
-        });
-
-        current_page_pk = header.next_page_pk;
-        page_start_idx = end_idx;
-    }
-
-    // Update totals on the descriptor and write it.
-    let mut total_rows = 0u64;
-    for m in metas.iter() {
-        total_rows += m.row_count;
-    }
-    descriptor.total_row_count = total_rows;
-
-    puts.push(BatchPut::Raw {
-        key: descriptor_pk,
-        bytes: descriptor.to_le_bytes(),
-    });
-
-    Ok(())
 }
