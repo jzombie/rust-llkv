@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::storage::pager::{BatchGet, GetResult, Pager};
 use crate::types::{LogicalFieldId, PhysicalKey};
 use std::mem;
+use std::sync::Arc;
 
 // All values are stored as little-endian.
 
@@ -78,6 +79,53 @@ pub(crate) struct ColumnDescriptor {
 impl ColumnDescriptor {
     pub(crate) const FIXED_DISK_SIZE_WITHOUT_INDEX_META: usize = 48;
     pub(crate) const FIXED_DISK_SIZE: usize = Self::FIXED_DISK_SIZE_WITHOUT_INDEX_META + 4; // + index_meta_len
+
+    // TODO: Separate between `data` and `rid` states?
+    /// (Internal) Loads the full state for a descriptor, creating it if it
+    /// doesn't exist.
+    pub(crate) fn load_or_create<P: Pager>(
+        pager: Arc<P>,
+        descriptor_pk: PhysicalKey,
+        field_id: LogicalFieldId,
+    ) -> Result<(ColumnDescriptor, Vec<u8>)> {
+        match pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+        {
+            Some(GetResult::Raw { bytes, .. }) => {
+                let descriptor = ColumnDescriptor::from_le_bytes(bytes.as_ref());
+                let tail_page_bytes = pager
+                    .batch_get(&[BatchGet::Raw {
+                        key: descriptor.tail_page_pk,
+                    }])?
+                    .pop()
+                    .and_then(|r| match r {
+                        GetResult::Raw { bytes, .. } => Some(bytes),
+                        _ => None,
+                    })
+                    .ok_or(Error::NotFound)?
+                    .as_ref()
+                    .to_vec();
+                Ok((descriptor, tail_page_bytes))
+            }
+            _ => {
+                let first_page_pk = pager.alloc_many(1)?[0];
+                let descriptor = ColumnDescriptor {
+                    field_id,
+                    head_page_pk: first_page_pk,
+                    tail_page_pk: first_page_pk,
+                    ..Default::default()
+                };
+                let header = DescriptorPageHeader {
+                    next_page_pk: 0,
+                    entry_count: 0,
+                    _padding: [0; 4],
+                };
+                let tail_page_bytes = header.to_le_bytes().to_vec();
+                Ok((descriptor, tail_page_bytes))
+            }
+        }
+    }
 
     /// Single allocation; append fields as LE without growth churn.
     pub(crate) fn to_le_bytes(&self) -> Vec<u8> {

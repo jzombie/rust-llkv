@@ -638,9 +638,12 @@ where
                 self.pager.alloc_many(1).unwrap()[0]
             });
             let (mut data_descriptor, mut data_tail_page) =
-                self.load_descriptor_state(descriptor_pk, field_id)?;
-            let (mut rid_descriptor, mut rid_tail_page) =
-                self.load_descriptor_state(rid_descriptor_pk, rid_fid)?;
+                ColumnDescriptor::load_or_create(Arc::clone(&self.pager), descriptor_pk, field_id)?;
+            let (mut rid_descriptor, mut rid_tail_page) = ColumnDescriptor::load_or_create(
+                Arc::clone(&self.pager),
+                rid_descriptor_pk,
+                rid_fid,
+            )?;
 
             // TODO: Remove?
             // Persist/refresh dtype fingerprint for both data and row-id descriptors.
@@ -1822,55 +1825,6 @@ where
 
         self.pager.batch_put(&puts)?;
         Ok(())
-    }
-
-    // TODO: Move to `descriptor` and separate between `data` and `rid` states?
-    /// (Internal) Loads the full state for a descriptor, creating it if it
-    /// doesn't exist.
-    fn load_descriptor_state(
-        &self,
-        descriptor_pk: PhysicalKey,
-        field_id: LogicalFieldId,
-    ) -> Result<(ColumnDescriptor, Vec<u8>)> {
-        match self
-            .pager
-            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
-            .pop()
-        {
-            Some(GetResult::Raw { bytes, .. }) => {
-                let descriptor = ColumnDescriptor::from_le_bytes(bytes.as_ref());
-                let tail_page_bytes = self
-                    .pager
-                    .batch_get(&[BatchGet::Raw {
-                        key: descriptor.tail_page_pk,
-                    }])?
-                    .pop()
-                    .and_then(|r| match r {
-                        GetResult::Raw { bytes, .. } => Some(bytes),
-                        _ => None,
-                    })
-                    .ok_or(Error::NotFound)?
-                    .as_ref()
-                    .to_vec();
-                Ok((descriptor, tail_page_bytes))
-            }
-            _ => {
-                let first_page_pk = self.pager.alloc_many(1)?[0];
-                let descriptor = ColumnDescriptor {
-                    field_id,
-                    head_page_pk: first_page_pk,
-                    tail_page_pk: first_page_pk,
-                    ..Default::default()
-                };
-                let header = DescriptorPageHeader {
-                    next_page_pk: 0,
-                    entry_count: 0,
-                    _padding: [0; 4],
-                };
-                let tail_page_bytes = header.to_le_bytes().to_vec();
-                Ok((descriptor, tail_page_bytes))
-            }
-        }
     }
 
     /// (Internal) Helper for batch appends. Appends metadata to the current
