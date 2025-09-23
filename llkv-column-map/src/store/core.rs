@@ -439,19 +439,18 @@ where
                 // The `value_order_perm_pk` is initialized to 0 (None).
                 let mut data_meta = ChunkMetadata {
                     chunk_pk: data_pk,
-                    value_order_perm_pk: 0,
                     row_count: rows as u64,
                     serialized_bytes: s_norm.get_array_memory_size() as u64,
-                    min_val_u64: 0,
                     max_val_u64: u64::MAX,
+                    ..Default::default()
                 };
                 let mut rid_meta = ChunkMetadata {
                     chunk_pk: rid_pk,
-                    value_order_perm_pk: 0,
                     row_count: rows as u64,
                     serialized_bytes: rid_norm.get_array_memory_size() as u64,
                     min_val_u64: min,
                     max_val_u64: max,
+                    ..Default::default()
                 };
 
                 // **GENERIC INDEX UPDATE DISPATCH**
@@ -1176,11 +1175,10 @@ where
                 });
                 let mut meta = ChunkMetadata {
                     chunk_pk: data_pk,
-                    value_order_perm_pk: 0,
                     row_count: rows as u64,
                     serialized_bytes: s_norm.get_array_memory_size() as u64,
-                    min_val_u64: 0,
                     max_val_u64: u64::MAX,
+                    ..Default::default()
                 };
                 // If any source chunk had a perm, recompute for this slice.
                 if need_perms {
