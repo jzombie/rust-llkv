@@ -56,6 +56,8 @@ where
 
     /// Registers an index for a given column, building it for existing data.
     pub fn register_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
+        // TODO: Combine these ops in the indexing manager
+
         // First, build the physical index data for any data already in the column.
         self.index_manager.build_index(kind, field_id)?;
 
@@ -65,6 +67,10 @@ where
 
     /// Unregisters a persisted index from a given column.
     pub fn unregister_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
+        // TODO: Combine these ops in the manager
+
+        self.index_manager.drop_index(kind, field_id)?;
+
         self.index_manager.unregister_index(field_id, kind)
     }
 
