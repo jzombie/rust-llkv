@@ -1,4 +1,5 @@
-//! The main module for managing column indexes.
+//! Indexing: shared traits, manager, and dispatcher only.
+//! Concrete indexes live in their own files.
 
 use crate::error::{Error, Result};
 use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
@@ -6,52 +7,26 @@ use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::ColumnDescriptor;
 use crate::types::LogicalFieldId;
 use rustc_hash::FxHashMap;
+use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{Arc, RwLock};
 
-/// A trait for column indexes.
+pub mod presence;
+pub mod sort;
+
+/* ======================= Public discovery surface ====================== */
+
+/// Marker trait carried by concrete index types.
 pub trait Index {
-    /// The name of the index.
+    /// Stable name of the index (e.g., "sort", "presence").
     fn name(&self) -> &'static str;
-    // In the future, this trait will include methods for building, querying,
-    // and maintaining the index.
 }
 
-/// A no-op index used for discovery of legacy sort permutations.
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
-pub struct SortIndex;
+/* ========== Manager: register / unregister / list (generic Pager) ====== */
 
-impl SortIndex {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Index for SortIndex {
-    fn name(&self) -> &'static str {
-        "sort"
-    }
-}
-
-/// An index for fast row presence checks.
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
-pub struct PresenceIndex;
-
-impl PresenceIndex {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Index for PresenceIndex {
-    fn name(&self) -> &'static str {
-        "presence"
-    }
-}
-
-/// Manages the registration and discovery of indexes on columns.
+/// Manages registration and discovery of indexes on columns.
 pub struct IndexManager<P: Pager> {
-    pager: Arc<P>,
-    catalog: Arc<RwLock<ColumnCatalog>>,
+    pub(crate) pager: Arc<P>,
+    pub(crate) catalog: Arc<RwLock<ColumnCatalog>>,
 }
 
 impl<P: Pager> IndexManager<P> {
@@ -60,7 +35,7 @@ impl<P: Pager> IndexManager<P> {
         Self { pager, catalog }
     }
 
-    /// Registers an index for a given column.
+    /// Registers an index name for a given column.
     pub fn register_index(&self, field_id: LogicalFieldId, index_name: &str) -> Result<()> {
         self.update_indexes(field_id, |indexes| {
             if indexes.contains(&index_name.to_string()) {
@@ -74,7 +49,7 @@ impl<P: Pager> IndexManager<P> {
         })
     }
 
-    /// Unregisters an index from a given column.
+    /// Unregisters an index name from a given column.
     pub fn unregister_index(&self, field_id: LogicalFieldId, index_name: &str) -> Result<()> {
         self.update_indexes(field_id, |indexes| {
             let original_len = indexes.len();
@@ -89,36 +64,7 @@ impl<P: Pager> IndexManager<P> {
         })
     }
 
-    /// A helper function to load, modify, and save column descriptor indexes.
-    fn update_indexes<F>(&self, field_id: LogicalFieldId, mut modifier: F) -> Result<()>
-    where
-        F: FnMut(&mut Vec<String>) -> Result<()>,
-    {
-        let catalog = self.catalog.read().unwrap();
-        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
-
-        let desc_blob = self
-            .pager
-            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?;
-
-        let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-        let mut indexes = descriptor.get_indexes()?;
-        modifier(&mut indexes)?;
-        descriptor.set_indexes(&indexes)?;
-
-        self.pager.batch_put(&[BatchPut::Raw {
-            key: descriptor_pk,
-            bytes: descriptor.to_le_bytes(),
-        }])
-    }
-
-    /// Retrieves the names of registered indexes for a set of columns.
+    /// Retrieves the names of registered indexes for the given columns.
     pub fn get_column_indexes(
         &self,
         field_ids: &[LogicalFieldId],
@@ -151,5 +97,124 @@ impl<P: Pager> IndexManager<P> {
         }
 
         Ok(all_indexes)
+    }
+
+    /// Helper to load, modify, and save descriptor indexes.
+    fn update_indexes<F>(&self, field_id: LogicalFieldId, mut modifier: F) -> Result<()>
+    where
+        F: FnMut(&mut Vec<String>) -> Result<()>,
+    {
+        let catalog = self.catalog.read().unwrap();
+        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+
+        let desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
+
+        let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+        let mut indexes = descriptor.get_indexes()?;
+        modifier(&mut indexes)?;
+        descriptor.set_indexes(&indexes)?;
+
+        self.pager.batch_put(&[BatchPut::Raw {
+            key: descriptor_pk,
+            bytes: descriptor.to_le_bytes(),
+        }])
+    }
+}
+
+/* ======================= Uniform execution interface =================== */
+
+/// Kinds of indexes supported by the engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexKind {
+    Sort,
+    Presence,
+}
+
+/// Hints for incremental updates to an index.
+#[derive(Clone, Debug, Default)]
+pub struct IndexUpdateHint {
+    /// Recompute only these chunk pages. Empty => unknown/all.
+    pub changed_chunk_pks: Vec<crate::types::PhysicalKey>,
+    /// If true, builder may ignore hints and rebuild all.
+    pub full_rebuild_ok: bool,
+}
+
+/// Uniform ops each concrete index must implement.
+///
+/// These do the physical work (compute/alloc/write). They DO NOT change
+/// descriptor index-name lists; call register/unregister separately.
+pub trait IndexOps<P: Pager> {
+    fn build_all(
+        &self,
+        pager: &Arc<P>,
+        catalog: &Arc<RwLock<ColumnCatalog>>,
+        field: LogicalFieldId,
+    ) -> Result<()>;
+
+    fn update(
+        &self,
+        pager: &Arc<P>,
+        catalog: &Arc<RwLock<ColumnCatalog>>,
+        field: LogicalFieldId,
+        hint: &IndexUpdateHint,
+    ) -> Result<()>;
+
+    fn drop_index(
+        &self,
+        pager: &Arc<P>,
+        catalog: &Arc<RwLock<ColumnCatalog>>,
+        field: LogicalFieldId,
+    ) -> Result<()>;
+}
+
+/* ===== Dispatcher: requires Pager blobs to be EntryHandle for sort ===== */
+
+impl<P> IndexManager<P>
+where
+    P: Pager<Blob = EntryHandle>,
+{
+    /// Build from scratch for a populated column.
+    pub fn build_index(&self, kind: IndexKind, field_id: LogicalFieldId) -> Result<()> {
+        match kind {
+            IndexKind::Sort => sort::SortIndexOps.build_all(&self.pager, &self.catalog, field_id),
+            IndexKind::Presence => {
+                presence::PresenceIndexOps.build_all(&self.pager, &self.catalog, field_id)
+            }
+        }
+    }
+
+    /// Incrementally update an existing index.
+    pub fn update_index(
+        &self,
+        kind: IndexKind,
+        field_id: LogicalFieldId,
+        hint: &IndexUpdateHint,
+    ) -> Result<()> {
+        match kind {
+            IndexKind::Sort => {
+                sort::SortIndexOps.update(&self.pager, &self.catalog, field_id, hint)
+            }
+            IndexKind::Presence => {
+                presence::PresenceIndexOps.update(&self.pager, &self.catalog, field_id, hint)
+            }
+        }
+    }
+
+    /// Remove the index and its metadata from the descriptor.
+    pub fn drop_index(&self, kind: IndexKind, field_id: LogicalFieldId) -> Result<()> {
+        match kind {
+            IndexKind::Sort => sort::SortIndexOps.drop_index(&self.pager, &self.catalog, field_id),
+            IndexKind::Presence => {
+                presence::PresenceIndexOps.drop_index(&self.pager, &self.catalog, field_id)
+            }
+        }
     }
 }

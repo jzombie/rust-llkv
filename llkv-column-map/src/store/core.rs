@@ -1343,118 +1343,18 @@ where
         Ok(())
     }
 
+    /// Builds (or rebuilds) the sort index by delegating to the indexing
+    /// module, then registers the "sort" index name on the descriptor.
+    /// This preserves the external behavior while moving the heavy work
+    /// out of core.
     pub fn create_sort_index(&self, field_id: LogicalFieldId) -> Result<()> {
-        let catalog = self.catalog.read().unwrap();
-        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+        // 1) Build physical index (per-chunk permutations, page rewrites).
+        self.index_manager.build_index(IndexKind::Sort, field_id)?;
 
-        let desc_blob = self
-            .pager
-            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?;
-        let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+        // 2) Register the logical index name on the descriptor.
+        //    (Persists inside this call.)
+        self.register_index(field_id, "sort")?;
 
-        let mut all_chunk_metadata = Vec::new();
-        let meta_iter = DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk);
-        for meta_result in meta_iter {
-            all_chunk_metadata.push(meta_result?);
-        }
-
-        let data_chunk_keys: Vec<PhysicalKey> =
-            all_chunk_metadata.iter().map(|m| m.chunk_pk).collect();
-        let gets: Vec<BatchGet> = data_chunk_keys
-            .into_iter()
-            .map(|k| BatchGet::Raw { key: k })
-            .collect();
-        let results = self.pager.batch_get(&gets)?;
-
-        let mut chunks_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-        for result in results {
-            match result {
-                GetResult::Raw { key, bytes } => {
-                    chunks_map.insert(key, bytes);
-                }
-                GetResult::Missing { .. } => return Err(Error::NotFound),
-            }
-        }
-
-        let mut puts = Vec::new();
-        for meta in all_chunk_metadata.iter_mut() {
-            let chunk_blob = chunks_map.get(&meta.chunk_pk).ok_or(Error::NotFound)?;
-            let chunk_array = deserialize_array(chunk_blob.clone())?;
-
-            let sort_column = SortColumn {
-                values: chunk_array,
-                options: None,
-            };
-            let indices = lexsort_to_indices(&[sort_column], None)?;
-            let perm_bytes = serialize_array(&indices)?;
-            let perm_pk = self.pager.alloc_many(1)?[0];
-            puts.push(BatchPut::Raw {
-                key: perm_pk,
-                bytes: perm_bytes,
-            });
-            meta.value_order_perm_pk = perm_pk;
-        }
-
-        // Rewrite descriptor pages with updated perm keys.
-        let mut current_page_pk = descriptor.head_page_pk;
-        let mut page_start_chunk_idx = 0;
-        while current_page_pk != 0 {
-            let page_blob = self
-                .pager
-                .batch_get(&[BatchGet::Raw {
-                    key: current_page_pk,
-                }])?
-                .pop()
-                .and_then(|r| match r {
-                    GetResult::Raw { bytes, .. } => Some(bytes),
-                    _ => None,
-                })
-                .ok_or(Error::NotFound)?
-                .as_ref()
-                .to_vec();
-
-            let header =
-                DescriptorPageHeader::from_le_bytes(&page_blob[..DescriptorPageHeader::DISK_SIZE]);
-            let chunks_on_this_page = header.entry_count as usize;
-            let page_end_chunk_idx = page_start_chunk_idx + chunks_on_this_page;
-            let updated_chunks = &all_chunk_metadata[page_start_chunk_idx..page_end_chunk_idx];
-            let mut new_page_data = Vec::new();
-            for chunk_meta in updated_chunks {
-                new_page_data.extend_from_slice(&chunk_meta.to_le_bytes());
-            }
-
-            let mut final_page_bytes =
-                Vec::with_capacity(DescriptorPageHeader::DISK_SIZE + new_page_data.len());
-            final_page_bytes.extend_from_slice(&header.to_le_bytes());
-            final_page_bytes.extend_from_slice(&new_page_data);
-
-            puts.push(BatchPut::Raw {
-                key: current_page_pk,
-                bytes: final_page_bytes,
-            });
-            current_page_pk = header.next_page_pk;
-            page_start_chunk_idx = page_end_chunk_idx;
-        }
-
-        // TODO: Improve
-        // Register the "sort" index in the descriptor.
-        let mut indexes = descriptor.get_indexes()?;
-        if !indexes.contains(&"sort".to_string()) {
-            indexes.push("sort".to_string());
-            descriptor.set_indexes(&indexes)?;
-        }
-        puts.push(BatchPut::Raw {
-            key: descriptor_pk,
-            bytes: descriptor.to_le_bytes(),
-        });
-
-        self.pager.batch_put(&puts)?;
         Ok(())
     }
 
