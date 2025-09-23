@@ -178,7 +178,6 @@ where
         Ok(false)
     }
 
-    // TODO: Convert all nulls to deletes (don't store them)
     #[allow(unused_variables, unused_assignments)] // TODO: Keep `presence_index_created`?
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         // Ensure we append rows in ascending row_id order to keep row_id chunks
