@@ -9,16 +9,16 @@ publish.workspace = true
 autobenches = false
 
 [dependencies]
-arrow = { version = "56.1.0", default-features = false, features = ["prettyprint"] }
-arrow-ord = "56.1.0"
-modular-bitfield = "0.12.0"
-roaring = "0.11.2"
+arrow = { workspace = true }
+arrow-ord = { workspace = true }
+modular-bitfield = { workspace = true }
+roaring = { workspace = true }
 rustc-hash.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
-thiserror = "2.0.16"
+thiserror = { workspace = true }
 
 [dev-dependencies]
-criterion = { version = "3.0.5", package = "codspeed-criterion-compat" }
+criterion = { workspace = true }
 line-ending.workspace = true
 rand.workspace = true
 
