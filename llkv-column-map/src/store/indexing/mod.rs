@@ -61,6 +61,7 @@ pub(crate) trait IndexOps<P: Pager>: Send + Sync {
         rid_meta: &mut ChunkMetadata,
         puts: &mut Vec<BatchPut>,
     ) -> Result<()>;
+
     /// Stages an index build for a single, existing chunk of data.
     fn stage_build_for_chunk(
         &self,
@@ -68,6 +69,7 @@ pub(crate) trait IndexOps<P: Pager>: Send + Sync {
         meta: &mut ChunkMetadata,
         chunk_blob: &P::Blob,
     ) -> Result<Option<BatchPut>>;
+
     /// Stages the removal of a physical index from a chunk's metadata.
     fn stage_drop_index(
         &self,
@@ -108,7 +110,7 @@ impl<P: Pager<Blob = EntryHandle>> IndexManager<P> {
         // Load the root descriptor for the main data column, which is always needed for logical registration.
         let catalog = column_store.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
-        let desc_blob = column_store
+        let desc_blob = self
             .pager
             .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
             .pop()
@@ -133,7 +135,7 @@ impl<P: Pager<Blob = EntryHandle>> IndexManager<P> {
                 {
                     let mut meta = meta_result?;
                     // Fetch only the data for the current chunk.
-                    let chunk_blob = column_store
+                    let chunk_blob = self
                         .pager
                         .batch_get(&[BatchGet::Raw { key: meta.chunk_pk }])?
                         .pop()
@@ -157,6 +159,7 @@ impl<P: Pager<Blob = EntryHandle>> IndexManager<P> {
 
                 // Logically register the index on the in-memory descriptor FIRST.
                 self.stage_index_registration(&mut descriptor, kind)?;
+
                 // NOW rewrite the descriptor chain, which will serialize the updated descriptor and its pages.
                 column_store.write_descriptor_chain(
                     descriptor_pk,
@@ -210,6 +213,7 @@ impl<P: Pager<Blob = EntryHandle>> IndexManager<P> {
 
                 // Logically register the index on the main data descriptor.
                 self.stage_index_registration(&mut descriptor, kind)?;
+
                 // Stage a write for the main descriptor, as it's now changed.
                 puts.push(BatchPut::Raw {
                     key: descriptor_pk,
@@ -278,6 +282,7 @@ impl<P: Pager<Blob = EntryHandle>> IndexManager<P> {
 
                 // Logically unregister the index first.
                 self.stage_index_unregistration(&mut descriptor, kind)?;
+
                 // Then rewrite the descriptor chain, which will serialize the updated descriptor and its pages.
                 column_store.write_descriptor_chain(
                     descriptor_pk,
@@ -315,11 +320,13 @@ impl<P: Pager<Blob = EntryHandle>> IndexManager<P> {
 
                 // Logically unregister on the main descriptor first.
                 self.stage_index_unregistration(&mut descriptor, kind)?;
+
                 // Stage the write for the main descriptor.
                 puts.push(BatchPut::Raw {
                     key: descriptor_pk,
                     bytes: descriptor.to_le_bytes(),
                 });
+
                 // Then rewrite the now-modified shadow descriptor chain.
                 column_store.write_descriptor_chain(
                     rid_pk,
