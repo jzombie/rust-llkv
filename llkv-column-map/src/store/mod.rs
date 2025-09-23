@@ -14,7 +14,6 @@ pub mod debug;
 pub mod descriptor;
 
 mod ingest;
-use ingest::*;
 
 pub mod layout;
 pub use layout::*;

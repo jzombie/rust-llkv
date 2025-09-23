@@ -837,14 +837,14 @@ where
         // Optionally mirror metas for row_id column.
         let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
         let mut descriptor_rid: Option<ColumnDescriptor> = None;
-        if let Some(pk_rid) = desc_pk_rid {
-            if let Some(desc_blob_rid) = blobs_by_pk.remove(&pk_rid) {
-                let d_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
-                for m in DescriptorIterator::new(self.pager.as_ref(), d_rid.head_page_pk) {
-                    metas_rid.push(m?);
-                }
-                descriptor_rid = Some(d_rid);
+        if let Some(pk_rid) = desc_pk_rid
+            && let Some(desc_blob_rid) = blobs_by_pk.remove(&pk_rid)
+        {
+            let d_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
+            for m in DescriptorIterator::new(self.pager.as_ref(), d_rid.head_page_pk) {
+                metas_rid.push(m?);
             }
+            descriptor_rid = Some(d_rid);
         }
 
         let mut puts = Vec::new();
@@ -856,14 +856,15 @@ where
 
             // Advance deletes into this chunk window [start, end).
             while let Some(d) = cur_del {
-                if d < start_u64 {
-                    if let Some(prev) = last_seen {
-                        if d < prev {
-                            return Err(Error::Internal(
-                                "rows_to_delete must be ascending/unique".into(),
-                            ));
-                        }
+                if d < start_u64
+                    && let Some(prev) = last_seen
+                {
+                    if d < prev {
+                        return Err(Error::Internal(
+                            "rows_to_delete must be ascending/unique".into(),
+                        ));
                     }
+
                     last_seen = Some(d);
                     cur_del = del_iter.next();
                 } else {
