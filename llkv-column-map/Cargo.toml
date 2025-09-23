@@ -19,8 +19,8 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-line-ending.workspace = true
-rand.workspace = true
+line-ending = { workspace = true }
+rand = { workspace = true }
 
 [[bench]]
 name = "column_sum_bench"
