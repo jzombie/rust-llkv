@@ -321,6 +321,7 @@ impl DescriptorPageHeader {
     }
 }
 
+// TODO: Rename to `ColumnDescriptorIterator`?
 /// An iterator that streams `ChunkMetadata` by walking the descriptor page
 /// chain. It only holds one page blob in memory at a time.
 pub(crate) struct DescriptorIterator<'a, P: Pager> {
