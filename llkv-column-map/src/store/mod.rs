@@ -66,6 +66,7 @@ pub struct ColumnStoreConfig {
 impl Default for ColumnStoreConfig {
     fn default() -> Self {
         Self {
+            // TODO: Don't hardcode
             varwidth_fallback_rows_per_slice: 4096,
         }
     }
