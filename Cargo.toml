@@ -16,8 +16,8 @@ simd-r-drive = "0.14.0-alpha"
 simd-r-drive-entry-handle = "0.14.0-alpha"
 
 # Vendor crates
-arrow = { version = "56.1.0", default-features = false, features = ["prettyprint"] }
-arrow-ord = "56.1.0"
+arrow = { version = "56.2.0", default-features = false, features = ["prettyprint"] }
+arrow-ord = "56.2.0"
 bitcode = "0.6.7"
 criterion = { version = "3.0.5", package = "codspeed-criterion-compat" }
 crossbeam-channel = "0.5.15"
