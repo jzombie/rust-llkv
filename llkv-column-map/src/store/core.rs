@@ -264,11 +264,11 @@ where
         }
 
         let mut catalog_dirty = false;
-        let mut catalog = self.catalog.write().unwrap();
         let mut puts_rewrites: Vec<BatchPut> = Vec::new();
         let mut all_rewritten_ids = FxHashSet::default();
 
         // --- LWW Phase: Perform all rewrites first ---
+        let mut catalog = self.catalog.write().unwrap();
         for i in 0..batch.num_columns() {
             if i == row_id_idx {
                 continue;
@@ -293,6 +293,7 @@ where
                 all_rewritten_ids.extend(rewritten);
             }
         }
+        drop(catalog);
 
         if !puts_rewrites.is_empty() {
             self.pager.batch_put(&puts_rewrites)?;
@@ -349,6 +350,7 @@ where
                 continue;
             }
 
+            let mut catalog = self.catalog.write().unwrap();
             let descriptor_pk = *catalog.map.entry(field_id).or_insert_with(|| {
                 catalog_dirty = true;
                 self.pager.alloc_many(1).unwrap()[0]
@@ -365,6 +367,7 @@ where
                 rid_descriptor_pk,
                 rid_fid,
             )?;
+            drop(catalog);
 
             // TODO: Remove?
             // Persist/refresh dtype fingerprint for both data and row-id descriptors.
@@ -484,6 +487,7 @@ where
                 indexes.push(IndexKind::Presence);
                 data_descriptor.set_indexes(&indexes)?;
             }
+            // self.register_index(field_id, IndexKind::Presence)?;
 
             puts_appends.push(BatchPut::Raw {
                 key: data_descriptor.tail_page_pk,
@@ -504,6 +508,7 @@ where
         }
 
         if catalog_dirty {
+            let catalog = self.catalog.read().unwrap();
             puts_appends.push(BatchPut::Raw {
                 key: CATALOG_ROOT_PKEY,
                 bytes: catalog.to_bytes(),
