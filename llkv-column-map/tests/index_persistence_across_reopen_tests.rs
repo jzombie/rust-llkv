@@ -5,10 +5,8 @@ use arrow::array::UInt64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use llkv_column_map::storage::pager::{BatchGet, GetResult, MemPager, Pager};
+use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::store::catalog::ColumnCatalog;
-use llkv_column_map::store::descriptor::{ColumnDescriptor, DescriptorIterator};
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanOptions,

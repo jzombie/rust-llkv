@@ -468,6 +468,7 @@ where
     }
 
     // TODO: Convert all nulls to deletes (don't store them)
+    #[allow(unused_variables, unused_assignments)] // TODO: Keep `presence_index_created`?
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         // Ensure we append rows in ascending row_id order to keep row_id chunks
         // naturally sorted and avoid building presence permutations later.
@@ -1195,7 +1196,7 @@ where
         // Optional: corresponding shadow row_id descriptor + metas.
         let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
         let mut descriptor_rid: Option<ColumnDescriptor> = None;
-        if let (Some(pk), Some(desc_blob_rid)) =
+        if let (Some(_pk), Some(desc_blob_rid)) =
             (desc_pk_rid, blobs_by_pk.remove(&desc_pk_rid.unwrap()))
         {
             let d_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());

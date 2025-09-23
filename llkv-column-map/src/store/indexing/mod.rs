@@ -142,11 +142,11 @@ impl<P: Pager> IndexManager<P> {
         let mut all_indexes = FxHashMap::default();
 
         for result in results {
-            if let GetResult::Raw { key, bytes } = result {
-                if let Some(&field_id) = pk_to_fid.get(&key) {
-                    let descriptor = ColumnDescriptor::from_le_bytes(bytes.as_ref());
-                    all_indexes.insert(field_id, descriptor.get_indexes()?);
-                }
+            if let GetResult::Raw { key, bytes } = result
+                && let Some(&field_id) = pk_to_fid.get(&key)
+            {
+                let descriptor = ColumnDescriptor::from_le_bytes(bytes.as_ref());
+                all_indexes.insert(field_id, descriptor.get_indexes()?);
             }
         }
 

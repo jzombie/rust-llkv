@@ -15,20 +15,20 @@ use std::mem;
 /// This struct's memory layout IS the on-disk format.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct ChunkMetadata {
-    pub chunk_pk: PhysicalKey,
-    pub value_order_perm_pk: PhysicalKey, // Using 0 as None
-    pub row_count: u64,
-    pub serialized_bytes: u64,
-    pub min_val_u64: u64, // For pruning, assumes u64-comparable values
-    pub max_val_u64: u64,
+pub(crate) struct ChunkMetadata {
+    pub(crate) chunk_pk: PhysicalKey,
+    pub(crate) value_order_perm_pk: PhysicalKey, // Using 0 as None
+    pub(crate) row_count: u64,
+    pub(crate) serialized_bytes: u64,
+    pub(crate) min_val_u64: u64, // For pruning, assumes u64-comparable values
+    pub(crate) max_val_u64: u64,
 }
 
 impl ChunkMetadata {
-    pub const DISK_SIZE: usize = mem::size_of::<Self>();
+    pub(crate) const DISK_SIZE: usize = mem::size_of::<Self>();
 
     /// Single allocation; append fields as LE without growth churn.
-    pub fn to_le_bytes(&self) -> Vec<u8> {
+    pub(crate) fn to_le_bytes(self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::DISK_SIZE);
         write_u64_le(&mut buf, self.chunk_pk);
         write_u64_le(&mut buf, self.value_order_perm_pk);
@@ -39,7 +39,7 @@ impl ChunkMetadata {
         buf
     }
 
-    pub fn from_le_bytes(bytes: &[u8]) -> Self {
+    pub(crate) fn from_le_bytes(bytes: &[u8]) -> Self {
         let mut o = 0usize;
         let chunk_pk = read_u64_le(bytes, &mut o);
         let value_order_perm_pk = read_u64_le(bytes, &mut o);
@@ -61,41 +61,26 @@ impl ChunkMetadata {
 
 /// The root metadata object for a single column.
 /// Points to the head/tail of a linked list of DescriptorPages.
-#[derive(Clone, Debug)]
-pub struct ColumnDescriptor {
-    pub field_id: LogicalFieldId,
-    pub head_page_pk: PhysicalKey,
-    pub tail_page_pk: PhysicalKey,
-    pub total_row_count: u64,
-    pub total_chunk_count: u64,
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ColumnDescriptor {
+    pub(crate) field_id: LogicalFieldId,
+    pub(crate) head_page_pk: PhysicalKey,
+    pub(crate) tail_page_pk: PhysicalKey,
+    pub(crate) total_row_count: u64,
+    pub(crate) total_chunk_count: u64,
     /// Optional Arrow data type code (0 => unknown). Persisted to avoid peeking chunks.
-    pub data_type_code: u32,
-    pub _padding: u32,
+    pub(crate) data_type_code: u32,
+    pub(crate) _padding: u32,
     /// Serialized index metadata.
-    pub index_metadata: Vec<u8>,
-}
-
-impl Default for ColumnDescriptor {
-    fn default() -> Self {
-        Self {
-            field_id: LogicalFieldId::default(),
-            head_page_pk: 0,
-            tail_page_pk: 0,
-            total_row_count: 0,
-            total_chunk_count: 0,
-            data_type_code: 0,
-            _padding: 0,
-            index_metadata: Vec::new(),
-        }
-    }
+    pub(crate) index_metadata: Vec<u8>,
 }
 
 impl ColumnDescriptor {
-    pub const FIXED_DISK_SIZE_WITHOUT_INDEX_META: usize = 48;
-    pub const FIXED_DISK_SIZE: usize = Self::FIXED_DISK_SIZE_WITHOUT_INDEX_META + 4; // + index_meta_len
+    pub(crate) const FIXED_DISK_SIZE_WITHOUT_INDEX_META: usize = 48;
+    pub(crate) const FIXED_DISK_SIZE: usize = Self::FIXED_DISK_SIZE_WITHOUT_INDEX_META + 4; // + index_meta_len
 
     /// Single allocation; append fields as LE without growth churn.
-    pub fn to_le_bytes(&self) -> Vec<u8> {
+    pub(crate) fn to_le_bytes(&self) -> Vec<u8> {
         let index_meta_len = self.index_metadata.len() as u32;
         let mut buf = Vec::with_capacity(Self::FIXED_DISK_SIZE + self.index_metadata.len());
         let field_id_u64: u64 = self.field_id.into();
@@ -111,7 +96,7 @@ impl ColumnDescriptor {
         buf
     }
 
-    pub fn from_le_bytes(bytes: &[u8]) -> Self {
+    pub(crate) fn from_le_bytes(bytes: &[u8]) -> Self {
         let mut o = 0usize;
         let field_id = LogicalFieldId::from(read_u64_le(bytes, &mut o));
         let head_page_pk = read_u64_le(bytes, &mut o);
@@ -148,8 +133,8 @@ impl ColumnDescriptor {
     }
 
     /// Deserializes index names from metadata using a custom format.
-    /// Format: [num_indexes: u32_le] [[len1: u32_le] [string1_bytes]]...
-    pub fn get_indexes(&self) -> Result<Vec<String>> {
+    /// Format: \[num_indexes: u32_le\] \[\[len1: u32_le\] \[string1_bytes\]\]...
+    pub(crate) fn get_indexes(&self) -> Result<Vec<String>> {
         if self.index_metadata.is_empty() {
             return Ok(Vec::new());
         }
@@ -182,7 +167,7 @@ impl ColumnDescriptor {
     }
 
     /// Serializes and sets index names to metadata using a custom format.
-    pub fn set_indexes(&mut self, indexes: &[String]) -> Result<()> {
+    pub(crate) fn set_indexes(&mut self, indexes: &[String]) -> Result<()> {
         let mut buf = Vec::new();
         write_u32_le(&mut buf, indexes.len() as u32);
         for index in indexes {
@@ -200,15 +185,15 @@ impl ColumnDescriptor {
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct DescriptorPageHeader {
-    pub next_page_pk: PhysicalKey, // Using 0 as None
-    pub entry_count: u32,
-    pub _padding: [u8; 4],
+    pub(crate) next_page_pk: PhysicalKey, // Using 0 as None
+    pub(crate) entry_count: u32,
+    pub(crate) _padding: [u8; 4],
 }
 
 impl DescriptorPageHeader {
-    pub const DISK_SIZE: usize = mem::size_of::<Self>();
+    pub(crate) const DISK_SIZE: usize = mem::size_of::<Self>();
 
-    pub fn to_le_bytes(&self) -> [u8; Self::DISK_SIZE] {
+    pub(crate) fn to_le_bytes(self) -> [u8; Self::DISK_SIZE] {
         let mut v = Vec::with_capacity(Self::DISK_SIZE);
         write_u64_le(&mut v, self.next_page_pk);
         write_u32_le(&mut v, self.entry_count);
@@ -220,7 +205,7 @@ impl DescriptorPageHeader {
         buf
     }
 
-    pub fn from_le_bytes(bytes: &[u8]) -> Self {
+    pub(crate) fn from_le_bytes(bytes: &[u8]) -> Self {
         let mut o = 0usize;
         let next_page_pk = read_u64_le(bytes, &mut o);
         let entry_count = read_u32_le(bytes, &mut o);
@@ -234,7 +219,7 @@ impl DescriptorPageHeader {
 
 /// An iterator that streams `ChunkMetadata` by walking the descriptor page
 /// chain. It only holds one page blob in memory at a time.
-pub struct DescriptorIterator<'a, P: Pager> {
+pub(crate) struct DescriptorIterator<'a, P: Pager> {
     pager: &'a P,
     current_page_pk: PhysicalKey,
     current_blob: Option<P::Blob>,
@@ -242,7 +227,7 @@ pub struct DescriptorIterator<'a, P: Pager> {
 }
 
 impl<'a, P: Pager> DescriptorIterator<'a, P> {
-    pub fn new(pager: &'a P, head_page_pk: PhysicalKey) -> Self {
+    pub(crate) fn new(pager: &'a P, head_page_pk: PhysicalKey) -> Self {
         Self {
             pager,
             current_page_pk: head_page_pk,
@@ -298,17 +283,18 @@ impl<'a, P: Pager> Iterator for DescriptorIterator<'a, P> {
     }
 }
 
-/// Build a descriptor page payload (header + packed entries) with a single
-/// allocation. Useful when rewriting a page after metadata updates.
-pub fn build_descriptor_page_bytes(
-    header: &DescriptorPageHeader,
-    entries: &[ChunkMetadata],
-) -> Vec<u8> {
-    let cap = DescriptorPageHeader::DISK_SIZE + entries.len() * ChunkMetadata::DISK_SIZE;
-    let mut page = Vec::with_capacity(cap);
-    page.extend_from_slice(&header.to_le_bytes());
-    for m in entries {
-        page.extend_from_slice(&m.to_le_bytes());
-    }
-    page
-}
+// TODO: Keep?
+// Build a descriptor page payload (header + packed entries) with a single
+// allocation. Useful when rewriting a page after metadata updates.
+// pub(crate) fn build_descriptor_page_bytes(
+//     header: &DescriptorPageHeader,
+//     entries: &[ChunkMetadata],
+// ) -> Vec<u8> {
+//     let cap = DescriptorPageHeader::DISK_SIZE + entries.len() * ChunkMetadata::DISK_SIZE;
+//     let mut page = Vec::with_capacity(cap);
+//     page.extend_from_slice(&header.to_le_bytes());
+//     for m in entries {
+//         page.extend_from_slice(&m.to_le_bytes());
+//     }
+//     page
+// }
