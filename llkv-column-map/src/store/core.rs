@@ -51,15 +51,17 @@ where
         })
     }
 
-    /// Registers an index for a given column, building it for existing data atomically.
+    /// Registers an index for a given column, building it for existing data atomically and with low memory usage.
     pub fn register_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
-        // PHASE 1: READ
-        // Read all necessary metadata and data for the column from storage into memory.
-        // This is done upfront to prepare for the transaction.
+        // This vector will collect all write operations to be committed in one batch.
+        let mut puts = Vec::new();
+        // This vector collects keys of any descriptor pages that are deallocated.
+        let mut frees = Vec::new();
+
+        // --- PHASE 1: READ DESCRIPTORS ---
+        // Load the root descriptor for the main data column, which is always needed for logical registration.
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
-
-        // Fetch the root ColumnDescriptor for the column.
         let desc_blob = self
             .pager
             .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
@@ -71,75 +73,133 @@ where
             .ok_or(Error::NotFound)?;
         let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
-        // Walk the descriptor's page chain to load all of its ChunkMetadata.
-        let mut metas: Vec<ChunkMetadata> =
-            DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk)
-                .collect::<Result<_>>()?;
+        // --- PHASE 2: STAGE PHYSICAL INDEX DATA (CHUNK-BY-CHUNK) ---
+        match kind {
+            IndexKind::Sort => {
+                // The Sort index operates on the main data column's chunks.
+                // This vector will hold the modified metadata to rewrite the descriptor pages at the end.
+                let mut modified_metas = Vec::new();
 
-        // Batch-fetch all raw data chunks associated with the metadata.
-        let gets: Vec<BatchGet> = metas
-            .iter()
-            .map(|m| BatchGet::Raw { key: m.chunk_pk })
-            .collect();
-        let results = self.pager.batch_get(&gets)?;
-        let mut chunk_blobs = FxHashMap::default();
-        for r in results {
-            if let GetResult::Raw { key, bytes } = r {
-                chunk_blobs.insert(key, bytes);
-            } else {
-                return Err(Error::NotFound); // A chunk is missing
+                // Iterate through the column's metadata one chunk at a time to keep memory usage low.
+                for meta_result in
+                    DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk)
+                {
+                    let mut meta = meta_result?;
+                    // Fetch only the data for the current chunk.
+                    let chunk_blob = self
+                        .pager
+                        .batch_get(&[BatchGet::Raw { key: meta.chunk_pk }])?
+                        .pop()
+                        .and_then(|r| match r {
+                            GetResult::Raw { bytes, .. } => Some(bytes),
+                            _ => None,
+                        })
+                        .ok_or(Error::NotFound)?;
+
+                    // Call the specialist to build the index for this single chunk.
+                    // This modifies `meta` in-place and returns a `BatchPut` for any new permutation blob.
+                    if let Some(put) = <sort::SortIndexOps as IndexOps<P>>::stage_build_for_chunk(
+                        &self.index_manager.sort_ops,
+                        &self.pager,
+                        &mut meta,
+                        &chunk_blob,
+                    )? {
+                        puts.push(put);
+                    }
+                    modified_metas.push(meta);
+                }
+
+                // Logically register the index on the in-memory descriptor FIRST.
+                self.index_manager
+                    .stage_index_registration(&mut descriptor, kind)?;
+                // NOW rewrite the descriptor chain, which will serialize the updated descriptor and its pages.
+                self.write_descriptor_chain(
+                    descriptor_pk,
+                    &mut descriptor,
+                    &modified_metas,
+                    &mut puts,
+                    &mut frees,
+                )?;
             }
-        }
-        drop(catalog);
+            IndexKind::Presence => {
+                // The Presence index operates on the shadow row_id column.
+                let rid_fid = rowid_fid(field_id);
+                let rid_pk = *catalog.map.get(&rid_fid).ok_or(Error::NotFound)?;
+                let rid_desc_blob = self
+                    .pager
+                    .batch_get(&[BatchGet::Raw { key: rid_pk }])?
+                    .pop()
+                    .and_then(|r| match r {
+                        GetResult::Raw { bytes, .. } => Some(bytes),
+                        _ => None,
+                    })
+                    .ok_or(Error::NotFound)?;
+                let mut rid_desc = ColumnDescriptor::from_le_bytes(rid_desc_blob.as_ref());
 
-        // PHASE 2: STAGE WRITES
-        // Perform all logic on the in-memory data and collect the resulting write
-        // operations into a `puts` vector. Nothing is written to storage yet.
+                let mut modified_rid_metas = Vec::new();
+                for meta_result in
+                    DescriptorIterator::new(self.pager.as_ref(), rid_desc.head_page_pk)
+                {
+                    let mut meta = meta_result?;
+                    let chunk_blob = self
+                        .pager
+                        .batch_get(&[BatchGet::Raw { key: meta.chunk_pk }])?
+                        .pop()
+                        .and_then(|r| match r {
+                            GetResult::Raw { bytes, .. } => Some(bytes),
+                            _ => None,
+                        })
+                        .ok_or(Error::NotFound)?;
 
-        // Dispatch to the correct index implementation (Sort or Presence). The `stage_build_all`
-        // method computes the physical index data (e.g., permutations), modifies the in-memory
-        // `metas` to link to them, and returns a vector of `BatchPut` operations for the new index data.
-        let mut puts = match kind {
-            IndexKind::Sort => self.index_manager.sort_ops.stage_build_all(
-                &self.pager,
-                &mut metas,
-                &chunk_blobs,
-            )?,
-            IndexKind::Presence => self.index_manager.presence_ops.stage_build_all(
-                &self.pager,
-                &mut metas,
-                &chunk_blobs,
-            )?,
+                    if let Some(put) =
+                        <presence::PresenceIndexOps as IndexOps<P>>::stage_build_for_chunk(
+                            &self.index_manager.presence_ops,
+                            &self.pager,
+                            &mut meta,
+                            &chunk_blob,
+                        )?
+                    {
+                        puts.push(put);
+                    }
+                    modified_rid_metas.push(meta);
+                }
+
+                // Logically register the index on the main data descriptor.
+                self.index_manager
+                    .stage_index_registration(&mut descriptor, kind)?;
+                // Stage a write for the main descriptor, as it's now changed.
+                puts.push(BatchPut::Raw {
+                    key: descriptor_pk,
+                    bytes: descriptor.to_le_bytes(),
+                });
+                // Separately, rewrite the descriptor chain for the shadow row_id column.
+                self.write_descriptor_chain(
+                    rid_pk,
+                    &mut rid_desc,
+                    &modified_rid_metas,
+                    &mut puts,
+                    &mut frees,
+                )?;
+            }
         };
 
-        // Logically enable the index by updating the in-memory descriptor's metadata.
-        self.index_manager
-            .stage_index_registration(&mut descriptor, kind)?;
+        drop(catalog);
 
-        // Stage the writes for the (now modified) descriptor metadata pages.
-        descriptor.rewrite_pages(
-            Arc::clone(&self.pager),
-            descriptor_pk,
-            &mut metas,
-            &mut puts,
-        )?;
-
-        // Stage the write for the final, updated root ColumnDescriptor itself.
-        puts.push(BatchPut::Raw {
-            key: descriptor_pk,
-            bytes: descriptor.to_le_bytes(),
-        });
-
-        // PHASE 3: COMMIT
-        // Atomically write all staged operations to the pager in a single batch.
-        self.pager.batch_put(&puts)?;
+        // --- PHASE 3: COMMIT ---
+        // Atomically write all staged operations to the pager.
+        if !puts.is_empty() {
+            self.pager.batch_put(&puts)?;
+        }
+        if !frees.is_empty() {
+            self.pager.free_many(&frees)?;
+        }
         Ok(())
     }
 
     /// Unregisters a persisted index from a given column atomically.
     pub fn unregister_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
-        // PHASE 1: READ
-        // Read all necessary metadata for the column from storage into memory.
+        let mut puts = Vec::new();
+        let mut frees = Vec::new();
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
         let desc_blob = self
@@ -152,53 +212,85 @@ where
             })
             .ok_or(Error::NotFound)?;
         let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-        let mut metas: Vec<ChunkMetadata> =
-            DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk)
-                .collect::<Result<_>>()?;
+
+        match kind {
+            IndexKind::Sort => {
+                // The Sort index lives on the main data column.
+                let mut metas: Vec<ChunkMetadata> =
+                    DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk)
+                        .collect::<Result<_>>()?;
+
+                // `stage_drop_index` modifies `metas` in-place (clearing perm_pk) and returns a list of keys to free.
+                let sort_frees = <sort::SortIndexOps as IndexOps<P>>::stage_drop_index(
+                    &self.index_manager.sort_ops,
+                    &self.pager,
+                    &mut metas,
+                )?;
+                frees.extend(sort_frees);
+
+                // Logically unregister the index first.
+                self.index_manager
+                    .stage_index_unregistration(&mut descriptor, kind)?;
+                // Then rewrite the descriptor chain, which will serialize the updated descriptor and its pages.
+                self.write_descriptor_chain(
+                    descriptor_pk,
+                    &mut descriptor,
+                    &metas,
+                    &mut puts,
+                    &mut frees,
+                )?;
+            }
+            IndexKind::Presence => {
+                // The Presence index lives on the shadow row_id column.
+                let rid_fid = rowid_fid(field_id);
+                let rid_pk = *catalog.map.get(&rid_fid).ok_or(Error::NotFound)?;
+                let rid_desc_blob = self
+                    .pager
+                    .batch_get(&[BatchGet::Raw { key: rid_pk }])?
+                    .pop()
+                    .and_then(|r| match r {
+                        GetResult::Raw { bytes, .. } => Some(bytes),
+                        _ => None,
+                    })
+                    .ok_or(Error::NotFound)?;
+                let mut rid_desc = ColumnDescriptor::from_le_bytes(rid_desc_blob.as_ref());
+
+                let mut rid_metas: Vec<ChunkMetadata> =
+                    DescriptorIterator::new(self.pager.as_ref(), rid_desc.head_page_pk)
+                        .collect::<Result<_>>()?;
+
+                let presence_frees = <presence::PresenceIndexOps as IndexOps<P>>::stage_drop_index(
+                    &self.index_manager.presence_ops,
+                    &self.pager,
+                    &mut rid_metas,
+                )?;
+                frees.extend(presence_frees);
+
+                // Logically unregister on the main descriptor first.
+                self.index_manager
+                    .stage_index_unregistration(&mut descriptor, kind)?;
+                // Stage the write for the main descriptor.
+                puts.push(BatchPut::Raw {
+                    key: descriptor_pk,
+                    bytes: descriptor.to_le_bytes(),
+                });
+                // Then rewrite the now-modified shadow descriptor chain.
+                self.write_descriptor_chain(
+                    rid_pk,
+                    &mut rid_desc,
+                    &rid_metas,
+                    &mut puts,
+                    &mut frees,
+                )?;
+            }
+        }
+
         drop(catalog);
 
-        // PHASE 2: STAGE WRITES & FREES
-        // Perform all logic and collect the resulting write and free operations.
-
-        // Dispatch to the correct index implementation. `stage_drop_index` clears the index
-        // pointers from the in-memory `metas` and returns a list of physical keys for the
-        // now-obsolete index data that should be freed from storage.
-        let frees = match kind {
-            IndexKind::Sort => self
-                .index_manager
-                .sort_ops
-                .stage_drop_index(&self.pager, &mut metas)?,
-            IndexKind::Presence => self
-                .index_manager
-                .presence_ops
-                .stage_drop_index(&self.pager, &mut metas)?,
-        };
-
-        // This vector will collect all the writes needed for the metadata updates.
-        let mut puts = Vec::new();
-
-        // Logically disable the index by updating the in-memory descriptor's metadata.
-        self.index_manager
-            .stage_index_unregistration(&mut descriptor, kind)?;
-
-        // Stage the writes for the descriptor pages, which now contain metadata
-        // with the index pointers removed.
-        descriptor.rewrite_pages(
-            Arc::clone(&self.pager),
-            descriptor_pk,
-            &mut metas,
-            &mut puts,
-        )?;
-
-        // Stage the write for the final, updated root ColumnDescriptor.
-        puts.push(BatchPut::Raw {
-            key: descriptor_pk,
-            bytes: descriptor.to_le_bytes(),
-        });
-
-        // PHASE 3: COMMIT
-        // Atomically write all metadata changes and free the old index data.
-        self.pager.batch_put(&puts)?;
+        // Commit all staged metadata writes and free the old index data.
+        if !puts.is_empty() {
+            self.pager.batch_put(&puts)?;
+        }
         if !frees.is_empty() {
             self.pager.free_many(&frees)?;
         }

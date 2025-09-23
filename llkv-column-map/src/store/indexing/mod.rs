@@ -58,15 +58,15 @@ pub(crate) trait IndexOps<P: Pager>: Send + Sync {
         puts: &mut Vec<BatchPut>,
     ) -> Result<()>;
 
-    /// Stages a full index build from existing data.
-    fn stage_build_all(
+    /// Stages an index build for a single, existing chunk of data.
+    fn stage_build_for_chunk(
         &self,
-        pager: &Arc<P>,
-        metas: &mut [ChunkMetadata],
-        chunk_blobs: &rustc_hash::FxHashMap<PhysicalKey, P::Blob>,
-    ) -> Result<Vec<BatchPut>>;
+        pager: &Arc<P>, // Only used for pager.alloc_many()
+        meta: &mut ChunkMetadata,
+        chunk_blob: &P::Blob,
+    ) -> Result<Option<BatchPut>>;
 
-    /// Stages the removal of a physical index.
+    /// Stages the removal of a physical index from a chunk's metadata.
     fn stage_drop_index(
         &self,
         pager: &Arc<P>,
@@ -91,7 +91,6 @@ impl<P: Pager> IndexManager<P> {
     }
 
     /// Dispatches updates for a new data chunk to all registered indexes for that column.
-    /// Called by `append` to make index maintenance automatic.
     #[allow(clippy::too_many_arguments)] // TODO: Refactor
     pub(crate) fn stage_updates_for_new_chunk(
         &self,
@@ -106,7 +105,6 @@ impl<P: Pager> IndexManager<P> {
     where
         P: Pager<Blob = EntryHandle>,
     {
-        // Get the list of logically active indexes from the descriptor.
         let active_indexes = descriptor.get_indexes()?;
 
         for index_kind in active_indexes {
