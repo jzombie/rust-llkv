@@ -53,10 +53,13 @@ where
 
     /// Registers an index for a given column, building it for existing data atomically.
     pub fn register_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
-        // 1. --- PREPARE & READ PHASE (Coordinator's Job) ---
+        // PHASE 1: READ
+        // Read all necessary metadata and data for the column from storage into memory.
+        // This is done upfront to prepare for the transaction.
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
 
+        // Fetch the root ColumnDescriptor for the column.
         let desc_blob = self
             .pager
             .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
@@ -68,10 +71,12 @@ where
             .ok_or(Error::NotFound)?;
         let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
+        // Walk the descriptor's page chain to load all of its ChunkMetadata.
         let mut metas: Vec<ChunkMetadata> =
             DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk)
                 .collect::<Result<_>>()?;
 
+        // Batch-fetch all raw data chunks associated with the metadata.
         let gets: Vec<BatchGet> = metas
             .iter()
             .map(|m| BatchGet::Raw { key: m.chunk_pk })
@@ -87,7 +92,13 @@ where
         }
         drop(catalog);
 
-        // 2. --- STAGING PHASE (Call the Specialist) ---
+        // PHASE 2: STAGE WRITES
+        // Perform all logic on the in-memory data and collect the resulting write
+        // operations into a `puts` vector. Nothing is written to storage yet.
+
+        // Dispatch to the correct index implementation (Sort or Presence). The `stage_build_all`
+        // method computes the physical index data (e.g., permutations), modifies the in-memory
+        // `metas` to link to them, and returns a vector of `BatchPut` operations for the new index data.
         let mut puts = match kind {
             IndexKind::Sort => self.index_manager.sort_ops.stage_build_all(
                 &self.pager,
@@ -101,27 +112,34 @@ where
             )?,
         };
 
+        // Logically enable the index by updating the in-memory descriptor's metadata.
         self.index_manager
             .stage_index_registration(&mut descriptor, kind)?;
+
+        // Stage the writes for the (now modified) descriptor metadata pages.
         descriptor.rewrite_pages(
             Arc::clone(&self.pager),
             descriptor_pk,
             &mut metas,
             &mut puts,
         )?;
+
+        // Stage the write for the final, updated root ColumnDescriptor itself.
         puts.push(BatchPut::Raw {
             key: descriptor_pk,
             bytes: descriptor.to_le_bytes(),
         });
 
-        // 3. --- COMMIT PHASE (Coordinator's Job) ---
+        // PHASE 3: COMMIT
+        // Atomically write all staged operations to the pager in a single batch.
         self.pager.batch_put(&puts)?;
         Ok(())
     }
 
     /// Unregisters a persisted index from a given column atomically.
     pub fn unregister_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
-        // 1. --- PREPARE & READ PHASE ---
+        // PHASE 1: READ
+        // Read all necessary metadata for the column from storage into memory.
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
         let desc_blob = self
@@ -139,7 +157,12 @@ where
                 .collect::<Result<_>>()?;
         drop(catalog);
 
-        // 2. --- STAGING PHASE ---
+        // PHASE 2: STAGE WRITES & FREES
+        // Perform all logic and collect the resulting write and free operations.
+
+        // Dispatch to the correct index implementation. `stage_drop_index` clears the index
+        // pointers from the in-memory `metas` and returns a list of physical keys for the
+        // now-obsolete index data that should be freed from storage.
         let frees = match kind {
             IndexKind::Sort => self
                 .index_manager
@@ -151,21 +174,30 @@ where
                 .stage_drop_index(&self.pager, &mut metas)?,
         };
 
+        // This vector will collect all the writes needed for the metadata updates.
         let mut puts = Vec::new();
+
+        // Logically disable the index by updating the in-memory descriptor's metadata.
         self.index_manager
             .stage_index_unregistration(&mut descriptor, kind)?;
+
+        // Stage the writes for the descriptor pages, which now contain metadata
+        // with the index pointers removed.
         descriptor.rewrite_pages(
             Arc::clone(&self.pager),
             descriptor_pk,
             &mut metas,
             &mut puts,
         )?;
+
+        // Stage the write for the final, updated root ColumnDescriptor.
         puts.push(BatchPut::Raw {
             key: descriptor_pk,
             bytes: descriptor.to_le_bytes(),
         });
 
-        // 3. --- COMMIT PHASE ---
+        // PHASE 3: COMMIT
+        // Atomically write all metadata changes and free the old index data.
         self.pager.batch_put(&puts)?;
         if !frees.is_empty() {
             self.pager.free_many(&frees)?;
