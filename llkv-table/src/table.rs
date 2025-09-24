@@ -632,6 +632,245 @@ mod tests {
     }
 
     #[test]
+    fn test_filtered_scan_sum_i32_kernel() {
+        use arrow::compute::sum;
+
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        // Same IN filter on a_u64 to select rows with c_i32 = [10, 30].
+        let candidates = [100.into(), 300.into()];
+        let filter = Filter {
+            field_id: COL_A_U64,
+            op: Operator::In(&candidates),
+        };
+
+        let projection = vec![COL_C_I32];
+        let batch = table.scan(&projection, &filter).unwrap();
+
+        assert_eq!(batch.num_columns(), 1);
+        let c_vals = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        // Sum over the filtered c_i32 column: 10 + 30 = 40.
+        let total = sum(c_vals).expect("non-empty sum");
+        assert_eq!(total, 40);
+    }
+
+    #[test]
+    fn test_filtered_scan_min_max_kernel() {
+        use arrow::compute::{max, min};
+
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        // Filter rows where a_u64 IN {100, 300}. That selects row_ids with
+        // c_i32 values [10, 30] in our fixture.
+        let candidates = [100.into(), 300.into()];
+        let filter = Filter {
+            field_id: COL_A_U64,
+            op: Operator::In(&candidates),
+        };
+
+        let projection = vec![COL_C_I32];
+        let batch = table.scan(&projection, &filter).unwrap();
+
+        assert_eq!(batch.num_columns(), 1);
+        let c_vals = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        // min/max should be 10 and 30 respectively.
+        let mn = min(c_vals).expect("non-empty min");
+        let mx = max(c_vals).expect("non-empty max");
+        assert_eq!(mn, 10);
+        assert_eq!(mx, 30);
+    }
+
+    #[test]
+    fn test_filtered_scan_int_sqrt_float64() {
+        use arrow::array::Float64Array;
+        use arrow::compute::cast;
+
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        // Filter rows where c_i32 > 15: picks rows with a_u64 = [200, 300, 200]
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::GreaterThan(15.into()),
+        };
+
+        // Project the a_u64 column, then compute sqrt(a_u64) as f64.
+        let projection = vec![COL_A_U64];
+        let batch = table.scan(&projection, &filter).unwrap();
+
+        assert_eq!(batch.num_columns(), 1);
+
+        // Cast UInt64 -> Float64 for math
+        let a_as_f64 = cast(batch.column(0), &arrow::datatypes::DataType::Float64).unwrap();
+        let a_as_f64 = a_as_f64.as_any().downcast_ref::<Float64Array>().unwrap();
+
+        // Apply sqrt in pure Rust over Option<f64> iterator
+        let sqrt_vals = (0..a_as_f64.len()).map(|i| {
+            if a_as_f64.is_null(i) {
+                None
+            } else {
+                let v = a_as_f64.value(i);
+                Some(v.sqrt())
+            }
+        });
+
+        let sqrt_arr = Float64Array::from_iter(sqrt_vals);
+
+        // Expected: sqrt([200, 300, 200])
+        let expected = [200_f64.sqrt(), 300_f64.sqrt(), 200_f64.sqrt()];
+
+        let got: Vec<Option<f64>> = (0..sqrt_arr.len())
+            .map(|i| {
+                if sqrt_arr.is_null(i) {
+                    None
+                } else {
+                    Some(sqrt_arr.value(i))
+                }
+            })
+            .collect();
+
+        assert_eq!(got, expected.iter().copied().map(Some).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_multi_field_kernels_with_filters() {
+        use arrow::array::{Float64Array, Int16Array, UInt8Array, UInt32Array};
+        use arrow::compute::{cast, max, min, sum};
+        use std::collections::HashMap;
+
+        let table = Table::new(2, TableCfg::default());
+
+        // Field ids for this test table.
+        const COL_A_U64: FieldId = 20;
+        const COL_D_U32: FieldId = 21;
+        const COL_E_I16: FieldId = 22;
+        const COL_F_U8: FieldId = 23;
+        const COL_C_I32: FieldId = 24;
+
+        // Schema: row_id, a_u64, d_u32, e_i16, f_u8, c_i32.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_A_U64.to_string(),
+            )])),
+            Field::new("d_u32", DataType::UInt32, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_D_U32.to_string(),
+            )])),
+            Field::new("e_i16", DataType::Int16, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_E_I16.to_string(),
+            )])),
+            Field::new("f_u8", DataType::UInt8, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_F_U8.to_string(),
+            )])),
+            Field::new("c_i32", DataType::Int32, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_C_I32.to_string(),
+            )])),
+        ]));
+
+        // Data: 5 rows. We will filter c_i32 >= 20 -> keep rows 2..5.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(UInt64Array::from(vec![100, 225, 400, 900, 1600])),
+                Arc::new(UInt32Array::from(vec![7, 8, 9, 10, 11])),
+                Arc::new(Int16Array::from(vec![-3, 0, 3, -6, 6])),
+                Arc::new(UInt8Array::from(vec![2, 4, 6, 8, 10])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+
+        table.append(&batch).unwrap();
+
+        // Filter: c_i32 >= 20.
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::GreaterThanOrEquals(20.into()),
+        };
+
+        // 1) SUM over d_u32 under the filter.
+        let proj_d = vec![COL_D_U32];
+        let batch_d = table.scan(&proj_d, &filter).unwrap();
+        let d_vals = batch_d
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let d_sum = sum(d_vals).expect("non-empty sum");
+        assert_eq!(d_sum, 8 + 9 + 10 + 11);
+
+        // 2) MIN over e_i16 under the filter.
+        let proj_e = vec![COL_E_I16];
+        let batch_e = table.scan(&proj_e, &filter).unwrap();
+        let e_vals = batch_e
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+        let e_min = min(e_vals).expect("non-empty min");
+        assert_eq!(e_min, -6);
+
+        // 3) MAX over f_u8 under the filter.
+        let proj_f = vec![COL_F_U8];
+        let batch_f = table.scan(&proj_f, &filter).unwrap();
+        let f_vals = batch_f
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap();
+        let f_max = max(f_vals).expect("non-empty max");
+        assert_eq!(f_max, 10);
+
+        // 4) SQRT over a_u64 under the filter. Cast to Float64, then sqrt.
+        let proj_a = vec![COL_A_U64];
+        let batch_a = table.scan(&proj_a, &filter).unwrap();
+        let a_as_f64 = cast(batch_a.column(0), &arrow::datatypes::DataType::Float64).unwrap();
+        let a_as_f64 = a_as_f64.as_any().downcast_ref::<Float64Array>().unwrap();
+        let sqrt_vals = (0..a_as_f64.len()).map(|i| {
+            if a_as_f64.is_null(i) {
+                None
+            } else {
+                Some(a_as_f64.value(i).sqrt())
+            }
+        });
+        let sqrt_arr = Float64Array::from_iter(sqrt_vals);
+
+        // Expected sqrt for filtered rows: [225, 400, 900, 1600].
+        let expected = [15.0_f64, 20.0, 30.0, 40.0];
+        let got: Vec<Option<f64>> = (0..sqrt_arr.len())
+            .map(|i| {
+                if sqrt_arr.is_null(i) {
+                    None
+                } else {
+                    Some(sqrt_arr.value(i))
+                }
+            })
+            .collect();
+        assert_eq!(got, expected.iter().copied().map(Some).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn test_scan_with_in_filter() {
         let table = setup_test_table();
         const COL_A_U64: FieldId = 10;
