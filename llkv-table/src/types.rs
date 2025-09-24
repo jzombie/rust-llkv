@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+// TODO: Map these types directly from `llkv-column-map` and don't reintroduce them.
+
 /// Field identifier type for addressing columns within a table.
 pub type FieldId = u32;
 
