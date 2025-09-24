@@ -1,4 +1,4 @@
-use std::ops::{Bound, RangeBounds};
+use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int32Array, PrimitiveArray, RecordBatch, UInt64Array};
@@ -88,9 +88,7 @@ fn filter_data_type(op: &Operator<'_>) -> Result<DataType, CmError> {
                 CmError::Internal("IN operator requires at least one value".to_string())
             })?;
             let dtype = scalar_data_type(first);
-            let all_match = values
-                .iter()
-                .all(|value| scalar_data_type(value) == dtype);
+            let all_match = values.iter().all(|value| scalar_data_type(value) == dtype);
             if all_match {
                 Ok(dtype)
             } else {
@@ -105,95 +103,245 @@ fn filter_data_type(op: &Operator<'_>) -> Result<DataType, CmError> {
     }
 }
 
-/// Generic helper to apply filters for any primitive type that supports them.
-fn apply_primitive_filter<'a, T, P, V, F>(
-    make_builder: F,
-    op: &Operator<'a>,
-    visitor: &mut V,
-) -> Result<(), CmError>
+enum RangeLimit<T> {
+    Included(T),
+    Excluded(T),
+}
+
+enum Predicate<T>
 where
     T: ArrowPrimitiveType,
-    T::Native: scan::RangeKey + Copy,
-    P: llkv_column_map::storage::pager::Pager<Blob = simd_r_drive_entry_handle::EntryHandle>,
-    V: scan::PrimitiveVisitor
-        + scan::PrimitiveWithRowIdsVisitor
-        + scan::PrimitiveSortedVisitor
-        + scan::PrimitiveSortedWithRowIdsVisitor,
-    F: Fn() -> ScanBuilder<'a, P>,
 {
-    struct BoundRange<T> {
-        start: Bound<T>,
-        end: Bound<T>,
-    }
+    All,
+    Equals(T::Native),
+    GreaterThan(T::Native),
+    GreaterThanOrEquals(T::Native),
+    LessThan(T::Native),
+    LessThanOrEquals(T::Native),
+    Range {
+        lower: Option<RangeLimit<T::Native>>,
+        upper: Option<RangeLimit<T::Native>>,
+    },
+    In(Vec<T::Native>),
+}
 
-    impl<T: Copy> RangeBounds<T> for BoundRange<T> {
-        fn start_bound(&self) -> Bound<&T> {
-            match &self.start {
-                Bound::Unbounded => Bound::Unbounded,
-                Bound::Included(v) => Bound::Included(v),
-                Bound::Excluded(v) => Bound::Excluded(v),
+impl<T> Predicate<T>
+where
+    T: ArrowPrimitiveType,
+{
+    fn matches(&self, value: T::Native) -> bool {
+        match self {
+            Predicate::All => true,
+            Predicate::Equals(target) => value == *target,
+            Predicate::GreaterThan(target) => value > *target,
+            Predicate::GreaterThanOrEquals(target) => value >= *target,
+            Predicate::LessThan(target) => value < *target,
+            Predicate::LessThanOrEquals(target) => value <= *target,
+            Predicate::Range { lower, upper } => {
+                if let Some(limit) = lower {
+                    match limit {
+                        RangeLimit::Included(bound) => {
+                            if value < *bound {
+                                return false;
+                            }
+                        }
+                        RangeLimit::Excluded(bound) => {
+                            if value <= *bound {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                if let Some(limit) = upper {
+                    match limit {
+                        RangeLimit::Included(bound) => {
+                            if value > *bound {
+                                return false;
+                            }
+                        }
+                        RangeLimit::Excluded(bound) => {
+                            if value >= *bound {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
             }
-        }
-
-        fn end_bound(&self) -> Bound<&T> {
-            match &self.end {
-                Bound::Unbounded => Bound::Unbounded,
-                Bound::Included(v) => Bound::Included(v),
-                Bound::Excluded(v) => Bound::Excluded(v),
-            }
+            Predicate::In(values) => values.contains(&value),
         }
     }
+}
 
-    let mut run_bounds = |start: Bound<T::Native>, end: Bound<T::Native>| -> Result<(), CmError> {
-        make_builder()
-            .with_range::<T::Native, _>(BoundRange { start, end })
-            .run(visitor)?;
-        Ok(())
-    };
-
+fn build_predicate<T>(op: &Operator<'_>) -> Result<Predicate<T>, CmError>
+where
+    T: ArrowPrimitiveType,
+{
     match op {
-        Operator::Equals(scalar) => {
-            let value = scalar_to_native::<T>(scalar)?;
-            run_bounds(Bound::Included(value), Bound::Included(value))
-        }
-        Operator::GreaterThan(scalar) => {
-            let value = scalar_to_native::<T>(scalar)?;
-            run_bounds(Bound::Excluded(value), Bound::Unbounded)
-        }
-        Operator::GreaterThanOrEquals(scalar) => {
-            let value = scalar_to_native::<T>(scalar)?;
-            run_bounds(Bound::Included(value), Bound::Unbounded)
-        }
-        Operator::LessThan(scalar) => {
-            let value = scalar_to_native::<T>(scalar)?;
-            run_bounds(Bound::Unbounded, Bound::Excluded(value))
-        }
+        Operator::Equals(scalar) => Ok(Predicate::Equals(scalar_to_native::<T>(scalar)?)),
+        Operator::GreaterThan(scalar) => Ok(Predicate::GreaterThan(scalar_to_native::<T>(scalar)?)),
+        Operator::GreaterThanOrEquals(scalar) => Ok(Predicate::GreaterThanOrEquals(
+            scalar_to_native::<T>(scalar)?,
+        )),
+        Operator::LessThan(scalar) => Ok(Predicate::LessThan(scalar_to_native::<T>(scalar)?)),
         Operator::LessThanOrEquals(scalar) => {
-            let value = scalar_to_native::<T>(scalar)?;
-            run_bounds(Bound::Unbounded, Bound::Included(value))
+            Ok(Predicate::LessThanOrEquals(scalar_to_native::<T>(scalar)?))
         }
         Operator::Range { lower, upper } => {
-            let lb = bound_to_native::<T>(lower)?;
-            let ub = bound_to_native::<T>(upper)?;
-            if matches!(&lb, Bound::Unbounded) && matches!(&ub, Bound::Unbounded) {
-                make_builder().run(visitor)?;
-                Ok(())
+            let lb = match bound_to_native::<T>(lower)? {
+                Bound::Unbounded => None,
+                Bound::Included(v) => Some(RangeLimit::Included(v)),
+                Bound::Excluded(v) => Some(RangeLimit::Excluded(v)),
+            };
+            let ub = match bound_to_native::<T>(upper)? {
+                Bound::Unbounded => None,
+                Bound::Included(v) => Some(RangeLimit::Included(v)),
+                Bound::Excluded(v) => Some(RangeLimit::Excluded(v)),
+            };
+            if lb.is_none() && ub.is_none() {
+                Ok(Predicate::All)
             } else {
-                run_bounds(lb, ub)
+                Ok(Predicate::Range {
+                    lower: lb,
+                    upper: ub,
+                })
             }
         }
         Operator::In(values) => {
-            for scalar in values.iter() {
-                let value = scalar_to_native::<T>(scalar)?;
-                run_bounds(Bound::Included(value), Bound::Included(value))?;
+            let mut natives = Vec::with_capacity(values.len());
+            for scalar in *values {
+                natives.push(scalar_to_native::<T>(scalar)?);
             }
-            Ok(())
+            Ok(Predicate::In(natives))
         }
-        _ => Err(CmError::Internal(format!(
-            "Unsupported operator for type {}",
-            std::any::type_name::<T::Native>()
-        ))),
+        _ => Err(CmError::Internal(
+            "Filter operator does not contain a supported typed value".to_string(),
+        )),
     }
+}
+
+struct FilterRowCollector<T>
+where
+    T: ArrowPrimitiveType,
+{
+    predicate: Predicate<T>,
+    row_ids: Vec<u64>,
+}
+
+impl<T> FilterRowCollector<T>
+where
+    T: ArrowPrimitiveType,
+{
+    fn new(predicate: Predicate<T>) -> Self {
+        Self {
+            predicate,
+            row_ids: Vec::new(),
+        }
+    }
+
+    fn into_row_ids(self) -> Vec<u64> {
+        self.row_ids
+    }
+}
+
+impl<T> scan::PrimitiveVisitor for FilterRowCollector<T>
+where
+    T: ArrowPrimitiveType,
+{
+    fn u64_chunk(&mut self, _: &UInt64Array) {}
+    fn u32_chunk(&mut self, _: &arrow::array::UInt32Array) {}
+    fn u16_chunk(&mut self, _: &arrow::array::UInt16Array) {}
+    fn u8_chunk(&mut self, _: &arrow::array::UInt8Array) {}
+    fn i64_chunk(&mut self, _: &arrow::array::Int64Array) {}
+    fn i32_chunk(&mut self, _: &Int32Array) {}
+    fn i16_chunk(&mut self, _: &arrow::array::Int16Array) {}
+    fn i8_chunk(&mut self, _: &arrow::array::Int8Array) {}
+}
+
+impl<T> scan::PrimitiveSortedVisitor for FilterRowCollector<T>
+where
+    T: ArrowPrimitiveType,
+{
+    fn u64_run(&mut self, _: &UInt64Array, _: usize, _: usize) {}
+    fn u32_run(&mut self, _: &arrow::array::UInt32Array, _: usize, _: usize) {}
+    fn u16_run(&mut self, _: &arrow::array::UInt16Array, _: usize, _: usize) {}
+    fn u8_run(&mut self, _: &arrow::array::UInt8Array, _: usize, _: usize) {}
+    fn i64_run(&mut self, _: &arrow::array::Int64Array, _: usize, _: usize) {}
+    fn i32_run(&mut self, _: &Int32Array, _: usize, _: usize) {}
+    fn i16_run(&mut self, _: &arrow::array::Int16Array, _: usize, _: usize) {}
+    fn i8_run(&mut self, _: &arrow::array::Int8Array, _: usize, _: usize) {}
+}
+
+impl<T> scan::PrimitiveSortedWithRowIdsVisitor for FilterRowCollector<T> where T: ArrowPrimitiveType {}
+
+macro_rules! impl_filter_with_rids {
+    ($ty:ty, $method:ident, $arr:ty) => {
+        impl scan::PrimitiveWithRowIdsVisitor for FilterRowCollector<$ty> {
+            fn $method(&mut self, v: &$arr, r: &UInt64Array) {
+                let len = v.len();
+                debug_assert_eq!(len, r.len());
+                for i in 0..len {
+                    if v.is_null(i) {
+                        continue;
+                    }
+                    let value = v.value(i);
+                    if self.predicate.matches(value) {
+                        self.row_ids.push(r.value(i));
+                    }
+                }
+            }
+        }
+    };
+}
+
+impl_filter_with_rids!(UInt64Type, u64_chunk_with_rids, UInt64Array);
+impl_filter_with_rids!(
+    arrow::datatypes::UInt32Type,
+    u32_chunk_with_rids,
+    arrow::array::UInt32Array
+);
+impl_filter_with_rids!(
+    arrow::datatypes::UInt16Type,
+    u16_chunk_with_rids,
+    arrow::array::UInt16Array
+);
+impl_filter_with_rids!(
+    arrow::datatypes::UInt8Type,
+    u8_chunk_with_rids,
+    arrow::array::UInt8Array
+);
+impl_filter_with_rids!(
+    arrow::datatypes::Int64Type,
+    i64_chunk_with_rids,
+    arrow::array::Int64Array
+);
+impl_filter_with_rids!(Int32Type, i32_chunk_with_rids, Int32Array);
+impl_filter_with_rids!(
+    arrow::datatypes::Int16Type,
+    i16_chunk_with_rids,
+    arrow::array::Int16Array
+);
+impl_filter_with_rids!(
+    arrow::datatypes::Int8Type,
+    i8_chunk_with_rids,
+    arrow::array::Int8Array
+);
+
+fn collect_matching_row_ids<T>(
+    store: &ColumnStore<MemPager>,
+    field_id: LogicalFieldId,
+    op: &Operator<'_>,
+) -> Result<Vec<u64>, CmError>
+where
+    T: ArrowPrimitiveType,
+    FilterRowCollector<T>: scan::PrimitiveWithRowIdsVisitor,
+{
+    let predicate = build_predicate::<T>(op)?;
+    let mut collector = FilterRowCollector::<T>::new(predicate);
+    ScanBuilder::new(store, field_id)
+        .with_row_ids(rowid_fid(field_id))
+        .run(&mut collector)?;
+    Ok(collector.into_row_ids())
 }
 
 #[inline]
@@ -289,61 +437,61 @@ impl Table {
 
         let dtype = filter_data_type(&filter.op)?;
 
-        struct RowIdCollector {
-            row_ids: Vec<u64>,
-        }
-        impl scan::PrimitiveVisitor for RowIdCollector {}
-        impl scan::PrimitiveWithRowIdsVisitor for RowIdCollector {
-            fn u64_chunk_with_rids(&mut self, _v: &UInt64Array, r: &UInt64Array) {
-                self.row_ids.extend_from_slice(r.values());
-            }
-            fn i32_chunk_with_rids(&mut self, _v: &Int32Array, r: &UInt64Array) {
-                self.row_ids.extend_from_slice(r.values());
-            }
-        }
-        impl scan::PrimitiveSortedVisitor for RowIdCollector {}
-        impl scan::PrimitiveSortedWithRowIdsVisitor for RowIdCollector {}
-
-        let mut rid_visitor = RowIdCollector { row_ids: vec![] };
-
-        let make_builder = || {
-            ScanBuilder::new(&self.store, filter_lfid).with_row_ids(rowid_fid(filter_lfid))
-        };
-        match dtype {
+        let row_ids = match dtype {
             DataType::UInt64 => {
-                apply_primitive_filter::<UInt64Type, _, _, _>(
-                    make_builder,
-                    &filter.op,
-                    &mut rid_visitor,
-                )?;
+                collect_matching_row_ids::<UInt64Type>(&self.store, filter_lfid, &filter.op)?
             }
+            DataType::UInt32 => collect_matching_row_ids::<arrow::datatypes::UInt32Type>(
+                &self.store,
+                filter_lfid,
+                &filter.op,
+            )?,
+            DataType::UInt16 => collect_matching_row_ids::<arrow::datatypes::UInt16Type>(
+                &self.store,
+                filter_lfid,
+                &filter.op,
+            )?,
+            DataType::UInt8 => collect_matching_row_ids::<arrow::datatypes::UInt8Type>(
+                &self.store,
+                filter_lfid,
+                &filter.op,
+            )?,
+            DataType::Int64 => collect_matching_row_ids::<arrow::datatypes::Int64Type>(
+                &self.store,
+                filter_lfid,
+                &filter.op,
+            )?,
             DataType::Int32 => {
-                apply_primitive_filter::<Int32Type, _, _, _>(
-                    make_builder,
-                    &filter.op,
-                    &mut rid_visitor,
-                )?;
+                collect_matching_row_ids::<Int32Type>(&self.store, filter_lfid, &filter.op)?
             }
+            DataType::Int16 => collect_matching_row_ids::<arrow::datatypes::Int16Type>(
+                &self.store,
+                filter_lfid,
+                &filter.op,
+            )?,
+            DataType::Int8 => collect_matching_row_ids::<arrow::datatypes::Int8Type>(
+                &self.store,
+                filter_lfid,
+                &filter.op,
+            )?,
             other => {
                 return Err(CmError::Internal(format!(
                     "Filtering on type {:?} is not supported",
                     other
                 )));
             }
-        }
+        };
 
         let mut projected_columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
         let mut projected_fields: Vec<Field> = Vec::with_capacity(projection.len());
 
         for &field_id_to_project in projection {
             let lfid_to_project = lfid_for(self.table_id, field_id_to_project);
-            let all_column_data = self.store.get_column_for_test(lfid_to_project)?;
-            projected_columns.push(all_column_data.data);
-            projected_fields.push(Field::new(
-                &field_id_to_project.to_string(),
-                all_column_data.data_type,
-                true,
-            ));
+            let dtype = self.store.data_type(lfid_to_project)?;
+            let column = self.store.gather_rows(lfid_to_project, &row_ids)?;
+
+            projected_fields.push(Field::new(field_id_to_project.to_string(), dtype, true));
+            projected_columns.push(column);
         }
 
         let schema = Arc::new(Schema::new(projected_fields));
@@ -444,7 +592,7 @@ impl ColumnStoreTestExt for ColumnStore<MemPager> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::BinaryArray;
+    use arrow::array::{BinaryArray, Int32Array, UInt64Array};
     use std::collections::HashMap;
 
     fn scalar_from_u64(value: u64) -> DynScalar {
@@ -511,7 +659,21 @@ mod tests {
         let result_batch = table.scan(&projection, &filter).unwrap();
 
         assert_eq!(result_batch.num_columns(), 1);
-        assert_eq!(result_batch.column(0).data_type(), &DataType::Int32);
+        let values = result_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let collected: Vec<Option<i32>> = (0..values.len())
+            .map(|i| {
+                if values.is_null(i) {
+                    None
+                } else {
+                    Some(values.value(i))
+                }
+            })
+            .collect();
+        assert_eq!(collected, vec![Some(20), Some(20)]);
     }
 
     #[test]
@@ -528,7 +690,21 @@ mod tests {
         let result_batch = table.scan(&projection, &filter).unwrap();
 
         assert_eq!(result_batch.num_columns(), 1);
-        assert_eq!(result_batch.column(0).data_type(), &DataType::UInt64);
+        let values = result_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let collected: Vec<Option<u64>> = (0..values.len())
+            .map(|i| {
+                if values.is_null(i) {
+                    None
+                } else {
+                    Some(values.value(i))
+                }
+            })
+            .collect();
+        assert_eq!(collected, vec![Some(200), Some(200)]);
     }
 
     #[test]
@@ -545,7 +721,21 @@ mod tests {
         let result_batch = table.scan(&projection, &filter).unwrap();
 
         assert_eq!(result_batch.num_columns(), 1);
-        assert_eq!(result_batch.column(0).data_type(), &DataType::UInt64);
+        let values = result_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let collected: Vec<Option<u64>> = (0..values.len())
+            .map(|i| {
+                if values.is_null(i) {
+                    None
+                } else {
+                    Some(values.value(i))
+                }
+            })
+            .collect();
+        assert_eq!(collected, vec![Some(200), Some(300), Some(200)]);
     }
 
     #[test]
@@ -565,7 +755,21 @@ mod tests {
         let result_batch = table.scan(&projection, &filter).unwrap();
 
         assert_eq!(result_batch.num_columns(), 1);
-        assert_eq!(result_batch.column(0).data_type(), &DataType::Int32);
+        let values = result_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let collected: Vec<Option<i32>> = (0..values.len())
+            .map(|i| {
+                if values.is_null(i) {
+                    None
+                } else {
+                    Some(values.value(i))
+                }
+            })
+            .collect();
+        assert_eq!(collected, vec![Some(20), Some(20)]);
     }
 
     #[test]
@@ -583,6 +787,67 @@ mod tests {
         let result_batch = table.scan(&projection, &filter).unwrap();
 
         assert_eq!(result_batch.num_columns(), 1);
-        assert_eq!(result_batch.column(0).data_type(), &DataType::UInt64);
+        let values = result_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let collected: Vec<Option<u64>> = (0..values.len())
+            .map(|i| {
+                if values.is_null(i) {
+                    None
+                } else {
+                    Some(values.value(i))
+                }
+            })
+            .collect();
+        assert_eq!(collected, vec![Some(100), Some(300)]);
+    }
+
+    #[test]
+    fn test_scan_with_multiple_projection_columns() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::Equals(scalar_from_i32(20)),
+        };
+        let projection = vec![COL_A_U64, COL_C_I32];
+        let batch = table.scan(&projection, &filter).unwrap();
+
+        assert_eq!(batch.num_columns(), 2);
+        let a_vals = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let a_collected: Vec<Option<u64>> = (0..a_vals.len())
+            .map(|i| {
+                if a_vals.is_null(i) {
+                    None
+                } else {
+                    Some(a_vals.value(i))
+                }
+            })
+            .collect();
+        assert_eq!(a_collected, vec![Some(200), Some(200)]);
+
+        let c_vals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let c_collected: Vec<Option<i32>> = (0..c_vals.len())
+            .map(|i| {
+                if c_vals.is_null(i) {
+                    None
+                } else {
+                    Some(c_vals.value(i))
+                }
+            })
+            .collect();
+        assert_eq!(c_collected, vec![Some(20), Some(20)]);
     }
 }

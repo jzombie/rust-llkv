@@ -134,8 +134,11 @@ impl<'a> SysCatalog<'a> {
         };
         // Note: The scan needs `with_row_ids` to be true for `u64_chunk_with_rids` to be called.
         // A full implementation would require passing ScanOptions.
-        let mut scan_opts = llkv_column_map::store::scan::ScanOptions::default();
-        scan_opts.with_row_ids = true;
+        let scan_opts = llkv_column_map::store::scan::ScanOptions {
+            with_row_ids: true,
+            ..Default::default()
+        };
+
         let _ = self
             .store
             .scan(lfid(CATALOG_TID, F_TABLE_META), scan_opts, &mut visitor);
@@ -163,7 +166,7 @@ impl<'a> SysCatalog<'a> {
 
     /// Batch fetch specific column metas by col_id using a shared keyset.
     pub fn get_cols_meta(&self, table_id: u32, col_ids: &[u32]) -> Vec<Option<ColMeta>> {
-        let mut results = vec![None; col_ids.len()];
+        let results = vec![None; col_ids.len()];
         let target_rids: HashMap<u64, usize> = col_ids
             .iter()
             .enumerate()
@@ -172,7 +175,7 @@ impl<'a> SysCatalog<'a> {
 
         struct MetaVisitor<'a> {
             target_rids: &'a HashMap<u64, usize>,
-            results: &'a mut Vec<Option<ColMeta>>,
+            // results: &'a mut Vec<Option<ColMeta>>,
         }
         impl<'a> PrimitiveVisitor for MetaVisitor<'a> {}
         impl<'a> PrimitiveWithRowIdsVisitor for MetaVisitor<'a> {
@@ -193,10 +196,13 @@ impl<'a> SysCatalog<'a> {
 
         let mut visitor = MetaVisitor {
             target_rids: &target_rids,
-            results: &mut results,
+            // results: &mut results,
         };
-        let mut scan_opts = llkv_column_map::store::scan::ScanOptions::default();
-        scan_opts.with_row_ids = true;
+        let scan_opts = llkv_column_map::store::scan::ScanOptions {
+            with_row_ids: true,
+            ..Default::default()
+        };
+
         let _ = self
             .store
             .scan(lfid(CATALOG_TID, F_COL_META), scan_opts, &mut visitor);
