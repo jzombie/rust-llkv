@@ -5,8 +5,6 @@ pub mod expr {
     pub use llkv_expr::expr::*;
 }
 
-pub mod codecs;
-pub mod constants;
 pub mod table;
 pub mod types;
 
