@@ -1,5 +1,2 @@
-use crate::types::ColumnInput;
-use std::borrow::Cow;
-
-// TODO: Rename to `EMPTY_CELL`? This shouldn't imply that the entire column is empty.
-pub const EMPTY_COL: ColumnInput<'static> = Cow::Borrowed(&[]);
+// This file is intentionally left empty.
+// Constants associated with the old RowPatch-based API have been removed.
