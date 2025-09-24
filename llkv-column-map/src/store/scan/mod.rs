@@ -48,6 +48,9 @@ pub use sorted::*;
 pub mod visitors;
 pub use visitors::*;
 
+pub mod filter;
+pub use filter::*;
+
 impl<P> ColumnStore<P>
 where
     P: Pager<Blob = EntryHandle>,

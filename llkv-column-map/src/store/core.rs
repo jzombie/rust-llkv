@@ -6,6 +6,7 @@ use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
 };
+use crate::store::scan::FilterPrimitive;
 use crate::types::{CATALOG_ROOT_PKEY, LogicalFieldId, PhysicalKey};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, PrimitiveArray,
@@ -17,7 +18,6 @@ use arrow::record_batch::RecordBatch;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
-use std::marker::PhantomData;
 use std::sync::{Arc, RwLock};
 
 pub struct ColumnStore<P: Pager> {
@@ -164,22 +164,6 @@ where
         F: FnMut(T::Native) -> bool,
     {
         T::run_filter(self, field_id, predicate)
-    }
-
-    fn filter_row_ids_typed<T, F>(&self, field_id: LogicalFieldId, predicate: F) -> Result<Vec<u64>>
-    where
-        T: ArrowPrimitiveType,
-        F: FnMut(T::Native) -> bool,
-        FilterVisitor<T, F>: scan::PrimitiveVisitor
-            + scan::PrimitiveSortedVisitor
-            + scan::PrimitiveSortedWithRowIdsVisitor
-            + scan::PrimitiveWithRowIdsVisitor,
-    {
-        let mut visitor = FilterVisitor::<T, F>::new(predicate);
-        ScanBuilder::new(self, field_id)
-            .with_row_ids(rowid_fid(field_id))
-            .run(&mut visitor)?;
-        Ok(visitor.into_row_ids())
     }
 
     /// Lists the names of all persisted indexes for a given column.
@@ -1693,121 +1677,3 @@ impl_gather_visitor!(arrow::datatypes::Int64Type, Int64Array, i64_chunk_with_rid
 impl_gather_visitor!(arrow::datatypes::Int32Type, Int32Array, i32_chunk_with_rids);
 impl_gather_visitor!(arrow::datatypes::Int16Type, Int16Array, i16_chunk_with_rids);
 impl_gather_visitor!(arrow::datatypes::Int8Type, Int8Array, i8_chunk_with_rids);
-
-struct FilterVisitor<T: ArrowPrimitiveType, F: FnMut(T::Native) -> bool> {
-    predicate: F,
-    row_ids: Vec<u64>,
-    _phantom: PhantomData<T>,
-}
-
-impl<T: ArrowPrimitiveType, F: FnMut(T::Native) -> bool> FilterVisitor<T, F> {
-    fn new(predicate: F) -> Self {
-        Self {
-            predicate,
-            row_ids: Vec::new(),
-            _phantom: PhantomData,
-        }
-    }
-
-    fn into_row_ids(self) -> Vec<u64> {
-        self.row_ids
-    }
-}
-
-impl<T: ArrowPrimitiveType, F: FnMut(T::Native) -> bool> scan::PrimitiveVisitor
-    for FilterVisitor<T, F>
-{
-}
-
-impl<T: ArrowPrimitiveType, F: FnMut(T::Native) -> bool> scan::PrimitiveSortedVisitor
-    for FilterVisitor<T, F>
-{
-}
-
-impl<T: ArrowPrimitiveType, F: FnMut(T::Native) -> bool> scan::PrimitiveSortedWithRowIdsVisitor
-    for FilterVisitor<T, F>
-{
-}
-
-macro_rules! impl_filter_visitor {
-    ($ty:ty, $arr:ty, $method:ident) => {
-        impl<F> scan::PrimitiveWithRowIdsVisitor for FilterVisitor<$ty, F>
-        where
-            F: FnMut(<$ty as ArrowPrimitiveType>::Native) -> bool,
-        {
-            fn $method(&mut self, values: &$arr, row_ids: &UInt64Array) {
-                let len = values.len();
-                debug_assert_eq!(len, row_ids.len());
-                let predicate = &mut self.predicate;
-                for i in 0..len {
-                    if values.is_null(i) {
-                        continue;
-                    }
-                    let value = values.value(i);
-                    if predicate(value) {
-                        self.row_ids.push(row_ids.value(i));
-                    }
-                }
-            }
-        }
-    };
-}
-
-impl_filter_visitor!(
-    arrow::datatypes::UInt64Type,
-    UInt64Array,
-    u64_chunk_with_rids
-);
-impl_filter_visitor!(
-    arrow::datatypes::UInt32Type,
-    UInt32Array,
-    u32_chunk_with_rids
-);
-impl_filter_visitor!(
-    arrow::datatypes::UInt16Type,
-    UInt16Array,
-    u16_chunk_with_rids
-);
-impl_filter_visitor!(arrow::datatypes::UInt8Type, UInt8Array, u8_chunk_with_rids);
-impl_filter_visitor!(arrow::datatypes::Int64Type, Int64Array, i64_chunk_with_rids);
-impl_filter_visitor!(arrow::datatypes::Int32Type, Int32Array, i32_chunk_with_rids);
-impl_filter_visitor!(arrow::datatypes::Int16Type, Int16Array, i16_chunk_with_rids);
-impl_filter_visitor!(arrow::datatypes::Int8Type, Int8Array, i8_chunk_with_rids);
-
-pub trait FilterPrimitive: ArrowPrimitiveType {
-    fn run_filter<P, F>(
-        store: &ColumnStore<P>,
-        field_id: LogicalFieldId,
-        predicate: F,
-    ) -> Result<Vec<u64>>
-    where
-        P: Pager<Blob = EntryHandle> + Send + Sync,
-        F: FnMut(Self::Native) -> bool;
-}
-
-macro_rules! impl_filter_primitive {
-    ($ty:ty) => {
-        impl FilterPrimitive for $ty {
-            fn run_filter<P, F>(
-                store: &ColumnStore<P>,
-                field_id: LogicalFieldId,
-                predicate: F,
-            ) -> Result<Vec<u64>>
-            where
-                P: Pager<Blob = EntryHandle> + Send + Sync,
-                F: FnMut(Self::Native) -> bool,
-            {
-                store.filter_row_ids_typed::<$ty, F>(field_id, predicate)
-            }
-        }
-    };
-}
-
-impl_filter_primitive!(arrow::datatypes::UInt64Type);
-impl_filter_primitive!(arrow::datatypes::UInt32Type);
-impl_filter_primitive!(arrow::datatypes::UInt16Type);
-impl_filter_primitive!(arrow::datatypes::UInt8Type);
-impl_filter_primitive!(arrow::datatypes::Int64Type);
-impl_filter_primitive!(arrow::datatypes::Int32Type);
-impl_filter_primitive!(arrow::datatypes::Int16Type);
-impl_filter_primitive!(arrow::datatypes::Int8Type);
