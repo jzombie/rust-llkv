@@ -15,6 +15,7 @@ use crate::expr::{Filter, Literal, LiteralCastError, Operator, literal_to_native
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
 
+// TODO: Move to `llkv-expr`
 /// Convert a bound of `Literal` into a bound of `T::Native`.
 fn bound_to_native<T>(bound: &Bound<Literal>) -> Result<Bound<T::Native>, TableError>
 where
