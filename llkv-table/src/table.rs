@@ -1,9 +1,8 @@
 use std::ops::Bound;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int32Array, PrimitiveArray, RecordBatch, UInt64Array};
+use arrow::array::{Array, ArrayRef, Int32Array, RecordBatch, UInt64Array};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Int32Type, Schema, UInt64Type};
-use arrow_array::{Datum, Scalar};
 
 use llkv_column_map::store::FilterPrimitive;
 use llkv_column_map::{
@@ -12,94 +11,46 @@ use llkv_column_map::{
     types::{LogicalFieldId, Namespace},
 };
 
-use crate::expr::{Filter, Operator};
+use crate::expr::{Filter, Literal, Operator};
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
 
-type DynScalar = Scalar<Arc<dyn arrow_array::Array>>;
+/// Convert a `Literal` into a concrete native value for `T`.
+fn literal_to_native<T>(lit: &Literal) -> Result<T::Native, CmError>
+where
+    T: ArrowPrimitiveType + FilterPrimitive,
+    T::Native: TryFrom<i128> + Copy,
+{
+    use std::convert::TryFrom;
 
-fn scalar_data_type(s: &DynScalar) -> DataType {
-    let (array, _) = s.get();
-    array.data_type().clone()
-}
-
-fn scalar_to_native<T: ArrowPrimitiveType>(scalar: &DynScalar) -> Result<T::Native, CmError> {
-    let (array, _) = scalar.get();
-    let typed = array
-        .as_any()
-        .downcast_ref::<PrimitiveArray<T>>()
-        .ok_or_else(|| {
+    match lit {
+        Literal::Integer(i) => T::Native::try_from(*i).map_err(|_| {
             CmError::Internal(format!(
-                "Mismatched type for filter value. Expected {}",
+                "Integer literal {} out of range for {}",
+                i,
                 std::any::type_name::<T::Native>()
             ))
-        })?;
-    if typed.is_null(0) {
-        return Err(CmError::Internal("Filter value is null".to_string()));
+        }),
+        Literal::Float(_) => Err(CmError::Internal(
+            "Float literal for integer column".to_string(),
+        )),
+        Literal::String(_) => Err(CmError::Internal(
+            "String literal for numeric column".to_string(),
+        )),
     }
-    Ok(typed.value(0))
 }
 
-fn bound_to_native<T: ArrowPrimitiveType>(
-    bound: &Bound<DynScalar>,
-) -> Result<Bound<T::Native>, CmError>
+/// Convert a bound of `Literal` into a bound of `T::Native`.
+fn bound_to_native<T>(bound: &Bound<Literal>) -> Result<Bound<T::Native>, CmError>
 where
-    T::Native: Copy,
+    T: ArrowPrimitiveType + FilterPrimitive,
+    T::Native: TryFrom<i128> + Copy,
 {
     Ok(match bound {
         Bound::Unbounded => Bound::Unbounded,
-        Bound::Included(scalar) => Bound::Included(scalar_to_native::<T>(scalar)?),
-        Bound::Excluded(scalar) => Bound::Excluded(scalar_to_native::<T>(scalar)?),
+        Bound::Included(l) => Bound::Included(literal_to_native::<T>(l)?),
+        Bound::Excluded(l) => Bound::Excluded(literal_to_native::<T>(l)?),
     })
-}
-
-fn scalar_bound_data_type(bound: &Bound<DynScalar>) -> Option<DataType> {
-    match bound {
-        Bound::Unbounded => None,
-        Bound::Included(s) | Bound::Excluded(s) => Some(scalar_data_type(s)),
-    }
-}
-
-fn filter_data_type(op: &Operator<'_>) -> Result<DataType, CmError> {
-    match op {
-        Operator::Equals(s)
-        | Operator::GreaterThan(s)
-        | Operator::LessThan(s)
-        | Operator::GreaterThanOrEquals(s)
-        | Operator::LessThanOrEquals(s) => Ok(scalar_data_type(s)),
-        Operator::Range { lower, upper } => {
-            let lower_ty = scalar_bound_data_type(lower);
-            let upper_ty = scalar_bound_data_type(upper);
-            match (lower_ty, upper_ty) {
-                (None, None) => Err(CmError::Internal(
-                    "Range filter requires at least one concrete bound".to_string(),
-                )),
-                (Some(dt), None) | (None, Some(dt)) => Ok(dt),
-                (Some(l), Some(u)) if l == u => Ok(l),
-                (Some(l), Some(u)) => Err(CmError::Internal(format!(
-                    "Mismatched range bound types: {:?} vs {:?}",
-                    l, u
-                ))),
-            }
-        }
-        Operator::In(values) => {
-            let first = values.first().ok_or_else(|| {
-                CmError::Internal("IN operator requires at least one value".to_string())
-            })?;
-            let dtype = scalar_data_type(first);
-            let all_match = values.iter().all(|value| scalar_data_type(value) == dtype);
-            if all_match {
-                Ok(dtype)
-            } else {
-                Err(CmError::Internal(
-                    "IN operator values must share the same type".to_string(),
-                ))
-            }
-        }
-        _ => Err(CmError::Internal(
-            "Filter operator does not contain a typed value".to_string(),
-        )),
-    }
 }
 
 enum RangeLimit<T> {
@@ -175,16 +126,17 @@ where
 fn build_predicate<T>(op: &Operator<'_>) -> Result<Predicate<T>, CmError>
 where
     T: ArrowPrimitiveType + FilterPrimitive,
+    T::Native: TryFrom<i128> + Copy,
 {
     match op {
-        Operator::Equals(scalar) => Ok(Predicate::Equals(scalar_to_native::<T>(scalar)?)),
-        Operator::GreaterThan(scalar) => Ok(Predicate::GreaterThan(scalar_to_native::<T>(scalar)?)),
-        Operator::GreaterThanOrEquals(scalar) => Ok(Predicate::GreaterThanOrEquals(
-            scalar_to_native::<T>(scalar)?,
-        )),
-        Operator::LessThan(scalar) => Ok(Predicate::LessThan(scalar_to_native::<T>(scalar)?)),
-        Operator::LessThanOrEquals(scalar) => {
-            Ok(Predicate::LessThanOrEquals(scalar_to_native::<T>(scalar)?))
+        Operator::Equals(lit) => Ok(Predicate::Equals(literal_to_native::<T>(lit)?)),
+        Operator::GreaterThan(lit) => Ok(Predicate::GreaterThan(literal_to_native::<T>(lit)?)),
+        Operator::GreaterThanOrEquals(lit) => {
+            Ok(Predicate::GreaterThanOrEquals(literal_to_native::<T>(lit)?))
+        }
+        Operator::LessThan(lit) => Ok(Predicate::LessThan(literal_to_native::<T>(lit)?)),
+        Operator::LessThanOrEquals(lit) => {
+            Ok(Predicate::LessThanOrEquals(literal_to_native::<T>(lit)?))
         }
         Operator::Range { lower, upper } => {
             let lb = match bound_to_native::<T>(lower)? {
@@ -208,16 +160,20 @@ where
         }
         Operator::In(values) => {
             let mut natives = Vec::with_capacity(values.len());
-            for scalar in *values {
-                natives.push(scalar_to_native::<T>(scalar)?);
+            for lit in *values {
+                natives.push(literal_to_native::<T>(lit)?);
             }
             Ok(Predicate::In(natives))
         }
+        // Pattern/string ops are not supported in this numeric predicate path.
         _ => Err(CmError::Internal(
-            "Filter operator does not contain a supported typed value".to_string(),
+            "Filter operator does not contain a supported \
+             typed value"
+                .to_string(),
         )),
     }
 }
+
 fn collect_matching_row_ids<T>(
     store: &ColumnStore<MemPager>,
     field_id: LogicalFieldId,
@@ -225,6 +181,7 @@ fn collect_matching_row_ids<T>(
 ) -> Result<Vec<u64>, CmError>
 where
     T: ArrowPrimitiveType + FilterPrimitive,
+    T::Native: TryFrom<i128> + Copy,
 {
     let predicate = build_predicate::<T>(op)?;
     store
@@ -295,7 +252,8 @@ impl Table {
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| {
                     llkv_column_map::error::Error::Internal(format!(
-                        "Field '{}' is missing a valid 'field_id' in its metadata.",
+                        "Field '{}' is missing a valid 'field_id' in its \
+                         metadata.",
                         field.name()
                     ))
                 })?;
@@ -323,7 +281,9 @@ impl Table {
     ) -> Result<RecordBatch, CmError> {
         let filter_lfid = lfid_for(self.table_id, filter.field_id);
 
-        let dtype = filter_data_type(&filter.op)?;
+        // Determine dtype from the store. Operators now carry untyped
+        // `Literal`s, so we dispatch based on the column's dtype.
+        let dtype = self.store.data_type(filter_lfid)?;
 
         let row_ids = match dtype {
             DataType::UInt64 => {
@@ -362,6 +322,12 @@ impl Table {
                 filter_lfid,
                 &filter.op,
             )?,
+            // Float types are not supported by FilterPrimitive in column-map.
+            DataType::Float64 | DataType::Float32 => {
+                return Err(CmError::Internal(
+                    "Filtering on float columns is not supported".to_string(),
+                ));
+            }
             other => {
                 return Err(CmError::Internal(format!(
                     "Filtering on type {:?} is not supported",
@@ -442,10 +408,10 @@ impl ColumnStoreTestExt for ColumnStore<MemPager> {
                 self.data_type.get_or_insert(DataType::Int32);
                 self.chunks.push(Arc::new(a.clone()));
             }
-            // FIX: The trait `PrimitiveVisitor` does not have a `binary_chunk` method.
-            // This must be handled by downcasting a generic `array_chunk` if needed,
-            // or by adding the method to the trait in `column-map`. For now, we remove it
-            // to allow compilation.
+            // FIX: The trait `PrimitiveVisitor` does not have a `binary_chunk`
+            // method. This must be handled by downcasting a generic
+            // `array_chunk` if needed, or by adding the method to the trait in
+            // `column-map`. For now, we remove it to allow compilation.
             // fn binary_chunk(&mut self, a: &arrow::array::BinaryArray) {
             //     self.data_type.get_or_insert(DataType::Binary);
             //     self.chunks.push(Arc::new(a.clone()));
@@ -483,14 +449,6 @@ mod tests {
     use arrow::array::{BinaryArray, Int32Array, UInt64Array};
     use arrow::compute::sum;
     use std::collections::HashMap;
-
-    fn scalar_from_u64(value: u64) -> DynScalar {
-        Scalar::new(Arc::new(UInt64Array::from(vec![value])) as ArrayRef)
-    }
-
-    fn scalar_from_i32(value: i32) -> DynScalar {
-        Scalar::new(Arc::new(Int32Array::from(vec![value])) as ArrayRef)
-    }
 
     fn setup_test_table() -> Table {
         let table = Table::new(1, TableCfg::default());
@@ -542,7 +500,7 @@ mod tests {
 
         let filter = Filter {
             field_id: COL_A_U64,
-            op: Operator::Equals(scalar_from_u64(200)),
+            op: Operator::Equals(200.into()),
         };
         let projection = vec![COL_C_I32];
         let result_batch = table.scan(&projection, &filter).unwrap();
@@ -573,7 +531,7 @@ mod tests {
 
         let filter = Filter {
             field_id: COL_C_I32,
-            op: Operator::Equals(scalar_from_i32(20)),
+            op: Operator::Equals(20.into()),
         };
         let projection = vec![COL_A_U64];
         let result_batch = table.scan(&projection, &filter).unwrap();
@@ -604,7 +562,7 @@ mod tests {
 
         let filter = Filter {
             field_id: COL_C_I32,
-            op: Operator::GreaterThan(scalar_from_i32(15)),
+            op: Operator::GreaterThan(15.into()),
         };
         let projection = vec![COL_A_U64];
         let result_batch = table.scan(&projection, &filter).unwrap();
@@ -636,8 +594,8 @@ mod tests {
         let filter = Filter {
             field_id: COL_A_U64,
             op: Operator::Range {
-                lower: Bound::Included(scalar_from_u64(150)),
-                upper: Bound::Excluded(scalar_from_u64(300)),
+                lower: Bound::Included(150.into()),
+                upper: Bound::Excluded(300.into()),
             },
         };
         let projection = vec![COL_C_I32];
@@ -669,8 +627,8 @@ mod tests {
         let filter = Filter {
             field_id: COL_A_U64,
             op: Operator::Range {
-                lower: Bound::Included(scalar_from_u64(150)),
-                upper: Bound::Excluded(scalar_from_u64(300)),
+                lower: Bound::Included(150.into()),
+                upper: Bound::Excluded(300.into()),
             },
         };
         let projection = vec![COL_A_U64];
@@ -683,7 +641,8 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .unwrap();
 
-        // Only the two values equal to 200 should be included by the filter range.
+        // Only the two values equal to 200 should be included by the filter
+        // range.
         let total = sum(values).expect("non-empty sum");
         assert_eq!(total, 400);
     }
@@ -694,7 +653,8 @@ mod tests {
         const COL_A_U64: FieldId = 10;
         const COL_C_I32: FieldId = 12;
 
-        let candidates = [scalar_from_i32(10), scalar_from_i32(30)];
+        // IN now uses untyped literals, too.
+        let candidates = [10.into(), 30.into()];
         let filter = Filter {
             field_id: COL_C_I32,
             op: Operator::In(&candidates),
@@ -728,7 +688,7 @@ mod tests {
 
         let filter = Filter {
             field_id: COL_C_I32,
-            op: Operator::Equals(scalar_from_i32(20)),
+            op: Operator::Equals(20.into()),
         };
         let projection = vec![COL_A_U64, COL_C_I32];
         let batch = table.scan(&projection, &filter).unwrap();

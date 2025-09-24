@@ -1,9 +1,7 @@
 //! Type-aware, Arrow-native predicate AST.
 #![forbid(unsafe_code)]
 
-use arrow_array::{Array, Scalar};
 use std::ops::Bound;
-use std::sync::Arc;
 
 /// Logical expression over predicates.
 #[derive(Clone, Debug)]
@@ -42,21 +40,52 @@ pub struct Filter<'a, F> {
     pub op: Operator<'a>,
 }
 
-type DynScalar = Scalar<Arc<dyn Array>>;
+/// A literal value that has not yet been coerced into a specific Arrow
+/// `Scalar` type. This allows for type inference to be deferred until the
+/// column type is known.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Literal {
+    Integer(i128),
+    Float(f64),
+    String(String),
+    // Other types like Bool, Bytes can be added here.
+}
 
-/// Comparison/matching operators over Arrow's Scalar.
+macro_rules! impl_from_for_literal {
+    ($variant:ident, $($t:ty),*) => {
+        $(
+            impl From<$t> for Literal {
+                fn from(v: $t) -> Self {
+                    Literal::$variant(v.into())
+                }
+            }
+        )*
+    };
+}
+
+impl_from_for_literal!(Integer, i8, i16, i32, i64, i128, u8, u16, u32, u64);
+impl_from_for_literal!(Float, f32, f64);
+
+impl From<&str> for Literal {
+    fn from(v: &str) -> Self {
+        Literal::String(v.to_string())
+    }
+}
+
+/// Comparison/matching operators over untyped `Literal`s.
+/// `In` now accepts a borrowed slice of `Literal`s.
 #[derive(Debug, Clone)]
 pub enum Operator<'a> {
-    Equals(DynScalar),
+    Equals(Literal),
     Range {
-        lower: Bound<DynScalar>,
-        upper: Bound<DynScalar>,
+        lower: Bound<Literal>,
+        upper: Bound<Literal>,
     },
-    GreaterThan(DynScalar),
-    GreaterThanOrEquals(DynScalar),
-    LessThan(DynScalar),
-    LessThanOrEquals(DynScalar),
-    In(&'a [DynScalar]),
+    GreaterThan(Literal),
+    GreaterThanOrEquals(Literal),
+    LessThan(Literal),
+    LessThanOrEquals(Literal),
+    In(&'a [Literal]),
     StartsWith(&'a str),
     EndsWith(&'a str),
     Contains(&'a str),
@@ -65,21 +94,16 @@ pub enum Operator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Array, Scalar, StringArray};
-
-    fn make_scalar<T: Array + 'static>(value: T) -> DynScalar {
-        Scalar::new(Arc::new(value) as Arc<dyn Array>)
-    }
 
     #[test]
     fn build_simple_exprs() {
         let f1 = Filter {
             field_id: 1,
-            op: Operator::Equals(make_scalar(StringArray::from(vec!["abc"]))),
+            op: Operator::Equals("abc".into()),
         };
         let f2 = Filter {
             field_id: 2,
-            op: Operator::LessThan(make_scalar(StringArray::from(vec!["zzz"]))),
+            op: Operator::LessThan("zzz".into()),
         };
         let all = Expr::all_of(vec![f1.clone(), f2.clone()]);
         let any = Expr::any_of(vec![f1.clone(), f2.clone()]);
@@ -105,17 +129,13 @@ mod tests {
         // f4: id=4 starts_with "pre"
         let f1 = Filter {
             field_id: 1u32,
-            op: Operator::Equals(make_scalar(StringArray::from(vec!["a"]))),
+            op: Operator::Equals("a".into()),
         };
         let f2 = Filter {
             field_id: 2u32,
-            op: Operator::LessThan(make_scalar(StringArray::from(vec!["zzz"]))),
+            op: Operator::LessThan("zzz".into()),
         };
-        let in_values = [
-            make_scalar(StringArray::from(vec!["x"])),
-            make_scalar(StringArray::from(vec!["y"])),
-            make_scalar(StringArray::from(vec!["z"])),
-        ];
+        let in_values = ["x".into(), "y".into(), "z".into()];
         let f3 = Filter {
             field_id: 3u32,
             op: Operator::In(&in_values),
@@ -148,14 +168,18 @@ mod tests {
                         assert_eq!(v.len(), 2);
                         // AND: [Pred(f1), OR(...)]
                         match &v[0] {
-                            Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 1),
+                            Expr::Pred(Filter { field_id, .. }) => {
+                                assert_eq!(*field_id, 1)
+                            }
                             _ => panic!("expected Pred(f1) in left-AND[0]"),
                         }
                         match &v[1] {
                             Expr::Or(or_vec) => {
                                 assert_eq!(or_vec.len(), 2);
                                 match &or_vec[0] {
-                                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 2),
+                                    Expr::Pred(Filter { field_id, .. }) => {
+                                        assert_eq!(*field_id, 2)
+                                    }
                                     _ => panic!("expected Pred(f2) in left-AND[1].OR[0]"),
                                 }
                                 match &or_vec[1] {
@@ -163,7 +187,10 @@ mod tests {
                                         Expr::Pred(Filter { field_id, .. }) => {
                                             assert_eq!(*field_id, 3)
                                         }
-                                        _ => panic!("expected Not(Pred(f3)) in left-AND[1].OR[1]"),
+                                        _ => panic!(
+                                            "expected Not(Pred(f3)) in \
+                                             left-AND[1].OR[1]"
+                                        ),
                                     },
                                     _ => panic!("expected Not(...) in left-AND[1].OR[1]"),
                                 }
@@ -179,13 +206,17 @@ mod tests {
                         // AND: [Not(f1), Pred(f4)]
                         match &v[0] {
                             Expr::Not(inner) => match inner.as_ref() {
-                                Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 1),
+                                Expr::Pred(Filter { field_id, .. }) => {
+                                    assert_eq!(*field_id, 1)
+                                }
                                 _ => panic!("expected Not(Pred(f1)) in right-AND[0]"),
                             },
                             _ => panic!("expected Not(...) in right-AND[0]"),
                         }
                         match &v[1] {
-                            Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 4),
+                            Expr::Pred(Filter { field_id, .. }) => {
+                                assert_eq!(*field_id, 4)
+                            }
                             _ => panic!("expected Pred(f4) in right-AND[1]"),
                         }
                     }
@@ -202,33 +233,21 @@ mod tests {
         let f = Filter {
             field_id: 7u32,
             op: Operator::Range {
-                lower: Bound::Included(make_scalar(StringArray::from(vec!["aaa"]))),
-                upper: Bound::Excluded(make_scalar(StringArray::from(vec!["bbb"]))),
+                lower: Bound::Included("aaa".into()),
+                upper: Bound::Excluded("bbb".into()),
             },
         };
 
         match &f.op {
             Operator::Range { lower, upper } => {
                 if let Bound::Included(l) = lower {
-                    let l_arr = l.clone().into_inner();
-                    let l_val = l_arr
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .unwrap()
-                        .value(0);
-                    assert_eq!(l_val, "aaa");
+                    assert_eq!(*l, Literal::String("aaa".to_string()));
                 } else {
                     panic!("lower bound should be Included");
                 }
 
                 if let Bound::Excluded(u) = upper {
-                    let u_arr = u.clone().into_inner();
-                    let u_val = u_arr
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .unwrap()
-                        .value(0);
-                    assert_eq!(u_val, "bbb");
+                    assert_eq!(*u, Literal::String("bbb".to_string()));
                 } else {
                     panic!("upper bound should be Excluded");
                 }
@@ -241,15 +260,15 @@ mod tests {
     fn helper_builders_preserve_structure_and_order() {
         let f1 = Filter {
             field_id: 1u32,
-            op: Operator::Equals(make_scalar(StringArray::from(vec!["a"]))),
+            op: Operator::Equals("a".into()),
         };
         let f2 = Filter {
             field_id: 2u32,
-            op: Operator::Equals(make_scalar(StringArray::from(vec!["b"]))),
+            op: Operator::Equals("b".into()),
         };
         let f3 = Filter {
             field_id: 3u32,
-            op: Operator::Equals(make_scalar(StringArray::from(vec!["c"]))),
+            op: Operator::Equals("c".into()),
         };
 
         let and_expr = Expr::all_of(vec![f1.clone(), f2.clone(), f3.clone()]);
@@ -258,15 +277,21 @@ mod tests {
                 assert_eq!(v.len(), 3);
                 // Expect Pred(1), Pred(2), Pred(3) in order
                 match &v[0] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 1),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, 1)
+                    }
                     _ => panic!(),
                 }
                 match &v[1] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 2),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, 2)
+                    }
                     _ => panic!(),
                 }
                 match &v[2] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 3),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, 3)
+                    }
                     _ => panic!(),
                 }
             }
@@ -279,15 +304,21 @@ mod tests {
                 assert_eq!(v.len(), 3);
                 // Expect Pred(3), Pred(2), Pred(1) in order
                 match &v[0] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 3),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, 3)
+                    }
                     _ => panic!(),
                 }
                 match &v[1] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 2),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, 2)
+                    }
                     _ => panic!(),
                 }
                 match &v[2] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 1),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, 1)
+                    }
                     _ => panic!(),
                 }
             }
@@ -297,11 +328,7 @@ mod tests {
 
     #[test]
     fn set_and_pattern_ops_hold_borrowed_slices() {
-        let in_values = [
-            make_scalar(StringArray::from(vec!["aa"])),
-            make_scalar(StringArray::from(vec!["bb"])),
-            make_scalar(StringArray::from(vec!["cc"])),
-        ];
+        let in_values = ["aa".into(), "bb".into(), "cc".into()];
         let f_in = Filter {
             field_id: 9u32,
             op: Operator::In(&in_values),
@@ -345,11 +372,11 @@ mod tests {
         // Demonstrate F = &'static str
         let f1 = Filter {
             field_id: "name",
-            op: Operator::Equals(make_scalar(StringArray::from(vec!["alice"]))),
+            op: Operator::Equals("alice".into()),
         };
         let f2 = Filter {
             field_id: "status",
-            op: Operator::GreaterThanOrEquals(make_scalar(StringArray::from(vec!["active"]))),
+            op: Operator::GreaterThanOrEquals("active".into()),
         };
         let expr = Expr::all_of(vec![f1.clone(), f2.clone()]);
 
@@ -357,11 +384,15 @@ mod tests {
             Expr::And(v) => {
                 assert_eq!(v.len(), 2);
                 match &v[0] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, "name"),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, "name")
+                    }
                     _ => panic!("expected Pred(name)"),
                 }
                 match &v[1] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, "status"),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, "status")
+                    }
                     _ => panic!("expected Pred(status)"),
                 }
             }
@@ -374,7 +405,7 @@ mod tests {
         // Build Not(Not(...Not(Pred)...)) of depth 64
         let base = Expr::Pred(Filter {
             field_id: 42u32,
-            op: Operator::Equals(make_scalar(StringArray::from(vec!["x"]))),
+            op: Operator::Equals("x".into()),
         });
         let mut expr = base;
         for _ in 0..64 {
@@ -398,5 +429,36 @@ mod tests {
             }
         }
         assert_eq!(count, 64);
+    }
+
+    #[test]
+    fn literal_construction() {
+        let f = Filter {
+            field_id: "my_u64_col",
+            op: Operator::Range {
+                lower: Bound::Included(150.into()),
+                upper: Bound::Excluded(300.into()),
+            },
+        };
+
+        match f.op {
+            Operator::Range { lower, upper } => {
+                assert_eq!(lower, Bound::Included(Literal::Integer(150)));
+                assert_eq!(upper, Bound::Excluded(Literal::Integer(300)));
+            }
+            _ => panic!("Expected a range operator"),
+        }
+
+        let f2 = Filter {
+            field_id: "my_str_col",
+            op: Operator::Equals("hello".into()),
+        };
+
+        match f2.op {
+            Operator::Equals(lit) => {
+                assert_eq!(lit, Literal::String("hello".to_string()));
+            }
+            _ => panic!("Expected an equals operator"),
+        }
     }
 }
