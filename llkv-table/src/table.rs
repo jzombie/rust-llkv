@@ -5,10 +5,9 @@ use arrow::array::{Array, ArrayRef, Int32Array, PrimitiveArray, RecordBatch, UIn
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Int32Type, Schema, UInt64Type};
 use arrow_array::{Datum, Scalar};
 
-use llkv_column_map::store::rowid_fid;
+use llkv_column_map::store::FilterPrimitive;
 use llkv_column_map::{
-    ColumnStore,
-    scan::{self, ScanBuilder},
+    ColumnStore, scan,
     storage::pager::MemPager,
     types::{LogicalFieldId, Namespace},
 };
@@ -110,7 +109,7 @@ enum RangeLimit<T> {
 
 enum Predicate<T>
 where
-    T: ArrowPrimitiveType,
+    T: ArrowPrimitiveType + FilterPrimitive,
 {
     All,
     Equals(T::Native),
@@ -127,7 +126,7 @@ where
 
 impl<T> Predicate<T>
 where
-    T: ArrowPrimitiveType,
+    T: ArrowPrimitiveType + FilterPrimitive,
 {
     fn matches(&self, value: T::Native) -> bool {
         match self {
@@ -175,7 +174,7 @@ where
 
 fn build_predicate<T>(op: &Operator<'_>) -> Result<Predicate<T>, CmError>
 where
-    T: ArrowPrimitiveType,
+    T: ArrowPrimitiveType + FilterPrimitive,
 {
     match op {
         Operator::Equals(scalar) => Ok(Predicate::Equals(scalar_to_native::<T>(scalar)?)),
@@ -219,129 +218,18 @@ where
         )),
     }
 }
-
-struct FilterRowCollector<T>
-where
-    T: ArrowPrimitiveType,
-{
-    predicate: Predicate<T>,
-    row_ids: Vec<u64>,
-}
-
-impl<T> FilterRowCollector<T>
-where
-    T: ArrowPrimitiveType,
-{
-    fn new(predicate: Predicate<T>) -> Self {
-        Self {
-            predicate,
-            row_ids: Vec::new(),
-        }
-    }
-
-    fn into_row_ids(self) -> Vec<u64> {
-        self.row_ids
-    }
-}
-
-impl<T> scan::PrimitiveVisitor for FilterRowCollector<T>
-where
-    T: ArrowPrimitiveType,
-{
-    fn u64_chunk(&mut self, _: &UInt64Array) {}
-    fn u32_chunk(&mut self, _: &arrow::array::UInt32Array) {}
-    fn u16_chunk(&mut self, _: &arrow::array::UInt16Array) {}
-    fn u8_chunk(&mut self, _: &arrow::array::UInt8Array) {}
-    fn i64_chunk(&mut self, _: &arrow::array::Int64Array) {}
-    fn i32_chunk(&mut self, _: &Int32Array) {}
-    fn i16_chunk(&mut self, _: &arrow::array::Int16Array) {}
-    fn i8_chunk(&mut self, _: &arrow::array::Int8Array) {}
-}
-
-impl<T> scan::PrimitiveSortedVisitor for FilterRowCollector<T>
-where
-    T: ArrowPrimitiveType,
-{
-    fn u64_run(&mut self, _: &UInt64Array, _: usize, _: usize) {}
-    fn u32_run(&mut self, _: &arrow::array::UInt32Array, _: usize, _: usize) {}
-    fn u16_run(&mut self, _: &arrow::array::UInt16Array, _: usize, _: usize) {}
-    fn u8_run(&mut self, _: &arrow::array::UInt8Array, _: usize, _: usize) {}
-    fn i64_run(&mut self, _: &arrow::array::Int64Array, _: usize, _: usize) {}
-    fn i32_run(&mut self, _: &Int32Array, _: usize, _: usize) {}
-    fn i16_run(&mut self, _: &arrow::array::Int16Array, _: usize, _: usize) {}
-    fn i8_run(&mut self, _: &arrow::array::Int8Array, _: usize, _: usize) {}
-}
-
-impl<T> scan::PrimitiveSortedWithRowIdsVisitor for FilterRowCollector<T> where T: ArrowPrimitiveType {}
-
-macro_rules! impl_filter_with_rids {
-    ($ty:ty, $method:ident, $arr:ty) => {
-        impl scan::PrimitiveWithRowIdsVisitor for FilterRowCollector<$ty> {
-            fn $method(&mut self, v: &$arr, r: &UInt64Array) {
-                let len = v.len();
-                debug_assert_eq!(len, r.len());
-                for i in 0..len {
-                    if v.is_null(i) {
-                        continue;
-                    }
-                    let value = v.value(i);
-                    if self.predicate.matches(value) {
-                        self.row_ids.push(r.value(i));
-                    }
-                }
-            }
-        }
-    };
-}
-
-impl_filter_with_rids!(UInt64Type, u64_chunk_with_rids, UInt64Array);
-impl_filter_with_rids!(
-    arrow::datatypes::UInt32Type,
-    u32_chunk_with_rids,
-    arrow::array::UInt32Array
-);
-impl_filter_with_rids!(
-    arrow::datatypes::UInt16Type,
-    u16_chunk_with_rids,
-    arrow::array::UInt16Array
-);
-impl_filter_with_rids!(
-    arrow::datatypes::UInt8Type,
-    u8_chunk_with_rids,
-    arrow::array::UInt8Array
-);
-impl_filter_with_rids!(
-    arrow::datatypes::Int64Type,
-    i64_chunk_with_rids,
-    arrow::array::Int64Array
-);
-impl_filter_with_rids!(Int32Type, i32_chunk_with_rids, Int32Array);
-impl_filter_with_rids!(
-    arrow::datatypes::Int16Type,
-    i16_chunk_with_rids,
-    arrow::array::Int16Array
-);
-impl_filter_with_rids!(
-    arrow::datatypes::Int8Type,
-    i8_chunk_with_rids,
-    arrow::array::Int8Array
-);
-
 fn collect_matching_row_ids<T>(
     store: &ColumnStore<MemPager>,
     field_id: LogicalFieldId,
     op: &Operator<'_>,
 ) -> Result<Vec<u64>, CmError>
 where
-    T: ArrowPrimitiveType,
-    FilterRowCollector<T>: scan::PrimitiveWithRowIdsVisitor,
+    T: ArrowPrimitiveType + FilterPrimitive,
 {
     let predicate = build_predicate::<T>(op)?;
-    let mut collector = FilterRowCollector::<T>::new(predicate);
-    ScanBuilder::new(store, field_id)
-        .with_row_ids(rowid_fid(field_id))
-        .run(&mut collector)?;
-    Ok(collector.into_row_ids())
+    store
+        .filter_row_ids::<T, _>(field_id, move |value| predicate.matches(value))
+        .map_err(CmError::from)
 }
 
 #[inline]
