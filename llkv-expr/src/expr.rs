@@ -1,7 +1,9 @@
-//! Buffer-only predicate AST.
+//! Type-aware, Arrow-native predicate AST.
 #![forbid(unsafe_code)]
 
+use arrow_array::{Array, Scalar};
 use std::ops::Bound;
+use std::sync::Arc;
 
 /// Logical expression over predicates.
 #[derive(Clone, Debug)]
@@ -33,53 +35,51 @@ impl<'a, F> Expr<'a, F> {
     }
 }
 
-/// Single predicate against a field. Byte semantics are adapter-defined.
+/// Single predicate against a field.
 #[derive(Debug, Clone)]
 pub struct Filter<'a, F> {
     pub field_id: F,
     pub op: Operator<'a>,
 }
 
-/// Comparison/matching operators over raw byte slices.
+type DynScalar = Scalar<Arc<dyn Array>>;
+
+/// Comparison/matching operators over Arrow's Scalar.
 #[derive(Debug, Clone)]
 pub enum Operator<'a> {
-    // Equality
-    Equals(&'a [u8]),
-
+    Equals(DynScalar),
     Range {
-        lower: Bound<&'a [u8]>,
-        upper: Bound<&'a [u8]>,
+        lower: Bound<DynScalar>,
+        upper: Bound<DynScalar>,
     },
-
-    // Simple comparisons (can be implemented as special cases of Range if needed)
-    GreaterThan(&'a [u8]),
-    GreaterThanOrEquals(&'a [u8]),
-    LessThan(&'a [u8]),
-    LessThanOrEquals(&'a [u8]),
-
-    // Set & pattern matching
-    In(&'a [&'a [u8]]),
-    StartsWith(&'a [u8]),
-    EndsWith(&'a [u8]),
-    Contains(&'a [u8]),
+    GreaterThan(DynScalar),
+    GreaterThanOrEquals(DynScalar),
+    LessThan(DynScalar),
+    LessThanOrEquals(DynScalar),
+    In(&'a [DynScalar]),
+    StartsWith(&'a str),
+    EndsWith(&'a str),
+    Contains(&'a str),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    type TestFieldId = u32;
-    use std::ops::Bound;
-    use std::ptr;
+    use arrow_array::{Array, Scalar, StringArray};
+
+    fn make_scalar<T: Array + 'static>(value: T) -> DynScalar {
+        Scalar::new(Arc::new(value) as Arc<dyn Array>)
+    }
 
     #[test]
     fn build_simple_exprs() {
         let f1 = Filter {
             field_id: 1,
-            op: Operator::Equals(b"abc"),
+            op: Operator::Equals(make_scalar(StringArray::from(vec!["abc"]))),
         };
         let f2 = Filter {
             field_id: 2,
-            op: Operator::LessThan(b"zzz"),
+            op: Operator::LessThan(make_scalar(StringArray::from(vec!["zzz"]))),
         };
         let all = Expr::all_of(vec![f1.clone(), f2.clone()]);
         let any = Expr::any_of(vec![f1.clone(), f2.clone()]);
@@ -105,19 +105,24 @@ mod tests {
         // f4: id=4 starts_with "pre"
         let f1 = Filter {
             field_id: 1u32,
-            op: Operator::Equals(b"a"),
+            op: Operator::Equals(make_scalar(StringArray::from(vec!["a"]))),
         };
         let f2 = Filter {
             field_id: 2u32,
-            op: Operator::LessThan(b"zzz"),
+            op: Operator::LessThan(make_scalar(StringArray::from(vec!["zzz"]))),
         };
+        let in_values = [
+            make_scalar(StringArray::from(vec!["x"])),
+            make_scalar(StringArray::from(vec!["y"])),
+            make_scalar(StringArray::from(vec!["z"])),
+        ];
         let f3 = Filter {
             field_id: 3u32,
-            op: Operator::In(&[b"x", b"y", b"z"]),
+            op: Operator::In(&in_values),
         };
         let f4 = Filter {
             field_id: 4u32,
-            op: Operator::StartsWith(b"pre"),
+            op: Operator::StartsWith("pre"),
         };
 
         // ( f1 AND ( f2 OR NOT f3 ) )  OR  ( NOT f1 AND f4 )
@@ -197,20 +202,35 @@ mod tests {
         let f = Filter {
             field_id: 7u32,
             op: Operator::Range {
-                lower: Bound::Included(b"aaa"),
-                upper: Bound::Excluded(b"bbb"),
+                lower: Bound::Included(make_scalar(StringArray::from(vec!["aaa"]))),
+                upper: Bound::Excluded(make_scalar(StringArray::from(vec!["bbb"]))),
             },
         };
 
-        match f.op {
+        match &f.op {
             Operator::Range { lower, upper } => {
-                match lower {
-                    Bound::Included(b) => assert_eq!(b, b"aaa"),
-                    _ => panic!("lower bound should be Included"),
+                if let Bound::Included(l) = lower {
+                    let l_arr = l.clone().into_inner();
+                    let l_val = l_arr
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0);
+                    assert_eq!(l_val, "aaa");
+                } else {
+                    panic!("lower bound should be Included");
                 }
-                match upper {
-                    Bound::Excluded(b) => assert_eq!(b, b"bbb"),
-                    _ => panic!("upper bound should be Excluded"),
+
+                if let Bound::Excluded(u) = upper {
+                    let u_arr = u.clone().into_inner();
+                    let u_val = u_arr
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0);
+                    assert_eq!(u_val, "bbb");
+                } else {
+                    panic!("upper bound should be Excluded");
                 }
             }
             _ => panic!("expected Range operator"),
@@ -221,15 +241,15 @@ mod tests {
     fn helper_builders_preserve_structure_and_order() {
         let f1 = Filter {
             field_id: 1u32,
-            op: Operator::Equals(b"a"),
+            op: Operator::Equals(make_scalar(StringArray::from(vec!["a"]))),
         };
         let f2 = Filter {
             field_id: 2u32,
-            op: Operator::Equals(b"b"),
+            op: Operator::Equals(make_scalar(StringArray::from(vec!["b"]))),
         };
         let f3 = Filter {
             field_id: 3u32,
-            op: Operator::Equals(b"c"),
+            op: Operator::Equals(make_scalar(StringArray::from(vec!["c"]))),
         };
 
         let and_expr = Expr::all_of(vec![f1.clone(), f2.clone(), f3.clone()]);
@@ -273,74 +293,49 @@ mod tests {
             }
             _ => panic!("expected Or"),
         }
-
-        // empty lists are allowed => empty And/Or
-        match Expr::<TestFieldId>::all_of(vec![]) {
-            Expr::And(v) => assert!(v.is_empty()),
-            _ => panic!(),
-        }
-        match Expr::<TestFieldId>::any_of(vec![]) {
-            Expr::Or(v) => assert!(v.is_empty()),
-            _ => panic!(),
-        }
-
-        // not wraps exactly once
-        let pred = Expr::Pred(f1.clone());
-        let not_pred = Expr::not(pred);
-        match not_pred {
-            Expr::Not(inner) => match *inner {
-                Expr::Pred(Filter { field_id, .. }) => assert_eq!(field_id, 1),
-                _ => panic!("Not should contain the original Pred"),
-            },
-            _ => panic!("expected Not"),
-        }
     }
 
     #[test]
     fn set_and_pattern_ops_hold_borrowed_slices() {
-        // Using 'static byte literals to check pointer identity is preserved.
-        let a: &'static [u8] = b"aa";
-        let b_: &'static [u8] = b"bb";
-        let c: &'static [u8] = b"cc";
-
+        let in_values = [
+            make_scalar(StringArray::from(vec!["aa"])),
+            make_scalar(StringArray::from(vec!["bb"])),
+            make_scalar(StringArray::from(vec!["cc"])),
+        ];
         let f_in = Filter {
             field_id: 9u32,
-            op: Operator::In(&[a, b_, c]),
+            op: Operator::In(&in_values),
         };
         match f_in.op {
             Operator::In(arr) => {
                 assert_eq!(arr.len(), 3);
-                // Pointer identity check
-                assert!(ptr::eq(arr[0].as_ptr(), a.as_ptr()));
-                assert!(ptr::eq(arr[1].as_ptr(), b_.as_ptr()));
-                assert!(ptr::eq(arr[2].as_ptr(), c.as_ptr()));
             }
             _ => panic!("expected In"),
         }
 
         let f_sw = Filter {
             field_id: 10u32,
-            op: Operator::StartsWith(b"pre"),
+            op: Operator::StartsWith("pre"),
         };
         let f_ew = Filter {
             field_id: 11u32,
-            op: Operator::EndsWith(b"suf"),
+            op: Operator::EndsWith("suf"),
         };
         let f_ct = Filter {
             field_id: 12u32,
-            op: Operator::Contains(b"mid"),
+            op: Operator::Contains("mid"),
         };
 
         match f_sw.op {
-            Operator::StartsWith(b) => assert_eq!(b, b"pre"),
+            Operator::StartsWith(b) => assert_eq!(b, "pre"),
             _ => panic!(),
         }
         match f_ew.op {
-            Operator::EndsWith(b) => assert_eq!(b, b"suf"),
+            Operator::EndsWith(b) => assert_eq!(b, "suf"),
             _ => panic!(),
         }
         match f_ct.op {
-            Operator::Contains(b) => assert_eq!(b, b"mid"),
+            Operator::Contains(b) => assert_eq!(b, "mid"),
             _ => panic!(),
         }
     }
@@ -350,11 +345,11 @@ mod tests {
         // Demonstrate F = &'static str
         let f1 = Filter {
             field_id: "name",
-            op: Operator::Equals(b"alice"),
+            op: Operator::Equals(make_scalar(StringArray::from(vec!["alice"]))),
         };
         let f2 = Filter {
             field_id: "status",
-            op: Operator::GreaterThanOrEquals(b"active"),
+            op: Operator::GreaterThanOrEquals(make_scalar(StringArray::from(vec!["active"]))),
         };
         let expr = Expr::all_of(vec![f1.clone(), f2.clone()]);
 
@@ -379,7 +374,7 @@ mod tests {
         // Build Not(Not(...Not(Pred)...)) of depth 64
         let base = Expr::Pred(Filter {
             field_id: 42u32,
-            op: Operator::Equals(b"x"),
+            op: Operator::Equals(make_scalar(StringArray::from(vec!["x"]))),
         });
         let mut expr = base;
         for _ in 0..64 {

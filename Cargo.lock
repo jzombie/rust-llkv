@@ -932,6 +932,10 @@ dependencies = [
 [[package]]
 name = "llkv-expr"
 version = "0.1.0-alpha"
+dependencies = [
+ "arrow",
+ "arrow-array",
+]
 
 [[package]]
 name = "llkv-storage"
@@ -957,6 +961,7 @@ dependencies = [
  "llkv-expr",
  "rayon",
  "rustc-hash",
+ "simd-r-drive-entry-handle",
 ]
 
 [[package]]
