@@ -1,16 +1,17 @@
+use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int32Array, PrimitiveArray, RecordBatch, UInt64Array};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Int32Type, Schema, UInt64Type};
 use arrow_array::{Datum, Scalar};
 
+use llkv_column_map::store::rowid_fid;
 use llkv_column_map::{
     ColumnStore,
     scan::{self, ScanBuilder},
     storage::pager::MemPager,
     types::{LogicalFieldId, Namespace},
 };
-use llkv_column_map::store::rowid_fid;
 
 use crate::expr::{Filter, Operator};
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
@@ -40,9 +41,73 @@ fn scalar_to_native<T: ArrowPrimitiveType>(scalar: &DynScalar) -> Result<T::Nati
     Ok(typed.value(0))
 }
 
+fn bound_to_native<T: ArrowPrimitiveType>(
+    bound: &Bound<DynScalar>,
+) -> Result<Bound<T::Native>, CmError>
+where
+    T::Native: Copy,
+{
+    Ok(match bound {
+        Bound::Unbounded => Bound::Unbounded,
+        Bound::Included(scalar) => Bound::Included(scalar_to_native::<T>(scalar)?),
+        Bound::Excluded(scalar) => Bound::Excluded(scalar_to_native::<T>(scalar)?),
+    })
+}
+
+fn scalar_bound_data_type(bound: &Bound<DynScalar>) -> Option<DataType> {
+    match bound {
+        Bound::Unbounded => None,
+        Bound::Included(s) | Bound::Excluded(s) => Some(scalar_data_type(s)),
+    }
+}
+
+fn filter_data_type(op: &Operator<'_>) -> Result<DataType, CmError> {
+    match op {
+        Operator::Equals(s)
+        | Operator::GreaterThan(s)
+        | Operator::LessThan(s)
+        | Operator::GreaterThanOrEquals(s)
+        | Operator::LessThanOrEquals(s) => Ok(scalar_data_type(s)),
+        Operator::Range { lower, upper } => {
+            let lower_ty = scalar_bound_data_type(lower);
+            let upper_ty = scalar_bound_data_type(upper);
+            match (lower_ty, upper_ty) {
+                (None, None) => Err(CmError::Internal(
+                    "Range filter requires at least one concrete bound".to_string(),
+                )),
+                (Some(dt), None) | (None, Some(dt)) => Ok(dt),
+                (Some(l), Some(u)) if l == u => Ok(l),
+                (Some(l), Some(u)) => Err(CmError::Internal(format!(
+                    "Mismatched range bound types: {:?} vs {:?}",
+                    l, u
+                ))),
+            }
+        }
+        Operator::In(values) => {
+            let first = values.first().ok_or_else(|| {
+                CmError::Internal("IN operator requires at least one value".to_string())
+            })?;
+            let dtype = scalar_data_type(first);
+            let all_match = values
+                .iter()
+                .all(|value| scalar_data_type(value) == dtype);
+            if all_match {
+                Ok(dtype)
+            } else {
+                Err(CmError::Internal(
+                    "IN operator values must share the same type".to_string(),
+                ))
+            }
+        }
+        _ => Err(CmError::Internal(
+            "Filter operator does not contain a typed value".to_string(),
+        )),
+    }
+}
+
 /// Generic helper to apply filters for any primitive type that supports them.
-fn apply_primitive_filter<'a, T, P, V>(
-    builder: ScanBuilder<'a, P>,
+fn apply_primitive_filter<'a, T, P, V, F>(
+    make_builder: F,
     op: &Operator<'a>,
     visitor: &mut V,
 ) -> Result<(), CmError>
@@ -54,13 +119,74 @@ where
         + scan::PrimitiveWithRowIdsVisitor
         + scan::PrimitiveSortedVisitor
         + scan::PrimitiveSortedWithRowIdsVisitor,
+    F: Fn() -> ScanBuilder<'a, P>,
 {
+    struct BoundRange<T> {
+        start: Bound<T>,
+        end: Bound<T>,
+    }
+
+    impl<T: Copy> RangeBounds<T> for BoundRange<T> {
+        fn start_bound(&self) -> Bound<&T> {
+            match &self.start {
+                Bound::Unbounded => Bound::Unbounded,
+                Bound::Included(v) => Bound::Included(v),
+                Bound::Excluded(v) => Bound::Excluded(v),
+            }
+        }
+
+        fn end_bound(&self) -> Bound<&T> {
+            match &self.end {
+                Bound::Unbounded => Bound::Unbounded,
+                Bound::Included(v) => Bound::Included(v),
+                Bound::Excluded(v) => Bound::Excluded(v),
+            }
+        }
+    }
+
+    let mut run_bounds = |start: Bound<T::Native>, end: Bound<T::Native>| -> Result<(), CmError> {
+        make_builder()
+            .with_range::<T::Native, _>(BoundRange { start, end })
+            .run(visitor)?;
+        Ok(())
+    };
+
     match op {
         Operator::Equals(scalar) => {
             let value = scalar_to_native::<T>(scalar)?;
-            builder
-                .with_range::<T::Native, _>(value..=value)
-                .run(visitor)?;
+            run_bounds(Bound::Included(value), Bound::Included(value))
+        }
+        Operator::GreaterThan(scalar) => {
+            let value = scalar_to_native::<T>(scalar)?;
+            run_bounds(Bound::Excluded(value), Bound::Unbounded)
+        }
+        Operator::GreaterThanOrEquals(scalar) => {
+            let value = scalar_to_native::<T>(scalar)?;
+            run_bounds(Bound::Included(value), Bound::Unbounded)
+        }
+        Operator::LessThan(scalar) => {
+            let value = scalar_to_native::<T>(scalar)?;
+            run_bounds(Bound::Unbounded, Bound::Excluded(value))
+        }
+        Operator::LessThanOrEquals(scalar) => {
+            let value = scalar_to_native::<T>(scalar)?;
+            run_bounds(Bound::Unbounded, Bound::Included(value))
+        }
+        Operator::Range { lower, upper } => {
+            let lb = bound_to_native::<T>(lower)?;
+            let ub = bound_to_native::<T>(upper)?;
+            if matches!(&lb, Bound::Unbounded) && matches!(&ub, Bound::Unbounded) {
+                make_builder().run(visitor)?;
+                Ok(())
+            } else {
+                run_bounds(lb, ub)
+            }
+        }
+        Operator::In(values) => {
+            for scalar in values.iter() {
+                let value = scalar_to_native::<T>(scalar)?;
+                run_bounds(Bound::Included(value), Bound::Included(value))?;
+            }
             Ok(())
         }
         _ => Err(CmError::Internal(format!(
@@ -78,6 +204,7 @@ fn lfid_for(table_id: u32, column_id: FieldId) -> LogicalFieldId {
         .with_namespace(Namespace::UserData)
 }
 
+// TODO: Remove?
 #[derive(Clone, Debug, Default)]
 pub struct TableCfg {}
 
@@ -160,18 +287,7 @@ impl Table {
     ) -> Result<RecordBatch, CmError> {
         let filter_lfid = lfid_for(self.table_id, filter.field_id);
 
-        let dtype = match &filter.op {
-            Operator::Equals(s)
-            | Operator::GreaterThan(s)
-            | Operator::LessThan(s)
-            | Operator::GreaterThanOrEquals(s)
-            | Operator::LessThanOrEquals(s) => scalar_data_type(s),
-            _ => {
-                return Err(CmError::Internal(
-                    "Filter operator does not contain a typed value".to_string(),
-                ));
-            }
-        };
+        let dtype = filter_data_type(&filter.op)?;
 
         struct RowIdCollector {
             row_ids: Vec<u64>,
@@ -190,19 +306,20 @@ impl Table {
 
         let mut rid_visitor = RowIdCollector { row_ids: vec![] };
 
-        let scan_builder =
-            ScanBuilder::new(&self.store, filter_lfid).with_row_ids(rowid_fid(filter_lfid));
+        let make_builder = || {
+            ScanBuilder::new(&self.store, filter_lfid).with_row_ids(rowid_fid(filter_lfid))
+        };
         match dtype {
             DataType::UInt64 => {
-                apply_primitive_filter::<UInt64Type, _, _>(
-                    scan_builder,
+                apply_primitive_filter::<UInt64Type, _, _, _>(
+                    make_builder,
                     &filter.op,
                     &mut rid_visitor,
                 )?;
             }
             DataType::Int32 => {
-                apply_primitive_filter::<Int32Type, _, _>(
-                    scan_builder,
+                apply_primitive_filter::<Int32Type, _, _, _>(
+                    make_builder,
                     &filter.op,
                     &mut rid_visitor,
                 )?;
@@ -406,6 +523,61 @@ mod tests {
         let filter = Filter {
             field_id: COL_C_I32,
             op: Operator::Equals(scalar_from_i32(20)),
+        };
+        let projection = vec![COL_A_U64];
+        let result_batch = table.scan(&projection, &filter).unwrap();
+
+        assert_eq!(result_batch.num_columns(), 1);
+        assert_eq!(result_batch.column(0).data_type(), &DataType::UInt64);
+    }
+
+    #[test]
+    fn test_scan_with_greater_than_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::GreaterThan(scalar_from_i32(15)),
+        };
+        let projection = vec![COL_A_U64];
+        let result_batch = table.scan(&projection, &filter).unwrap();
+
+        assert_eq!(result_batch.num_columns(), 1);
+        assert_eq!(result_batch.column(0).data_type(), &DataType::UInt64);
+    }
+
+    #[test]
+    fn test_scan_with_range_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = Filter {
+            field_id: COL_A_U64,
+            op: Operator::Range {
+                lower: Bound::Included(scalar_from_u64(150)),
+                upper: Bound::Excluded(scalar_from_u64(300)),
+            },
+        };
+        let projection = vec![COL_C_I32];
+        let result_batch = table.scan(&projection, &filter).unwrap();
+
+        assert_eq!(result_batch.num_columns(), 1);
+        assert_eq!(result_batch.column(0).data_type(), &DataType::Int32);
+    }
+
+    #[test]
+    fn test_scan_with_in_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let candidates = [scalar_from_i32(10), scalar_from_i32(30)];
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::In(&candidates),
         };
         let projection = vec![COL_A_U64];
         let result_batch = table.scan(&projection, &filter).unwrap();
