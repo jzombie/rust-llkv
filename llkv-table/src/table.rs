@@ -11,45 +11,20 @@ use llkv_column_map::{
     types::{LogicalFieldId, Namespace},
 };
 
-use crate::expr::{Filter, Literal, Operator};
+use crate::expr::{Filter, Literal, LiteralCastError, Operator, literal_to_native};
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
 
-/// Convert a `Literal` into a concrete native value for `T`.
-fn literal_to_native<T>(lit: &Literal) -> Result<T::Native, CmError>
-where
-    T: ArrowPrimitiveType + FilterPrimitive,
-    T::Native: TryFrom<i128> + Copy,
-{
-    use std::convert::TryFrom;
-
-    match lit {
-        Literal::Integer(i) => T::Native::try_from(*i).map_err(|_| {
-            CmError::Internal(format!(
-                "Integer literal {} out of range for {}",
-                i,
-                std::any::type_name::<T::Native>()
-            ))
-        }),
-        Literal::Float(_) => Err(CmError::Internal(
-            "Float literal for integer column".to_string(),
-        )),
-        Literal::String(_) => Err(CmError::Internal(
-            "String literal for numeric column".to_string(),
-        )),
-    }
-}
-
 /// Convert a bound of `Literal` into a bound of `T::Native`.
-fn bound_to_native<T>(bound: &Bound<Literal>) -> Result<Bound<T::Native>, CmError>
+fn bound_to_native<T>(bound: &Bound<Literal>) -> Result<Bound<T::Native>, TableError>
 where
     T: ArrowPrimitiveType + FilterPrimitive,
     T::Native: TryFrom<i128> + Copy,
 {
     Ok(match bound {
         Bound::Unbounded => Bound::Unbounded,
-        Bound::Included(l) => Bound::Included(literal_to_native::<T>(l)?),
-        Bound::Excluded(l) => Bound::Excluded(literal_to_native::<T>(l)?),
+        Bound::Included(l) => Bound::Included(literal_to_native::<T::Native>(l)?),
+        Bound::Excluded(l) => Bound::Excluded(literal_to_native::<T::Native>(l)?),
     })
 }
 
@@ -123,21 +98,25 @@ where
     }
 }
 
-fn build_predicate<T>(op: &Operator<'_>) -> Result<Predicate<T>, CmError>
+fn build_predicate<T>(op: &Operator<'_>) -> Result<Predicate<T>, TableError>
 where
     T: ArrowPrimitiveType + FilterPrimitive,
     T::Native: TryFrom<i128> + Copy,
 {
     match op {
-        Operator::Equals(lit) => Ok(Predicate::Equals(literal_to_native::<T>(lit)?)),
-        Operator::GreaterThan(lit) => Ok(Predicate::GreaterThan(literal_to_native::<T>(lit)?)),
+        Operator::Equals(lit) => Ok(Predicate::Equals(literal_to_native::<T::Native>(lit)?)),
+        Operator::GreaterThan(lit) => {
+            Ok(Predicate::GreaterThan(literal_to_native::<T::Native>(lit)?))
+        }
         Operator::GreaterThanOrEquals(lit) => {
-            Ok(Predicate::GreaterThanOrEquals(literal_to_native::<T>(lit)?))
+            Ok(Predicate::GreaterThanOrEquals(literal_to_native::<
+                T::Native,
+            >(lit)?))
         }
-        Operator::LessThan(lit) => Ok(Predicate::LessThan(literal_to_native::<T>(lit)?)),
-        Operator::LessThanOrEquals(lit) => {
-            Ok(Predicate::LessThanOrEquals(literal_to_native::<T>(lit)?))
-        }
+        Operator::LessThan(lit) => Ok(Predicate::LessThan(literal_to_native::<T::Native>(lit)?)),
+        Operator::LessThanOrEquals(lit) => Ok(Predicate::LessThanOrEquals(literal_to_native::<
+            T::Native,
+        >(lit)?)),
         Operator::Range { lower, upper } => {
             let lb = match bound_to_native::<T>(lower)? {
                 Bound::Unbounded => None,
@@ -161,15 +140,13 @@ where
         Operator::In(values) => {
             let mut natives = Vec::with_capacity(values.len());
             for lit in *values {
-                natives.push(literal_to_native::<T>(lit)?);
+                natives.push(literal_to_native::<T::Native>(lit)?);
             }
             Ok(Predicate::In(natives))
         }
         // Pattern/string ops are not supported in this numeric predicate path.
-        _ => Err(CmError::Internal(
-            "Filter operator does not contain a supported \
-             typed value"
-                .to_string(),
+        _ => Err(TableError::Internal(
+            "Filter operator does not contain a supported typed value".to_string(),
         )),
     }
 }
@@ -178,7 +155,7 @@ fn collect_matching_row_ids<T>(
     store: &ColumnStore<MemPager>,
     field_id: LogicalFieldId,
     op: &Operator<'_>,
-) -> Result<Vec<u64>, CmError>
+) -> Result<Vec<u64>, TableError>
 where
     T: ArrowPrimitiveType + FilterPrimitive,
     T::Native: TryFrom<i128> + Copy,
@@ -186,7 +163,7 @@ where
     let predicate = build_predicate::<T>(op)?;
     store
         .filter_row_ids::<T, _>(field_id, move |value| predicate.matches(value))
-        .map_err(CmError::from)
+        .map_err(TableError::from)
 }
 
 #[inline]
@@ -202,21 +179,28 @@ fn lfid_for(table_id: u32, column_id: FieldId) -> LogicalFieldId {
 pub struct TableCfg {}
 
 #[derive(Debug)]
-pub enum CmError {
+pub enum TableError {
     ColumnMap(llkv_column_map::error::Error),
     Arrow(arrow::error::ArrowError),
+    ExprCast(LiteralCastError),
     Internal(String),
 }
 
-impl From<llkv_column_map::error::Error> for CmError {
+impl From<llkv_column_map::error::Error> for TableError {
     fn from(e: llkv_column_map::error::Error) -> Self {
-        CmError::ColumnMap(e)
+        TableError::ColumnMap(e)
     }
 }
 
-impl From<arrow::error::ArrowError> for CmError {
+impl From<arrow::error::ArrowError> for TableError {
     fn from(e: arrow::error::ArrowError) -> Self {
-        CmError::Arrow(e)
+        TableError::Arrow(e)
+    }
+}
+
+impl From<LiteralCastError> for TableError {
+    fn from(e: LiteralCastError) -> Self {
+        TableError::ExprCast(e)
     }
 }
 
@@ -278,7 +262,7 @@ impl Table {
         &self,
         projection: &[FieldId],
         filter: &Filter<'a, FieldId>,
-    ) -> Result<RecordBatch, CmError> {
+    ) -> Result<RecordBatch, TableError> {
         let filter_lfid = lfid_for(self.table_id, filter.field_id);
 
         // Determine dtype from the store. Operators now carry untyped
@@ -324,12 +308,12 @@ impl Table {
             )?,
             // Float types are not supported by FilterPrimitive in column-map.
             DataType::Float64 | DataType::Float32 => {
-                return Err(CmError::Internal(
+                return Err(TableError::Internal(
                     "Filtering on float columns is not supported".to_string(),
                 ));
             }
             other => {
-                return Err(CmError::Internal(format!(
+                return Err(TableError::Internal(format!(
                     "Filtering on type {:?} is not supported",
                     other
                 )));
@@ -390,11 +374,11 @@ pub struct ColumnData {
 
 // FIX: Move helper methods into a trait to satisfy Rust's orphan rule
 pub trait ColumnStoreTestExt {
-    fn get_column_for_test(&self, field_id: LogicalFieldId) -> Result<ColumnData, CmError>;
+    fn get_column_for_test(&self, field_id: LogicalFieldId) -> Result<ColumnData, TableError>;
 }
 
 impl ColumnStoreTestExt for ColumnStore<MemPager> {
-    fn get_column_for_test(&self, field_id: LogicalFieldId) -> Result<ColumnData, CmError> {
+    fn get_column_for_test(&self, field_id: LogicalFieldId) -> Result<ColumnData, TableError> {
         struct ColVisitor {
             chunks: Vec<ArrayRef>,
             data_type: Option<DataType>,
@@ -428,7 +412,7 @@ impl ColumnStoreTestExt for ColumnStore<MemPager> {
         self.scan(field_id, Default::default(), &mut visitor)?;
 
         if visitor.chunks.is_empty() {
-            return Err(CmError::Internal(
+            return Err(TableError::Internal(
                 "Column not found or is empty".to_string(),
             ));
         }

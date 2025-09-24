@@ -1,4 +1,10 @@
 //! Type-aware, Arrow-native predicate AST.
+//!
+//! This module defines a small predicate-expression AST that is decoupled
+//! from Arrow's concrete scalar types by using `Literal`. Concrete typing
+//! is deferred to the consumer (e.g., a table/scan layer) which knows the
+//! column types and can coerce `Literal` into native values.
+
 #![forbid(unsafe_code)]
 
 use std::ops::Bound;
@@ -40,9 +46,9 @@ pub struct Filter<'a, F> {
     pub op: Operator<'a>,
 }
 
-/// A literal value that has not yet been coerced into a specific Arrow
-/// `Scalar` type. This allows for type inference to be deferred until the
-/// column type is known.
+/// A literal value that has not yet been coerced into a specific native
+/// type. This allows for type inference to be deferred until the column
+/// type is known.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Integer(i128),
@@ -72,8 +78,62 @@ impl From<&str> for Literal {
     }
 }
 
+/// Error converting a `Literal` into a concrete native type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiteralCastError {
+    /// Tried to coerce a non-integer literal into an integer native type.
+    TypeMismatch {
+        expected: &'static str,
+        got: &'static str,
+    },
+    /// Integer value does not fit in the destination type.
+    OutOfRange { target: &'static str, value: i128 },
+}
+
+impl std::fmt::Display for LiteralCastError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiteralCastError::TypeMismatch { expected, got } => {
+                write!(f, "expected {}, got {}", expected, got)
+            }
+            LiteralCastError::OutOfRange { target, value } => {
+                write!(f, "value {} out of range for {}", value, target)
+            }
+        }
+    }
+}
+
+impl std::error::Error for LiteralCastError {}
+
+/// Convert a `Literal` into a concrete integer-like native type `T`.
+/// This crate does not depend on Arrow; it only requires `TryFrom<i128>`.
+///
+/// Note: the current implementation only permits integer-like targets.
+/// Calling this with a float/string `Literal` returns `TypeMismatch`.
+pub fn literal_to_native<T>(lit: &Literal) -> Result<T, LiteralCastError>
+where
+    T: TryFrom<i128> + Copy + 'static,
+{
+    match lit {
+        Literal::Integer(i) => T::try_from(*i).map_err(|_| LiteralCastError::OutOfRange {
+            target: std::any::type_name::<T>(),
+            value: *i,
+        }),
+        Literal::Float(_) => Err(LiteralCastError::TypeMismatch {
+            expected: "integer",
+            got: "float",
+        }),
+        Literal::String(_) => Err(LiteralCastError::TypeMismatch {
+            expected: "integer",
+            got: "string",
+        }),
+    }
+}
+
 /// Comparison/matching operators over untyped `Literal`s.
-/// `In` now accepts a borrowed slice of `Literal`s.
+///
+/// `In` accepts a borrowed slice of `Literal`s to avoid allocations in the
+/// common case of small, static IN lists built at call sites.
 #[derive(Debug, Clone)]
 pub enum Operator<'a> {
     Equals(Literal),
