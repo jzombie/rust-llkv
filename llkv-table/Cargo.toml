@@ -10,6 +10,8 @@ publish.workspace = true
 
 [dependencies]
 arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
 bitcode.workspace = true
 crossbeam-channel.workspace = true
 llkv-column-map.workspace = true
@@ -17,3 +19,4 @@ llkv-expr.workspace = true
 # llkv-storage.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
+simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }

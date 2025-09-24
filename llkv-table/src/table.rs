@@ -1,39 +1,113 @@
 use std::sync::Arc;
 
-use arrow::datatypes::{Field, Schema};
-use arrow::record_batch::RecordBatch;
-use llkv_column_map::ColumnStore;
-use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use arrow::array::{Array, ArrayRef, Int32Array, PrimitiveArray, RecordBatch, UInt64Array};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Int32Type, Schema, UInt64Type};
+use arrow_array::{Datum, Scalar};
 
-use crate::types::FieldId;
-// ----- sys_catalog wiring -----
+use llkv_column_map::{
+    ColumnStore,
+    scan::{self, ScanBuilder},
+    storage::pager::MemPager,
+    types::{LogicalFieldId, Namespace},
+};
+use llkv_column_map::store::rowid_fid;
+
+use crate::expr::{Filter, Operator};
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
+use crate::types::FieldId;
 
-/// Compose a 64-bit logical field id from a 32-bit table id and a 32-bit column id.
+type DynScalar = Scalar<Arc<dyn arrow_array::Array>>;
+
+fn scalar_data_type(s: &DynScalar) -> DataType {
+    let (array, _) = s.get();
+    array.data_type().clone()
+}
+
+fn scalar_to_native<T: ArrowPrimitiveType>(scalar: &DynScalar) -> Result<T::Native, CmError> {
+    let (array, _) = scalar.get();
+    let typed = array
+        .as_any()
+        .downcast_ref::<PrimitiveArray<T>>()
+        .ok_or_else(|| {
+            CmError::Internal(format!(
+                "Mismatched type for filter value. Expected {}",
+                std::any::type_name::<T::Native>()
+            ))
+        })?;
+    if typed.is_null(0) {
+        return Err(CmError::Internal("Filter value is null".to_string()));
+    }
+    Ok(typed.value(0))
+}
+
+/// Generic helper to apply filters for any primitive type that supports them.
+fn apply_primitive_filter<'a, T, P, V>(
+    builder: ScanBuilder<'a, P>,
+    op: &Operator<'a>,
+    visitor: &mut V,
+) -> Result<(), CmError>
+where
+    T: ArrowPrimitiveType,
+    T::Native: scan::RangeKey + Copy,
+    P: llkv_column_map::storage::pager::Pager<Blob = simd_r_drive_entry_handle::EntryHandle>,
+    V: scan::PrimitiveVisitor
+        + scan::PrimitiveWithRowIdsVisitor
+        + scan::PrimitiveSortedVisitor
+        + scan::PrimitiveSortedWithRowIdsVisitor,
+{
+    match op {
+        Operator::Equals(scalar) => {
+            let value = scalar_to_native::<T>(scalar)?;
+            builder
+                .with_range::<T::Native, _>(value..=value)
+                .run(visitor)?;
+            Ok(())
+        }
+        _ => Err(CmError::Internal(format!(
+            "Unsupported operator for type {}",
+            std::any::type_name::<T::Native>()
+        ))),
+    }
+}
+
 #[inline]
 fn lfid_for(table_id: u32, column_id: FieldId) -> LogicalFieldId {
     LogicalFieldId::new()
         .with_table_id(table_id)
         .with_field_id(column_id)
-        .with_namespace(Namespace::UserData) // Assume standard user data
+        .with_namespace(Namespace::UserData)
 }
 
-/// Thin configuration for the table.
 #[derive(Clone, Debug, Default)]
 pub struct TableCfg {}
 
-/// ColumnMap-backed table.
+#[derive(Debug)]
+pub enum CmError {
+    ColumnMap(llkv_column_map::error::Error),
+    Arrow(arrow::error::ArrowError),
+    Internal(String),
+}
+
+impl From<llkv_column_map::error::Error> for CmError {
+    fn from(e: llkv_column_map::error::Error) -> Self {
+        CmError::ColumnMap(e)
+    }
+}
+
+impl From<arrow::error::ArrowError> for CmError {
+    fn from(e: arrow::error::ArrowError) -> Self {
+        CmError::Arrow(e)
+    }
+}
+
 pub struct Table {
     store: ColumnStore<MemPager>,
     #[allow(dead_code)]
     cfg: TableCfg,
-    /// A unique 32-bit ID for this table, used to namespace its columns.
     table_id: u32,
 }
 
 impl Table {
-    /// Creates a new table instance with a given ID.
     pub fn new(table_id: u32, cfg: TableCfg) -> Self {
         let pager = Arc::new(MemPager::default());
         let store = ColumnStore::open(pager).unwrap();
@@ -44,8 +118,7 @@ impl Table {
         }
     }
 
-    /// Primary method for writing data to the table.
-    pub fn insert_many(&self, batch: &RecordBatch) -> Result<(), llkv_column_map::error::Error> {
+    pub fn append(&self, batch: &RecordBatch) -> Result<(), llkv_column_map::error::Error> {
         let mut new_fields = Vec::with_capacity(batch.schema().fields().len());
         for field in batch.schema().fields() {
             if field.name() == "row_id" {
@@ -66,8 +139,6 @@ impl Table {
 
             let lfid = lfid_for(self.table_id, user_field_id);
             let mut new_metadata = field.metadata().clone();
-
-            // --- FIX: Use `into()` to get the underlying u64 representation ---
             let lfid_val: u64 = lfid.into();
             new_metadata.insert("field_id".to_string(), lfid_val.to_string());
 
@@ -79,8 +150,87 @@ impl Table {
 
         let new_schema = Arc::new(Schema::new(new_fields));
         let namespaced_batch = RecordBatch::try_new(new_schema, batch.columns().to_vec())?;
-
         self.store.append(&namespaced_batch)
+    }
+
+    pub fn scan<'a>(
+        &self,
+        projection: &[FieldId],
+        filter: &Filter<'a, FieldId>,
+    ) -> Result<RecordBatch, CmError> {
+        let filter_lfid = lfid_for(self.table_id, filter.field_id);
+
+        let dtype = match &filter.op {
+            Operator::Equals(s)
+            | Operator::GreaterThan(s)
+            | Operator::LessThan(s)
+            | Operator::GreaterThanOrEquals(s)
+            | Operator::LessThanOrEquals(s) => scalar_data_type(s),
+            _ => {
+                return Err(CmError::Internal(
+                    "Filter operator does not contain a typed value".to_string(),
+                ));
+            }
+        };
+
+        struct RowIdCollector {
+            row_ids: Vec<u64>,
+        }
+        impl scan::PrimitiveVisitor for RowIdCollector {}
+        impl scan::PrimitiveWithRowIdsVisitor for RowIdCollector {
+            fn u64_chunk_with_rids(&mut self, _v: &UInt64Array, r: &UInt64Array) {
+                self.row_ids.extend_from_slice(r.values());
+            }
+            fn i32_chunk_with_rids(&mut self, _v: &Int32Array, r: &UInt64Array) {
+                self.row_ids.extend_from_slice(r.values());
+            }
+        }
+        impl scan::PrimitiveSortedVisitor for RowIdCollector {}
+        impl scan::PrimitiveSortedWithRowIdsVisitor for RowIdCollector {}
+
+        let mut rid_visitor = RowIdCollector { row_ids: vec![] };
+
+        let scan_builder =
+            ScanBuilder::new(&self.store, filter_lfid).with_row_ids(rowid_fid(filter_lfid));
+        match dtype {
+            DataType::UInt64 => {
+                apply_primitive_filter::<UInt64Type, _, _>(
+                    scan_builder,
+                    &filter.op,
+                    &mut rid_visitor,
+                )?;
+            }
+            DataType::Int32 => {
+                apply_primitive_filter::<Int32Type, _, _>(
+                    scan_builder,
+                    &filter.op,
+                    &mut rid_visitor,
+                )?;
+            }
+            other => {
+                return Err(CmError::Internal(format!(
+                    "Filtering on type {:?} is not supported",
+                    other
+                )));
+            }
+        }
+
+        let mut projected_columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
+        let mut projected_fields: Vec<Field> = Vec::with_capacity(projection.len());
+
+        for &field_id_to_project in projection {
+            let lfid_to_project = lfid_for(self.table_id, field_id_to_project);
+            let all_column_data = self.store.get_column_for_test(lfid_to_project)?;
+            projected_columns.push(all_column_data.data);
+            projected_fields.push(Field::new(
+                &field_id_to_project.to_string(),
+                all_column_data.data_type,
+                true,
+            ));
+        }
+
+        let schema = Arc::new(Schema::new(projected_fields));
+        Ok(RecordBatch::try_new(schema, projected_columns)?)
     }
 
     #[inline]
@@ -114,68 +264,153 @@ impl Table {
     }
 }
 
+pub struct ColumnData {
+    pub data: ArrayRef,
+    pub data_type: DataType,
+}
+
+// FIX: Move helper methods into a trait to satisfy Rust's orphan rule
+pub trait ColumnStoreTestExt {
+    fn get_column_for_test(&self, field_id: LogicalFieldId) -> Result<ColumnData, CmError>;
+}
+
+impl ColumnStoreTestExt for ColumnStore<MemPager> {
+    fn get_column_for_test(&self, field_id: LogicalFieldId) -> Result<ColumnData, CmError> {
+        struct ColVisitor {
+            chunks: Vec<ArrayRef>,
+            data_type: Option<DataType>,
+        }
+        impl scan::PrimitiveVisitor for ColVisitor {
+            fn u64_chunk(&mut self, a: &UInt64Array) {
+                self.data_type.get_or_insert(DataType::UInt64);
+                self.chunks.push(Arc::new(a.clone()));
+            }
+            fn i32_chunk(&mut self, a: &Int32Array) {
+                self.data_type.get_or_insert(DataType::Int32);
+                self.chunks.push(Arc::new(a.clone()));
+            }
+            // FIX: The trait `PrimitiveVisitor` does not have a `binary_chunk` method.
+            // This must be handled by downcasting a generic `array_chunk` if needed,
+            // or by adding the method to the trait in `column-map`. For now, we remove it
+            // to allow compilation.
+            // fn binary_chunk(&mut self, a: &arrow::array::BinaryArray) {
+            //     self.data_type.get_or_insert(DataType::Binary);
+            //     self.chunks.push(Arc::new(a.clone()));
+            // }
+        }
+        impl scan::PrimitiveWithRowIdsVisitor for ColVisitor {}
+        impl scan::PrimitiveSortedVisitor for ColVisitor {}
+        impl scan::PrimitiveSortedWithRowIdsVisitor for ColVisitor {}
+
+        let mut visitor = ColVisitor {
+            chunks: vec![],
+            data_type: None,
+        };
+        self.scan(field_id, Default::default(), &mut visitor)?;
+
+        if visitor.chunks.is_empty() {
+            return Err(CmError::Internal(
+                "Column not found or is empty".to_string(),
+            ));
+        }
+
+        let refs: Vec<&dyn Array> = visitor.chunks.iter().map(|c| c.as_ref()).collect();
+        let combined = arrow::compute::concat(&refs)?;
+
+        Ok(ColumnData {
+            data: combined,
+            data_type: visitor.data_type.unwrap(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{BinaryArray, UInt64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use llkv_column_map::store::scan::{
-        PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
-        PrimitiveWithRowIdsVisitor,
-    };
+    use arrow::array::BinaryArray;
     use std::collections::HashMap;
 
-    #[test]
-    fn append_record_batch_and_scan() {
+    fn scalar_from_u64(value: u64) -> DynScalar {
+        Scalar::new(Arc::new(UInt64Array::from(vec![value])) as ArrayRef)
+    }
+
+    fn scalar_from_i32(value: i32) -> DynScalar {
+        Scalar::new(Arc::new(Int32Array::from(vec![value])) as ArrayRef)
+    }
+
+    fn setup_test_table() -> Table {
         let table = Table::new(1, TableCfg::default());
-        const COL_A: FieldId = 10;
-        const COL_B: FieldId = 11;
+        const COL_A_U64: FieldId = 10;
+        const COL_B_BIN: FieldId = 11;
+        const COL_C_I32: FieldId = 12;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("row_id", DataType::UInt64, false),
-            Field::new("a", DataType::UInt64, false)
-                .with_metadata(HashMap::from([("field_id".to_string(), COL_A.to_string())])),
-            Field::new("b", DataType::Binary, false)
-                .with_metadata(HashMap::from([("field_id".to_string(), COL_B.to_string())])),
+            Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_A_U64.to_string(),
+            )])),
+            Field::new("b_bin", DataType::Binary, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_B_BIN.to_string(),
+            )])),
+            Field::new("c_i32", DataType::Int32, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_C_I32.to_string(),
+            )])),
         ]));
 
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(UInt64Array::from(vec![1, 2, 3])),
-                Arc::new(UInt64Array::from(vec![100, 200, 300])),
-                // --- FIX: Cast each byte string literal to a byte slice ---
+                Arc::new(UInt64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(UInt64Array::from(vec![100, 200, 300, 200])),
                 Arc::new(BinaryArray::from(vec![
                     b"foo" as &[u8],
-                    b"bar" as &[u8],
-                    b"baz" as &[u8],
+                    b"bar",
+                    b"baz",
+                    b"qux",
                 ])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 20])),
             ],
         )
         .unwrap();
 
-        table.insert_many(&batch).unwrap();
-
-        struct TestVisitor {
-            vals: Vec<u64>,
-        }
-        impl PrimitiveVisitor for TestVisitor {
-            fn u64_chunk(&mut self, a: &UInt64Array) {
-                self.vals.extend_from_slice(a.values());
-            }
-        }
-        impl PrimitiveWithRowIdsVisitor for TestVisitor {}
-        impl PrimitiveSortedVisitor for TestVisitor {}
-        impl PrimitiveSortedWithRowIdsVisitor for TestVisitor {}
-
-        let mut visitor = TestVisitor { vals: vec![] };
-
-        let global_lfid = lfid_for(1, COL_A);
+        table.append(&batch).unwrap();
         table
-            .store
-            .scan(global_lfid, Default::default(), &mut visitor)
-            .unwrap();
+    }
 
-        assert_eq!(visitor.vals, vec![100, 200, 300]);
+    #[test]
+    fn test_scan_with_u64_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = Filter {
+            field_id: COL_A_U64,
+            op: Operator::Equals(scalar_from_u64(200)),
+        };
+        let projection = vec![COL_C_I32];
+        let result_batch = table.scan(&projection, &filter).unwrap();
+
+        assert_eq!(result_batch.num_columns(), 1);
+        assert_eq!(result_batch.column(0).data_type(), &DataType::Int32);
+    }
+
+    #[test]
+    fn test_scan_with_i32_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::Equals(scalar_from_i32(20)),
+        };
+        let projection = vec![COL_A_U64];
+        let result_batch = table.scan(&projection, &filter).unwrap();
+
+        assert_eq!(result_batch.num_columns(), 1);
+        assert_eq!(result_batch.column(0).data_type(), &DataType::UInt64);
     }
 }

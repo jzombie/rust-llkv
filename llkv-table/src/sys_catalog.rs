@@ -180,7 +180,7 @@ impl<'a> SysCatalog<'a> {
             fn u64_chunk_with_rids(&mut self, v: &UInt64Array, r: &UInt64Array) {
                 for i in 0..r.len() {
                     let rid = r.value(i);
-                    if let Some(&idx) = self.target_rids.get(&rid) {
+                    if let Some(&_idx) = self.target_rids.get(&rid) {
                         // Placeholder logic, as in get_table_meta.
                         let _bytes = v.value(i);
                         // self.results[idx] = Some(bitcode::decode(&bytes.to_be_bytes()).unwrap());

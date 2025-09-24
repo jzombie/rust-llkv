@@ -955,6 +955,8 @@ name = "llkv-table"
 version = "0.1.0-alpha"
 dependencies = [
  "arrow",
+ "arrow-array",
+ "arrow-schema",
  "bitcode",
  "crossbeam-channel",
  "llkv-column-map",

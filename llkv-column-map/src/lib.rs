@@ -7,7 +7,10 @@ pub mod types;
 mod codecs;
 
 pub use error::{Error, Result};
-pub use store::{ColumnStore, IndexKind, scan::PrimitiveVisitor};
+pub use store::{
+    ColumnStore, IndexKind,
+    scan::{self, ScanBuilder},
+};
 
 pub mod debug {
     pub use super::store::debug::*;
