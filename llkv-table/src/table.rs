@@ -1,3 +1,4 @@
+use std::cmp;
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -14,6 +15,10 @@ use llkv_column_map::{
 use crate::expr::{Filter, Literal, LiteralCastError, Operator, literal_to_native};
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
+
+// TODO: Extract to constants
+/// Default max rows per streamed batch. Tune as needed.
+const STREAM_BATCH_ROWS: usize = 8192;
 
 // TODO: Move to `llkv-expr`
 /// Convert a bound of `Literal` into a bound of `T::Native`.
@@ -259,17 +264,32 @@ impl Table {
         self.store.append(&namespaced_batch)
     }
 
-    pub fn scan<'a>(
+    /// Stream a single projected column as a sequence of RecordBatches.
+    ///
+    /// - Avoids `concat` and large materializations.
+    /// - Uses the same filter machinery as the old `scan` to produce
+    ///   `row_ids`.
+    /// - Splits `row_ids` into fixed-size windows and gathers rows per
+    ///   window to form a small `RecordBatch` that is sent to `on_batch`.
+    ///
+    /// Notes:
+    /// - Currently supports exactly 1 projected column. This avoids
+    ///   cross-column chunk alignment problems without changing
+    ///   column-map APIs. We can generalize once a chunk-aligned
+    ///   multi-column scan is exposed upstream.
+    pub fn scan_stream<'a, F>(
         &self,
-        projection: &[FieldId],
+        projection_col: FieldId,
         filter: &Filter<'a, FieldId>,
-    ) -> Result<RecordBatch, TableError> {
+        mut on_batch: F,
+    ) -> Result<(), TableError>
+    where
+        F: FnMut(RecordBatch),
+    {
         let filter_lfid = lfid_for(self.table_id, filter.field_id);
-
-        // Determine dtype from the store. Operators now carry untyped
-        // `Literal`s, so we dispatch based on the column's dtype.
         let dtype = self.store.data_type(filter_lfid)?;
 
+        // Build row_ids using the typed predicate path.
         let row_ids = match dtype {
             DataType::UInt64 => {
                 collect_matching_row_ids::<UInt64Type>(&self.store, filter_lfid, &filter.op)?
@@ -321,20 +341,33 @@ impl Table {
             }
         };
 
-        let mut projected_columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
-        let mut projected_fields: Vec<Field> = Vec::with_capacity(projection.len());
-
-        for &field_id_to_project in projection {
-            let lfid_to_project = lfid_for(self.table_id, field_id_to_project);
-            let dtype = self.store.data_type(lfid_to_project)?;
-            let column = self.store.gather_rows(lfid_to_project, &row_ids)?;
-
-            projected_fields.push(Field::new(field_id_to_project.to_string(), dtype, true));
-            projected_columns.push(column);
+        // If nothing matches, emit nothing.
+        if row_ids.is_empty() {
+            return Ok(());
         }
 
-        let schema = Arc::new(Schema::new(projected_fields));
-        Ok(RecordBatch::try_new(schema, projected_columns)?)
+        // Prepare schema for the single projected column.
+        let proj_lfid = lfid_for(self.table_id, projection_col);
+        let proj_dtype = self.store.data_type(proj_lfid)?;
+        let proj_field = Field::new(projection_col.to_string(), proj_dtype.clone(), true);
+        let out_schema = Arc::new(Schema::new(vec![proj_field]));
+
+        // Stream in fixed-size windows of row_ids.
+        let mut start = 0usize;
+        while start < row_ids.len() {
+            let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
+            let window = &row_ids[start..end];
+
+            // Gather only this window's rows for the projected column.
+            let col = self.store.gather_rows(proj_lfid, window)?;
+
+            let batch = RecordBatch::try_new(out_schema.clone(), vec![col])?;
+            on_batch(batch);
+
+            start = end;
+        }
+
+        Ok(())
     }
 
     #[inline]
@@ -418,6 +451,8 @@ impl ColumnStoreTestExt for ColumnStore<MemPager> {
             ));
         }
 
+        // NOTE: This helper still concatenates for tests. Production code
+        // uses streaming via `scan_stream`.
         let refs: Vec<&dyn Array> = visitor.chunks.iter().map(|c| c.as_ref()).collect();
         let combined = arrow::compute::concat(&refs)?;
 
@@ -431,8 +466,8 @@ impl ColumnStoreTestExt for ColumnStore<MemPager> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{BinaryArray, Int32Array, UInt64Array};
-    use arrow::compute::sum;
+    use arrow::array::{BinaryArray, Float64Array, Int32Array, UInt64Array};
+    use arrow::compute::{cast, max, min, sum, unary};
     use std::collections::HashMap;
 
     fn setup_test_table() -> Table {
@@ -477,6 +512,28 @@ mod tests {
         table
     }
 
+    /// Helper to collect a streamed column into a Vec<Option<T>> using a
+    /// provided extractor function. Avoids concat in tests while keeping
+    /// assertions simple.
+    fn collect_streamed_values<T, FExtract>(
+        table: &Table,
+        proj: FieldId,
+        filter: &Filter<'_, FieldId>,
+        mut extract: FExtract,
+    ) -> Vec<Option<T>>
+    where
+        T: Copy,
+        FExtract: FnMut(&RecordBatch) -> Vec<Option<T>>,
+    {
+        let mut out = Vec::<Option<T>>::new();
+        table
+            .scan_stream(proj, filter, |b| {
+                out.extend(extract(&b));
+            })
+            .unwrap();
+        out
+    }
+
     #[test]
     fn test_scan_with_u64_filter() {
         let table = setup_test_table();
@@ -487,25 +544,14 @@ mod tests {
             field_id: COL_A_U64,
             op: Operator::Equals(200.into()),
         };
-        let projection = vec![COL_C_I32];
-        let result_batch = table.scan(&projection, &filter).unwrap();
 
-        assert_eq!(result_batch.num_columns(), 1);
-        let values = result_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let collected: Vec<Option<i32>> = (0..values.len())
-            .map(|i| {
-                if values.is_null(i) {
-                    None
-                } else {
-                    Some(values.value(i))
-                }
-            })
-            .collect();
-        assert_eq!(collected, vec![Some(20), Some(20)]);
+        let vals = collect_streamed_values::<i32, _>(&table, COL_C_I32, &filter, |b| {
+            let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..a.len())
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(vals, vec![Some(20), Some(20)]);
     }
 
     #[test]
@@ -518,25 +564,14 @@ mod tests {
             field_id: COL_C_I32,
             op: Operator::Equals(20.into()),
         };
-        let projection = vec![COL_A_U64];
-        let result_batch = table.scan(&projection, &filter).unwrap();
 
-        assert_eq!(result_batch.num_columns(), 1);
-        let values = result_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let collected: Vec<Option<u64>> = (0..values.len())
-            .map(|i| {
-                if values.is_null(i) {
-                    None
-                } else {
-                    Some(values.value(i))
-                }
-            })
-            .collect();
-        assert_eq!(collected, vec![Some(200), Some(200)]);
+        let vals = collect_streamed_values::<u64, _>(&table, COL_A_U64, &filter, |b| {
+            let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+            (0..a.len())
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(vals, vec![Some(200), Some(200)]);
     }
 
     #[test]
@@ -549,25 +584,14 @@ mod tests {
             field_id: COL_C_I32,
             op: Operator::GreaterThan(15.into()),
         };
-        let projection = vec![COL_A_U64];
-        let result_batch = table.scan(&projection, &filter).unwrap();
 
-        assert_eq!(result_batch.num_columns(), 1);
-        let values = result_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let collected: Vec<Option<u64>> = (0..values.len())
-            .map(|i| {
-                if values.is_null(i) {
-                    None
-                } else {
-                    Some(values.value(i))
-                }
-            })
-            .collect();
-        assert_eq!(collected, vec![Some(200), Some(300), Some(200)]);
+        let vals = collect_streamed_values::<u64, _>(&table, COL_A_U64, &filter, |b| {
+            let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+            (0..a.len())
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(vals, vec![Some(200), Some(300), Some(200)]);
     }
 
     #[test]
@@ -583,29 +607,21 @@ mod tests {
                 upper: Bound::Excluded(300.into()),
             },
         };
-        let projection = vec![COL_C_I32];
-        let result_batch = table.scan(&projection, &filter).unwrap();
 
-        assert_eq!(result_batch.num_columns(), 1);
-        let values = result_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let collected: Vec<Option<i32>> = (0..values.len())
-            .map(|i| {
-                if values.is_null(i) {
-                    None
-                } else {
-                    Some(values.value(i))
-                }
-            })
-            .collect();
-        assert_eq!(collected, vec![Some(20), Some(20)]);
+        let vals = collect_streamed_values::<i32, _>(&table, COL_C_I32, &filter, |b| {
+            let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..a.len())
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(vals, vec![Some(20), Some(20)]);
     }
 
     #[test]
     fn test_filtered_scan_sum_kernel() {
+        // Trade-off note:
+        // - We use Arrow's sum kernel per batch, then add the partial sums.
+        // - This preserves Arrow null semantics and avoids concat.
         let table = setup_test_table();
         const COL_A_U64: FieldId = 10;
 
@@ -616,154 +632,138 @@ mod tests {
                 upper: Bound::Excluded(300.into()),
             },
         };
-        let projection = vec![COL_A_U64];
-        let batch = table.scan(&projection, &filter).unwrap();
 
-        assert_eq!(batch.num_columns(), 1);
-        let values = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
+        let mut total: u128 = 0;
+        table
+            .scan_stream(COL_A_U64, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                if let Some(part) = sum(a) {
+                    total += part as u128;
+                }
+            })
             .unwrap();
 
-        // Only the two values equal to 200 should be included by the filter
-        // range.
-        let total = sum(values).expect("non-empty sum");
         assert_eq!(total, 400);
     }
 
     #[test]
     fn test_filtered_scan_sum_i32_kernel() {
-        use arrow::compute::sum;
-
+        // Trade-off note:
+        // - Per-batch sum + accumulate avoids building one big Array.
+        // - For tiny batches overhead may match manual loops, but keeps
+        //   Arrow semantics exact.
         let table = setup_test_table();
         const COL_A_U64: FieldId = 10;
         const COL_C_I32: FieldId = 12;
 
-        // Same IN filter on a_u64 to select rows with c_i32 = [10, 30].
         let candidates = [100.into(), 300.into()];
         let filter = Filter {
             field_id: COL_A_U64,
             op: Operator::In(&candidates),
         };
 
-        let projection = vec![COL_C_I32];
-        let batch = table.scan(&projection, &filter).unwrap();
-
-        assert_eq!(batch.num_columns(), 1);
-        let c_vals = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
+        let mut total: i64 = 0;
+        table
+            .scan_stream(COL_C_I32, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                if let Some(part) = sum(a) {
+                    total += part as i64;
+                }
+            })
             .unwrap();
-
-        // Sum over the filtered c_i32 column: 10 + 30 = 40.
-        let total = sum(c_vals).expect("non-empty sum");
         assert_eq!(total, 40);
     }
 
     #[test]
     fn test_filtered_scan_min_max_kernel() {
-        use arrow::compute::{max, min};
-
+        // Trade-off note:
+        // - min/max are computed per batch and folded. This preserves
+        //   Arrow's null behavior and avoids concat.
+        // - Be mindful of NaN semantics if extended to floats later.
         let table = setup_test_table();
         const COL_A_U64: FieldId = 10;
         const COL_C_I32: FieldId = 12;
 
-        // Filter rows where a_u64 IN {100, 300}. That selects row_ids with
-        // c_i32 values [10, 30] in our fixture.
         let candidates = [100.into(), 300.into()];
         let filter = Filter {
             field_id: COL_A_U64,
             op: Operator::In(&candidates),
         };
 
-        let projection = vec![COL_C_I32];
-        let batch = table.scan(&projection, &filter).unwrap();
+        let mut mn: Option<i32> = None;
+        let mut mx: Option<i32> = None;
+        table
+            .scan_stream(COL_C_I32, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
 
-        assert_eq!(batch.num_columns(), 1);
-        let c_vals = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
+                if let Some(part_min) = min(a) {
+                    mn = Some(mn.map_or(part_min, |m| m.min(part_min)));
+                }
+                if let Some(part_max) = max(a) {
+                    mx = Some(mx.map_or(part_max, |m| m.max(part_max)));
+                }
+            })
             .unwrap();
-
-        // min/max should be 10 and 30 respectively.
-        let mn = min(c_vals).expect("non-empty min");
-        let mx = max(c_vals).expect("non-empty max");
-        assert_eq!(mn, 10);
-        assert_eq!(mx, 30);
+        assert_eq!(mn, Some(10));
+        assert_eq!(mx, Some(30));
     }
 
     #[test]
     fn test_filtered_scan_int_sqrt_float64() {
-        use arrow::array::Float64Array;
-        use arrow::compute::cast;
-
+        // Trade-off note:
+        // - We cast per batch and apply a compute unary kernel for sqrt.
+        // - This keeps processing streaming and avoids per-value loops.
+        // - `unary` operates on `PrimitiveArray<T>`; cast and downcast to
+        //   `Float64Array` first.
         let table = setup_test_table();
         const COL_A_U64: FieldId = 10;
         const COL_C_I32: FieldId = 12;
 
-        // Filter rows where c_i32 > 15: picks rows with a_u64 = [200, 300, 200]
         let filter = Filter {
             field_id: COL_C_I32,
             op: Operator::GreaterThan(15.into()),
         };
 
-        // Project the a_u64 column, then compute sqrt(a_u64) as f64.
-        let projection = vec![COL_A_U64];
-        let batch = table.scan(&projection, &filter).unwrap();
+        let mut got: Vec<f64> = Vec::new();
+        table
+            .scan_stream(COL_A_U64, &filter, |b| {
+                let casted = cast(b.column(0), &arrow::datatypes::DataType::Float64).unwrap();
+                let f64_arr = casted.as_any().downcast_ref::<Float64Array>().unwrap();
 
-        assert_eq!(batch.num_columns(), 1);
+                // unary::<Float64Type, _, Float64Type>(...)
+                let sqrt_arr = unary::<
+                    arrow::datatypes::Float64Type,
+                    _,
+                    arrow::datatypes::Float64Type,
+                >(f64_arr, |v: f64| v.sqrt());
 
-        // Cast UInt64 -> Float64 for math
-        let a_as_f64 = cast(batch.column(0), &arrow::datatypes::DataType::Float64).unwrap();
-        let a_as_f64 = a_as_f64.as_any().downcast_ref::<Float64Array>().unwrap();
-
-        // Apply sqrt in pure Rust over Option<f64> iterator
-        let sqrt_vals = (0..a_as_f64.len()).map(|i| {
-            if a_as_f64.is_null(i) {
-                None
-            } else {
-                let v = a_as_f64.value(i);
-                Some(v.sqrt())
-            }
-        });
-
-        let sqrt_arr = Float64Array::from_iter(sqrt_vals);
-
-        // Expected: sqrt([200, 300, 200])
-        let expected = [200_f64.sqrt(), 300_f64.sqrt(), 200_f64.sqrt()];
-
-        let got: Vec<Option<f64>> = (0..sqrt_arr.len())
-            .map(|i| {
-                if sqrt_arr.is_null(i) {
-                    None
-                } else {
-                    Some(sqrt_arr.value(i))
+                for i in 0..sqrt_arr.len() {
+                    if !sqrt_arr.is_null(i) {
+                        got.push(sqrt_arr.value(i));
+                    }
                 }
             })
-            .collect();
+            .unwrap();
 
-        assert_eq!(got, expected.iter().copied().map(Some).collect::<Vec<_>>());
+        let expected = [200_f64.sqrt(), 300_f64.sqrt(), 200_f64.sqrt()];
+        assert_eq!(got, expected);
     }
 
     #[test]
     fn test_multi_field_kernels_with_filters() {
-        use arrow::array::{Float64Array, Int16Array, UInt8Array, UInt32Array};
-        use arrow::compute::{cast, max, min, sum};
-        use std::collections::HashMap;
+        // Trade-off note:
+        // - All reductions use per-batch kernels + accumulation to stay
+        //   streaming. No concat or whole-column materialization.
+        use arrow::array::{Int16Array, UInt8Array, UInt32Array};
 
         let table = Table::new(2, TableCfg::default());
 
-        // Field ids for this test table.
         const COL_A_U64: FieldId = 20;
         const COL_D_U32: FieldId = 21;
         const COL_E_I16: FieldId = 22;
         const COL_F_U8: FieldId = 23;
         const COL_C_I32: FieldId = 24;
 
-        // Schema: row_id, a_u64, d_u32, e_i16, f_u8, c_i32.
         let schema = Arc::new(Schema::new(vec![
             Field::new("row_id", DataType::UInt64, false),
             Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
@@ -810,65 +810,67 @@ mod tests {
             op: Operator::GreaterThanOrEquals(20.into()),
         };
 
-        // 1) SUM over d_u32 under the filter.
-        let proj_d = vec![COL_D_U32];
-        let batch_d = table.scan(&proj_d, &filter).unwrap();
-        let d_vals = batch_d
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-        let d_sum = sum(d_vals).expect("non-empty sum");
-        assert_eq!(d_sum, 8 + 9 + 10 + 11);
-
-        // 2) MIN over e_i16 under the filter.
-        let proj_e = vec![COL_E_I16];
-        let batch_e = table.scan(&proj_e, &filter).unwrap();
-        let e_vals = batch_e
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int16Array>()
-            .unwrap();
-        let e_min = min(e_vals).expect("non-empty min");
-        assert_eq!(e_min, -6);
-
-        // 3) MAX over f_u8 under the filter.
-        let proj_f = vec![COL_F_U8];
-        let batch_f = table.scan(&proj_f, &filter).unwrap();
-        let f_vals = batch_f
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt8Array>()
-            .unwrap();
-        let f_max = max(f_vals).expect("non-empty max");
-        assert_eq!(f_max, 10);
-
-        // 4) SQRT over a_u64 under the filter. Cast to Float64, then sqrt.
-        let proj_a = vec![COL_A_U64];
-        let batch_a = table.scan(&proj_a, &filter).unwrap();
-        let a_as_f64 = cast(batch_a.column(0), &arrow::datatypes::DataType::Float64).unwrap();
-        let a_as_f64 = a_as_f64.as_any().downcast_ref::<Float64Array>().unwrap();
-        let sqrt_vals = (0..a_as_f64.len()).map(|i| {
-            if a_as_f64.is_null(i) {
-                None
-            } else {
-                Some(a_as_f64.value(i).sqrt())
-            }
-        });
-        let sqrt_arr = Float64Array::from_iter(sqrt_vals);
-
-        // Expected sqrt for filtered rows: [225, 400, 900, 1600].
-        let expected = [15.0_f64, 20.0, 30.0, 40.0];
-        let got: Vec<Option<f64>> = (0..sqrt_arr.len())
-            .map(|i| {
-                if sqrt_arr.is_null(i) {
-                    None
-                } else {
-                    Some(sqrt_arr.value(i))
+        // 1) SUM over d_u32 (per-batch sum + accumulate).
+        let mut d_sum: u128 = 0;
+        table
+            .scan_stream(COL_D_U32, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<UInt32Array>().unwrap();
+                if let Some(part) = sum(a) {
+                    d_sum += part as u128;
                 }
             })
-            .collect();
-        assert_eq!(got, expected.iter().copied().map(Some).collect::<Vec<_>>());
+            .unwrap();
+        assert_eq!(d_sum, (8 + 9 + 10 + 11) as u128);
+
+        // 2) MIN over e_i16 (per-batch min + fold).
+        let mut e_min: Option<i16> = None;
+        table
+            .scan_stream(COL_E_I16, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<Int16Array>().unwrap();
+                if let Some(part_min) = min(a) {
+                    e_min = Some(e_min.map_or(part_min, |m| m.min(part_min)));
+                }
+            })
+            .unwrap();
+        assert_eq!(e_min, Some(-6));
+
+        // 3) MAX over f_u8 (per-batch max + fold).
+        let mut f_max: Option<u8> = None;
+        table
+            .scan_stream(COL_F_U8, &filter, |b| {
+                let a = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt8Array>()
+                    .unwrap();
+                if let Some(part_max) = max(a) {
+                    f_max = Some(f_max.map_or(part_max, |m| m.max(part_max)));
+                }
+            })
+            .unwrap();
+        assert_eq!(f_max, Some(10));
+
+        // 4) SQRT over a_u64 (cast to f64, then unary sqrt per batch).
+        let mut got: Vec<f64> = Vec::new();
+        table
+            .scan_stream(COL_A_U64, &filter, |b| {
+                let casted = cast(b.column(0), &arrow::datatypes::DataType::Float64).unwrap();
+                let f64_arr = casted.as_any().downcast_ref::<Float64Array>().unwrap();
+                let sqrt_arr = unary::<
+                    arrow::datatypes::Float64Type,
+                    _,
+                    arrow::datatypes::Float64Type,
+                >(f64_arr, |v: f64| v.sqrt());
+
+                for i in 0..sqrt_arr.len() {
+                    if !sqrt_arr.is_null(i) {
+                        got.push(sqrt_arr.value(i));
+                    }
+                }
+            })
+            .unwrap();
+        let expected = [15.0_f64, 20.0, 30.0, 40.0];
+        assert_eq!(got, expected);
     }
 
     #[test]
@@ -883,29 +885,51 @@ mod tests {
             field_id: COL_C_I32,
             op: Operator::In(&candidates),
         };
-        let projection = vec![COL_A_U64];
-        let result_batch = table.scan(&projection, &filter).unwrap();
 
-        assert_eq!(result_batch.num_columns(), 1);
-        let values = result_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let collected: Vec<Option<u64>> = (0..values.len())
-            .map(|i| {
-                if values.is_null(i) {
-                    None
-                } else {
-                    Some(values.value(i))
+        let vals = collect_streamed_values::<u64, _>(&table, COL_A_U64, &filter, |b| {
+            let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+            (0..a.len())
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(vals, vec![Some(100), Some(300)]);
+    }
+
+    #[test]
+    fn test_scan_stream_single_column_batches() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        // Filter c_i32 == 20 -> two rows; stream a_u64 in batches of <= N.
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::Equals(20.into()),
+        };
+
+        let mut seen = Vec::<u64>::new();
+        table
+            .scan_stream(COL_A_U64, &filter, |b| {
+                assert_eq!(b.num_columns(), 1);
+                let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                // No kernel needed; just collect values for shape assertions.
+                for i in 0..a.len() {
+                    if !a.is_null(i) {
+                        seen.push(a.value(i));
+                    }
                 }
             })
-            .collect();
-        assert_eq!(collected, vec![Some(100), Some(300)]);
+            .unwrap();
+
+        // In fixture, c_i32 == 20 corresponds to a_u64 values [200, 200].
+        assert_eq!(seen, vec![200, 200]);
     }
 
     #[test]
     fn test_scan_with_multiple_projection_columns() {
+        // With streaming, scan each column independently using the same
+        // filter and compare results. This keeps the core API streaming-
+        // friendly without multi-column chunk alignment.
         let table = setup_test_table();
         const COL_A_U64: FieldId = 10;
         const COL_C_I32: FieldId = 12;
@@ -914,40 +938,21 @@ mod tests {
             field_id: COL_C_I32,
             op: Operator::Equals(20.into()),
         };
-        let projection = vec![COL_A_U64, COL_C_I32];
-        let batch = table.scan(&projection, &filter).unwrap();
 
-        assert_eq!(batch.num_columns(), 2);
-        let a_vals = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let a_collected: Vec<Option<u64>> = (0..a_vals.len())
-            .map(|i| {
-                if a_vals.is_null(i) {
-                    None
-                } else {
-                    Some(a_vals.value(i))
-                }
-            })
-            .collect();
-        assert_eq!(a_collected, vec![Some(200), Some(200)]);
+        let a_vals = collect_streamed_values::<u64, _>(&table, COL_A_U64, &filter, |b| {
+            let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+            (0..a.len())
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(a_vals, vec![Some(200), Some(200)]);
 
-        let c_vals = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let c_collected: Vec<Option<i32>> = (0..c_vals.len())
-            .map(|i| {
-                if c_vals.is_null(i) {
-                    None
-                } else {
-                    Some(c_vals.value(i))
-                }
-            })
-            .collect();
-        assert_eq!(c_collected, vec![Some(20), Some(20)]);
+        let c_vals = collect_streamed_values::<i32, _>(&table, COL_C_I32, &filter, |b| {
+            let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..a.len())
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(c_vals, vec![Some(20), Some(20)]);
     }
 }
