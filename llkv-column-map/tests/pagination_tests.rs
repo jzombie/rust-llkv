@@ -7,8 +7,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::{PrimitiveSortedVisitor, PrimitiveVisitor, ScanOptions};
+use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 fn fid_user(id: u32) -> LogicalFieldId {
@@ -172,7 +172,7 @@ fn pagination_sorted_u64() {
     let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
     store.append(&batch).unwrap();
     // Build sort index
-    store.create_sort_index(field_id).unwrap();
+    store.register_index(field_id, IndexKind::Sort).unwrap();
 
     // Asc collector (runs are ascending; iterate forward)
     struct CollectAsc<'a> {

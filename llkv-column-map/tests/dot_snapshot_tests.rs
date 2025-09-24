@@ -8,8 +8,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::debug::ColumnStoreDebug;
+use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 fn fid(table_id: u32, field_id: u32) -> LogicalFieldId {
@@ -144,8 +144,8 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     store.append(&rb6).unwrap();
 
     // Build sort index for some u64 columns to include perm nodes in DOT
-    store.create_sort_index(fid_u64).unwrap();
-    store.create_sort_index(fid1_u64).unwrap();
+    store.register_index(fid_u64, IndexKind::Sort).unwrap();
+    store.register_index(fid1_u64, IndexKind::Sort).unwrap();
 
     store
 }

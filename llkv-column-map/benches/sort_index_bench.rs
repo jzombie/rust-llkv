@@ -48,8 +48,8 @@ use rand::seq::SliceRandom;
 use rand::{SeedableRng, rngs::StdRng};
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::ScanOptions;
+use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 const N_ROWS: usize = 1_000_000;
@@ -187,7 +187,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let (s, fid, _) = seed_store_1m();
-                s.create_sort_index(fid).unwrap();
+                s.register_index(fid, IndexKind::Sort).unwrap();
                 (s, fid)
             },
             |(store, fid)| {
@@ -251,7 +251,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let (s, fid, _) = seed_store_1m();
-                s.create_sort_index(fid).unwrap();
+                s.register_index(fid, IndexKind::Sort).unwrap();
                 (s, fid)
             },
             |(store, fid)| {
@@ -303,7 +303,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let (s, fid) = seed_store_1m_fragmented_random(128);
-                s.create_sort_index(fid).unwrap();
+                s.register_index(fid, IndexKind::Sort).unwrap();
                 (s, fid)
             },
             |(store, fid)| {
@@ -367,7 +367,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let (s, fid) = seed_store_1m_fragmented_random(128);
-                s.create_sort_index(fid).unwrap();
+                s.register_index(fid, IndexKind::Sort).unwrap();
                 (s, fid)
             },
             |(store, fid)| {

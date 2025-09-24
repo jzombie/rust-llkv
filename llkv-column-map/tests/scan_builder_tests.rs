@@ -6,11 +6,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
+use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 fn fid(id: u32) -> LogicalFieldId {
@@ -41,7 +41,7 @@ fn scan_builder_sorted_range_u64() {
     let val_arr = Arc::new(UInt64Array::from(vals));
     let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
     store.append(&batch).unwrap();
-    store.create_sort_index(field_id).unwrap();
+    store.register_index(field_id, IndexKind::Sort).unwrap();
 
     // Range [2000, 8000]
     struct Collect {
@@ -98,7 +98,7 @@ fn scan_builder_sorted_with_row_ids() {
     let val_arr = Arc::new(UInt64Array::from(vals));
     let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
     store.append(&batch).unwrap();
-    store.create_sort_index(field_id).unwrap();
+    store.register_index(field_id, IndexKind::Sort).unwrap();
 
     // Collect row ids for a range
     struct CollectRids {

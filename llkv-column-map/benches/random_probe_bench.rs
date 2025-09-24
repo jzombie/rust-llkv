@@ -23,11 +23,11 @@ use arrow::record_batch::RecordBatch;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
+use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use rand::rngs::StdRng;
@@ -71,7 +71,7 @@ fn seed_store_1m() -> (ColumnStore<MemPager>, LogicalFieldId) {
     let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
 
     store.append(&batch).unwrap();
-    store.create_sort_index(field_id).unwrap();
+    store.register_index(field_id, IndexKind::Sort).unwrap();
 
     (store, field_id)
 }

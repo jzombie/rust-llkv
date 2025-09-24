@@ -6,11 +6,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
+use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use rand::seq::SliceRandom;
@@ -59,7 +59,7 @@ fn seed_u64_perm(
     let val_arr = Arc::new(UInt64Array::from(vals.clone()));
     let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
     store.append(&batch).unwrap();
-    store.create_sort_index(field_id).unwrap();
+    store.register_index(field_id, IndexKind::Sort).unwrap();
 
     let rid_fid = field_id.with_namespace(Namespace::RowIdShadow);
     (store, field_id, rid_fid, vals, pos_of_val)

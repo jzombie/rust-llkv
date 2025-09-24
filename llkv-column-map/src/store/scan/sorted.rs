@@ -3,7 +3,7 @@ use crate::types::Namespace;
 
 macro_rules! sorted_visit_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident) => {
-        pub fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
+        pub(crate) fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
             _pager: &P,
             metas: &[ChunkMetadata],
             blobs: &FxHashMap<PhysicalKey, EntryHandle>,
@@ -46,7 +46,7 @@ macro_rules! sorted_visit_impl {
             );
             Ok(())
         }
-        pub fn $name_rev<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
+        pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
             _pager: &P,
             metas: &[ChunkMetadata],
             blobs: &FxHashMap<PhysicalKey, EntryHandle>,
@@ -102,7 +102,7 @@ sorted_visit_impl!(sorted_visit_i8, sorted_visit_i8_rev, Int8Array, i8_run);
 
 macro_rules! sorted_with_rids_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident) => {
-        pub fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedWithRowIdsVisitor>(
+        pub(crate) fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedWithRowIdsVisitor>(
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
@@ -158,7 +158,10 @@ macro_rules! sorted_with_rids_impl {
             );
             Ok(())
         }
-        pub fn $name_rev<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedWithRowIdsVisitor>(
+        pub(crate) fn $name_rev<
+            P: Pager<Blob = EntryHandle>,
+            V: PrimitiveSortedWithRowIdsVisitor,
+        >(
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],

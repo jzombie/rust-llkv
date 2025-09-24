@@ -16,11 +16,11 @@ use rand::seq::SliceRandom;
 use rand::{SeedableRng, rngs::StdRng};
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
+use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 const N_ROWS: usize = 1_000_000;
@@ -71,8 +71,8 @@ fn seed_store_1m() -> (ColumnStore<MemPager>, LogicalFieldId, LogicalFieldId) {
     let batch2 = RecordBatch::try_new(schema2, vec![rid2_arr, val_arr_i32]).unwrap();
     store.append(&batch2).unwrap();
 
-    store.create_sort_index(fid_u64).unwrap();
-    store.create_sort_index(fid_i32).unwrap();
+    store.register_index(fid_u64, IndexKind::Sort).unwrap();
+    store.register_index(fid_i32, IndexKind::Sort).unwrap();
     (store, fid_u64, fid_i32)
 }
 

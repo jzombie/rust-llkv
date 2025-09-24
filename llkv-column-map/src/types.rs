@@ -21,9 +21,7 @@ pub enum Namespace {
     UserData = 0,
     /// Internal shadow column for row IDs.
     RowIdShadow = 1,
-    /// Internal shadow column for sort permutations.
-    SortIndex = 2,
-    // Up to 5 more namespaces can be added here.
+    // Up to 8 total namespaces can be added here.
     Reserved = 7,
 }
 

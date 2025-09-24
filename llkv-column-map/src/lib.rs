@@ -7,7 +7,7 @@ pub mod types;
 mod codecs;
 
 pub use error::{Error, Result};
-pub use store::ColumnStore;
+pub use store::{ColumnStore, IndexKind};
 
 pub mod debug {
     pub use super::store::debug::*;

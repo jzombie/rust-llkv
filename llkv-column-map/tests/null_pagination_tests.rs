@@ -6,11 +6,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
+use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 fn fid(id: u32) -> LogicalFieldId {
@@ -63,7 +63,7 @@ fn sorted_with_nulls_last_pagination() {
     )
     .unwrap();
     store.append(&t0).unwrap();
-    store.create_sort_index(target_fid).unwrap();
+    store.register_index(target_fid, IndexKind::Sort).unwrap();
 
     struct Collect<'a> {
         vals: &'a std::cell::RefCell<Vec<u64>>,
