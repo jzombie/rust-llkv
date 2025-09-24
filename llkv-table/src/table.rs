@@ -481,6 +481,7 @@ impl ColumnStoreTestExt for ColumnStore<MemPager> {
 mod tests {
     use super::*;
     use arrow::array::{BinaryArray, Int32Array, UInt64Array};
+    use arrow::compute::sum;
     use std::collections::HashMap;
 
     fn scalar_from_u64(value: u64) -> DynScalar {
@@ -658,6 +659,33 @@ mod tests {
             })
             .collect();
         assert_eq!(collected, vec![Some(20), Some(20)]);
+    }
+
+    #[test]
+    fn test_filtered_scan_sum_kernel() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+
+        let filter = Filter {
+            field_id: COL_A_U64,
+            op: Operator::Range {
+                lower: Bound::Included(scalar_from_u64(150)),
+                upper: Bound::Excluded(scalar_from_u64(300)),
+            },
+        };
+        let projection = vec![COL_A_U64];
+        let batch = table.scan(&projection, &filter).unwrap();
+
+        assert_eq!(batch.num_columns(), 1);
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        // Only the two values equal to 200 should be included by the filter range.
+        let total = sum(values).expect("non-empty sum");
+        assert_eq!(total, 400);
     }
 
     #[test]
