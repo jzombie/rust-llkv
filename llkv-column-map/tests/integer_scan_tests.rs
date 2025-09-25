@@ -622,14 +622,14 @@ fn scan_all_integer_types_sorted_and_ranges() {
 #[test]
 fn scan_builder_range_all_integer_types() {
     run_builder_range_case::<i8, Int8Array>(
-        (0..200).map(|i| (i as i32 - 100) as i8).collect(),
+        (0..200).map(|i| (i - 100) as i8).collect(),
         DataType::Int8,
         -40i8,
         60i8,
     );
 
     run_builder_range_case::<i16, Int16Array>(
-        (0..1024).map(|i| ((i as i32 - 512) * 4) as i16).collect(),
+        (0..1024).map(|i| ((i - 512) * 4) as i16).collect(),
         DataType::Int16,
         -1_000i16,
         1_200i16,

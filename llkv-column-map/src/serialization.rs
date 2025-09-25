@@ -31,49 +31,63 @@ const MAGIC: [u8; 4] = *b"ARR0";
 /// Variants:
 ///
 /// - `Primitive`
-///     Fixed-width primitive arrays (e.g., Int32, UInt64, Float32, Float64).
-///     Header:
-///       len     = element count
-///       extra_a = values_len (u32), byte length of the values buffer
-///       extra_b = 0
-///     Payload:
-///       [values buffer bytes]
-///     Notes:
-///       - `type_code` (header byte 5) is a `PrimType` that chooses the Arrow
-///         primitive `DataType`.
-///       - Nulls are not supported yet (null_count must be 0).
+///
+///   - Fixed-width primitive arrays (e.g., Int32, UInt64, Float32, Float64).
+///
+///   - Header:
+///     - len = element count
+///     - extra_a = values_len (u32), byte length of the values buffer
+///     - extra_b = 0
+///
+///   - Payload:
+///     - [values buffer bytes]
+///
+///   - Notes:
+///     - `type_code` (header byte 5) is a `PrimType` that chooses the Arrow
+///       primitive `DataType`.
+///     - Nulls are not supported yet (null_count must be 0).
 ///
 /// - `FslFloat32`
-///     Specialized fast-path for `FixedSizeList<Float32>`.
-///     This encodes a vector-like column (e.g., embeddings) as a single,
-///     contiguous `Float32` child buffer without per-list headers.
-///     Header:
-///       len     = number of lists (rows)
-///       extra_a = list_size (u32), number of f32 values per list
-///       extra_b = child_values_len (u32), total bytes in the child f32 buffer
-///     Payload:
-///       [child Float32 values as a single buffer]
+///
+///   - Specialized fast-path for `FixedSizeList<Float32>`. Encodes a
+///     vector-like column (e.g., embeddings) as one contiguous `Float32`
+///     child buffer, without per-list headers.
+///
+///   - Header:
+///     - len = number of lists (rows)
+///     - extra_a = list_size (u32), number of f32 values per list
+///     - extra_b = child_values_len (u32), total bytes in the child f32
+///       buffer
+///
+///   - Payload:
+///     - [child Float32 values as a single buffer]
 ///       The child has `len * list_size` elements, each 4 bytes (f32).
-///     Constraints:
-///       - The parent `FixedSizeList` has no nulls.
-///       - The child array has `DataType::Float32` and no nulls.
-///       - `type_code` (header byte 5) is unused here and written as 0.
-///     Rationale:
-///       Many workloads store dense float vectors (embeddings) as
+///
+///   - Constraints:
+///     - The parent `FixedSizeList` has no nulls.
+///     - The child array has `DataType::Float32` and no nulls.
+///     - `type_code` (header byte 5) is unused here and written as 0.
+///
+///   - Rationale:
+///     - Many workloads store dense float vectors (embeddings) as
 ///       `FixedSizeList<Float32>`. This variant avoids extra nesting
 ///       overhead and allows a direct slice into the contiguous f32 buffer.
 ///
 /// - `Varlen`
-///     Variable-length, currently for `Binary` (offsets + values).
-///     Header:
-///       len     = number of binary values
-///       extra_a = offsets_len (u32) in bytes
-///       extra_b = values_len (u32) in bytes
-///     Payload:
-///       [offsets buffer bytes][values buffer bytes]
-///     Notes:
-///       - `type_code` is a `PrimType` and must be `Binary` for now.
-///       - Nulls are not supported yet (null_count must be 0).
+///
+///   - Variable-length, currently for `Binary` (offsets + values).
+///
+///   - Header:
+///     - len = number of binary values
+///     - extra_a = offsets_len (u32) in bytes
+///     - extra_b = values_len (u32) in bytes
+///
+///   - Payload:
+///     - [offsets buffer bytes][values buffer bytes]
+///
+///   - Notes:
+///     - `type_code` is a `PrimType` and must be `Binary` for now.
+///     - Nulls are not supported yet (null_count must be 0).
 #[repr(u8)]
 enum Layout {
     Primitive = 0,
@@ -371,6 +385,7 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
    Changing any discriminant silently would corrupt persistence. These const
    checks make such edits fail to compile immediately.
 */
+#[allow(clippy::no_effect)]
 const _: () = {
     // true -> 1, false -> 0; index out of bounds if false.
     ["code changed"][!(PrimType::UInt64 as u8 == 1) as usize];
