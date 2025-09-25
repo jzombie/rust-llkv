@@ -12,6 +12,11 @@ pub use instrumented_pager::*;
 pub mod mem_pager;
 pub use mem_pager::*;
 
+#[cfg(feature = "simd-r-drive-support")]
+pub mod simd_r_drive_pager;
+#[cfg(feature = "simd-r-drive-support")]
+pub use simd_r_drive_pager::*;
+
 #[derive(Clone, Debug)]
 pub enum BatchPut {
     Raw { key: PhysicalKey, bytes: Vec<u8> },

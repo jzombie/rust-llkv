@@ -10,7 +10,6 @@ publish.workspace = true
 
 [dependencies]
 llkv-result.workspace = true
-memmap2.workspace = true
 rustc-hash.workspace = true
 simd-r-drive = { workspace = true, optional = true }
 simd-r-drive-entry-handle.workspace = true

@@ -971,7 +971,6 @@ version = "0.1.0-alpha"
 dependencies = [
  "llkv-result",
  "llkv-storage",
- "memmap2",
  "rustc-hash",
  "simd-r-drive",
  "simd-r-drive-entry-handle",
