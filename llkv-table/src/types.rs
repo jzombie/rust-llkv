@@ -9,6 +9,3 @@ pub type FieldId = u32;
 
 /// Row identifier type.
 pub type RowId = u64;
-
-pub type RootId = u64;
-pub type RootIdBytes = [u8; 8];
