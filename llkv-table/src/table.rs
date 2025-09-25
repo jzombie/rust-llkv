@@ -2,6 +2,8 @@ use std::cmp;
 use std::ops::Bound;
 use std::sync::Arc;
 
+use crate::types::TableId;
+
 use arrow::array::{Array, ArrayRef, Int32Array, RecordBatch, UInt64Array};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
@@ -161,9 +163,9 @@ where
 }
 
 #[inline]
-fn lfid_for(table_id: u32, column_id: FieldId) -> LogicalFieldId {
+fn lfid_for(table_id: TableId, column_id: FieldId) -> LogicalFieldId {
     LogicalFieldId::new()
-        .with_table_id(table_id)
+        .with_table_id(u32::from(table_id))
         .with_field_id(column_id)
         .with_namespace(Namespace::UserData)
 }
@@ -199,14 +201,15 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     store: ColumnStore<P>,
-    table_id: u32,
+    table_id: TableId,
 }
 
 impl<P> Table<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    pub fn new(table_id: u32, pager: Arc<P>) -> Self {
+    // TODO: Ensure this errors if using a reserved `table_id`
+    pub fn new(table_id: TableId, pager: Arc<P>) -> Self {
         let store = ColumnStore::open(pager).unwrap();
         Self { store, table_id }
     }
@@ -339,7 +342,7 @@ where
     }
 
     #[inline]
-    pub fn get_cols_meta(&self, col_ids: &[u32]) -> Vec<Option<ColMeta>> {
+    pub fn get_cols_meta(&self, col_ids: &[FieldId]) -> Vec<Option<ColMeta>> {
         self.catalog().get_cols_meta(self.table_id, col_ids)
     }
 
@@ -413,6 +416,7 @@ impl ColumnStoreTestExt for ColumnStore<MemPager> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::RowId;
     use arrow::array::{
         BinaryArray, Float64Array, Int16Array, Int32Array, UInt8Array, UInt32Array, UInt64Array,
     };
@@ -510,9 +514,9 @@ mod tests {
 
     #[test]
     fn test_table_reopen_with_shared_pager() {
-        const TABLE_ALPHA: u32 = 42;
-        const TABLE_BETA: u32 = 43;
-        const TABLE_GAMMA: u32 = 44;
+        const TABLE_ALPHA: TableId = 42;
+        const TABLE_BETA: TableId = 43;
+        const TABLE_GAMMA: TableId = 44;
         const COL_ALPHA_U64: FieldId = 100;
         const COL_ALPHA_I32: FieldId = 101;
         const COL_ALPHA_U32: FieldId = 102;
@@ -523,7 +527,7 @@ mod tests {
 
         let pager = Arc::new(MemPager::default());
 
-        let alpha_rows: Vec<u64> = vec![1, 2, 3, 4];
+        let alpha_rows: Vec<RowId> = vec![1, 2, 3, 4];
         let alpha_vals_u64: Vec<u64> = vec![10, 20, 30, 40];
         let alpha_vals_i32: Vec<i32> = vec![-5, 15, 25, 35];
         let alpha_vals_u32: Vec<u32> = vec![7, 11, 13, 17];

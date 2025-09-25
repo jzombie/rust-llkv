@@ -41,6 +41,13 @@ pub struct LogicalFieldId {
     pub namespace: Namespace,
 }
 
+/// Identifier for a logical table within a [`Namespace`].
+///
+/// `TableId` consumes the middle 29 bits inside [`LogicalFieldId`]. Using a
+/// `u16` keeps IDs compact and (more importantly) guarantees they always fit in
+/// that bitfield without extra checks.
+pub type TableId = u16;
+
 /// Logical column identifier within a table.
 ///
 /// `FieldId` is stored inside [`LogicalFieldId::field_id`], which is a 32-bit

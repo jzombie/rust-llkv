@@ -8,10 +8,12 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bitcode::{Decode, Encode};
 
+use crate::types::TableId;
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor,
 };
+
 use llkv_column_map::types::LogicalFieldId;
 use llkv_column_map::{
     ColumnStore,
@@ -23,7 +25,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 // ----- Catalog constants -----
 
 /// Reserved catalog table id.
-pub const CATALOG_TID: u32 = 0;
+pub const CATALOG_TID: TableId = 0;
 
 /// Catalog column ids (within table id 0).
 const F_TABLE_META: u32 = 1; // bytes: bitcode(TableMeta)
@@ -32,24 +34,24 @@ const F_COL_META: u32 = 10; // bytes: bitcode(ColMeta)
 // ----- Namespacing helpers -----
 
 #[inline]
-fn lfid(table_id: u32, col_id: u32) -> LogicalFieldId {
+fn lfid(table_id: TableId, col_id: u32) -> LogicalFieldId {
     LogicalFieldId::new()
         .with_namespace(Namespace::UserData)
-        .with_table_id(table_id)
+        .with_table_id(u32::from(table_id))
         .with_field_id(col_id)
 }
 
 #[inline]
-fn rid_table(table_id: u32) -> u64 {
+fn rid_table(table_id: TableId) -> u64 {
     let fid = LogicalFieldId::new()
         .with_namespace(Namespace::UserData)
-        .with_table_id(table_id)
+        .with_table_id(u32::from(table_id))
         .with_field_id(0);
     fid.into()
 }
 
 #[inline]
-fn rid_col(table_id: u32, col_id: u32) -> u64 {
+fn rid_col(table_id: TableId, col_id: u32) -> u64 {
     lfid(table_id, col_id).into()
 }
 
@@ -57,7 +59,7 @@ fn rid_col(table_id: u32, col_id: u32) -> u64 {
 
 #[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
 pub struct TableMeta {
-    pub table_id: u32,
+    pub table_id: TableId,
     pub name: Option<String>,
     pub created_at_micros: u64,
     pub flags: u32,
@@ -109,7 +111,7 @@ where
     }
 
     /// Fetch table metadata by table_id.
-    pub fn get_table_meta(&self, table_id: u32) -> Option<TableMeta> {
+    pub fn get_table_meta(&self, table_id: TableId) -> Option<TableMeta> {
         struct MetaVisitor {
             target_rid: u64,
             meta: Option<TableMeta>,
@@ -151,7 +153,7 @@ where
     }
 
     /// Upsert a single column’s metadata.
-    pub fn put_col_meta(&self, table_id: u32, meta: &ColMeta) {
+    pub fn put_col_meta(&self, table_id: TableId, meta: &ColMeta) {
         let lfid_val: u64 = lfid(CATALOG_TID, F_COL_META).into();
         let schema = Arc::new(Schema::new(vec![
             Field::new("row_id", DataType::UInt64, false),
@@ -170,7 +172,7 @@ where
     }
 
     /// Batch fetch specific column metas by col_id using a shared keyset.
-    pub fn get_cols_meta(&self, table_id: u32, col_ids: &[u32]) -> Vec<Option<ColMeta>> {
+    pub fn get_cols_meta(&self, table_id: TableId, col_ids: &[u32]) -> Vec<Option<ColMeta>> {
         let results = vec![None; col_ids.len()];
         let target_rids: HashMap<u64, usize> = col_ids
             .iter()
