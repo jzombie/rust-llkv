@@ -9,7 +9,7 @@ use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
-use llkv_column_map::store::{ColumnStore, IndexKind};
+use llkv_column_map::store::{ColumnStore, IndexKind, ProjectionBatch};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_storage::pager::MemPager;
 
@@ -125,4 +125,47 @@ fn scan_builder_sorted_with_row_ids() {
     assert!(!coll.out.is_empty());
     assert_eq!(coll.out.first().copied(), Some(10_000));
     assert_eq!(coll.out.last().copied(), Some(20_000));
+}
+
+#[test]
+fn project_column_streams_row_aligned_batches() {
+    let pager = Arc::new(MemPager::new());
+    let store = ColumnStore::open(pager).unwrap();
+    let field_id = fid(5);
+
+    let mut md = HashMap::new();
+    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::UInt64, false),
+        Field::new("data", DataType::UInt64, false).with_metadata(md),
+    ]));
+
+    let rid: Vec<u64> = (0..512u64).collect();
+    let vals: Vec<u64> = rid.iter().map(|r| r * 2).collect();
+    let rid_arr = Arc::new(UInt64Array::from(rid));
+    let val_arr = Arc::new(UInt64Array::from(vals));
+    let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
+    store.append(&batch).unwrap();
+
+    let mut collected: Vec<ProjectionBatch> = Vec::new();
+    store
+        .project_column(field_id, ScanOptions::default(), |proj| {
+            collected.push(proj);
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(!collected.is_empty());
+    let mut expected = 0u64;
+    for batch in collected {
+        let rids = batch.row_ids;
+        let vals = batch.values.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(rids.len(), vals.len());
+        for i in 0..rids.len() {
+            assert_eq!(rids.value(i), expected);
+            assert_eq!(vals.value(i), expected * 2);
+            expected += 1;
+        }
+    }
+    assert_eq!(expected, 512);
 }
