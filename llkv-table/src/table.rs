@@ -412,9 +412,10 @@ impl ColumnStoreTestExt for ColumnStore<MemPager> {
 
 #[cfg(test)]
 mod tests {
-    use super::ColumnStoreTestExt;
     use super::*;
-    use arrow::array::{BinaryArray, Float64Array, Int32Array, UInt64Array};
+    use arrow::array::{
+        BinaryArray, Float64Array, Int16Array, Int32Array, UInt8Array, UInt32Array, UInt64Array,
+    };
     use arrow::compute::{cast, max, min, sum, unary};
     use std::collections::HashMap;
 
@@ -511,18 +512,31 @@ mod tests {
     fn test_table_reopen_with_shared_pager() {
         const TABLE_ALPHA: u32 = 42;
         const TABLE_BETA: u32 = 43;
+        const TABLE_GAMMA: u32 = 44;
         const COL_ALPHA_U64: FieldId = 100;
         const COL_ALPHA_I32: FieldId = 101;
+        const COL_ALPHA_U32: FieldId = 102;
+        const COL_ALPHA_I16: FieldId = 103;
         const COL_BETA_U64: FieldId = 200;
+        const COL_BETA_U8: FieldId = 201;
+        const COL_GAMMA_I16: FieldId = 300;
 
         let pager = Arc::new(MemPager::default());
 
         let alpha_rows: Vec<u64> = vec![1, 2, 3, 4];
         let alpha_vals_u64: Vec<u64> = vec![10, 20, 30, 40];
         let alpha_vals_i32: Vec<i32> = vec![-5, 15, 25, 35];
-        let beta_rows: Vec<u64> = vec![101, 102, 103];
-        let beta_vals: Vec<u64> = vec![900, 901, 902];
+        let alpha_vals_u32: Vec<u32> = vec![7, 11, 13, 17];
+        let alpha_vals_i16: Vec<i16> = vec![-2, 4, -6, 8];
 
+        let beta_rows: Vec<u64> = vec![101, 102, 103];
+        let beta_vals_u64: Vec<u64> = vec![900, 901, 902];
+        let beta_vals_u8: Vec<u8> = vec![1, 2, 3];
+
+        let gamma_rows: Vec<u64> = vec![501, 502];
+        let gamma_vals_i16: Vec<i16> = vec![123, -321];
+
+        // First session: create tables and write data.
         {
             let table = Table::new(TABLE_ALPHA, Arc::clone(&pager));
             let schema =
@@ -534,6 +548,12 @@ mod tests {
                     Field::new("alpha_i32", DataType::Int32, false).with_metadata(HashMap::from([
                         ("field_id".to_string(), COL_ALPHA_I32.to_string()),
                     ])),
+                    Field::new("alpha_u32", DataType::UInt32, false).with_metadata(HashMap::from(
+                        [("field_id".to_string(), COL_ALPHA_U32.to_string())],
+                    )),
+                    Field::new("alpha_i16", DataType::Int16, false).with_metadata(HashMap::from([
+                        ("field_id".to_string(), COL_ALPHA_I16.to_string()),
+                    ])),
                 ]));
             let batch = RecordBatch::try_new(
                 schema,
@@ -541,6 +561,8 @@ mod tests {
                     Arc::new(UInt64Array::from(alpha_rows.clone())),
                     Arc::new(UInt64Array::from(alpha_vals_u64.clone())),
                     Arc::new(Int32Array::from(alpha_vals_i32.clone())),
+                    Arc::new(UInt32Array::from(alpha_vals_u32.clone())),
+                    Arc::new(Int16Array::from(alpha_vals_i16.clone())),
                 ],
             )
             .unwrap();
@@ -555,12 +577,17 @@ mod tests {
                     "field_id".to_string(),
                     COL_BETA_U64.to_string(),
                 )])),
+                Field::new("beta_u8", DataType::UInt8, false).with_metadata(HashMap::from([(
+                    "field_id".to_string(),
+                    COL_BETA_U8.to_string(),
+                )])),
             ]));
             let batch = RecordBatch::try_new(
                 schema,
                 vec![
                     Arc::new(UInt64Array::from(beta_rows.clone())),
-                    Arc::new(UInt64Array::from(beta_vals.clone())),
+                    Arc::new(UInt64Array::from(beta_vals_u64.clone())),
+                    Arc::new(UInt8Array::from(beta_vals_u8.clone())),
                 ],
             )
             .unwrap();
@@ -568,37 +595,88 @@ mod tests {
         }
 
         {
+            let table = Table::new(TABLE_GAMMA, Arc::clone(&pager));
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("row_id", DataType::UInt64, false),
+                Field::new("gamma_i16", DataType::Int16, false).with_metadata(HashMap::from([(
+                    "field_id".to_string(),
+                    COL_GAMMA_I16.to_string(),
+                )])),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt64Array::from(gamma_rows.clone())),
+                    Arc::new(Int16Array::from(gamma_vals_i16.clone())),
+                ],
+            )
+            .unwrap();
+            table.append(&batch).unwrap();
+        }
+
+        // Second session: reopen each table and ensure schema and values are intact.
+        {
             let table = Table::new(TABLE_ALPHA, Arc::clone(&pager));
-            let lfid_u64 = lfid_for(TABLE_ALPHA, COL_ALPHA_U64);
-            let lfid_i32 = lfid_for(TABLE_ALPHA, COL_ALPHA_I32);
+            let store = table.store();
 
-            let col_u64 = table
-                .store()
-                .get_column_for_test(lfid_u64)
-                .expect("expected alpha u64 column");
-            assert_eq!(col_u64.data_type, DataType::UInt64);
-            let arr_u64 = col_u64.data.as_any().downcast_ref::<UInt64Array>().unwrap();
-            assert_eq!(arr_u64.values(), alpha_vals_u64.as_slice());
+            let expectations: &[(FieldId, DataType)] = &[
+                (COL_ALPHA_U64, DataType::UInt64),
+                (COL_ALPHA_I32, DataType::Int32),
+                (COL_ALPHA_U32, DataType::UInt32),
+                (COL_ALPHA_I16, DataType::Int16),
+            ];
 
-            let col_i32 = table
-                .store()
-                .get_column_for_test(lfid_i32)
-                .expect("expected alpha i32 column");
-            assert_eq!(col_i32.data_type, DataType::Int32);
-            let arr_i32 = col_i32.data.as_any().downcast_ref::<Int32Array>().unwrap();
-            assert_eq!(arr_i32.values(), alpha_vals_i32.as_slice());
+            for &(col, ref ty) in expectations {
+                let lfid = lfid_for(TABLE_ALPHA, col);
+                assert_eq!(store.data_type(lfid).unwrap(), *ty);
+                let arr = store.gather_rows(lfid, &alpha_rows).unwrap();
+                match ty {
+                    DataType::UInt64 => {
+                        let arr = arr.as_any().downcast_ref::<UInt64Array>().unwrap();
+                        assert_eq!(arr.values(), alpha_vals_u64.as_slice());
+                    }
+                    DataType::Int32 => {
+                        let arr = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+                        assert_eq!(arr.values(), alpha_vals_i32.as_slice());
+                    }
+                    DataType::UInt32 => {
+                        let arr = arr.as_any().downcast_ref::<UInt32Array>().unwrap();
+                        assert_eq!(arr.values(), alpha_vals_u32.as_slice());
+                    }
+                    DataType::Int16 => {
+                        let arr = arr.as_any().downcast_ref::<Int16Array>().unwrap();
+                        assert_eq!(arr.values(), alpha_vals_i16.as_slice());
+                    }
+                    other => panic!("unexpected dtype {other:?}"),
+                }
+            }
         }
 
         {
             let table = Table::new(TABLE_BETA, Arc::clone(&pager));
-            let lfid = lfid_for(TABLE_BETA, COL_BETA_U64);
-            let col = table
-                .store()
-                .get_column_for_test(lfid)
-                .expect("expected beta column");
-            assert_eq!(col.data_type, DataType::UInt64);
-            let arr = col.data.as_any().downcast_ref::<UInt64Array>().unwrap();
-            assert_eq!(arr.values(), beta_vals.as_slice());
+            let store = table.store();
+
+            let lfid_u64 = lfid_for(TABLE_BETA, COL_BETA_U64);
+            assert_eq!(store.data_type(lfid_u64).unwrap(), DataType::UInt64);
+            let arr_u64 = store.gather_rows(lfid_u64, &beta_rows).unwrap();
+            let arr_u64 = arr_u64.as_any().downcast_ref::<UInt64Array>().unwrap();
+            assert_eq!(arr_u64.values(), beta_vals_u64.as_slice());
+
+            let lfid_u8 = lfid_for(TABLE_BETA, COL_BETA_U8);
+            assert_eq!(store.data_type(lfid_u8).unwrap(), DataType::UInt8);
+            let arr_u8 = store.gather_rows(lfid_u8, &beta_rows).unwrap();
+            let arr_u8 = arr_u8.as_any().downcast_ref::<UInt8Array>().unwrap();
+            assert_eq!(arr_u8.values(), beta_vals_u8.as_slice());
+        }
+
+        {
+            let table = Table::new(TABLE_GAMMA, Arc::clone(&pager));
+            let store = table.store();
+            let lfid = lfid_for(TABLE_GAMMA, COL_GAMMA_I16);
+            assert_eq!(store.data_type(lfid).unwrap(), DataType::Int16);
+            let arr = store.gather_rows(lfid, &gamma_rows).unwrap();
+            let arr = arr.as_any().downcast_ref::<Int16Array>().unwrap();
+            assert_eq!(arr.values(), gamma_vals_i16.as_slice());
         }
     }
 
