@@ -147,8 +147,11 @@ where
             + scan::PrimitiveWithRowIdsVisitor,
     {
         let mut visitor = GatherVisitor::<T>::new(row_index, len);
-        let mut opts = ScanOptions::default();
-        opts.with_row_ids = true;
+        let mut opts = ScanOptions {
+            with_row_ids: true,
+            ..Default::default()
+        };
+
         if include_nulls {
             opts.include_nulls = true;
             opts.anchor_row_id_field =

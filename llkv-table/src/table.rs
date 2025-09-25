@@ -399,7 +399,7 @@ where
                 continue;
             };
 
-            if col.len() == 0 {
+            if col.is_empty() {
                 start = end;
                 continue;
             }
