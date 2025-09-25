@@ -62,4 +62,6 @@ jobs:
           components: miri
 
       - name: Run Miri tests
-        run: cargo miri test -p llkv-column-map
+        # Miri cannot emulate the OS-backed mmap calls used by our integration tests, so
+        # we limit the run to library tests (unit tests) for now.
+        run: cargo miri test -p llkv-column-map --lib
