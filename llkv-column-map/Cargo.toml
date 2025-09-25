@@ -12,6 +12,7 @@ autobenches = false
 arrow = { workspace = true }
 arrow-ord = { workspace = true }
 modular-bitfield = { workspace = true }
+num_enum = { workspace = true }
 roaring = { workspace = true }
 rustc-hash.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }

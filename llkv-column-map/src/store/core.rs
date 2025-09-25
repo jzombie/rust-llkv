@@ -6,11 +6,11 @@ use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
 };
-use crate::store::scan::FilterPrimitive;
+use crate::store::scan::{FilterPrimitive, ScanOptions};
 use crate::types::{LogicalFieldId, PhysicalKey};
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, PrimitiveArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_empty_array,
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, PrimitiveArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_empty_array,
 };
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::{ArrowPrimitiveType, DataType};
@@ -76,6 +76,30 @@ where
 
     /// Gathers values for the specified `row_ids`, returned in the same order as provided.
     pub fn gather_rows(&self, field_id: LogicalFieldId, row_ids: &[u64]) -> Result<ArrayRef> {
+        self.gather_rows_internal(field_id, row_ids, /* include_nulls */ false, None)
+    }
+
+    pub fn gather_rows_with_nulls(
+        &self,
+        field_id: LogicalFieldId,
+        row_ids: &[u64],
+        anchor_row_id_field: Option<LogicalFieldId>,
+    ) -> Result<ArrayRef> {
+        self.gather_rows_internal(
+            field_id,
+            row_ids,
+            /* include_nulls */ true,
+            anchor_row_id_field,
+        )
+    }
+
+    fn gather_rows_internal(
+        &self,
+        field_id: LogicalFieldId,
+        row_ids: &[u64],
+        include_nulls: bool,
+        anchor_row_id_field: Option<LogicalFieldId>,
+    ) -> Result<ArrayRef> {
         let dtype = self.data_type(field_id)?;
         if row_ids.is_empty() {
             return Ok(new_empty_array(&dtype));
@@ -92,7 +116,13 @@ where
         crate::with_integer_arrow_type!(
             dtype.clone(),
             |ArrowTy| {
-                self.gather_rows_primitive::<ArrowTy>(field_id, &row_index, row_ids.len())
+                self.gather_rows_primitive::<ArrowTy>(
+                    field_id,
+                    &row_index,
+                    row_ids.len(),
+                    include_nulls,
+                    anchor_row_id_field,
+                )
             },
             Err(Error::Internal(format!(
                 "gather_rows: unsupported dtype {:?}",
@@ -106,6 +136,8 @@ where
         field_id: LogicalFieldId,
         row_index: &FxHashMap<u64, usize>,
         len: usize,
+        include_nulls: bool,
+        anchor_row_id_field: Option<LogicalFieldId>,
     ) -> Result<ArrayRef>
     where
         T: ArrowPrimitiveType,
@@ -115,8 +147,18 @@ where
             + scan::PrimitiveWithRowIdsVisitor,
     {
         let mut visitor = GatherVisitor::<T>::new(row_index, len);
+        let mut opts = ScanOptions {
+            with_row_ids: true,
+            ..Default::default()
+        };
+
+        if include_nulls {
+            opts.include_nulls = true;
+            opts.anchor_row_id_field =
+                Some(anchor_row_id_field.unwrap_or_else(|| rowid_fid(field_id)));
+        }
         ScanBuilder::new(self, field_id)
-            .with_row_ids(rowid_fid(field_id))
+            .options(opts)
             .run(&mut visitor)?;
         visitor.finish()
     }
@@ -1602,7 +1644,15 @@ macro_rules! impl_gather_visitor {
     ($ty:ty, $arr:ty, $method:ident) => {
         impl<'a> scan::PrimitiveVisitor for GatherVisitor<'a, $ty> {}
         impl<'a> scan::PrimitiveSortedVisitor for GatherVisitor<'a, $ty> {}
-        impl<'a> scan::PrimitiveSortedWithRowIdsVisitor for GatherVisitor<'a, $ty> {}
+        impl<'a> scan::PrimitiveSortedWithRowIdsVisitor for GatherVisitor<'a, $ty> {
+            fn null_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
+                let end = start + len;
+                for i in start..end {
+                    let row_id = row_ids.value(i);
+                    self.record(row_id, None);
+                }
+            }
+        }
         impl<'a> scan::PrimitiveWithRowIdsVisitor for GatherVisitor<'a, $ty> {
             fn $method(&mut self, values: &$arr, row_ids: &UInt64Array) {
                 let len = values.len();
@@ -1641,3 +1691,13 @@ impl_gather_visitor!(arrow::datatypes::Int64Type, Int64Array, i64_chunk_with_rid
 impl_gather_visitor!(arrow::datatypes::Int32Type, Int32Array, i32_chunk_with_rids);
 impl_gather_visitor!(arrow::datatypes::Int16Type, Int16Array, i16_chunk_with_rids);
 impl_gather_visitor!(arrow::datatypes::Int8Type, Int8Array, i8_chunk_with_rids);
+impl_gather_visitor!(
+    arrow::datatypes::Float64Type,
+    Float64Array,
+    f64_chunk_with_rids
+);
+impl_gather_visitor!(
+    arrow::datatypes::Float32Type,
+    Float32Array,
+    f32_chunk_with_rids
+);

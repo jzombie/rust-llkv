@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
 use arrow::array::{
-    Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::ArrowPrimitiveType;
 
@@ -94,6 +94,16 @@ impl_filter_visitor!(arrow::datatypes::Int64Type, Int64Array, i64_chunk_with_rid
 impl_filter_visitor!(arrow::datatypes::Int32Type, Int32Array, i32_chunk_with_rids);
 impl_filter_visitor!(arrow::datatypes::Int16Type, Int16Array, i16_chunk_with_rids);
 impl_filter_visitor!(arrow::datatypes::Int8Type, Int8Array, i8_chunk_with_rids);
+impl_filter_visitor!(
+    arrow::datatypes::Float64Type,
+    Float64Array,
+    f64_chunk_with_rids
+);
+impl_filter_visitor!(
+    arrow::datatypes::Float32Type,
+    Float32Array,
+    f32_chunk_with_rids
+);
 
 pub trait FilterPrimitive: ArrowPrimitiveType {
     fn run_filter<P, F>(
@@ -132,6 +142,8 @@ impl_filter_primitive!(arrow::datatypes::Int64Type);
 impl_filter_primitive!(arrow::datatypes::Int32Type);
 impl_filter_primitive!(arrow::datatypes::Int16Type);
 impl_filter_primitive!(arrow::datatypes::Int8Type);
+impl_filter_primitive!(arrow::datatypes::Float64Type);
+impl_filter_primitive!(arrow::datatypes::Float32Type);
 
 pub(crate) fn run_filter_for<P, T, F>(
     store: &ColumnStore<P>,

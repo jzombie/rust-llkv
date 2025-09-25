@@ -26,7 +26,7 @@ fn scan_builder_sorted_range_u64() {
     let store = ColumnStore::open(pager).unwrap();
     let field_id = fid(42);
 
-    // Build schema and ingest 0..1000 shuffled segments (single chunk is fine)
+    // Build schema and ingest 0..10000 (shuffled via reverse values)
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());
     let schema = Arc::new(Schema::new(vec![
@@ -36,14 +36,14 @@ fn scan_builder_sorted_range_u64() {
 
     let n = 10_000usize;
     let rid: Vec<u64> = (0..n as u64).collect();
-    let vals: Vec<u64> = (0..n as u64).rev().collect(); // deliberately unsorted
+    let vals: Vec<u64> = (0..n as u64).rev().collect();
     let rid_arr = Arc::new(UInt64Array::from(rid));
     let val_arr = Arc::new(UInt64Array::from(vals));
     let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
     store.append(&batch).unwrap();
     store.register_index(field_id, IndexKind::Sort).unwrap();
 
-    // Range [2000, 8000]
+    // Collect values within range [2000, 8000]
     struct Collect {
         out: Vec<u64>,
     }
@@ -58,17 +58,14 @@ fn scan_builder_sorted_range_u64() {
             }
         }
     }
+
     let mut coll = Collect { out: Vec::new() };
     ScanBuilder::new(&store, field_id)
         .options(ScanOptions {
             sorted: true,
             reverse: false,
             with_row_ids: false,
-            limit: None,
-            offset: 0,
-            include_nulls: false,
-            nulls_first: false,
-            anchor_row_id_field: None,
+            ..Default::default()
         })
         .with_range::<u64, _>(2000..=8000)
         .run(&mut coll)
@@ -84,7 +81,6 @@ fn scan_builder_sorted_with_row_ids() {
     let store = ColumnStore::open(pager).unwrap();
     let field_id = fid(77);
 
-    // Schema and ingest: values = row_id for simplicity
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());
     let schema = Arc::new(Schema::new(vec![
@@ -100,7 +96,6 @@ fn scan_builder_sorted_with_row_ids() {
     store.append(&batch).unwrap();
     store.register_index(field_id, IndexKind::Sort).unwrap();
 
-    // Collect row ids for a range
     struct CollectRids {
         out: Vec<u64>,
     }
@@ -122,11 +117,7 @@ fn scan_builder_sorted_with_row_ids() {
             sorted: true,
             reverse: false,
             with_row_ids: true,
-            limit: None,
-            offset: 0,
-            include_nulls: false,
-            nulls_first: false,
-            anchor_row_id_field: None,
+            ..Default::default()
         })
         .with_range::<u64, _>(10_000..=20_000)
         .run(&mut coll)

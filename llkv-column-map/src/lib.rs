@@ -40,6 +40,14 @@ macro_rules! with_integer_arrow_type {
                 type $ty = arrow::datatypes::Int8Type;
                 $body
             }
+            arrow::datatypes::DataType::Float64 => {
+                type $ty = arrow::datatypes::Float64Type;
+                $body
+            }
+            arrow::datatypes::DataType::Float32 => {
+                type $ty = arrow::datatypes::Float32Type;
+                $body
+            }
             _ => $unsupported,
         }
     }};
