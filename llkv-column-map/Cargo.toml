@@ -24,7 +24,6 @@ thiserror = { workspace = true }
 criterion = { workspace = true }
 line-ending = { workspace = true }
 rand = { workspace = true }
-tempfile.workspace = true
 
 [[bench]]
 name = "column_sum_bench"

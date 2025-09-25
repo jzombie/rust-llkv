@@ -945,7 +945,6 @@ dependencies = [
  "roaring",
  "rustc-hash",
  "simd-r-drive-entry-handle",
- "tempfile",
  "thiserror",
 ]
 
