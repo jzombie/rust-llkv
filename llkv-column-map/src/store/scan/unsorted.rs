@@ -1,4 +1,5 @@
 use super::*;
+use arrow::datatypes::DataType;
 
 pub fn unsorted_visit<P: Pager<Blob = EntryHandle>, V: PrimitiveVisitor>(
     pager: &P,

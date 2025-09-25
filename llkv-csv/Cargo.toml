@@ -11,3 +11,4 @@ publish.workspace = true
 csv.workspace = true
 llkv-table.workspace = true
 rustc-hash.workspace = true
+llkv-column-map.workspace = true

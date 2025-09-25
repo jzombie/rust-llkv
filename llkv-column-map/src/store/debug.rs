@@ -1,11 +1,11 @@
-use super::ColumnStore;
+use super::{ColumnStore, constants::CATALOG_ROOT_PKEY};
 use crate::{
     storage::pager::{BatchGet, GetResult, Pager},
     store::{
         catalog::ColumnCatalog,
         descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorPageHeader},
     },
-    types::{CATALOG_ROOT_PKEY, PhysicalKey},
+    types::PhysicalKey,
 };
 use arrow::{
     array::{StringBuilder, UInt64Builder},

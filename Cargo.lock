@@ -106,6 +106,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayvec"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+
+[[package]]
 name = "arrow"
 version = "56.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -299,6 +305,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "bitcode"
+version = "0.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "648bd963d2e5d465377acecfb4b827f9f553b6bc97a8f61715779e9ed9e52b74"
+dependencies = [
+ "arrayvec",
+ "bitcode_derive",
+ "bytemuck",
+ "glam",
+ "serde",
+]
+
+[[package]]
+name = "bitcode_derive"
+version = "0.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffebfc2d28a12b262c303cb3860ee77b91bd83b1f20f0bd2a9693008e2f55a9e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -566,6 +596,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -660,6 +699,12 @@ dependencies = [
  "r-efi",
  "wasi 0.14.3+wasi-0.2.4",
 ]
+
+[[package]]
+name = "glam"
+version = "0.30.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34e4649b62c21fb8c737abe6449192ce96ecd16b5c0d606759fe43831b31bd95"
 
 [[package]]
 name = "glob"
@@ -885,6 +930,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-expr"
+version = "0.1.0-alpha"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "llkv-column-map",
+]
+
+[[package]]
 name = "llkv-storage"
 version = "0.1.0-alpha"
 dependencies = [
@@ -895,6 +949,22 @@ dependencies = [
  "simd-r-drive-entry-handle",
  "tempfile",
  "xxhash-rust",
+]
+
+[[package]]
+name = "llkv-table"
+version = "0.1.0-alpha"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "bitcode",
+ "crossbeam-channel",
+ "llkv-column-map",
+ "llkv-expr",
+ "rayon",
+ "rustc-hash",
+ "simd-r-drive-entry-handle",
 ]
 
 [[package]]

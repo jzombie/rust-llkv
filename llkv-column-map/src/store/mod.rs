@@ -4,6 +4,7 @@ mod config;
 use config::*;
 
 mod constants;
+pub use constants::CATALOG_ROOT_PKEY;
 use constants::*;
 
 pub mod core;

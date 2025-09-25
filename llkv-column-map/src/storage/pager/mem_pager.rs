@@ -1,6 +1,7 @@
 use super::*;
 use crate::error::{Error, Result};
-use crate::types::{CATALOG_ROOT_PKEY, PhysicalKey};
+use crate::store::CATALOG_ROOT_PKEY;
+use crate::types::PhysicalKey;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{

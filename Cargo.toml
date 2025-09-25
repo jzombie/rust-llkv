@@ -9,15 +9,17 @@ publish = true
 [workspace.dependencies]
 llkv-column-map = { path = "./llkv-column-map", version = "0.1.0-alpha" }
 # llkv-csv = { path = "./llkv-csv", version = "0.1.0-alpha" }
-# llkv-expr = { path = "./llkv-expr", version = "0.1.0-alpha" }
+llkv-expr = { path = "./llkv-expr", version = "0.1.0-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.1.0-alpha" }
-# llkv-table = { path = "./llkv-table", version = "0.1.0-alpha" }
+llkv-table = { path = "./llkv-table", version = "0.1.0-alpha" }
 simd-r-drive = "0.14.0-alpha"
 simd-r-drive-entry-handle = "0.14.0-alpha"
 
 # Vendor crates
 arrow = { version = "56.2.0", default-features = false, features = ["prettyprint"] }
+arrow-array = "56.2.0"
 arrow-ord = "56.2.0"
+arrow-schema = "56.2.0"
 bitcode = "0.6.7"
 criterion = { version = "3.0.5", package = "codspeed-criterion-compat" }
 crossbeam-channel = "0.5.15"
@@ -37,8 +39,8 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 members = [
     "llkv-column-map",
     # "llkv-csv",
-    # "llkv-expr",
+    "llkv-expr",
     "llkv-storage",
-    # "llkv-table"
+    "llkv-table"
 ]
 resolver = "2"

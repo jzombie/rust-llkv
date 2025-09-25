@@ -1,1426 +1,1133 @@
-// TODO: Look into https://docs.rs/arrow-row/56.1.0/arrow_row/
-
-// TODO: Replace internal `HashMap` and `HashSet` with `Fx` equivalents
-// TODO: Implement `Display` trait for CLI views
-
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::cmp;
+use std::fmt;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use crossbeam_channel as xchan;
+use crate::types::TableId;
 
-use llkv_column_map::column_store::read_scan::{Direction, OrderBy, ScanError, ValueScanOpts};
-use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::types::{AppendOptions, LogicalFieldId, Put, ValueMode};
-use llkv_column_map::views::ValueSlice;
-use llkv_column_map::ColumnStore;
+use arrow::array::{Array, ArrayRef, Int32Array, RecordBatch, UInt64Array};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
-use crate::expr::{Expr, Filter, Operator};
-use crate::types::{FieldId, RowId, RowPatch};
+use llkv_column_map::store::FilterPrimitive;
+use llkv_column_map::{
+    ColumnStore, scan,
+    storage::pager::{MemPager, Pager},
+    types::{LogicalFieldId, Namespace},
+};
+use simd_r_drive_entry_handle::EntryHandle;
 
-// ----- sys_catalog wiring -----
-use crate::sys_catalog::{ColMeta, Schema, SysCatalog, TableMeta};
+use crate::expr::{Filter, LiteralCastError, Operator, bound_to_native, literal_to_native};
+use crate::sys_catalog::{CATALOG_TID, ColMeta, SysCatalog, TableMeta};
+use crate::types::FieldId;
 
-/// Compose a 64-bit logical field id from a 32-bit table id and a 32-bit column id.
-/// Layout: [ table_id: u32 | column_id: u32 ]
-#[inline]
-fn lfid_for(table_id: u32, column_id: FieldId) -> LogicalFieldId {
-    ((table_id as u64) << 32) | (column_id as u64)
+// TODO: Extract to constants
+/// Default max rows per streamed batch. Tune as needed.
+const STREAM_BATCH_ROWS: usize = 8192;
+
+// TODO: Move to `llkv-expr`?
+enum RangeLimit<T> {
+    Included(T),
+    Excluded(T),
 }
 
-/// Reserved column id for per-table presence. Clients should not use this id.
-/// (Catalog can use a different presence id; presence is namespaced per table id.)
-const PRESENCE_COL_ID: FieldId = u32::MAX;
-
-/// Encode row id as big-endian bytes so lexicographic order == numeric.
-#[inline]
-fn row_key_bytes(row_id: RowId) -> Vec<u8> {
-    row_id.to_be_bytes().to_vec()
+// TODO: Move to `llkv-expr`?
+enum Predicate<T>
+where
+    T: ArrowPrimitiveType + FilterPrimitive,
+{
+    All,
+    Equals(T::Native),
+    GreaterThan(T::Native),
+    GreaterThanOrEquals(T::Native),
+    LessThan(T::Native),
+    LessThanOrEquals(T::Native),
+    Range {
+        lower: Option<RangeLimit<T::Native>>,
+        upper: Option<RangeLimit<T::Native>>,
+    },
+    In(Vec<T::Native>),
 }
 
-/// Parse big-endian row id from the first 8 bytes of a key.
-#[inline]
-fn parse_row_id(key: &[u8]) -> RowId {
-    let mut a = [0u8; 8];
-    a.copy_from_slice(&key[..8]);
-    u64::from_be_bytes(a)
-}
-
-/// Extract owned bytes from a ValueSlice<Arc<[u8]>>.
-#[inline]
-fn value_slice_bytes(v: &ValueSlice<std::sync::Arc<[u8]>>) -> Vec<u8> {
-    let a = v.start() as usize;
-    let b = v.end() as usize;
-    v.data().as_ref()[a..b].to_vec()
-}
-
-/// Compute the smallest byte string strictly greater than all strings
-/// that start with `prefix`. If none exists (e.g. prefix is all 0xFF),
-/// returns None.
-#[inline]
-fn next_prefix_upper(prefix: &[u8]) -> Option<Vec<u8>> {
-    if prefix.is_empty() {
-        return None;
-    }
-    let mut up = prefix.to_vec();
-    for i in (0..up.len()).rev() {
-        if up[i] != 0xFF {
-            up[i] = up[i].saturating_add(1);
-            up.truncate(i + 1);
-            return Some(up);
+impl<T> Predicate<T>
+where
+    T: ArrowPrimitiveType + FilterPrimitive,
+{
+    fn build(op: &Operator<'_>) -> Result<Predicate<T>, TableError>
+    where
+        T: ArrowPrimitiveType + FilterPrimitive,
+        T::Native: TryFrom<i128> + Copy,
+    {
+        match op {
+            Operator::Equals(lit) => Ok(Predicate::Equals(literal_to_native::<T::Native>(lit)?)),
+            Operator::GreaterThan(lit) => {
+                Ok(Predicate::GreaterThan(literal_to_native::<T::Native>(lit)?))
+            }
+            Operator::GreaterThanOrEquals(lit) => {
+                Ok(Predicate::GreaterThanOrEquals(literal_to_native::<
+                    T::Native,
+                >(lit)?))
+            }
+            Operator::LessThan(lit) => {
+                Ok(Predicate::LessThan(literal_to_native::<T::Native>(lit)?))
+            }
+            Operator::LessThanOrEquals(lit) => Ok(Predicate::LessThanOrEquals(
+                literal_to_native::<T::Native>(lit)?,
+            )),
+            Operator::Range { lower, upper } => {
+                let lb = match bound_to_native::<T>(lower)? {
+                    Bound::Unbounded => None,
+                    Bound::Included(v) => Some(RangeLimit::Included(v)),
+                    Bound::Excluded(v) => Some(RangeLimit::Excluded(v)),
+                };
+                let ub = match bound_to_native::<T>(upper)? {
+                    Bound::Unbounded => None,
+                    Bound::Included(v) => Some(RangeLimit::Included(v)),
+                    Bound::Excluded(v) => Some(RangeLimit::Excluded(v)),
+                };
+                if lb.is_none() && ub.is_none() {
+                    Ok(Predicate::All)
+                } else {
+                    Ok(Predicate::Range {
+                        lower: lb,
+                        upper: ub,
+                    })
+                }
+            }
+            Operator::In(values) => {
+                let mut natives = Vec::with_capacity(values.len());
+                for lit in *values {
+                    natives.push(literal_to_native::<T::Native>(lit)?);
+                }
+                Ok(Predicate::In(natives))
+            }
+            // Pattern/string ops are not supported in this numeric predicate path.
+            _ => Err(TableError::Internal(
+                "Filter operator does not contain a supported typed value".to_string(),
+            )),
         }
     }
-    None
-}
 
-/// Thin configuration for ingest segmentation and LWW policy.
-#[derive(Clone, Debug)]
-pub struct TableCfg {
-    pub segment_max_entries: usize,
-    pub segment_max_bytes: usize,
-    pub last_write_wins_in_batch: bool,
-}
-
-impl Default for TableCfg {
-    fn default() -> Self {
-        Self {
-            segment_max_entries: 100_000,
-            segment_max_bytes: 32 << 20,
-            last_write_wins_in_batch: true,
+    fn matches(&self, value: T::Native) -> bool {
+        match self {
+            Predicate::All => true,
+            Predicate::Equals(target) => value == *target,
+            Predicate::GreaterThan(target) => value > *target,
+            Predicate::GreaterThanOrEquals(target) => value >= *target,
+            Predicate::LessThan(target) => value < *target,
+            Predicate::LessThanOrEquals(target) => value <= *target,
+            Predicate::Range { lower, upper } => {
+                if let Some(limit) = lower {
+                    match limit {
+                        RangeLimit::Included(bound) => {
+                            if value < *bound {
+                                return false;
+                            }
+                        }
+                        RangeLimit::Excluded(bound) => {
+                            if value <= *bound {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                if let Some(limit) = upper {
+                    match limit {
+                        RangeLimit::Included(bound) => {
+                            if value > *bound {
+                                return false;
+                            }
+                        }
+                        RangeLimit::Excluded(bound) => {
+                            if value >= *bound {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            }
+            Predicate::In(values) => values.contains(&value),
         }
     }
 }
 
-/// Scan/init error wrapper for this module.
+fn collect_matching_row_ids<T, P>(
+    store: &ColumnStore<P>,
+    field_id: LogicalFieldId,
+    op: &Operator<'_>,
+) -> Result<Vec<u64>, TableError>
+where
+    T: ArrowPrimitiveType + FilterPrimitive,
+    T::Native: TryFrom<i128> + Copy,
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let predicate = Predicate::<T>::build(op)?;
+    store
+        .filter_row_ids::<T, _>(field_id, move |value| predicate.matches(value))
+        .map_err(TableError::from)
+}
+
+#[inline]
+fn lfid_for(table_id: TableId, column_id: FieldId) -> LogicalFieldId {
+    LogicalFieldId::new()
+        .with_table_id(table_id)
+        .with_field_id(column_id)
+        .with_namespace(Namespace::UserData)
+}
+
 #[derive(Debug)]
-pub enum CmError {
-    ScanInit(String),
+pub enum TableError {
+    ColumnMap(llkv_column_map::error::Error),
+    Arrow(arrow::error::ArrowError),
+    ExprCast(LiteralCastError),
+    ReservedTableId(TableId),
+    Internal(String),
 }
 
-/// ColumnMap-backed table.
-pub struct Table {
-    /// Leaked pager to satisfy ColumnStore's lifetime without
-    /// gymnastics.
-    store: ColumnStore<MemPager>,
-    cfg: TableCfg,
-    /// 32-bit table id used to namespace logical field ids.
-    table_id: u32,
-}
-
-impl Table {
-    pub fn new(table_id: u32, cfg: TableCfg) -> Self {
-        let pager = Arc::new(MemPager::default());
-        let store = ColumnStore::open(pager);
-        Self {
-            store,
-            cfg,
-            table_id,
+impl fmt::Display for TableError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TableError::ColumnMap(err) => write!(f, "column map error: {err}"),
+            TableError::Arrow(err) => write!(f, "arrow error: {err}"),
+            TableError::ExprCast(err) => write!(f, "expression cast error: {err}"),
+            TableError::ReservedTableId(table_id) => {
+                write!(f, "table id {table_id} is reserved for system catalogs")
+            }
+            TableError::Internal(msg) => write!(f, "internal table error: {msg}"),
         }
     }
+}
 
-    /// Optional: declare a column; ColumnStore creates on first append.
-    pub fn add_column(&mut self, _fid: FieldId) {}
+impl std::error::Error for TableError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TableError::ColumnMap(err) => Some(err),
+            TableError::Arrow(err) => Some(err),
+            TableError::ExprCast(err) => Some(err),
+            TableError::ReservedTableId(_) => None,
+            TableError::Internal(_) => None,
+        }
+    }
+}
 
-    /// Internal: per-table presence logical field id.
-    #[inline]
-    fn presence_lfid(&self) -> LogicalFieldId {
-        lfid_for(self.table_id, PRESENCE_COL_ID)
+impl From<llkv_column_map::error::Error> for TableError {
+    fn from(e: llkv_column_map::error::Error) -> Self {
+        TableError::ColumnMap(e)
+    }
+}
+
+impl From<arrow::error::ArrowError> for TableError {
+    fn from(e: arrow::error::ArrowError) -> Self {
+        TableError::Arrow(e)
+    }
+}
+
+impl From<LiteralCastError> for TableError {
+    fn from(e: LiteralCastError) -> Self {
+        TableError::ExprCast(e)
+    }
+}
+
+pub struct Table<P = MemPager>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    store: ColumnStore<P>,
+    table_id: TableId,
+}
+
+impl<P> Table<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    pub fn new(table_id: TableId, pager: Arc<P>) -> Result<Self, TableError> {
+        if table_id == CATALOG_TID {
+            return Err(TableError::ReservedTableId(table_id));
+        }
+
+        let store = ColumnStore::open(pager)?;
+        Ok(Self { store, table_id })
     }
 
-    /// Internal: map an external FieldId to a namespaced LogicalFieldId.
-    #[inline]
-    fn lfid(&self, fid: FieldId) -> LogicalFieldId {
-        lfid_for(self.table_id, fid)
+    pub fn append(&self, batch: &RecordBatch) -> Result<(), llkv_column_map::error::Error> {
+        let mut new_fields = Vec::with_capacity(batch.schema().fields().len());
+        for field in batch.schema().fields() {
+            if field.name() == "row_id" {
+                new_fields.push(field.as_ref().clone());
+                continue;
+            }
+
+            let user_field_id: FieldId = field
+                .metadata()
+                .get("field_id")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| {
+                    llkv_column_map::error::Error::Internal(format!(
+                        "Field '{}' is missing a valid 'field_id' in its \
+                         metadata.",
+                        field.name()
+                    ))
+                })?;
+
+            let lfid = lfid_for(self.table_id, user_field_id);
+            let mut new_metadata = field.metadata().clone();
+            let lfid_val: u64 = lfid.into();
+            new_metadata.insert("field_id".to_string(), lfid_val.to_string());
+
+            let new_field =
+                Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                    .with_metadata(new_metadata);
+            new_fields.push(new_field);
+        }
+
+        let new_schema = Arc::new(Schema::new(new_fields));
+        let namespaced_batch = RecordBatch::try_new(new_schema, batch.columns().to_vec())?;
+        self.store.append(&namespaced_batch)
     }
 
-    // ---------- sys_catalog: wiring ----------
+    /// Stream a single projected column as a sequence of RecordBatches.
+    ///
+    /// - Avoids `concat` and large materializations.
+    /// - Uses the same filter machinery as the old `scan` to produce
+    ///   `row_ids`.
+    /// - Splits `row_ids` into fixed-size windows and gathers rows per
+    ///   window to form a small `RecordBatch` that is sent to `on_batch`.
+    ///
+    /// Notes:
+    /// - Currently supports exactly 1 projected column. This avoids
+    ///   cross-column chunk alignment problems without changing
+    ///   column-map APIs. We can generalize once a chunk-aligned
+    ///   multi-column scan is exposed upstream.
+    pub fn scan_stream<'a, F>(
+        &self,
+        projection_col: FieldId,
+        filter: &Filter<'a, FieldId>,
+        mut on_batch: F,
+    ) -> Result<(), TableError>
+    where
+        F: FnMut(RecordBatch),
+    {
+        let filter_lfid = lfid_for(self.table_id, filter.field_id);
+        let dtype = self.store.data_type(filter_lfid)?;
 
-    /// Return a lightweight SysCatalog handle bound to this table's ColumnStore.
+        // Build row_ids using the typed predicate path.
+        if matches!(dtype, DataType::Float64 | DataType::Float32) {
+            return Err(TableError::Internal(
+                "Filtering on float columns is not supported".to_string(),
+            ));
+        }
+
+        let row_ids = llkv_column_map::with_integer_arrow_type!(
+            dtype.clone(),
+            |ArrowTy| collect_matching_row_ids::<ArrowTy, P>(&self.store, filter_lfid, &filter.op),
+            Err(TableError::Internal(format!(
+                "Filtering on type {:?} is not supported",
+                dtype
+            ))),
+        )?;
+
+        // If nothing matches, emit nothing.
+        if row_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Prepare schema for the single projected column.
+        let proj_lfid = lfid_for(self.table_id, projection_col);
+        let proj_dtype = self.store.data_type(proj_lfid)?;
+        let proj_field = Field::new(projection_col.to_string(), proj_dtype.clone(), true);
+        let out_schema = Arc::new(Schema::new(vec![proj_field]));
+
+        // Stream in fixed-size windows of row_ids.
+        let mut start = 0usize;
+        while start < row_ids.len() {
+            let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
+            let window = &row_ids[start..end];
+
+            // Gather only this window's rows for the projected column.
+            let col = self.store.gather_rows(proj_lfid, window)?;
+
+            let batch = RecordBatch::try_new(out_schema.clone(), vec![col])?;
+            on_batch(batch);
+
+            start = end;
+        }
+
+        Ok(())
+    }
+
     #[inline]
-    pub fn catalog(&self) -> SysCatalog<'_> {
+    pub fn catalog(&self) -> SysCatalog<'_, P> {
         SysCatalog::new(&self.store)
     }
 
-    /// Convenience: write this table's meta into the system catalog.
     #[inline]
     pub fn put_table_meta(&self, meta: &TableMeta) {
         debug_assert_eq!(meta.table_id, self.table_id);
         self.catalog().put_table_meta(meta);
     }
 
-    /// Convenience: read this table’s meta from the catalog.
     #[inline]
     pub fn get_table_meta(&self) -> Option<TableMeta> {
         self.catalog().get_table_meta(self.table_id)
     }
 
-    /// Convenience: add/update a column’s metadata in the catalog for this table.
     #[inline]
     pub fn put_col_meta(&self, meta: &ColMeta) {
         self.catalog().put_col_meta(self.table_id, meta);
     }
 
-    /// Convenience: batch fetch column metadata for this table.
     #[inline]
-    pub fn get_cols_meta(&self, col_ids: &[u32]) -> Vec<Option<ColMeta>> {
+    pub fn get_cols_meta(&self, col_ids: &[FieldId]) -> Vec<Option<ColMeta>> {
         self.catalog().get_cols_meta(self.table_id, col_ids)
     }
 
-    /// Arrow-ish schema for this table (from the catalog).
-    #[inline]
-    pub fn schema(&self) -> Option<Schema> {
-        self.catalog().schema(self.table_id)
-    }
-
-    // ---------- ingest / scans ----------
-
-    /// Row-based ingest. Each row contains (field_id -> value).
-    /// We map to per-column `Put` batches and call append_many.
-    ///
-    /// Additionally, we write to the per-table presence column once per row
-    /// (value is empty), enabling efficient "universe" scans and NOT queries.
-    pub fn insert_many(&self, rows: &[RowPatch]) {
-        if rows.is_empty() {
-            return;
-        }
-
-        // FieldId -> Vec<(key, val)>
-        #[allow(clippy::type_complexity)] // TODO: Alias type
-        let mut by_col: HashMap<LogicalFieldId, Vec<(Cow<[u8]>, Cow<[u8]>)>> = HashMap::new();
-
-        for (row_id, cols) in rows.iter() {
-            let key = row_key_bytes(*row_id);
-
-            // presence marker (empty value)
-            by_col
-                .entry(self.presence_lfid())
-                .or_default()
-                .push((Cow::Owned(key.clone()), Cow::Borrowed(b"")));
-
-            for (fid, (_index_key, col_in)) in cols {
-                // Ignoring _index_key for now (no secondary indexes).
-                by_col
-                    .entry(self.lfid(*fid))
-                    .or_default()
-                    .push((Cow::Owned(key.clone()), col_in.clone()));
-            }
-        }
-
-        let puts: Vec<Put> = by_col
-            .into_iter()
-            .map(|(field_id, items)| Put { field_id, items })
-            .collect();
-
-        let opts = AppendOptions {
-            mode: ValueMode::Auto,
-            segment_max_entries: self.cfg.segment_max_entries,
-            segment_max_bytes: self.cfg.segment_max_bytes,
-            last_write_wins_in_batch: self.cfg.last_write_wins_in_batch,
-        };
-
-        self.store.append_many(puts, opts);
-    }
-
-    /// Scan rows by a row-id range, projecting a set of columns.
-    ///
-    /// Semantics: rows appear if they have a value in the driver
-    /// column. Choose `driver_fid` with wide coverage (e.g., PK or
-    /// common column).
-    ///
-    /// For each row, projected columns are fetched via `get_many_projected`.
-    pub fn scan_by_row_id_range<F>(
-        &self,
-        driver_fid: FieldId,
-        lo: Bound<RowId>,
-        hi: Bound<RowId>,
-        project: &[FieldId],
-        page: usize,
-        mut on_row: F,
-    ) where
-        F: FnMut(RowId, Vec<Option<Vec<u8>>>),
-    {
-        if page == 0 {
-            return;
-        }
-
-        let mut after: Option<Vec<u8>> = match lo {
-            Bound::Unbounded => None,
-            Bound::Included(x) => Some(row_key_bytes(x)),
-            Bound::Excluded(x) => Some(row_key_bytes(x)),
-        };
-
-        loop {
-            // Backing storage for &[u8] bounds.
-
-            // TODO: Clean up or wire up
-            #[allow(unused_assignments)]
-            let mut lo_buf: Option<Vec<u8>> = None;
-
-            // TODO: Clean up or wire up
-            #[allow(unused_assignments)]
-            let mut hi_buf: Option<Vec<u8>> = None;
-
-            let lo_bound: Bound<&[u8]> = match (&after, lo) {
-                (None, Bound::Unbounded) => Bound::Unbounded,
-                (None, Bound::Included(x)) => {
-                    lo_buf = Some(row_key_bytes(x));
-                    Bound::Included(lo_buf.as_ref().unwrap().as_slice())
-                }
-                (None, Bound::Excluded(x)) => {
-                    lo_buf = Some(row_key_bytes(x));
-                    Bound::Excluded(lo_buf.as_ref().unwrap().as_slice())
-                }
-                (Some(k), _) => {
-                    lo_buf = Some(k.clone());
-                    Bound::Excluded(lo_buf.as_ref().unwrap().as_slice())
-                }
-            };
-
-            let hi_bound: Bound<&[u8]> = match hi {
-                Bound::Unbounded => Bound::Unbounded,
-                Bound::Included(x) => {
-                    hi_buf = Some(row_key_bytes(x));
-                    Bound::Included(hi_buf.as_ref().unwrap().as_slice())
-                }
-                Bound::Excluded(x) => {
-                    hi_buf = Some(row_key_bytes(x));
-                    Bound::Excluded(hi_buf.as_ref().unwrap().as_slice())
-                }
-            };
-
-            let it = match self.store.scan_values_lww(
-                self.lfid(driver_fid),
-                ValueScanOpts {
-                    order_by: OrderBy::Key,
-                    dir: Direction::Forward,
-                    lo: lo_bound,
-                    hi: hi_bound,
-                    prefix: None,
-                    bucket_prefix_len: 2,
-                    // 16 minimizes head-tie fallbacks inside column-map.
-                    head_tag_len: 16,
-                    frame_predicate: None,
-                },
-            ) {
-                Ok(it) => it,
-                Err(ScanError::NoActiveSegments) => break,
-                Err(e) => panic!("scan init error: {:?}", e),
-            };
-
-            // Own the keys for this page and keep them alive while we query.
-            let mut keys: Vec<Vec<u8>> = Vec::with_capacity(page);
-            let mut last_key: Option<Vec<u8>> = None;
-
-            for item in it.take(page) {
-                last_key = Some(item.key.clone());
-                keys.push(item.key);
-            }
-
-            if keys.is_empty() {
-                break;
-            }
-
-            // Build shared keyset & fid list for get_many_projected.
-            let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-            let fids: Vec<LogicalFieldId> = project.iter().map(|fid| self.lfid(*fid)).collect();
-
-            let results = self.store.get_many_projected(&fids, &key_refs);
-
-            // Emit rows in the same order as `keys`.
-            for (i, key) in keys.iter().enumerate() {
-                let rid = parse_row_id(key);
-                let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(project.len());
-
-                for col_cells in results.iter().take(project.len()) {
-                    let owned = col_cells[i].as_ref().map(value_slice_bytes);
-                    row.push(owned);
-                }
-
-                on_row(rid, row);
-            }
-
-            after = last_key;
-        }
-    }
-
-    /// Stream (row_id, value) pairs for one column ordered by VALUE.
-    /// Efficient due to segment-local order + heads in column-map.
-    pub fn stream_column_values<F>(&self, fid: FieldId, dir: Direction, page: usize, mut on_item: F)
-    where
-        F: FnMut(RowId, Vec<u8>),
-    {
-        if page == 0 {
-            return;
-        }
-
-        let mut cursor_v: Option<Vec<u8>> = None;
-
-        loop {
-            // TODO: Clean up or wire up
-            #[allow(unused_assignments)]
-            let mut lo_buf: Option<Vec<u8>> = None;
-
-            // TODO: Clean up or wire up
-            #[allow(unused_assignments)]
-            let mut hi_buf: Option<Vec<u8>> = None;
-
-            let (lo_bound, hi_bound): (Bound<&[u8]>, Bound<&[u8]>) = match dir {
-                Direction::Forward => {
-                    let lo = match cursor_v.as_deref() {
-                        None => Bound::Unbounded,
-                        Some(v) => {
-                            lo_buf = Some(v.to_vec());
-                            Bound::Excluded(lo_buf.as_ref().unwrap().as_slice())
-                        }
-                    };
-                    (lo, Bound::Unbounded)
-                }
-                Direction::Reverse => {
-                    let hi = match cursor_v.as_deref() {
-                        None => Bound::Unbounded,
-                        Some(v) => {
-                            hi_buf = Some(v.to_vec());
-                            Bound::Excluded(hi_buf.as_ref().unwrap().as_slice())
-                        }
-                    };
-                    (Bound::Unbounded, hi)
-                }
-            };
-
-            let it = match self.store.scan_values_lww(
-                self.lfid(fid),
-                ValueScanOpts {
-                    order_by: OrderBy::Value,
-                    dir,
-                    lo: lo_bound,
-                    hi: hi_bound,
-                    prefix: None,
-                    bucket_prefix_len: 2,
-                    // 16 minimizes tag-ties across segments.
-                    head_tag_len: 16,
-                    frame_predicate: None,
-                },
-            ) {
-                Ok(it) => it,
-                Err(ScanError::NoActiveSegments) => break,
-                Err(e) => panic!("scan init error (value-ordered): {:?}", e),
-            };
-
-            let mut took = 0usize;
-
-            for item in it.take(page) {
-                let rid = parse_row_id(item.key.as_slice());
-                let a = item.value.start() as usize;
-                let b = item.value.end() as usize;
-
-                // Keep Arc alive; avoid slicing from a temporary.
-                let data_arc = item.value.data();
-                let data = data_arc.as_ref();
-                let v = data[a..b].to_vec();
-
-                cursor_v = Some(v.clone());
-                on_item(rid, v);
-                took += 1;
-            }
-
-            if took == 0 {
-                break;
-            }
-        }
-    }
-
-    /// Stream all row ids present in this table (by scanning the presence column by KEY).
-    pub fn stream_all_row_ids(&self) -> xchan::Receiver<RowId> {
-        let (tx, rx) = xchan::unbounded();
-        let it = match self.store.scan_values_lww(
-            self.presence_lfid(),
-            ValueScanOpts {
-                order_by: OrderBy::Key,
-                dir: Direction::Forward,
-                lo: Bound::Unbounded,
-                hi: Bound::Unbounded,
-                prefix: None,
-                bucket_prefix_len: 2,
-                head_tag_len: 16,
-                frame_predicate: None,
-            },
-        ) {
-            Ok(it) => it,
-            Err(_) => return rx, // empty stream if column missing / no segments
-        };
-
-        // Fill synchronously; iterator isn't Send.
-        for item in it {
-            let rid = parse_row_id(item.key.as_slice());
-            if tx.send(rid).is_err() {
-                break;
-            }
-        }
-        drop(tx);
-        rx
-    }
-
-    /// Scan rows using an expression over column values (by value order),
-    /// then project the requested columns.
-    pub fn scan_expr<F>(
-        &self,
-        expr: &Expr<'_, FieldId>,
-        projection: &[FieldId],
-        mut on_row: F,
-    ) -> Result<(), CmError>
-    where
-        F: FnMut(RowId, Vec<Option<Vec<u8>>>),
-    {
-        let rx_opt = self.get_row_id_stream(expr)?;
-        let Some(rx) = rx_opt else {
-            return Ok(());
-        };
-
-        // Drain all row ids from the stream.
-        let mut rids: Vec<RowId> = Vec::new();
-        for rid in rx {
-            rids.push(rid);
-        }
-        if rids.is_empty() {
-            return Ok(());
-        }
-
-        // Shared keyset for this projection batch.
-        let keys: Vec<Vec<u8>> = rids.iter().map(|r| row_key_bytes(*r)).collect();
-        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-        let fids: Vec<LogicalFieldId> = projection.iter().map(|fid| self.lfid(*fid)).collect();
-
-        let results = self.store.get_many_projected(&fids, &key_refs);
-
-        // Emit per-row, preserving rids order.
-        for (i, rid) in rids.into_iter().enumerate() {
-            let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(projection.len());
-
-            for col_cells in results.iter().take(projection.len()) {
-                let owned = col_cells[i].as_ref().map(value_slice_bytes);
-                row.push(owned);
-            }
-
-            on_row(rid, row);
-        }
-        Ok(())
-    }
-
-    /// Build a stream (receiver) of row ids that satisfy the expression.
-    /// Uses value-ordered scans per predicate; AND/OR combine via sets.
-    pub fn get_row_id_stream<'b>(
-        &'b self,
-        expr: &Expr<'b, FieldId>,
-    ) -> Result<Option<xchan::Receiver<RowId>>, CmError> {
-        match expr {
-            Expr::Pred(filter) => self.get_stream_for_predicate(filter),
-            Expr::And(children) => {
-                // Collect child streams.
-                let mut streams: Vec<xchan::Receiver<RowId>> = Vec::new();
-                for ch in children {
-                    if let Some(rx) = self.get_row_id_stream(ch)? {
-                        streams.push(rx);
-                    }
-                }
-
-                // No predicates? return closed empty stream.
-                if streams.is_empty() {
-                    let (_tx, rx) = xchan::unbounded();
-                    return Ok(Some(rx));
-                }
-
-                // Combine via intersection in a worker thread.
-                let (tx, rx) = xchan::unbounded();
-                std::thread::spawn(move || {
-                    let first: HashSet<RowId> = streams.remove(0).into_iter().collect();
-                    let mut acc = first;
-                    for s in streams {
-                        if acc.is_empty() {
-                            break;
-                        }
-                        let set: HashSet<RowId> = s.into_iter().collect();
-                        acc.retain(|rid| set.contains(rid));
-                    }
-                    for rid in acc {
-                        if tx.send(rid).is_err() {
-                            break;
-                        }
-                    }
-                });
-                Ok(Some(rx))
-            }
-            Expr::Or(children) => {
-                let mut streams: Vec<xchan::Receiver<RowId>> = Vec::new();
-                for ch in children {
-                    if let Some(rx) = self.get_row_id_stream(ch)? {
-                        streams.push(rx);
-                    }
-                }
-                let (tx, rx) = xchan::unbounded();
-                std::thread::spawn(move || {
-                    let mut acc: HashSet<RowId> = HashSet::new();
-                    for s in streams {
-                        for rid in s {
-                            acc.insert(rid);
-                        }
-                    }
-                    for rid in acc {
-                        if tx.send(rid).is_err() {
-                            break;
-                        }
-                    }
-                });
-                Ok(Some(rx))
-            }
-            Expr::Not(inner) => {
-                // NOT: (Universe \ Matches(inner)).
-                // Universe = presence column scan by KEY.
-                let universe_rx = self.stream_all_row_ids();
-
-                // Collect inner matches into a set.
-                let inner_rx_opt = self.get_row_id_stream(inner)?;
-                let Some(inner_rx) = inner_rx_opt else {
-                    // NOT over empty -> all rows (i.e., Universe).
-                    return Ok(Some(universe_rx));
-                };
-                let inner_set: HashSet<RowId> = inner_rx.into_iter().collect();
-
-                // Filter the universe by membership.
-                let (tx, rx) = xchan::unbounded();
-                std::thread::spawn(move || {
-                    for rid in universe_rx {
-                        if !inner_set.contains(&rid) && tx.send(rid).is_err() {
-                            break;
-                        }
-                    }
-                });
-                Ok(Some(rx))
-            }
-        }
-    }
-
-    /// Single-predicate stream using a value-ordered scan on the column.
-    fn get_stream_for_predicate<'b>(
-        &'b self,
-        filter: &Filter<'b, FieldId>,
-    ) -> Result<Option<xchan::Receiver<RowId>>, CmError> {
-        // Helper that runs a scan with lo/hi bounds and an optional value predicate.
-        #[allow(clippy::type_complexity)] // TODO: Alias complex type
-        let scan_stream = |fid: LogicalFieldId,
-                           lo: Bound<&[u8]>,
-                           hi: Bound<&[u8]>,
-                           mut keep: Option<Box<dyn FnMut(&[u8]) -> bool + 'b>>|
-         -> Result<Option<xchan::Receiver<RowId>>, CmError> {
-            let it = match self.store.scan_values_lww(
-                fid,
-                ValueScanOpts {
-                    order_by: OrderBy::Value,
-                    dir: Direction::Forward,
-                    lo,
-                    hi,
-                    prefix: None,
-                    bucket_prefix_len: 2,
-                    head_tag_len: 16,
-                    frame_predicate: None,
-                },
-            ) {
-                Ok(it) => it,
-                Err(ScanError::NoActiveSegments) => {
-                    return Ok(None);
-                }
-                Err(ScanError::ColumnMissing(_)) => {
-                    return Ok(None);
-                }
-                Err(e) => return Err(CmError::ScanInit(format!("{:?}", e))),
-            };
-
-            // Fill the channel synchronously; ValueScan isn't Send.
-            let (tx, rx) = xchan::unbounded();
-            let mut started = false;
-
-            for item in it {
-                let rid = parse_row_id(item.key.as_slice());
-                let a = item.value.start() as usize;
-                let b = item.value.end() as usize;
-
-                // Hold Arc to extend lifetime while we slice.
-                let data_arc = item.value.data();
-                let data = data_arc.as_ref();
-                let v = &data[a..b];
-
-                if let Some(ref mut predicate) = keep {
-                    // For prefix scans we can early-exit once we leave the prefix region.
-                    if !predicate(v) {
-                        if started {
-                            break;
-                        } else {
-                            continue;
-                        }
-                    }
-                }
-
-                started = true;
-                if tx.send(rid).is_err() {
-                    break;
-                }
-            }
-            drop(tx);
-            Ok(Some(rx))
-        };
-
-        match &filter.op {
-            // Equality
-            Operator::Equals(val) => scan_stream(
-                self.lfid(filter.field_id),
-                Bound::Included(*val),
-                Bound::Included(*val),
-                None,
-            ),
-
-            // Half-open range
-            Operator::Range { lower, upper } => {
-                let lo = match lower {
-                    Bound::Unbounded => Bound::Unbounded,
-                    Bound::Included(b) => Bound::Included(*b),
-                    Bound::Excluded(b) => Bound::Excluded(*b),
-                };
-                let hi = match upper {
-                    Bound::Unbounded => Bound::Unbounded,
-                    Bound::Included(b) => Bound::Included(*b),
-                    Bound::Excluded(b) => Bound::Excluded(*b),
-                };
-                scan_stream(self.lfid(filter.field_id), lo, hi, None)
-            }
-
-            // Simple comparisons mapped to ranges
-            Operator::GreaterThan(b) => scan_stream(
-                self.lfid(filter.field_id),
-                Bound::Excluded(*b),
-                Bound::Unbounded,
-                None,
-            ),
-            Operator::GreaterThanOrEquals(b) => scan_stream(
-                self.lfid(filter.field_id),
-                Bound::Included(*b),
-                Bound::Unbounded,
-                None,
-            ),
-            Operator::LessThan(b) => scan_stream(
-                self.lfid(filter.field_id),
-                Bound::Unbounded,
-                Bound::Excluded(*b),
-                None,
-            ),
-            Operator::LessThanOrEquals(b) => scan_stream(
-                self.lfid(filter.field_id),
-                Bound::Unbounded,
-                Bound::Included(*b),
-                None,
-            ),
-
-            // Set membership: union of equals scans.
-            Operator::In(arr) => {
-                let mut streams: Vec<xchan::Receiver<RowId>> = Vec::new();
-                for v in *arr {
-                    if let Some(rx) = self.get_stream_for_predicate(&Filter {
-                        field_id: filter.field_id,
-                        op: Operator::Equals(v),
-                    })? {
-                        streams.push(rx);
-                    }
-                }
-                if streams.is_empty() {
-                    return Ok(None);
-                }
-                let (tx, rx) = xchan::unbounded();
-                std::thread::spawn(move || {
-                    let mut seen: HashSet<RowId> = HashSet::new();
-                    for s in streams {
-                        for rid in s {
-                            if seen.insert(rid) && tx.send(rid).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                });
-                Ok(Some(rx))
-            }
-
-            // Prefix: tight bound [prefix, next_prefix_upper(prefix))
-            Operator::StartsWith(prefix) => {
-                let upper_buf = next_prefix_upper(prefix);
-                let hi = match upper_buf.as_ref() {
-                    Some(u) => Bound::Excluded(u.as_slice()),
-                    None => Bound::Unbounded,
-                };
-                // If hi is Unbounded (all 0xFF), add a predicate to short-circuit once we pass.
-                #[allow(clippy::type_complexity)] // TODO: Alias complex type
-                let pred: Option<Box<dyn FnMut(&[u8]) -> bool + 'b>> = if upper_buf.is_none() {
-                    let p = *prefix;
-                    Some(Box::new(move |v: &[u8]| v.starts_with(p)))
-                } else {
-                    None
-                };
-                scan_stream(
-                    self.lfid(filter.field_id),
-                    Bound::Included(*prefix),
-                    hi,
-                    pred,
-                )
-            }
-
-            // EndsWith / Contains: full column scan + predicate (cannot bound in value-order).
-            Operator::EndsWith(suf) => {
-                let suf = *suf;
-                scan_stream(
-                    self.lfid(filter.field_id),
-                    Bound::Unbounded,
-                    Bound::Unbounded,
-                    Some(Box::new(move |v: &[u8]| v.ends_with(suf))),
-                )
-            }
-            Operator::Contains(sub) => {
-                let sub = *sub;
-                scan_stream(
-                    self.lfid(filter.field_id),
-                    Bound::Unbounded,
-                    Bound::Unbounded,
-                    Some(Box::new(move |v: &[u8]| {
-                        v.windows(sub.len()).any(|w| w == sub)
-                    })),
-                )
-            }
-        }
-    }
-
-    /// Access to the underlying store for power users.
-    pub fn store(&self) -> &ColumnStore<MemPager> {
+    pub fn store(&self) -> &ColumnStore<P> {
         &self.store
+    }
+}
+
+pub struct ColumnData {
+    pub data: ArrayRef,
+    pub data_type: DataType,
+}
+
+// FIX: Move helper methods into a trait to satisfy Rust's orphan rule
+pub trait ColumnStoreTestExt {
+    fn get_column_for_test(&self, field_id: LogicalFieldId) -> Result<ColumnData, TableError>;
+}
+
+impl ColumnStoreTestExt for ColumnStore<MemPager> {
+    fn get_column_for_test(&self, field_id: LogicalFieldId) -> Result<ColumnData, TableError> {
+        struct ColVisitor {
+            chunks: Vec<ArrayRef>,
+            data_type: Option<DataType>,
+        }
+        impl scan::PrimitiveVisitor for ColVisitor {
+            fn u64_chunk(&mut self, a: &UInt64Array) {
+                self.data_type.get_or_insert(DataType::UInt64);
+                self.chunks.push(Arc::new(a.clone()));
+            }
+            fn i32_chunk(&mut self, a: &Int32Array) {
+                self.data_type.get_or_insert(DataType::Int32);
+                self.chunks.push(Arc::new(a.clone()));
+            }
+            // FIX: The trait `PrimitiveVisitor` does not have a `binary_chunk`
+            // method. This must be handled by downcasting a generic
+            // `array_chunk` if needed, or by adding the method to the trait in
+            // `column-map`. For now, we remove it to allow compilation.
+            // fn binary_chunk(&mut self, a: &arrow::array::BinaryArray) {
+            //     self.data_type.get_or_insert(DataType::Binary);
+            //     self.chunks.push(Arc::new(a.clone()));
+            // }
+        }
+        impl scan::PrimitiveWithRowIdsVisitor for ColVisitor {}
+        impl scan::PrimitiveSortedVisitor for ColVisitor {}
+        impl scan::PrimitiveSortedWithRowIdsVisitor for ColVisitor {}
+
+        let mut visitor = ColVisitor {
+            chunks: vec![],
+            data_type: None,
+        };
+        self.scan(field_id, Default::default(), &mut visitor)?;
+
+        if visitor.chunks.is_empty() {
+            return Err(TableError::Internal(
+                "Column not found or is empty".to_string(),
+            ));
+        }
+
+        // NOTE: This helper still concatenates for tests. Production code
+        // uses streaming via `scan_stream`.
+        let refs: Vec<&dyn Array> = visitor.chunks.iter().map(|c| c.as_ref()).collect();
+        let combined = arrow::compute::concat(&refs)?;
+
+        Ok(ColumnData {
+            data: combined,
+            data_type: visitor.data_type.unwrap(),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ColumnInput;
-    use std::borrow::Cow;
+    use crate::sys_catalog::CATALOG_TID;
+    use crate::types::RowId;
+    use arrow::array::{
+        BinaryArray, Float64Array, Int16Array, Int32Array, UInt8Array, UInt32Array, UInt64Array,
+    };
+    use arrow::compute::{cast, max, min, sum, unary};
     use std::collections::HashMap;
-    use std::ops::Bound;
 
-    /// Build a single row patch from simple (field, value) pairs.
-    #[inline]
-    fn mk_row(
-        rid: RowId,
-        kv: &[(FieldId, ColumnInput<'static>)],
-    ) -> (RowId, HashMap<FieldId, (u64, ColumnInput<'static>)>) {
-        let mut m = HashMap::new();
-        for (fid, v) in kv.iter() {
-            m.insert(*fid, (0u64, v.clone()));
-        }
-        (rid, m)
+    fn setup_test_table() -> Table {
+        let pager = Arc::new(MemPager::default());
+        setup_test_table_with_pager(&pager)
     }
 
-    /// String helper: own bytes to avoid 'static lifetime requirements.
-    #[inline]
-    fn s(x: &str) -> ColumnInput<'static> {
-        Cow::Owned(x.as_bytes().to_vec())
+    fn setup_test_table_with_pager(pager: &Arc<MemPager>) -> Table {
+        let table = Table::new(1, Arc::clone(pager)).unwrap();
+        const COL_A_U64: FieldId = 10;
+        const COL_B_BIN: FieldId = 11;
+        const COL_C_I32: FieldId = 12;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_A_U64.to_string(),
+            )])),
+            Field::new("b_bin", DataType::Binary, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_B_BIN.to_string(),
+            )])),
+            Field::new("c_i32", DataType::Int32, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_C_I32.to_string(),
+            )])),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(UInt64Array::from(vec![100, 200, 300, 200])),
+                Arc::new(BinaryArray::from(vec![
+                    b"foo" as &[u8],
+                    b"bar",
+                    b"baz",
+                    b"qux",
+                ])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 20])),
+            ],
+        )
+        .unwrap();
+
+        table.append(&batch).unwrap();
+        table
     }
 
-    #[inline]
-    fn be_u64(x: u64) -> Vec<u8> {
-        x.to_be_bytes().to_vec()
-    }
-
-    #[inline]
-    fn from_be_u64(b: &[u8]) -> u64 {
-        let mut a = [0u8; 8];
-        a.copy_from_slice(&b[..8]);
-        u64::from_be_bytes(a)
-    }
-
-    /// u64 helper: store as big-endian bytes (lex order == numeric).
-    #[inline]
-    fn be64_bytes(x: u64) -> ColumnInput<'static> {
-        Cow::Owned(x.to_be_bytes().to_vec())
-    }
-
-    fn mk_rowpatch_u64(
-        rid: RowId,
-        pairs: &[(FieldId, u64)],
-    ) -> (RowId, HashMap<FieldId, (u64, ColumnInput<'static>)>) {
-        let mut m = HashMap::new();
-        for &(fid, n) in pairs {
-            m.insert(fid, (0u64, Cow::Owned(be_u64(n))));
-        }
-        (rid, m)
+    /// Helper to collect a streamed column into a Vec<Option<T>> using a
+    /// provided extractor function. Avoids concat in tests while keeping
+    /// assertions simple.
+    fn collect_streamed_values<T, FExtract>(
+        table: &Table,
+        proj: FieldId,
+        filter: &Filter<'_, FieldId>,
+        mut extract: FExtract,
+    ) -> Vec<Option<T>>
+    where
+        T: Copy,
+        FExtract: FnMut(&RecordBatch) -> Vec<Option<T>>,
+    {
+        let mut out = Vec::<Option<T>>::new();
+        table
+            .scan_stream(proj, filter, |b| {
+                out.extend(extract(&b));
+            })
+            .unwrap();
+        out
     }
 
     #[test]
-    fn insert_many_strings_readable() {
-        let table = Table::new(1, TableCfg::default());
+    fn table_new_rejects_reserved_table_id() {
+        let result = Table::new(CATALOG_TID, Arc::new(MemPager::default()));
+        assert!(matches!(
+            result,
+            Err(TableError::ReservedTableId(id)) if id == CATALOG_TID
+        ));
+    }
 
-        const COL_NAME: FieldId = 11;
-        const COL_CITY: FieldId = 12;
-        const COL_ROLE: FieldId = 13;
+    #[test]
+    fn test_scan_with_u64_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
 
-        let rows: Vec<RowPatch> = vec![
-            mk_row(
-                1,
-                &[
-                    (COL_NAME, s("alice")),
-                    (COL_CITY, s("austin")),
-                    (COL_ROLE, s("dev")),
-                ],
-            ),
-            mk_row(
-                2,
-                &[
-                    (COL_NAME, s("bob")),
-                    (COL_CITY, s("boston")),
-                    (COL_ROLE, s("pm")),
-                ],
-            ),
-            mk_row(
-                3,
-                &[
-                    (COL_NAME, s("carol")),
-                    (COL_CITY, s("chicago")),
-                    (COL_ROLE, s("qa")),
-                ],
-            ),
-        ];
-
-        table.insert_many(&rows);
-
-        let mut got: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
-        table.scan_by_row_id_range(
-            COL_NAME,
-            Bound::Excluded(0),
-            Bound::Included(3),
-            &[COL_NAME, COL_CITY, COL_ROLE],
-            2,
-            |rid, cols| got.push((rid, cols)),
-        );
-
-        assert_eq!(got.len(), 3);
-
-        let to_s = |o: &Option<Vec<u8>>| -> String {
-            String::from_utf8(o.as_ref().unwrap().clone()).unwrap()
+        let filter = Filter {
+            field_id: COL_A_U64,
+            op: Operator::Equals(200.into()),
         };
 
-        assert_eq!(got[0].0, 1);
-        assert_eq!(to_s(&got[0].1[0]), "alice");
-        assert_eq!(to_s(&got[0].1[1]), "austin");
-        assert_eq!(to_s(&got[0].1[2]), "dev");
-
-        assert_eq!(got[1].0, 2);
-        assert_eq!(to_s(&got[1].1[0]), "bob");
-        assert_eq!(to_s(&got[1].1[1]), "boston");
-        assert_eq!(to_s(&got[1].1[2]), "pm");
-
-        assert_eq!(got[2].0, 3);
-        assert_eq!(to_s(&got[2].1[0]), "carol");
-        assert_eq!(to_s(&got[2].1[1]), "chicago");
-        assert_eq!(to_s(&got[2].1[2]), "qa");
+        let vals = collect_streamed_values::<i32, _>(&table, COL_C_I32, &filter, |b| {
+            let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..a.len())
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(vals, vec![Some(20), Some(20)]);
     }
 
     #[test]
-    fn insert_many_u64_readable() {
-        let table = Table::new(1, TableCfg::default());
+    fn test_table_reopen_with_shared_pager() {
+        const TABLE_ALPHA: TableId = 42;
+        const TABLE_BETA: TableId = 43;
+        const TABLE_GAMMA: TableId = 44;
+        const COL_ALPHA_U64: FieldId = 100;
+        const COL_ALPHA_I32: FieldId = 101;
+        const COL_ALPHA_U32: FieldId = 102;
+        const COL_ALPHA_I16: FieldId = 103;
+        const COL_BETA_U64: FieldId = 200;
+        const COL_BETA_U8: FieldId = 201;
+        const COL_GAMMA_I16: FieldId = 300;
 
-        const COL_A: FieldId = 21; // driver
-        const COL_B: FieldId = 22; // numeric payload
-        const COL_C: FieldId = 23; // numeric payload (sparse)
+        let pager = Arc::new(MemPager::default());
 
-        let rows: Vec<RowPatch> = (1..=5)
-            .map(|rid| {
-                let mut cols = vec![
-                    (COL_A, be64_bytes(10 + rid)),
-                    (COL_B, be64_bytes(100 + rid)),
-                ];
-                if rid % 2 == 1 {
-                    cols.push((COL_C, be64_bytes(1000 + rid)));
+        let alpha_rows: Vec<RowId> = vec![1, 2, 3, 4];
+        let alpha_vals_u64: Vec<u64> = vec![10, 20, 30, 40];
+        let alpha_vals_i32: Vec<i32> = vec![-5, 15, 25, 35];
+        let alpha_vals_u32: Vec<u32> = vec![7, 11, 13, 17];
+        let alpha_vals_i16: Vec<i16> = vec![-2, 4, -6, 8];
+
+        let beta_rows: Vec<u64> = vec![101, 102, 103];
+        let beta_vals_u64: Vec<u64> = vec![900, 901, 902];
+        let beta_vals_u8: Vec<u8> = vec![1, 2, 3];
+
+        let gamma_rows: Vec<u64> = vec![501, 502];
+        let gamma_vals_i16: Vec<i16> = vec![123, -321];
+
+        // First session: create tables and write data.
+        {
+            let table = Table::new(TABLE_ALPHA, Arc::clone(&pager)).unwrap();
+            let schema =
+                Arc::new(Schema::new(vec![
+                    Field::new("row_id", DataType::UInt64, false),
+                    Field::new("alpha_u64", DataType::UInt64, false).with_metadata(HashMap::from(
+                        [("field_id".to_string(), COL_ALPHA_U64.to_string())],
+                    )),
+                    Field::new("alpha_i32", DataType::Int32, false).with_metadata(HashMap::from([
+                        ("field_id".to_string(), COL_ALPHA_I32.to_string()),
+                    ])),
+                    Field::new("alpha_u32", DataType::UInt32, false).with_metadata(HashMap::from(
+                        [("field_id".to_string(), COL_ALPHA_U32.to_string())],
+                    )),
+                    Field::new("alpha_i16", DataType::Int16, false).with_metadata(HashMap::from([
+                        ("field_id".to_string(), COL_ALPHA_I16.to_string()),
+                    ])),
+                ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt64Array::from(alpha_rows.clone())),
+                    Arc::new(UInt64Array::from(alpha_vals_u64.clone())),
+                    Arc::new(Int32Array::from(alpha_vals_i32.clone())),
+                    Arc::new(UInt32Array::from(alpha_vals_u32.clone())),
+                    Arc::new(Int16Array::from(alpha_vals_i16.clone())),
+                ],
+            )
+            .unwrap();
+            table.append(&batch).unwrap();
+        }
+
+        {
+            let table = Table::new(TABLE_BETA, Arc::clone(&pager)).unwrap();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("row_id", DataType::UInt64, false),
+                Field::new("beta_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
+                    "field_id".to_string(),
+                    COL_BETA_U64.to_string(),
+                )])),
+                Field::new("beta_u8", DataType::UInt8, false).with_metadata(HashMap::from([(
+                    "field_id".to_string(),
+                    COL_BETA_U8.to_string(),
+                )])),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt64Array::from(beta_rows.clone())),
+                    Arc::new(UInt64Array::from(beta_vals_u64.clone())),
+                    Arc::new(UInt8Array::from(beta_vals_u8.clone())),
+                ],
+            )
+            .unwrap();
+            table.append(&batch).unwrap();
+        }
+
+        {
+            let table = Table::new(TABLE_GAMMA, Arc::clone(&pager)).unwrap();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("row_id", DataType::UInt64, false),
+                Field::new("gamma_i16", DataType::Int16, false).with_metadata(HashMap::from([(
+                    "field_id".to_string(),
+                    COL_GAMMA_I16.to_string(),
+                )])),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt64Array::from(gamma_rows.clone())),
+                    Arc::new(Int16Array::from(gamma_vals_i16.clone())),
+                ],
+            )
+            .unwrap();
+            table.append(&batch).unwrap();
+        }
+
+        // Second session: reopen each table and ensure schema and values are intact.
+        {
+            let table = Table::new(TABLE_ALPHA, Arc::clone(&pager)).unwrap();
+            let store = table.store();
+
+            let expectations: &[(FieldId, DataType)] = &[
+                (COL_ALPHA_U64, DataType::UInt64),
+                (COL_ALPHA_I32, DataType::Int32),
+                (COL_ALPHA_U32, DataType::UInt32),
+                (COL_ALPHA_I16, DataType::Int16),
+            ];
+
+            for &(col, ref ty) in expectations {
+                let lfid = lfid_for(TABLE_ALPHA, col);
+                assert_eq!(store.data_type(lfid).unwrap(), *ty);
+                let arr = store.gather_rows(lfid, &alpha_rows).unwrap();
+                match ty {
+                    DataType::UInt64 => {
+                        let arr = arr.as_any().downcast_ref::<UInt64Array>().unwrap();
+                        assert_eq!(arr.values(), alpha_vals_u64.as_slice());
+                    }
+                    DataType::Int32 => {
+                        let arr = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+                        assert_eq!(arr.values(), alpha_vals_i32.as_slice());
+                    }
+                    DataType::UInt32 => {
+                        let arr = arr.as_any().downcast_ref::<UInt32Array>().unwrap();
+                        assert_eq!(arr.values(), alpha_vals_u32.as_slice());
+                    }
+                    DataType::Int16 => {
+                        let arr = arr.as_any().downcast_ref::<Int16Array>().unwrap();
+                        assert_eq!(arr.values(), alpha_vals_i16.as_slice());
+                    }
+                    other => panic!("unexpected dtype {other:?}"),
                 }
-                mk_row(rid, &cols)
-            })
-            .collect();
-
-        table.insert_many(&rows);
-
-        let mut got: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
-        table.scan_by_row_id_range(
-            COL_A,
-            Bound::Excluded(0),
-            Bound::Included(5),
-            &[COL_A, COL_B, COL_C],
-            3,
-            |rid, cols| got.push((rid, cols)),
-        );
-
-        assert_eq!(got.len(), 5);
-        for (i, _) in got.iter().enumerate().take(5) {
-            let (rid, cols) = &got[i];
-            let expect = (i as u64) + 1;
-            assert_eq!(*rid, expect);
-
-            let a = from_be_u64(cols[0].as_ref().unwrap());
-            let b = from_be_u64(cols[1].as_ref().unwrap());
-            assert_eq!(a, 10 + expect);
-            assert_eq!(b, 100 + expect);
-
-            if expect % 2 == 1 {
-                let c = from_be_u64(cols[2].as_ref().unwrap());
-                assert_eq!(c, 1000 + expect);
-            } else {
-                assert!(cols[2].is_none());
             }
         }
-    }
 
-    #[test]
-    fn scan_unmatched_range_returns_no_rows_u64() {
-        let cfg = TableCfg::default();
-        let table = Table::new(1, cfg);
+        {
+            let table = Table::new(TABLE_BETA, Arc::clone(&pager)).unwrap();
+            let store = table.store();
 
-        let fid_row: FieldId = 10;
-        let fid_d1: FieldId = 11;
-        let fid_d2: FieldId = 12;
+            let lfid_u64 = lfid_for(TABLE_BETA, COL_BETA_U64);
+            assert_eq!(store.data_type(lfid_u64).unwrap(), DataType::UInt64);
+            let arr_u64 = store.gather_rows(lfid_u64, &beta_rows).unwrap();
+            let arr_u64 = arr_u64.as_any().downcast_ref::<UInt64Array>().unwrap();
+            assert_eq!(arr_u64.values(), beta_vals_u64.as_slice());
 
-        let rows: Vec<RowPatch> = (1..=3)
-            .map(|rid| {
-                mk_rowpatch_u64(rid, &[(fid_row, rid), (fid_d1, rid + 7), (fid_d2, rid + 9)])
-            })
-            .collect();
-        table.insert_many(&rows);
-
-        let mut called = false;
-        table.scan_by_row_id_range(
-            fid_row,
-            Bound::Excluded(10),
-            Bound::Included(20),
-            &[fid_row, fid_d1, fid_d2],
-            8,
-            |_rid, _cols| {
-                called = true;
-            },
-        );
-        assert!(!called, "no rows should be returned");
-    }
-
-    #[test]
-    fn stream_value_order_multi_cols() {
-        let cfg = TableCfg::default();
-        let table = Table::new(1, cfg);
-
-        let fid_row: FieldId = 20; // driver
-        let fid_v1: FieldId = 21; // rid * 10
-        let fid_v2: FieldId = 22; // 500 - rid (reverse baseline)
-        let fid_sparse: FieldId = 23; // multiples of 3, 3000 + rid
-
-        let rows: Vec<RowPatch> = (1..=12)
-            .map(|rid| {
-                let mut pairs = vec![(fid_row, rid), (fid_v1, rid * 10), (fid_v2, 500 - rid)];
-                if rid % 3 == 0 {
-                    pairs.push((fid_sparse, 3000 + rid));
-                }
-                mk_rowpatch_u64(rid, &pairs)
-            })
-            .collect();
-        table.insert_many(&rows);
-
-        // Stream v1 forward: strictly increasing.
-        let mut v1_f: Vec<(RowId, u64)> = Vec::new();
-        table.stream_column_values(fid_v1, Direction::Forward, 4, |rid, v| {
-            v1_f.push((rid, from_be_u64(&v)));
-        });
-        assert_eq!(v1_f.len(), 12);
-        for w in v1_f.windows(2) {
-            assert!(w[0].1 < w[1].1, "v1 must increase forward");
+            let lfid_u8 = lfid_for(TABLE_BETA, COL_BETA_U8);
+            assert_eq!(store.data_type(lfid_u8).unwrap(), DataType::UInt8);
+            let arr_u8 = store.gather_rows(lfid_u8, &beta_rows).unwrap();
+            let arr_u8 = arr_u8.as_any().downcast_ref::<UInt8Array>().unwrap();
+            assert_eq!(arr_u8.values(), beta_vals_u8.as_slice());
         }
 
-        // Stream v2 reverse: strictly decreasing.
-        let mut v2_r: Vec<(RowId, u64)> = Vec::new();
-        table.stream_column_values(fid_v2, Direction::Reverse, 5, |rid, v| {
-            v2_r.push((rid, from_be_u64(&v)));
-        });
-        assert_eq!(v2_r.len(), 12);
-        for w in v2_r.windows(2) {
-            assert!(w[0].1 > w[1].1, "v2 must decrease reverse");
-        }
-
-        // Stream sparse forward: only rid % 3 == 0.
-        let mut sp_f: Vec<(RowId, u64)> = Vec::new();
-        table.stream_column_values(fid_sparse, Direction::Forward, 3, |rid, v| {
-            sp_f.push((rid, from_be_u64(&v)));
-        });
-        assert_eq!(sp_f.len(), 4);
-        assert_eq!(
-            sp_f.iter().map(|x| x.0).collect::<Vec<_>>(),
-            vec![3, 6, 9, 12]
-        );
-        for (i, (_rid, val)) in sp_f.iter().enumerate() {
-            assert_eq!(*val, 3000 + ((i as u64 + 1) * 3));
+        {
+            let table = Table::new(TABLE_GAMMA, Arc::clone(&pager)).unwrap();
+            let store = table.store();
+            let lfid = lfid_for(TABLE_GAMMA, COL_GAMMA_I16);
+            assert_eq!(store.data_type(lfid).unwrap(), DataType::Int16);
+            let arr = store.gather_rows(lfid, &gamma_rows).unwrap();
+            let arr = arr.as_any().downcast_ref::<Int16Array>().unwrap();
+            assert_eq!(arr.values(), gamma_vals_i16.as_slice());
         }
     }
 
     #[test]
-    fn pagination_chunks_are_consistent_u64_multi_proj() {
-        let cfg = TableCfg::default();
-        let table = Table::new(1, cfg);
+    fn test_scan_with_i32_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
 
-        let fid_row: FieldId = 30; // driver
-        let fid_d1: FieldId = 31;
-        let fid_d2: FieldId = 32;
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::Equals(20.into()),
+        };
 
-        let rows: Vec<RowPatch> = (1..=50)
-            .map(|rid| {
-                mk_rowpatch_u64(
-                    rid,
-                    &[(fid_row, rid), (fid_d1, 1000 + rid), (fid_d2, 2000 + rid)],
-                )
-            })
-            .collect();
-        table.insert_many(&rows);
-
-        let mut got: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
-        table.scan_by_row_id_range(
-            fid_row,
-            Bound::Excluded(0),
-            Bound::Included(50),
-            &[fid_row, fid_d1, fid_d2],
-            7,
-            |rid, cols| got.push((rid, cols)),
-        );
-
-        assert_eq!(got.len(), 50);
-        for (i, (rid, cols)) in got.into_iter().enumerate() {
-            let expect = (i as u64) + 1;
-            assert_eq!(rid, expect);
-            assert_eq!(from_be_u64(cols[0].as_ref().unwrap()), expect);
-            assert_eq!(from_be_u64(cols[1].as_ref().unwrap()), 1000 + expect);
-            assert_eq!(from_be_u64(cols[2].as_ref().unwrap()), 2000 + expect);
-        }
+        let vals = collect_streamed_values::<u64, _>(&table, COL_A_U64, &filter, |b| {
+            let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+            (0..a.len())
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(vals, vec![Some(200), Some(200)]);
     }
 
-    use crate::expr::{Expr, Filter, Operator};
+    #[test]
+    fn test_scan_with_greater_than_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::GreaterThan(15.into()),
+        };
+
+        let vals = collect_streamed_values::<u64, _>(&table, COL_A_U64, &filter, |b| {
+            let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+            (0..a.len())
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(vals, vec![Some(200), Some(300), Some(200)]);
+    }
 
     #[test]
-    fn expr_equals_and_range_scan_projects_values() {
-        let table = Table::new(1, TableCfg::default());
+    fn test_scan_with_range_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
 
-        const COL_NAME: FieldId = 101;
-        const COL_CITY: FieldId = 102;
-        const COL_SCORE: FieldId = 103;
-
-        let rows: Vec<RowPatch> = vec![
-            mk_row(
-                1,
-                &[
-                    (COL_NAME, s("alice")),
-                    (COL_CITY, s("austin")),
-                    (COL_SCORE, be64_bytes(10)),
-                ],
-            ),
-            mk_row(
-                2,
-                &[
-                    (COL_NAME, s("bob")),
-                    (COL_CITY, s("boston")),
-                    (COL_SCORE, be64_bytes(20)),
-                ],
-            ),
-            mk_row(
-                3,
-                &[
-                    (COL_NAME, s("carol")),
-                    (COL_CITY, s("chicago")),
-                    (COL_SCORE, be64_bytes(30)),
-                ],
-            ),
-            mk_row(
-                4,
-                &[
-                    (COL_NAME, s("dave")),
-                    (COL_CITY, s("dallas")),
-                    (COL_SCORE, be64_bytes(40)),
-                ],
-            ),
-            mk_row(
-                5,
-                &[
-                    (COL_NAME, s("erin")),
-                    (COL_CITY, s("el paso")),
-                    (COL_SCORE, be64_bytes(50)),
-                ],
-            ),
-            mk_row(
-                6,
-                &[
-                    (COL_NAME, s("frank")),
-                    (COL_CITY, s("fresno")),
-                    (COL_SCORE, be64_bytes(60)),
-                ],
-            ),
-        ];
-        table.insert_many(&rows);
-
-        // WHERE score = 30
-        let key_eq = 30u64.to_be_bytes();
-        let expr_eq = Expr::Pred(Filter {
-            field_id: COL_SCORE,
-            op: Operator::Equals(&key_eq),
-        });
-        let mut got_eq: Vec<(RowId, Vec<Option<Vec<u8>>>)> = Vec::new();
-        table
-            .scan_expr(&expr_eq, &[COL_NAME, COL_CITY], |rid, cols| {
-                got_eq.push((rid, cols));
-            })
-            .unwrap();
-        assert_eq!(got_eq.len(), 1);
-        assert_eq!(got_eq[0].0, 3);
-
-        // WHERE 20 <= score < 50
-        let lo = 20u64.to_be_bytes();
-        let hi = 50u64.to_be_bytes();
-        let expr_rng = Expr::Pred(Filter {
-            field_id: COL_SCORE,
+        let filter = Filter {
+            field_id: COL_A_U64,
             op: Operator::Range {
-                lower: Bound::Included(&lo),
-                upper: Bound::Excluded(&hi),
+                lower: Bound::Included(150.into()),
+                upper: Bound::Excluded(300.into()),
             },
+        };
+
+        let vals = collect_streamed_values::<i32, _>(&table, COL_C_I32, &filter, |b| {
+            let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..a.len())
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
         });
-        let mut got_rng: Vec<RowId> = Vec::new();
-        table
-            .scan_expr(&expr_rng, &[], |rid, _| {
-                got_rng.push(rid);
-            })
-            .unwrap();
-        got_rng.sort_unstable();
-        assert_eq!(got_rng, vec![2, 3, 4]);
+        assert_eq!(vals, vec![Some(20), Some(20)]);
     }
 
     #[test]
-    fn expr_other_comparisons_and_patterns() {
-        let table = Table::new(1, TableCfg::default());
+    fn test_filtered_scan_sum_kernel() {
+        // Trade-off note:
+        // - We use Arrow's sum kernel per batch, then add the partial sums.
+        // - This preserves Arrow null semantics and avoids concat.
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
 
-        const COL_S: FieldId = 301; // strings
-        const COL_N: FieldId = 302; // numbers (be64)
+        let filter = Filter {
+            field_id: COL_A_U64,
+            op: Operator::Range {
+                lower: Bound::Included(150.into()),
+                upper: Bound::Excluded(300.into()),
+            },
+        };
 
-        let rows: Vec<RowPatch> = vec![
-            mk_row(1, &[(COL_S, s("alpha")), (COL_N, be64_bytes(10))]),
-            mk_row(2, &[(COL_S, s("beta")), (COL_N, be64_bytes(20))]),
-            mk_row(3, &[(COL_S, s("gamma")), (COL_N, be64_bytes(30))]),
-            mk_row(4, &[(COL_S, s("alphabet")), (COL_N, be64_bytes(40))]),
-            mk_row(5, &[(COL_S, s("alphanumeric")), (COL_N, be64_bytes(50))]),
-        ];
-        table.insert_many(&rows);
-
-        // GreaterThanOrEquals 30
-        let k30 = 30u64.to_be_bytes();
-        let e_gte = Expr::Pred(Filter {
-            field_id: COL_N,
-            op: Operator::GreaterThanOrEquals(&k30),
-        });
-        let mut got: Vec<RowId> = Vec::new();
+        let mut total: u128 = 0;
         table
-            .scan_expr(&e_gte, &[], |rid, _| got.push(rid))
-            .unwrap();
-        got.sort_unstable();
-        assert_eq!(got, vec![3, 4, 5]);
-
-        // LessThan 30
-        let e_lt = Expr::Pred(Filter {
-            field_id: COL_N,
-            op: Operator::LessThan(&k30),
-        });
-        let mut lt_rows: Vec<RowId> = Vec::new();
-        table
-            .scan_expr(&e_lt, &[], |rid, _| lt_rows.push(rid))
-            .unwrap();
-        lt_rows.sort_unstable();
-        assert_eq!(lt_rows, vec![1, 2]);
-
-        // IN {"beta","gamma"}
-        let e_in = Expr::Pred(Filter {
-            field_id: COL_S,
-            op: Operator::In(&[b"beta", b"gamma"]),
-        });
-        let mut in_rows: Vec<RowId> = Vec::new();
-        table
-            .scan_expr(&e_in, &[], |rid, _| in_rows.push(rid))
-            .unwrap();
-        in_rows.sort_unstable();
-        assert_eq!(in_rows, vec![2, 3]);
-
-        // StartsWith "alph"
-        let e_sw = Expr::Pred(Filter {
-            field_id: COL_S,
-            op: Operator::StartsWith(b"alph"),
-        });
-        let mut sw_rows: Vec<RowId> = Vec::new();
-        table
-            .scan_expr(&e_sw, &[], |rid, _| sw_rows.push(rid))
-            .unwrap();
-        sw_rows.sort_unstable();
-        assert_eq!(sw_rows, vec![1, 4, 5]);
-
-        // EndsWith "a"
-        let e_ew = Expr::Pred(Filter {
-            field_id: COL_S,
-            op: Operator::EndsWith(b"a"),
-        });
-        let mut ew_rows: Vec<RowId> = Vec::new();
-        table
-            .scan_expr(&e_ew, &[], |rid, _| ew_rows.push(rid))
-            .unwrap();
-        ew_rows.sort_unstable();
-        assert_eq!(ew_rows, vec![1]);
-
-        // Contains "num"
-        let e_ct = Expr::Pred(Filter {
-            field_id: COL_S,
-            op: Operator::Contains(b"num"),
-        });
-        let mut ct_rows: Vec<RowId> = Vec::new();
-        table
-            .scan_expr(&e_ct, &[], |rid, _| ct_rows.push(rid))
-            .unwrap();
-        ct_rows.sort_unstable();
-        assert_eq!(ct_rows, vec![5]);
-    }
-
-    #[test]
-    fn expr_intersection_and_union() {
-        let table = Table::new(1, TableCfg::default());
-
-        const COL_COUNTRY: FieldId = 201;
-        const COL_STATUS: FieldId = 202;
-        const COL_PAYLOAD: FieldId = 203;
-
-        let rows: Vec<RowPatch> = (1..=20)
-            .map(|rid| {
-                mk_row(
-                    rid,
-                    &[
-                        (COL_COUNTRY, be64_bytes(rid % 5)),
-                        (COL_STATUS, be64_bytes(rid % 4)),
-                        (COL_PAYLOAD, s("x")),
-                    ],
-                )
-            })
-            .collect();
-        table.insert_many(&rows);
-
-        // country=3 AND status=2
-        let c3 = (3u64).to_be_bytes();
-        let s2 = (2u64).to_be_bytes();
-        let expr_and = Expr::And(vec![
-            Expr::Pred(Filter {
-                field_id: COL_COUNTRY,
-                op: Operator::Equals(&c3),
-            }),
-            Expr::Pred(Filter {
-                field_id: COL_STATUS,
-                op: Operator::Equals(&s2),
-            }),
-        ]);
-
-        let mut and_rows: Vec<RowId> = Vec::new();
-        table
-            .scan_expr(&expr_and, &[], |rid, _| and_rows.push(rid))
-            .unwrap();
-        and_rows.sort_unstable();
-        assert_eq!(and_rows, vec![18]);
-
-        // country=1 OR status=0
-        let c1 = (1u64).to_be_bytes();
-        let s0 = (0u64).to_be_bytes();
-        let expr_or = Expr::Or(vec![
-            Expr::Pred(Filter {
-                field_id: COL_COUNTRY,
-                op: Operator::Equals(&c1),
-            }),
-            Expr::Pred(Filter {
-                field_id: COL_STATUS,
-                op: Operator::Equals(&s0),
-            }),
-        ]);
-
-        let mut or_rows: Vec<RowId> = Vec::new();
-        table
-            .scan_expr(&expr_or, &[], |rid, _| or_rows.push(rid))
-            .unwrap();
-        or_rows.sort_unstable();
-        assert_eq!(or_rows, vec![1, 4, 6, 8, 11, 12, 16, 20]);
-    }
-
-    // --- Presence + NOT tests re-added ---
-
-    #[test]
-    fn not_equals_returns_complement_including_missing_field() {
-        let table = Table::new(1, TableCfg::default());
-
-        const F_NAME: FieldId = 301;
-
-        // 1..=5; only rows 2 and 4 have the value "target"
-        let rows: Vec<RowPatch> = (1..=5)
-            .map(|rid| {
-                if rid % 2 == 0 {
-                    mk_row(rid, &[(F_NAME, s("target"))])
-                } else {
-                    // row present but field missing
-                    mk_row(rid, &[])
+            .scan_stream(COL_A_U64, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                if let Some(part) = sum(a) {
+                    total += part as u128;
                 }
             })
-            .collect();
-        table.insert_many(&rows);
+            .unwrap();
 
-        let tgt = b"target";
-        let expr = Expr::Not(Box::new(Expr::Pred(Filter {
-            field_id: F_NAME,
-            op: Operator::Equals(tgt),
-        })));
-
-        let mut got: Vec<RowId> = Vec::new();
-        table.scan_expr(&expr, &[], |rid, _| got.push(rid)).unwrap();
-        got.sort_unstable();
-
-        // Expect all rows except {2,4}
-        assert_eq!(got, vec![1, 3, 5]);
+        assert_eq!(total, 400);
     }
 
     #[test]
-    fn not_over_empty_predicate_yields_all_rows() {
-        let table = Table::new(1, TableCfg::default());
+    fn test_filtered_scan_sum_i32_kernel() {
+        // Trade-off note:
+        // - Per-batch sum + accumulate avoids building one big Array.
+        // - For tiny batches overhead may match manual loops, but keeps
+        //   Arrow semantics exact.
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
 
-        const F_TAG: FieldId = 401;
+        let candidates = [100.into(), 300.into()];
+        let filter = Filter {
+            field_id: COL_A_U64,
+            op: Operator::In(&candidates),
+        };
 
-        // Insert 4 rows with **no** F_TAG values at all.
-        let rows: Vec<RowPatch> = (1..=4).map(|rid| mk_row(rid, &[])).collect();
-        table.insert_many(&rows);
-
-        // Positive predicate has no matches -> NOT(empty) == all rows.
-        let expr = Expr::Not(Box::new(Expr::Pred(Filter {
-            field_id: F_TAG,
-            op: Operator::Equals(b"never-appears"),
-        })));
-
-        let mut got: Vec<RowId> = Vec::new();
-        table.scan_expr(&expr, &[], |rid, _| got.push(rid)).unwrap();
-        got.sort_unstable();
-        assert_eq!(got, vec![1, 2, 3, 4]);
+        let mut total: i64 = 0;
+        table
+            .scan_stream(COL_C_I32, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                if let Some(part) = sum(a) {
+                    total += part as i64;
+                }
+            })
+            .unwrap();
+        assert_eq!(total, 40);
     }
 
     #[test]
-    fn presence_stream_orders_row_ids_by_key() {
-        let table = Table::new(1, TableCfg::default());
-        let rows: Vec<RowPatch> = vec![mk_row(3, &[]), mk_row(1, &[]), mk_row(2, &[])];
-        table.insert_many(&rows);
+    fn test_filtered_scan_min_max_kernel() {
+        // Trade-off note:
+        // - min/max are computed per batch and folded. This preserves
+        //   Arrow's null behavior and avoids concat.
+        // - Be mindful of NaN semantics if extended to floats later.
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
 
-        // Stream all and check order 1,2,3 (by key order)
-        let rx = table.stream_all_row_ids();
-        let got: Vec<RowId> = rx.into_iter().collect();
-        assert_eq!(got, vec![1, 2, 3]);
+        let candidates = [100.into(), 300.into()];
+        let filter = Filter {
+            field_id: COL_A_U64,
+            op: Operator::In(&candidates),
+        };
+
+        let mut mn: Option<i32> = None;
+        let mut mx: Option<i32> = None;
+        table
+            .scan_stream(COL_C_I32, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+
+                if let Some(part_min) = min(a) {
+                    mn = Some(mn.map_or(part_min, |m| m.min(part_min)));
+                }
+                if let Some(part_max) = max(a) {
+                    mx = Some(mx.map_or(part_max, |m| m.max(part_max)));
+                }
+            })
+            .unwrap();
+        assert_eq!(mn, Some(10));
+        assert_eq!(mx, Some(30));
+    }
+
+    #[test]
+    fn test_filtered_scan_int_sqrt_float64() {
+        // Trade-off note:
+        // - We cast per batch and apply a compute unary kernel for sqrt.
+        // - This keeps processing streaming and avoids per-value loops.
+        // - `unary` operates on `PrimitiveArray<T>`; cast and downcast to
+        //   `Float64Array` first.
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::GreaterThan(15.into()),
+        };
+
+        let mut got: Vec<f64> = Vec::new();
+        table
+            .scan_stream(COL_A_U64, &filter, |b| {
+                let casted = cast(b.column(0), &arrow::datatypes::DataType::Float64).unwrap();
+                let f64_arr = casted.as_any().downcast_ref::<Float64Array>().unwrap();
+
+                // unary::<Float64Type, _, Float64Type>(...)
+                let sqrt_arr = unary::<
+                    arrow::datatypes::Float64Type,
+                    _,
+                    arrow::datatypes::Float64Type,
+                >(f64_arr, |v: f64| v.sqrt());
+
+                for i in 0..sqrt_arr.len() {
+                    if !sqrt_arr.is_null(i) {
+                        got.push(sqrt_arr.value(i));
+                    }
+                }
+            })
+            .unwrap();
+
+        let expected = [200_f64.sqrt(), 300_f64.sqrt(), 200_f64.sqrt()];
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_multi_field_kernels_with_filters() {
+        // Trade-off note:
+        // - All reductions use per-batch kernels + accumulation to stay
+        //   streaming. No concat or whole-column materialization.
+        use arrow::array::{Int16Array, UInt8Array, UInt32Array};
+
+        let table = Table::new(2, Arc::new(MemPager::default())).unwrap();
+
+        const COL_A_U64: FieldId = 20;
+        const COL_D_U32: FieldId = 21;
+        const COL_E_I16: FieldId = 22;
+        const COL_F_U8: FieldId = 23;
+        const COL_C_I32: FieldId = 24;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_A_U64.to_string(),
+            )])),
+            Field::new("d_u32", DataType::UInt32, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_D_U32.to_string(),
+            )])),
+            Field::new("e_i16", DataType::Int16, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_E_I16.to_string(),
+            )])),
+            Field::new("f_u8", DataType::UInt8, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_F_U8.to_string(),
+            )])),
+            Field::new("c_i32", DataType::Int32, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_C_I32.to_string(),
+            )])),
+        ]));
+
+        // Data: 5 rows. We will filter c_i32 >= 20 -> keep rows 2..5.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(UInt64Array::from(vec![100, 225, 400, 900, 1600])),
+                Arc::new(UInt32Array::from(vec![7, 8, 9, 10, 11])),
+                Arc::new(Int16Array::from(vec![-3, 0, 3, -6, 6])),
+                Arc::new(UInt8Array::from(vec![2, 4, 6, 8, 10])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+
+        table.append(&batch).unwrap();
+
+        // Filter: c_i32 >= 20.
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::GreaterThanOrEquals(20.into()),
+        };
+
+        // 1) SUM over d_u32 (per-batch sum + accumulate).
+        let mut d_sum: u128 = 0;
+        table
+            .scan_stream(COL_D_U32, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<UInt32Array>().unwrap();
+                if let Some(part) = sum(a) {
+                    d_sum += part as u128;
+                }
+            })
+            .unwrap();
+        assert_eq!(d_sum, (8 + 9 + 10 + 11) as u128);
+
+        // 2) MIN over e_i16 (per-batch min + fold).
+        let mut e_min: Option<i16> = None;
+        table
+            .scan_stream(COL_E_I16, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<Int16Array>().unwrap();
+                if let Some(part_min) = min(a) {
+                    e_min = Some(e_min.map_or(part_min, |m| m.min(part_min)));
+                }
+            })
+            .unwrap();
+        assert_eq!(e_min, Some(-6));
+
+        // 3) MAX over f_u8 (per-batch max + fold).
+        let mut f_max: Option<u8> = None;
+        table
+            .scan_stream(COL_F_U8, &filter, |b| {
+                let a = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt8Array>()
+                    .unwrap();
+                if let Some(part_max) = max(a) {
+                    f_max = Some(f_max.map_or(part_max, |m| m.max(part_max)));
+                }
+            })
+            .unwrap();
+        assert_eq!(f_max, Some(10));
+
+        // 4) SQRT over a_u64 (cast to f64, then unary sqrt per batch).
+        let mut got: Vec<f64> = Vec::new();
+        table
+            .scan_stream(COL_A_U64, &filter, |b| {
+                let casted = cast(b.column(0), &arrow::datatypes::DataType::Float64).unwrap();
+                let f64_arr = casted.as_any().downcast_ref::<Float64Array>().unwrap();
+                let sqrt_arr = unary::<
+                    arrow::datatypes::Float64Type,
+                    _,
+                    arrow::datatypes::Float64Type,
+                >(f64_arr, |v: f64| v.sqrt());
+
+                for i in 0..sqrt_arr.len() {
+                    if !sqrt_arr.is_null(i) {
+                        got.push(sqrt_arr.value(i));
+                    }
+                }
+            })
+            .unwrap();
+        let expected = [15.0_f64, 20.0, 30.0, 40.0];
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_scan_with_in_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        // IN now uses untyped literals, too.
+        let candidates = [10.into(), 30.into()];
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::In(&candidates),
+        };
+
+        let vals = collect_streamed_values::<u64, _>(&table, COL_A_U64, &filter, |b| {
+            let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+            (0..a.len())
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(vals, vec![Some(100), Some(300)]);
+    }
+
+    #[test]
+    fn test_scan_stream_single_column_batches() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        // Filter c_i32 == 20 -> two rows; stream a_u64 in batches of <= N.
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::Equals(20.into()),
+        };
+
+        let mut seen = Vec::<u64>::new();
+        table
+            .scan_stream(COL_A_U64, &filter, |b| {
+                assert_eq!(b.num_columns(), 1);
+                let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                // No kernel needed; just collect values for shape assertions.
+                for i in 0..a.len() {
+                    if !a.is_null(i) {
+                        seen.push(a.value(i));
+                    }
+                }
+            })
+            .unwrap();
+
+        // In fixture, c_i32 == 20 corresponds to a_u64 values [200, 200].
+        assert_eq!(seen, vec![200, 200]);
+    }
+
+    #[test]
+    fn test_scan_with_multiple_projection_columns() {
+        // With streaming, scan each column independently using the same
+        // filter and compare results. This keeps the core API streaming-
+        // friendly without multi-column chunk alignment.
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::Equals(20.into()),
+        };
+
+        let a_vals = collect_streamed_values::<u64, _>(&table, COL_A_U64, &filter, |b| {
+            let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+            (0..a.len())
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(a_vals, vec![Some(200), Some(200)]);
+
+        let c_vals = collect_streamed_values::<i32, _>(&table, COL_C_I32, &filter, |b| {
+            let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..a.len())
+                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(c_vals, vec![Some(20), Some(20)]);
     }
 }

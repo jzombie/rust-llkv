@@ -6,9 +6,14 @@ use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
 };
-use crate::types::{CATALOG_ROOT_PKEY, LogicalFieldId, PhysicalKey};
-use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, UInt64Array};
+use crate::store::scan::FilterPrimitive;
+use crate::types::{LogicalFieldId, PhysicalKey};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, PrimitiveArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_empty_array,
+};
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
+use arrow::datatypes::{ArrowPrimitiveType, DataType};
 use arrow::record_batch::RecordBatch;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -59,6 +64,70 @@ where
     /// Unregisters a persisted index from a given column atomically.
     pub fn unregister_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
         self.index_manager.unregister_index(self, field_id, kind)
+    }
+
+    /// Returns the Arrow data type of the given field, loading it if not cached.
+    pub fn data_type(&self, field_id: LogicalFieldId) -> Result<DataType> {
+        if let Some(dt) = self.dtype_cache.cached_data_type(field_id) {
+            return Ok(dt);
+        }
+        self.dtype_cache.dtype_for_field(field_id)
+    }
+
+    /// Gathers values for the specified `row_ids`, returned in the same order as provided.
+    pub fn gather_rows(&self, field_id: LogicalFieldId, row_ids: &[u64]) -> Result<ArrayRef> {
+        let dtype = self.data_type(field_id)?;
+        if row_ids.is_empty() {
+            return Ok(new_empty_array(&dtype));
+        }
+
+        let mut row_index: FxHashMap<u64, usize> = FxHashMap::default();
+        row_index.reserve(row_ids.len());
+        for (idx, &row_id) in row_ids.iter().enumerate() {
+            if row_index.insert(row_id, idx).is_some() {
+                return Err(Error::Internal("duplicate row_id in gather_rows".into()));
+            }
+        }
+
+        crate::with_integer_arrow_type!(
+            dtype.clone(),
+            |ArrowTy| {
+                self.gather_rows_primitive::<ArrowTy>(field_id, &row_index, row_ids.len())
+            },
+            Err(Error::Internal(format!(
+                "gather_rows: unsupported dtype {:?}",
+                dtype
+            ))),
+        )
+    }
+
+    fn gather_rows_primitive<T>(
+        &self,
+        field_id: LogicalFieldId,
+        row_index: &FxHashMap<u64, usize>,
+        len: usize,
+    ) -> Result<ArrayRef>
+    where
+        T: ArrowPrimitiveType,
+        for<'a> GatherVisitor<'a, T>: scan::PrimitiveVisitor
+            + scan::PrimitiveSortedVisitor
+            + scan::PrimitiveSortedWithRowIdsVisitor
+            + scan::PrimitiveWithRowIdsVisitor,
+    {
+        let mut visitor = GatherVisitor::<T>::new(row_index, len);
+        ScanBuilder::new(self, field_id)
+            .with_row_ids(rowid_fid(field_id))
+            .run(&mut visitor)?;
+        visitor.finish()
+    }
+
+    /// Collects the row ids whose values satisfy the provided predicate.
+    pub fn filter_row_ids<T, F>(&self, field_id: LogicalFieldId, predicate: F) -> Result<Vec<u64>>
+    where
+        T: FilterPrimitive,
+        F: FnMut(T::Native) -> bool,
+    {
+        T::run_filter(self, field_id, predicate)
     }
 
     /// Lists the names of all persisted indexes for a given column.
@@ -333,7 +402,6 @@ where
                 .map(LogicalFieldId::from)
                 .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
 
-            // **** THIS IS THE RESTORED LINE ****
             // Populate the data type cache for this column. This is a performance optimization
             // to avoid reading a chunk from storage later just to determine its type.
             self.dtype_cache.insert(field_id, field.data_type().clone());
@@ -1496,3 +1564,80 @@ where
         Ok(all_stats)
     }
 }
+
+struct GatherVisitor<'a, T: ArrowPrimitiveType> {
+    row_index: &'a FxHashMap<u64, usize>,
+    values: Vec<Option<T::Native>>,
+    found: Vec<bool>,
+}
+
+impl<'a, T: ArrowPrimitiveType> GatherVisitor<'a, T> {
+    fn new(row_index: &'a FxHashMap<u64, usize>, len: usize) -> Self {
+        Self {
+            row_index,
+            values: vec![None; len],
+            found: vec![false; len],
+        }
+    }
+
+    fn record(&mut self, row_id: u64, value: Option<T::Native>) {
+        if let Some(&idx) = self.row_index.get(&row_id) {
+            self.values[idx] = value;
+            self.found[idx] = true;
+        }
+    }
+
+    fn finish(self) -> Result<ArrayRef> {
+        if self.found.iter().any(|found| !found) {
+            return Err(Error::Internal(
+                "gather_rows: one or more requested row IDs were not found".into(),
+            ));
+        }
+        let array = PrimitiveArray::<T>::from_iter(self.values);
+        Ok(Arc::new(array) as ArrayRef)
+    }
+}
+
+macro_rules! impl_gather_visitor {
+    ($ty:ty, $arr:ty, $method:ident) => {
+        impl<'a> scan::PrimitiveVisitor for GatherVisitor<'a, $ty> {}
+        impl<'a> scan::PrimitiveSortedVisitor for GatherVisitor<'a, $ty> {}
+        impl<'a> scan::PrimitiveSortedWithRowIdsVisitor for GatherVisitor<'a, $ty> {}
+        impl<'a> scan::PrimitiveWithRowIdsVisitor for GatherVisitor<'a, $ty> {
+            fn $method(&mut self, values: &$arr, row_ids: &UInt64Array) {
+                let len = values.len();
+                debug_assert_eq!(len, row_ids.len());
+                for i in 0..len {
+                    let row_id = row_ids.value(i);
+                    let value = if values.is_null(i) {
+                        None
+                    } else {
+                        Some(values.value(i))
+                    };
+                    self.record(row_id, value);
+                }
+            }
+        }
+    };
+}
+
+impl_gather_visitor!(
+    arrow::datatypes::UInt64Type,
+    UInt64Array,
+    u64_chunk_with_rids
+);
+impl_gather_visitor!(
+    arrow::datatypes::UInt32Type,
+    UInt32Array,
+    u32_chunk_with_rids
+);
+impl_gather_visitor!(
+    arrow::datatypes::UInt16Type,
+    UInt16Array,
+    u16_chunk_with_rids
+);
+impl_gather_visitor!(arrow::datatypes::UInt8Type, UInt8Array, u8_chunk_with_rids);
+impl_gather_visitor!(arrow::datatypes::Int64Type, Int64Array, i64_chunk_with_rids);
+impl_gather_visitor!(arrow::datatypes::Int32Type, Int32Array, i32_chunk_with_rids);
+impl_gather_visitor!(arrow::datatypes::Int16Type, Int16Array, i16_chunk_with_rids);
+impl_gather_visitor!(arrow::datatypes::Int8Type, Int8Array, i8_chunk_with_rids);

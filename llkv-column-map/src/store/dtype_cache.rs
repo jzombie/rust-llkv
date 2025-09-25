@@ -32,6 +32,11 @@ where
         self.cache.write().unwrap().insert(field_id, dtype);
     }
 
+    #[inline]
+    pub fn cached_data_type(&self, field_id: LogicalFieldId) -> Option<DataType> {
+        self.cache.read().unwrap().get(&field_id).cloned()
+    }
+
     /// Stable FNV-1a 64-bit over the Debug representation of DataType.
     #[inline]
     #[allow(dead_code)] // TODO: Keep?

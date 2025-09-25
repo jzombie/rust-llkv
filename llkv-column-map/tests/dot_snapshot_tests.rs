@@ -10,9 +10,9 @@ use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::debug::ColumnStoreDebug;
 use llkv_column_map::store::{ColumnStore, IndexKind};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::{LogicalFieldId, Namespace, TableId};
 
-fn fid(table_id: u32, field_id: u32) -> LogicalFieldId {
+fn fid(table_id: TableId, field_id: u32) -> LogicalFieldId {
     LogicalFieldId::new()
         .with_namespace(Namespace::UserData)
         .with_table_id(table_id)
@@ -150,6 +150,10 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     store
 }
 
+#[cfg_attr(
+    miri,
+    ignore = "Miri lacks support for the mmap/mprotect calls used by MemPager"
+)]
 #[test]
 fn snapshot_storage_dot_canonical() {
     let store = seed_small_store();
@@ -159,6 +163,10 @@ fn snapshot_storage_dot_canonical() {
     common::assert_matches_golden(&canon, "tests/snapshots/storage_small.dot");
 }
 
+#[cfg_attr(
+    miri,
+    ignore = "Miri lacks support for the mmap/mprotect calls used by MemPager"
+)]
 #[test]
 fn snapshot_storage_table_ascii() {
     let store = seed_small_store();

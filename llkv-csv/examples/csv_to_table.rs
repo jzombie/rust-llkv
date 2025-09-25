@@ -11,12 +11,14 @@ use std::env;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::ops::Bound;
+use std::sync::Arc;
 use std::time::Instant;
 
 use csv::{ReaderBuilder, StringRecord};
 use llkv_csv::{CsvConfig, load_into_table};
 use llkv_table::types::{ColumnInput, FieldId, IndexKey, RowId};
-use llkv_table::{Table, TableCfg};
+use llkv_table::Table;
+use llkv_column_map::storage::pager::MemPager;
 
 fn parse_args() -> Result<(String, bool, u8), String> {
     let mut it = env::args().skip(1);
@@ -82,8 +84,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Build the new non-generic Table.
-    let table = Table::new(1, TableCfg::default());
+    // Build the new non-generic Table using an in-memory pager.
+    let pager = Arc::new(MemPager::default());
+    let table = Table::new(1, pager)?;
 
     // Reader and config for ingest.
     let reader = BufReader::new(file);
