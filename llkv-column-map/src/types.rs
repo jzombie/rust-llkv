@@ -41,5 +41,19 @@ pub struct LogicalFieldId {
     pub namespace: Namespace,
 }
 
+/// Logical column identifier within a table.
+///
+/// `FieldId` is stored inside [`LogicalFieldId::field_id`], which is a 32-bit
+/// lane.  Keep this alias in sync with that width so table metadata and
+/// runtime identifiers can round-trip without truncation.
+pub type FieldId = u32;
+
+/// Row identifier for persisted data.
+///
+/// `ColumnStore` emits row ids as Arrow `UInt64Array`s (see `core.rs`), so this
+/// alias mirrors that width to avoid casts when marshalling data in and out of
+/// the engine.
+pub type RowId = u64;
+
 // Well-known key for the root ColumnCatalog.
 pub(crate) const CATALOG_ROOT_PKEY: PhysicalKey = 0;
