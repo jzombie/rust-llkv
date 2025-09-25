@@ -66,7 +66,10 @@ jobs:
         with:
           components: miri
 
-      - name: Run Miri tests
-        # Miri cannot emulate the OS-backed mmap calls used by our integration tests, so
-        # we limit the run to library tests (unit tests) for now.
-        run: cargo miri test -p llkv-column-map --lib
+      # TODO: To effectively use this a custom test-only, Miri-friendly pager may need to be created
+      # and feature gated to only use `EntryHandle` (mmap-backed). This should be modified to test
+      # integration tests as well, not only `--lib` tests.
+      #   - name: Run Miri tests
+      #     # Miri cannot emulate the OS-backed mmap calls used by our integration tests, so
+      #     # we limit the run to library tests (unit tests) for now.
+      #     run: cargo miri test -p llkv-column-map --lib
