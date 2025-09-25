@@ -48,9 +48,14 @@ jobs:
         # Explicitly ignore benches (workaround for CodSpeed benches running for default)
         run: cargo test --workspace --all-features --verbose --lib --bins --tests --examples -- --include-ignored
 
-  # Runs the Miri interpreter on Linux to detect undefined behavior in unsafe code during CI
+  # Runs the Miri interpreter across all OS targets to detect undefined behavior in unsafe code
   miri:
-    runs-on: ubuntu-latest
+    name: Miri (OS=${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - name: Checkout repository
