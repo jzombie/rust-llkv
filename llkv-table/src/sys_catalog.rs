@@ -57,22 +57,10 @@ pub struct TableMeta {
     pub epoch: u64,
 }
 
-// TODO: Remove this entirely; Don't maintain a separate type system; Derive from native Arrow type
-#[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
-pub enum ColType {
-    Bytes,
-    Utf8,
-    BeU64,
-    BeI64,
-    F64,
-    Json,
-}
-
 #[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
 pub struct ColMeta {
     pub col_id: u32,
     pub name: Option<String>,
-    pub ty: ColType,
     pub flags: u32,
     pub default: Option<Vec<u8>>,
 }
