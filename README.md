@@ -6,11 +6,15 @@
 
 It is designed for data stores that provide zero-copy reads with SIMD-friendly alignment (vector-width or cacheline aligned), enabling direct use in vectorized kernels (e.g. [SIMD R Drive](https://crates.io/crates/simd-r-drive)).
 
-## Storage Layout: Physical / Logical Key Separation
+## Storage Layout: Physical vs. Logical Keys
 
-In `LLKV`, a physical data store key typically maps to a segment of a single column (one logical field) that spans a contiguous range of row IDs. One lookup returns a compact, columnar slice: many rows of one column. This reduces round trips, improves cache locality, and speeds up scans.
+In `LLKV`, data is split into physical keys and logical fields.
 
-Above storage, data is addressed by logical field IDs and row-ID ranges for cataloging, planning, and predicate pushdown. The on-disk layout can split a column into multiple physical keys as data grows or is reorganized. The common path stays simple and efficient: one column segment per key, many rows inside. This separation keeps lookups cheap while preserving clear columnar packing on top of a key-value store.
+- A physical key maps to a chunk of one column (a slice of rows).
+- A lookup returns many rows of a single column in one go, using the [Apache Arrow](https://arrow.apache.org/) memory layout for efficient, zero-copy access.
+- Logical field IDs describe the higher-level schema, while physical keys handle the actual storage.
+
+As data grows, a column can be split across multiple physical keys, but the main pattern stays simple: one key, one column chunk, many rows inside. This keeps lookups fast while preserving a clean, Arrow-based columnar layout on top of the key-value store.
 
 ## License
 

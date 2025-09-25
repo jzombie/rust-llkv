@@ -1,7 +1,31 @@
 //! Zero-copy array persistence for fixed/var width Arrow arrays used by the
 //! store.
-
-// TODO: Document layout
+//!
+//! ## Why a custom on-disk format instead of Arrow IPC?
+//!
+//! This module persists Arrow arrays in a minimal, mmap-friendly container so
+//! we can reconstruct `ArrayData` *zero-copy* from a single memory-mapped
+//! region. Using Arrow IPC (stream/file) directly would:
+//!   - Increase file size from extra framing, padding, and metadata.
+//!   - Require additional allocations and buffer copies during decode.
+//!   - Prevent us from keeping a single contiguous payload per array, which
+//!     hurts scan performance.
+//!
+//! Design goals of this format:
+//! - **Minimal headers**: fixed-size header plus raw buffers only, no framing
+//!   or schema objects.
+//! - **Predictable contiguous payloads**: each array’s bytes live together in
+//!   one region, ideal for mmap and SIMD access.
+//! - **True zero-copy rebuild**: deserialization produces `ArrayData` that
+//!   references the original mmap directly, avoiding memcpy.
+//! - **Simpler invariants**: deliberately omits certain features (e.g., null
+//!   bitmaps) to keep the format compact and reconstruction trivial.
+//! - **Stable codes**: layout and type tags are explicitly pinned with
+//!   compile-time checks to avoid silent corruption.
+//!
+//! Net effect: smaller files, faster scans, and preserved zero-copy semantics
+//! tailored to this storage engine’s access pattern, at the cost of leaving
+//! out some of the generality of Arrow IPC.
 
 use std::convert::TryFrom;
 use std::sync::Arc;
