@@ -7,7 +7,7 @@ use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
 };
 use crate::store::scan::FilterPrimitive;
-use crate::types::{CATALOG_ROOT_PKEY, LogicalFieldId, PhysicalKey};
+use crate::types::{LogicalFieldId, PhysicalKey};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, PrimitiveArray,
     UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_empty_array,

@@ -49,7 +49,7 @@ mod codecs;
 
 pub use error::{Error, Result};
 pub use store::{
-    ColumnStore, IndexKind,
+    CATALOG_ROOT_PKEY, ColumnStore, IndexKind,
     scan::{self, ScanBuilder},
 };
 

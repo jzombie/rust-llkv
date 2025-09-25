@@ -1,3 +1,8 @@
+use crate::types::PhysicalKey;
+
+// Well-known key for the root ColumnCatalog.
+pub const CATALOG_ROOT_PKEY: PhysicalKey = 0;
+
 pub(crate) const DESCRIPTOR_ENTRIES_PER_PAGE: usize = 256;
 
 /// Target byte size for descriptor pages. The pager may be mmapped, so page
