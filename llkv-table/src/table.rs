@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::types::TableId;
 
-use arrow::array::{Array, ArrayRef, Int32Array, RecordBatch, UInt64Array};
+use arrow::array::{Array, ArrayRef, Int32Array, PrimitiveArray, RecordBatch, UInt64Array};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
 use llkv_column_map::store::FilterPrimitive;
@@ -237,6 +237,11 @@ where
     table_id: TableId,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScanStreamOptions {
+    pub include_nulls: bool,
+}
+
 impl<P> Table<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -303,12 +308,32 @@ where
         &self,
         projection_col: FieldId,
         filter: &Filter<'a, FieldId>,
+        on_batch: F,
+    ) -> Result<(), TableError>
+    where
+        F: FnMut(RecordBatch),
+    {
+        self.scan_stream_with_options(
+            projection_col,
+            filter,
+            ScanStreamOptions::default(),
+            on_batch,
+        )
+    }
+
+    pub fn scan_stream_with_options<'a, F>(
+        &self,
+        projection_col: FieldId,
+        filter: &Filter<'a, FieldId>,
+        options: ScanStreamOptions,
         mut on_batch: F,
     ) -> Result<(), TableError>
     where
         F: FnMut(RecordBatch),
     {
         let filter_lfid = lfid_for(self.table_id, filter.field_id);
+        let anchor_lfid =
+            lfid_for(self.table_id, filter.field_id).with_namespace(Namespace::RowIdShadow);
         let dtype = self.store.data_type(filter_lfid)?;
 
         let row_ids = llkv_column_map::with_integer_arrow_type!(
@@ -338,7 +363,46 @@ where
             let window = &row_ids[start..end];
 
             // Gather only this window's rows for the projected column.
-            let col = self.store.gather_rows(proj_lfid, window)?;
+            let arr = if options.include_nulls {
+                Some(
+                    self.store
+                        .gather_rows_with_nulls(proj_lfid, window, Some(anchor_lfid))
+                        .map_err(TableError::from)?,
+                )
+            } else {
+                match self.store.gather_rows(proj_lfid, window) {
+                    Ok(values) => Some(values),
+                    Err(err) => Some(match err {
+                        llkv_column_map::error::Error::Internal(_)
+                        | llkv_column_map::error::Error::NotFound => self
+                            .store
+                            .gather_rows_with_nulls(proj_lfid, window, Some(anchor_lfid))
+                            .map_err(TableError::from)?,
+                        _ => return Err(TableError::from(err)),
+                    }),
+                }
+            };
+
+            let Some(arr) = arr else {
+                start = end;
+                continue;
+            };
+
+            let maybe_arr = if options.include_nulls {
+                Some(arr)
+            } else {
+                drop_nulls(arr)
+            };
+
+            let Some(col) = maybe_arr else {
+                start = end;
+                continue;
+            };
+
+            if col.len() == 0 {
+                start = end;
+                continue;
+            }
 
             let batch = RecordBatch::try_new(out_schema.clone(), vec![col])?;
             on_batch(batch);
@@ -377,6 +441,98 @@ where
 
     pub fn store(&self) -> &ColumnStore<P> {
         &self.store
+    }
+}
+
+fn drop_nulls(arr: ArrayRef) -> Option<ArrayRef> {
+    if arr.null_count() == 0 {
+        return Some(arr);
+    }
+
+    fn filter_primitive<T>(array: &PrimitiveArray<T>) -> Option<ArrayRef>
+    where
+        T: ArrowPrimitiveType,
+    {
+        let values: Vec<T::Native> = array.iter().flatten().collect();
+        if values.is_empty() {
+            None
+        } else {
+            Some(Arc::new(PrimitiveArray::<T>::from_iter_values(values)) as ArrayRef)
+        }
+    }
+
+    match arr.data_type() {
+        DataType::UInt64 => {
+            let prim = arr
+                .as_any()
+                .downcast_ref::<PrimitiveArray<arrow::datatypes::UInt64Type>>()
+                .unwrap();
+            filter_primitive(prim)
+        }
+        DataType::UInt32 => {
+            let prim = arr
+                .as_any()
+                .downcast_ref::<PrimitiveArray<arrow::datatypes::UInt32Type>>()
+                .unwrap();
+            filter_primitive(prim)
+        }
+        DataType::UInt16 => {
+            let prim = arr
+                .as_any()
+                .downcast_ref::<PrimitiveArray<arrow::datatypes::UInt16Type>>()
+                .unwrap();
+            filter_primitive(prim)
+        }
+        DataType::UInt8 => {
+            let prim = arr
+                .as_any()
+                .downcast_ref::<PrimitiveArray<arrow::datatypes::UInt8Type>>()
+                .unwrap();
+            filter_primitive(prim)
+        }
+        DataType::Int64 => {
+            let prim = arr
+                .as_any()
+                .downcast_ref::<PrimitiveArray<arrow::datatypes::Int64Type>>()
+                .unwrap();
+            filter_primitive(prim)
+        }
+        DataType::Int32 => {
+            let prim = arr
+                .as_any()
+                .downcast_ref::<PrimitiveArray<arrow::datatypes::Int32Type>>()
+                .unwrap();
+            filter_primitive(prim)
+        }
+        DataType::Int16 => {
+            let prim = arr
+                .as_any()
+                .downcast_ref::<PrimitiveArray<arrow::datatypes::Int16Type>>()
+                .unwrap();
+            filter_primitive(prim)
+        }
+        DataType::Int8 => {
+            let prim = arr
+                .as_any()
+                .downcast_ref::<PrimitiveArray<arrow::datatypes::Int8Type>>()
+                .unwrap();
+            filter_primitive(prim)
+        }
+        DataType::Float64 => {
+            let prim = arr
+                .as_any()
+                .downcast_ref::<PrimitiveArray<arrow::datatypes::Float64Type>>()
+                .unwrap();
+            filter_primitive(prim)
+        }
+        DataType::Float32 => {
+            let prim = arr
+                .as_any()
+                .downcast_ref::<PrimitiveArray<arrow::datatypes::Float32Type>>()
+                .unwrap();
+            filter_primitive(prim)
+        }
+        _ => Some(arr),
     }
 }
 
@@ -537,6 +693,26 @@ mod tests {
         let mut out = Vec::<Option<T>>::new();
         table
             .scan_stream(proj, filter, |b| {
+                out.extend(extract(&b));
+            })
+            .unwrap();
+        out
+    }
+
+    fn collect_streamed_values_with_options<T, FExtract>(
+        table: &Table,
+        proj: FieldId,
+        filter: &Filter<'_, FieldId>,
+        options: ScanStreamOptions,
+        mut extract: FExtract,
+    ) -> Vec<Option<T>>
+    where
+        T: Copy,
+        FExtract: FnMut(&RecordBatch) -> Vec<Option<T>>,
+    {
+        let mut out = Vec::<Option<T>>::new();
+        table
+            .scan_stream_with_options(proj, filter, options, |b| {
                 out.extend(extract(&b));
             })
             .unwrap();
@@ -949,6 +1125,99 @@ mod tests {
 
         let collected: Vec<f32> = vals.into_iter().flatten().collect();
         assert_eq!(collected, vec![2.0, 3.0, 2.0]);
+    }
+
+    #[test]
+    fn test_scan_stream_include_nulls_toggle() {
+        let pager = Arc::new(MemPager::default());
+        let table = setup_test_table_with_pager(&pager);
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+        const COL_B_BIN: FieldId = 11;
+        const COL_D_F64: FieldId = 13;
+        const COL_E_F32: FieldId = 14;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_A_U64.to_string(),
+            )])),
+            Field::new("b_bin", DataType::Binary, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_B_BIN.to_string(),
+            )])),
+            Field::new("c_i32", DataType::Int32, true).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_C_I32.to_string(),
+            )])),
+            Field::new("d_f64", DataType::Float64, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_D_F64.to_string(),
+            )])),
+            Field::new("e_f32", DataType::Float32, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_E_F32.to_string(),
+            )])),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![5, 6])),
+                Arc::new(UInt64Array::from(vec![500, 600])),
+                Arc::new(BinaryArray::from(vec![
+                    Some(&b"new"[..]),
+                    Some(&b"alt"[..]),
+                ])),
+                Arc::new(Int32Array::from(vec![Some(40), None])),
+                Arc::new(Float64Array::from(vec![5.5, 6.5])),
+                Arc::new(Float32Array::from(vec![5.0, 6.0])),
+            ],
+        )
+        .unwrap();
+        table.append(&batch).unwrap();
+
+        let filter = Filter {
+            field_id: COL_A_U64,
+            op: Operator::GreaterThan(450.into()),
+        };
+
+        let default_vals = collect_streamed_values::<i32, _>(&table, COL_C_I32, &filter, |b| {
+            let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i))
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(default_vals, vec![Some(40)]);
+
+        let include_null_vals = collect_streamed_values_with_options::<i32, _>(
+            &table,
+            COL_C_I32,
+            &filter,
+            ScanStreamOptions {
+                include_nulls: true,
+            },
+            |b| {
+                let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                (0..arr.len())
+                    .map(|i| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            },
+        );
+        assert_eq!(include_null_vals, vec![Some(40), None]);
     }
 
     #[test]

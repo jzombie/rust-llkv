@@ -550,14 +550,13 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
             .ok_or(Error::NotFound)?
             .clone(),
     )?;
-    match first_any.data_type() {
-        DataType::UInt64 => {
+    macro_rules! emit_unsorted_nulls {
+        ($array_ty:ty, $visit:ident, $err:literal) => {{
             let mut ai = 0usize;
             let mut aj = 0usize;
             let mut pi = 0usize;
             let mut pj = 0usize;
-            // Materialize typed arrays
-            let mut vals: Vec<UInt64Array> = Vec::with_capacity(v_metas.len());
+            let mut vals: Vec<$array_ty> = Vec::with_capacity(v_metas.len());
             let mut prids: Vec<UInt64Array> = Vec::with_capacity(r_metas.len());
             let mut anchors: Vec<UInt64Array> = Vec::with_capacity(a_metas.len());
             for vm in &v_metas {
@@ -565,8 +564,8 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
                     deserialize_array(vblobs.get(&vm.chunk_pk).ok_or(Error::NotFound)?.clone())?;
                 vals.push(
                     any.as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| Error::Internal("downcast".into()))?
+                        .downcast_ref::<$array_ty>()
+                        .ok_or_else(|| Error::Internal($err.into()))?
                         .clone(),
                 );
             }
@@ -576,7 +575,7 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
                 prids.push(
                     any.as_any()
                         .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| Error::Internal("downcast".into()))?
+                        .ok_or_else(|| Error::Internal("downcast row_id u64".into()))?
                         .clone(),
                 );
             }
@@ -586,7 +585,7 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
                 anchors.push(
                     any.as_any()
                         .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| Error::Internal("downcast".into()))?
+                        .ok_or_else(|| Error::Internal("downcast anchor u64".into()))?
                         .clone(),
                 );
             }
@@ -595,7 +594,6 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
                 let a = &anchors[ai];
                 while aj < a.len() {
                     let av = a.value(aj);
-                    // advance pres to >= av
                     while pi < prids.len() {
                         let p = &prids[pi];
                         if pj >= p.len() {
@@ -621,14 +619,13 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
                             let arr = UInt64Array::from(std::mem::take(&mut null_buf));
                             visitor.null_run(&arr, 0, arr.len());
                         }
-                        // emit single present value slice
                         let v = &vals[pi];
                         let r = &prids[pi];
                         let sref_v = v.slice(pj, 1);
                         let sref_r = r.slice(pj, 1);
-                        let sv = sref_v.as_any().downcast_ref::<UInt64Array>().unwrap();
+                        let sv = sref_v.as_any().downcast_ref::<$array_ty>().unwrap();
                         let sr = sref_r.as_any().downcast_ref::<UInt64Array>().unwrap();
-                        visitor.u64_chunk_with_rids(sv, sr);
+                        visitor.$visit(sv, sr);
                         pj += 1;
                     } else {
                         null_buf.push(av);
@@ -647,8 +644,40 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
                 visitor.null_run(&arr, 0, arr.len());
             }
             Ok(())
+        }};
+    }
+
+    match first_any.data_type() {
+        DataType::UInt64 => {
+            emit_unsorted_nulls!(UInt64Array, u64_chunk_with_rids, "downcast u64")
         }
-        // Fallback: emit present in chunk order and nulls interleaved as found; for other dtypes, we can map to u64 anchor
+        DataType::UInt32 => {
+            emit_unsorted_nulls!(UInt32Array, u32_chunk_with_rids, "downcast u32")
+        }
+        DataType::UInt16 => {
+            emit_unsorted_nulls!(UInt16Array, u16_chunk_with_rids, "downcast u16")
+        }
+        DataType::UInt8 => {
+            emit_unsorted_nulls!(UInt8Array, u8_chunk_with_rids, "downcast u8")
+        }
+        DataType::Int64 => {
+            emit_unsorted_nulls!(Int64Array, i64_chunk_with_rids, "downcast i64")
+        }
+        DataType::Int32 => {
+            emit_unsorted_nulls!(Int32Array, i32_chunk_with_rids, "downcast i32")
+        }
+        DataType::Int16 => {
+            emit_unsorted_nulls!(Int16Array, i16_chunk_with_rids, "downcast i16")
+        }
+        DataType::Int8 => {
+            emit_unsorted_nulls!(Int8Array, i8_chunk_with_rids, "downcast i8")
+        }
+        DataType::Float64 => {
+            emit_unsorted_nulls!(Float64Array, f64_chunk_with_rids, "downcast f64")
+        }
+        DataType::Float32 => {
+            emit_unsorted_nulls!(Float32Array, f32_chunk_with_rids, "downcast f32")
+        }
         _ => Err(Error::Internal(
             "unsorted_with_nulls: dtype not supported".into(),
         )),
