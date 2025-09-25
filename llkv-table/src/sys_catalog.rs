@@ -16,6 +16,7 @@ use llkv_column_map::types::LogicalFieldId;
 use llkv_column_map::{
     ColumnStore,
     storage::pager::{MemPager, Pager},
+    types::Namespace,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -32,18 +33,24 @@ const F_COL_META: u32 = 10; // bytes: bitcode(ColMeta)
 
 #[inline]
 fn lfid(table_id: u32, col_id: u32) -> LogicalFieldId {
-    let combined_id = ((table_id as u64) << 32) | (col_id as u64);
-    LogicalFieldId::from(combined_id)
+    LogicalFieldId::new()
+        .with_namespace(Namespace::UserData)
+        .with_table_id(table_id)
+        .with_field_id(col_id)
 }
 
 #[inline]
 fn rid_table(table_id: u32) -> u64 {
-    (table_id as u64) << 32
+    let fid = LogicalFieldId::new()
+        .with_namespace(Namespace::UserData)
+        .with_table_id(table_id)
+        .with_field_id(0);
+    fid.into()
 }
 
 #[inline]
 fn rid_col(table_id: u32, col_id: u32) -> u64 {
-    ((table_id as u64) << 32) | (col_id as u64)
+    lfid(table_id, col_id).into()
 }
 
 // ----- Public catalog types -----
@@ -109,7 +116,6 @@ where
         }
         impl PrimitiveVisitor for MetaVisitor {}
         impl PrimitiveWithRowIdsVisitor for MetaVisitor {
-            // --- FIX: Method moved to the correct trait implementation ---
             fn u64_chunk_with_rids(&mut self, v: &UInt64Array, r: &UInt64Array) {
                 for i in 0..r.len() {
                     if r.value(i) == self.target_rid {
