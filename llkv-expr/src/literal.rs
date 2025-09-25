@@ -1,3 +1,6 @@
+use arrow::datatypes::ArrowPrimitiveType;
+use std::ops::Bound;
+
 /// A literal value that has not yet been coerced into a specific native
 /// type. This allows for type inference to be deferred until the column
 /// type is known.
@@ -80,4 +83,22 @@ where
             got: "string",
         }),
     }
+}
+
+/// Convert a bound of `Literal` into a bound of `T::Native`.
+///
+/// Kept generic over `T: ArrowPrimitiveType` so callers (like the table
+/// crate) can use `bound_to_native::<T>()` with `T::Native` inferred.
+/// Error type is `LiteralCastError` since this crate is independent of
+/// table-layer errors.
+pub fn bound_to_native<T>(bound: &Bound<Literal>) -> Result<Bound<T::Native>, LiteralCastError>
+where
+    T: ArrowPrimitiveType,
+    T::Native: TryFrom<i128> + Copy,
+{
+    Ok(match bound {
+        Bound::Unbounded => Bound::Unbounded,
+        Bound::Included(l) => Bound::Included(literal_to_native::<T::Native>(l)?),
+        Bound::Excluded(l) => Bound::Excluded(literal_to_native::<T::Native>(l)?),
+    })
 }

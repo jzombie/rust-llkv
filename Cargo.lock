@@ -935,6 +935,7 @@ version = "0.1.0-alpha"
 dependencies = [
  "arrow",
  "arrow-array",
+ "llkv-column-map",
 ]
 
 [[package]]

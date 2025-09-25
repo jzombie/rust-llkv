@@ -12,27 +12,13 @@ use llkv_column_map::{
     types::{LogicalFieldId, Namespace},
 };
 
-use crate::expr::{Filter, Literal, LiteralCastError, Operator, literal_to_native};
+use crate::expr::{Filter, LiteralCastError, Operator, bound_to_native, literal_to_native};
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
 
 // TODO: Extract to constants
 /// Default max rows per streamed batch. Tune as needed.
 const STREAM_BATCH_ROWS: usize = 8192;
-
-// TODO: Move to `llkv-expr`
-/// Convert a bound of `Literal` into a bound of `T::Native`.
-fn bound_to_native<T>(bound: &Bound<Literal>) -> Result<Bound<T::Native>, TableError>
-where
-    T: ArrowPrimitiveType + FilterPrimitive,
-    T::Native: TryFrom<i128> + Copy,
-{
-    Ok(match bound {
-        Bound::Unbounded => Bound::Unbounded,
-        Bound::Included(l) => Bound::Included(literal_to_native::<T::Native>(l)?),
-        Bound::Excluded(l) => Bound::Excluded(literal_to_native::<T::Native>(l)?),
-    })
-}
 
 enum RangeLimit<T> {
     Included(T),
