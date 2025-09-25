@@ -4,7 +4,7 @@
 
 `LLKV` is a lightweight toolkit for building logical, columnar layouts and query primitives on top of generic key–value stores.
 
-It's designed for storage engines that support zero-copy reads (e.g. [SIMD R Drive](https://crates.io/crates/simd-r-drive)) and aims to provide columnar storage with expression-based querying.
+It is designed for stores that provide zero-copy reads with SIMD-friendly alignment (vector-width or cacheline aligned), enabling direct use in vectorized kernels (e.g. [SIMD R Drive](https://crates.io/crates/simd-r-drive)).
 
 ## Physical / Logical Key Separation
 
