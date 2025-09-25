@@ -118,6 +118,12 @@ where
             fn i8_chunk(&mut self, a: &Int8Array) {
                 self.inner.i8_chunk(a)
             }
+            fn f64_chunk(&mut self, a: &Float64Array) {
+                self.inner.f64_chunk(a)
+            }
+            fn f32_chunk(&mut self, a: &Float32Array) {
+                self.inner.f32_chunk(a)
+            }
         }
         impl<'v, V> crate::store::scan::PrimitiveWithRowIdsVisitor for RangeAdapter<'v, V>
         where
@@ -146,6 +152,12 @@ where
             }
             fn i8_chunk_with_rids(&mut self, v: &Int8Array, r: &UInt64Array) {
                 self.inner.i8_chunk_with_rids(v, r)
+            }
+            fn f64_chunk_with_rids(&mut self, v: &Float64Array, r: &UInt64Array) {
+                self.inner.f64_chunk_with_rids(v, r)
+            }
+            fn f32_chunk_with_rids(&mut self, v: &Float32Array, r: &UInt64Array) {
+                self.inner.f32_chunk_with_rids(v, r)
             }
         }
 
@@ -341,6 +353,12 @@ where
                     self.inner.i8_run(a, s, l);
                 }
             }
+            fn f64_run(&mut self, a: &Float64Array, s: usize, l: usize) {
+                self.inner.f64_run(a, s, l);
+            }
+            fn f32_run(&mut self, a: &Float32Array, s: usize, l: usize) {
+                self.inner.f32_run(a, s, l);
+            }
         }
         impl<'v, V> crate::store::scan::PrimitiveSortedWithRowIdsVisitor for RangeAdapter<'v, V>
         where
@@ -385,6 +403,12 @@ where
                 }
             }
             // For brevity, other integer widths with row ids fall back to pass-through.
+            fn f64_run_with_rids(&mut self, v: &Float64Array, r: &UInt64Array, s: usize, l: usize) {
+                self.inner.f64_run_with_rids(v, r, s, l);
+            }
+            fn f32_run_with_rids(&mut self, v: &Float32Array, r: &UInt64Array, s: usize, l: usize) {
+                self.inner.f32_run_with_rids(v, r, s, l);
+            }
         }
 
         let mut adapter = RangeAdapter {

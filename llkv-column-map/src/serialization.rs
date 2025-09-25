@@ -33,6 +33,7 @@ enum PrimType {
     Int8 = 8,
     UInt16 = 9,
     UInt8 = 10,
+    Float64 = 11,
 }
 
 // Re-export convenience helpers from codecs to keep call sites tidy.
@@ -50,6 +51,7 @@ pub fn serialize_array(arr: &dyn Array) -> Result<Vec<u8>> {
         &DataType::UInt16 => serialize_primitive(arr, PrimType::UInt16),
         &DataType::UInt8 => serialize_primitive(arr, PrimType::UInt8),
         &DataType::Float32 => serialize_primitive(arr, PrimType::Float32),
+        &DataType::Float64 => serialize_primitive(arr, PrimType::Float64),
         &DataType::Binary => serialize_varlen(arr, PrimType::Binary),
         &DataType::FixedSizeList(ref child, list_size) => {
             if child.data_type() != &DataType::Float32 {
@@ -191,6 +193,7 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
                 x if x == PrimType::UInt16 as u8 => DataType::UInt16,
                 x if x == PrimType::UInt8 as u8 => DataType::UInt8,
                 x if x == PrimType::Float32 as u8 => DataType::Float32,
+                x if x == PrimType::Float64 as u8 => DataType::Float64,
                 _ => return Err(Error::Internal("unsupported primitive code".into())),
             };
             let data = ArrayData::builder(data_type)

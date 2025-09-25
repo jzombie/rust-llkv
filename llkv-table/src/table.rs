@@ -19,6 +19,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 use crate::expr::{Filter, LiteralCastError, Operator, bound_to_native, literal_to_native};
 use crate::sys_catalog::{CATALOG_TID, ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
+use llkv_expr::literal::FromLiteral;
 
 // TODO: Extract to constants
 /// Default max rows per streamed batch. Tune as needed.
@@ -55,7 +56,7 @@ where
     fn build(op: &Operator<'_>) -> Result<Predicate<T>, TableError>
     where
         T: ArrowPrimitiveType + FilterPrimitive,
-        T::Native: TryFrom<i128> + Copy,
+        T::Native: FromLiteral + Copy,
     {
         match op {
             Operator::Equals(lit) => Ok(Predicate::Equals(literal_to_native::<T::Native>(lit)?)),
@@ -158,7 +159,7 @@ fn collect_matching_row_ids<T, P>(
 ) -> Result<Vec<u64>, TableError>
 where
     T: ArrowPrimitiveType + FilterPrimitive,
-    T::Native: TryFrom<i128> + Copy,
+    T::Native: FromLiteral + Copy,
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     let predicate = Predicate::<T>::build(op)?;
@@ -310,13 +311,6 @@ where
         let filter_lfid = lfid_for(self.table_id, filter.field_id);
         let dtype = self.store.data_type(filter_lfid)?;
 
-        // Build row_ids using the typed predicate path.
-        if matches!(dtype, DataType::Float64 | DataType::Float32) {
-            return Err(TableError::Internal(
-                "Filtering on float columns is not supported".to_string(),
-            ));
-        }
-
         let row_ids = llkv_column_map::with_integer_arrow_type!(
             dtype.clone(),
             |ArrowTy| collect_matching_row_ids::<ArrowTy, P>(&self.store, filter_lfid, &filter.op),
@@ -411,6 +405,14 @@ impl ColumnStoreTestExt for ColumnStore<MemPager> {
                 self.data_type.get_or_insert(DataType::Int32);
                 self.chunks.push(Arc::new(a.clone()));
             }
+            fn f64_chunk(&mut self, a: &arrow::array::Float64Array) {
+                self.data_type.get_or_insert(DataType::Float64);
+                self.chunks.push(Arc::new(a.clone()));
+            }
+            fn f32_chunk(&mut self, a: &arrow::array::Float32Array) {
+                self.data_type.get_or_insert(DataType::Float32);
+                self.chunks.push(Arc::new(a.clone()));
+            }
             // FIX: The trait `PrimitiveVisitor` does not have a `binary_chunk`
             // method. This must be handled by downcasting a generic
             // `array_chunk` if needed, or by adding the method to the trait in
@@ -454,7 +456,8 @@ mod tests {
     use crate::sys_catalog::CATALOG_TID;
     use crate::types::RowId;
     use arrow::array::{
-        BinaryArray, Float64Array, Int16Array, Int32Array, UInt8Array, UInt32Array, UInt64Array,
+        BinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, UInt8Array, UInt32Array,
+        UInt64Array,
     };
     use arrow::compute::{cast, max, min, sum, unary};
     use std::collections::HashMap;
@@ -469,6 +472,8 @@ mod tests {
         const COL_A_U64: FieldId = 10;
         const COL_B_BIN: FieldId = 11;
         const COL_C_I32: FieldId = 12;
+        const COL_D_F64: FieldId = 13;
+        const COL_E_F32: FieldId = 14;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("row_id", DataType::UInt64, false),
@@ -484,6 +489,14 @@ mod tests {
                 "field_id".to_string(),
                 COL_C_I32.to_string(),
             )])),
+            Field::new("d_f64", DataType::Float64, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_D_F64.to_string(),
+            )])),
+            Field::new("e_f32", DataType::Float32, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_E_F32.to_string(),
+            )])),
         ]));
 
         let batch = RecordBatch::try_new(
@@ -498,6 +511,8 @@ mod tests {
                     b"qux",
                 ])),
                 Arc::new(Int32Array::from(vec![10, 20, 30, 20])),
+                Arc::new(Float64Array::from(vec![1.5, 2.5, 3.5, 2.5])),
+                Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 2.0])),
             ],
         )
         .unwrap();
@@ -881,6 +896,59 @@ mod tests {
             .unwrap();
         assert_eq!(mn, Some(10));
         assert_eq!(mx, Some(30));
+    }
+
+    #[test]
+    fn test_filtered_scan_float64_column() {
+        let table = setup_test_table();
+        const COL_D_F64: FieldId = 13;
+
+        let filter = Filter {
+            field_id: COL_D_F64,
+            op: Operator::GreaterThan(2.0_f64.into()),
+        };
+
+        let mut got = Vec::new();
+        table
+            .scan_stream(COL_D_F64, &filter, |b| {
+                let arr = b.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+                for i in 0..arr.len() {
+                    if arr.is_valid(i) {
+                        got.push(arr.value(i));
+                    }
+                }
+            })
+            .unwrap();
+
+        assert_eq!(got, vec![2.5, 3.5, 2.5]);
+    }
+
+    #[test]
+    fn test_filtered_scan_float32_in_operator() {
+        let table = setup_test_table();
+        const COL_E_F32: FieldId = 14;
+
+        let candidates = [2.0_f32.into(), 3.0_f32.into()];
+        let filter = Filter {
+            field_id: COL_E_F32,
+            op: Operator::In(&candidates),
+        };
+
+        let vals = collect_streamed_values::<f32, _>(&table, COL_E_F32, &filter, |b| {
+            let arr = b.column(0).as_any().downcast_ref::<Float32Array>().unwrap();
+            (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i))
+                    }
+                })
+                .collect()
+        });
+
+        let collected: Vec<f32> = vals.into_iter().flatten().collect();
+        assert_eq!(collected, vec![2.0, 3.0, 2.0]);
     }
 
     #[test]

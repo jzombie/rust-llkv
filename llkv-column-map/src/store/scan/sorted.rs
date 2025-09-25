@@ -439,6 +439,127 @@ impl_sorted_dispatch!(
     sorted_visit_with_rids_i8_rev
 );
 
+#[inline]
+fn float_sorted_unsupported() -> Error {
+    Error::Internal("sorted scans are not supported for float dtypes".into())
+}
+
+impl SortedDispatch for arrow::datatypes::Float64Type {
+    fn visit<P, V>(
+        _pager: &P,
+        _metas: &[ChunkMetadata],
+        _blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        _visitor: &mut V,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+        V: PrimitiveSortedVisitor,
+    {
+        Err(float_sorted_unsupported())
+    }
+
+    fn visit_rev<P, V>(
+        _pager: &P,
+        _metas: &[ChunkMetadata],
+        _blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        _visitor: &mut V,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+        V: PrimitiveSortedVisitor,
+    {
+        Err(float_sorted_unsupported())
+    }
+
+    fn visit_with_rids<P, V>(
+        _pager: &P,
+        _metas_val: &[ChunkMetadata],
+        _metas_rid: &[ChunkMetadata],
+        _vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        _rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        _visitor: &mut V,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+        V: PrimitiveSortedWithRowIdsVisitor,
+    {
+        Err(float_sorted_unsupported())
+    }
+
+    fn visit_with_rids_rev<P, V>(
+        _pager: &P,
+        _metas_val: &[ChunkMetadata],
+        _metas_rid: &[ChunkMetadata],
+        _vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        _rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        _visitor: &mut V,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+        V: PrimitiveSortedWithRowIdsVisitor,
+    {
+        Err(float_sorted_unsupported())
+    }
+}
+
+impl SortedDispatch for arrow::datatypes::Float32Type {
+    fn visit<P, V>(
+        _pager: &P,
+        _metas: &[ChunkMetadata],
+        _blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        _visitor: &mut V,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+        V: PrimitiveSortedVisitor,
+    {
+        Err(float_sorted_unsupported())
+    }
+
+    fn visit_rev<P, V>(
+        _pager: &P,
+        _metas: &[ChunkMetadata],
+        _blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        _visitor: &mut V,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+        V: PrimitiveSortedVisitor,
+    {
+        Err(float_sorted_unsupported())
+    }
+
+    fn visit_with_rids<P, V>(
+        _pager: &P,
+        _metas_val: &[ChunkMetadata],
+        _metas_rid: &[ChunkMetadata],
+        _vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        _rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        _visitor: &mut V,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+        V: PrimitiveSortedWithRowIdsVisitor,
+    {
+        Err(float_sorted_unsupported())
+    }
+
+    fn visit_with_rids_rev<P, V>(
+        _pager: &P,
+        _metas_val: &[ChunkMetadata],
+        _metas_rid: &[ChunkMetadata],
+        _vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        _rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        _visitor: &mut V,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+        V: PrimitiveSortedWithRowIdsVisitor,
+    {
+        Err(float_sorted_unsupported())
+    }
+}
+
 macro_rules! sorted_visit_bounds_impl {
     ($name:ident, $ArrTy:ty, $ty:ty, $visit:ident) => {
         fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(

@@ -34,7 +34,7 @@ impl From<&str> for Literal {
 }
 
 /// Error converting a `Literal` into a concrete native type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LiteralCastError {
     /// Tried to coerce a non-integer literal into an integer native type.
     TypeMismatch {
@@ -43,6 +43,8 @@ pub enum LiteralCastError {
     },
     /// Integer value does not fit in the destination type.
     OutOfRange { target: &'static str, value: i128 },
+    /// Float value does not fit in the destination type.
+    FloatOutOfRange { target: &'static str, value: f64 },
 }
 
 impl std::fmt::Display for LiteralCastError {
@@ -54,35 +56,91 @@ impl std::fmt::Display for LiteralCastError {
             LiteralCastError::OutOfRange { target, value } => {
                 write!(f, "value {} out of range for {}", value, target)
             }
+            LiteralCastError::FloatOutOfRange { target, value } => {
+                write!(f, "value {} out of range for {}", value, target)
+            }
         }
     }
 }
 
 impl std::error::Error for LiteralCastError {}
 
-/// Convert a `Literal` into a concrete integer-like native type `T`.
-/// This crate does not depend on Arrow; it only requires `TryFrom<i128>`.
-///
-/// Note: the current implementation only permits integer-like targets.
-/// Calling this with a float/string `Literal` returns `TypeMismatch`.
+/// Helper trait implemented for primitive types that can be produced from a `Literal`.
+pub trait FromLiteral: Sized {
+    fn from_literal(lit: &Literal) -> Result<Self, LiteralCastError>;
+}
+
+macro_rules! impl_from_literal_int {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl FromLiteral for $ty {
+                fn from_literal(lit: &Literal) -> Result<Self, LiteralCastError> {
+                    match lit {
+                        Literal::Integer(i) => <$ty>::try_from(*i).map_err(|_| {
+                            LiteralCastError::OutOfRange {
+                                target: std::any::type_name::<$ty>(),
+                                value: *i,
+                            }
+                        }),
+                        Literal::Float(_) => Err(LiteralCastError::TypeMismatch {
+                            expected: "integer",
+                            got: "float",
+                        }),
+                        Literal::String(_) => Err(LiteralCastError::TypeMismatch {
+                            expected: "integer",
+                            got: "string",
+                        }),
+                    }
+                }
+            }
+        )*
+    };
+}
+
+impl_from_literal_int!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, usize);
+
+impl FromLiteral for f32 {
+    fn from_literal(lit: &Literal) -> Result<Self, LiteralCastError> {
+        let value = match lit {
+            Literal::Float(f) => *f,
+            Literal::Integer(i) => *i as f64,
+            Literal::String(_) => {
+                return Err(LiteralCastError::TypeMismatch {
+                    expected: "float",
+                    got: "string",
+                });
+            }
+        };
+        let cast = value as f32;
+        if value.is_finite() && !cast.is_finite() {
+            return Err(LiteralCastError::FloatOutOfRange {
+                target: "f32",
+                value,
+            });
+        }
+        Ok(cast)
+    }
+}
+
+impl FromLiteral for f64 {
+    fn from_literal(lit: &Literal) -> Result<Self, LiteralCastError> {
+        match lit {
+            Literal::Float(f) => Ok(*f),
+            Literal::Integer(i) => Ok(*i as f64),
+            Literal::String(_) => Err(LiteralCastError::TypeMismatch {
+                expected: "float",
+                got: "string",
+            }),
+        }
+    }
+}
+
+/// Convert a `Literal` into a concrete native type `T`.
 pub fn literal_to_native<T>(lit: &Literal) -> Result<T, LiteralCastError>
 where
-    T: TryFrom<i128> + Copy + 'static,
+    T: FromLiteral + Copy + 'static,
 {
-    match lit {
-        Literal::Integer(i) => T::try_from(*i).map_err(|_| LiteralCastError::OutOfRange {
-            target: std::any::type_name::<T>(),
-            value: *i,
-        }),
-        Literal::Float(_) => Err(LiteralCastError::TypeMismatch {
-            expected: "integer",
-            got: "float",
-        }),
-        Literal::String(_) => Err(LiteralCastError::TypeMismatch {
-            expected: "integer",
-            got: "string",
-        }),
-    }
+    T::from_literal(lit)
 }
 
 /// Convert a bound of `Literal` into a bound of `T::Native`.
@@ -94,7 +152,7 @@ where
 pub fn bound_to_native<T>(bound: &Bound<Literal>) -> Result<Bound<T::Native>, LiteralCastError>
 where
     T: ArrowPrimitiveType,
-    T::Native: TryFrom<i128> + Copy,
+    T::Native: FromLiteral + Copy,
 {
     Ok(match bound {
         Bound::Unbounded => Bound::Unbounded,

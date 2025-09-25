@@ -9,8 +9,8 @@ use crate::store::descriptor::{
 use crate::store::scan::FilterPrimitive;
 use crate::types::{LogicalFieldId, PhysicalKey};
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, PrimitiveArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_empty_array,
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, PrimitiveArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_empty_array,
 };
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::{ArrowPrimitiveType, DataType};
@@ -1641,3 +1641,13 @@ impl_gather_visitor!(arrow::datatypes::Int64Type, Int64Array, i64_chunk_with_rid
 impl_gather_visitor!(arrow::datatypes::Int32Type, Int32Array, i32_chunk_with_rids);
 impl_gather_visitor!(arrow::datatypes::Int16Type, Int16Array, i16_chunk_with_rids);
 impl_gather_visitor!(arrow::datatypes::Int8Type, Int8Array, i8_chunk_with_rids);
+impl_gather_visitor!(
+    arrow::datatypes::Float64Type,
+    Float64Array,
+    f64_chunk_with_rids
+);
+impl_gather_visitor!(
+    arrow::datatypes::Float32Type,
+    Float32Array,
+    f32_chunk_with_rids
+);
