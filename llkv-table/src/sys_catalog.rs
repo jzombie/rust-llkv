@@ -37,7 +37,7 @@ const F_COL_META: u32 = 10; // bytes: bitcode(ColMeta)
 fn lfid(table_id: TableId, col_id: u32) -> LogicalFieldId {
     LogicalFieldId::new()
         .with_namespace(Namespace::UserData)
-        .with_table_id(u32::from(table_id))
+        .with_table_id(table_id)
         .with_field_id(col_id)
 }
 
@@ -45,7 +45,7 @@ fn lfid(table_id: TableId, col_id: u32) -> LogicalFieldId {
 fn rid_table(table_id: TableId) -> u64 {
     let fid = LogicalFieldId::new()
         .with_namespace(Namespace::UserData)
-        .with_table_id(u32::from(table_id))
+        .with_table_id(table_id)
         .with_field_id(0);
     fid.into()
 }

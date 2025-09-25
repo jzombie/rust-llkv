@@ -10,9 +10,9 @@ use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::debug::ColumnStoreDebug;
 use llkv_column_map::store::{ColumnStore, IndexKind};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::{LogicalFieldId, Namespace, TableId};
 
-fn fid(table_id: u32, field_id: u32) -> LogicalFieldId {
+fn fid(table_id: TableId, field_id: u32) -> LogicalFieldId {
     LogicalFieldId::new()
         .with_namespace(Namespace::UserData)
         .with_table_id(table_id)

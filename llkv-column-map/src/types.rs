@@ -13,16 +13,16 @@ use modular_bitfield::prelude::*;
 pub type PhysicalKey = u64;
 
 /// Defines the category of data a `LogicalFieldId` refers to.
-/// This enum uses 3 bits, allowing for up to 8 distinct namespaces.
+/// This enum uses 16 bits, allowing for up to 65,536 distinct namespaces.
 #[derive(Specifier, Debug, PartialEq, Eq, Clone, Copy)]
-#[bits = 3]
+#[bits = 16]
 pub enum Namespace {
     /// Standard user-defined column data.
     UserData = 0,
     /// Internal shadow column for row IDs.
     RowIdShadow = 1,
-    // Up to 8 total namespaces can be added here.
-    Reserved = 7,
+    /// Highest sentinel reserved for future expansion.
+    Reserved = 0xFFFF,
 }
 
 /// A namespaced logical identifier for a column.
@@ -35,15 +35,15 @@ pub enum Namespace {
 pub struct LogicalFieldId {
     /// The specific field/column within a table (up to ~4.3 billion).
     pub field_id: B32,
-    /// The table this field belongs to (up to ~536 million).
-    pub table_id: B29,
-    /// The type of data this ID represents (e.g., user data, shadow row ID).
+    /// The table this field belongs to (up to 65,535).
+    pub table_id: B16,
+    /// The type of data this ID represents (up to 65,536 namespaces).
     pub namespace: Namespace,
 }
 
 /// Identifier for a logical table within a [`Namespace`].
 ///
-/// `TableId` consumes the middle 29 bits inside [`LogicalFieldId`]. Using a
+/// `TableId` consumes the middle 16 bits inside [`LogicalFieldId`]. Using a
 /// `u16` keeps IDs compact and (more importantly) guarantees they always fit in
 /// that bitfield without extra checks.
 pub type TableId = u16;

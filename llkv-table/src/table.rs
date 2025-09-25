@@ -165,7 +165,7 @@ where
 #[inline]
 fn lfid_for(table_id: TableId, column_id: FieldId) -> LogicalFieldId {
     LogicalFieldId::new()
-        .with_table_id(u32::from(table_id))
+        .with_table_id(table_id)
         .with_field_id(column_id)
         .with_namespace(Namespace::UserData)
 }
