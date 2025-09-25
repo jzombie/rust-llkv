@@ -57,6 +57,7 @@ pub struct TableMeta {
     pub epoch: u64,
 }
 
+// TODO: Remove this entirely; Don't maintain a separate type system; Derive from native Arrow type
 #[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
 pub enum ColType {
     Bytes,
