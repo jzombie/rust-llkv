@@ -940,7 +940,6 @@ dependencies = [
  "llkv-result",
  "llkv-storage",
  "modular-bitfield",
- "num_enum",
  "rand",
  "roaring",
  "rustc-hash",
@@ -969,8 +968,10 @@ dependencies = [
 name = "llkv-storage"
 version = "0.1.0-alpha"
 dependencies = [
+ "arrow",
  "llkv-result",
  "llkv-storage",
+ "num_enum",
  "rustc-hash",
  "simd-r-drive",
  "simd-r-drive-entry-handle",

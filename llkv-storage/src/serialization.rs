@@ -1,5 +1,3 @@
-// TODO: Migrate to storage
-
 //! Zero-copy array persistence for fixed/var width Arrow arrays used by the
 //! store.
 //!

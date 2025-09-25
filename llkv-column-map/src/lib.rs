@@ -1,6 +1,15 @@
-pub mod serialization;
 pub mod store;
 pub mod types;
+
+pub use llkv_result::{Error, Result};
+pub use store::{
+    ColumnStore, IndexKind,
+    scan::{self, ScanBuilder},
+};
+
+pub mod debug {
+    pub use super::store::debug::*;
+}
 
 #[macro_export]
 macro_rules! with_integer_arrow_type {
@@ -49,16 +58,4 @@ macro_rules! with_integer_arrow_type {
             _ => $unsupported,
         }
     }};
-}
-
-mod codecs;
-
-pub use llkv_result::{Error, Result};
-pub use store::{
-    ColumnStore, IndexKind,
-    scan::{self, ScanBuilder},
-};
-
-pub mod debug {
-    pub use super::store::debug::*;
 }
