@@ -17,18 +17,20 @@ use llkv_column_map::{
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::expr::{Filter, LiteralCastError, Operator, bound_to_native, literal_to_native};
-use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta, CATALOG_TID};
+use crate::sys_catalog::{CATALOG_TID, ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
 
 // TODO: Extract to constants
 /// Default max rows per streamed batch. Tune as needed.
 const STREAM_BATCH_ROWS: usize = 8192;
 
+// TODO: Move to `llkv-expr`?
 enum RangeLimit<T> {
     Included(T),
     Excluded(T),
 }
 
+// TODO: Move to `llkv-expr`?
 enum Predicate<T>
 where
     T: ArrowPrimitiveType + FilterPrimitive,
@@ -50,6 +52,61 @@ impl<T> Predicate<T>
 where
     T: ArrowPrimitiveType + FilterPrimitive,
 {
+    fn build(op: &Operator<'_>) -> Result<Predicate<T>, TableError>
+    where
+        T: ArrowPrimitiveType + FilterPrimitive,
+        T::Native: TryFrom<i128> + Copy,
+    {
+        match op {
+            Operator::Equals(lit) => Ok(Predicate::Equals(literal_to_native::<T::Native>(lit)?)),
+            Operator::GreaterThan(lit) => {
+                Ok(Predicate::GreaterThan(literal_to_native::<T::Native>(lit)?))
+            }
+            Operator::GreaterThanOrEquals(lit) => {
+                Ok(Predicate::GreaterThanOrEquals(literal_to_native::<
+                    T::Native,
+                >(lit)?))
+            }
+            Operator::LessThan(lit) => {
+                Ok(Predicate::LessThan(literal_to_native::<T::Native>(lit)?))
+            }
+            Operator::LessThanOrEquals(lit) => Ok(Predicate::LessThanOrEquals(
+                literal_to_native::<T::Native>(lit)?,
+            )),
+            Operator::Range { lower, upper } => {
+                let lb = match bound_to_native::<T>(lower)? {
+                    Bound::Unbounded => None,
+                    Bound::Included(v) => Some(RangeLimit::Included(v)),
+                    Bound::Excluded(v) => Some(RangeLimit::Excluded(v)),
+                };
+                let ub = match bound_to_native::<T>(upper)? {
+                    Bound::Unbounded => None,
+                    Bound::Included(v) => Some(RangeLimit::Included(v)),
+                    Bound::Excluded(v) => Some(RangeLimit::Excluded(v)),
+                };
+                if lb.is_none() && ub.is_none() {
+                    Ok(Predicate::All)
+                } else {
+                    Ok(Predicate::Range {
+                        lower: lb,
+                        upper: ub,
+                    })
+                }
+            }
+            Operator::In(values) => {
+                let mut natives = Vec::with_capacity(values.len());
+                for lit in *values {
+                    natives.push(literal_to_native::<T::Native>(lit)?);
+                }
+                Ok(Predicate::In(natives))
+            }
+            // Pattern/string ops are not supported in this numeric predicate path.
+            _ => Err(TableError::Internal(
+                "Filter operator does not contain a supported typed value".to_string(),
+            )),
+        }
+    }
+
     fn matches(&self, value: T::Native) -> bool {
         match self {
             Predicate::All => true,
@@ -94,59 +151,6 @@ where
     }
 }
 
-fn build_predicate<T>(op: &Operator<'_>) -> Result<Predicate<T>, TableError>
-where
-    T: ArrowPrimitiveType + FilterPrimitive,
-    T::Native: TryFrom<i128> + Copy,
-{
-    match op {
-        Operator::Equals(lit) => Ok(Predicate::Equals(literal_to_native::<T::Native>(lit)?)),
-        Operator::GreaterThan(lit) => {
-            Ok(Predicate::GreaterThan(literal_to_native::<T::Native>(lit)?))
-        }
-        Operator::GreaterThanOrEquals(lit) => {
-            Ok(Predicate::GreaterThanOrEquals(literal_to_native::<
-                T::Native,
-            >(lit)?))
-        }
-        Operator::LessThan(lit) => Ok(Predicate::LessThan(literal_to_native::<T::Native>(lit)?)),
-        Operator::LessThanOrEquals(lit) => Ok(Predicate::LessThanOrEquals(literal_to_native::<
-            T::Native,
-        >(lit)?)),
-        Operator::Range { lower, upper } => {
-            let lb = match bound_to_native::<T>(lower)? {
-                Bound::Unbounded => None,
-                Bound::Included(v) => Some(RangeLimit::Included(v)),
-                Bound::Excluded(v) => Some(RangeLimit::Excluded(v)),
-            };
-            let ub = match bound_to_native::<T>(upper)? {
-                Bound::Unbounded => None,
-                Bound::Included(v) => Some(RangeLimit::Included(v)),
-                Bound::Excluded(v) => Some(RangeLimit::Excluded(v)),
-            };
-            if lb.is_none() && ub.is_none() {
-                Ok(Predicate::All)
-            } else {
-                Ok(Predicate::Range {
-                    lower: lb,
-                    upper: ub,
-                })
-            }
-        }
-        Operator::In(values) => {
-            let mut natives = Vec::with_capacity(values.len());
-            for lit in *values {
-                natives.push(literal_to_native::<T::Native>(lit)?);
-            }
-            Ok(Predicate::In(natives))
-        }
-        // Pattern/string ops are not supported in this numeric predicate path.
-        _ => Err(TableError::Internal(
-            "Filter operator does not contain a supported typed value".to_string(),
-        )),
-    }
-}
-
 fn collect_matching_row_ids<T, P>(
     store: &ColumnStore<P>,
     field_id: LogicalFieldId,
@@ -157,7 +161,7 @@ where
     T::Native: TryFrom<i128> + Copy,
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    let predicate = build_predicate::<T>(op)?;
+    let predicate = Predicate::<T>::build(op)?;
     store
         .filter_row_ids::<T, _>(field_id, move |value| predicate.matches(value))
         .map_err(TableError::from)
