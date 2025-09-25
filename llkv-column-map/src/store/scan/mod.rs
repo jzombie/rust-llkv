@@ -15,7 +15,6 @@ use std::ops::{Bound, RangeBounds};
 
 use arrow::array::*;
 use arrow::compute;
-use arrow::datatypes::DataType;
 
 use rustc_hash::FxHashMap;
 
@@ -124,33 +123,18 @@ where
                 .ok_or(Error::NotFound)?
                 .clone(),
         )?;
-        match first_any.data_type() {
-            DataType::UInt64 => {
-                crate::store::scan::sorted_visit_u64(self.pager.as_ref(), &metas, &blobs, visitor)
-            }
-            DataType::UInt32 => {
-                crate::store::scan::sorted_visit_u32(self.pager.as_ref(), &metas, &blobs, visitor)
-            }
-            DataType::UInt16 => {
-                crate::store::scan::sorted_visit_u16(self.pager.as_ref(), &metas, &blobs, visitor)
-            }
-            DataType::UInt8 => {
-                crate::store::scan::sorted_visit_u8(self.pager.as_ref(), &metas, &blobs, visitor)
-            }
-            DataType::Int64 => {
-                crate::store::scan::sorted_visit_i64(self.pager.as_ref(), &metas, &blobs, visitor)
-            }
-            DataType::Int32 => {
-                crate::store::scan::sorted_visit_i32(self.pager.as_ref(), &metas, &blobs, visitor)
-            }
-            DataType::Int16 => {
-                crate::store::scan::sorted_visit_i16(self.pager.as_ref(), &metas, &blobs, visitor)
-            }
-            DataType::Int8 => {
-                crate::store::scan::sorted_visit_i8(self.pager.as_ref(), &metas, &blobs, visitor)
-            }
-            _ => Err(Error::Internal("unsupported sorted dtype".into())),
-        }
+        crate::with_integer_arrow_type!(
+            first_any.data_type().clone(),
+            |ArrowTy| {
+                <ArrowTy as sorted::SortedDispatch>::visit(
+                    self.pager.as_ref(),
+                    &metas,
+                    &blobs,
+                    visitor,
+                )
+            },
+            Err(Error::Internal("unsupported sorted dtype".into())),
+        )
     }
 
     /// Sorted scan in reverse (descending) with typed visitor callbacks.
@@ -211,57 +195,18 @@ where
                 .ok_or(Error::NotFound)?
                 .clone(),
         )?;
-        match first_any.data_type() {
-            DataType::UInt64 => crate::store::scan::sorted_visit_u64_rev(
-                self.pager.as_ref(),
-                &metas,
-                &blobs,
-                visitor,
-            ),
-            DataType::UInt32 => crate::store::scan::sorted_visit_u32_rev(
-                self.pager.as_ref(),
-                &metas,
-                &blobs,
-                visitor,
-            ),
-            DataType::UInt16 => crate::store::scan::sorted_visit_u16_rev(
-                self.pager.as_ref(),
-                &metas,
-                &blobs,
-                visitor,
-            ),
-            DataType::UInt8 => crate::store::scan::sorted_visit_u8_rev(
-                self.pager.as_ref(),
-                &metas,
-                &blobs,
-                visitor,
-            ),
-            DataType::Int64 => crate::store::scan::sorted_visit_i64_rev(
-                self.pager.as_ref(),
-                &metas,
-                &blobs,
-                visitor,
-            ),
-            DataType::Int32 => crate::store::scan::sorted_visit_i32_rev(
-                self.pager.as_ref(),
-                &metas,
-                &blobs,
-                visitor,
-            ),
-            DataType::Int16 => crate::store::scan::sorted_visit_i16_rev(
-                self.pager.as_ref(),
-                &metas,
-                &blobs,
-                visitor,
-            ),
-            DataType::Int8 => crate::store::scan::sorted_visit_i8_rev(
-                self.pager.as_ref(),
-                &metas,
-                &blobs,
-                visitor,
-            ),
-            _ => Err(Error::Internal("unsupported sorted dtype".into())),
-        }
+        crate::with_integer_arrow_type!(
+            first_any.data_type().clone(),
+            |ArrowTy| {
+                <ArrowTy as sorted::SortedDispatch>::visit_rev(
+                    self.pager.as_ref(),
+                    &metas,
+                    &blobs,
+                    visitor,
+                )
+            },
+            Err(Error::Internal("unsupported sorted dtype".into())),
+        )
     }
 
     /// Unified scan entrypoint configured by ScanOptions.
@@ -444,73 +389,20 @@ where
                         opts.limit,
                         true,
                     );
-                    let vals_res = match first_any.data_type() {
-                        DataType::UInt64 => sorted_visit_with_rids_u64_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            &mut pv,
-                        ),
-                        DataType::UInt32 => sorted_visit_with_rids_u32_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            &mut pv,
-                        ),
-                        DataType::UInt16 => sorted_visit_with_rids_u16_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            &mut pv,
-                        ),
-                        DataType::UInt8 => sorted_visit_with_rids_u8_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            &mut pv,
-                        ),
-                        DataType::Int64 => sorted_visit_with_rids_i64_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            &mut pv,
-                        ),
-                        DataType::Int32 => sorted_visit_with_rids_i32_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            &mut pv,
-                        ),
-                        DataType::Int16 => sorted_visit_with_rids_i16_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            &mut pv,
-                        ),
-                        DataType::Int8 => sorted_visit_with_rids_i8_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            &mut pv,
-                        ),
-                        _ => Err(Error::Internal("unsupported sorted dtype".into())),
-                    };
+                    let vals_res = crate::with_integer_arrow_type!(
+                        first_any.data_type().clone(),
+                        |ArrowTy| {
+                            <ArrowTy as sorted::SortedDispatch>::visit_with_rids_rev(
+                                self.pager.as_ref(),
+                                &metas_val,
+                                &metas_rid,
+                                &vblobs,
+                                &rblobs,
+                                &mut pv,
+                            )
+                        },
+                        Err(Error::Internal("unsupported sorted dtype".into())),
+                    );
                     if opts.include_nulls {
                         let anchor_fid = opts.anchor_row_id_field.unwrap_or(row_fid);
                         let catalog = self.catalog.read().unwrap();
@@ -717,144 +609,38 @@ where
                         vals_res
                     }
                 } else {
-                    match first_any.data_type() {
-                        DataType::UInt64 => sorted_visit_with_rids_u64_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::UInt32 => sorted_visit_with_rids_u32_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::UInt16 => sorted_visit_with_rids_u16_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::UInt8 => sorted_visit_with_rids_u8_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::Int64 => sorted_visit_with_rids_i64_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::Int32 => sorted_visit_with_rids_i32_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::Int16 => sorted_visit_with_rids_i16_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        DataType::Int8 => sorted_visit_with_rids_i8_rev(
-                            self.pager.as_ref(),
-                            &metas_val,
-                            &metas_rid,
-                            &vblobs,
-                            &rblobs,
-                            visitor,
-                        ),
-                        _ => Err(Error::Internal("unsupported sorted dtype".into())),
-                    }
+                    crate::with_integer_arrow_type!(
+                        first_any.data_type().clone(),
+                        |ArrowTy| {
+                            <ArrowTy as sorted::SortedDispatch>::visit_with_rids_rev(
+                                self.pager.as_ref(),
+                                &metas_val,
+                                &metas_rid,
+                                &vblobs,
+                                &rblobs,
+                                visitor,
+                            )
+                        },
+                        Err(Error::Internal("unsupported sorted dtype".into())),
+                    )
                 }
             } else if paginate {
                 let mut pv =
                     crate::store::scan::PaginateVisitor::new(visitor, opts.offset, opts.limit);
-                let vals_res = match first_any.data_type() {
-                    DataType::UInt64 => sorted_visit_with_rids_u64(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        &mut pv,
-                    ),
-                    DataType::UInt32 => sorted_visit_with_rids_u32(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        &mut pv,
-                    ),
-                    DataType::UInt16 => sorted_visit_with_rids_u16(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        &mut pv,
-                    ),
-                    DataType::UInt8 => sorted_visit_with_rids_u8(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        &mut pv,
-                    ),
-                    DataType::Int64 => sorted_visit_with_rids_i64(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        &mut pv,
-                    ),
-                    DataType::Int32 => sorted_visit_with_rids_i32(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        &mut pv,
-                    ),
-                    DataType::Int16 => sorted_visit_with_rids_i16(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        &mut pv,
-                    ),
-                    DataType::Int8 => sorted_visit_with_rids_i8(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        &mut pv,
-                    ),
-                    _ => Err(Error::Internal("unsupported sorted dtype".into())),
-                };
+                let vals_res = crate::with_integer_arrow_type!(
+                    first_any.data_type().clone(),
+                    |ArrowTy| {
+                        <ArrowTy as sorted::SortedDispatch>::visit_with_rids(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            &mut pv,
+                        )
+                    },
+                    Err(Error::Internal("unsupported sorted dtype".into())),
+                );
                 if opts.include_nulls {
                     // nulls_first not meaningful without with_row_ids
                     let anchor_fid = opts.anchor_row_id_field.unwrap_or(row_fid);
@@ -1151,142 +937,36 @@ where
                 }
                 flush(&mut buf)?;
                 // Then emit values
-                match first_any.data_type() {
-                    DataType::UInt64 => sorted_visit_with_rids_u64(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::UInt32 => sorted_visit_with_rids_u32(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::UInt16 => sorted_visit_with_rids_u16(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::UInt8 => sorted_visit_with_rids_u8(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int64 => sorted_visit_with_rids_i64(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int32 => sorted_visit_with_rids_i32(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int16 => sorted_visit_with_rids_i16(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int8 => sorted_visit_with_rids_i8(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    _ => Err(Error::Internal("unsupported sorted dtype".into())),
-                }
+                crate::with_integer_arrow_type!(
+                    first_any.data_type().clone(),
+                    |ArrowTy| {
+                        <ArrowTy as sorted::SortedDispatch>::visit_with_rids(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        )
+                    },
+                    Err(Error::Internal("unsupported sorted dtype".into())),
+                )
             } else {
                 // Values first
-                let res = match first_any.data_type() {
-                    DataType::UInt64 => sorted_visit_with_rids_u64(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::UInt32 => sorted_visit_with_rids_u32(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::UInt16 => sorted_visit_with_rids_u16(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::UInt8 => sorted_visit_with_rids_u8(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int64 => sorted_visit_with_rids_i64(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int32 => sorted_visit_with_rids_i32(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int16 => sorted_visit_with_rids_i16(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    DataType::Int8 => sorted_visit_with_rids_i8(
-                        self.pager.as_ref(),
-                        &metas_val,
-                        &metas_rid,
-                        &vblobs,
-                        &rblobs,
-                        visitor,
-                    ),
-                    _ => Err(Error::Internal("unsupported sorted dtype".into())),
-                };
+                let res = crate::with_integer_arrow_type!(
+                    first_any.data_type().clone(),
+                    |ArrowTy| {
+                        <ArrowTy as sorted::SortedDispatch>::visit_with_rids(
+                            self.pager.as_ref(),
+                            &metas_val,
+                            &metas_rid,
+                            &vblobs,
+                            &rblobs,
+                            visitor,
+                        )
+                    },
+                    Err(Error::Internal("unsupported sorted dtype".into())),
+                );
                 if opts.include_nulls {
                     res?;
                     let anchor_fid = opts.anchor_row_id_field.ok_or_else(|| {

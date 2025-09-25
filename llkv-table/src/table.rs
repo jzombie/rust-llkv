@@ -3,7 +3,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int32Array, RecordBatch, UInt64Array};
-use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Int32Type, Schema, UInt64Type};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
 use llkv_column_map::store::FilterPrimitive;
 use llkv_column_map::{
@@ -276,56 +276,20 @@ impl Table {
         let dtype = self.store.data_type(filter_lfid)?;
 
         // Build row_ids using the typed predicate path.
-        let row_ids = match dtype {
-            DataType::UInt64 => {
-                collect_matching_row_ids::<UInt64Type>(&self.store, filter_lfid, &filter.op)?
-            }
-            DataType::UInt32 => collect_matching_row_ids::<arrow::datatypes::UInt32Type>(
-                &self.store,
-                filter_lfid,
-                &filter.op,
-            )?,
-            DataType::UInt16 => collect_matching_row_ids::<arrow::datatypes::UInt16Type>(
-                &self.store,
-                filter_lfid,
-                &filter.op,
-            )?,
-            DataType::UInt8 => collect_matching_row_ids::<arrow::datatypes::UInt8Type>(
-                &self.store,
-                filter_lfid,
-                &filter.op,
-            )?,
-            DataType::Int64 => collect_matching_row_ids::<arrow::datatypes::Int64Type>(
-                &self.store,
-                filter_lfid,
-                &filter.op,
-            )?,
-            DataType::Int32 => {
-                collect_matching_row_ids::<Int32Type>(&self.store, filter_lfid, &filter.op)?
-            }
-            DataType::Int16 => collect_matching_row_ids::<arrow::datatypes::Int16Type>(
-                &self.store,
-                filter_lfid,
-                &filter.op,
-            )?,
-            DataType::Int8 => collect_matching_row_ids::<arrow::datatypes::Int8Type>(
-                &self.store,
-                filter_lfid,
-                &filter.op,
-            )?,
-            // Float types are not supported by FilterPrimitive in column-map.
-            DataType::Float64 | DataType::Float32 => {
-                return Err(TableError::Internal(
-                    "Filtering on float columns is not supported".to_string(),
-                ));
-            }
-            other => {
-                return Err(TableError::Internal(format!(
-                    "Filtering on type {:?} is not supported",
-                    other
-                )));
-            }
-        };
+        if matches!(dtype, DataType::Float64 | DataType::Float32) {
+            return Err(TableError::Internal(
+                "Filtering on float columns is not supported".to_string(),
+            ));
+        }
+
+        let row_ids = llkv_column_map::with_integer_arrow_type!(
+            dtype.clone(),
+            |ArrowTy| collect_matching_row_ids::<ArrowTy>(&self.store, filter_lfid, &filter.op),
+            Err(TableError::Internal(format!(
+                "Filtering on type {:?} is not supported",
+                dtype
+            ))),
+        )?;
 
         // If nothing matches, emit nothing.
         if row_ids.is_empty() {

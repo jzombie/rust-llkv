@@ -1,5 +1,6 @@
 use super::*;
 use crate::types::Namespace;
+use arrow::datatypes::{ArrowPrimitiveType, DataType};
 
 macro_rules! sorted_visit_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident) => {
@@ -267,6 +268,175 @@ sorted_with_rids_impl!(
     sorted_visit_with_rids_i8_rev,
     Int8Array,
     i8_run_with_rids
+);
+
+pub(crate) trait SortedDispatch: ArrowPrimitiveType {
+    fn visit<P, V>(
+        pager: &P,
+        metas: &[ChunkMetadata],
+        blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        visitor: &mut V,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+        V: PrimitiveSortedVisitor;
+
+    fn visit_rev<P, V>(
+        pager: &P,
+        metas: &[ChunkMetadata],
+        blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        visitor: &mut V,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+        V: PrimitiveSortedVisitor;
+
+    fn visit_with_rids<P, V>(
+        pager: &P,
+        metas_val: &[ChunkMetadata],
+        metas_rid: &[ChunkMetadata],
+        vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        visitor: &mut V,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+        V: PrimitiveSortedWithRowIdsVisitor;
+
+    fn visit_with_rids_rev<P, V>(
+        pager: &P,
+        metas_val: &[ChunkMetadata],
+        metas_rid: &[ChunkMetadata],
+        vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        visitor: &mut V,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+        V: PrimitiveSortedWithRowIdsVisitor;
+}
+
+macro_rules! impl_sorted_dispatch {
+    ($ty:ty, $visit:ident, $visit_rev:ident, $with_rids:ident, $with_rids_rev:ident) => {
+        impl SortedDispatch for $ty {
+            #[inline]
+            fn visit<P, V>(
+                pager: &P,
+                metas: &[ChunkMetadata],
+                blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+                visitor: &mut V,
+            ) -> Result<()>
+            where
+                P: Pager<Blob = EntryHandle>,
+                V: PrimitiveSortedVisitor,
+            {
+                $visit(pager, metas, blobs, visitor)
+            }
+
+            #[inline]
+            fn visit_rev<P, V>(
+                pager: &P,
+                metas: &[ChunkMetadata],
+                blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+                visitor: &mut V,
+            ) -> Result<()>
+            where
+                P: Pager<Blob = EntryHandle>,
+                V: PrimitiveSortedVisitor,
+            {
+                $visit_rev(pager, metas, blobs, visitor)
+            }
+
+            #[inline]
+            fn visit_with_rids<P, V>(
+                pager: &P,
+                metas_val: &[ChunkMetadata],
+                metas_rid: &[ChunkMetadata],
+                vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+                rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+                visitor: &mut V,
+            ) -> Result<()>
+            where
+                P: Pager<Blob = EntryHandle>,
+                V: PrimitiveSortedWithRowIdsVisitor,
+            {
+                $with_rids(pager, metas_val, metas_rid, vblobs, rblobs, visitor)
+            }
+
+            #[inline]
+            fn visit_with_rids_rev<P, V>(
+                pager: &P,
+                metas_val: &[ChunkMetadata],
+                metas_rid: &[ChunkMetadata],
+                vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+                rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+                visitor: &mut V,
+            ) -> Result<()>
+            where
+                P: Pager<Blob = EntryHandle>,
+                V: PrimitiveSortedWithRowIdsVisitor,
+            {
+                $with_rids_rev(pager, metas_val, metas_rid, vblobs, rblobs, visitor)
+            }
+        }
+    };
+}
+
+impl_sorted_dispatch!(
+    arrow::datatypes::UInt64Type,
+    sorted_visit_u64,
+    sorted_visit_u64_rev,
+    sorted_visit_with_rids_u64,
+    sorted_visit_with_rids_u64_rev
+);
+impl_sorted_dispatch!(
+    arrow::datatypes::UInt32Type,
+    sorted_visit_u32,
+    sorted_visit_u32_rev,
+    sorted_visit_with_rids_u32,
+    sorted_visit_with_rids_u32_rev
+);
+impl_sorted_dispatch!(
+    arrow::datatypes::UInt16Type,
+    sorted_visit_u16,
+    sorted_visit_u16_rev,
+    sorted_visit_with_rids_u16,
+    sorted_visit_with_rids_u16_rev
+);
+impl_sorted_dispatch!(
+    arrow::datatypes::UInt8Type,
+    sorted_visit_u8,
+    sorted_visit_u8_rev,
+    sorted_visit_with_rids_u8,
+    sorted_visit_with_rids_u8_rev
+);
+impl_sorted_dispatch!(
+    arrow::datatypes::Int64Type,
+    sorted_visit_i64,
+    sorted_visit_i64_rev,
+    sorted_visit_with_rids_i64,
+    sorted_visit_with_rids_i64_rev
+);
+impl_sorted_dispatch!(
+    arrow::datatypes::Int32Type,
+    sorted_visit_i32,
+    sorted_visit_i32_rev,
+    sorted_visit_with_rids_i32,
+    sorted_visit_with_rids_i32_rev
+);
+impl_sorted_dispatch!(
+    arrow::datatypes::Int16Type,
+    sorted_visit_i16,
+    sorted_visit_i16_rev,
+    sorted_visit_with_rids_i16,
+    sorted_visit_with_rids_i16_rev
+);
+impl_sorted_dispatch!(
+    arrow::datatypes::Int8Type,
+    sorted_visit_i8,
+    sorted_visit_i8_rev,
+    sorted_visit_with_rids_i8,
+    sorted_visit_with_rids_i8_rev
 );
 
 macro_rules! sorted_visit_bounds_impl {

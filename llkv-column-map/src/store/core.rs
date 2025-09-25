@@ -89,52 +89,16 @@ where
             }
         }
 
-        match dtype {
-            DataType::UInt64 => self.gather_rows_primitive::<arrow::datatypes::UInt64Type>(
-                field_id,
-                &row_index,
-                row_ids.len(),
-            ),
-            DataType::UInt32 => self.gather_rows_primitive::<arrow::datatypes::UInt32Type>(
-                field_id,
-                &row_index,
-                row_ids.len(),
-            ),
-            DataType::UInt16 => self.gather_rows_primitive::<arrow::datatypes::UInt16Type>(
-                field_id,
-                &row_index,
-                row_ids.len(),
-            ),
-            DataType::UInt8 => self.gather_rows_primitive::<arrow::datatypes::UInt8Type>(
-                field_id,
-                &row_index,
-                row_ids.len(),
-            ),
-            DataType::Int64 => self.gather_rows_primitive::<arrow::datatypes::Int64Type>(
-                field_id,
-                &row_index,
-                row_ids.len(),
-            ),
-            DataType::Int32 => self.gather_rows_primitive::<arrow::datatypes::Int32Type>(
-                field_id,
-                &row_index,
-                row_ids.len(),
-            ),
-            DataType::Int16 => self.gather_rows_primitive::<arrow::datatypes::Int16Type>(
-                field_id,
-                &row_index,
-                row_ids.len(),
-            ),
-            DataType::Int8 => self.gather_rows_primitive::<arrow::datatypes::Int8Type>(
-                field_id,
-                &row_index,
-                row_ids.len(),
-            ),
-            other => Err(Error::Internal(format!(
+        crate::with_integer_arrow_type!(
+            dtype.clone(),
+            |ArrowTy| {
+                self.gather_rows_primitive::<ArrowTy>(field_id, &row_index, row_ids.len())
+            },
+            Err(Error::Internal(format!(
                 "gather_rows: unsupported dtype {:?}",
-                other
+                dtype
             ))),
-        }
+        )
     }
 
     fn gather_rows_primitive<T>(
