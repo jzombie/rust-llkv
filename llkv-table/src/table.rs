@@ -1,4 +1,5 @@
 use std::cmp;
+use std::fmt;
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -16,7 +17,7 @@ use llkv_column_map::{
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::expr::{Filter, LiteralCastError, Operator, bound_to_native, literal_to_native};
-use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
+use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta, CATALOG_TID};
 use crate::types::FieldId;
 
 // TODO: Extract to constants
@@ -175,7 +176,34 @@ pub enum TableError {
     ColumnMap(llkv_column_map::error::Error),
     Arrow(arrow::error::ArrowError),
     ExprCast(LiteralCastError),
+    ReservedTableId(TableId),
     Internal(String),
+}
+
+impl fmt::Display for TableError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TableError::ColumnMap(err) => write!(f, "column map error: {err}"),
+            TableError::Arrow(err) => write!(f, "arrow error: {err}"),
+            TableError::ExprCast(err) => write!(f, "expression cast error: {err}"),
+            TableError::ReservedTableId(table_id) => {
+                write!(f, "table id {table_id} is reserved for system catalogs")
+            }
+            TableError::Internal(msg) => write!(f, "internal table error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for TableError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TableError::ColumnMap(err) => Some(err),
+            TableError::Arrow(err) => Some(err),
+            TableError::ExprCast(err) => Some(err),
+            TableError::ReservedTableId(_) => None,
+            TableError::Internal(_) => None,
+        }
+    }
 }
 
 impl From<llkv_column_map::error::Error> for TableError {
@@ -208,10 +236,13 @@ impl<P> Table<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    // TODO: Ensure this errors if using a reserved `table_id`
-    pub fn new(table_id: TableId, pager: Arc<P>) -> Self {
-        let store = ColumnStore::open(pager).unwrap();
-        Self { store, table_id }
+    pub fn new(table_id: TableId, pager: Arc<P>) -> Result<Self, TableError> {
+        if table_id == CATALOG_TID {
+            return Err(TableError::ReservedTableId(table_id));
+        }
+
+        let store = ColumnStore::open(pager)?;
+        Ok(Self { store, table_id })
     }
 
     pub fn append(&self, batch: &RecordBatch) -> Result<(), llkv_column_map::error::Error> {
@@ -416,6 +447,7 @@ impl ColumnStoreTestExt for ColumnStore<MemPager> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sys_catalog::CATALOG_TID;
     use crate::types::RowId;
     use arrow::array::{
         BinaryArray, Float64Array, Int16Array, Int32Array, UInt8Array, UInt32Array, UInt64Array,
@@ -429,7 +461,7 @@ mod tests {
     }
 
     fn setup_test_table_with_pager(pager: &Arc<MemPager>) -> Table {
-        let table = Table::new(1, Arc::clone(pager));
+        let table = Table::new(1, Arc::clone(pager)).unwrap();
         const COL_A_U64: FieldId = 10;
         const COL_B_BIN: FieldId = 11;
         const COL_C_I32: FieldId = 12;
@@ -493,6 +525,15 @@ mod tests {
     }
 
     #[test]
+    fn table_new_rejects_reserved_table_id() {
+        let result = Table::new(CATALOG_TID, Arc::new(MemPager::default()));
+        assert!(matches!(
+            result,
+            Err(TableError::ReservedTableId(id)) if id == CATALOG_TID
+        ));
+    }
+
+    #[test]
     fn test_scan_with_u64_filter() {
         let table = setup_test_table();
         const COL_A_U64: FieldId = 10;
@@ -542,7 +583,7 @@ mod tests {
 
         // First session: create tables and write data.
         {
-            let table = Table::new(TABLE_ALPHA, Arc::clone(&pager));
+            let table = Table::new(TABLE_ALPHA, Arc::clone(&pager)).unwrap();
             let schema =
                 Arc::new(Schema::new(vec![
                     Field::new("row_id", DataType::UInt64, false),
@@ -574,7 +615,7 @@ mod tests {
         }
 
         {
-            let table = Table::new(TABLE_BETA, Arc::clone(&pager));
+            let table = Table::new(TABLE_BETA, Arc::clone(&pager)).unwrap();
             let schema = Arc::new(Schema::new(vec![
                 Field::new("row_id", DataType::UInt64, false),
                 Field::new("beta_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
@@ -599,7 +640,7 @@ mod tests {
         }
 
         {
-            let table = Table::new(TABLE_GAMMA, Arc::clone(&pager));
+            let table = Table::new(TABLE_GAMMA, Arc::clone(&pager)).unwrap();
             let schema = Arc::new(Schema::new(vec![
                 Field::new("row_id", DataType::UInt64, false),
                 Field::new("gamma_i16", DataType::Int16, false).with_metadata(HashMap::from([(
@@ -620,7 +661,7 @@ mod tests {
 
         // Second session: reopen each table and ensure schema and values are intact.
         {
-            let table = Table::new(TABLE_ALPHA, Arc::clone(&pager));
+            let table = Table::new(TABLE_ALPHA, Arc::clone(&pager)).unwrap();
             let store = table.store();
 
             let expectations: &[(FieldId, DataType)] = &[
@@ -657,7 +698,7 @@ mod tests {
         }
 
         {
-            let table = Table::new(TABLE_BETA, Arc::clone(&pager));
+            let table = Table::new(TABLE_BETA, Arc::clone(&pager)).unwrap();
             let store = table.store();
 
             let lfid_u64 = lfid_for(TABLE_BETA, COL_BETA_U64);
@@ -674,7 +715,7 @@ mod tests {
         }
 
         {
-            let table = Table::new(TABLE_GAMMA, Arc::clone(&pager));
+            let table = Table::new(TABLE_GAMMA, Arc::clone(&pager)).unwrap();
             let store = table.store();
             let lfid = lfid_for(TABLE_GAMMA, COL_GAMMA_I16);
             assert_eq!(store.data_type(lfid).unwrap(), DataType::Int16);
@@ -886,7 +927,7 @@ mod tests {
         //   streaming. No concat or whole-column materialization.
         use arrow::array::{Int16Array, UInt8Array, UInt32Array};
 
-        let table = Table::new(2, Arc::new(MemPager::default()));
+        let table = Table::new(2, Arc::new(MemPager::default())).unwrap();
 
         const COL_A_U64: FieldId = 20;
         const COL_D_U32: FieldId = 21;

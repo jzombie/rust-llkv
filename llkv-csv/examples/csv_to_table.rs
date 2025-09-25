@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the new non-generic Table using an in-memory pager.
     let pager = Arc::new(MemPager::default());
-    let table = Table::new(1, pager);
+    let table = Table::new(1, pager)?;
 
     // Reader and config for ingest.
     let reader = BufReader::new(file);
