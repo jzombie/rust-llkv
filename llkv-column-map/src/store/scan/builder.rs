@@ -1,4 +1,65 @@
 use super::*;
+use std::cmp::Ordering;
+
+#[derive(Clone, Copy, Debug)]
+struct F64Key(f64);
+
+impl F64Key {
+    #[inline]
+    fn new(v: f64) -> Self {
+        Self(v)
+    }
+}
+
+impl PartialEq for F64Key {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for F64Key {}
+
+impl PartialOrd for F64Key {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for F64Key {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct F32Key(f32);
+
+impl F32Key {
+    #[inline]
+    fn new(v: f32) -> Self {
+        Self(v)
+    }
+}
+
+impl PartialEq for F32Key {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for F32Key {}
+
+impl PartialOrd for F32Key {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for F32Key {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
 
 pub struct ScanBuilder<'a, P: Pager<Blob = EntryHandle>> {
     store: &'a ColumnStore<P>,
@@ -75,7 +136,9 @@ where
             || self.ir.i64_r.is_some()
             || self.ir.i32_r.is_some()
             || self.ir.i16_r.is_some()
-            || self.ir.i8_r.is_some();
+            || self.ir.i8_r.is_some()
+            || self.ir.f64_r.is_some()
+            || self.ir.f32_r.is_some();
         if !has_ranges {
             return self.store.scan(self.field_id, self.opts, visitor);
         }
@@ -354,10 +417,66 @@ where
                 }
             }
             fn f64_run(&mut self, a: &Float64Array, s: usize, l: usize) {
-                self.inner.f64_run(a, s, l);
+                if let Some((lb, ub)) = self.ir.f64_r {
+                    let start = match lb {
+                        Bound::Unbounded => s,
+                        Bound::Included(x) => {
+                            let key = F64Key::new(x);
+                            lower_idx_by(s, s + l, &key, |i| F64Key::new(a.value(i)))
+                        }
+                        Bound::Excluded(x) => {
+                            let key = F64Key::new(x);
+                            upper_idx_by(s, s + l, &key, |i| F64Key::new(a.value(i)))
+                        }
+                    };
+                    let end = match ub {
+                        Bound::Unbounded => s + l,
+                        Bound::Included(x) => {
+                            let key = F64Key::new(x);
+                            upper_idx_by(s, s + l, &key, |i| F64Key::new(a.value(i)))
+                        }
+                        Bound::Excluded(x) => {
+                            let key = F64Key::new(x);
+                            lower_idx_by(s, s + l, &key, |i| F64Key::new(a.value(i)))
+                        }
+                    };
+                    if start < end {
+                        self.inner.f64_run(a, start, end - start);
+                    }
+                } else {
+                    self.inner.f64_run(a, s, l);
+                }
             }
             fn f32_run(&mut self, a: &Float32Array, s: usize, l: usize) {
-                self.inner.f32_run(a, s, l);
+                if let Some((lb, ub)) = self.ir.f32_r {
+                    let start = match lb {
+                        Bound::Unbounded => s,
+                        Bound::Included(x) => {
+                            let key = F32Key::new(x);
+                            lower_idx_by(s, s + l, &key, |i| F32Key::new(a.value(i)))
+                        }
+                        Bound::Excluded(x) => {
+                            let key = F32Key::new(x);
+                            upper_idx_by(s, s + l, &key, |i| F32Key::new(a.value(i)))
+                        }
+                    };
+                    let end = match ub {
+                        Bound::Unbounded => s + l,
+                        Bound::Included(x) => {
+                            let key = F32Key::new(x);
+                            upper_idx_by(s, s + l, &key, |i| F32Key::new(a.value(i)))
+                        }
+                        Bound::Excluded(x) => {
+                            let key = F32Key::new(x);
+                            lower_idx_by(s, s + l, &key, |i| F32Key::new(a.value(i)))
+                        }
+                    };
+                    if start < end {
+                        self.inner.f32_run(a, start, end - start);
+                    }
+                } else {
+                    self.inner.f32_run(a, s, l);
+                }
             }
         }
         impl<'v, V> crate::store::scan::PrimitiveSortedWithRowIdsVisitor for RangeAdapter<'v, V>
@@ -404,10 +523,66 @@ where
             }
             // For brevity, other integer widths with row ids fall back to pass-through.
             fn f64_run_with_rids(&mut self, v: &Float64Array, r: &UInt64Array, s: usize, l: usize) {
-                self.inner.f64_run_with_rids(v, r, s, l);
+                if let Some((lb, ub)) = self.ir.f64_r {
+                    let start = match lb {
+                        Bound::Unbounded => s,
+                        Bound::Included(x) => {
+                            let key = F64Key::new(x);
+                            lower_idx_by(s, s + l, &key, |i| F64Key::new(v.value(i)))
+                        }
+                        Bound::Excluded(x) => {
+                            let key = F64Key::new(x);
+                            upper_idx_by(s, s + l, &key, |i| F64Key::new(v.value(i)))
+                        }
+                    };
+                    let end = match ub {
+                        Bound::Unbounded => s + l,
+                        Bound::Included(x) => {
+                            let key = F64Key::new(x);
+                            upper_idx_by(s, s + l, &key, |i| F64Key::new(v.value(i)))
+                        }
+                        Bound::Excluded(x) => {
+                            let key = F64Key::new(x);
+                            lower_idx_by(s, s + l, &key, |i| F64Key::new(v.value(i)))
+                        }
+                    };
+                    if start < end {
+                        self.inner.f64_run_with_rids(v, r, start, end - start);
+                    }
+                } else {
+                    self.inner.f64_run_with_rids(v, r, s, l);
+                }
             }
             fn f32_run_with_rids(&mut self, v: &Float32Array, r: &UInt64Array, s: usize, l: usize) {
-                self.inner.f32_run_with_rids(v, r, s, l);
+                if let Some((lb, ub)) = self.ir.f32_r {
+                    let start = match lb {
+                        Bound::Unbounded => s,
+                        Bound::Included(x) => {
+                            let key = F32Key::new(x);
+                            lower_idx_by(s, s + l, &key, |i| F32Key::new(v.value(i)))
+                        }
+                        Bound::Excluded(x) => {
+                            let key = F32Key::new(x);
+                            upper_idx_by(s, s + l, &key, |i| F32Key::new(v.value(i)))
+                        }
+                    };
+                    let end = match ub {
+                        Bound::Unbounded => s + l,
+                        Bound::Included(x) => {
+                            let key = F32Key::new(x);
+                            upper_idx_by(s, s + l, &key, |i| F32Key::new(v.value(i)))
+                        }
+                        Bound::Excluded(x) => {
+                            let key = F32Key::new(x);
+                            lower_idx_by(s, s + l, &key, |i| F32Key::new(v.value(i)))
+                        }
+                    };
+                    if start < end {
+                        self.inner.f32_run_with_rids(v, r, start, end - start);
+                    }
+                } else {
+                    self.inner.f32_run_with_rids(v, r, s, l);
+                }
             }
         }
 

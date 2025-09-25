@@ -10,7 +10,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::scan::{PrimitiveSortedVisitor, ScanOptions};
+use llkv_column_map::store::scan::{
+    PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+    PrimitiveWithRowIdsVisitor, RangeKey, ScanBuilder, ScanOptions,
+};
 use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
@@ -50,6 +53,174 @@ fn append_random<T, A>(
     };
     let batch = RecordBatch::try_new(schema, vec![rid_arr, Arc::clone(&vals_arr_any)]).unwrap();
     store.append(&batch).unwrap();
+}
+
+macro_rules! impl_collect_sorted_methods {
+    ($($method:ident, $arr:ty),+ $(,)?) => {
+        $(
+            fn $method(&mut self, a: &$arr, start: usize, len: usize) {
+                let end = start + len;
+                for i in start..end {
+                    self.values.push(a.value(i) as i128);
+                }
+            }
+        )+
+    };
+}
+
+struct CollectSortedI128 {
+    values: Vec<i128>,
+}
+
+impl CollectSortedI128 {
+    fn new() -> Self {
+        Self { values: Vec::new() }
+    }
+}
+
+impl PrimitiveVisitor for CollectSortedI128 {}
+impl PrimitiveWithRowIdsVisitor for CollectSortedI128 {}
+impl PrimitiveSortedWithRowIdsVisitor for CollectSortedI128 {}
+impl PrimitiveSortedVisitor for CollectSortedI128 {
+    impl_collect_sorted_methods!(
+        u64_run,
+        UInt64Array,
+        u32_run,
+        UInt32Array,
+        u16_run,
+        UInt16Array,
+        u8_run,
+        UInt8Array,
+        i64_run,
+        Int64Array,
+        i32_run,
+        Int32Array,
+        i16_run,
+        Int16Array,
+        i8_run,
+        Int8Array
+    );
+}
+
+macro_rules! impl_collect_row_ids_methods {
+    ($($method:ident, $arr:ty),+ $(,)?) => {
+        $(
+            fn $method(
+                &mut self,
+                _values: &$arr,
+                rids: &UInt64Array,
+                start: usize,
+                len: usize,
+            ) {
+                let end = start + len;
+                for i in start..end {
+                    self.rids.push(rids.value(i));
+                }
+            }
+        )+
+    };
+}
+
+struct CollectRowIds {
+    rids: Vec<u64>,
+}
+
+impl CollectRowIds {
+    fn new() -> Self {
+        Self { rids: Vec::new() }
+    }
+}
+
+impl PrimitiveVisitor for CollectRowIds {}
+impl PrimitiveSortedVisitor for CollectRowIds {}
+impl PrimitiveWithRowIdsVisitor for CollectRowIds {}
+impl PrimitiveSortedWithRowIdsVisitor for CollectRowIds {
+    impl_collect_row_ids_methods!(
+        u64_run_with_rids,
+        UInt64Array,
+        u32_run_with_rids,
+        UInt32Array,
+        u16_run_with_rids,
+        UInt16Array,
+        u8_run_with_rids,
+        UInt8Array,
+        i64_run_with_rids,
+        Int64Array,
+        i32_run_with_rids,
+        Int32Array,
+        i16_run_with_rids,
+        Int16Array,
+        i8_run_with_rids,
+        Int8Array
+    );
+}
+
+fn run_builder_range_case<T, Arr>(mut values: Vec<T>, dt: DataType, low: T, high: T)
+where
+    T: Copy + Ord + Into<i128> + RangeKey,
+    Arr: From<Vec<T>> + arrow::array::Array + 'static,
+{
+    let mut rng = rand::rng();
+    values.shuffle(&mut rng);
+
+    let pager = Arc::new(MemPager::new());
+    let store = ColumnStore::open(Arc::clone(&pager)).unwrap();
+    let field_id = fid(1);
+
+    let mut md = HashMap::new();
+    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::UInt64, false),
+        Field::new("data", dt, false).with_metadata(md),
+    ]));
+
+    let rid: Vec<u64> = (0..values.len() as u64).collect();
+    let rid_arr = Arc::new(UInt64Array::from(rid.clone()));
+    let val_arr = Arc::new(Arr::from(values.clone())) as arrow::array::ArrayRef;
+    let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
+    store.append(&batch).unwrap();
+    store.register_index(field_id, IndexKind::Sort).unwrap();
+
+    let mut sorted_pairs: Vec<(i128, u64)> = values
+        .iter()
+        .enumerate()
+        .map(|(idx, &v)| (v.into(), rid[idx]))
+        .collect();
+    sorted_pairs.sort_by_key(|(value, _)| *value);
+    let low_i128 = low.into();
+    let high_i128 = high.into();
+    let mut expected_values = Vec::new();
+    let mut expected_rids = Vec::new();
+    for (v, r) in sorted_pairs {
+        if v >= low_i128 && v <= high_i128 {
+            expected_values.push(v);
+            expected_rids.push(r);
+        }
+    }
+
+    let mut val_collect = CollectSortedI128::new();
+    ScanBuilder::new(&store, field_id)
+        .options(ScanOptions {
+            sorted: true,
+            ..Default::default()
+        })
+        .with_range::<T, _>(low..=high)
+        .run(&mut val_collect)
+        .unwrap();
+
+    let mut rid_collect = CollectRowIds::new();
+    ScanBuilder::new(&store, field_id)
+        .options(ScanOptions {
+            sorted: true,
+            with_row_ids: true,
+            ..Default::default()
+        })
+        .with_range::<T, _>(low..=high)
+        .run(&mut rid_collect)
+        .unwrap();
+
+    assert_eq!(val_collect.values, expected_values);
+    assert_eq!(rid_collect.rids, expected_rids);
 }
 
 #[test]
@@ -446,4 +617,65 @@ fn scan_all_integer_types_sorted_and_ranges() {
     test_type(DataType::UInt16, &mut |n| gen_unsigned(n, 16));
     test_type(DataType::UInt32, &mut |n| gen_unsigned(n, 32));
     test_type(DataType::UInt64, &mut |n| gen_unsigned(n, 64));
+}
+
+#[test]
+fn scan_builder_range_all_integer_types() {
+    run_builder_range_case::<i8, Int8Array>(
+        (0..200).map(|i| (i as i32 - 100) as i8).collect(),
+        DataType::Int8,
+        -40i8,
+        60i8,
+    );
+
+    run_builder_range_case::<i16, Int16Array>(
+        (0..1024).map(|i| ((i as i32 - 512) * 4) as i16).collect(),
+        DataType::Int16,
+        -1_000i16,
+        1_200i16,
+    );
+
+    run_builder_range_case::<i32, Int32Array>(
+        (0..1024).map(|i| ((i as i64 - 512) * 256) as i32).collect(),
+        DataType::Int32,
+        -32_000i32,
+        40_000i32,
+    );
+
+    run_builder_range_case::<i64, Int64Array>(
+        (0..1024)
+            .map(|i| ((i as i128 - 512) * 1_048_576) as i64)
+            .collect(),
+        DataType::Int64,
+        -50_000_000i64,
+        60_000_000i64,
+    );
+
+    run_builder_range_case::<u8, UInt8Array>(
+        (0..256).map(|i| i as u8).collect(),
+        DataType::UInt8,
+        30u8,
+        180u8,
+    );
+
+    run_builder_range_case::<u16, UInt16Array>(
+        (0..1024).map(|i| (i as u16) * 3).collect(),
+        DataType::UInt16,
+        150u16,
+        900u16,
+    );
+
+    run_builder_range_case::<u32, UInt32Array>(
+        (0..1024).map(|i| (i as u32) * 65_537).collect(),
+        DataType::UInt32,
+        500_000u32,
+        40_000_000u32,
+    );
+
+    run_builder_range_case::<u64, UInt64Array>(
+        (0..1024).map(|i| (i as u64) * 1_000_000).collect(),
+        DataType::UInt64,
+        50_000_000u64,
+        400_000_000u64,
+    );
 }
