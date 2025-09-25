@@ -8,5 +8,5 @@ pub mod expr {
 pub mod table;
 pub mod types;
 
-pub use table::{Table, TableCfg};
+pub use table::Table;
 pub use types::{FieldId, RowId};

@@ -8,9 +8,10 @@ use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 use llkv_column_map::store::FilterPrimitive;
 use llkv_column_map::{
     ColumnStore, scan,
-    storage::pager::MemPager,
+    storage::pager::{MemPager, Pager},
     types::{LogicalFieldId, Namespace},
 };
+use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::expr::{Filter, LiteralCastError, Operator, bound_to_native, literal_to_native};
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
@@ -143,14 +144,15 @@ where
     }
 }
 
-fn collect_matching_row_ids<T>(
-    store: &ColumnStore<MemPager>,
+fn collect_matching_row_ids<T, P>(
+    store: &ColumnStore<P>,
     field_id: LogicalFieldId,
     op: &Operator<'_>,
 ) -> Result<Vec<u64>, TableError>
 where
     T: ArrowPrimitiveType + FilterPrimitive,
     T::Native: TryFrom<i128> + Copy,
+    P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     let predicate = build_predicate::<T>(op)?;
     store
@@ -165,10 +167,6 @@ fn lfid_for(table_id: u32, column_id: FieldId) -> LogicalFieldId {
         .with_field_id(column_id)
         .with_namespace(Namespace::UserData)
 }
-
-// TODO: Remove?
-#[derive(Clone, Debug, Default)]
-pub struct TableCfg {}
 
 #[derive(Debug)]
 pub enum TableError {
@@ -196,22 +194,21 @@ impl From<LiteralCastError> for TableError {
     }
 }
 
-pub struct Table {
-    store: ColumnStore<MemPager>,
-    #[allow(dead_code)]
-    cfg: TableCfg,
+pub struct Table<P = MemPager>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    store: ColumnStore<P>,
     table_id: u32,
 }
 
-impl Table {
-    pub fn new(table_id: u32, cfg: TableCfg) -> Self {
-        let pager = Arc::new(MemPager::default());
+impl<P> Table<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    pub fn new(table_id: u32, pager: Arc<P>) -> Self {
         let store = ColumnStore::open(pager).unwrap();
-        Self {
-            store,
-            cfg,
-            table_id,
-        }
+        Self { store, table_id }
     }
 
     pub fn append(&self, batch: &RecordBatch) -> Result<(), llkv_column_map::error::Error> {
@@ -284,7 +281,7 @@ impl Table {
 
         let row_ids = llkv_column_map::with_integer_arrow_type!(
             dtype.clone(),
-            |ArrowTy| collect_matching_row_ids::<ArrowTy>(&self.store, filter_lfid, &filter.op),
+            |ArrowTy| collect_matching_row_ids::<ArrowTy, P>(&self.store, filter_lfid, &filter.op),
             Err(TableError::Internal(format!(
                 "Filtering on type {:?} is not supported",
                 dtype
@@ -321,7 +318,7 @@ impl Table {
     }
 
     #[inline]
-    pub fn catalog(&self) -> SysCatalog<'_> {
+    pub fn catalog(&self) -> SysCatalog<'_, P> {
         SysCatalog::new(&self.store)
     }
 
@@ -346,7 +343,7 @@ impl Table {
         self.catalog().get_cols_meta(self.table_id, col_ids)
     }
 
-    pub fn store(&self) -> &ColumnStore<MemPager> {
+    pub fn store(&self) -> &ColumnStore<P> {
         &self.store
     }
 }
@@ -415,13 +412,19 @@ impl ColumnStoreTestExt for ColumnStore<MemPager> {
 
 #[cfg(test)]
 mod tests {
+    use super::ColumnStoreTestExt;
     use super::*;
     use arrow::array::{BinaryArray, Float64Array, Int32Array, UInt64Array};
     use arrow::compute::{cast, max, min, sum, unary};
     use std::collections::HashMap;
 
     fn setup_test_table() -> Table {
-        let table = Table::new(1, TableCfg::default());
+        let pager = Arc::new(MemPager::default());
+        setup_test_table_with_pager(&pager)
+    }
+
+    fn setup_test_table_with_pager(pager: &Arc<MemPager>) -> Table {
+        let table = Table::new(1, Arc::clone(pager));
         const COL_A_U64: FieldId = 10;
         const COL_B_BIN: FieldId = 11;
         const COL_C_I32: FieldId = 12;
@@ -502,6 +505,101 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(vals, vec![Some(20), Some(20)]);
+    }
+
+    #[test]
+    fn test_table_reopen_with_shared_pager() {
+        const TABLE_ALPHA: u32 = 42;
+        const TABLE_BETA: u32 = 43;
+        const COL_ALPHA_U64: FieldId = 100;
+        const COL_ALPHA_I32: FieldId = 101;
+        const COL_BETA_U64: FieldId = 200;
+
+        let pager = Arc::new(MemPager::default());
+
+        let alpha_rows: Vec<u64> = vec![1, 2, 3, 4];
+        let alpha_vals_u64: Vec<u64> = vec![10, 20, 30, 40];
+        let alpha_vals_i32: Vec<i32> = vec![-5, 15, 25, 35];
+        let beta_rows: Vec<u64> = vec![101, 102, 103];
+        let beta_vals: Vec<u64> = vec![900, 901, 902];
+
+        {
+            let table = Table::new(TABLE_ALPHA, Arc::clone(&pager));
+            let schema =
+                Arc::new(Schema::new(vec![
+                    Field::new("row_id", DataType::UInt64, false),
+                    Field::new("alpha_u64", DataType::UInt64, false).with_metadata(HashMap::from(
+                        [("field_id".to_string(), COL_ALPHA_U64.to_string())],
+                    )),
+                    Field::new("alpha_i32", DataType::Int32, false).with_metadata(HashMap::from([
+                        ("field_id".to_string(), COL_ALPHA_I32.to_string()),
+                    ])),
+                ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt64Array::from(alpha_rows.clone())),
+                    Arc::new(UInt64Array::from(alpha_vals_u64.clone())),
+                    Arc::new(Int32Array::from(alpha_vals_i32.clone())),
+                ],
+            )
+            .unwrap();
+            table.append(&batch).unwrap();
+        }
+
+        {
+            let table = Table::new(TABLE_BETA, Arc::clone(&pager));
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("row_id", DataType::UInt64, false),
+                Field::new("beta_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
+                    "field_id".to_string(),
+                    COL_BETA_U64.to_string(),
+                )])),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt64Array::from(beta_rows.clone())),
+                    Arc::new(UInt64Array::from(beta_vals.clone())),
+                ],
+            )
+            .unwrap();
+            table.append(&batch).unwrap();
+        }
+
+        {
+            let table = Table::new(TABLE_ALPHA, Arc::clone(&pager));
+            let lfid_u64 = lfid_for(TABLE_ALPHA, COL_ALPHA_U64);
+            let lfid_i32 = lfid_for(TABLE_ALPHA, COL_ALPHA_I32);
+
+            let col_u64 = table
+                .store()
+                .get_column_for_test(lfid_u64)
+                .expect("expected alpha u64 column");
+            assert_eq!(col_u64.data_type, DataType::UInt64);
+            let arr_u64 = col_u64.data.as_any().downcast_ref::<UInt64Array>().unwrap();
+            assert_eq!(arr_u64.values(), alpha_vals_u64.as_slice());
+
+            let col_i32 = table
+                .store()
+                .get_column_for_test(lfid_i32)
+                .expect("expected alpha i32 column");
+            assert_eq!(col_i32.data_type, DataType::Int32);
+            let arr_i32 = col_i32.data.as_any().downcast_ref::<Int32Array>().unwrap();
+            assert_eq!(arr_i32.values(), alpha_vals_i32.as_slice());
+        }
+
+        {
+            let table = Table::new(TABLE_BETA, Arc::clone(&pager));
+            let lfid = lfid_for(TABLE_BETA, COL_BETA_U64);
+            let col = table
+                .store()
+                .get_column_for_test(lfid)
+                .expect("expected beta column");
+            assert_eq!(col.data_type, DataType::UInt64);
+            let arr = col.data.as_any().downcast_ref::<UInt64Array>().unwrap();
+            assert_eq!(arr.values(), beta_vals.as_slice());
+        }
     }
 
     #[test]
@@ -706,7 +804,7 @@ mod tests {
         //   streaming. No concat or whole-column materialization.
         use arrow::array::{Int16Array, UInt8Array, UInt32Array};
 
-        let table = Table::new(2, TableCfg::default());
+        let table = Table::new(2, Arc::new(MemPager::default()));
 
         const COL_A_U64: FieldId = 20;
         const COL_D_U32: FieldId = 21;

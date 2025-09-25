@@ -8,12 +8,16 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bitcode::{Decode, Encode};
 
-use llkv_column_map::ColumnStore;
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor,
 };
 use llkv_column_map::types::LogicalFieldId;
+use llkv_column_map::{
+    ColumnStore,
+    storage::pager::{MemPager, Pager},
+};
+use simd_r_drive_entry_handle::EntryHandle;
 
 // ----- Catalog constants -----
 
@@ -74,12 +78,18 @@ pub struct ColMeta {
 
 // ----- SysCatalog -----
 
-pub struct SysCatalog<'a> {
-    store: &'a ColumnStore<llkv_column_map::storage::pager::MemPager>,
+pub struct SysCatalog<'a, P = MemPager>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    store: &'a ColumnStore<P>,
 }
 
-impl<'a> SysCatalog<'a> {
-    pub fn new(store: &'a ColumnStore<llkv_column_map::storage::pager::MemPager>) -> Self {
+impl<'a, P> SysCatalog<'a, P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    pub fn new(store: &'a ColumnStore<P>) -> Self {
         Self { store }
     }
 
