@@ -47,3 +47,19 @@ jobs:
         # run: cargo test --workspace --all-targets --verbose ${{ matrix.flags }} -- --include-ignored
         # Explicitly ignore benches (workaround for CodSpeed benches running for default)
         run: cargo test --workspace --all-features --verbose --lib --bins --tests --examples -- --include-ignored
+
+  # Runs the Miri interpreter on Linux to detect undefined behavior in unsafe code during CI
+  miri:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Run Miri tests
+        run: cargo miri test -p llkv-column-map
