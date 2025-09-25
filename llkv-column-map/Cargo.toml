@@ -42,9 +42,6 @@ harness = false
 name = "sort_index_bench"
 harness = false
 
-[features]
-legacy_api = []
-
 [profile.bench]
 opt-level = 3
 lto = "thin"
