@@ -150,7 +150,10 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     store
 }
 
-#[cfg_attr(miri, ignore = "Miri lacks support for the mmap/mprotect calls used by MemPager")]
+#[cfg_attr(
+    miri,
+    ignore = "Miri lacks support for the mmap/mprotect calls used by MemPager"
+)]
 #[test]
 fn snapshot_storage_dot_canonical() {
     let store = seed_small_store();
@@ -160,7 +163,10 @@ fn snapshot_storage_dot_canonical() {
     common::assert_matches_golden(&canon, "tests/snapshots/storage_small.dot");
 }
 
-#[cfg_attr(miri, ignore = "Miri lacks support for the mmap/mprotect calls used by MemPager")]
+#[cfg_attr(
+    miri,
+    ignore = "Miri lacks support for the mmap/mprotect calls used by MemPager"
+)]
 #[test]
 fn snapshot_storage_table_ascii() {
     let store = seed_small_store();
