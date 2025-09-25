@@ -11,9 +11,9 @@ use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 use llkv_column_map::store::FilterPrimitive;
 use llkv_column_map::{
     ColumnStore, scan,
-    storage::pager::{MemPager, Pager},
     types::{LogicalFieldId, Namespace},
 };
+use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::expr::{Filter, LiteralCastError, Operator, bound_to_native, literal_to_native};
@@ -176,9 +176,10 @@ fn lfid_for(table_id: TableId, column_id: FieldId) -> LogicalFieldId {
         .with_namespace(Namespace::UserData)
 }
 
+// TODO: Migrate to `llkv-result`
 #[derive(Debug)]
 pub enum TableError {
-    ColumnMap(llkv_column_map::error::Error),
+    ColumnMap(llkv_result::Error),
     Arrow(arrow::error::ArrowError),
     ExprCast(LiteralCastError),
     ReservedTableId(TableId),
@@ -211,8 +212,8 @@ impl std::error::Error for TableError {
     }
 }
 
-impl From<llkv_column_map::error::Error> for TableError {
-    fn from(e: llkv_column_map::error::Error) -> Self {
+impl From<llkv_result::Error> for TableError {
+    fn from(e: llkv_result::Error) -> Self {
         TableError::ColumnMap(e)
     }
 }
@@ -255,7 +256,7 @@ where
         Ok(Self { store, table_id })
     }
 
-    pub fn append(&self, batch: &RecordBatch) -> Result<(), llkv_column_map::error::Error> {
+    pub fn append(&self, batch: &RecordBatch) -> Result<(), llkv_result::Error> {
         let mut new_fields = Vec::with_capacity(batch.schema().fields().len());
         for field in batch.schema().fields() {
             if field.name() == "row_id" {
@@ -268,7 +269,7 @@ where
                 .get("field_id")
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| {
-                    llkv_column_map::error::Error::Internal(format!(
+                    llkv_result::Error::Internal(format!(
                         "Field '{}' is missing a valid 'field_id' in its \
                          metadata.",
                         field.name()
@@ -373,8 +374,7 @@ where
                 match self.store.gather_rows(proj_lfid, window) {
                     Ok(values) => Some(values),
                     Err(err) => Some(match err {
-                        llkv_column_map::error::Error::Internal(_)
-                        | llkv_column_map::error::Error::NotFound => self
+                        llkv_result::Error::Internal(_) | llkv_result::Error::NotFound => self
                             .store
                             .gather_rows_with_nulls(proj_lfid, window, Some(anchor_lfid))
                             .map_err(TableError::from)?,

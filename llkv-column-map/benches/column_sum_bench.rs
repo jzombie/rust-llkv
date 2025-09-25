@@ -20,10 +20,10 @@ use arrow::record_batch::RecordBatch;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
-use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_storage::pager::MemPager;
 
 use roaring::RoaringTreemap;
 

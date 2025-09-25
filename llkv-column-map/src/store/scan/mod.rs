@@ -19,11 +19,12 @@ use arrow::compute;
 use rustc_hash::FxHashMap;
 
 use super::ColumnStore;
-use crate::error::{Error, Result};
 use crate::serialization::deserialize_array;
-use crate::storage::pager::{BatchGet, GetResult, Pager};
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
-use crate::types::{LogicalFieldId, Namespace, PhysicalKey};
+use crate::types::{LogicalFieldId, Namespace};
+use llkv_result::{Error, Result};
+use llkv_storage::pager::{BatchGet, GetResult, Pager};
+use llkv_storage::types::PhysicalKey;
 use simd_r_drive_entry_handle::EntryHandle;
 
 pub mod builder;

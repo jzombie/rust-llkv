@@ -3,8 +3,8 @@
 //! Returning `bytes::Bytes` lets readers build Arrow `Buffer`s that borrow
 //! the pager memory with zero copying.
 
-use crate::error::Result;
 use crate::types::PhysicalKey;
+use llkv_result::Result;
 
 pub mod instrumented_pager;
 pub use instrumented_pager::*;

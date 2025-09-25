@@ -47,10 +47,10 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::seq::SliceRandom;
 use rand::{SeedableRng, rngs::StdRng};
 
-use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_storage::pager::MemPager;
 
 const N_ROWS: usize = 1_000_000;
 // 64-bit seed (previous literal overflowed u64)

@@ -8,10 +8,6 @@
 
 use modular_bitfield::prelude::*;
 
-/// Opaque 64-bit address in the pager namespace.
-/// Treated as an opaque handle by higher layers.
-pub type PhysicalKey = u64;
-
 /// Defines the category of data a `LogicalFieldId` refers to.
 /// This enum uses 16 bits, allowing for up to 65,536 distinct namespaces.
 #[derive(Specifier, Debug, PartialEq, Eq, Clone, Copy)]

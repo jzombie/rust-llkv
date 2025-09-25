@@ -24,9 +24,9 @@ use arrow::record_batch::RecordBatch;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use llkv_column_map::debug::ColumnStoreDebug;
-use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_storage::pager::MemPager;
 
 const N_ROWS: usize = 1_000_000;
 

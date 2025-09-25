@@ -1,8 +1,8 @@
-use crate::error::{Error, Result};
 use arrow::array::{
     Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, make_array,
 };
 use arrow::datatypes::DataType;
+use llkv_result::{Error, Result};
 
 /// Normalize an array so its offset is zero without copying buffers.
 #[inline]

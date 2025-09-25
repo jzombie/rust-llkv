@@ -1,6 +1,4 @@
-pub mod error;
 pub mod serialization;
-pub mod storage;
 pub mod store;
 pub mod types;
 
@@ -55,9 +53,9 @@ macro_rules! with_integer_arrow_type {
 
 mod codecs;
 
-pub use error::{Error, Result};
+pub use llkv_result::{Error, Result};
 pub use store::{
-    CATALOG_ROOT_PKEY, ColumnStore, IndexKind,
+    ColumnStore, IndexKind,
     scan::{self, ScanBuilder},
 };
 

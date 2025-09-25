@@ -10,6 +10,7 @@ publish = true
 llkv-column-map = { path = "./llkv-column-map", version = "0.1.0-alpha" }
 # llkv-csv = { path = "./llkv-csv", version = "0.1.0-alpha" }
 llkv-expr = { path = "./llkv-expr", version = "0.1.0-alpha" }
+llkv-result = { path = "./llkv-result", version = "0.1.0-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.1.0-alpha" }
 llkv-table = { path = "./llkv-table", version = "0.1.0-alpha" }
 simd-r-drive = "0.15.0-alpha"
@@ -34,13 +35,13 @@ roaring = "0.11.2"
 tempfile = "3.21.0"
 thiserror = "2.0.16"
 rustc-hash = "2.1.1"
-xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [workspace]
 members = [
     "llkv-column-map",
     # "llkv-csv",
     "llkv-expr",
+    "llkv-result",
     "llkv-storage",
     "llkv-table"
 ]

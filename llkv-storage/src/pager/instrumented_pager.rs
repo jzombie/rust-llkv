@@ -1,6 +1,6 @@
-use crate::error::Result; // Use the project's Result type
-use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
+use crate::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::types::PhysicalKey;
+use llkv_result::Result;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

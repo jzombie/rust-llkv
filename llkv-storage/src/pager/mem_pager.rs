@@ -1,7 +1,7 @@
 use super::*;
-use crate::error::{Error, Result};
-use crate::store::CATALOG_ROOT_PKEY;
+use crate::constants::CATALOG_ROOT_PKEY;
 use crate::types::PhysicalKey;
+use llkv_result::{Error, Result};
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{

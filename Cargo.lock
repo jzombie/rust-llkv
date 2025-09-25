@@ -937,6 +937,8 @@ dependencies = [
  "arrow-ord",
  "codspeed-criterion-compat",
  "line-ending",
+ "llkv-result",
+ "llkv-storage",
  "modular-bitfield",
  "num_enum",
  "rand",
@@ -956,16 +958,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-result"
+version = "0.1.0-alpha"
+dependencies = [
+ "arrow",
+ "thiserror",
+]
+
+[[package]]
 name = "llkv-storage"
 version = "0.1.0-alpha"
 dependencies = [
+ "llkv-result",
  "llkv-storage",
  "memmap2",
  "rustc-hash",
  "simd-r-drive",
  "simd-r-drive-entry-handle",
  "tempfile",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -979,6 +989,8 @@ dependencies = [
  "crossbeam-channel",
  "llkv-column-map",
  "llkv-expr",
+ "llkv-result",
+ "llkv-storage",
  "rayon",
  "rustc-hash",
  "simd-r-drive-entry-handle",

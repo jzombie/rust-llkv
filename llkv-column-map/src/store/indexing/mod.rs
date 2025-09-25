@@ -2,14 +2,15 @@
 //!
 //! Concrete indexes live in their own files.
 
-use crate::error::{Error, Result};
-use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::store::{
     ColumnStore,
     catalog::ColumnCatalog,
     descriptor::{ChunkMetadata, ColumnDescriptor},
 };
-use crate::types::{LogicalFieldId, PhysicalKey};
+use crate::types::LogicalFieldId;
+use llkv_result::{Error, Result};
+use llkv_storage::pager::{BatchGet, BatchPut, GetResult, Pager};
+use llkv_storage::types::PhysicalKey;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 use std::sync::RwLockReadGuard;
@@ -40,7 +41,7 @@ impl From<IndexKind> for u8 {
 }
 
 impl TryFrom<u8> for IndexKind {
-    type Error = crate::error::Error;
+    type Error = llkv_result::Error;
     fn try_from(value: u8) -> Result<Self> {
         match value {
             0 => Ok(IndexKind::Presence),
