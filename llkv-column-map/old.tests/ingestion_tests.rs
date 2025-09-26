@@ -2,7 +2,7 @@ use arrow::array::{Array, FixedSizeListArray, Float32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::ColumnStore;
+use llkv_column_map::store::{ColumnStore, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,7 +47,7 @@ fn ingest_and_scan_multiple_columns() {
     ));
 
     // 3b. Add required row_id column (UInt64, non-null, same length).
-    let row_id_field = Field::new("row_id", DataType::UInt64, false);
+    let row_id_field = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     let row_ids = Arc::new(UInt64Array::from(vec![0u64, 1, 2]));
 
     // 4. Create the RecordBatch from the schema and arrays.

@@ -5,8 +5,8 @@
 //!   multi-column schema (several integer types + one binary column).
 //! - Varies the number of append batches (1, 4, 16, 64) to expose batching
 //!   overhead vs. throughput.
-//! - Uses the current `append(&RecordBatch)` API; every batch contains
-//!   `row_id` plus all data columns.
+//! - Uses the current `append(&RecordBatch)` API; every batch contains the
+//!   column identified by `ROW_ID_COLUMN_NAME` plus all data columns.
 //!
 //! Run:
 //!   cargo bench --bench ingest_bench
@@ -24,7 +24,7 @@ use arrow::record_batch::RecordBatch;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use llkv_column_map::debug::ColumnStoreDebug;
-use llkv_column_map::store::ColumnStore;
+use llkv_column_map::store::{ColumnStore, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_storage::pager::MemPager;
 
@@ -63,7 +63,7 @@ fn column_kinds() -> Vec<ColKind> {
 
 fn schema_for(cols: &[ColKind]) -> Arc<Schema> {
     let mut fields = Vec::with_capacity(cols.len() + 1);
-    fields.push(Field::new("row_id", DataType::UInt64, false));
+    fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
     for c in cols {
         let (fid_raw, dt) = match *c {
             ColKind::U64(fid) => (fid, DataType::UInt64),

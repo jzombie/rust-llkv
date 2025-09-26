@@ -13,7 +13,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
-use llkv_column_map::store::{BoundValue, ColumnStore};
+use llkv_column_map::store::{BoundValue, ColumnStore, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 
 use rand::rng;
@@ -42,7 +42,7 @@ fn ingest_two_cols(
     let mut md_i32 = HashMap::new();
     md_i32.insert("field_id".to_string(), u64::from(fid_i32).to_string());
 
-    let row_f = Field::new("row_id", DataType::UInt64, false);
+    let row_f = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     let data_u64_f = Field::new("data_u64", DataType::UInt64, false).with_metadata(md_u64);
     let data_i32_f = Field::new("data_i32", DataType::Int32, false).with_metadata(md_i32);
     let schema = Arc::new(Schema::new(vec![row_f, data_u64_f, data_i32_f]));

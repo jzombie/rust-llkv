@@ -3,9 +3,10 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
+    ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, PrimitiveArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
+use arrow::compute::{filter as arrow_filter, is_not_null, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_storage::pager::{BatchGet, GetResult};
@@ -13,7 +14,7 @@ use llkv_storage::types::PhysicalKey;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::store::rowid::rowid_fid;
+use crate::store::{ROW_ID_COLUMN_NAME, rowid::rowid_fid};
 
 #[derive(Clone, Copy, Debug)]
 struct F64Key(f64);
@@ -701,7 +702,7 @@ where
         }
 
         let mut schema_fields: Vec<Field> = Vec::with_capacity(2 + extras.len());
-        schema_fields.push(Field::new("__row_id", DataType::UInt64, false));
+        schema_fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
         schema_fields.push(Field::new(
             logical_field_name(self.field_id),
             base_dtype.clone(),
@@ -716,10 +717,13 @@ where
         }
         let schema = Arc::new(Schema::new(schema_fields));
 
+        let projection_arc: Arc<[LogicalFieldId]> = projection.clone().into();
+
         let mut visitor = MultiProjectionVisitor::new(
             base_dtype,
             schema,
             extras,
+            Arc::clone(&projection_arc),
             &mut on_batch,
             self.opts.include_nulls,
         );
@@ -733,12 +737,14 @@ where
 pub struct MultiProjectionBatch {
     pub row_ids: Arc<UInt64Array>,
     pub record_batch: RecordBatch,
+    pub columns: Arc<[LogicalFieldId]>,
 }
 
 struct PrefetchedColumn {
     field_id: LogicalFieldId,
     dtype: DataType,
     chunks: Vec<ArrayRef>,
+    row_ids: Vec<Arc<UInt64Array>>,
 }
 
 struct MultiProjectionVisitor<'a, F>
@@ -748,6 +754,7 @@ where
     base_dtype: DataType,
     schema: Arc<Schema>,
     extras: Vec<PrefetchedColumn>,
+    projection: Arc<[LogicalFieldId]>,
     on_batch: &'a mut F,
     include_nulls: bool,
     chunk_idx: usize,
@@ -762,6 +769,7 @@ where
         base_dtype: DataType,
         schema: Arc<Schema>,
         extras: Vec<PrefetchedColumn>,
+        projection: Arc<[LogicalFieldId]>,
         on_batch: &'a mut F,
         include_nulls: bool,
     ) -> Self {
@@ -769,6 +777,7 @@ where
             base_dtype,
             schema,
             extras,
+            projection,
             on_batch,
             include_nulls,
             chunk_idx: 0,
@@ -787,11 +796,15 @@ where
                 "project: base column length mismatch".into(),
             ));
         }
-        for arr in &extra_arrays {
+        for (idx, arr) in extra_arrays.iter().enumerate() {
+            let fid = self.extras.get(idx).map(|c| c.field_id);
             if arr.len() != row_ids.len() {
-                return Err(Error::Internal(
-                    "project: extra column length mismatch".into(),
-                ));
+                return Err(Error::Internal(format!(
+                    "project: extra column length mismatch (column {idx}, field {:?}, row_ids {}, extra {})",
+                    fid,
+                    row_ids.len(),
+                    arr.len()
+                )));
             }
         }
 
@@ -806,6 +819,7 @@ where
         (self.on_batch)(MultiProjectionBatch {
             row_ids,
             record_batch: batch,
+            columns: Arc::clone(&self.projection),
         })
     }
 
@@ -817,7 +831,30 @@ where
         let mut extra_arrays: Vec<ArrayRef> = Vec::with_capacity(self.extras.len());
         for col in &self.extras {
             if let Some(arr) = col.chunks.get(chunk_idx) {
-                extra_arrays.push(arr.clone());
+                let needs_alignment = match col.row_ids.get(chunk_idx) {
+                    Some(rids) => rids.len() != row_ids.len(),
+                    None => false,
+                };
+                if needs_alignment {
+                    let rid_arr = match col.row_ids.get(chunk_idx) {
+                        Some(r) => r.as_ref(),
+                        None => {
+                            self.error = Some(Error::Internal(
+                                "project: missing row-ids for extra column chunk".into(),
+                            ));
+                            return;
+                        }
+                    };
+                    match self.align_projection_chunk(arr, rid_arr, row_ids.as_ref()) {
+                        Ok(aligned) => extra_arrays.push(aligned),
+                        Err(err) => {
+                            self.error = Some(err);
+                            return;
+                        }
+                    }
+                } else {
+                    extra_arrays.push(arr.clone());
+                }
             } else if col.chunks.is_empty() {
                 extra_arrays.push(new_null_array(&col.dtype, row_ids.len()));
             } else {
@@ -832,6 +869,45 @@ where
             return;
         }
         self.chunk_idx += 1;
+    }
+
+    fn align_projection_chunk(
+        &self,
+        values: &ArrayRef,
+        value_row_ids: &UInt64Array,
+        base_row_ids: &UInt64Array,
+    ) -> Result<ArrayRef> {
+        if values.len() != value_row_ids.len() {
+            return Err(Error::Internal(
+                "project: extra column value/row-id length mismatch".into(),
+            ));
+        }
+
+        let mut indices: Vec<Option<u32>> = Vec::with_capacity(base_row_ids.len());
+        let mut value_idx = 0usize;
+        for base_idx in 0..base_row_ids.len() {
+            let base_rid = base_row_ids.value(base_idx);
+            while value_idx < value_row_ids.len() && value_row_ids.value(value_idx) < base_rid {
+                value_idx += 1;
+            }
+            if value_idx < value_row_ids.len() && value_row_ids.value(value_idx) == base_rid {
+                let idx = value_idx as u32;
+                indices.push(Some(idx));
+                value_idx += 1;
+            } else {
+                indices.push(None);
+            }
+        }
+
+        if value_idx != value_row_ids.len() {
+            return Err(Error::Internal(
+                "project: extra column row ids not aligned with driver chunk".into(),
+            ));
+        }
+
+        let indices_array = UInt32Array::from(indices);
+        let aligned = take(values.as_ref(), &indices_array, None).map_err(Error::from)?;
+        Ok(aligned)
     }
 
     fn emit_null_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
@@ -1037,8 +1113,16 @@ where
 {
     let dtype = store.data_type(field_id)?;
 
-    let catalog = store.catalog.read().unwrap();
-    let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+    let (descriptor_pk, rowid_descriptor_pk) = {
+        let catalog = store.catalog.read().unwrap();
+        let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+        let rid_fid = rowid_fid(field_id);
+        let rowid_descriptor_pk = *catalog.map.get(&rid_fid).ok_or(Error::Internal(
+            "prefetch: missing row-id column for projection".into(),
+        ))?;
+        (descriptor_pk, rowid_descriptor_pk)
+    };
+
     let desc_blob = store
         .pager
         .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
@@ -1049,7 +1133,6 @@ where
         })
         .ok_or(Error::NotFound)?;
     let desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-    drop(catalog);
 
     let mut metas: Vec<crate::store::descriptor::ChunkMetadata> = Vec::new();
     for m in
@@ -1065,31 +1148,163 @@ where
             field_id,
             dtype,
             chunks: Vec::new(),
+            row_ids: Vec::new(),
         });
     }
 
-    let gets: Vec<BatchGet> = metas
-        .iter()
-        .map(|m| BatchGet::Raw { key: m.chunk_pk })
-        .collect();
+    let rid_desc_blob = store
+        .pager
+        .batch_get(&[BatchGet::Raw {
+            key: rowid_descriptor_pk,
+        }])?
+        .pop()
+        .and_then(|r| match r {
+            GetResult::Raw { bytes, .. } => Some(bytes),
+            _ => None,
+        })
+        .ok_or(Error::NotFound)?;
+    let rid_desc =
+        crate::store::descriptor::ColumnDescriptor::from_le_bytes(rid_desc_blob.as_ref());
+
+    let mut rowid_metas: Vec<crate::store::descriptor::ChunkMetadata> = Vec::new();
+    for m in crate::store::descriptor::DescriptorIterator::new(
+        store.pager.as_ref(),
+        rid_desc.head_page_pk,
+    ) {
+        let meta = m?;
+        if meta.row_count > 0 {
+            rowid_metas.push(meta);
+        }
+    }
+    if rowid_metas.len() != metas.len() {
+        return Err(Error::Internal(
+            "prefetch: row-id chunk count mismatch for projection".into(),
+        ));
+    }
+
+    let mut gets: Vec<BatchGet> = Vec::with_capacity(metas.len() * 2);
+    for m in &metas {
+        gets.push(BatchGet::Raw { key: m.chunk_pk });
+    }
+    for m in &rowid_metas {
+        gets.push(BatchGet::Raw { key: m.chunk_pk });
+    }
+
     let results = store.pager.batch_get(&gets)?;
-    let mut blobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
+    let data_keys: FxHashSet<PhysicalKey> = metas.iter().map(|m| m.chunk_pk).collect();
+    let rowid_keys: FxHashSet<PhysicalKey> = rowid_metas.iter().map(|m| m.chunk_pk).collect();
+    let mut data_blobs: FxHashMap<PhysicalKey, Option<EntryHandle>> = FxHashMap::default();
+    let mut rowid_blobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
     for r in results {
-        if let GetResult::Raw { key, bytes } = r {
-            blobs.insert(key, bytes);
+        match r {
+            GetResult::Raw { key, bytes } => {
+                if data_keys.contains(&key) {
+                    data_blobs.insert(key, Some(bytes));
+                } else if rowid_keys.contains(&key) {
+                    rowid_blobs.insert(key, bytes);
+                }
+            }
+            GetResult::Missing { key } => {
+                if data_keys.contains(&key) {
+                    data_blobs.insert(key, None);
+                } else if rowid_keys.contains(&key) {
+                    return Err(Error::Internal(
+                        "prefetch: missing row-id chunk for projection".into(),
+                    ));
+                }
+            }
         }
     }
 
     let mut chunks: Vec<ArrayRef> = Vec::with_capacity(metas.len());
-    for meta in metas {
-        let bytes = blobs.remove(&meta.chunk_pk).ok_or(Error::NotFound)?;
-        let arr = llkv_storage::serialization::deserialize_array(bytes)?;
+    let mut row_id_chunks: Vec<Arc<UInt64Array>> = Vec::with_capacity(metas.len());
+    for (meta, rid_meta) in metas.into_iter().zip(rowid_metas.into_iter()) {
+        let rid_bytes = rowid_blobs
+            .remove(&rid_meta.chunk_pk)
+            .ok_or(Error::NotFound)?;
+        let rid_arr_any = llkv_storage::serialization::deserialize_array(rid_bytes)?;
+        let rid_arr = rid_arr_any
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::Internal("prefetch: row-id column type mismatch".into()))?
+            .clone();
+        let rid_len = rid_arr.len();
+        let rid_arr = Arc::new(rid_arr);
+
+        let value_entry = data_blobs
+            .remove(&meta.chunk_pk)
+            .ok_or_else(|| Error::Internal("prefetch: missing data chunk for projection".into()))?;
+        let arr = match value_entry {
+            Some(bytes) => llkv_storage::serialization::deserialize_array(bytes)?,
+            None => new_null_array(&dtype, rid_len),
+        };
+
         chunks.push(arr);
+        row_id_chunks.push(rid_arr);
     }
 
     Ok(PrefetchedColumn {
         field_id,
         dtype,
         chunks,
+        row_ids: row_id_chunks,
     })
+}
+
+pub fn filter_projection_values<ArrowTy>(
+    proj_lfid: LogicalFieldId,
+    include_nulls: bool,
+    batch: &MultiProjectionBatch,
+    predicate: &dyn Fn(ArrowTy::Native) -> bool,
+) -> Result<Option<ArrayRef>>
+where
+    ArrowTy: ArrowPrimitiveType + crate::store::FilterPrimitive,
+{
+    let base_col = batch.record_batch.column(1).clone();
+    let filter_col = base_col
+        .as_any()
+        .downcast_ref::<PrimitiveArray<ArrowTy>>()
+        .ok_or_else(|| Error::Internal("project: filter column type mismatch".into()))?;
+
+    let projection_pos = batch
+        .columns
+        .iter()
+        .position(|fid| *fid == proj_lfid)
+        .ok_or_else(|| Error::Internal("project: projection column missing".into()))?;
+
+    let proj_col_idx = 1 + projection_pos;
+    let proj_col = if proj_col_idx < batch.record_batch.num_columns() {
+        batch.record_batch.column(proj_col_idx).clone()
+    } else {
+        base_col.clone()
+    };
+
+    let mut indices: Vec<u32> = Vec::new();
+    for (idx, maybe_value) in filter_col.iter().enumerate() {
+        if let Some(value) = maybe_value {
+            if predicate(value) {
+                indices.push(idx as u32);
+            }
+        }
+    }
+
+    if indices.is_empty() {
+        return Ok(None);
+    }
+
+    let indices_array = UInt32Array::from(indices);
+    let mut filtered = take(proj_col.as_ref(), &indices_array, None).map_err(Error::from)?;
+
+    if !include_nulls {
+        if filtered.null_count() > 0 {
+            let mask: BooleanArray = is_not_null(filtered.as_ref()).map_err(Error::from)?;
+            filtered = arrow_filter(filtered.as_ref(), &mask).map_err(Error::from)?;
+        }
+    }
+
+    if filtered.len() == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(filtered))
 }

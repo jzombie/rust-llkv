@@ -2,7 +2,7 @@ use arrow::array::{Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::{InstrumentedPager, MemPager, Pager};
-use llkv_column_map::store::ColumnStore;
+use llkv_column_map::store::{ColumnStore, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use roaring::RoaringTreemap;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -23,7 +23,7 @@ fn u64_schema_with_fid(fid: LogicalFieldId) -> Arc<Schema> {
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(fid).to_string());
     let data_field = Field::new("data", DataType::UInt64, false).with_metadata(md);
-    let row_id_field = Field::new("row_id", DataType::UInt64, false);
+    let row_id_field = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     Arc::new(Schema::new(vec![row_id_field, data_field]))
 }
 

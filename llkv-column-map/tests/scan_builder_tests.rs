@@ -9,7 +9,7 @@ use llkv_column_map::store::scan::{
     MultiProjectionBatch, PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor,
     PrimitiveVisitor, PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
-use llkv_column_map::store::{ColumnStore, IndexKind};
+use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_storage::pager::MemPager;
 
@@ -34,7 +34,7 @@ fn inventory_batch(
     quantities: Vec<u64>,
 ) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         field_with_fid("price", DataType::UInt64, price_fid),
         field_with_fid("qty", DataType::UInt64, qty_fid),
     ]));
@@ -208,7 +208,7 @@ fn project_column_streams_row_aligned_batches() {
         let rb = batch.record_batch;
         assert_eq!(rb.num_columns(), 2);
         let schema = rb.schema();
-        assert_eq!(schema.field(0).name(), "__row_id");
+        assert_eq!(schema.field(0).name(), ROW_ID_COLUMN_NAME);
         let expected_qty_name = format!("{:?}-{}-{}", Namespace::UserData, 0, qty_fid.field_id());
         assert_eq!(schema.field(1).name(), &expected_qty_name);
         let rb_rids = rb.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
@@ -260,7 +260,7 @@ fn project_multiple_columns_streams_record_batches() {
         let rb = batch.record_batch;
         assert_eq!(rb.num_columns(), 3);
         let schema = rb.schema();
-        assert_eq!(schema.field(0).name(), "__row_id");
+        assert_eq!(schema.field(0).name(), ROW_ID_COLUMN_NAME);
         let expected_price_name =
             format!("{:?}-{}-{}", Namespace::UserData, 0, price_fid.field_id());
         let expected_qty_name = format!("{:?}-{}-{}", Namespace::UserData, 0, qty_fid.field_id());
@@ -319,7 +319,7 @@ fn project_deduplicates_projection_slice() {
     let rb = &batch.record_batch;
     assert_eq!(rb.num_columns(), 3, "row id + unique columns");
     let schema = rb.schema();
-    assert_eq!(schema.field(0).name(), "__row_id");
+    assert_eq!(schema.field(0).name(), ROW_ID_COLUMN_NAME);
     let expected_base_name = format!("{:?}-{}-{}", Namespace::UserData, 0, base_fid.field_id());
     let expected_extra_name = format!("{:?}-{}-{}", Namespace::UserData, 0, extra_fid.field_id());
     assert_eq!(schema.field(1).name(), &expected_base_name);

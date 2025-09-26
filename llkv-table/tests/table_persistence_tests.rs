@@ -7,19 +7,62 @@ use arrow::array::{
     Float32Array, Float64Array, Int16Array, Int32Array, UInt8Array, UInt16Array, UInt32Array,
     UInt64Array,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_table::Table;
 use llkv_table::types::{FieldId, RowId, TableId};
 
+use llkv_column_map::store::ROW_ID_COLUMN_NAME;
+use llkv_column_map::store::rowid::rowid_fid;
+use llkv_column_map::{ColumnStore, scan};
 use llkv_storage::pager::simd_r_drive_pager::SimdRDrivePager;
+use rustc_hash::FxHashMap;
 use tempfile::TempDir;
 
 /// Attach required `field_id` metadata to a data column field.
 fn field_with_fid(name: &str, dt: DataType, fid: FieldId, nullable: bool) -> Field {
     Field::new(name, dt, nullable)
         .with_metadata(HashMap::from([("field_id".to_string(), fid.to_string())]))
+}
+
+fn collect_values_for_rows<ArrowTy, P>(
+    store: &ColumnStore<P>,
+    field_id: llkv_column_map::types::LogicalFieldId,
+    row_ids: &[u64],
+) -> Vec<ArrowTy::Native>
+where
+    ArrowTy: ArrowPrimitiveType,
+    ArrowTy::Native: Copy,
+    P: llkv_storage::pager::Pager<Blob = simd_r_drive_entry_handle::EntryHandle> + Send + Sync,
+{
+    use arrow::array::PrimitiveArray;
+
+    let mut values: FxHashMap<u64, ArrowTy::Native> = FxHashMap::default();
+
+    scan::ScanBuilder::new(store, field_id)
+        .with_row_ids(rowid_fid(field_id))
+        .project(|batch| {
+            let row_ids_arr = batch.row_ids.clone();
+            let array = batch
+                .record_batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<PrimitiveArray<ArrowTy>>()
+                .unwrap();
+            for (idx, maybe_value) in array.iter().enumerate() {
+                if let Some(value) = maybe_value {
+                    values.insert(row_ids_arr.value(idx), value);
+                }
+            }
+            Ok(())
+        })
+        .expect("scan project");
+
+    row_ids
+        .iter()
+        .map(|rid| *values.get(rid).expect("missing row"))
+        .collect()
 }
 
 #[test]
@@ -61,7 +104,7 @@ fn table_persistence_many_columns_simd_r_drive() {
 
         let schema = Arc::new(Schema::new(vec![
             // row_id must be non-nullable u64
-            Field::new("row_id", DataType::UInt64, false),
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             field_with_fid("u64_col", DataType::UInt64, F_U64, false),
             field_with_fid("i32_col", DataType::Int32, F_I32, false),
             field_with_fid("u32_col", DataType::UInt32, F_U32, false),
@@ -108,21 +151,30 @@ fn table_persistence_many_columns_simd_r_drive() {
 
         // Helper to assert a primitive column exactly matches `expect`.
         macro_rules! assert_prim_eq {
-            ($fid:expr, $dt:expr, $cast:ty, $expect:expr) => {{
+            ($fid:expr, $dt:expr, $arrow_ty:ty, $expect:expr) => {{
                 assert_eq!(store.data_type(lfid($fid)).unwrap(), $dt);
-                let arr = store.gather_rows(lfid($fid), &rows).unwrap();
-                let arr = arr.as_any().downcast_ref::<$cast>().unwrap();
-                assert_eq!(arr.values(), $expect.as_slice());
+                let values = collect_values_for_rows::<$arrow_ty, _>(store, lfid($fid), &rows);
+                assert_eq!(values, $expect);
             }};
         }
 
-        assert_prim_eq!(F_U64, DataType::UInt64, UInt64Array, v_u64);
-        assert_prim_eq!(F_I32, DataType::Int32, Int32Array, v_i32);
-        assert_prim_eq!(F_U32, DataType::UInt32, UInt32Array, v_u32);
-        assert_prim_eq!(F_I16, DataType::Int16, Int16Array, v_i16);
-        assert_prim_eq!(F_U8, DataType::UInt8, UInt8Array, v_u8);
-        assert_prim_eq!(F_F64, DataType::Float64, Float64Array, v_f64);
-        assert_prim_eq!(F_F32, DataType::Float32, Float32Array, v_f32);
-        assert_prim_eq!(F_U16, DataType::UInt16, UInt16Array, v_u16);
+        assert_prim_eq!(F_U64, DataType::UInt64, arrow::datatypes::UInt64Type, v_u64);
+        assert_prim_eq!(F_I32, DataType::Int32, arrow::datatypes::Int32Type, v_i32);
+        assert_prim_eq!(F_U32, DataType::UInt32, arrow::datatypes::UInt32Type, v_u32);
+        assert_prim_eq!(F_I16, DataType::Int16, arrow::datatypes::Int16Type, v_i16);
+        assert_prim_eq!(F_U8, DataType::UInt8, arrow::datatypes::UInt8Type, v_u8);
+        assert_prim_eq!(
+            F_F64,
+            DataType::Float64,
+            arrow::datatypes::Float64Type,
+            v_f64
+        );
+        assert_prim_eq!(
+            F_F32,
+            DataType::Float32,
+            arrow::datatypes::Float32Type,
+            v_f32
+        );
+        assert_prim_eq!(F_U16, DataType::UInt16, arrow::datatypes::UInt16Type, v_u16);
     }
 }

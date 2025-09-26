@@ -35,7 +35,10 @@ use std::time::Instant;
 
 use llkv_column_map::{
     ColumnStore,
-    store::debug::{ColumnStoreDebug, discover_all_pks},
+    store::{
+        ROW_ID_COLUMN_NAME,
+        debug::{ColumnStoreDebug, discover_all_pks},
+    },
     types::{LogicalFieldId, Namespace},
 };
 use llkv_storage::{pager::MemPager, types::PhysicalKey};
@@ -113,13 +116,17 @@ fn batch_from_pairs(pairs: &[(LogicalFieldId, ArrayRef)]) -> RecordBatch {
         })
         .collect();
 
-    // The store's append logic requires a `row_id` column.
+    // The store's append logic requires a row-id column.
     let num_rows = if pairs.is_empty() {
         0
     } else {
         pairs[0].1.len()
     };
-    let row_id_field = Field::new("row_id", arrow::datatypes::DataType::UInt64, false);
+    let row_id_field = Field::new(
+        ROW_ID_COLUMN_NAME,
+        arrow::datatypes::DataType::UInt64,
+        false,
+    );
     let start_row_id = NEXT_ROW_ID.fetch_add(num_rows as u64, Ordering::Relaxed);
     let end_row_id = start_row_id + num_rows as u64;
     let row_id_array =

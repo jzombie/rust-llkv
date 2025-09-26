@@ -1,7 +1,7 @@
 //! Simple and fragmented sum benches using the ColumnStore API.
 //!
 //! Notes for the new API:
-//! - Every RecordBatch must include a non-nullable UInt64 "row_id" column.
+//! - Every RecordBatch must include a non-nullable UInt64 column named by `ROW_ID_COLUMN_NAME`.
 //! - Only data columns carry "field_id" metadata.
 //!
 //! Run:
@@ -20,8 +20,8 @@ use arrow::record_batch::RecordBatch;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
-use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::ScanOptions;
+use llkv_column_map::store::{ColumnStore, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_storage::pager::MemPager;
 
@@ -42,7 +42,7 @@ fn fid(id: u32) -> LogicalFieldId {
 
 /// Build a 2-field schema: row_id (u64, non-null) + one data field.
 fn schema_with_row_id(field: Field) -> Arc<Schema> {
-    let rid = Field::new("row_id", DataType::UInt64, false);
+    let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     Arc::new(Schema::new(vec![rid, field]))
 }
 
