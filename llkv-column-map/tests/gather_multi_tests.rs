@@ -9,6 +9,9 @@ use llkv_column_map::store::ColumnStore;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_result::Result;
 use llkv_storage::pager::MemPager;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
 
 fn logical_fid(id: u32) -> LogicalFieldId {
     LogicalFieldId::new()
@@ -165,6 +168,95 @@ fn gather_rows_multi_with_nulls() -> Result<()> {
         .gather_rows_multi(&[fid_sparse], &gather_ids, false)
         .expect_err("missing rows should error without null support");
     assert!(matches!(err, llkv_result::Error::Internal(_)));
+
+    Ok(())
+}
+
+#[test]
+fn gather_rows_multi_shuffled_with_nulls_preserves_alignment() -> Result<()> {
+    let pager = Arc::new(MemPager::new());
+    let store = ColumnStore::open(Arc::clone(&pager))?;
+
+    let all_rids: Vec<u64> = (0..12u64).collect();
+    let rid_arr: ArrayRef = Arc::new(UInt64Array::from(all_rids.clone()));
+
+    let fid_dense = logical_fid(20);
+    let schema_dense = schema_for_field(fid_dense, "dense_shuffle", DataType::UInt64);
+    let dense_vals: Vec<u64> = all_rids.iter().map(|rid| rid * 11).collect();
+    let dense_arr: ArrayRef = Arc::new(UInt64Array::from(dense_vals.clone()));
+    let dense_batch = RecordBatch::try_new(schema_dense, vec![rid_arr.clone(), dense_arr.clone()])?;
+    store.append(&dense_batch)?;
+
+    let fid_sparse = logical_fid(21);
+    let schema_sparse = schema_for_nullable_field(fid_sparse, "sparse_shuffle", DataType::Int32);
+    let sparse_present_rids: Vec<u64> = all_rids.iter().copied().filter(|rid| rid % 4 != 2).collect();
+    let sparse_values: Vec<i32> = sparse_present_rids.iter().map(|rid| (*rid as i32) * -3).collect();
+    let sparse_rid_arr: ArrayRef = Arc::new(UInt64Array::from(sparse_present_rids.clone()));
+    let sparse_val_arr: ArrayRef = Arc::new(Int32Array::from(sparse_values.clone()));
+    let sparse_batch = RecordBatch::try_new(schema_sparse, vec![sparse_rid_arr, sparse_val_arr])?;
+    store.append(&sparse_batch)?;
+
+    let mut shuffled_ids = all_rids.clone();
+    let mut rng = StdRng::seed_from_u64(0x5A17_1E5F_CE37_3B4u64);
+    shuffled_ids.shuffle(&mut rng);
+    assert_eq!(shuffled_ids.len(), all_rids.len());
+
+    let multi = store.gather_rows_multi(&[fid_dense, fid_sparse], &shuffled_ids, true)?;
+    assert_eq!(multi.num_columns(), 2);
+    assert_eq!(multi.num_rows(), shuffled_ids.len());
+
+    let multi_dense = multi
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("dense downcast");
+    let multi_sparse = multi
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("sparse downcast");
+
+    assert_eq!(multi_dense.len(), shuffled_ids.len());
+    assert_eq!(multi_sparse.len(), shuffled_ids.len());
+
+    let sparse_lookup: HashMap<u64, i32> = sparse_present_rids
+        .iter()
+        .copied()
+        .zip(sparse_values.iter().copied())
+        .collect();
+
+    for (idx, row_id) in shuffled_ids.iter().enumerate() {
+        let expected_dense = row_id * 11;
+        assert_eq!(multi_dense.value(idx), expected_dense);
+
+        if let Some(expected_sparse) = sparse_lookup.get(row_id) {
+            assert!(!multi_sparse.is_null(idx));
+            assert_eq!(multi_sparse.value(idx), *expected_sparse);
+        } else {
+            assert!(multi_sparse.is_null(idx));
+        }
+    }
+
+    let single_dense = store.gather_rows(fid_dense, &shuffled_ids, false)?;
+    let single_sparse = store.gather_rows(fid_sparse, &shuffled_ids, true)?;
+
+    let single_dense = single_dense
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("single dense downcast");
+    let single_sparse = single_sparse
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("single sparse downcast");
+
+    assert_eq!(single_dense.values(), multi_dense.values());
+    assert_eq!(single_sparse.len(), multi_sparse.len());
+    for idx in 0..multi_sparse.len() {
+        assert_eq!(single_sparse.is_null(idx), multi_sparse.is_null(idx));
+        if !multi_sparse.is_null(idx) {
+            assert_eq!(single_sparse.value(idx), multi_sparse.value(idx));
+        }
+    }
 
     Ok(())
 }
