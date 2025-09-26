@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use crate::types::TableId;
 
-use arrow::array::RecordBatch;
+use arrow::array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt32Array};
+use arrow::compute::take;
 use arrow::datatypes::{ArrowPrimitiveType, Field, Schema};
 
 use llkv_column_map::store::{FilterPrimitive, ROW_ID_COLUMN_NAME};
@@ -276,19 +277,13 @@ where
         self.store.append(&namespaced_batch)
     }
 
-    /// Stream a single projected column as a sequence of RecordBatches.
+    /// Stream one projected column as a sequence of RecordBatches.
     ///
     /// - Avoids `concat` and large materializations.
     /// - Uses the scan builder to stream logical batches directly from
     ///   column-map without allocating whole-column materializations.
     /// - Applies predicate filtering inside column-map and emits compact
     ///   Arrow batches that contain the requested projection only.
-    ///
-    /// Notes:
-    /// - Currently supports exactly 1 projected column. This avoids
-    ///   cross-column chunk alignment problems without changing
-    ///   column-map APIs. We can generalize once a chunk-aligned
-    ///   multi-column scan is exposed upstream.
     pub fn scan_stream<'a, F>(
         &self,
         projection_col: FieldId,
@@ -299,7 +294,7 @@ where
         F: FnMut(RecordBatch),
     {
         self.scan_stream_with_options(
-            projection_col,
+            &[projection_col],
             filter,
             ScanStreamOptions::default(),
             on_batch,
@@ -308,7 +303,7 @@ where
 
     pub fn scan_stream_with_options<'a, F>(
         &self,
-        projection_col: FieldId,
+        projection_cols: &[FieldId],
         filter: &Filter<'a, FieldId>,
         options: ScanStreamOptions,
         mut on_batch: F,
@@ -316,18 +311,32 @@ where
     where
         F: FnMut(RecordBatch),
     {
+        if projection_cols.is_empty() {
+            return Err(TableError::Internal(
+                "scan_stream_with_options requires at least one projection column".into(),
+            ));
+        }
+
         let filter_lfid = lfid_for(self.table_id, filter.field_id);
         let dtype = self.store.data_type(filter_lfid)?;
 
-        let proj_lfid = lfid_for(self.table_id, projection_col);
-        let proj_dtype = self.store.data_type(proj_lfid)?;
-        let proj_field = Field::new(projection_col.to_string(), proj_dtype.clone(), true);
-        let out_schema = Arc::new(Schema::new(vec![proj_field]));
+        let mut projection_lfids: Vec<LogicalFieldId> = Vec::with_capacity(projection_cols.len());
+        let mut out_fields: Vec<Field> = Vec::with_capacity(projection_cols.len());
+        for &col_id in projection_cols {
+            let proj_lfid = lfid_for(self.table_id, col_id);
+            let proj_dtype = self.store.data_type(proj_lfid)?;
+            projection_lfids.push(proj_lfid);
+            out_fields.push(Field::new(col_id.to_string(), proj_dtype.clone(), true));
+        }
+        let out_schema = Arc::new(Schema::new(out_fields));
 
-        let mut builder_columns = Vec::with_capacity(2);
+        let mut builder_columns: Vec<LogicalFieldId> =
+            Vec::with_capacity(1 + projection_lfids.len());
         builder_columns.push(filter_lfid);
-        if proj_lfid != filter_lfid {
-            builder_columns.push(proj_lfid);
+        for &lfid in &projection_lfids {
+            if !builder_columns.contains(&lfid) {
+                builder_columns.push(lfid);
+            }
         }
 
         let mut scan_opts = scan::ScanOptions::default();
@@ -343,7 +352,8 @@ where
                 builder
                     .project(|mp_batch| {
                         process_multi_projection_batch::<ArrowTy, _>(
-                            proj_lfid,
+                            filter_lfid,
+                            &projection_lfids,
                             mp_batch,
                             &predicate,
                             options.include_nulls,
@@ -394,7 +404,8 @@ where
 }
 
 fn process_multi_projection_batch<ArrowTy, F>(
-    proj_lfid: LogicalFieldId,
+    filter_lfid: LogicalFieldId,
+    projection_lfids: &[LogicalFieldId],
     batch: scan::MultiProjectionBatch,
     predicate: &Predicate<ArrowTy>,
     include_nulls: bool,
@@ -406,26 +417,95 @@ where
     ArrowTy::Native: FromLiteral + Copy,
     F: FnMut(RecordBatch),
 {
-    let predicate_fn = |value: ArrowTy::Native| predicate.matches(value);
-    let Some(filtered_array) = llkv_column_map::store::scan::builder::filter_projection_values::<
-        ArrowTy,
-    >(proj_lfid, include_nulls, &batch, &predicate_fn)?
-    else {
+    let driver_pos = batch
+        .columns
+        .iter()
+        .position(|fid| *fid == filter_lfid)
+        .ok_or_else(|| llkv_result::Error::Internal("project: filter column missing".into()))?;
+    let driver_column = batch.record_batch.column(1 + driver_pos).clone();
+    let filter_values = driver_column
+        .as_any()
+        .downcast_ref::<PrimitiveArray<ArrowTy>>()
+        .ok_or_else(|| {
+            llkv_result::Error::Internal("project: filter column type mismatch".into())
+        })?;
+
+    let mut indices: Vec<u32> = Vec::new();
+    for (idx, maybe_value) in filter_values.iter().enumerate() {
+        if let Some(value) = maybe_value {
+            if predicate.matches(value) {
+                indices.push(idx as u32);
+            }
+        }
+    }
+
+    if indices.is_empty() {
         return Ok(());
-    };
+    }
+
+    let indices_array = UInt32Array::from(indices);
+    let mut projected: Vec<ArrayRef> = Vec::with_capacity(projection_lfids.len());
+    for &proj_lfid in projection_lfids {
+        let projection_pos = batch
+            .columns
+            .iter()
+            .position(|fid| *fid == proj_lfid)
+            .ok_or_else(|| {
+                llkv_result::Error::Internal("project: projection column missing".into())
+            })?;
+        let col_idx = 1 + projection_pos;
+        let column = batch.record_batch.column(col_idx).clone();
+        let taken =
+            take(column.as_ref(), &indices_array, None).map_err(llkv_result::Error::from)?;
+        projected.push(taken);
+    }
+
+    if projected.is_empty() {
+        return Ok(());
+    }
+
+    if !include_nulls {
+        let row_count = projected[0].len();
+        let mut keep: Vec<u32> = Vec::with_capacity(row_count);
+        for idx in 0..row_count {
+            if projected.iter().any(|col| col.is_null(idx)) {
+                continue;
+            }
+            keep.push(idx as u32);
+        }
+
+        if keep.len() != row_count {
+            if keep.is_empty() {
+                return Ok(());
+            }
+            let keep_indices = UInt32Array::from(keep);
+            for col in projected.iter_mut() {
+                let filtered =
+                    take(col.as_ref(), &keep_indices, None).map_err(llkv_result::Error::from)?;
+                *col = filtered;
+            }
+        }
+    }
+
+    let total_len = projected[0].len();
+    if total_len == 0 {
+        return Ok(());
+    }
 
     let mut offset = 0;
-    let len = filtered_array.len();
-    while offset < len {
-        let chunk_len = cmp::min(STREAM_BATCH_ROWS, len - offset);
+    while offset < total_len {
+        let chunk_len = cmp::min(STREAM_BATCH_ROWS, total_len - offset);
         if chunk_len == 0 {
             break;
         }
-        let slice = filtered_array.slice(offset, chunk_len);
-        if slice.len() == 0 {
+        let mut chunk_columns: Vec<ArrayRef> = Vec::with_capacity(projected.len());
+        for col in &projected {
+            chunk_columns.push(col.slice(offset, chunk_len));
+        }
+        if chunk_columns.is_empty() {
             break;
         }
-        let batch = RecordBatch::try_new(out_schema.clone(), vec![slice])
+        let batch = RecordBatch::try_new(out_schema.clone(), chunk_columns)
             .map_err(llkv_result::Error::from)?;
         on_batch(batch);
         offset += chunk_len;
@@ -578,7 +658,7 @@ mod tests {
             include_nulls: true,
         };
         table
-            .scan_stream_with_options(COL_A_U64, &filter, include_null_options, |batch| {
+            .scan_stream_with_options(&[COL_A_U64], &filter, include_null_options, |batch| {
                 assert_eq!(batch.num_columns(), 1);
                 let column = batch
                     .column(0)
@@ -591,69 +671,41 @@ mod tests {
 
         assert_eq!(values_with_nulls, vec![Some(100), None, Some(300)]);
 
-        // Verify multi-column projection keeps values aligned when one column contains nulls.
-        let filter_lfid = lfid_for(TABLE_ID_SMALL, COL_C_I32);
-        let proj_a_lfid = lfid_for(TABLE_ID_SMALL, COL_A_U64);
-        let proj_b_lfid = lfid_for(TABLE_ID_SMALL, COL_B_U64);
+        // Verify multi-column streaming keeps values aligned when one column contains nulls.
+        let mut multi_column_a: Vec<Option<u64>> = Vec::new();
+        let mut multi_column_b: Vec<u64> = Vec::new();
 
-        assert_eq!(
-            table.store().data_type(proj_b_lfid).unwrap(),
-            DataType::UInt64
-        );
+        table
+            .scan_stream_with_options(
+                &[COL_A_U64, COL_B_U64],
+                &filter,
+                include_null_options,
+                |batch| {
+                    assert_eq!(batch.num_columns(), 2);
+                    let col_a = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap();
+                    let col_b = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap();
+                    for idx in 0..batch.num_rows() {
+                        if col_a.is_null(idx) {
+                            multi_column_a.push(None);
+                        } else {
+                            multi_column_a.push(Some(col_a.value(idx)));
+                        }
+                        multi_column_b.push(col_b.value(idx));
+                    }
+                },
+            )
+            .expect("multi-column scan_stream_with_options should succeed");
 
-        let mut scan_opts = scan::ScanOptions::default();
-        scan_opts.include_nulls = true;
-
-        let builder = scan::ScanBuilder::with_columns(
-            table.store(),
-            &[filter_lfid, proj_a_lfid, proj_b_lfid],
-        )
-        .options(scan_opts);
-
-        let mut mp_batches = Vec::new();
-        builder
-            .project(|mp_batch| {
-                mp_batches.push(mp_batch);
-                Ok(())
-            })
-            .expect("multi-column projection should succeed");
-
-        let mut aligned_row_ids = Vec::new();
-        let mut column_a: Vec<Option<u64>> = Vec::new();
-        let mut column_b: Vec<u64> = Vec::new();
-
-        for mp in mp_batches {
-            let row_ids = mp.row_ids.as_ref();
-            let record_batch = mp.record_batch;
-
-            let col_a = record_batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .expect("projection column a should be UInt64");
-            let col_b = record_batch
-                .column(3)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .expect("projection column b should be UInt64");
-
-            assert_eq!(col_a.len(), col_b.len());
-            assert_eq!(col_a.len(), row_ids.len());
-
-            for idx in 0..row_ids.len() {
-                aligned_row_ids.push(row_ids.value(idx));
-                if col_a.is_null(idx) {
-                    column_a.push(None);
-                } else {
-                    column_a.push(Some(col_a.value(idx)));
-                }
-                column_b.push(col_b.value(idx));
-            }
-        }
-
-        assert_eq!(aligned_row_ids, vec![1, 2, 3]);
-        assert_eq!(column_a, vec![Some(100), None, Some(300)]);
-        assert_eq!(column_b, vec![1000, 2000, 3000]);
+        assert_eq!(multi_column_a, vec![Some(100), None, Some(300)]);
+        assert_eq!(multi_column_b, vec![1000, 2000, 3000]);
     }
 
     fn setup_large_table() -> Table {
