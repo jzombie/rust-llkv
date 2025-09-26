@@ -5,6 +5,7 @@ pub use llkv_result::{Error, Result};
 pub use store::{
     ColumnStore, IndexKind,
     scan::{self, ScanBuilder},
+    ROW_ID_COLUMN_NAME
 };
 
 pub mod debug {

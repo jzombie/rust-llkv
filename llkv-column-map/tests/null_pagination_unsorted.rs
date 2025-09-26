@@ -5,7 +5,7 @@ use arrow::array::UInt64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use llkv_column_map::store::ColumnStore;
+use llkv_column_map::store::{ColumnStore, ROW_ID_COLUMN_NAME};
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanOptions,
@@ -30,7 +30,7 @@ fn unsorted_with_nulls_anchor_order() {
     let mut md_a = HashMap::new();
     md_a.insert("field_id".to_string(), u64::from(anchor_fid).to_string());
     let schema_a = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md_a),
     ]));
     let r: Vec<u64> = (0..50).collect();
@@ -49,7 +49,7 @@ fn unsorted_with_nulls_anchor_order() {
     let mut md_t = HashMap::new();
     md_t.insert("field_id".to_string(), u64::from(target_fid).to_string());
     let schema_t = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md_t),
     ]));
     let t_r: Vec<u64> = (0..50).filter(|x| x % 2 == 0).collect();

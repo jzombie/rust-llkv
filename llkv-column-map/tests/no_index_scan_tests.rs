@@ -5,7 +5,7 @@ use arrow::array::{Int32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use llkv_column_map::store::ColumnStore;
+use llkv_column_map::store::{ColumnStore, ROW_ID_COLUMN_NAME};
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanOptions,
@@ -29,7 +29,7 @@ fn unsorted_scan_works_without_index_u64() {
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(fid).to_string());
     let schema = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md),
     ]));
 
@@ -89,7 +89,7 @@ fn unsorted_with_row_ids_works_without_index() {
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(fid).to_string());
     let schema = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::Int32, false).with_metadata(md),
     ]));
 
@@ -143,7 +143,7 @@ fn sorted_scan_without_index_returns_error() {
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(fid).to_string());
     let schema = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md),
     ]));
     let rid: Vec<u64> = (0..1000u64).collect();

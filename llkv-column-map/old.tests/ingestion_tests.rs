@@ -47,7 +47,7 @@ fn ingest_and_scan_multiple_columns() {
     ));
 
     // 3b. Add required row_id column (UInt64, non-null, same length).
-    let row_id_field = Field::new("row_id", DataType::UInt64, false);
+    let row_id_field = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     let row_ids = Arc::new(UInt64Array::from(vec![0u64, 1, 2]));
 
     // 4. Create the RecordBatch from the schema and arrays.

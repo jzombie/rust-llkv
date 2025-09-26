@@ -7,7 +7,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::store::scan::{PrimitiveSortedVisitor, PrimitiveVisitor, ScanOptions};
-use llkv_column_map::store::{ColumnStore, IndexKind};
+use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_storage::pager::MemPager;
 
@@ -19,7 +19,7 @@ fn fid_user(id: u32) -> LogicalFieldId {
 }
 
 fn make_schema_u64(field_id: LogicalFieldId) -> Arc<Schema> {
-    let rid = Field::new("row_id", DataType::UInt64, false);
+    let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);

@@ -309,7 +309,7 @@ where
         let batch_ref = {
             let schema = batch.schema();
             let row_id_idx = schema
-                .index_of("row_id")
+                .index_of(ROW_ID_COLUMN_NAME)
                 .map_err(|_| Error::Internal("row_id column required".into()))?;
             let row_id_any = batch.column(row_id_idx).clone();
             let row_id_arr = row_id_any
@@ -361,7 +361,7 @@ where
         // transaction that happens before the main append of new rows.
         let schema = batch_ref.schema();
         let row_id_idx = schema
-            .index_of("row_id")
+            .index_of(ROW_ID_COLUMN_NAME)
             .map_err(|_| Error::Internal("row_id column required".into()))?;
 
         // Create a quick lookup map of incoming row IDs to their positions in the batch.
@@ -436,7 +436,7 @@ where
         // This is the main append transaction. All writes generated in this phase will be
         // collected and committed atomically at the very end.
         let append_schema = batch_to_append.schema();
-        let append_row_id_idx = append_schema.index_of("row_id")?;
+        let append_row_id_idx = append_schema.index_of(ROW_ID_COLUMN_NAME)?;
         let append_row_id_any: ArrayRef = Arc::clone(batch_to_append.column(append_row_id_idx));
         let mut puts_appends: Vec<BatchPut> = Vec::new();
 

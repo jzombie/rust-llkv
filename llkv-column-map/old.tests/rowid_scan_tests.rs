@@ -21,7 +21,7 @@ fn fid(id: u32) -> LogicalFieldId {
 }
 
 fn schema_with_row_id(field_id: LogicalFieldId) -> Arc<Schema> {
-    let rid = Field::new("row_id", DataType::UInt64, false);
+    let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);

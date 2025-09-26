@@ -13,7 +13,7 @@ use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, RangeKey, ScanBuilder, ScanOptions,
 };
-use llkv_column_map::store::{ColumnStore, IndexKind};
+use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_storage::pager::MemPager;
 
@@ -27,7 +27,7 @@ fn fid(id: u32) -> LogicalFieldId {
 }
 
 fn make_schema(field_id: LogicalFieldId, dt: DataType) -> Arc<Schema> {
-    let rid = Field::new("row_id", DataType::UInt64, false);
+    let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());
     let data_f = Field::new("data", dt, false).with_metadata(md);
@@ -170,7 +170,7 @@ where
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());
     let schema = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", dt, false).with_metadata(md),
     ]));
 

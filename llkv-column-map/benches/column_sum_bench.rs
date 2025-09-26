@@ -23,6 +23,7 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_storage::pager::MemPager;
 
 use roaring::RoaringTreemap;
@@ -42,7 +43,7 @@ fn fid(id: u32) -> LogicalFieldId {
 
 /// Build a 2-field schema: row_id (u64, non-null) + one data field.
 fn schema_with_row_id(field: Field) -> Arc<Schema> {
-    let rid = Field::new("row_id", DataType::UInt64, false);
+    let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     Arc::new(Schema::new(vec![rid, field]))
 }
 

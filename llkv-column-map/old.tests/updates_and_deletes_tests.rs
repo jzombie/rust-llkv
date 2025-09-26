@@ -35,7 +35,7 @@ fn fid(id: u32) -> LogicalFieldId {
 
 /// Helper: build a schema with "row_id" inserted at column 0.
 fn schema_with_row_id(mut fields: Vec<Field>) -> Arc<Schema> {
-    let rid = Field::new("row_id", DataType::UInt64, false);
+    let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     fields.insert(0, rid);
     Arc::new(Schema::new(fields))
 }

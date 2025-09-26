@@ -12,6 +12,7 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_table::Table;
 use llkv_table::types::{FieldId, RowId, TableId};
+use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 
 use llkv_storage::pager::simd_r_drive_pager::SimdRDrivePager;
 use tempfile::TempDir;
@@ -61,7 +62,7 @@ fn table_persistence_many_columns_simd_r_drive() {
 
         let schema = Arc::new(Schema::new(vec![
             // row_id must be non-nullable u64
-            Field::new("row_id", DataType::UInt64, false),
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             field_with_fid("u64_col", DataType::UInt64, F_U64, false),
             field_with_fid("i32_col", DataType::Int32, F_I32, false),
             field_with_fid("u32_col", DataType::UInt32, F_U32, false),

@@ -9,7 +9,7 @@ use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
-use llkv_column_map::store::{ColumnStore, IndexKind};
+use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_storage::pager::MemPager;
 
@@ -30,7 +30,7 @@ fn sorted_with_nulls_last_pagination() {
     let mut md_anchor = HashMap::new();
     md_anchor.insert("field_id".to_string(), u64::from(anchor_fid).to_string());
     let schema_anchor = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md_anchor),
     ]));
     let r0: Vec<u64> = (0..100).collect();
@@ -49,7 +49,7 @@ fn sorted_with_nulls_last_pagination() {
     let mut md_t = HashMap::new();
     md_t.insert("field_id".to_string(), u64::from(target_fid).to_string());
     let schema_t = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md_t),
     ]));
     let t_rids: Vec<u64> = (0..100).filter(|x| x % 2 == 0).collect();
