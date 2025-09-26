@@ -298,6 +298,7 @@ where
         Ok(false)
     }
 
+    // TODO: Rename to `append_batch` or `insert_batch`
     #[allow(unused_variables, unused_assignments)] // TODO: Keep `presence_index_created`?
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         // --- PHASE 1: PRE-PROCESSING THE INCOMING BATCH ---
