@@ -7,9 +7,9 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
-    PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
+    PrimitiveWithRowIdsVisitor, ProjectionBatch, ScanBuilder, ScanOptions,
 };
-use llkv_column_map::store::{ColumnStore, IndexKind, ProjectionBatch};
+use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_storage::pager::MemPager;
 
@@ -171,8 +171,8 @@ fn project_column_streams_row_aligned_batches() {
     store.append(&batch).unwrap();
 
     let mut collected: Vec<ProjectionBatch> = Vec::new();
-    store
-        .project_column(qty_fid, ScanOptions::default(), |proj| {
+    ScanBuilder::new(&store, qty_fid)
+        .project(|proj| {
             collected.push(proj);
             Ok(())
         })

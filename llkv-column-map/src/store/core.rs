@@ -1,4 +1,4 @@
-use super::{projection::*, *};
+use super::*;
 use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
@@ -100,34 +100,6 @@ where
             /* include_nulls */ true,
             anchor_row_id_field,
         )
-    }
-
-    /// Streams a single-column projection as `ProjectionBatch` items using the scan pipeline.
-    ///
-    /// The returned batches always include the column's row ids so callers can join with other
-    /// data or preserve ordering. All knobs exposed by `ScanOptions`—sorted/range scans,
-    /// pagination, reverse order, and null synthesis—apply directly.
-    pub fn project_column<F>(
-        &self,
-        field_id: LogicalFieldId,
-        mut opts: ScanOptions,
-        mut on_batch: F,
-    ) -> Result<()>
-    where
-        F: FnMut(ProjectionBatch) -> Result<()>,
-    {
-        let dtype = self.data_type(field_id)?;
-        // Ensure the visitor receives row ids for each batch so it can align value slices.
-        opts.with_row_ids = true;
-        if opts.include_nulls && opts.anchor_row_id_field.is_none() {
-            opts.anchor_row_id_field = Some(rowid_fid(field_id));
-        }
-
-        let mut visitor = ProjectionVisitor::new(dtype, &mut on_batch);
-        ScanBuilder::new(self, field_id)
-            .options(opts)
-            .run(&mut visitor)?;
-        visitor.finish()
     }
 
     fn gather_rows_internal(
