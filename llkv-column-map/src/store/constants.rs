@@ -1,3 +1,6 @@
+/// Canonical Arrow field name for physical row-id columns.
+pub const ROW_ID_COLUMN_NAME: &str = "row_id";
+
 pub(crate) const DESCRIPTOR_ENTRIES_PER_PAGE: usize = 256;
 
 /// Target byte size for descriptor pages. The pager may be mmapped, so page

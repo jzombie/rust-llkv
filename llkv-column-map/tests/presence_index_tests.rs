@@ -5,7 +5,7 @@ use arrow::array::UInt64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use llkv_column_map::store::ColumnStore;
+use llkv_column_map::store::{ColumnStore, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_storage::pager::MemPager;
 
@@ -26,7 +26,7 @@ fn presence_index_cross_column_queries() {
     let mut md_a = HashMap::new();
     md_a.insert("field_id".to_string(), u64::from(fid_a).to_string());
     let schema_a = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md_a),
     ]));
 
@@ -35,7 +35,7 @@ fn presence_index_cross_column_queries() {
     let mut md_b = HashMap::new();
     md_b.insert("field_id".to_string(), u64::from(fid_b).to_string());
     let schema_b = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md_b),
     ]));
 

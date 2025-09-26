@@ -15,7 +15,7 @@ use llkv_column_map::store::scan::{
 };
 
 use llkv_column_map::types::LogicalFieldId;
-use llkv_column_map::{ColumnStore, types::Namespace};
+use llkv_column_map::{ColumnStore, store::ROW_ID_COLUMN_NAME, types::Namespace};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -92,7 +92,7 @@ where
     pub fn put_table_meta(&self, meta: &TableMeta) {
         let lfid_val: u64 = lfid(CATALOG_TID, F_TABLE_META).into();
         let schema = Arc::new(Schema::new(vec![
-            Field::new("row_id", DataType::UInt64, false),
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("meta", DataType::Binary, false).with_metadata(HashMap::from([(
                 "field_id".to_string(),
                 lfid_val.to_string(),
@@ -153,7 +153,7 @@ where
     pub fn put_col_meta(&self, table_id: TableId, meta: &ColMeta) {
         let lfid_val: u64 = lfid(CATALOG_TID, F_COL_META).into();
         let schema = Arc::new(Schema::new(vec![
-            Field::new("row_id", DataType::UInt64, false),
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("meta", DataType::Binary, false).with_metadata(HashMap::from([(
                 "field_id".to_string(),
                 lfid_val.to_string(),

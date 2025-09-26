@@ -23,6 +23,7 @@ use arrow::record_batch::RecordBatch;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
+use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::debug::ColumnStoreDebug;
 use llkv_column_map::store::ColumnStore;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
@@ -63,7 +64,7 @@ fn column_kinds() -> Vec<ColKind> {
 
 fn schema_for(cols: &[ColKind]) -> Arc<Schema> {
     let mut fields = Vec::with_capacity(cols.len() + 1);
-    fields.push(Field::new("row_id", DataType::UInt64, false));
+    fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
     for c in cols {
         let (fid_raw, dt) = match *c {
             ColKind::U64(fid) => (fid, DataType::UInt64),

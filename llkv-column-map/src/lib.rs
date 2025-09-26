@@ -3,7 +3,7 @@ pub mod types;
 
 pub use llkv_result::{Error, Result};
 pub use store::{
-    ColumnStore, IndexKind,
+    ColumnStore, IndexKind, ROW_ID_COLUMN_NAME,
     scan::{self, ScanBuilder},
 };
 

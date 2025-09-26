@@ -13,7 +13,7 @@
 //! column.
 
 use llkv_column_map::{
-    ColumnStore,
+    ColumnStore, ROW_ID_COLUMN_NAME,
     debug::ColumnStoreDebug,
     types::{LogicalFieldId, Namespace},
 };
@@ -75,7 +75,11 @@ fn batch_from_columns(cols: &[(LogicalFieldId, ArrayRef)]) -> RecordBatch {
 
     // The store's append logic requires a `row_id` column.
     let num_rows = if cols.is_empty() { 0 } else { cols[0].1.len() };
-    let row_id_field = Field::new("row_id", arrow::datatypes::DataType::UInt64, false);
+    let row_id_field = Field::new(
+        ROW_ID_COLUMN_NAME,
+        arrow::datatypes::DataType::UInt64,
+        false,
+    );
     // Use unique row IDs for each batch to avoid LWW updates in this example.
     let start_row_id = NEXT_ROW_ID.fetch_add(num_rows as u64, Ordering::Relaxed);
     let end_row_id = start_row_id + num_rows as u64;

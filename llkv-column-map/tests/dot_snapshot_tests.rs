@@ -8,7 +8,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::store::debug::ColumnStoreDebug;
-use llkv_column_map::store::{ColumnStore, IndexKind};
+use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::{LogicalFieldId, Namespace, TableId};
 use llkv_storage::pager::MemPager;
 
@@ -28,7 +28,7 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     let mut md1 = HashMap::new();
     md1.insert("field_id".to_string(), u64::from(fid_u64).to_string());
     let schema1 = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md1),
     ]));
     let rid: Vec<u64> = (0..100u64).collect();
@@ -47,7 +47,7 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     let mut md2 = HashMap::new();
     md2.insert("field_id".to_string(), u64::from(fid_i32).to_string());
     let schema2 = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::Int32, false).with_metadata(md2),
     ]));
     let rid2: Vec<u64> = (0..50u64).collect();
@@ -67,7 +67,7 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     let mut md3 = HashMap::new();
     md3.insert("field_id".to_string(), u64::from(fid_bin).to_string());
     let schema3 = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::Binary, false).with_metadata(md3),
     ]));
     let rid3: Vec<u64> = (0..25u64).collect();
@@ -89,7 +89,7 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     let mut md4 = HashMap::new();
     md4.insert("field_id".to_string(), u64::from(fid1_u64).to_string());
     let schema4 = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md4),
     ]));
     let rid4: Vec<u64> = (0..30u64).collect();
@@ -108,7 +108,7 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     let mut md5 = HashMap::new();
     md5.insert("field_id".to_string(), u64::from(fid1_i32).to_string());
     let schema5 = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::Int32, false).with_metadata(md5),
     ]));
     let rid5: Vec<u64> = (0..15u64).collect();
@@ -128,7 +128,7 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     let mut md6 = HashMap::new();
     md6.insert("field_id".to_string(), u64::from(fid2_u64).to_string());
     let schema6 = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md6),
     ]));
     let rid6: Vec<u64> = (0..10u64).collect();

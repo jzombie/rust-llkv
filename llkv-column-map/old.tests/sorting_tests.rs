@@ -35,7 +35,7 @@ fn test_large_sort_u64() {
     metadata.insert("field_id".to_string(), u64::from(field_id).to_string());
 
     let data_field = Field::new("data", DataType::UInt64, false).with_metadata(metadata);
-    let row_id_field = Field::new("row_id", DataType::UInt64, false);
+    let row_id_field = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     let schema = Arc::new(Schema::new(vec![row_id_field, data_field]));
 
     // --- 2. Generate and ingest unsorted data ---
@@ -98,7 +98,7 @@ fn test_large_sort_i32() {
     metadata.insert("field_id".to_string(), u64::from(field_id).to_string());
 
     let data_field = Field::new("data", DataType::Int32, false).with_metadata(metadata);
-    let row_id_field = Field::new("row_id", DataType::UInt64, false);
+    let row_id_field = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     let schema = Arc::new(Schema::new(vec![row_id_field, data_field]));
 
     // --- 2. Generate and ingest unsorted data (with negatives) ---

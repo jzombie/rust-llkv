@@ -8,7 +8,7 @@ use crate::types::TableId;
 use arrow::array::{Array, ArrayRef, Int32Array, PrimitiveArray, RecordBatch, UInt64Array};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
-use llkv_column_map::store::FilterPrimitive;
+use llkv_column_map::store::{FilterPrimitive, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{
     ColumnStore, scan,
     types::{LogicalFieldId, Namespace},
@@ -259,7 +259,7 @@ where
     pub fn append(&self, batch: &RecordBatch) -> Result<(), llkv_result::Error> {
         let mut new_fields = Vec::with_capacity(batch.schema().fields().len());
         for field in batch.schema().fields() {
-            if field.name() == "row_id" {
+            if field.name() == ROW_ID_COLUMN_NAME {
                 new_fields.push(field.as_ref().clone());
                 continue;
             }
@@ -632,7 +632,7 @@ mod tests {
         const COL_E_F32: FieldId = 14;
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("row_id", DataType::UInt64, false),
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
                 "field_id".to_string(),
                 COL_A_U64.to_string(),
@@ -781,7 +781,7 @@ mod tests {
             let table = Table::new(TABLE_ALPHA, Arc::clone(&pager)).unwrap();
             let schema =
                 Arc::new(Schema::new(vec![
-                    Field::new("row_id", DataType::UInt64, false),
+                    Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
                     Field::new("alpha_u64", DataType::UInt64, false).with_metadata(HashMap::from(
                         [("field_id".to_string(), COL_ALPHA_U64.to_string())],
                     )),
@@ -812,7 +812,7 @@ mod tests {
         {
             let table = Table::new(TABLE_BETA, Arc::clone(&pager)).unwrap();
             let schema = Arc::new(Schema::new(vec![
-                Field::new("row_id", DataType::UInt64, false),
+                Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
                 Field::new("beta_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
                     "field_id".to_string(),
                     COL_BETA_U64.to_string(),
@@ -837,7 +837,7 @@ mod tests {
         {
             let table = Table::new(TABLE_GAMMA, Arc::clone(&pager)).unwrap();
             let schema = Arc::new(Schema::new(vec![
-                Field::new("row_id", DataType::UInt64, false),
+                Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
                 Field::new("gamma_i16", DataType::Int16, false).with_metadata(HashMap::from([(
                     "field_id".to_string(),
                     COL_GAMMA_I16.to_string(),
@@ -1138,7 +1138,7 @@ mod tests {
         const COL_E_F32: FieldId = 14;
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("row_id", DataType::UInt64, false),
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
                 "field_id".to_string(),
                 COL_A_U64.to_string(),
@@ -1277,7 +1277,7 @@ mod tests {
         const COL_C_I32: FieldId = 24;
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("row_id", DataType::UInt64, false),
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
                 "field_id".to_string(),
                 COL_A_U64.to_string(),
