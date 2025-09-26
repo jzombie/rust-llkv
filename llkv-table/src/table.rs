@@ -277,16 +277,18 @@ where
         self.store.append(&namespaced_batch)
     }
 
-    /// Stream one projected column as a sequence of RecordBatches.
+    /// Stream one or more projected columns as a sequence of `RecordBatch`es.
     ///
     /// - Avoids `concat` and large materializations.
     /// - Uses the scan builder to stream logical batches directly from
     ///   column-map without allocating whole-column materializations.
     /// - Applies predicate filtering inside column-map and emits compact
-    ///   Arrow batches that contain the requested projection only.
+    ///   Arrow batches that contain only the requested projection columns.
+    /// - `filter` identifies the column and predicate used to cull rows before
+    ///   projection; only rows matching it will be streamed.
     pub fn scan_stream<'a, F>(
         &self,
-        projection_col: FieldId,
+        projection_cols: &[FieldId],
         filter: &Filter<'a, FieldId>,
         on_batch: F,
     ) -> Result<(), TableError>
@@ -294,7 +296,7 @@ where
         F: FnMut(RecordBatch),
     {
         self.scan_stream_with_options(
-            &[projection_col],
+            projection_cols,
             filter,
             ScanStreamOptions::default(),
             on_batch,
@@ -532,11 +534,15 @@ mod tests {
     const COL_C_I32: FieldId = 11;
     const COL_BIG_U64: FieldId = 42;
 
-    fn collect_batches<F>(table: &Table, proj: FieldId, filter: &Filter<'_, FieldId>, f: F)
-    where
+    fn collect_batches<F>(
+        table: &Table,
+        projection_cols: &[FieldId],
+        filter: &Filter<'_, FieldId>,
+        f: F,
+    ) where
         F: FnMut(RecordBatch),
     {
-        table.scan_stream(proj, filter, f).unwrap();
+        table.scan_stream(projection_cols, filter, f).unwrap();
     }
 
     fn setup_small_table() -> Table {
@@ -614,7 +620,7 @@ mod tests {
         };
 
         let mut batches: Vec<RecordBatch> = Vec::new();
-        collect_batches(&table, COL_A_U64, &filter, |batch| batches.push(batch));
+        collect_batches(&table, &[COL_A_U64], &filter, |batch| batches.push(batch));
 
         assert!(!batches.is_empty(), "expected at least one batch");
 
@@ -642,7 +648,7 @@ mod tests {
         };
 
         let mut non_null_values = Vec::new();
-        collect_batches(&table, COL_A_U64, &filter, |batch| {
+        collect_batches(&table, &[COL_A_U64], &filter, |batch| {
             assert_eq!(batch.num_columns(), 1);
             let column = batch
                 .column(0)
@@ -757,7 +763,7 @@ mod tests {
         };
 
         let mut batches = Vec::new();
-        collect_batches(&table, COL_BIG_U64, &filter, |batch| batches.push(batch));
+        collect_batches(&table, &[COL_BIG_U64], &filter, |batch| batches.push(batch));
 
         assert!(batches.len() > 1, "expected multiple batches");
 
