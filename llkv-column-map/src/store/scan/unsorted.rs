@@ -451,6 +451,7 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
     let v_pk = *catalog.get(&value_fid).ok_or(Error::NotFound)?;
     let r_pk = *catalog.get(&rowid_fid).ok_or(Error::NotFound)?;
     let a_pk = *catalog.get(&anchor_rowid_fid).ok_or(Error::NotFound)?;
+    let reuse_rowid_as_anchor = anchor_rowid_fid == rowid_fid;
 
     // Load descriptors
     let v_desc = {
@@ -580,8 +581,21 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
                 );
             }
             for am in &a_metas {
-                let any =
-                    deserialize_array(ablobs.get(&am.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let entry = if let Some(bytes) = ablobs.get(&am.chunk_pk) {
+                    bytes.clone()
+                } else if reuse_rowid_as_anchor {
+                    rblobs
+                        .get(&am.chunk_pk)
+                        .ok_or_else(|| {
+                            Error::Internal(
+                                "unsorted_with_nulls: missing shared row-id chunk".into(),
+                            )
+                        })?
+                        .clone()
+                } else {
+                    return Err(Error::NotFound);
+                };
+                let any = deserialize_array(entry)?;
                 anchors.push(
                     any.as_any()
                         .downcast_ref::<UInt64Array>()

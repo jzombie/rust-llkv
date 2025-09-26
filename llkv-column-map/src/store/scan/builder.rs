@@ -743,8 +743,41 @@ pub struct MultiProjectionBatch {
 struct PrefetchedColumn {
     field_id: LogicalFieldId,
     dtype: DataType,
-    chunks: Vec<ArrayRef>,
-    row_ids: Vec<Arc<UInt64Array>>,
+    values: ArrayRef,
+    row_ids: Arc<UInt64Array>,
+    cursor: usize,
+}
+
+impl PrefetchedColumn {
+    fn next_aligned(&mut self, base_row_ids: &UInt64Array) -> Result<ArrayRef> {
+        if self.row_ids.is_empty() {
+            return Ok(new_null_array(&self.dtype, base_row_ids.len()));
+        }
+
+        let mut indices: Vec<Option<u32>> = Vec::with_capacity(base_row_ids.len());
+        let mut cursor = self.cursor;
+        let rid_slice = self.row_ids.as_ref();
+        let total = rid_slice.len();
+
+        for base_idx in 0..base_row_ids.len() {
+            let base_rid = base_row_ids.value(base_idx);
+            while cursor < total && rid_slice.value(cursor) < base_rid {
+                cursor += 1;
+            }
+            if cursor < total && rid_slice.value(cursor) == base_rid {
+                indices.push(Some(cursor as u32));
+                cursor += 1;
+            } else {
+                indices.push(None);
+            }
+        }
+
+        self.cursor = cursor;
+
+        let indices_array = UInt32Array::from(indices);
+        let aligned = take(self.values.as_ref(), &indices_array, None).map_err(Error::from)?;
+        Ok(aligned)
+    }
 }
 
 struct MultiProjectionVisitor<'a, F>
@@ -757,7 +790,6 @@ where
     projection: Arc<[LogicalFieldId]>,
     on_batch: &'a mut F,
     include_nulls: bool,
-    chunk_idx: usize,
     error: Option<Error>,
 }
 
@@ -780,7 +812,6 @@ where
             projection,
             on_batch,
             include_nulls,
-            chunk_idx: 0,
             error: None,
         }
     }
@@ -827,87 +858,19 @@ where
         if self.error.is_some() {
             return;
         }
-        let chunk_idx = self.chunk_idx;
         let mut extra_arrays: Vec<ArrayRef> = Vec::with_capacity(self.extras.len());
-        for col in &self.extras {
-            if let Some(arr) = col.chunks.get(chunk_idx) {
-                let needs_alignment = match col.row_ids.get(chunk_idx) {
-                    Some(rids) => rids.len() != row_ids.len(),
-                    None => false,
-                };
-                if needs_alignment {
-                    let rid_arr = match col.row_ids.get(chunk_idx) {
-                        Some(r) => r.as_ref(),
-                        None => {
-                            self.error = Some(Error::Internal(
-                                "project: missing row-ids for extra column chunk".into(),
-                            ));
-                            return;
-                        }
-                    };
-                    match self.align_projection_chunk(arr, rid_arr, row_ids.as_ref()) {
-                        Ok(aligned) => extra_arrays.push(aligned),
-                        Err(err) => {
-                            self.error = Some(err);
-                            return;
-                        }
-                    }
-                } else {
-                    extra_arrays.push(arr.clone());
+        for col in &mut self.extras {
+            match col.next_aligned(row_ids.as_ref()) {
+                Ok(aligned) => extra_arrays.push(aligned),
+                Err(err) => {
+                    self.error = Some(err);
+                    return;
                 }
-            } else if col.chunks.is_empty() {
-                extra_arrays.push(new_null_array(&col.dtype, row_ids.len()));
-            } else {
-                self.error = Some(Error::Internal(
-                    "project: chunk count mismatch for extra column".into(),
-                ));
-                return;
             }
         }
         if let Err(err) = self.emit_record(row_ids, values, extra_arrays) {
             self.error = Some(err);
-            return;
         }
-        self.chunk_idx += 1;
-    }
-
-    fn align_projection_chunk(
-        &self,
-        values: &ArrayRef,
-        value_row_ids: &UInt64Array,
-        base_row_ids: &UInt64Array,
-    ) -> Result<ArrayRef> {
-        if values.len() != value_row_ids.len() {
-            return Err(Error::Internal(
-                "project: extra column value/row-id length mismatch".into(),
-            ));
-        }
-
-        let mut indices: Vec<Option<u32>> = Vec::with_capacity(base_row_ids.len());
-        let mut value_idx = 0usize;
-        for base_idx in 0..base_row_ids.len() {
-            let base_rid = base_row_ids.value(base_idx);
-            while value_idx < value_row_ids.len() && value_row_ids.value(value_idx) < base_rid {
-                value_idx += 1;
-            }
-            if value_idx < value_row_ids.len() && value_row_ids.value(value_idx) == base_rid {
-                let idx = value_idx as u32;
-                indices.push(Some(idx));
-                value_idx += 1;
-            } else {
-                indices.push(None);
-            }
-        }
-
-        if value_idx != value_row_ids.len() {
-            return Err(Error::Internal(
-                "project: extra column row ids not aligned with driver chunk".into(),
-            ));
-        }
-
-        let indices_array = UInt32Array::from(indices);
-        let aligned = take(values.as_ref(), &indices_array, None).map_err(Error::from)?;
-        Ok(aligned)
     }
 
     fn emit_null_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
@@ -1131,7 +1094,7 @@ where
             GetResult::Raw { bytes, .. } => Some(bytes),
             _ => None,
         })
-        .ok_or(Error::NotFound)?;
+        .ok_or_else(|| Error::Internal("prefetch: missing descriptor".into()))?;
     let desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
     let mut metas: Vec<crate::store::descriptor::ChunkMetadata> = Vec::new();
@@ -1144,11 +1107,14 @@ where
         }
     }
     if metas.is_empty() {
+        let empty_values = new_null_array(&dtype, 0);
+        let empty_row_ids = Arc::new(UInt64Array::from(Vec::<u64>::new()));
         return Ok(PrefetchedColumn {
             field_id,
             dtype,
-            chunks: Vec::new(),
-            row_ids: Vec::new(),
+            values: empty_values,
+            row_ids: empty_row_ids,
+            cursor: 0,
         });
     }
 
@@ -1162,7 +1128,7 @@ where
             GetResult::Raw { bytes, .. } => Some(bytes),
             _ => None,
         })
-        .ok_or(Error::NotFound)?;
+        .ok_or_else(|| Error::Internal("prefetch: missing rowid descriptor".into()))?;
     let rid_desc =
         crate::store::descriptor::ColumnDescriptor::from_le_bytes(rid_desc_blob.as_ref());
 
@@ -1221,7 +1187,7 @@ where
     for (meta, rid_meta) in metas.into_iter().zip(rowid_metas.into_iter()) {
         let rid_bytes = rowid_blobs
             .remove(&rid_meta.chunk_pk)
-            .ok_or(Error::NotFound)?;
+            .ok_or_else(|| Error::Internal("prefetch: missing rowid chunk".into()))?;
         let rid_arr_any = llkv_storage::serialization::deserialize_array(rid_bytes)?;
         let rid_arr = rid_arr_any
             .as_any()
@@ -1243,11 +1209,36 @@ where
         row_id_chunks.push(rid_arr);
     }
 
+    let values = if chunks.is_empty() {
+        new_null_array(&dtype, 0)
+    } else {
+        let refs: Vec<&ArrayRef> = chunks.iter().collect();
+        crate::store::slicing::concat_many(refs)?
+    };
+
+    let row_ids = if row_id_chunks.is_empty() {
+        Arc::new(UInt64Array::from(Vec::<u64>::new()))
+    } else {
+        let row_refs: Vec<ArrayRef> = row_id_chunks
+            .iter()
+            .map(|arr| Arc::clone(arr) as ArrayRef)
+            .collect();
+        let ref_refs: Vec<&ArrayRef> = row_refs.iter().collect();
+        let any = crate::store::slicing::concat_many(ref_refs)?;
+        let arr = any
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::Internal("prefetch: row-id concat type mismatch".into()))?
+            .clone();
+        Arc::new(arr)
+    };
+
     Ok(PrefetchedColumn {
         field_id,
         dtype,
-        chunks,
-        row_ids: row_id_chunks,
+        values,
+        row_ids,
+        cursor: 0,
     })
 }
 

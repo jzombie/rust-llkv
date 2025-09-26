@@ -581,7 +581,7 @@ mod tests {
                     .unwrap();
                 values_with_nulls.extend(column.iter());
             })
-            .unwrap();
+            .expect("scan_stream_with_options should succeed");
 
         assert_eq!(values_with_nulls, vec![Some(100), None, Some(300)]);
     }
