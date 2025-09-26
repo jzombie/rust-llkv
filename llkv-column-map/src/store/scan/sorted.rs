@@ -1154,6 +1154,263 @@ sorted_with_rids_float_bounds_impl!(
     f32_run_with_rids
 );
 
+macro_rules! sorted_bounds_visit {
+    ($ir:expr, $field:ident, $func:ident, $pager:expr, $metas:expr, $blobs:expr, $visitor:expr) => {{
+        let (lb, ub) = $ir.$field.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+        $func($pager, $metas, $blobs, (lb, ub), $visitor)
+    }};
+}
+
+macro_rules! sorted_bounds_with_rids_visit {
+    (
+        $ir:expr,
+        $field:ident,
+        $func:ident,
+        $pager:expr,
+        $metas_val:expr,
+        $metas_rid:expr,
+        $vblobs:expr,
+        $rblobs:expr,
+        $visitor:expr
+    ) => {{
+        let (lb, ub) = $ir.$field.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+        $func(
+            $pager,
+            $metas_val,
+            $metas_rid,
+            $vblobs,
+            $rblobs,
+            (lb, ub),
+            $visitor,
+        )
+    }};
+}
+
+macro_rules! dispatch_sorted_bounds {
+    ($dtype:expr, $pager:expr, $metas:expr, $blobs:expr, $ir:expr, $visitor:expr) => {{
+        match $dtype {
+            DataType::UInt64 => sorted_bounds_visit!(
+                $ir,
+                u64_r,
+                sorted_visit_u64_bounds,
+                $pager,
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::UInt32 => sorted_bounds_visit!(
+                $ir,
+                u32_r,
+                sorted_visit_u32_bounds,
+                $pager,
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::UInt16 => sorted_bounds_visit!(
+                $ir,
+                u16_r,
+                sorted_visit_u16_bounds,
+                $pager,
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::UInt8 => sorted_bounds_visit!(
+                $ir,
+                u8_r,
+                sorted_visit_u8_bounds,
+                $pager,
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::Int64 => sorted_bounds_visit!(
+                $ir,
+                i64_r,
+                sorted_visit_i64_bounds,
+                $pager,
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::Int32 => sorted_bounds_visit!(
+                $ir,
+                i32_r,
+                sorted_visit_i32_bounds,
+                $pager,
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::Int16 => sorted_bounds_visit!(
+                $ir,
+                i16_r,
+                sorted_visit_i16_bounds,
+                $pager,
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::Int8 => sorted_bounds_visit!(
+                $ir,
+                i8_r,
+                sorted_visit_i8_bounds,
+                $pager,
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::Float64 => sorted_bounds_visit!(
+                $ir,
+                f64_r,
+                sorted_visit_f64_bounds,
+                $pager,
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::Float32 => sorted_bounds_visit!(
+                $ir,
+                f32_r,
+                sorted_visit_f32_bounds,
+                $pager,
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            _ => Err(Error::Internal("unsupported sorted dtype (builder)".into())),
+        }
+    }};
+}
+
+macro_rules! dispatch_sorted_with_rids_bounds {
+    (
+        $dtype:expr,
+        $pager:expr,
+        $metas_val:expr,
+        $metas_rid:expr,
+        $vblobs:expr,
+        $rblobs:expr,
+        $ir:expr,
+        $visitor:expr
+    ) => {{
+        match $dtype {
+            DataType::UInt64 => sorted_bounds_with_rids_visit!(
+                $ir,
+                u64_r,
+                sorted_visit_with_rids_u64_bounds,
+                $pager,
+                $metas_val,
+                $metas_rid,
+                $vblobs,
+                $rblobs,
+                $visitor
+            ),
+            DataType::UInt32 => sorted_bounds_with_rids_visit!(
+                $ir,
+                u32_r,
+                sorted_visit_with_rids_u32_bounds,
+                $pager,
+                $metas_val,
+                $metas_rid,
+                $vblobs,
+                $rblobs,
+                $visitor
+            ),
+            DataType::UInt16 => sorted_bounds_with_rids_visit!(
+                $ir,
+                u16_r,
+                sorted_visit_with_rids_u16_bounds,
+                $pager,
+                $metas_val,
+                $metas_rid,
+                $vblobs,
+                $rblobs,
+                $visitor
+            ),
+            DataType::UInt8 => sorted_bounds_with_rids_visit!(
+                $ir,
+                u8_r,
+                sorted_visit_with_rids_u8_bounds,
+                $pager,
+                $metas_val,
+                $metas_rid,
+                $vblobs,
+                $rblobs,
+                $visitor
+            ),
+            DataType::Int64 => sorted_bounds_with_rids_visit!(
+                $ir,
+                i64_r,
+                sorted_visit_with_rids_i64_bounds,
+                $pager,
+                $metas_val,
+                $metas_rid,
+                $vblobs,
+                $rblobs,
+                $visitor
+            ),
+            DataType::Int32 => sorted_bounds_with_rids_visit!(
+                $ir,
+                i32_r,
+                sorted_visit_with_rids_i32_bounds,
+                $pager,
+                $metas_val,
+                $metas_rid,
+                $vblobs,
+                $rblobs,
+                $visitor
+            ),
+            DataType::Int16 => sorted_bounds_with_rids_visit!(
+                $ir,
+                i16_r,
+                sorted_visit_with_rids_i16_bounds,
+                $pager,
+                $metas_val,
+                $metas_rid,
+                $vblobs,
+                $rblobs,
+                $visitor
+            ),
+            DataType::Int8 => sorted_bounds_with_rids_visit!(
+                $ir,
+                i8_r,
+                sorted_visit_with_rids_i8_bounds,
+                $pager,
+                $metas_val,
+                $metas_rid,
+                $vblobs,
+                $rblobs,
+                $visitor
+            ),
+            DataType::Float64 => sorted_bounds_with_rids_visit!(
+                $ir,
+                f64_r,
+                sorted_visit_with_rids_f64_bounds,
+                $pager,
+                $metas_val,
+                $metas_rid,
+                $vblobs,
+                $rblobs,
+                $visitor
+            ),
+            DataType::Float32 => sorted_bounds_with_rids_visit!(
+                $ir,
+                f32_r,
+                sorted_visit_with_rids_f32_bounds,
+                $pager,
+                $metas_val,
+                $metas_rid,
+                $vblobs,
+                $rblobs,
+                $visitor
+            ),
+            _ => Err(Error::Internal("unsupported sorted dtype (builder)".into())),
+        }
+    }};
+}
+
 pub fn range_sorted_dispatch<P, V>(
     store: &ColumnStore<P>,
     field_id: LogicalFieldId,
@@ -1266,220 +1523,24 @@ where
 
     // Dispatch by dtype + bounds for this dtype only
     if opts.with_row_ids {
-        match first_any.data_type() {
-            DataType::UInt64 => {
-                let (lb, ub) = ir.u64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_with_rids_u64_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &metas_rid,
-                    &vblobs,
-                    &rblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::UInt32 => {
-                let (lb, ub) = ir.u32_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_with_rids_u32_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &metas_rid,
-                    &vblobs,
-                    &rblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::UInt16 => {
-                let (lb, ub) = ir.u16_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_with_rids_u16_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &metas_rid,
-                    &vblobs,
-                    &rblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::UInt8 => {
-                let (lb, ub) = ir.u8_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_with_rids_u8_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &metas_rid,
-                    &vblobs,
-                    &rblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::Int64 => {
-                let (lb, ub) = ir.i64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_with_rids_i64_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &metas_rid,
-                    &vblobs,
-                    &rblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::Int32 => {
-                let (lb, ub) = ir.i32_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_with_rids_i32_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &metas_rid,
-                    &vblobs,
-                    &rblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::Int16 => {
-                let (lb, ub) = ir.i16_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_with_rids_i16_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &metas_rid,
-                    &vblobs,
-                    &rblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::Int8 => {
-                let (lb, ub) = ir.i8_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_with_rids_i8_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &metas_rid,
-                    &vblobs,
-                    &rblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::Float64 => {
-                let (lb, ub) = ir.f64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_with_rids_f64_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &metas_rid,
-                    &vblobs,
-                    &rblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::Float32 => {
-                let (lb, ub) = ir.f32_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_with_rids_f32_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &metas_rid,
-                    &vblobs,
-                    &rblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            _ => Err(Error::Internal("unsupported sorted dtype (builder)".into())),
-        }
+        dispatch_sorted_with_rids_bounds!(
+            first_any.data_type(),
+            store.pager.as_ref(),
+            &metas_val,
+            &metas_rid,
+            &vblobs,
+            &rblobs,
+            ir,
+            visitor
+        )
     } else {
-        match first_any.data_type() {
-            DataType::UInt64 => {
-                let (lb, ub) = ir.u64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_u64_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &vblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::UInt32 => {
-                let (lb, ub) = ir.u32_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_u32_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &vblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::UInt16 => {
-                let (lb, ub) = ir.u16_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_u16_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &vblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::UInt8 => {
-                let (lb, ub) = ir.u8_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_u8_bounds(store.pager.as_ref(), &metas_val, &vblobs, (lb, ub), visitor)
-            }
-            DataType::Int64 => {
-                let (lb, ub) = ir.i64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_i64_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &vblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::Int32 => {
-                let (lb, ub) = ir.i32_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_i32_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &vblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::Int16 => {
-                let (lb, ub) = ir.i16_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_i16_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &vblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::Int8 => {
-                let (lb, ub) = ir.i8_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_i8_bounds(store.pager.as_ref(), &metas_val, &vblobs, (lb, ub), visitor)
-            }
-            DataType::Float64 => {
-                let (lb, ub) = ir.f64_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_f64_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &vblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            DataType::Float32 => {
-                let (lb, ub) = ir.f32_r.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                sorted_visit_f32_bounds(
-                    store.pager.as_ref(),
-                    &metas_val,
-                    &vblobs,
-                    (lb, ub),
-                    visitor,
-                )
-            }
-            _ => Err(Error::Internal("unsupported sorted dtype (builder)".into())),
-        }
+        dispatch_sorted_bounds!(
+            first_any.data_type(),
+            store.pager.as_ref(),
+            &metas_val,
+            &vblobs,
+            ir,
+            visitor
+        )
     }
 }
