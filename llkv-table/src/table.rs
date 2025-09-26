@@ -446,6 +446,7 @@ mod tests {
     const TABLE_ID_SMALL: TableId = 1;
     const TABLE_ID_LARGE: TableId = 2;
     const COL_A_U64: FieldId = 10;
+    const COL_B_U64: FieldId = 12;
     const COL_C_I32: FieldId = 11;
     const COL_BIG_U64: FieldId = 42;
 
@@ -496,6 +497,10 @@ mod tests {
                 "field_id".to_string(),
                 COL_A_U64.to_string(),
             )])),
+            Field::new("b_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_B_U64.to_string(),
+            )])),
             Field::new("c_i32", DataType::Int32, false).with_metadata(HashMap::from([(
                 "field_id".to_string(),
                 COL_C_I32.to_string(),
@@ -507,6 +512,7 @@ mod tests {
             vec![
                 Arc::new(UInt64Array::from(vec![1, 2, 3])) as ArrayRef,
                 Arc::new(UInt64Array::from(vec![Some(100), None, Some(300)])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![1000, 2000, 3000])) as ArrayRef,
                 Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef,
             ],
         )
@@ -584,6 +590,70 @@ mod tests {
             .expect("scan_stream_with_options should succeed");
 
         assert_eq!(values_with_nulls, vec![Some(100), None, Some(300)]);
+
+        // Verify multi-column projection keeps values aligned when one column contains nulls.
+        let filter_lfid = lfid_for(TABLE_ID_SMALL, COL_C_I32);
+        let proj_a_lfid = lfid_for(TABLE_ID_SMALL, COL_A_U64);
+        let proj_b_lfid = lfid_for(TABLE_ID_SMALL, COL_B_U64);
+
+        assert_eq!(
+            table.store().data_type(proj_b_lfid).unwrap(),
+            DataType::UInt64
+        );
+
+        let mut scan_opts = scan::ScanOptions::default();
+        scan_opts.include_nulls = true;
+
+        let builder = scan::ScanBuilder::with_columns(
+            table.store(),
+            &[filter_lfid, proj_a_lfid, proj_b_lfid],
+        )
+        .options(scan_opts);
+
+        let mut mp_batches = Vec::new();
+        builder
+            .project(|mp_batch| {
+                mp_batches.push(mp_batch);
+                Ok(())
+            })
+            .expect("multi-column projection should succeed");
+
+        let mut aligned_row_ids = Vec::new();
+        let mut column_a: Vec<Option<u64>> = Vec::new();
+        let mut column_b: Vec<u64> = Vec::new();
+
+        for mp in mp_batches {
+            let row_ids = mp.row_ids.as_ref();
+            let record_batch = mp.record_batch;
+
+            let col_a = record_batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("projection column a should be UInt64");
+            let col_b = record_batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("projection column b should be UInt64");
+
+            assert_eq!(col_a.len(), col_b.len());
+            assert_eq!(col_a.len(), row_ids.len());
+
+            for idx in 0..row_ids.len() {
+                aligned_row_ids.push(row_ids.value(idx));
+                if col_a.is_null(idx) {
+                    column_a.push(None);
+                } else {
+                    column_a.push(Some(col_a.value(idx)));
+                }
+                column_b.push(col_b.value(idx));
+            }
+        }
+
+        assert_eq!(aligned_row_ids, vec![1, 2, 3]);
+        assert_eq!(column_a, vec![Some(100), None, Some(300)]);
+        assert_eq!(column_b, vec![1000, 2000, 3000]);
     }
 
     fn setup_large_table() -> Table {
