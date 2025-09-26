@@ -22,13 +22,13 @@ use arrow::record_batch::RecordBatch;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
+use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
-use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_storage::pager::MemPager;
 
 use rand::rngs::StdRng;

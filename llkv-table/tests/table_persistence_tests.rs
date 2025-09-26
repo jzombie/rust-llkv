@@ -10,9 +10,9 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_table::Table;
 use llkv_table::types::{FieldId, RowId, TableId};
-use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 
 use llkv_storage::pager::simd_r_drive_pager::SimdRDrivePager;
 use tempfile::TempDir;

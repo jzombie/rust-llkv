@@ -4,8 +4,8 @@ mod config;
 use config::*;
 
 mod constants;
-use constants::*;
 pub use constants::ROW_ID_COLUMN_NAME;
+use constants::*;
 
 pub mod core;
 pub use core::*;

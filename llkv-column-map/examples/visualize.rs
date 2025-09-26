@@ -120,7 +120,11 @@ fn batch_from_pairs(pairs: &[(LogicalFieldId, ArrayRef)]) -> RecordBatch {
     } else {
         pairs[0].1.len()
     };
-    let row_id_field = Field::new(ROW_ID_COLUMN_NAME, arrow::datatypes::DataType::UInt64, false);
+    let row_id_field = Field::new(
+        ROW_ID_COLUMN_NAME,
+        arrow::datatypes::DataType::UInt64,
+        false,
+    );
     let start_row_id = NEXT_ROW_ID.fetch_add(num_rows as u64, Ordering::Relaxed);
     let end_row_id = start_row_id + num_rows as u64;
     let row_id_array =
