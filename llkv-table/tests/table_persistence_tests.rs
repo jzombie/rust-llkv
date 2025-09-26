@@ -111,7 +111,7 @@ fn table_persistence_many_columns_simd_r_drive() {
         macro_rules! assert_prim_eq {
             ($fid:expr, $dt:expr, $cast:ty, $expect:expr) => {{
                 assert_eq!(store.data_type(lfid($fid)).unwrap(), $dt);
-                let arr = store.gather_rows(lfid($fid), &rows).unwrap();
+                let arr = store.gather_rows(lfid($fid), &rows, false).unwrap();
                 let arr = arr.as_any().downcast_ref::<$cast>().unwrap();
                 assert_eq!(arr.values(), $expect.as_slice());
             }};

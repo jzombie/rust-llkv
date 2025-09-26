@@ -25,6 +25,8 @@ pub use rowid::*;
 pub mod scan;
 pub use scan::*;
 
+mod projection;
+
 mod slicing;
 use slicing::*;
 
