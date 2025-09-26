@@ -1,6 +1,289 @@
 use super::*;
 use arrow::datatypes::DataType;
 
+macro_rules! unsorted_visit_arm {
+    ($array:ty, $method:ident, $err:literal, $metas:ident, $blobs:ident, $visitor:ident) => {{
+        for m in $metas {
+            let a_any = deserialize_array($blobs.remove(&m.chunk_pk).ok_or(Error::NotFound)?)?;
+            let a = a_any
+                .as_any()
+                .downcast_ref::<$array>()
+                .ok_or_else(|| Error::Internal($err.into()))?;
+            $visitor.$method(a);
+        }
+        Ok(())
+    }};
+}
+
+macro_rules! unsorted_with_rids_arm {
+    (
+        $array:ty,
+        $method:ident,
+        $err:literal,
+        $v_metas:ident,
+        $r_metas:ident,
+        $vals_blobs:ident,
+        $rids_blobs:ident,
+        $visitor:ident
+    ) => {{
+        for (vm, rm) in $v_metas.into_iter().zip($r_metas.into_iter()) {
+            let va = deserialize_array($vals_blobs.remove(&vm.chunk_pk).ok_or(Error::NotFound)?)?;
+            let ra = deserialize_array($rids_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?)?;
+            let v = va
+                .as_any()
+                .downcast_ref::<$array>()
+                .ok_or_else(|| Error::Internal($err.into()))?;
+            let r = ra
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("downcast row_id u64".into()))?;
+            $visitor.$method(v, r);
+        }
+        Ok(())
+    }};
+}
+
+macro_rules! dispatch_unsorted_visit {
+    ($dtype:expr, $metas:ident, $blobs:ident, $visitor:ident) => {{
+        match $dtype {
+            DataType::UInt64 => unsorted_visit_arm!(
+                UInt64Array,
+                u64_chunk,
+                "downcast UInt64",
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::UInt32 => unsorted_visit_arm!(
+                UInt32Array,
+                u32_chunk,
+                "downcast UInt32",
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::UInt16 => unsorted_visit_arm!(
+                UInt16Array,
+                u16_chunk,
+                "downcast UInt16",
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::UInt8 => unsorted_visit_arm!(
+                UInt8Array,
+                u8_chunk,
+                "downcast UInt8",
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::Int64 => unsorted_visit_arm!(
+                Int64Array,
+                i64_chunk,
+                "downcast Int64",
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::Int32 => unsorted_visit_arm!(
+                Int32Array,
+                i32_chunk,
+                "downcast Int32",
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::Int16 => unsorted_visit_arm!(
+                Int16Array,
+                i16_chunk,
+                "downcast Int16",
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::Int8 => unsorted_visit_arm!(
+                Int8Array,
+                i8_chunk,
+                "downcast Int8",
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::Float64 => unsorted_visit_arm!(
+                Float64Array,
+                f64_chunk,
+                "downcast Float64",
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            DataType::Float32 => unsorted_visit_arm!(
+                Float32Array,
+                f32_chunk,
+                "downcast Float32",
+                $metas,
+                $blobs,
+                $visitor
+            ),
+            _ => Err(Error::Internal("unsorted_visit: unsupported dtype".into())),
+        }
+    }};
+}
+
+macro_rules! dispatch_unsorted_with_rids_visit {
+    (
+        $dtype:expr,
+        $v_metas:ident,
+        $r_metas:ident,
+        $vals_blobs:ident,
+        $rids_blobs:ident,
+        $visitor:ident
+    ) => {{
+        match $dtype {
+            DataType::UInt64 => unsorted_with_rids_arm!(
+                UInt64Array,
+                u64_chunk_with_rids,
+                "downcast u64",
+                $v_metas,
+                $r_metas,
+                $vals_blobs,
+                $rids_blobs,
+                $visitor
+            ),
+            DataType::UInt32 => unsorted_with_rids_arm!(
+                UInt32Array,
+                u32_chunk_with_rids,
+                "downcast u32",
+                $v_metas,
+                $r_metas,
+                $vals_blobs,
+                $rids_blobs,
+                $visitor
+            ),
+            DataType::UInt16 => unsorted_with_rids_arm!(
+                UInt16Array,
+                u16_chunk_with_rids,
+                "downcast u16",
+                $v_metas,
+                $r_metas,
+                $vals_blobs,
+                $rids_blobs,
+                $visitor
+            ),
+            DataType::UInt8 => unsorted_with_rids_arm!(
+                UInt8Array,
+                u8_chunk_with_rids,
+                "downcast u8",
+                $v_metas,
+                $r_metas,
+                $vals_blobs,
+                $rids_blobs,
+                $visitor
+            ),
+            DataType::Int64 => unsorted_with_rids_arm!(
+                Int64Array,
+                i64_chunk_with_rids,
+                "downcast i64",
+                $v_metas,
+                $r_metas,
+                $vals_blobs,
+                $rids_blobs,
+                $visitor
+            ),
+            DataType::Int32 => unsorted_with_rids_arm!(
+                Int32Array,
+                i32_chunk_with_rids,
+                "downcast i32",
+                $v_metas,
+                $r_metas,
+                $vals_blobs,
+                $rids_blobs,
+                $visitor
+            ),
+            DataType::Int16 => unsorted_with_rids_arm!(
+                Int16Array,
+                i16_chunk_with_rids,
+                "downcast i16",
+                $v_metas,
+                $r_metas,
+                $vals_blobs,
+                $rids_blobs,
+                $visitor
+            ),
+            DataType::Int8 => unsorted_with_rids_arm!(
+                Int8Array,
+                i8_chunk_with_rids,
+                "downcast i8",
+                $v_metas,
+                $r_metas,
+                $vals_blobs,
+                $rids_blobs,
+                $visitor
+            ),
+            DataType::Float64 => unsorted_with_rids_arm!(
+                Float64Array,
+                f64_chunk_with_rids,
+                "downcast f64",
+                $v_metas,
+                $r_metas,
+                $vals_blobs,
+                $rids_blobs,
+                $visitor
+            ),
+            DataType::Float32 => unsorted_with_rids_arm!(
+                Float32Array,
+                f32_chunk_with_rids,
+                "downcast f32",
+                $v_metas,
+                $r_metas,
+                $vals_blobs,
+                $rids_blobs,
+                $visitor
+            ),
+            _ => Err(Error::Internal(
+                "unsorted_with_row_ids: unsupported dtype".into(),
+            )),
+        }
+    }};
+}
+
+macro_rules! dispatch_unsorted_nulls {
+    ($dtype:expr) => {{
+        match $dtype {
+            DataType::UInt64 => {
+                emit_unsorted_nulls!(UInt64Array, u64_chunk_with_rids, "downcast u64")
+            }
+            DataType::UInt32 => {
+                emit_unsorted_nulls!(UInt32Array, u32_chunk_with_rids, "downcast u32")
+            }
+            DataType::UInt16 => {
+                emit_unsorted_nulls!(UInt16Array, u16_chunk_with_rids, "downcast u16")
+            }
+            DataType::UInt8 => emit_unsorted_nulls!(UInt8Array, u8_chunk_with_rids, "downcast u8"),
+            DataType::Int64 => {
+                emit_unsorted_nulls!(Int64Array, i64_chunk_with_rids, "downcast i64")
+            }
+            DataType::Int32 => {
+                emit_unsorted_nulls!(Int32Array, i32_chunk_with_rids, "downcast i32")
+            }
+            DataType::Int16 => {
+                emit_unsorted_nulls!(Int16Array, i16_chunk_with_rids, "downcast i16")
+            }
+            DataType::Int8 => emit_unsorted_nulls!(Int8Array, i8_chunk_with_rids, "downcast i8"),
+            DataType::Float64 => {
+                emit_unsorted_nulls!(Float64Array, f64_chunk_with_rids, "downcast f64")
+            }
+            DataType::Float32 => {
+                emit_unsorted_nulls!(Float32Array, f32_chunk_with_rids, "downcast f32")
+            }
+            _ => Err(Error::Internal(
+                "unsorted_with_nulls: dtype not supported".into(),
+            )),
+        }
+    }};
+}
+
 pub fn unsorted_visit<P: Pager<Blob = EntryHandle>, V: PrimitiveVisitor>(
     pager: &P,
     catalog: &FxHashMap<LogicalFieldId, PhysicalKey>,
@@ -48,119 +331,7 @@ pub fn unsorted_visit<P: Pager<Blob = EntryHandle>, V: PrimitiveVisitor>(
             .ok_or(Error::NotFound)?
             .clone(),
     )?;
-    match first_any.data_type() {
-        DataType::UInt64 => {
-            for m in metas {
-                let a_any = deserialize_array(blobs.remove(&m.chunk_pk).ok_or(Error::NotFound)?)?;
-                let a = a_any
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("downcast UInt64".into()))?;
-                visitor.u64_chunk(a);
-            }
-            Ok(())
-        }
-        DataType::UInt32 => {
-            for m in metas {
-                let a_any = deserialize_array(blobs.remove(&m.chunk_pk).ok_or(Error::NotFound)?)?;
-                let a = a_any
-                    .as_any()
-                    .downcast_ref::<UInt32Array>()
-                    .ok_or_else(|| Error::Internal("downcast UInt32".into()))?;
-                visitor.u32_chunk(a);
-            }
-            Ok(())
-        }
-        DataType::UInt16 => {
-            for m in metas {
-                let a_any = deserialize_array(blobs.remove(&m.chunk_pk).ok_or(Error::NotFound)?)?;
-                let a = a_any
-                    .as_any()
-                    .downcast_ref::<UInt16Array>()
-                    .ok_or_else(|| Error::Internal("downcast UInt16".into()))?;
-                visitor.u16_chunk(a);
-            }
-            Ok(())
-        }
-        DataType::UInt8 => {
-            for m in metas {
-                let a_any = deserialize_array(blobs.remove(&m.chunk_pk).ok_or(Error::NotFound)?)?;
-                let a = a_any
-                    .as_any()
-                    .downcast_ref::<UInt8Array>()
-                    .ok_or_else(|| Error::Internal("downcast UInt8".into()))?;
-                visitor.u8_chunk(a);
-            }
-            Ok(())
-        }
-        DataType::Int64 => {
-            for m in metas {
-                let a_any = deserialize_array(blobs.remove(&m.chunk_pk).ok_or(Error::NotFound)?)?;
-                let a = a_any
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| Error::Internal("downcast Int64".into()))?;
-                visitor.i64_chunk(a);
-            }
-            Ok(())
-        }
-        DataType::Int32 => {
-            for m in metas {
-                let a_any = deserialize_array(blobs.remove(&m.chunk_pk).ok_or(Error::NotFound)?)?;
-                let a = a_any
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| Error::Internal("downcast Int32".into()))?;
-                visitor.i32_chunk(a);
-            }
-            Ok(())
-        }
-        DataType::Int16 => {
-            for m in metas {
-                let a_any = deserialize_array(blobs.remove(&m.chunk_pk).ok_or(Error::NotFound)?)?;
-                let a = a_any
-                    .as_any()
-                    .downcast_ref::<Int16Array>()
-                    .ok_or_else(|| Error::Internal("downcast Int16".into()))?;
-                visitor.i16_chunk(a);
-            }
-            Ok(())
-        }
-        DataType::Int8 => {
-            for m in metas {
-                let a_any = deserialize_array(blobs.remove(&m.chunk_pk).ok_or(Error::NotFound)?)?;
-                let a = a_any
-                    .as_any()
-                    .downcast_ref::<Int8Array>()
-                    .ok_or_else(|| Error::Internal("downcast Int8".into()))?;
-                visitor.i8_chunk(a);
-            }
-            Ok(())
-        }
-        DataType::Float64 => {
-            for m in metas {
-                let a_any = deserialize_array(blobs.remove(&m.chunk_pk).ok_or(Error::NotFound)?)?;
-                let a = a_any
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| Error::Internal("downcast Float64".into()))?;
-                visitor.f64_chunk(a);
-            }
-            Ok(())
-        }
-        DataType::Float32 => {
-            for m in metas {
-                let a_any = deserialize_array(blobs.remove(&m.chunk_pk).ok_or(Error::NotFound)?)?;
-                let a = a_any
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| Error::Internal("downcast Float32".into()))?;
-                visitor.f32_chunk(a);
-            }
-            Ok(())
-        }
-        _ => Err(Error::Internal("unsorted_visit: unsupported dtype".into())),
-    }
+    dispatch_unsorted_visit!(first_any.data_type(), metas, blobs, visitor)
 }
 
 pub fn unsorted_with_row_ids_visit<P: Pager<Blob = EntryHandle>, V: PrimitiveWithRowIdsVisitor>(
@@ -249,191 +420,14 @@ pub fn unsorted_with_row_ids_visit<P: Pager<Blob = EntryHandle>, V: PrimitiveWit
         .as_any()
         .downcast_ref::<UInt64Array>()
         .ok_or_else(|| Error::Internal("row_id array must be UInt64".into()))?;
-    match first_any.data_type() {
-        DataType::UInt64 => {
-            for (vm, rm) in v_metas.into_iter().zip(r_metas.into_iter()) {
-                let va =
-                    deserialize_array(vals_blobs.remove(&vm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let ra =
-                    deserialize_array(rids_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let v = va
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("downcast u64".into()))?;
-                let r = ra
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("downcast row_id u64".into()))?;
-                visitor.u64_chunk_with_rids(v, r);
-            }
-            Ok(())
-        }
-        DataType::UInt32 => {
-            for (vm, rm) in v_metas.into_iter().zip(r_metas.into_iter()) {
-                let va =
-                    deserialize_array(vals_blobs.remove(&vm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let ra =
-                    deserialize_array(rids_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let v = va
-                    .as_any()
-                    .downcast_ref::<UInt32Array>()
-                    .ok_or_else(|| Error::Internal("downcast u32".into()))?;
-                let r = ra
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("downcast row_id u64".into()))?;
-                visitor.u32_chunk_with_rids(v, r);
-            }
-            Ok(())
-        }
-        DataType::UInt16 => {
-            for (vm, rm) in v_metas.into_iter().zip(r_metas.into_iter()) {
-                let va =
-                    deserialize_array(vals_blobs.remove(&vm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let ra =
-                    deserialize_array(rids_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let v = va
-                    .as_any()
-                    .downcast_ref::<UInt16Array>()
-                    .ok_or_else(|| Error::Internal("downcast u16".into()))?;
-                let r = ra
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("downcast row_id u64".into()))?;
-                visitor.u16_chunk_with_rids(v, r);
-            }
-            Ok(())
-        }
-        DataType::UInt8 => {
-            for (vm, rm) in v_metas.into_iter().zip(r_metas.into_iter()) {
-                let va =
-                    deserialize_array(vals_blobs.remove(&vm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let ra =
-                    deserialize_array(rids_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let v = va
-                    .as_any()
-                    .downcast_ref::<UInt8Array>()
-                    .ok_or_else(|| Error::Internal("downcast u8".into()))?;
-                let r = ra
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("downcast row_id u64".into()))?;
-                visitor.u8_chunk_with_rids(v, r);
-            }
-            Ok(())
-        }
-        DataType::Int64 => {
-            for (vm, rm) in v_metas.into_iter().zip(r_metas.into_iter()) {
-                let va =
-                    deserialize_array(vals_blobs.remove(&vm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let ra =
-                    deserialize_array(rids_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let v = va
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| Error::Internal("downcast i64".into()))?;
-                let r = ra
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("downcast row_id u64".into()))?;
-                visitor.i64_chunk_with_rids(v, r);
-            }
-            Ok(())
-        }
-        DataType::Int32 => {
-            for (vm, rm) in v_metas.into_iter().zip(r_metas.into_iter()) {
-                let va =
-                    deserialize_array(vals_blobs.remove(&vm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let ra =
-                    deserialize_array(rids_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let v = va
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| Error::Internal("downcast i32".into()))?;
-                let r = ra
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("downcast row_id u64".into()))?;
-                visitor.i32_chunk_with_rids(v, r);
-            }
-            Ok(())
-        }
-        DataType::Int16 => {
-            for (vm, rm) in v_metas.into_iter().zip(r_metas.into_iter()) {
-                let va =
-                    deserialize_array(vals_blobs.remove(&vm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let ra =
-                    deserialize_array(rids_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let v = va
-                    .as_any()
-                    .downcast_ref::<Int16Array>()
-                    .ok_or_else(|| Error::Internal("downcast i16".into()))?;
-                let r = ra
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("downcast row_id u64".into()))?;
-                visitor.i16_chunk_with_rids(v, r);
-            }
-            Ok(())
-        }
-        DataType::Int8 => {
-            for (vm, rm) in v_metas.into_iter().zip(r_metas.into_iter()) {
-                let va =
-                    deserialize_array(vals_blobs.remove(&vm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let ra =
-                    deserialize_array(rids_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let v = va
-                    .as_any()
-                    .downcast_ref::<Int8Array>()
-                    .ok_or_else(|| Error::Internal("downcast i8".into()))?;
-                let r = ra
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("downcast row_id u64".into()))?;
-                visitor.i8_chunk_with_rids(v, r);
-            }
-            Ok(())
-        }
-        DataType::Float64 => {
-            for (vm, rm) in v_metas.into_iter().zip(r_metas.into_iter()) {
-                let va =
-                    deserialize_array(vals_blobs.remove(&vm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let ra =
-                    deserialize_array(rids_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let v = va
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| Error::Internal("downcast f64".into()))?;
-                let r = ra
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("downcast row_id u64".into()))?;
-                visitor.f64_chunk_with_rids(v, r);
-            }
-            Ok(())
-        }
-        DataType::Float32 => {
-            for (vm, rm) in v_metas.into_iter().zip(r_metas.into_iter()) {
-                let va =
-                    deserialize_array(vals_blobs.remove(&vm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let ra =
-                    deserialize_array(rids_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?)?;
-                let v = va
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| Error::Internal("downcast f32".into()))?;
-                let r = ra
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| Error::Internal("downcast row_id u64".into()))?;
-                visitor.f32_chunk_with_rids(v, r);
-            }
-            Ok(())
-        }
-        _ => Err(Error::Internal(
-            "unsorted_with_row_ids: unsupported dtype".into(),
-        )),
-    }
+    dispatch_unsorted_with_rids_visit!(
+        first_any.data_type(),
+        v_metas,
+        r_metas,
+        vals_blobs,
+        rids_blobs,
+        visitor
+    )
 }
 
 pub fn unsorted_with_row_ids_and_nulls_visit<
@@ -647,39 +641,5 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
         }};
     }
 
-    match first_any.data_type() {
-        DataType::UInt64 => {
-            emit_unsorted_nulls!(UInt64Array, u64_chunk_with_rids, "downcast u64")
-        }
-        DataType::UInt32 => {
-            emit_unsorted_nulls!(UInt32Array, u32_chunk_with_rids, "downcast u32")
-        }
-        DataType::UInt16 => {
-            emit_unsorted_nulls!(UInt16Array, u16_chunk_with_rids, "downcast u16")
-        }
-        DataType::UInt8 => {
-            emit_unsorted_nulls!(UInt8Array, u8_chunk_with_rids, "downcast u8")
-        }
-        DataType::Int64 => {
-            emit_unsorted_nulls!(Int64Array, i64_chunk_with_rids, "downcast i64")
-        }
-        DataType::Int32 => {
-            emit_unsorted_nulls!(Int32Array, i32_chunk_with_rids, "downcast i32")
-        }
-        DataType::Int16 => {
-            emit_unsorted_nulls!(Int16Array, i16_chunk_with_rids, "downcast i16")
-        }
-        DataType::Int8 => {
-            emit_unsorted_nulls!(Int8Array, i8_chunk_with_rids, "downcast i8")
-        }
-        DataType::Float64 => {
-            emit_unsorted_nulls!(Float64Array, f64_chunk_with_rids, "downcast f64")
-        }
-        DataType::Float32 => {
-            emit_unsorted_nulls!(Float32Array, f32_chunk_with_rids, "downcast f32")
-        }
-        _ => Err(Error::Internal(
-            "unsorted_with_nulls: dtype not supported".into(),
-        )),
-    }
+    dispatch_unsorted_nulls!(first_any.data_type())
 }

@@ -61,6 +61,78 @@ impl Ord for F32Key {
     }
 }
 
+macro_rules! impl_sorted_range_filter {
+    ($fn_name:ident, $ArrTy:ty, $range_field:ident, $bound_to_key:expr, $value_to_key:expr) => {
+        fn $fn_name(&mut self, a: &$ArrTy, s: usize, l: usize) {
+            if let Some((lb, ub)) = self.ir.$range_field {
+                let start = match lb {
+                    Bound::Unbounded => s,
+                    Bound::Included(x) => {
+                        let key = ($bound_to_key)(x);
+                        crate::store::scan::lower_idx_by(s, s + l, &key, |i| ($value_to_key)(a, i))
+                    }
+                    Bound::Excluded(x) => {
+                        let key = ($bound_to_key)(x);
+                        crate::store::scan::upper_idx_by(s, s + l, &key, |i| ($value_to_key)(a, i))
+                    }
+                };
+                let end = match ub {
+                    Bound::Unbounded => s + l,
+                    Bound::Included(x) => {
+                        let key = ($bound_to_key)(x);
+                        crate::store::scan::upper_idx_by(s, s + l, &key, |i| ($value_to_key)(a, i))
+                    }
+                    Bound::Excluded(x) => {
+                        let key = ($bound_to_key)(x);
+                        crate::store::scan::lower_idx_by(s, s + l, &key, |i| ($value_to_key)(a, i))
+                    }
+                };
+                if start < end {
+                    self.inner.$fn_name(a, start, end - start);
+                }
+            } else {
+                self.inner.$fn_name(a, s, l);
+            }
+        }
+    };
+}
+
+macro_rules! impl_sorted_with_rids_range_filter {
+    ($fn_name:ident, $ArrTy:ty, $range_field:ident, $bound_to_key:expr, $value_to_key:expr) => {
+        fn $fn_name(&mut self, v: &$ArrTy, r: &UInt64Array, s: usize, l: usize) {
+            if let Some((lb, ub)) = self.ir.$range_field {
+                let start = match lb {
+                    Bound::Unbounded => s,
+                    Bound::Included(x) => {
+                        let key = ($bound_to_key)(x);
+                        crate::store::scan::lower_idx_by(s, s + l, &key, |i| ($value_to_key)(v, i))
+                    }
+                    Bound::Excluded(x) => {
+                        let key = ($bound_to_key)(x);
+                        crate::store::scan::upper_idx_by(s, s + l, &key, |i| ($value_to_key)(v, i))
+                    }
+                };
+                let end = match ub {
+                    Bound::Unbounded => s + l,
+                    Bound::Included(x) => {
+                        let key = ($bound_to_key)(x);
+                        crate::store::scan::upper_idx_by(s, s + l, &key, |i| ($value_to_key)(v, i))
+                    }
+                    Bound::Excluded(x) => {
+                        let key = ($bound_to_key)(x);
+                        crate::store::scan::lower_idx_by(s, s + l, &key, |i| ($value_to_key)(v, i))
+                    }
+                };
+                if start < end {
+                    self.inner.$fn_name(v, r, start, end - start);
+                }
+            } else {
+                self.inner.$fn_name(v, r, s, l);
+            }
+        }
+    };
+}
+
 pub struct ScanBuilder<'a, P: Pager<Blob = EntryHandle>> {
     store: &'a ColumnStore<P>,
     field_id: LogicalFieldId,
@@ -223,367 +295,151 @@ where
                 self.inner.f32_chunk_with_rids(v, r)
             }
         }
-
-        // Binary search helpers for sorted runs
-        #[inline]
-        fn lower_idx<T: Ord, F: Fn(usize) -> T>(
-            mut lo: usize,
-            mut hi: usize,
-            pred: &T,
-            get: F,
-        ) -> usize {
-            while lo < hi {
-                let mid = (lo + hi) >> 1;
-                if get(mid) < *pred {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            lo
-        }
-        #[inline]
-        fn upper_idx<T: Ord, F: Fn(usize) -> T>(
-            mut lo: usize,
-            mut hi: usize,
-            pred: &T,
-            get: F,
-        ) -> usize {
-            while lo < hi {
-                let mid = (lo + hi) >> 1;
-                if get(mid) <= *pred {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            lo
-        }
-
         impl<'v, V> crate::store::scan::PrimitiveSortedVisitor for RangeAdapter<'v, V>
         where
             V: crate::store::scan::PrimitiveSortedVisitor,
         {
-            fn u64_run(&mut self, a: &UInt64Array, s: usize, l: usize) {
-                if let Some((lb, ub)) = self.ir.u64_r {
-                    let start = match lb {
-                        Bound::Unbounded => s,
-                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    let end = match ub {
-                        Bound::Unbounded => s + l,
-                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    if start < end {
-                        self.inner.u64_run(a, start, end - start);
-                    }
-                } else {
-                    self.inner.u64_run(a, s, l);
-                }
-            }
-            fn u32_run(&mut self, a: &UInt32Array, s: usize, l: usize) {
-                if let Some((lb, ub)) = self.ir.u32_r {
-                    let start = match lb {
-                        Bound::Unbounded => s,
-                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    let end = match ub {
-                        Bound::Unbounded => s + l,
-                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    if start < end {
-                        self.inner.u32_run(a, start, end - start);
-                    }
-                } else {
-                    self.inner.u32_run(a, s, l);
-                }
-            }
-            fn u16_run(&mut self, a: &UInt16Array, s: usize, l: usize) {
-                if let Some((lb, ub)) = self.ir.u16_r {
-                    let start = match lb {
-                        Bound::Unbounded => s,
-                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    let end = match ub {
-                        Bound::Unbounded => s + l,
-                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    if start < end {
-                        self.inner.u16_run(a, start, end - start);
-                    }
-                } else {
-                    self.inner.u16_run(a, s, l);
-                }
-            }
-            fn u8_run(&mut self, a: &UInt8Array, s: usize, l: usize) {
-                if let Some((lb, ub)) = self.ir.u8_r {
-                    let start = match lb {
-                        Bound::Unbounded => s,
-                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    let end = match ub {
-                        Bound::Unbounded => s + l,
-                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    if start < end {
-                        self.inner.u8_run(a, start, end - start);
-                    }
-                } else {
-                    self.inner.u8_run(a, s, l);
-                }
-            }
-            fn i64_run(&mut self, a: &Int64Array, s: usize, l: usize) {
-                if let Some((lb, ub)) = self.ir.i64_r {
-                    let start = match lb {
-                        Bound::Unbounded => s,
-                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    let end = match ub {
-                        Bound::Unbounded => s + l,
-                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    if start < end {
-                        self.inner.i64_run(a, start, end - start);
-                    }
-                } else {
-                    self.inner.i64_run(a, s, l);
-                }
-            }
-            fn i32_run(&mut self, a: &Int32Array, s: usize, l: usize) {
-                if let Some((lb, ub)) = self.ir.i32_r {
-                    let start = match lb {
-                        Bound::Unbounded => s,
-                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    let end = match ub {
-                        Bound::Unbounded => s + l,
-                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    if start < end {
-                        self.inner.i32_run(a, start, end - start);
-                    }
-                } else {
-                    self.inner.i32_run(a, s, l);
-                }
-            }
-            fn i16_run(&mut self, a: &Int16Array, s: usize, l: usize) {
-                if let Some((lb, ub)) = self.ir.i16_r {
-                    let start = match lb {
-                        Bound::Unbounded => s,
-                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    let end = match ub {
-                        Bound::Unbounded => s + l,
-                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    if start < end {
-                        self.inner.i16_run(a, start, end - start);
-                    }
-                } else {
-                    self.inner.i16_run(a, s, l);
-                }
-            }
-            fn i8_run(&mut self, a: &Int8Array, s: usize, l: usize) {
-                if let Some((lb, ub)) = self.ir.i8_r {
-                    let start = match lb {
-                        Bound::Unbounded => s,
-                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    let end = match ub {
-                        Bound::Unbounded => s + l,
-                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| a.value(i)),
-                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| a.value(i)),
-                    };
-                    if start < end {
-                        self.inner.i8_run(a, start, end - start);
-                    }
-                } else {
-                    self.inner.i8_run(a, s, l);
-                }
-            }
-            fn f64_run(&mut self, a: &Float64Array, s: usize, l: usize) {
-                if let Some((lb, ub)) = self.ir.f64_r {
-                    let start = match lb {
-                        Bound::Unbounded => s,
-                        Bound::Included(x) => {
-                            let key = F64Key::new(x);
-                            lower_idx_by(s, s + l, &key, |i| F64Key::new(a.value(i)))
-                        }
-                        Bound::Excluded(x) => {
-                            let key = F64Key::new(x);
-                            upper_idx_by(s, s + l, &key, |i| F64Key::new(a.value(i)))
-                        }
-                    };
-                    let end = match ub {
-                        Bound::Unbounded => s + l,
-                        Bound::Included(x) => {
-                            let key = F64Key::new(x);
-                            upper_idx_by(s, s + l, &key, |i| F64Key::new(a.value(i)))
-                        }
-                        Bound::Excluded(x) => {
-                            let key = F64Key::new(x);
-                            lower_idx_by(s, s + l, &key, |i| F64Key::new(a.value(i)))
-                        }
-                    };
-                    if start < end {
-                        self.inner.f64_run(a, start, end - start);
-                    }
-                } else {
-                    self.inner.f64_run(a, s, l);
-                }
-            }
-            fn f32_run(&mut self, a: &Float32Array, s: usize, l: usize) {
-                if let Some((lb, ub)) = self.ir.f32_r {
-                    let start = match lb {
-                        Bound::Unbounded => s,
-                        Bound::Included(x) => {
-                            let key = F32Key::new(x);
-                            lower_idx_by(s, s + l, &key, |i| F32Key::new(a.value(i)))
-                        }
-                        Bound::Excluded(x) => {
-                            let key = F32Key::new(x);
-                            upper_idx_by(s, s + l, &key, |i| F32Key::new(a.value(i)))
-                        }
-                    };
-                    let end = match ub {
-                        Bound::Unbounded => s + l,
-                        Bound::Included(x) => {
-                            let key = F32Key::new(x);
-                            upper_idx_by(s, s + l, &key, |i| F32Key::new(a.value(i)))
-                        }
-                        Bound::Excluded(x) => {
-                            let key = F32Key::new(x);
-                            lower_idx_by(s, s + l, &key, |i| F32Key::new(a.value(i)))
-                        }
-                    };
-                    if start < end {
-                        self.inner.f32_run(a, start, end - start);
-                    }
-                } else {
-                    self.inner.f32_run(a, s, l);
-                }
-            }
+            impl_sorted_range_filter!(
+                u64_run,
+                UInt64Array,
+                u64_r,
+                |x| x,
+                |array: &UInt64Array, idx| array.value(idx)
+            );
+            impl_sorted_range_filter!(
+                u32_run,
+                UInt32Array,
+                u32_r,
+                |x| x,
+                |array: &UInt32Array, idx| array.value(idx)
+            );
+            impl_sorted_range_filter!(
+                u16_run,
+                UInt16Array,
+                u16_r,
+                |x| x,
+                |array: &UInt16Array, idx| array.value(idx)
+            );
+            impl_sorted_range_filter!(
+                u8_run,
+                UInt8Array,
+                u8_r,
+                |x| x,
+                |array: &UInt8Array, idx| array.value(idx)
+            );
+            impl_sorted_range_filter!(
+                i64_run,
+                Int64Array,
+                i64_r,
+                |x| x,
+                |array: &Int64Array, idx| array.value(idx)
+            );
+            impl_sorted_range_filter!(
+                i32_run,
+                Int32Array,
+                i32_r,
+                |x| x,
+                |array: &Int32Array, idx| array.value(idx)
+            );
+            impl_sorted_range_filter!(
+                i16_run,
+                Int16Array,
+                i16_r,
+                |x| x,
+                |array: &Int16Array, idx| array.value(idx)
+            );
+            impl_sorted_range_filter!(i8_run, Int8Array, i8_r, |x| x, |array: &Int8Array, idx| {
+                array.value(idx)
+            });
+            impl_sorted_range_filter!(
+                f64_run,
+                Float64Array,
+                f64_r,
+                |x| F64Key::new(x),
+                |array: &Float64Array, idx| F64Key::new(array.value(idx))
+            );
+            impl_sorted_range_filter!(
+                f32_run,
+                Float32Array,
+                f32_r,
+                |x| F32Key::new(x),
+                |array: &Float32Array, idx| F32Key::new(array.value(idx))
+            );
         }
         impl<'v, V> crate::store::scan::PrimitiveSortedWithRowIdsVisitor for RangeAdapter<'v, V>
         where
             V: crate::store::scan::PrimitiveSortedWithRowIdsVisitor,
         {
-            fn u64_run_with_rids(&mut self, v: &UInt64Array, r: &UInt64Array, s: usize, l: usize) {
-                if let Some((lb, ub)) = self.ir.u64_r {
-                    let start = match lb {
-                        Bound::Unbounded => s,
-                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| v.value(i)),
-                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| v.value(i)),
-                    };
-                    let end = match ub {
-                        Bound::Unbounded => s + l,
-                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| v.value(i)),
-                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| v.value(i)),
-                    };
-                    if start < end {
-                        self.inner.u64_run_with_rids(v, r, start, end - start);
-                    }
-                } else {
-                    self.inner.u64_run_with_rids(v, r, s, l);
-                }
-            }
-            fn i32_run_with_rids(&mut self, v: &Int32Array, r: &UInt64Array, s: usize, l: usize) {
-                if let Some((lb, ub)) = self.ir.i32_r {
-                    let start = match lb {
-                        Bound::Unbounded => s,
-                        Bound::Included(x) => lower_idx(s, s + l, &x, |i| v.value(i)),
-                        Bound::Excluded(x) => upper_idx(s, s + l, &x, |i| v.value(i)),
-                    };
-                    let end = match ub {
-                        Bound::Unbounded => s + l,
-                        Bound::Included(x) => upper_idx(s, s + l, &x, |i| v.value(i)),
-                        Bound::Excluded(x) => lower_idx(s, s + l, &x, |i| v.value(i)),
-                    };
-                    if start < end {
-                        self.inner.i32_run_with_rids(v, r, start, end - start);
-                    }
-                } else {
-                    self.inner.i32_run_with_rids(v, r, s, l);
-                }
-            }
-            // For brevity, other integer widths with row ids fall back to pass-through.
-            fn f64_run_with_rids(&mut self, v: &Float64Array, r: &UInt64Array, s: usize, l: usize) {
-                if let Some((lb, ub)) = self.ir.f64_r {
-                    let start = match lb {
-                        Bound::Unbounded => s,
-                        Bound::Included(x) => {
-                            let key = F64Key::new(x);
-                            lower_idx_by(s, s + l, &key, |i| F64Key::new(v.value(i)))
-                        }
-                        Bound::Excluded(x) => {
-                            let key = F64Key::new(x);
-                            upper_idx_by(s, s + l, &key, |i| F64Key::new(v.value(i)))
-                        }
-                    };
-                    let end = match ub {
-                        Bound::Unbounded => s + l,
-                        Bound::Included(x) => {
-                            let key = F64Key::new(x);
-                            upper_idx_by(s, s + l, &key, |i| F64Key::new(v.value(i)))
-                        }
-                        Bound::Excluded(x) => {
-                            let key = F64Key::new(x);
-                            lower_idx_by(s, s + l, &key, |i| F64Key::new(v.value(i)))
-                        }
-                    };
-                    if start < end {
-                        self.inner.f64_run_with_rids(v, r, start, end - start);
-                    }
-                } else {
-                    self.inner.f64_run_with_rids(v, r, s, l);
-                }
-            }
-            fn f32_run_with_rids(&mut self, v: &Float32Array, r: &UInt64Array, s: usize, l: usize) {
-                if let Some((lb, ub)) = self.ir.f32_r {
-                    let start = match lb {
-                        Bound::Unbounded => s,
-                        Bound::Included(x) => {
-                            let key = F32Key::new(x);
-                            lower_idx_by(s, s + l, &key, |i| F32Key::new(v.value(i)))
-                        }
-                        Bound::Excluded(x) => {
-                            let key = F32Key::new(x);
-                            upper_idx_by(s, s + l, &key, |i| F32Key::new(v.value(i)))
-                        }
-                    };
-                    let end = match ub {
-                        Bound::Unbounded => s + l,
-                        Bound::Included(x) => {
-                            let key = F32Key::new(x);
-                            upper_idx_by(s, s + l, &key, |i| F32Key::new(v.value(i)))
-                        }
-                        Bound::Excluded(x) => {
-                            let key = F32Key::new(x);
-                            lower_idx_by(s, s + l, &key, |i| F32Key::new(v.value(i)))
-                        }
-                    };
-                    if start < end {
-                        self.inner.f32_run_with_rids(v, r, start, end - start);
-                    }
-                } else {
-                    self.inner.f32_run_with_rids(v, r, s, l);
-                }
-            }
+            impl_sorted_with_rids_range_filter!(
+                u64_run_with_rids,
+                UInt64Array,
+                u64_r,
+                |x| x,
+                |array: &UInt64Array, idx| array.value(idx)
+            );
+            impl_sorted_with_rids_range_filter!(
+                u32_run_with_rids,
+                UInt32Array,
+                u32_r,
+                |x| x,
+                |array: &UInt32Array, idx| array.value(idx)
+            );
+            impl_sorted_with_rids_range_filter!(
+                u16_run_with_rids,
+                UInt16Array,
+                u16_r,
+                |x| x,
+                |array: &UInt16Array, idx| array.value(idx)
+            );
+            impl_sorted_with_rids_range_filter!(
+                u8_run_with_rids,
+                UInt8Array,
+                u8_r,
+                |x| x,
+                |array: &UInt8Array, idx| array.value(idx)
+            );
+            impl_sorted_with_rids_range_filter!(
+                i64_run_with_rids,
+                Int64Array,
+                i64_r,
+                |x| x,
+                |array: &Int64Array, idx| array.value(idx)
+            );
+            impl_sorted_with_rids_range_filter!(
+                i32_run_with_rids,
+                Int32Array,
+                i32_r,
+                |x| x,
+                |array: &Int32Array, idx| array.value(idx)
+            );
+            impl_sorted_with_rids_range_filter!(
+                i16_run_with_rids,
+                Int16Array,
+                i16_r,
+                |x| x,
+                |array: &Int16Array, idx| array.value(idx)
+            );
+            impl_sorted_with_rids_range_filter!(
+                i8_run_with_rids,
+                Int8Array,
+                i8_r,
+                |x| x,
+                |array: &Int8Array, idx| array.value(idx)
+            );
+            impl_sorted_with_rids_range_filter!(
+                f64_run_with_rids,
+                Float64Array,
+                f64_r,
+                |x| F64Key::new(x),
+                |array: &Float64Array, idx| F64Key::new(array.value(idx))
+            );
+            impl_sorted_with_rids_range_filter!(
+                f32_run_with_rids,
+                Float32Array,
+                f32_r,
+                |x| F32Key::new(x),
+                |array: &Float32Array, idx| F32Key::new(array.value(idx))
+            );
         }
 
         let mut adapter = RangeAdapter {
