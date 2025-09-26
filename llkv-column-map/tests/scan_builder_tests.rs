@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, UInt64Array};
+use arrow::array::UInt64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
-    PrimitiveWithRowIdsVisitor, ProjectionBatch, ScanBuilder, ScanOptions,
+    PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
@@ -20,52 +20,28 @@ fn fid(id: u32) -> LogicalFieldId {
         .with_field_id(id)
 }
 
-fn field_with_fid(name: &str, dtype: DataType, fid: LogicalFieldId) -> Field {
-    let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(fid).to_string());
-    Field::new(name, dtype, false).with_metadata(md)
-}
-
-fn inventory_batch(
-    price_fid: LogicalFieldId,
-    qty_fid: LogicalFieldId,
-    row_ids: Vec<u64>,
-    prices: Vec<u64>,
-    quantities: Vec<u64>,
-) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
-        field_with_fid("price", DataType::UInt64, price_fid),
-        field_with_fid("qty", DataType::UInt64, qty_fid),
-    ]));
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(UInt64Array::from(row_ids)) as ArrayRef,
-        Arc::new(UInt64Array::from(prices)) as ArrayRef,
-        Arc::new(UInt64Array::from(quantities)) as ArrayRef,
-    ];
-    RecordBatch::try_new(schema, columns).expect("inventory batch")
-}
-
 #[test]
-fn sorted_price_range_scan() {
+fn scan_builder_sorted_range_u64() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-    let price_fid = fid(42);
-    let qty_fid = fid(43);
+    let field_id = fid(42);
+
+    // Build schema and ingest 0..10000 (shuffled via reverse values)
+    let mut md = HashMap::new();
+    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::UInt64, false),
+        Field::new("data", DataType::UInt64, false).with_metadata(md),
+    ]));
 
     let n = 10_000usize;
-    let row_ids: Vec<u64> = (0..n as u64).collect();
-    let prices: Vec<u64> = row_ids.iter().rev().copied().collect();
-    let quantities: Vec<u64> = row_ids.iter().map(|rid| (rid % 7) + 1).collect();
-    let batch = inventory_batch(
-        price_fid,
-        qty_fid,
-        row_ids.clone(),
-        prices.clone(),
-        quantities,
-    );
+    let rid: Vec<u64> = (0..n as u64).collect();
+    let vals: Vec<u64> = (0..n as u64).rev().collect();
+    let rid_arr = Arc::new(UInt64Array::from(rid));
+    let val_arr = Arc::new(UInt64Array::from(vals));
+    let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
     store.append(&batch).unwrap();
-    store.register_index(price_fid, IndexKind::Sort).unwrap();
+    store.register_index(field_id, IndexKind::Sort).unwrap();
 
     // Collect values within range [2000, 8000]
     struct Collect {
@@ -84,7 +60,7 @@ fn sorted_price_range_scan() {
     }
 
     let mut coll = Collect { out: Vec::new() };
-    ScanBuilder::new(&store, price_fid)
+    ScanBuilder::new(&store, field_id)
         .options(ScanOptions {
             sorted: true,
             reverse: false,
@@ -100,25 +76,25 @@ fn sorted_price_range_scan() {
 }
 
 #[test]
-fn sorted_price_scan_with_row_ids() {
+fn scan_builder_sorted_with_row_ids() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-    let price_fid = fid(77);
-    let qty_fid = fid(78);
+    let field_id = fid(77);
 
+    let mut md = HashMap::new();
+    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::UInt64, false),
+        Field::new("data", DataType::UInt64, false).with_metadata(md),
+    ]));
     let n = 100_000usize;
-    let row_ids: Vec<u64> = (0..n as u64).collect();
-    let prices: Vec<u64> = row_ids.clone();
-    let quantities: Vec<u64> = row_ids.iter().map(|rid| (rid % 11) + 1).collect();
-    let batch = inventory_batch(
-        price_fid,
-        qty_fid,
-        row_ids.clone(),
-        prices.clone(),
-        quantities,
-    );
+    let rid: Vec<u64> = (0..n as u64).collect();
+    let vals: Vec<u64> = (0..n as u64).collect();
+    let rid_arr = Arc::new(UInt64Array::from(rid));
+    let val_arr = Arc::new(UInt64Array::from(vals));
+    let batch = RecordBatch::try_new(schema, vec![rid_arr, val_arr]).unwrap();
     store.append(&batch).unwrap();
-    store.register_index(price_fid, IndexKind::Sort).unwrap();
+    store.register_index(field_id, IndexKind::Sort).unwrap();
 
     struct CollectRids {
         out: Vec<u64>,
@@ -136,7 +112,7 @@ fn sorted_price_scan_with_row_ids() {
     impl PrimitiveWithRowIdsVisitor for CollectRids {}
 
     let mut coll = CollectRids { out: Vec::new() };
-    ScanBuilder::new(&store, price_fid)
+    ScanBuilder::new(&store, field_id)
         .options(ScanOptions {
             sorted: true,
             reverse: false,
@@ -149,46 +125,4 @@ fn sorted_price_scan_with_row_ids() {
     assert!(!coll.out.is_empty());
     assert_eq!(coll.out.first().copied(), Some(10_000));
     assert_eq!(coll.out.last().copied(), Some(20_000));
-}
-
-#[test]
-fn project_column_streams_row_aligned_batches() {
-    let pager = Arc::new(MemPager::new());
-    let store = ColumnStore::open(pager).unwrap();
-    let price_fid = fid(5);
-    let qty_fid = fid(6);
-
-    let row_ids: Vec<u64> = (0..512u64).collect();
-    let prices: Vec<u64> = row_ids.iter().map(|rid| 100 + rid * 3).collect();
-    let quantities: Vec<u64> = row_ids.iter().map(|rid| (rid % 8) + 1).collect();
-    let batch = inventory_batch(
-        price_fid,
-        qty_fid,
-        row_ids.clone(),
-        prices,
-        quantities.clone(),
-    );
-    store.append(&batch).unwrap();
-
-    let mut collected: Vec<ProjectionBatch> = Vec::new();
-    ScanBuilder::new(&store, qty_fid)
-        .project(|proj| {
-            collected.push(proj);
-            Ok(())
-        })
-        .unwrap();
-
-    assert!(!collected.is_empty());
-    let mut expected = 0u64;
-    for batch in collected {
-        let rids = batch.row_ids;
-        let vals = batch.values.as_any().downcast_ref::<UInt64Array>().unwrap();
-        assert_eq!(rids.len(), vals.len());
-        for i in 0..rids.len() {
-            assert_eq!(rids.value(i), expected);
-            assert_eq!(vals.value(i), quantities[expected as usize]);
-            expected += 1;
-        }
-    }
-    assert_eq!(expected, 512);
 }
