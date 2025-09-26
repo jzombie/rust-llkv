@@ -36,7 +36,7 @@ use arrow::datatypes::{DataType, Field};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::error::{Error, Result};
+use llkv_result::{Error, Result};
 
 const MAGIC: [u8; 4] = *b"ARR0";
 

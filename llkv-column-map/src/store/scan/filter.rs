@@ -6,17 +6,17 @@ use arrow::array::{
 };
 use arrow::datatypes::ArrowPrimitiveType;
 
-use crate::error::Result;
 use crate::store::rowid_fid;
 use crate::types::LogicalFieldId;
+use llkv_result::Result;
 use simd_r_drive_entry_handle::EntryHandle;
 
 use super::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanBuilder,
 };
-use crate::storage::pager::Pager;
 use crate::store::ColumnStore;
+use llkv_storage::pager::Pager;
 
 pub(crate) struct FilterVisitor<T: ArrowPrimitiveType, F: FnMut(T::Native) -> bool> {
     predicate: F,

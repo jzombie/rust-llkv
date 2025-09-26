@@ -35,10 +35,10 @@ use std::time::Instant;
 
 use llkv_column_map::{
     ColumnStore,
-    storage::pager::MemPager,
     store::debug::{ColumnStoreDebug, discover_all_pks},
-    types::{LogicalFieldId, Namespace, PhysicalKey},
+    types::{LogicalFieldId, Namespace},
 };
+use llkv_storage::{pager::MemPager, types::PhysicalKey};
 
 // ---------------- Workload config (small, but shows batching clearly) --------
 

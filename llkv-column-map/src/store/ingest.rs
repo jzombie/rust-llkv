@@ -1,5 +1,5 @@
-use crate::error::Result;
 use arrow::array::{ArrayRef, BooleanArray, UInt32Array, UInt64Array};
+use llkv_result::Result;
 use std::hash::BuildHasher;
 
 /// Per-chunk logical edit description used by delete and LWW upsert.

@@ -1,9 +1,20 @@
-pub mod error;
-pub mod serialization;
-pub mod storage;
 pub mod store;
 pub mod types;
 
+pub use llkv_result::{Error, Result};
+pub use store::{
+    ColumnStore, IndexKind,
+    scan::{self, ScanBuilder},
+};
+
+pub mod debug {
+    pub use super::store::debug::*;
+}
+
+/// Expands to the provided body with `$ty` bound to the concrete Arrow primitive type that
+/// matches the supplied `DataType`. Integer and floating-point primitives are supported; any
+/// other `DataType` triggers the `$unsupported` expression. This is used to avoid dynamic
+/// dispatch in hot paths like scans and row gathers.
 #[macro_export]
 macro_rules! with_integer_arrow_type {
     ($dtype:expr, |$ty:ident| $body:expr, $unsupported:expr $(,)?) => {{
@@ -51,16 +62,4 @@ macro_rules! with_integer_arrow_type {
             _ => $unsupported,
         }
     }};
-}
-
-mod codecs;
-
-pub use error::{Error, Result};
-pub use store::{
-    CATALOG_ROOT_PKEY, ColumnStore, IndexKind,
-    scan::{self, ScanBuilder},
-};
-
-pub mod debug {
-    pub use super::store::debug::*;
 }

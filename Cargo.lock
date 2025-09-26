@@ -937,8 +937,9 @@ dependencies = [
  "arrow-ord",
  "codspeed-criterion-compat",
  "line-ending",
+ "llkv-result",
+ "llkv-storage",
  "modular-bitfield",
- "num_enum",
  "rand",
  "roaring",
  "rustc-hash",
@@ -956,16 +957,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-result"
+version = "0.1.0-alpha"
+dependencies = [
+ "arrow",
+ "thiserror",
+]
+
+[[package]]
 name = "llkv-storage"
 version = "0.1.0-alpha"
 dependencies = [
+ "arrow",
+ "llkv-result",
  "llkv-storage",
- "memmap2",
+ "num_enum",
  "rustc-hash",
  "simd-r-drive",
  "simd-r-drive-entry-handle",
  "tempfile",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -979,9 +989,12 @@ dependencies = [
  "crossbeam-channel",
  "llkv-column-map",
  "llkv-expr",
+ "llkv-result",
+ "llkv-storage",
  "rayon",
  "rustc-hash",
  "simd-r-drive-entry-handle",
+ "tempfile",
 ]
 
 [[package]]
@@ -1472,9 +1485,9 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "simd-r-drive"
-version = "0.14.0-alpha"
+version = "0.15.0-alpha"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0a9e1bab3756925d4be3b204f67cfb8bdf2824d0b17cf5d6562c79a101f0e4e"
+checksum = "c2480b4177d81953e4136185f5738c3f97e54eed16a7d155972642be40c935f7"
 dependencies = [
  "async-trait",
  "clap",
@@ -1490,9 +1503,9 @@ dependencies = [
 
 [[package]]
 name = "simd-r-drive-entry-handle"
-version = "0.14.0-alpha"
+version = "0.15.0-alpha"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee348e3e2e5ba61efc253af852d12752d6a59f7058768e1beeb3d5243b00b9cd"
+checksum = "fd2ac2437c5f76823b18194e9f79d0e12aa210ae463f764baeaf2549d2ef1818"
 dependencies = [
  "arrow",
  "crc32fast",

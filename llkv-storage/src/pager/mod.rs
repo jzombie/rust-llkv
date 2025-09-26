@@ -3,14 +3,19 @@
 //! Returning `bytes::Bytes` lets readers build Arrow `Buffer`s that borrow
 //! the pager memory with zero copying.
 
-use crate::error::Result;
 use crate::types::PhysicalKey;
+use llkv_result::Result;
 
 pub mod instrumented_pager;
 pub use instrumented_pager::*;
 
 pub mod mem_pager;
 pub use mem_pager::*;
+
+#[cfg(feature = "simd-r-drive-support")]
+pub mod simd_r_drive_pager;
+#[cfg(feature = "simd-r-drive-support")]
+pub use simd_r_drive_pager::*;
 
 #[derive(Clone, Debug)]
 pub enum BatchPut {

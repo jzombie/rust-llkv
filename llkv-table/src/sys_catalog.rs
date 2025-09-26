@@ -15,11 +15,8 @@ use llkv_column_map::store::scan::{
 };
 
 use llkv_column_map::types::LogicalFieldId;
-use llkv_column_map::{
-    ColumnStore,
-    storage::pager::{MemPager, Pager},
-    types::Namespace,
-};
+use llkv_column_map::{ColumnStore, types::Namespace};
+use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
 // ----- Catalog constants -----

@@ -15,13 +15,13 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 use rand::seq::SliceRandom;
 use rand::{SeedableRng, rngs::StdRng};
 
-use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_storage::pager::MemPager;
 
 const N_ROWS: usize = 1_000_000;
 const SEED: u64 = 0xC0FF_EEF0_0DD1_5EA5;

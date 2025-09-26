@@ -19,11 +19,14 @@ use arrow::compute;
 use rustc_hash::FxHashMap;
 
 use super::ColumnStore;
-use crate::error::{Error, Result};
-use crate::serialization::deserialize_array;
-use crate::storage::pager::{BatchGet, GetResult, Pager};
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
-use crate::types::{LogicalFieldId, Namespace, PhysicalKey};
+use crate::types::{LogicalFieldId, Namespace};
+use llkv_result::{Error, Result};
+use llkv_storage::{
+    pager::{BatchGet, GetResult, Pager},
+    serialization::deserialize_array,
+    types::PhysicalKey,
+};
 use simd_r_drive_entry_handle::EntryHandle;
 
 pub mod builder;
@@ -117,7 +120,7 @@ where
             }
         }
 
-        let first_any = crate::serialization::deserialize_array(
+        let first_any = llkv_storage::serialization::deserialize_array(
             blobs
                 .get(&metas[0].chunk_pk)
                 .ok_or(Error::NotFound)?
@@ -189,7 +192,7 @@ where
             }
         }
 
-        let first_any = crate::serialization::deserialize_array(
+        let first_any = llkv_storage::serialization::deserialize_array(
             blobs
                 .get(&metas[0].chunk_pk)
                 .ok_or(Error::NotFound)?
@@ -375,7 +378,7 @@ where
                     }
                 }
             }
-            let first_any = crate::serialization::deserialize_array(
+            let first_any = llkv_storage::serialization::deserialize_array(
                 vblobs
                     .get(&metas_val[0].chunk_pk)
                     .ok_or(Error::NotFound)?

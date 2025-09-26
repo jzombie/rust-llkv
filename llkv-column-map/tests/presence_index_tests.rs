@@ -5,9 +5,9 @@ use arrow::array::UInt64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_storage::pager::MemPager;
 
 fn fid_user(id: u32) -> LogicalFieldId {
     LogicalFieldId::new()

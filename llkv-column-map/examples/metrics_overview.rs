@@ -15,9 +15,9 @@
 use llkv_column_map::{
     ColumnStore,
     debug::ColumnStoreDebug,
-    storage::pager::{InstrumentedPager, IoStats, MemPager},
     types::{LogicalFieldId, Namespace},
 };
+use llkv_storage::pager::{InstrumentedPager, IoStats, MemPager};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 

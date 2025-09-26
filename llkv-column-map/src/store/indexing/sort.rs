@@ -1,16 +1,19 @@
 //! Sort index: type and ops live here.
 
 use super::{Index, IndexKind, IndexManager, IndexOps};
-use crate::error::{Error, Result};
-use crate::serialization::{deserialize_array, serialize_array};
-use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::store::{
     ColumnStore,
     catalog::ColumnCatalog,
     descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator},
 };
-use crate::types::{LogicalFieldId, PhysicalKey};
+use crate::types::LogicalFieldId;
 use arrow::compute::{SortColumn, lexsort_to_indices};
+use llkv_result::{Error, Result};
+use llkv_storage::{
+    pager::{BatchGet, BatchPut, GetResult, Pager},
+    serialization::{deserialize_array, serialize_array},
+    types::PhysicalKey,
+};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{Arc, RwLockReadGuard};
 

@@ -1,13 +1,10 @@
 use super::*;
-use crate::error::{Error, Result};
-use crate::serialization::{deserialize_array, serialize_array};
-use crate::storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
 };
 use crate::store::scan::{FilterPrimitive, ScanOptions};
-use crate::types::{LogicalFieldId, PhysicalKey};
+use crate::types::LogicalFieldId;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
     Int64Array, PrimitiveArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_empty_array,
@@ -15,6 +12,13 @@ use arrow::array::{
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::{ArrowPrimitiveType, DataType};
 use arrow::record_batch::RecordBatch;
+use llkv_result::{Error, Result};
+use llkv_storage::{
+    constants::CATALOG_ROOT_PKEY,
+    pager::{BatchGet, BatchPut, GetResult, Pager},
+    serialization::{deserialize_array, serialize_array},
+    types::PhysicalKey,
+};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -75,10 +79,15 @@ where
     }
 
     /// Gathers values for the specified `row_ids`, returned in the same order as provided.
+    ///
+    /// This operates on any primitive Arrow column (integer or float) and streams chunks via the
+    /// regular scan machinery so it does not materialize the full column up front.
     pub fn gather_rows(&self, field_id: LogicalFieldId, row_ids: &[u64]) -> Result<ArrayRef> {
         self.gather_rows_internal(field_id, row_ids, /* include_nulls */ false, None)
     }
 
+    /// Gathers values for the specified `row_ids`, preserving nulls and optionally anchoring to
+    /// another field's row-id column for nullable projections.
     pub fn gather_rows_with_nulls(
         &self,
         field_id: LogicalFieldId,
@@ -157,6 +166,8 @@ where
             opts.anchor_row_id_field =
                 Some(anchor_row_id_field.unwrap_or_else(|| rowid_fid(field_id)));
         }
+        // The scan builder drives the visitor chunk-by-chunk so `gather_rows` only touches the
+        // subsets referenced by `row_ids`; output assembly happens incrementally inside the visitor.
         ScanBuilder::new(self, field_id)
             .options(opts)
             .run(&mut visitor)?;
@@ -1607,6 +1618,7 @@ where
     }
 }
 
+/// Visitor that records only the requested row IDs as chunks stream through the scan pipeline.
 struct GatherVisitor<'a, T: ArrowPrimitiveType> {
     row_index: &'a FxHashMap<u64, usize>,
     values: Vec<Option<T::Native>>,
