@@ -80,19 +80,43 @@ pub struct ScanBuilder<'a, P: Pager<Blob = EntryHandle>> {
     field_id: LogicalFieldId,
     opts: ScanOptions,
     ir: IntRanges,
+    projection: Vec<LogicalFieldId>,
 }
 
 impl<'a, P> ScanBuilder<'a, P>
 where
     P: Pager<Blob = EntryHandle>,
 {
+    /// Create a scan builder for the given logical column.
+    ///
+    /// The column passed here becomes the *driver* for subsequent scans: range, pagination, and
+    /// index decisions are derived from it, and it will be the first value column in any projection.
     pub fn new(store: &'a ColumnStore<P>, field_id: LogicalFieldId) -> Self {
         Self {
             store,
             field_id,
             opts: ScanOptions::default(),
             ir: IntRanges::default(),
+            projection: vec![field_id],
         }
+    }
+
+    /// Create a scan builder seeded with the provided projection list.
+    ///
+    /// `columns[0]` is treated as the driver column. If the slice is empty this falls back to the
+    /// single-column constructor.
+    pub fn with_columns(store: &'a ColumnStore<P>, columns: &[LogicalFieldId]) -> Self {
+        assert!(
+            !columns.is_empty(),
+            "ScanBuilder::with_columns requires at least one logical field id"
+        );
+        let mut iter = columns.iter();
+        let driver = *iter.next().unwrap();
+        let mut builder = Self::new(store, driver);
+        for &fid in iter {
+            builder.push_projection(fid);
+        }
+        builder
     }
     pub fn options(mut self, opts: ScanOptions) -> Self {
         self.opts = opts;
@@ -109,6 +133,29 @@ where
     pub fn reverse(mut self, reverse: bool) -> Self {
         self.opts.reverse = reverse;
         self
+    }
+
+    /// Extend the projection list with additional logical field ids.
+    ///
+    /// The list always keeps the driver column (passed to [`ScanBuilder::new`]) as the first
+    /// entry. Additional ids are appended in the order supplied here; duplicates are ignored.
+    /// Projection order controls both output column order and the sequence of chunk fetches for
+    /// companion columns.
+    pub fn with_projection(mut self, columns: &[LogicalFieldId]) -> Self {
+        for &fid in columns {
+            self.push_projection(fid);
+        }
+        self
+    }
+
+    fn push_projection(&mut self, fid: LogicalFieldId) {
+        if fid == self.field_id || self.projection.contains(&fid) {
+            if fid == self.field_id && self.projection.is_empty() {
+                self.projection.push(self.field_id);
+            }
+            return;
+        }
+        self.projection.push(fid);
     }
 
     // Generic, monomorphized range setter (no perf impact):
@@ -607,13 +654,19 @@ where
         self.store.scan(self.field_id, self.opts, &mut adapter)
     }
 
-    pub fn project_multi<F>(mut self, columns: &[LogicalFieldId], mut on_batch: F) -> Result<()>
+    /// Stream row-id aligned batches for the configured projection.
+    ///
+    /// The first projected column (by default the driver passed to [`ScanBuilder::new`]) defines
+    /// chunk order and powers range/pagination logic. Additional columns are hydrated per chunk
+    /// and combined into an Arrow `RecordBatch` alongside the row-id column. Callers receive each
+    /// batch via `on_batch` and can stop early by returning an error.
+    pub fn project<F>(mut self, mut on_batch: F) -> Result<()>
     where
         F: FnMut(MultiProjectionBatch) -> Result<()>,
     {
         if self.opts.sorted {
             return Err(Error::Internal(
-                "project_multi does not support sorted scans yet".into(),
+                "project does not support sorted scans yet".into(),
             ));
         }
         self.opts.with_row_ids = true;
@@ -621,24 +674,33 @@ where
             self.opts.anchor_row_id_field = Some(rowid_fid(self.field_id));
         }
 
+        if self.projection.is_empty() {
+            self.projection.push(self.field_id);
+        }
+        if self.projection[0] != self.field_id {
+            if let Some(pos) = self.projection.iter().position(|&fid| fid == self.field_id) {
+                self.projection.swap(0, pos);
+            } else {
+                self.projection.insert(0, self.field_id);
+            }
+        }
+
         let mut seen: FxHashSet<LogicalFieldId> = FxHashSet::default();
         let mut projection: Vec<LogicalFieldId> = Vec::new();
-        projection.push(self.field_id);
-        seen.insert(self.field_id);
-        for &fid in columns {
+        for &fid in &self.projection {
             if seen.insert(fid) {
                 projection.push(fid);
             }
         }
 
         let base_dtype = self.store.data_type(self.field_id)?;
+
         let mut extras: Vec<PrefetchedColumn> = Vec::new();
         for &fid in projection.iter().skip(1) {
-            let prefetched = prefetch_unsorted_column(self.store, fid)?;
-            extras.push(prefetched);
+            extras.push(prefetch_unsorted_column(self.store, fid)?);
         }
 
-        let mut schema_fields: Vec<Field> = Vec::with_capacity(1 + projection.len());
+        let mut schema_fields: Vec<Field> = Vec::with_capacity(2 + extras.len());
         schema_fields.push(Field::new("__row_id", DataType::UInt64, false));
         schema_fields.push(Field::new(
             logical_field_name(self.field_id),
@@ -666,7 +728,7 @@ where
     }
 }
 
-/// A logical batch emitted by `ScanBuilder::project_multi`, pairing row ids with one or more value
+/// A logical batch emitted by `ScanBuilder::project`, pairing row ids with one or more value
 /// columns materialized as an Arrow `RecordBatch`.
 pub struct MultiProjectionBatch {
     pub row_ids: Arc<UInt64Array>,
@@ -722,13 +784,13 @@ where
     ) -> Result<()> {
         if base.len() != row_ids.len() {
             return Err(Error::Internal(
-                "project_multi: base column length mismatch".into(),
+                "project: base column length mismatch".into(),
             ));
         }
         for arr in &extra_arrays {
             if arr.len() != row_ids.len() {
                 return Err(Error::Internal(
-                    "project_multi: extra column length mismatch".into(),
+                    "project: extra column length mismatch".into(),
                 ));
             }
         }
@@ -739,7 +801,7 @@ where
         columns.extend(extra_arrays);
 
         let batch = RecordBatch::try_new(self.schema.clone(), columns)
-            .map_err(|e| Error::Internal(format!("project_multi: {}", e)))?;
+            .map_err(|e| Error::Internal(format!("project: {}", e)))?;
 
         (self.on_batch)(MultiProjectionBatch {
             row_ids,
@@ -760,7 +822,7 @@ where
                 extra_arrays.push(new_null_array(&col.dtype, row_ids.len()));
             } else {
                 self.error = Some(Error::Internal(
-                    "project_multi: chunk count mismatch for extra column".into(),
+                    "project: chunk count mismatch for extra column".into(),
                 ));
                 return;
             }
@@ -791,7 +853,7 @@ where
     fn sorted_not_supported(&mut self) {
         if self.error.is_none() {
             self.error = Some(Error::Internal(
-                "project_multi: sorted scans are not supported".into(),
+                "project: sorted scans are not supported".into(),
             ));
         }
     }

@@ -184,11 +184,11 @@ fn project_column_streams_row_aligned_batches() {
         ))
         .unwrap();
 
-    let quantities: Vec<u64> = qty_a.into_iter().chain(qty_b.into_iter()).collect();
+    let quantities: Vec<u64> = qty_a.into_iter().chain(qty_b).collect();
 
     let mut collected: Vec<MultiProjectionBatch> = Vec::new();
-    ScanBuilder::new(&store, qty_fid)
-        .project_multi(&[], |proj| {
+    ScanBuilder::with_columns(&store, &[qty_fid])
+        .project(|proj| {
             collected.push(proj);
             Ok(())
         })
@@ -227,7 +227,7 @@ fn project_column_streams_row_aligned_batches() {
 }
 
 #[test]
-fn project_multi_columns_streams_record_batches() {
+fn project_multiple_columns_streams_record_batches() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
     let price_fid = fid(7);
@@ -246,8 +246,8 @@ fn project_multi_columns_streams_record_batches() {
     store.append(&batch).unwrap();
 
     let mut collected: Vec<MultiProjectionBatch> = Vec::new();
-    ScanBuilder::new(&store, price_fid)
-        .project_multi(&[qty_fid], |proj| {
+    ScanBuilder::with_columns(&store, &[price_fid, qty_fid])
+        .project(|proj| {
             collected.push(proj);
             Ok(())
         })
@@ -288,7 +288,7 @@ fn project_multi_columns_streams_record_batches() {
 }
 
 #[test]
-fn project_multi_deduplicates_projection_slice() {
+fn project_deduplicates_projection_slice() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
     let base_fid = fid(9);
@@ -307,8 +307,8 @@ fn project_multi_deduplicates_projection_slice() {
     store.append(&batch).unwrap();
 
     let mut collected: Vec<MultiProjectionBatch> = Vec::new();
-    ScanBuilder::new(&store, base_fid)
-        .project_multi(&[extra_fid, base_fid, extra_fid], |proj| {
+    ScanBuilder::with_columns(&store, &[base_fid, extra_fid, base_fid, extra_fid])
+        .project(|proj| {
             collected.push(proj);
             Ok(())
         })

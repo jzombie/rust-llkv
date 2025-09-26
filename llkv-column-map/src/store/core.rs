@@ -78,16 +78,17 @@ where
         self.dtype_cache.dtype_for_field(field_id)
     }
 
-    /// Gathers values for the specified `row_ids`, returned in the same order as provided.
+    /// Random-access helper that collects values for the specified `row_ids` in caller order.
     ///
-    /// This operates on any primitive Arrow column (integer or float) and streams chunks via the
-    /// regular scan machinery so it does not materialize the full column up front.
+    /// This is useful for point lookups or sparse retrievals when you already know the exact row
+    /// ids you care about. Internally it still uses the scan machinery but only materializes the
+    /// requested positions into a single Arrow array instead of streaming record batches.
     pub fn gather_rows(&self, field_id: LogicalFieldId, row_ids: &[u64]) -> Result<ArrayRef> {
         self.gather_rows_internal(field_id, row_ids, /* include_nulls */ false, None)
     }
 
-    /// Gathers values for the specified `row_ids`, preserving nulls and optionally anchoring to
-    /// another field's row-id column for nullable projections.
+    /// Random-access helper like [`gather_rows`](Self::gather_rows) that also preserves nulls and
+    /// can anchor null detection to another column's row-id universe.
     pub fn gather_rows_with_nulls(
         &self,
         field_id: LogicalFieldId,
