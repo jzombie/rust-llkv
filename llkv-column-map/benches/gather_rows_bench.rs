@@ -130,7 +130,7 @@ fn bench_gather_rows(c: &mut Criterion) {
     group.bench_function("single_column", |b| {
         b.iter(|| {
             let result = store
-                .gather_rows(single_field, &sample_rows)
+                .gather_rows(single_field, &sample_rows, false)
                 .expect("gather");
             black_box(result);
         });
@@ -139,7 +139,7 @@ fn bench_gather_rows(c: &mut Criterion) {
     group.bench_function("multi_column_sequential", |b| {
         b.iter(|| {
             for &fid in field_ids.iter().take(MULTI_FIELD_TAKE) {
-                let result = store.gather_rows(fid, &sample_rows).expect("gather");
+                let result = store.gather_rows(fid, &sample_rows, false).expect("gather");
                 black_box(result);
             }
         });

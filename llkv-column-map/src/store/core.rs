@@ -78,25 +78,14 @@ where
     }
 
     /// Gathers values for the specified `row_ids`, returned in the same order as provided.
-    pub fn gather_rows(&self, field_id: LogicalFieldId, row_ids: &[u64]) -> Result<ArrayRef> {
-        let batch = self.gather_rows_multi(&[field_id], row_ids, false)?;
-        batch
-            .columns()
-            .first()
-            .map(Arc::clone)
-            .ok_or_else(|| Error::Internal("gather_rows_multi returned no columns".into()))
-    }
-
-    /// Gathers values for the specified `row_ids`, preserving nulls and optionally anchoring to
-    /// another field's row-id column for nullable projections.
-    pub fn gather_rows_with_nulls(
+    /// When `include_nulls` is true, missing rows surface as nulls instead of an error.
+    pub fn gather_rows(
         &self,
         field_id: LogicalFieldId,
         row_ids: &[u64],
-        anchor_row_id_field: Option<LogicalFieldId>,
+        include_nulls: bool,
     ) -> Result<ArrayRef> {
-        let _ = anchor_row_id_field;
-        let batch = self.gather_rows_multi(&[field_id], row_ids, true)?;
+        let batch = self.gather_rows_multi(&[field_id], row_ids, include_nulls)?;
         batch
             .columns()
             .first()
@@ -376,7 +365,7 @@ where
             }
         }
 
-        let array = PrimitiveArray::<T>::from_iter(values.into_iter());
+        let array = PrimitiveArray::<T>::from_iter(values);
         Ok(Arc::new(array) as ArrayRef)
     }
 

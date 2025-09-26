@@ -65,8 +65,8 @@ fn gather_rows_multi_matches_single_columns() -> Result<()> {
     let multi = store.gather_rows_multi(&[fid_a, fid_b], &row_ids, false)?;
     assert_eq!(multi.num_columns(), 2);
 
-    let single_a = store.gather_rows(fid_a, &row_ids)?;
-    let single_b = store.gather_rows(fid_b, &row_ids)?;
+    let single_a = store.gather_rows(fid_a, &row_ids, false)?;
+    let single_b = store.gather_rows(fid_b, &row_ids, false)?;
 
     let multi_a = multi
         .column(0)

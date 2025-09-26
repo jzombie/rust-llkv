@@ -335,8 +335,6 @@ where
         F: FnMut(RecordBatch),
     {
         let filter_lfid = lfid_for(self.table_id, filter.field_id);
-        let anchor_lfid =
-            lfid_for(self.table_id, filter.field_id).with_namespace(Namespace::RowIdShadow);
         let dtype = self.store.data_type(filter_lfid)?;
 
         let row_ids = llkv_column_map::with_integer_arrow_type!(
@@ -366,28 +364,19 @@ where
             let window = &row_ids[start..end];
 
             // Gather only this window's rows for the projected column.
-            let arr = if options.include_nulls {
-                Some(
-                    self.store
-                        .gather_rows_with_nulls(proj_lfid, window, Some(anchor_lfid))
+            let arr = match self
+                .store
+                .gather_rows(proj_lfid, window, options.include_nulls)
+            {
+                Ok(values) => values,
+                Err(err) if !options.include_nulls => match err {
+                    llkv_result::Error::Internal(_) | llkv_result::Error::NotFound => self
+                        .store
+                        .gather_rows(proj_lfid, window, true)
                         .map_err(TableError::from)?,
-                )
-            } else {
-                match self.store.gather_rows(proj_lfid, window) {
-                    Ok(values) => Some(values),
-                    Err(err) => Some(match err {
-                        llkv_result::Error::Internal(_) | llkv_result::Error::NotFound => self
-                            .store
-                            .gather_rows_with_nulls(proj_lfid, window, Some(anchor_lfid))
-                            .map_err(TableError::from)?,
-                        _ => return Err(TableError::from(err)),
-                    }),
-                }
-            };
-
-            let Some(arr) = arr else {
-                start = end;
-                continue;
+                    _ => return Err(TableError::from(err)),
+                },
+                Err(err) => return Err(TableError::from(err)),
             };
 
             let maybe_arr = if options.include_nulls {
@@ -871,7 +860,7 @@ mod tests {
             for &(col, ref ty) in expectations {
                 let lfid = lfid_for(TABLE_ALPHA, col);
                 assert_eq!(store.data_type(lfid).unwrap(), *ty);
-                let arr = store.gather_rows(lfid, &alpha_rows).unwrap();
+                let arr = store.gather_rows(lfid, &alpha_rows, false).unwrap();
                 match ty {
                     DataType::UInt64 => {
                         let arr = arr.as_any().downcast_ref::<UInt64Array>().unwrap();
@@ -900,13 +889,13 @@ mod tests {
 
             let lfid_u64 = lfid_for(TABLE_BETA, COL_BETA_U64);
             assert_eq!(store.data_type(lfid_u64).unwrap(), DataType::UInt64);
-            let arr_u64 = store.gather_rows(lfid_u64, &beta_rows).unwrap();
+            let arr_u64 = store.gather_rows(lfid_u64, &beta_rows, false).unwrap();
             let arr_u64 = arr_u64.as_any().downcast_ref::<UInt64Array>().unwrap();
             assert_eq!(arr_u64.values(), beta_vals_u64.as_slice());
 
             let lfid_u8 = lfid_for(TABLE_BETA, COL_BETA_U8);
             assert_eq!(store.data_type(lfid_u8).unwrap(), DataType::UInt8);
-            let arr_u8 = store.gather_rows(lfid_u8, &beta_rows).unwrap();
+            let arr_u8 = store.gather_rows(lfid_u8, &beta_rows, false).unwrap();
             let arr_u8 = arr_u8.as_any().downcast_ref::<UInt8Array>().unwrap();
             assert_eq!(arr_u8.values(), beta_vals_u8.as_slice());
         }
@@ -916,7 +905,7 @@ mod tests {
             let store = table.store();
             let lfid = lfid_for(TABLE_GAMMA, COL_GAMMA_I16);
             assert_eq!(store.data_type(lfid).unwrap(), DataType::Int16);
-            let arr = store.gather_rows(lfid, &gamma_rows).unwrap();
+            let arr = store.gather_rows(lfid, &gamma_rows, false).unwrap();
             let arr = arr.as_any().downcast_ref::<Int16Array>().unwrap();
             assert_eq!(arr.values(), gamma_vals_i16.as_slice());
         }
