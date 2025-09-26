@@ -197,7 +197,7 @@ fn gather_rows_multi_shuffled_with_nulls_preserves_alignment() -> Result<()> {
     store.append(&sparse_batch)?;
 
     let mut shuffled_ids = all_rids.clone();
-    let mut rng = StdRng::seed_from_u64(0x5A17_1E5F_CE37_3B4u64);
+    let mut rng = StdRng::seed_from_u64(0x05A1_71E5_FCE3_73B4_u64);
     shuffled_ids.shuffle(&mut rng);
     assert_eq!(shuffled_ids.len(), all_rids.len());
 
