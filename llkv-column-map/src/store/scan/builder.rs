@@ -6,7 +6,12 @@ use arrow::array::{
     ArrayRef, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
     UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use llkv_storage::pager::{BatchGet, GetResult};
+use llkv_storage::types::PhysicalKey;
+use rustc_hash::{FxHashMap, FxHashSet};
+use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::store::rowid::rowid_fid;
 
@@ -602,62 +607,193 @@ where
         self.store.scan(self.field_id, self.opts, &mut adapter)
     }
 
-    pub fn project<F>(mut self, mut on_batch: F) -> Result<()>
+    pub fn project_multi<F>(mut self, columns: &[LogicalFieldId], mut on_batch: F) -> Result<()>
     where
-        F: FnMut(ProjectionBatch) -> Result<()>,
+        F: FnMut(MultiProjectionBatch) -> Result<()>,
     {
-        let dtype = self.store.data_type(self.field_id)?;
+        if self.opts.sorted {
+            return Err(Error::Internal(
+                "project_multi does not support sorted scans yet".into(),
+            ));
+        }
         self.opts.with_row_ids = true;
         if self.opts.include_nulls && self.opts.anchor_row_id_field.is_none() {
             self.opts.anchor_row_id_field = Some(rowid_fid(self.field_id));
         }
 
-        let mut visitor = ProjectionVisitor::new(dtype, &mut on_batch);
+        let mut seen: FxHashSet<LogicalFieldId> = FxHashSet::default();
+        let mut projection: Vec<LogicalFieldId> = Vec::new();
+        projection.push(self.field_id);
+        seen.insert(self.field_id);
+        for &fid in columns {
+            if seen.insert(fid) {
+                projection.push(fid);
+            }
+        }
+
+        let base_dtype = self.store.data_type(self.field_id)?;
+        let mut extras: Vec<PrefetchedColumn> = Vec::new();
+        for &fid in projection.iter().skip(1) {
+            let prefetched = prefetch_unsorted_column(self.store, fid)?;
+            extras.push(prefetched);
+        }
+
+        let mut schema_fields: Vec<Field> = Vec::with_capacity(1 + projection.len());
+        schema_fields.push(Field::new("__row_id", DataType::UInt64, false));
+        schema_fields.push(Field::new(
+            logical_field_name(self.field_id),
+            base_dtype.clone(),
+            true,
+        ));
+        for col in &extras {
+            schema_fields.push(Field::new(
+                logical_field_name(col.field_id),
+                col.dtype.clone(),
+                true,
+            ));
+        }
+        let schema = Arc::new(Schema::new(schema_fields));
+
+        let mut visitor = MultiProjectionVisitor::new(
+            base_dtype,
+            schema,
+            extras,
+            &mut on_batch,
+            self.opts.include_nulls,
+        );
         self.run(&mut visitor)?;
         visitor.finish()
     }
 }
 
-/// A logical batch produced by `ScanBuilder::project`, containing the requested row ids and values.
-pub struct ProjectionBatch {
+/// A logical batch emitted by `ScanBuilder::project_multi`, pairing row ids with one or more value
+/// columns materialized as an Arrow `RecordBatch`.
+pub struct MultiProjectionBatch {
     pub row_ids: Arc<UInt64Array>,
-    pub values: ArrayRef,
+    pub record_batch: RecordBatch,
 }
 
-struct ProjectionVisitor<'a, F>
-where
-    F: FnMut(ProjectionBatch) -> Result<()>,
-{
+struct PrefetchedColumn {
+    field_id: LogicalFieldId,
     dtype: DataType,
+    chunks: Vec<ArrayRef>,
+}
+
+struct MultiProjectionVisitor<'a, F>
+where
+    F: FnMut(MultiProjectionBatch) -> Result<()>,
+{
+    base_dtype: DataType,
+    schema: Arc<Schema>,
+    extras: Vec<PrefetchedColumn>,
     on_batch: &'a mut F,
+    include_nulls: bool,
+    chunk_idx: usize,
     error: Option<Error>,
 }
 
-impl<'a, F> ProjectionVisitor<'a, F>
+impl<'a, F> MultiProjectionVisitor<'a, F>
 where
-    F: FnMut(ProjectionBatch) -> Result<()>,
+    F: FnMut(MultiProjectionBatch) -> Result<()>,
 {
-    fn new(dtype: DataType, on_batch: &'a mut F) -> Self {
+    fn new(
+        base_dtype: DataType,
+        schema: Arc<Schema>,
+        extras: Vec<PrefetchedColumn>,
+        on_batch: &'a mut F,
+        include_nulls: bool,
+    ) -> Self {
         Self {
-            dtype,
+            base_dtype,
+            schema,
+            extras,
             on_batch,
+            include_nulls,
+            chunk_idx: 0,
             error: None,
         }
     }
 
-    fn emit(&mut self, values: ArrayRef, row_ids: Arc<UInt64Array>) {
+    fn emit_record(
+        &mut self,
+        row_ids: Arc<UInt64Array>,
+        base: ArrayRef,
+        extra_arrays: Vec<ArrayRef>,
+    ) -> Result<()> {
+        if base.len() != row_ids.len() {
+            return Err(Error::Internal(
+                "project_multi: base column length mismatch".into(),
+            ));
+        }
+        for arr in &extra_arrays {
+            if arr.len() != row_ids.len() {
+                return Err(Error::Internal(
+                    "project_multi: extra column length mismatch".into(),
+                ));
+            }
+        }
+
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(2 + extra_arrays.len());
+        columns.push(row_ids.clone() as ArrayRef);
+        columns.push(base);
+        columns.extend(extra_arrays);
+
+        let batch = RecordBatch::try_new(self.schema.clone(), columns)
+            .map_err(|e| Error::Internal(format!("project_multi: {}", e)))?;
+
+        (self.on_batch)(MultiProjectionBatch {
+            row_ids,
+            record_batch: batch,
+        })
+    }
+
+    fn emit_chunk(&mut self, values: ArrayRef, row_ids: Arc<UInt64Array>) {
         if self.error.is_some() {
             return;
         }
-        if let Err(err) = (self.on_batch)(ProjectionBatch { row_ids, values }) {
+        let chunk_idx = self.chunk_idx;
+        let mut extra_arrays: Vec<ArrayRef> = Vec::with_capacity(self.extras.len());
+        for col in &self.extras {
+            if let Some(arr) = col.chunks.get(chunk_idx) {
+                extra_arrays.push(arr.clone());
+            } else if col.chunks.is_empty() {
+                extra_arrays.push(new_null_array(&col.dtype, row_ids.len()));
+            } else {
+                self.error = Some(Error::Internal(
+                    "project_multi: chunk count mismatch for extra column".into(),
+                ));
+                return;
+            }
+        }
+        if let Err(err) = self.emit_record(row_ids, values, extra_arrays) {
+            self.error = Some(err);
+            return;
+        }
+        self.chunk_idx += 1;
+    }
+
+    fn emit_null_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
+        if self.error.is_some() || len == 0 {
+            return;
+        }
+        let rid_slice = Arc::new(row_ids.slice(start, len));
+        let base = new_null_array(&self.base_dtype, len);
+        let extras = self
+            .extras
+            .iter()
+            .map(|col| new_null_array(&col.dtype, len))
+            .collect();
+        if let Err(err) = self.emit_record(rid_slice, base, extras) {
             self.error = Some(err);
         }
     }
 
-    fn emit_null_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
-        let rid = Arc::new(row_ids.slice(start, len));
-        let values = new_null_array(&self.dtype, len);
-        self.emit(values, rid);
+    fn sorted_not_supported(&mut self) {
+        if self.error.is_none() {
+            self.error = Some(Error::Internal(
+                "project_multi: sorted scans are not supported".into(),
+            ));
+        }
     }
 
     fn finish(self) -> Result<()> {
@@ -669,9 +805,9 @@ where
     }
 }
 
-impl<'a, F> crate::store::scan::PrimitiveVisitor for ProjectionVisitor<'a, F>
+impl<'a, F> crate::store::scan::PrimitiveVisitor for MultiProjectionVisitor<'a, F>
 where
-    F: FnMut(ProjectionBatch) -> Result<()>,
+    F: FnMut(MultiProjectionBatch) -> Result<()>,
 {
     fn u64_chunk(&mut self, _a: &UInt64Array) {}
     fn u32_chunk(&mut self, _a: &UInt32Array) {}
@@ -685,74 +821,213 @@ where
     fn f32_chunk(&mut self, _a: &Float32Array) {}
 }
 
-impl<'a, F> crate::store::scan::PrimitiveSortedVisitor for ProjectionVisitor<'a, F>
-where
-    F: FnMut(ProjectionBatch) -> Result<()>,
-{
-    fn u64_run(&mut self, _a: &UInt64Array, _start: usize, _len: usize) {}
-    fn u32_run(&mut self, _a: &UInt32Array, _start: usize, _len: usize) {}
-    fn u16_run(&mut self, _a: &UInt16Array, _start: usize, _len: usize) {}
-    fn u8_run(&mut self, _a: &UInt8Array, _start: usize, _len: usize) {}
-    fn i64_run(&mut self, _a: &Int64Array, _start: usize, _len: usize) {}
-    fn i32_run(&mut self, _a: &Int32Array, _start: usize, _len: usize) {}
-    fn i16_run(&mut self, _a: &Int16Array, _start: usize, _len: usize) {}
-    fn i8_run(&mut self, _a: &Int8Array, _start: usize, _len: usize) {}
-    fn f64_run(&mut self, _a: &Float64Array, _start: usize, _len: usize) {}
-    fn f32_run(&mut self, _a: &Float32Array, _start: usize, _len: usize) {}
-}
-
-macro_rules! impl_projection_with_rids {
+macro_rules! impl_multi_projection_with_rids {
     ($meth:ident, $ArrTy:ty) => {
         fn $meth(&mut self, values: &$ArrTy, row_ids: &UInt64Array) {
-            let values_ref = values.clone();
-            let row_ids_ref = row_ids.clone();
-            self.emit(Arc::new(values_ref) as ArrayRef, Arc::new(row_ids_ref));
+            let base = Arc::new(values.clone()) as ArrayRef;
+            let rids = Arc::new(row_ids.clone());
+            self.emit_chunk(base, rids);
         }
     };
 }
 
-macro_rules! impl_projection_sorted_with_rids {
-    ($meth:ident, $ArrTy:ty) => {
-        fn $meth(&mut self, values: &$ArrTy, row_ids: &UInt64Array, start: usize, len: usize) {
-            let v_slice = values.slice(start, len);
-            let r_slice = row_ids.slice(start, len);
-            self.emit(Arc::new(v_slice) as ArrayRef, Arc::new(r_slice));
-        }
-    };
+impl<'a, F> crate::store::scan::PrimitiveWithRowIdsVisitor for MultiProjectionVisitor<'a, F>
+where
+    F: FnMut(MultiProjectionBatch) -> Result<()>,
+{
+    impl_multi_projection_with_rids!(u64_chunk_with_rids, UInt64Array);
+    impl_multi_projection_with_rids!(u32_chunk_with_rids, UInt32Array);
+    impl_multi_projection_with_rids!(u16_chunk_with_rids, UInt16Array);
+    impl_multi_projection_with_rids!(u8_chunk_with_rids, UInt8Array);
+    impl_multi_projection_with_rids!(i64_chunk_with_rids, Int64Array);
+    impl_multi_projection_with_rids!(i32_chunk_with_rids, Int32Array);
+    impl_multi_projection_with_rids!(i16_chunk_with_rids, Int16Array);
+    impl_multi_projection_with_rids!(i8_chunk_with_rids, Int8Array);
+    impl_multi_projection_with_rids!(f64_chunk_with_rids, Float64Array);
+    impl_multi_projection_with_rids!(f32_chunk_with_rids, Float32Array);
 }
 
-impl<'a, F> crate::store::scan::PrimitiveWithRowIdsVisitor for ProjectionVisitor<'a, F>
+impl<'a, F> crate::store::scan::PrimitiveSortedVisitor for MultiProjectionVisitor<'a, F>
 where
-    F: FnMut(ProjectionBatch) -> Result<()>,
+    F: FnMut(MultiProjectionBatch) -> Result<()>,
 {
-    impl_projection_with_rids!(u64_chunk_with_rids, UInt64Array);
-    impl_projection_with_rids!(u32_chunk_with_rids, UInt32Array);
-    impl_projection_with_rids!(u16_chunk_with_rids, UInt16Array);
-    impl_projection_with_rids!(u8_chunk_with_rids, UInt8Array);
-    impl_projection_with_rids!(i64_chunk_with_rids, Int64Array);
-    impl_projection_with_rids!(i32_chunk_with_rids, Int32Array);
-    impl_projection_with_rids!(i16_chunk_with_rids, Int16Array);
-    impl_projection_with_rids!(i8_chunk_with_rids, Int8Array);
-    impl_projection_with_rids!(f64_chunk_with_rids, Float64Array);
-    impl_projection_with_rids!(f32_chunk_with_rids, Float32Array);
+    fn u64_run(&mut self, _a: &UInt64Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
+    fn u32_run(&mut self, _a: &UInt32Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
+    fn u16_run(&mut self, _a: &UInt16Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
+    fn u8_run(&mut self, _a: &UInt8Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
+    fn i64_run(&mut self, _a: &Int64Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
+    fn i32_run(&mut self, _a: &Int32Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
+    fn i16_run(&mut self, _a: &Int16Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
+    fn i8_run(&mut self, _a: &Int8Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
+    fn f64_run(&mut self, _a: &Float64Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
+    fn f32_run(&mut self, _a: &Float32Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
 }
 
-impl<'a, F> crate::store::scan::PrimitiveSortedWithRowIdsVisitor for ProjectionVisitor<'a, F>
+impl<'a, F> crate::store::scan::PrimitiveSortedWithRowIdsVisitor for MultiProjectionVisitor<'a, F>
 where
-    F: FnMut(ProjectionBatch) -> Result<()>,
+    F: FnMut(MultiProjectionBatch) -> Result<()>,
 {
-    impl_projection_sorted_with_rids!(u64_run_with_rids, UInt64Array);
-    impl_projection_sorted_with_rids!(u32_run_with_rids, UInt32Array);
-    impl_projection_sorted_with_rids!(u16_run_with_rids, UInt16Array);
-    impl_projection_sorted_with_rids!(u8_run_with_rids, UInt8Array);
-    impl_projection_sorted_with_rids!(i64_run_with_rids, Int64Array);
-    impl_projection_sorted_with_rids!(i32_run_with_rids, Int32Array);
-    impl_projection_sorted_with_rids!(i16_run_with_rids, Int16Array);
-    impl_projection_sorted_with_rids!(i8_run_with_rids, Int8Array);
-    impl_projection_sorted_with_rids!(f64_run_with_rids, Float64Array);
-    impl_projection_sorted_with_rids!(f32_run_with_rids, Float32Array);
+    fn u64_run_with_rids(
+        &mut self,
+        _v: &UInt64Array,
+        _r: &UInt64Array,
+        _start: usize,
+        _len: usize,
+    ) {
+        self.sorted_not_supported();
+    }
+    fn u32_run_with_rids(
+        &mut self,
+        _v: &UInt32Array,
+        _r: &UInt64Array,
+        _start: usize,
+        _len: usize,
+    ) {
+        self.sorted_not_supported();
+    }
+    fn u16_run_with_rids(
+        &mut self,
+        _v: &UInt16Array,
+        _r: &UInt64Array,
+        _start: usize,
+        _len: usize,
+    ) {
+        self.sorted_not_supported();
+    }
+    fn u8_run_with_rids(&mut self, _v: &UInt8Array, _r: &UInt64Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
+    fn i64_run_with_rids(&mut self, _v: &Int64Array, _r: &UInt64Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
+    fn i32_run_with_rids(&mut self, _v: &Int32Array, _r: &UInt64Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
+    fn i16_run_with_rids(&mut self, _v: &Int16Array, _r: &UInt64Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
+    fn i8_run_with_rids(&mut self, _v: &Int8Array, _r: &UInt64Array, _start: usize, _len: usize) {
+        self.sorted_not_supported();
+    }
+    fn f64_run_with_rids(
+        &mut self,
+        _v: &Float64Array,
+        _r: &UInt64Array,
+        _start: usize,
+        _len: usize,
+    ) {
+        self.sorted_not_supported();
+    }
+    fn f32_run_with_rids(
+        &mut self,
+        _v: &Float32Array,
+        _r: &UInt64Array,
+        _start: usize,
+        _len: usize,
+    ) {
+        self.sorted_not_supported();
+    }
 
     fn null_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
-        self.emit_null_run(row_ids, start, len);
+        if self.include_nulls {
+            self.emit_null_run(row_ids, start, len);
+        } else {
+            self.sorted_not_supported();
+        }
     }
+}
+
+fn logical_field_name(fid: LogicalFieldId) -> String {
+    format!(
+        "{:?}-{}-{}",
+        fid.namespace(),
+        fid.table_id(),
+        fid.field_id()
+    )
+}
+
+fn prefetch_unsorted_column<P>(
+    store: &ColumnStore<P>,
+    field_id: LogicalFieldId,
+) -> Result<PrefetchedColumn>
+where
+    P: Pager<Blob = EntryHandle>,
+{
+    let dtype = store.data_type(field_id)?;
+
+    let catalog = store.catalog.read().unwrap();
+    let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+    let desc_blob = store
+        .pager
+        .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+        .pop()
+        .and_then(|r| match r {
+            GetResult::Raw { bytes, .. } => Some(bytes),
+            _ => None,
+        })
+        .ok_or(Error::NotFound)?;
+    let desc = crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+    drop(catalog);
+
+    let mut metas: Vec<crate::store::descriptor::ChunkMetadata> = Vec::new();
+    for m in
+        crate::store::descriptor::DescriptorIterator::new(store.pager.as_ref(), desc.head_page_pk)
+    {
+        let meta = m?;
+        if meta.row_count > 0 {
+            metas.push(meta);
+        }
+    }
+    if metas.is_empty() {
+        return Ok(PrefetchedColumn {
+            field_id,
+            dtype,
+            chunks: Vec::new(),
+        });
+    }
+
+    let gets: Vec<BatchGet> = metas
+        .iter()
+        .map(|m| BatchGet::Raw { key: m.chunk_pk })
+        .collect();
+    let results = store.pager.batch_get(&gets)?;
+    let mut blobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
+    for r in results {
+        if let GetResult::Raw { key, bytes } = r {
+            blobs.insert(key, bytes);
+        }
+    }
+
+    let mut chunks: Vec<ArrayRef> = Vec::with_capacity(metas.len());
+    for meta in metas {
+        let bytes = blobs.remove(&meta.chunk_pk).ok_or(Error::NotFound)?;
+        let arr = llkv_storage::serialization::deserialize_array(bytes)?;
+        chunks.push(arr);
+    }
+
+    Ok(PrefetchedColumn {
+        field_id,
+        dtype,
+        chunks,
+    })
 }
