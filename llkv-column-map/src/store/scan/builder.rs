@@ -1272,10 +1272,10 @@ where
 
     let mut indices: Vec<u32> = Vec::new();
     for (idx, maybe_value) in filter_col.iter().enumerate() {
-        if let Some(value) = maybe_value {
-            if predicate(value) {
-                indices.push(idx as u32);
-            }
+        if let Some(value) = maybe_value
+            && predicate(value)
+        {
+            indices.push(idx as u32);
         }
     }
 
@@ -1286,14 +1286,12 @@ where
     let indices_array = UInt32Array::from(indices);
     let mut filtered = take(proj_col.as_ref(), &indices_array, None).map_err(Error::from)?;
 
-    if !include_nulls {
-        if filtered.null_count() > 0 {
-            let mask: BooleanArray = is_not_null(filtered.as_ref()).map_err(Error::from)?;
-            filtered = arrow_filter(filtered.as_ref(), &mask).map_err(Error::from)?;
-        }
+    if !include_nulls && filtered.null_count() > 0 {
+        let mask: BooleanArray = is_not_null(filtered.as_ref()).map_err(Error::from)?;
+        filtered = arrow_filter(filtered.as_ref(), &mask).map_err(Error::from)?;
     }
 
-    if filtered.len() == 0 {
+    if filtered.is_empty() {
         return Ok(None);
     }
 

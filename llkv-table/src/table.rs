@@ -339,8 +339,10 @@ where
             }
         }
 
-        let mut scan_opts = scan::ScanOptions::default();
-        scan_opts.include_nulls = options.include_nulls;
+        let scan_opts = scan::ScanOptions {
+            include_nulls: options.include_nulls,
+            ..Default::default()
+        };
 
         llkv_column_map::with_integer_arrow_type!(
             dtype.clone(),
@@ -432,10 +434,10 @@ where
 
     let mut indices: Vec<u32> = Vec::new();
     for (idx, maybe_value) in filter_values.iter().enumerate() {
-        if let Some(value) = maybe_value {
-            if predicate.matches(value) {
-                indices.push(idx as u32);
-            }
+        if let Some(value) = maybe_value
+            && predicate.matches(value)
+        {
+            indices.push(idx as u32);
         }
     }
 
@@ -530,11 +532,11 @@ mod tests {
     const COL_C_I32: FieldId = 11;
     const COL_BIG_U64: FieldId = 42;
 
-    fn collect_batches<F>(table: &Table, proj: FieldId, filter: &Filter<'_, FieldId>, mut f: F)
+    fn collect_batches<F>(table: &Table, proj: FieldId, filter: &Filter<'_, FieldId>, f: F)
     where
         F: FnMut(RecordBatch),
     {
-        table.scan_stream(proj, filter, |batch| f(batch)).unwrap();
+        table.scan_stream(proj, filter, f).unwrap();
     }
 
     fn setup_small_table() -> Table {
