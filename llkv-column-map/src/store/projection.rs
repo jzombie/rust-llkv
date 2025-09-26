@@ -256,10 +256,10 @@ where
     where
         T: ArrowPrimitiveType,
     {
-    let mut values: Vec<Option<T::Native>> = Vec::with_capacity(len);
-    values.resize(len, None);
-    let mut found: Vec<bool> = Vec::with_capacity(len);
-    found.resize(len, false);
+        let mut values: Vec<Option<T::Native>> = Vec::with_capacity(len);
+        values.resize(len, None);
+        let mut found: Vec<bool> = Vec::with_capacity(len);
+        found.resize(len, false);
 
         for &idx in candidate_indices {
             let value_chunk = chunk_blobs
