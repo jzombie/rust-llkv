@@ -355,14 +355,14 @@ where
                 f64_run,
                 Float64Array,
                 f64_r,
-                |x| F64Key::new(x),
+                F64Key::new,
                 |array: &Float64Array, idx| F64Key::new(array.value(idx))
             );
             impl_sorted_range_filter!(
                 f32_run,
                 Float32Array,
                 f32_r,
-                |x| F32Key::new(x),
+                F32Key::new,
                 |array: &Float32Array, idx| F32Key::new(array.value(idx))
             );
         }
@@ -430,14 +430,14 @@ where
                 f64_run_with_rids,
                 Float64Array,
                 f64_r,
-                |x| F64Key::new(x),
+                F64Key::new,
                 |array: &Float64Array, idx| F64Key::new(array.value(idx))
             );
             impl_sorted_with_rids_range_filter!(
                 f32_run_with_rids,
                 Float32Array,
                 f32_r,
-                |x| F32Key::new(x),
+                F32Key::new,
                 |array: &Float32Array, idx| F32Key::new(array.value(idx))
             );
         }
