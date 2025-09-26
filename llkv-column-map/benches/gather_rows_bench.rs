@@ -91,6 +91,16 @@ fn bench_gather_rows(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("multi_column_batched", |b| {
+        let fids: Vec<LogicalFieldId> = field_ids.iter().take(MULTI_FIELD_TAKE).copied().collect();
+        b.iter(|| {
+            let result = store
+                .gather_rows_multi(&fids, &sample_rows)
+                .expect("gather multi");
+            black_box(result);
+        });
+    });
+
     group.finish();
 }
 

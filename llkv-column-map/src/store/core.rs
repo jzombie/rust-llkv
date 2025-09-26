@@ -102,6 +102,166 @@ where
         )
     }
 
+    /// Prototype: gathers multiple primitive columns for the given `row_ids` in a single
+    /// descriptor walk, reducing redundant pager fetches across columns. Currently mirrors the
+    /// semantics of `gather_rows` (no null anchoring) and returns arrays in the same order as
+    /// `field_ids`.
+    pub fn gather_rows_multi(
+        &self,
+        field_ids: &[LogicalFieldId],
+        row_ids: &[u64],
+    ) -> Result<Vec<ArrayRef>> {
+        if field_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut dtypes = Vec::with_capacity(field_ids.len());
+        for &fid in field_ids {
+            dtypes.push(self.data_type(fid)?);
+        }
+
+        if row_ids.is_empty() {
+            let mut outputs = Vec::with_capacity(field_ids.len());
+            for dt in dtypes {
+                outputs.push(new_empty_array(&dt));
+            }
+            return Ok(outputs);
+        }
+
+        let mut row_index: FxHashMap<u64, usize> = FxHashMap::default();
+        row_index.reserve(row_ids.len());
+        for (idx, &row_id) in row_ids.iter().enumerate() {
+            if row_index.insert(row_id, idx).is_some() {
+                return Err(Error::Internal(
+                    "duplicate row_id in gather_rows_multi".into(),
+                ));
+            }
+        }
+
+        let mut sorted_row_ids = row_ids.to_vec();
+        sorted_row_ids.sort_unstable();
+
+        struct FieldPlan {
+            dtype: DataType,
+            value_pk: PhysicalKey,
+            row_pk: PhysicalKey,
+            value_metas: Vec<ChunkMetadata>,
+            row_metas: Vec<ChunkMetadata>,
+            candidate_indices: Vec<usize>,
+        }
+
+        let mut plans = Vec::with_capacity(field_ids.len());
+        {
+            let catalog = self.catalog.read().unwrap();
+            for (idx, &fid) in field_ids.iter().enumerate() {
+                let value_pk = *catalog.map.get(&fid).ok_or(Error::NotFound)?;
+                let row_fid = rowid_fid(fid);
+                let row_pk = *catalog.map.get(&row_fid).ok_or(Error::NotFound)?;
+                plans.push(FieldPlan {
+                    dtype: dtypes[idx].clone(),
+                    value_pk,
+                    row_pk,
+                    value_metas: Vec::new(),
+                    row_metas: Vec::new(),
+                    candidate_indices: Vec::new(),
+                });
+            }
+        }
+
+        let mut descriptor_requests = Vec::with_capacity(plans.len() * 2);
+        for plan in &plans {
+            descriptor_requests.push(BatchGet::Raw { key: plan.value_pk });
+            descriptor_requests.push(BatchGet::Raw { key: plan.row_pk });
+        }
+        let descriptor_results = self.pager.batch_get(&descriptor_requests)?;
+        let mut descriptor_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
+        for result in descriptor_results {
+            if let GetResult::Raw { key, bytes } = result {
+                descriptor_map.insert(key, bytes);
+            }
+        }
+
+        for plan in &mut plans {
+            let value_desc_blob = descriptor_map
+                .remove(&plan.value_pk)
+                .ok_or(Error::NotFound)?;
+            let value_desc = ColumnDescriptor::from_le_bytes(value_desc_blob.as_ref());
+            plan.value_metas = Self::collect_non_empty_metas(self.pager.as_ref(), value_desc.head_page_pk)?;
+
+            let row_desc_blob = descriptor_map
+                .remove(&plan.row_pk)
+                .ok_or(Error::NotFound)?;
+            let row_desc = ColumnDescriptor::from_le_bytes(row_desc_blob.as_ref());
+            plan.row_metas = Self::collect_non_empty_metas(self.pager.as_ref(), row_desc.head_page_pk)?;
+
+            if plan.value_metas.len() != plan.row_metas.len() {
+                return Err(Error::Internal(
+                    "gather_rows_multi: chunk count mismatch".into(),
+                ));
+            }
+
+            plan.candidate_indices = plan
+                .row_metas
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, meta)| {
+                    if Self::chunk_intersects(&sorted_row_ids, meta) {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+
+        let mut chunk_keys: FxHashSet<PhysicalKey> = FxHashSet::default();
+        for plan in &plans {
+            for &idx in &plan.candidate_indices {
+                chunk_keys.insert(plan.value_metas[idx].chunk_pk);
+                chunk_keys.insert(plan.row_metas[idx].chunk_pk);
+            }
+        }
+
+        let mut chunk_requests = Vec::with_capacity(chunk_keys.len());
+        for &key in &chunk_keys {
+            chunk_requests.push(BatchGet::Raw { key });
+        }
+
+        let mut chunk_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
+        if !chunk_requests.is_empty() {
+            let chunk_results = self.pager.batch_get(&chunk_requests)?;
+            for result in chunk_results {
+                if let GetResult::Raw { key, bytes } = result {
+                    chunk_map.insert(key, bytes);
+                }
+            }
+        }
+
+        let mut outputs = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let array = crate::with_integer_arrow_type!(
+                plan.dtype.clone(),
+                |ArrowTy| {
+                    Self::gather_rows_from_chunks::<ArrowTy>(
+                        &row_index,
+                        row_ids.len(),
+                        &plan.candidate_indices,
+                        &plan.value_metas,
+                        &plan.row_metas,
+                        &mut chunk_map,
+                    )
+                },
+                Err(Error::Internal(format!(
+                    "gather_rows_multi: unsupported dtype {:?}",
+                    plan.dtype
+                ))),
+            )?;
+            outputs.push(array);
+        }
+
+        Ok(outputs)
+    }
+
     fn gather_rows_internal(
         &self,
         field_id: LogicalFieldId,
@@ -172,6 +332,100 @@ where
             .options(opts)
             .run(&mut visitor)?;
         visitor.finish()
+    }
+
+    fn collect_non_empty_metas(pager: &P, head_page_pk: PhysicalKey) -> Result<Vec<ChunkMetadata>> {
+        let mut metas = Vec::new();
+        if head_page_pk == 0 {
+            return Ok(metas);
+        }
+        for meta in DescriptorIterator::new(pager, head_page_pk) {
+            let meta = meta?;
+            if meta.row_count > 0 {
+                metas.push(meta);
+            }
+        }
+        Ok(metas)
+    }
+
+    #[inline]
+    fn chunk_intersects(sorted_row_ids: &[u64], meta: &ChunkMetadata) -> bool {
+        if sorted_row_ids.is_empty() || meta.row_count == 0 {
+            return false;
+        }
+        let min = meta.min_val_u64;
+        let max = meta.max_val_u64;
+        if min == 0 && max == 0 && meta.row_count > 0 {
+            return true;
+        }
+        if min > max {
+            return true;
+        }
+        let min_req = sorted_row_ids[0];
+        let max_req = *sorted_row_ids.last().unwrap();
+        if max < min_req || min > max_req {
+            return false;
+        }
+        let idx = sorted_row_ids.partition_point(|&rid| rid < min);
+        idx < sorted_row_ids.len() && sorted_row_ids[idx] <= max
+    }
+
+    fn gather_rows_from_chunks<T>(
+        row_index: &FxHashMap<u64, usize>,
+        len: usize,
+        candidate_indices: &[usize],
+        value_metas: &[ChunkMetadata],
+        row_metas: &[ChunkMetadata],
+        chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
+    ) -> Result<ArrayRef>
+    where
+        T: ArrowPrimitiveType,
+    {
+        let mut values: Vec<Option<T::Native>> = vec![None; len];
+        let mut found: Vec<bool> = vec![false; len];
+
+        for &idx in candidate_indices {
+            let value_chunk = chunk_blobs
+                .remove(&value_metas[idx].chunk_pk)
+                .ok_or(Error::NotFound)?;
+            let row_chunk = chunk_blobs
+                .remove(&row_metas[idx].chunk_pk)
+                .ok_or(Error::NotFound)?;
+
+            let value_any = deserialize_array(value_chunk)?;
+            let value_arr = value_any
+                .as_any()
+                .downcast_ref::<PrimitiveArray<T>>()
+                .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
+            let row_any = deserialize_array(row_chunk)?;
+            let row_arr = row_any
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
+
+            let len_chunk = row_arr.len();
+            for i in 0..len_chunk {
+                let row_id = row_arr.value(i);
+                if let Some(&out_idx) = row_index.get(&row_id) {
+                    found[out_idx] = true;
+                    let value = if value_arr.is_null(i) {
+                        None
+                    } else {
+                        Some(value_arr.value(i))
+                    };
+                    values[out_idx] = value;
+                }
+            }
+        }
+
+        if found.iter().any(|f| !*f) {
+            return Err(Error::Internal(
+                "gather_rows_multi: one or more requested row IDs were not found".into(),
+            ));
+        }
+
+        let array = PrimitiveArray::<T>::from_iter(values.into_iter());
+        Ok(Arc::new(array) as ArrayRef)
     }
 
     /// Collects the row ids whose values satisfy the provided predicate.
