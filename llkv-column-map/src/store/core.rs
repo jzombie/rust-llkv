@@ -9,7 +9,7 @@ use arrow::array::{
     Array, ArrayRef, BooleanArray, PrimitiveArray, UInt32Array, UInt64Array, new_empty_array,
 };
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
-use arrow::datatypes::{ArrowPrimitiveType, DataType};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
 use llkv_storage::{
@@ -79,11 +79,12 @@ where
 
     /// Gathers values for the specified `row_ids`, returned in the same order as provided.
     pub fn gather_rows(&self, field_id: LogicalFieldId, row_ids: &[u64]) -> Result<ArrayRef> {
-        let arrays = self.gather_rows_multi(&[field_id], row_ids, false)?;
-        arrays
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Internal("gather_rows_multi returned no arrays".into()))
+        let batch = self.gather_rows_multi(&[field_id], row_ids, false)?;
+        batch
+            .columns()
+            .first()
+            .map(Arc::clone)
+            .ok_or_else(|| Error::Internal("gather_rows_multi returned no columns".into()))
     }
 
     /// Gathers values for the specified `row_ids`, preserving nulls and optionally anchoring to
@@ -95,11 +96,12 @@ where
         anchor_row_id_field: Option<LogicalFieldId>,
     ) -> Result<ArrayRef> {
         let _ = anchor_row_id_field;
-        let arrays = self.gather_rows_multi(&[field_id], row_ids, true)?;
-        arrays
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Internal("gather_rows_multi returned no arrays".into()))
+        let batch = self.gather_rows_multi(&[field_id], row_ids, true)?;
+        batch
+            .columns()
+            .first()
+            .map(Arc::clone)
+            .ok_or_else(|| Error::Internal("gather_rows_multi returned no columns".into()))
     }
 
     /// Prototype: gathers multiple primitive columns for the given `row_ids` in a single
@@ -111,22 +113,27 @@ where
         field_ids: &[LogicalFieldId],
         row_ids: &[u64],
         include_nulls: bool,
-    ) -> Result<Vec<ArrayRef>> {
+    ) -> Result<RecordBatch> {
         if field_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
         }
 
-        let mut dtypes = Vec::with_capacity(field_ids.len());
+        let mut field_infos = Vec::with_capacity(field_ids.len());
         for &fid in field_ids {
-            dtypes.push(self.data_type(fid)?);
+            field_infos.push((fid, self.data_type(fid)?));
         }
 
         if row_ids.is_empty() {
-            let mut outputs = Vec::with_capacity(field_ids.len());
-            for dt in dtypes {
-                outputs.push(new_empty_array(&dt));
+            let mut arrays = Vec::with_capacity(field_infos.len());
+            let mut fields = Vec::with_capacity(field_infos.len());
+            for (fid, dtype) in &field_infos {
+                arrays.push(new_empty_array(dtype));
+                let field_name = format!("field_{}", u64::from(*fid));
+                fields.push(Field::new(field_name, dtype.clone(), true));
             }
-            return Ok(outputs);
+            let schema = Arc::new(Schema::new(fields));
+            return RecordBatch::try_new(schema, arrays)
+                .map_err(|e| Error::Internal(format!("gather_rows_multi empty batch: {e}")));
         }
 
         let mut row_index: FxHashMap<u64, usize> = FxHashMap::default();
@@ -151,15 +158,15 @@ where
             candidate_indices: Vec<usize>,
         }
 
-        let mut plans = Vec::with_capacity(field_ids.len());
+        let mut plans = Vec::with_capacity(field_infos.len());
         {
             let catalog = self.catalog.read().unwrap();
-            for (idx, &fid) in field_ids.iter().enumerate() {
-                let value_pk = *catalog.map.get(&fid).ok_or(Error::NotFound)?;
-                let row_fid = rowid_fid(fid);
+            for (fid, dtype) in &field_infos {
+                let value_pk = *catalog.map.get(fid).ok_or(Error::NotFound)?;
+                let row_fid = rowid_fid(*fid);
                 let row_pk = *catalog.map.get(&row_fid).ok_or(Error::NotFound)?;
                 plans.push(FieldPlan {
-                    dtype: dtypes[idx].clone(),
+                    dtype: dtype.clone(),
                     value_pk,
                     row_pk,
                     value_metas: Vec::new(),
@@ -239,7 +246,8 @@ where
         }
 
         let mut outputs = Vec::with_capacity(plans.len());
-        for plan in plans {
+        let mut fields = Vec::with_capacity(plans.len());
+        for (idx, plan) in plans.into_iter().enumerate() {
             let array = crate::with_integer_arrow_type!(
                 plan.dtype.clone(),
                 |ArrowTy| {
@@ -258,10 +266,15 @@ where
                     plan.dtype
                 ))),
             )?;
+            let field_name = format!("field_{}", u64::from(field_infos[idx].0));
+            let nullable = include_nulls || array.null_count() > 0;
+            fields.push(Field::new(field_name, field_infos[idx].1.clone(), nullable));
             outputs.push(array);
         }
 
-        Ok(outputs)
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, outputs)
+            .map_err(|e| Error::Internal(format!("gather_rows_multi batch: {e}")))
     }
 
     fn collect_non_empty_metas(pager: &P, head_page_pk: PhysicalKey) -> Result<Vec<ChunkMetadata>> {
