@@ -103,13 +103,14 @@ where
     }
 
     /// Prototype: gathers multiple primitive columns for the given `row_ids` in a single
-    /// descriptor walk, reducing redundant pager fetches across columns. Currently mirrors the
-    /// semantics of `gather_rows` (no null anchoring) and returns arrays in the same order as
-    /// `field_ids`.
+    /// descriptor walk, reducing redundant pager fetches across columns. When `include_nulls`
+    /// is true, missing row ids are surfaced as nulls (rather than producing an error), mirroring
+    /// the semantics of `gather_rows_with_nulls` without requiring an explicit anchor.
     pub fn gather_rows_multi(
         &self,
         field_ids: &[LogicalFieldId],
         row_ids: &[u64],
+        include_nulls: bool,
     ) -> Result<Vec<ArrayRef>> {
         if field_ids.is_empty() {
             return Ok(Vec::new());
@@ -186,13 +187,13 @@ where
                 .remove(&plan.value_pk)
                 .ok_or(Error::NotFound)?;
             let value_desc = ColumnDescriptor::from_le_bytes(value_desc_blob.as_ref());
-            plan.value_metas = Self::collect_non_empty_metas(self.pager.as_ref(), value_desc.head_page_pk)?;
+            plan.value_metas =
+                Self::collect_non_empty_metas(self.pager.as_ref(), value_desc.head_page_pk)?;
 
-            let row_desc_blob = descriptor_map
-                .remove(&plan.row_pk)
-                .ok_or(Error::NotFound)?;
+            let row_desc_blob = descriptor_map.remove(&plan.row_pk).ok_or(Error::NotFound)?;
             let row_desc = ColumnDescriptor::from_le_bytes(row_desc_blob.as_ref());
-            plan.row_metas = Self::collect_non_empty_metas(self.pager.as_ref(), row_desc.head_page_pk)?;
+            plan.row_metas =
+                Self::collect_non_empty_metas(self.pager.as_ref(), row_desc.head_page_pk)?;
 
             if plan.value_metas.len() != plan.row_metas.len() {
                 return Err(Error::Internal(
@@ -249,6 +250,7 @@ where
                         &plan.value_metas,
                         &plan.row_metas,
                         &mut chunk_map,
+                        include_nulls,
                     )
                 },
                 Err(Error::Internal(format!(
@@ -377,6 +379,7 @@ where
         value_metas: &[ChunkMetadata],
         row_metas: &[ChunkMetadata],
         chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
+        allow_missing: bool,
     ) -> Result<ArrayRef>
     where
         T: ArrowPrimitiveType,
@@ -418,10 +421,18 @@ where
             }
         }
 
-        if found.iter().any(|f| !*f) {
+        if !allow_missing && found.iter().any(|f| !*f) {
             return Err(Error::Internal(
                 "gather_rows_multi: one or more requested row IDs were not found".into(),
             ));
+        }
+
+        if allow_missing {
+            for (idx, was_found) in found.iter().enumerate() {
+                if !*was_found {
+                    values[idx] = None;
+                }
+            }
         }
 
         let array = PrimitiveArray::<T>::from_iter(values.into_iter());

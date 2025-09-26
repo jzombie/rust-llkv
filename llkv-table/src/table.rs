@@ -16,10 +16,12 @@ use llkv_column_map::{
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
-
 use crate::sys_catalog::{CATALOG_TID, ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
-use llkv_expr::{literal::FromLiteral, {Filter, LiteralCastError, Operator, bound_to_native, literal_to_native}};
+use llkv_expr::{
+    literal::FromLiteral,
+    {Filter, LiteralCastError, Operator, bound_to_native, literal_to_native},
+};
 
 // TODO: Extract to constants
 /// Default max rows per streamed batch. Tune as needed.
