@@ -9,9 +9,9 @@ use llkv_column_map::store::ColumnStore;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_result::Result;
 use llkv_storage::pager::MemPager;
+use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
 
 fn logical_fid(id: u32) -> LogicalFieldId {
     LogicalFieldId::new()
@@ -189,8 +189,15 @@ fn gather_rows_multi_shuffled_with_nulls_preserves_alignment() -> Result<()> {
 
     let fid_sparse = logical_fid(21);
     let schema_sparse = schema_for_nullable_field(fid_sparse, "sparse_shuffle", DataType::Int32);
-    let sparse_present_rids: Vec<u64> = all_rids.iter().copied().filter(|rid| rid % 4 != 2).collect();
-    let sparse_values: Vec<i32> = sparse_present_rids.iter().map(|rid| (*rid as i32) * -3).collect();
+    let sparse_present_rids: Vec<u64> = all_rids
+        .iter()
+        .copied()
+        .filter(|rid| rid % 4 != 2)
+        .collect();
+    let sparse_values: Vec<i32> = sparse_present_rids
+        .iter()
+        .map(|rid| (*rid as i32) * -3)
+        .collect();
     let sparse_rid_arr: ArrayRef = Arc::new(UInt64Array::from(sparse_present_rids.clone()));
     let sparse_val_arr: ArrayRef = Arc::new(Int32Array::from(sparse_values.clone()));
     let sparse_batch = RecordBatch::try_new(schema_sparse, vec![sparse_rid_arr, sparse_val_arr])?;

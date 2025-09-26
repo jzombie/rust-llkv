@@ -66,8 +66,8 @@ where
                 .map_err(|e| Error::Internal(format!("gather_rows_multi empty batch: {e}")));
         }
 
-        let mut row_index: FxHashMap<u64, usize> = FxHashMap::default();
-        row_index.reserve(row_ids.len());
+        let mut row_index: FxHashMap<u64, usize> =
+            FxHashMap::with_capacity_and_hasher(row_ids.len(), Default::default());
         for (idx, &row_id) in row_ids.iter().enumerate() {
             if row_index.insert(row_id, idx).is_some() {
                 return Err(Error::Internal(
@@ -165,7 +165,8 @@ where
             chunk_requests.push(BatchGet::Raw { key });
         }
 
-        let mut chunk_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
+        let mut chunk_map: FxHashMap<PhysicalKey, EntryHandle> =
+            FxHashMap::with_capacity_and_hasher(chunk_requests.len(), Default::default());
         if !chunk_requests.is_empty() {
             let chunk_results = self.pager.batch_get(&chunk_requests)?;
             for result in chunk_results {
@@ -255,8 +256,10 @@ where
     where
         T: ArrowPrimitiveType,
     {
-        let mut values: Vec<Option<T::Native>> = vec![None; len];
-        let mut found: Vec<bool> = vec![false; len];
+    let mut values: Vec<Option<T::Native>> = Vec::with_capacity(len);
+    values.resize(len, None);
+    let mut found: Vec<bool> = Vec::with_capacity(len);
+    found.resize(len, false);
 
         for &idx in candidate_indices {
             let value_chunk = chunk_blobs
