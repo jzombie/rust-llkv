@@ -79,10 +79,15 @@ where
     }
 
     /// Gathers values for the specified `row_ids`, returned in the same order as provided.
+    ///
+    /// This operates on any primitive Arrow column (integer or float) and streams chunks via the
+    /// regular scan machinery so it does not materialize the full column up front.
     pub fn gather_rows(&self, field_id: LogicalFieldId, row_ids: &[u64]) -> Result<ArrayRef> {
         self.gather_rows_internal(field_id, row_ids, /* include_nulls */ false, None)
     }
 
+    /// Gathers values for the specified `row_ids`, preserving nulls and optionally anchoring to
+    /// another field's row-id column for nullable projections.
     pub fn gather_rows_with_nulls(
         &self,
         field_id: LogicalFieldId,
@@ -161,6 +166,8 @@ where
             opts.anchor_row_id_field =
                 Some(anchor_row_id_field.unwrap_or_else(|| rowid_fid(field_id)));
         }
+        // The scan builder drives the visitor chunk-by-chunk so `gather_rows` only touches the
+        // subsets referenced by `row_ids`; output assembly happens incrementally inside the visitor.
         ScanBuilder::new(self, field_id)
             .options(opts)
             .run(&mut visitor)?;
@@ -1611,6 +1618,7 @@ where
     }
 }
 
+/// Visitor that records only the requested row IDs as chunks stream through the scan pipeline.
 struct GatherVisitor<'a, T: ArrowPrimitiveType> {
     row_index: &'a FxHashMap<u64, usize>,
     values: Vec<Option<T::Native>>,
