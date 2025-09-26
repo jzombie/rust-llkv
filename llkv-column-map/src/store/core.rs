@@ -3,7 +3,7 @@ use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
 };
-use crate::store::scan::{FilterPrimitive, ScanOptions};
+use crate::store::scan::{FilterPrimitive, ScanBuilder, ScanOptions};
 use crate::types::LogicalFieldId;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
