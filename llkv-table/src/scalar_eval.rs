@@ -105,11 +105,91 @@ impl NumericKernels {
         len: usize,
         arrays: &NumericArrayMap,
     ) -> LlkvResult<ArrayRef> {
+        if let Some(array) = Self::try_evaluate_vectorized(expr, len, arrays)? {
+            return Ok(array);
+        }
+
         let mut values: Vec<Option<f64>> = Vec::with_capacity(len);
         for idx in 0..len {
             values.push(Self::evaluate_value(expr, idx, arrays)?);
         }
         Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+    }
+
+    fn try_evaluate_vectorized(
+        expr: &ScalarExpr<FieldId>,
+        len: usize,
+        arrays: &NumericArrayMap,
+    ) -> LlkvResult<Option<ArrayRef>> {
+        match expr {
+            ScalarExpr::Column(fid) => {
+                let arr = arrays
+                    .get(fid)
+                    .ok_or_else(|| Error::Internal(format!("missing column for field {fid}")))?;
+                Ok(Some(Arc::clone(arr) as ArrayRef))
+            }
+            ScalarExpr::Literal(lit) => match lit {
+                llkv_expr::literal::Literal::Float(f) => {
+                    let array = Float64Array::from(vec![Some(*f); len]);
+                    Ok(Some(Arc::new(array) as ArrayRef))
+                }
+                llkv_expr::literal::Literal::Integer(i) => {
+                    let array = Float64Array::from(vec![Some(*i as f64); len]);
+                    Ok(Some(Arc::new(array) as ArrayRef))
+                }
+                llkv_expr::literal::Literal::String(_) => Ok(None),
+            },
+            ScalarExpr::Binary { left, op, right } => {
+                if *op == BinaryOp::Add {
+                    if Self::literal_is_zero(left) {
+                        return Self::try_evaluate_vectorized(right, len, arrays);
+                    }
+                    if Self::literal_is_zero(right) {
+                        return Self::try_evaluate_vectorized(left, len, arrays);
+                    }
+                }
+
+                Ok(None)
+            }
+        }
+    }
+
+    #[inline]
+    fn literal_is_zero(expr: &ScalarExpr<FieldId>) -> bool {
+        matches!(Self::literal_numeric_value(expr), Some(v) if v == 0.0)
+    }
+
+    /// Returns the column referenced by an expression when it's a direct or additive identity passthrough.
+    pub fn passthrough_column(expr: &ScalarExpr<FieldId>) -> Option<FieldId> {
+        match expr {
+            ScalarExpr::Column(fid) => Some(*fid),
+            ScalarExpr::Binary {
+                left,
+                op: BinaryOp::Add,
+                right,
+            } => {
+                if Self::literal_is_zero(left) {
+                    Self::passthrough_column(right)
+                } else if Self::literal_is_zero(right) {
+                    Self::passthrough_column(left)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn literal_numeric_value(expr: &ScalarExpr<FieldId>) -> Option<f64> {
+        if let ScalarExpr::Literal(lit) = expr {
+            match lit {
+                llkv_expr::literal::Literal::Float(f) => Some(*f),
+                llkv_expr::literal::Literal::Integer(i) => Some(*i as f64),
+                llkv_expr::literal::Literal::String(_) => None,
+            }
+        } else {
+            None
+        }
     }
 
     /// Apply an arithmetic kernel. Returns `None` when the computation results in a null (e.g. divide by zero).
@@ -127,19 +207,20 @@ impl NumericKernels {
                     }
                 }
             },
-            _ => None,
+            (Some(_), None) | (None, Some(_)) => None,
+            (None, None) => None,
         }
     }
 
-    /// Apply a comparison kernel.
-    pub fn compare(op: CompareOp, left: f64, right: f64) -> bool {
+    /// Compare two numeric values using the provided operator.
+    pub fn compare(op: CompareOp, lhs: f64, rhs: f64) -> bool {
         match op {
-            CompareOp::Eq => left == right,
-            CompareOp::NotEq => left != right,
-            CompareOp::Lt => left < right,
-            CompareOp::LtEq => left <= right,
-            CompareOp::Gt => left > right,
-            CompareOp::GtEq => left >= right,
+            CompareOp::Eq => lhs == rhs,
+            CompareOp::NotEq => lhs != rhs,
+            CompareOp::Lt => lhs < rhs,
+            CompareOp::LtEq => lhs <= rhs,
+            CompareOp::Gt => lhs > rhs,
+            CompareOp::GtEq => lhs >= rhs,
         }
     }
 }
