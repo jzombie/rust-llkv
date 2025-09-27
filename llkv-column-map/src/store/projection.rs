@@ -13,7 +13,7 @@ use llkv_storage::{
     serialization::deserialize_array,
     types::PhysicalKey,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -75,6 +75,7 @@ pub struct MultiGatherContext {
     chunk_cache: FxHashMap<PhysicalKey, ArrayRef>,
     row_index: FxHashMap<u64, usize>,
     row_scratch: Vec<Option<(usize, usize)>>,
+    chunk_keys: Vec<PhysicalKey>,
 }
 
 impl MultiGatherContext {
@@ -83,6 +84,7 @@ impl MultiGatherContext {
             chunk_cache: FxHashMap::default(),
             row_index: FxHashMap::default(),
             row_scratch: Vec::new(),
+            chunk_keys: Vec::new(),
             field_infos,
             plans,
         }
@@ -111,6 +113,19 @@ impl MultiGatherContext {
     #[inline]
     fn chunk_cache_mut(&mut self) -> &mut FxHashMap<PhysicalKey, ArrayRef> {
         &mut self.chunk_cache
+    }
+
+    #[inline]
+    fn plans_mut(&mut self) -> &mut [FieldPlan] {
+        &mut self.plans
+    }
+
+    fn take_chunk_keys(&mut self) -> Vec<PhysicalKey> {
+        std::mem::take(&mut self.chunk_keys)
+    }
+
+    fn store_chunk_keys(&mut self, keys: Vec<PhysicalKey>) {
+        self.chunk_keys = keys;
     }
 
     fn take_row_index(&mut self) -> FxHashMap<u64, usize> {
@@ -176,6 +191,7 @@ struct FieldPlan {
     dtype: DataType,
     value_metas: Vec<ChunkMetadata>,
     row_metas: Vec<ChunkMetadata>,
+    candidate_indices: Vec<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -327,6 +343,7 @@ where
                 dtype: dtype.clone(),
                 value_metas,
                 row_metas,
+                candidate_indices: Vec::new(),
             });
         }
 
@@ -358,6 +375,9 @@ where
 
         let mut row_index = ctx.take_row_index();
         let mut row_scratch = ctx.take_row_scratch();
+
+        let field_infos = ctx.field_infos().to_vec();
+        let mut chunk_keys = ctx.take_chunk_keys();
 
         let result: Result<RecordBatch> = (|| {
             let len = row_ids.len();
@@ -405,58 +425,52 @@ where
                 RowLocator::Sparse { index: &row_index }
             };
 
-            let field_infos = ctx.field_infos().to_vec();
-            let plans = ctx.plans().to_vec();
+            chunk_keys.clear();
 
-            let mut candidate_per_plan: Vec<Vec<usize>> = Vec::with_capacity(plans.len());
-            let mut chunk_keys: FxHashSet<PhysicalKey> = FxHashSet::default();
-            for plan in &plans {
-                let mut candidates = Vec::new();
-                for (idx, meta) in plan.row_metas.iter().enumerate() {
-                    if Self::chunk_intersects(sorted_row_ids, meta) {
-                        candidates.push(idx);
-                        chunk_keys.insert(plan.value_metas[idx].chunk_pk);
-                        chunk_keys.insert(plan.row_metas[idx].chunk_pk);
-                    }
-                }
-                candidate_per_plan.push(candidates);
-            }
-
-            let mut chunk_arrays: FxHashMap<PhysicalKey, ArrayRef> =
-                FxHashMap::with_capacity_and_hasher(chunk_keys.len(), Default::default());
             {
-                let cache = ctx.chunk_cache();
-                for key in chunk_keys.iter() {
-                    if let Some(arr) = cache.get(key) {
-                        chunk_arrays.insert(*key, Arc::clone(arr));
+                let plans_mut = ctx.plans_mut();
+                for plan in plans_mut.iter_mut() {
+                    plan.candidate_indices.clear();
+                    for (idx, meta) in plan.row_metas.iter().enumerate() {
+                        if Self::chunk_intersects(sorted_row_ids, meta) {
+                            plan.candidate_indices.push(idx);
+                            chunk_keys.push(plan.value_metas[idx].chunk_pk);
+                            chunk_keys.push(plan.row_metas[idx].chunk_pk);
+                        }
                     }
                 }
             }
 
-            let missing: Vec<PhysicalKey> = chunk_keys
-                .into_iter()
-                .filter(|k| !chunk_arrays.contains_key(k))
-                .collect();
-            if !missing.is_empty() {
-                let requests: Vec<BatchGet> = missing
-                    .iter()
-                    .map(|key| BatchGet::Raw { key: *key })
-                    .collect();
-                let chunk_results = self.pager.batch_get(&requests)?;
-                for result in chunk_results {
-                    if let GetResult::Raw { key, bytes } = result {
-                        let array = deserialize_array(bytes)?;
-                        ctx.chunk_cache_mut().insert(key, Arc::clone(&array));
-                        chunk_arrays.insert(key, array);
+            chunk_keys.sort_unstable();
+            chunk_keys.dedup();
+
+            {
+                let mut pending: Vec<BatchGet> = Vec::new();
+                {
+                    let cache = ctx.chunk_cache();
+                    for &key in &chunk_keys {
+                        if !cache.contains_key(&key) {
+                            pending.push(BatchGet::Raw { key });
+                        }
+                    }
+                }
+
+                if !pending.is_empty() {
+                    let chunk_results = self.pager.batch_get(&pending)?;
+                    let cache = ctx.chunk_cache_mut();
+                    for result in chunk_results {
+                        if let GetResult::Raw { key, bytes } = result {
+                            let array = deserialize_array(bytes)?;
+                            cache.insert(key, Arc::clone(&array));
+                        }
                     }
                 }
             }
 
             let allow_missing = policy.allow_missing();
 
-            let mut outputs = Vec::with_capacity(plans.len());
-            for (plan_idx, plan) in plans.iter().enumerate() {
-                let candidates = &candidate_per_plan[plan_idx];
+            let mut outputs = Vec::with_capacity(ctx.plans().len());
+            for plan in ctx.plans() {
                 let array = crate::with_integer_arrow_type!(
                     plan.dtype.clone(),
                     |ArrowTy| {
@@ -464,9 +478,9 @@ where
                             row_ids,
                             row_locator,
                             len,
-                            candidates,
+                            &plan.candidate_indices,
                             plan,
-                            &chunk_arrays,
+                            ctx.chunk_cache(),
                             &mut row_scratch,
                             allow_missing,
                         )
@@ -503,6 +517,7 @@ where
 
         ctx.store_row_scratch(row_scratch);
         ctx.store_row_index(row_index);
+        ctx.store_chunk_keys(chunk_keys);
 
         result
     }
