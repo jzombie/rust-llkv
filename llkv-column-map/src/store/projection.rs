@@ -25,6 +25,40 @@ pub enum GatherNullPolicy {
     DropNulls,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Projection {
+    pub logical_field_id: LogicalFieldId,
+    pub alias: Option<String>,
+}
+
+impl Projection {
+    pub fn new(logical_field_id: LogicalFieldId) -> Self {
+        Self {
+            logical_field_id,
+            alias: None,
+        }
+    }
+
+    pub fn with_alias<S: Into<String>>(logical_field_id: LogicalFieldId, alias: S) -> Self {
+        Self {
+            logical_field_id,
+            alias: Some(alias.into()),
+        }
+    }
+}
+
+impl From<LogicalFieldId> for Projection {
+    fn from(logical_field_id: LogicalFieldId) -> Self {
+        Projection::new(logical_field_id)
+    }
+}
+
+impl<S: Into<String>> From<(LogicalFieldId, S)> for Projection {
+    fn from(value: (LogicalFieldId, S)) -> Self {
+        Projection::with_alias(value.0, value.1)
+    }
+}
+
 impl GatherNullPolicy {
     #[inline]
     fn allow_missing(self) -> bool {

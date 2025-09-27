@@ -7,7 +7,7 @@ use crate::types::TableId;
 use arrow::array::{Array, ArrayRef, Int32Array, RecordBatch, UInt64Array};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
-use llkv_column_map::store::{FilterPrimitive, GatherNullPolicy, ROW_ID_COLUMN_NAME};
+use llkv_column_map::store::{FilterPrimitive, GatherNullPolicy, Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{
     ColumnStore, scan,
     types::{LogicalFieldId, Namespace},
@@ -60,40 +60,6 @@ pub struct ScanStreamOptions {
     /// the table scan column-oriented while delegating row-level
     /// filtering to the column-map layer.
     pub include_nulls: bool,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Projection {
-    pub field_id: FieldId,
-    pub alias: Option<String>,
-}
-
-impl Projection {
-    pub fn new(field_id: FieldId) -> Self {
-        Self {
-            field_id,
-            alias: None,
-        }
-    }
-
-    pub fn with_alias<S: Into<String>>(field_id: FieldId, alias: S) -> Self {
-        Self {
-            field_id,
-            alias: Some(alias.into()),
-        }
-    }
-}
-
-impl From<FieldId> for Projection {
-    fn from(field_id: FieldId) -> Self {
-        Projection::new(field_id)
-    }
-}
-
-impl<S: Into<String>> From<(FieldId, S)> for Projection {
-    fn from(value: (FieldId, S)) -> Self {
-        Projection::with_alias(value.0, value.1)
-    }
 }
 
 impl<P> Table<P>
@@ -178,7 +144,20 @@ where
         unique_index.reserve(projections.len());
         let mut unique_lfids: Vec<LogicalFieldId> = Vec::with_capacity(projections.len());
         for proj in projections {
-            let lfid = lfid_for(self.table_id, proj.field_id);
+            let lfid = proj.logical_field_id;
+            if lfid.table_id() != self.table_id {
+                return Err(Error::InvalidArgumentError(format!(
+                    "Projection targets table {} but scan_stream is on table {}",
+                    lfid.table_id(),
+                    self.table_id
+                )));
+            }
+            if lfid.namespace() != Namespace::UserData {
+                return Err(Error::InvalidArgumentError(format!(
+                    "Projection {:?} must target user data namespace",
+                    lfid
+                )));
+            }
             let dtype = self.store.data_type(lfid)?;
             proj_infos.push((proj.clone(), lfid, dtype));
             if !unique_index.contains_key(&lfid) {
@@ -211,7 +190,7 @@ where
                 let name = proj
                     .alias
                     .clone()
-                    .unwrap_or_else(|| proj.field_id.to_string());
+                    .unwrap_or_else(|| proj.logical_field_id.field_id().to_string());
                 Field::new(name, dtype.clone(), true)
             })
             .collect();
@@ -431,6 +410,14 @@ mod tests {
         table
     }
 
+    fn proj(table: &Table, field_id: FieldId) -> Projection {
+        Projection::from(lfid_for(table.table_id, field_id))
+    }
+
+    fn proj_alias<S: Into<String>>(table: &Table, field_id: FieldId, alias: S) -> Projection {
+        Projection::with_alias(lfid_for(table.table_id, field_id), alias)
+    }
+
     #[test]
     fn table_new_rejects_reserved_table_id() {
         let result = Table::new(CATALOG_TID, Arc::new(MemPager::default()));
@@ -454,7 +441,7 @@ mod tests {
         let mut vals: Vec<Option<i32>> = Vec::new();
         table
             .scan_stream(
-                &[Projection::from(COL_C_I32)],
+                &[proj(&table, COL_C_I32)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -654,7 +641,7 @@ mod tests {
         let mut vals: Vec<Option<u64>> = Vec::new();
         table
             .scan_stream(
-                &[Projection::from(COL_A_U64)],
+                &[proj(&table, COL_A_U64)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -682,7 +669,7 @@ mod tests {
         let mut vals: Vec<Option<u64>> = Vec::new();
         table
             .scan_stream(
-                &[Projection::from(COL_A_U64)],
+                &[proj(&table, COL_A_U64)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -713,7 +700,7 @@ mod tests {
         let mut vals: Vec<Option<i32>> = Vec::new();
         table
             .scan_stream(
-                &[Projection::from(COL_C_I32)],
+                &[proj(&table, COL_C_I32)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -746,7 +733,7 @@ mod tests {
         let mut total: u128 = 0;
         table
             .scan_stream(
-                &[Projection::from(COL_A_U64)],
+                &[proj(&table, COL_A_U64)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -780,7 +767,7 @@ mod tests {
         let mut total: i64 = 0;
         table
             .scan_stream(
-                &[Projection::from(COL_C_I32)],
+                &[proj(&table, COL_C_I32)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -814,7 +801,7 @@ mod tests {
         let mut mx: Option<i32> = None;
         table
             .scan_stream(
-                &[Projection::from(COL_C_I32)],
+                &[proj(&table, COL_C_I32)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -846,7 +833,7 @@ mod tests {
         let mut got = Vec::new();
         table
             .scan_stream(
-                &[Projection::from(COL_D_F64)],
+                &[proj(&table, COL_D_F64)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -877,7 +864,7 @@ mod tests {
         let mut vals: Vec<Option<f32>> = Vec::new();
         table
             .scan_stream(
-                &[Projection::from(COL_E_F32)],
+                &[proj(&table, COL_E_F32)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -956,7 +943,7 @@ mod tests {
         let mut default_vals: Vec<Option<i32>> = Vec::new();
         table
             .scan_stream(
-                &[Projection::from(COL_C_I32)],
+                &[proj(&table, COL_C_I32)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -976,7 +963,7 @@ mod tests {
         let mut include_null_vals: Vec<Option<i32>> = Vec::new();
         table
             .scan_stream(
-                &[Projection::from(COL_C_I32)],
+                &[proj(&table, COL_C_I32)],
                 &filter,
                 ScanStreamOptions {
                     include_nulls: true,
@@ -987,7 +974,7 @@ mod tests {
                     let mut paired_vals: Vec<(Option<i32>, Option<f64>)> = Vec::new();
                     table
                         .scan_stream(
-                            &[Projection::from(COL_C_I32), Projection::from(COL_D_F64)],
+                            &[proj(&table, COL_C_I32), proj(&table, COL_D_F64)],
                             &filter,
                             ScanStreamOptions::default(),
                             |b| {
@@ -1045,7 +1032,7 @@ mod tests {
         let mut got: Vec<f64> = Vec::new();
         table
             .scan_stream(
-                &[Projection::from(COL_A_U64)],
+                &[proj(&table, COL_A_U64)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -1137,7 +1124,7 @@ mod tests {
         let mut d_sum: u128 = 0;
         table
             .scan_stream(
-                &[Projection::from(COL_D_U32)],
+                &[proj(&table, COL_D_U32)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -1154,7 +1141,7 @@ mod tests {
         let mut e_min: Option<i16> = None;
         table
             .scan_stream(
-                &[Projection::from(COL_E_I16)],
+                &[proj(&table, COL_E_I16)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -1171,7 +1158,7 @@ mod tests {
         let mut f_max: Option<u8> = None;
         table
             .scan_stream(
-                &[Projection::from(COL_F_U8)],
+                &[proj(&table, COL_F_U8)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -1192,7 +1179,7 @@ mod tests {
         let mut got: Vec<f64> = Vec::new();
         table
             .scan_stream(
-                &[Projection::from(COL_A_U64)],
+                &[proj(&table, COL_A_U64)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -1232,7 +1219,7 @@ mod tests {
         let mut vals: Vec<Option<u64>> = Vec::new();
         table
             .scan_stream(
-                &[Projection::from(COL_A_U64)],
+                &[proj(&table, COL_A_U64)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -1261,7 +1248,7 @@ mod tests {
         let mut seen_cols = Vec::<u64>::new();
         table
             .scan_stream(
-                &[Projection::from(COL_A_U64)],
+                &[proj(&table, COL_A_U64)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -1297,7 +1284,7 @@ mod tests {
         let mut combined: Vec<(Option<u64>, Option<i32>)> = Vec::new();
         table
             .scan_stream(
-                &[Projection::from(COL_A_U64), Projection::from(COL_C_I32)],
+                &[proj(&table, COL_A_U64), proj(&table, COL_C_I32)],
                 &filter,
                 ScanStreamOptions::default(),
                 |b| {
@@ -1339,8 +1326,8 @@ mod tests {
         // order. Verify the call succeeds and produces two identical
         // columns per batch.
         let duplicate = [
-            Projection::from(COL_A_U64),
-            Projection::with_alias(COL_A_U64, "alias_a"),
+            proj(&table, COL_A_U64),
+            proj_alias(&table, COL_A_U64, "alias_a"),
         ];
         let mut collected = Vec::<u64>::new();
         table
