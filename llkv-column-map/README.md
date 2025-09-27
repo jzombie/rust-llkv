@@ -13,6 +13,7 @@ Prototype B+Tree replacement with batch-only pager I/O for the [LLKV](https://gi
 - Logical key and value segment pruning.
 - Scanning iterator which can iterate over key or value without maintaining a separate reverse index.
 - Supports scanning iterator pagination.
+- Configurable gather null-handling policies (preserve, error, or drop missing/null rows) for column-oriented consumers.
 - `Graphviz` (`.dot`) visualization generation (see [examples/visualize.rs](examples/visualize.rs)) for illustrative purposes and debugging.
 
 ## Testing

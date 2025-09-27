@@ -1,0 +1,2 @@
+# Add all testing snapshots to git
+!tests/snapshots/*

@@ -1,4 +1,4 @@
-use crate::types::ColumnInput;
-use std::borrow::Cow;
+#![forbid(unsafe_code)]
 
-pub const EMPTY_COL: ColumnInput<'static> = Cow::Borrowed(&[]);
+/// Default max rows per streamed batch. Tune as needed.
+pub const STREAM_BATCH_ROWS: usize = 65_536;

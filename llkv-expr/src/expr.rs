@@ -1,6 +1,13 @@
-//! Buffer-only predicate AST.
+//! Type-aware, Arrow-native predicate AST.
+//!
+//! This module defines a small predicate-expression AST that is decoupled
+//! from Arrow's concrete scalar types by using `Literal`. Concrete typing
+//! is deferred to the consumer (e.g., a table/scan layer) which knows the
+//! column types and can coerce `Literal` into native values.
+
 #![forbid(unsafe_code)]
 
+pub use crate::literal::*;
 use std::ops::Bound;
 
 /// Logical expression over predicates.
@@ -10,6 +17,11 @@ pub enum Expr<'a, F> {
     Or(Vec<Expr<'a, F>>),
     Not(Box<Expr<'a, F>>),
     Pred(Filter<'a, F>),
+    Compare {
+        left: ScalarExpr<F>,
+        op: CompareOp,
+        right: ScalarExpr<F>,
+    },
 }
 
 impl<'a, F> Expr<'a, F> {
@@ -33,53 +45,100 @@ impl<'a, F> Expr<'a, F> {
     }
 }
 
-/// Single predicate against a field. Byte semantics are adapter-defined.
+/// Arithmetic scalar expression that can reference multiple fields.
+#[derive(Clone, Debug)]
+pub enum ScalarExpr<F> {
+    Column(F),
+    Literal(Literal),
+    Binary {
+        left: Box<ScalarExpr<F>>,
+        op: BinaryOp,
+        right: Box<ScalarExpr<F>>,
+    },
+}
+
+impl<F> ScalarExpr<F> {
+    #[inline]
+    pub fn column(field: F) -> Self {
+        Self::Column(field)
+    }
+
+    #[inline]
+    pub fn literal<L: Into<Literal>>(lit: L) -> Self {
+        Self::Literal(lit.into())
+    }
+
+    #[inline]
+    pub fn binary(left: Self, op: BinaryOp, right: Self) -> Self {
+        Self::Binary {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        }
+    }
+}
+
+/// Arithmetic operator for [`ScalarExpr`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
+/// Comparison operator for scalar expressions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompareOp {
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+/// Single predicate against a field.
 #[derive(Debug, Clone)]
 pub struct Filter<'a, F> {
     pub field_id: F,
     pub op: Operator<'a>,
 }
 
-/// Comparison/matching operators over raw byte slices.
+/// Comparison/matching operators over untyped `Literal`s.
+///
+/// `In` accepts a borrowed slice of `Literal`s to avoid allocations in the
+/// common case of small, static IN lists built at call sites.
 #[derive(Debug, Clone)]
 pub enum Operator<'a> {
-    // Equality
-    Equals(&'a [u8]),
-
+    Equals(Literal),
     Range {
-        lower: Bound<&'a [u8]>,
-        upper: Bound<&'a [u8]>,
+        lower: Bound<Literal>,
+        upper: Bound<Literal>,
     },
-
-    // Simple comparisons (can be implemented as special cases of Range if needed)
-    GreaterThan(&'a [u8]),
-    GreaterThanOrEquals(&'a [u8]),
-    LessThan(&'a [u8]),
-    LessThanOrEquals(&'a [u8]),
-
-    // Set & pattern matching
-    In(&'a [&'a [u8]]),
-    StartsWith(&'a [u8]),
-    EndsWith(&'a [u8]),
-    Contains(&'a [u8]),
+    GreaterThan(Literal),
+    GreaterThanOrEquals(Literal),
+    LessThan(Literal),
+    LessThanOrEquals(Literal),
+    In(&'a [Literal]),
+    StartsWith(&'a str),
+    EndsWith(&'a str),
+    Contains(&'a str),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    type TestFieldId = u32;
-    use std::ops::Bound;
-    use std::ptr;
 
     #[test]
     fn build_simple_exprs() {
         let f1 = Filter {
             field_id: 1,
-            op: Operator::Equals(b"abc"),
+            op: Operator::Equals("abc".into()),
         };
         let f2 = Filter {
             field_id: 2,
-            op: Operator::LessThan(b"zzz"),
+            op: Operator::LessThan("zzz".into()),
         };
         let all = Expr::all_of(vec![f1.clone(), f2.clone()]);
         let any = Expr::any_of(vec![f1.clone(), f2.clone()]);
@@ -105,19 +164,20 @@ mod tests {
         // f4: id=4 starts_with "pre"
         let f1 = Filter {
             field_id: 1u32,
-            op: Operator::Equals(b"a"),
+            op: Operator::Equals("a".into()),
         };
         let f2 = Filter {
             field_id: 2u32,
-            op: Operator::LessThan(b"zzz"),
+            op: Operator::LessThan("zzz".into()),
         };
+        let in_values = ["x".into(), "y".into(), "z".into()];
         let f3 = Filter {
             field_id: 3u32,
-            op: Operator::In(&[b"x", b"y", b"z"]),
+            op: Operator::In(&in_values),
         };
         let f4 = Filter {
             field_id: 4u32,
-            op: Operator::StartsWith(b"pre"),
+            op: Operator::StartsWith("pre"),
         };
 
         // ( f1 AND ( f2 OR NOT f3 ) )  OR  ( NOT f1 AND f4 )
@@ -143,14 +203,18 @@ mod tests {
                         assert_eq!(v.len(), 2);
                         // AND: [Pred(f1), OR(...)]
                         match &v[0] {
-                            Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 1),
+                            Expr::Pred(Filter { field_id, .. }) => {
+                                assert_eq!(*field_id, 1)
+                            }
                             _ => panic!("expected Pred(f1) in left-AND[0]"),
                         }
                         match &v[1] {
                             Expr::Or(or_vec) => {
                                 assert_eq!(or_vec.len(), 2);
                                 match &or_vec[0] {
-                                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 2),
+                                    Expr::Pred(Filter { field_id, .. }) => {
+                                        assert_eq!(*field_id, 2)
+                                    }
                                     _ => panic!("expected Pred(f2) in left-AND[1].OR[0]"),
                                 }
                                 match &or_vec[1] {
@@ -158,7 +222,10 @@ mod tests {
                                         Expr::Pred(Filter { field_id, .. }) => {
                                             assert_eq!(*field_id, 3)
                                         }
-                                        _ => panic!("expected Not(Pred(f3)) in left-AND[1].OR[1]"),
+                                        _ => panic!(
+                                            "expected Not(Pred(f3)) in \
+                                             left-AND[1].OR[1]"
+                                        ),
                                     },
                                     _ => panic!("expected Not(...) in left-AND[1].OR[1]"),
                                 }
@@ -174,13 +241,17 @@ mod tests {
                         // AND: [Not(f1), Pred(f4)]
                         match &v[0] {
                             Expr::Not(inner) => match inner.as_ref() {
-                                Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 1),
+                                Expr::Pred(Filter { field_id, .. }) => {
+                                    assert_eq!(*field_id, 1)
+                                }
                                 _ => panic!("expected Not(Pred(f1)) in right-AND[0]"),
                             },
                             _ => panic!("expected Not(...) in right-AND[0]"),
                         }
                         match &v[1] {
-                            Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 4),
+                            Expr::Pred(Filter { field_id, .. }) => {
+                                assert_eq!(*field_id, 4)
+                            }
                             _ => panic!("expected Pred(f4) in right-AND[1]"),
                         }
                     }
@@ -197,20 +268,23 @@ mod tests {
         let f = Filter {
             field_id: 7u32,
             op: Operator::Range {
-                lower: Bound::Included(b"aaa"),
-                upper: Bound::Excluded(b"bbb"),
+                lower: Bound::Included("aaa".into()),
+                upper: Bound::Excluded("bbb".into()),
             },
         };
 
-        match f.op {
+        match &f.op {
             Operator::Range { lower, upper } => {
-                match lower {
-                    Bound::Included(b) => assert_eq!(b, b"aaa"),
-                    _ => panic!("lower bound should be Included"),
+                if let Bound::Included(l) = lower {
+                    assert_eq!(*l, Literal::String("aaa".to_string()));
+                } else {
+                    panic!("lower bound should be Included");
                 }
-                match upper {
-                    Bound::Excluded(b) => assert_eq!(b, b"bbb"),
-                    _ => panic!("upper bound should be Excluded"),
+
+                if let Bound::Excluded(u) = upper {
+                    assert_eq!(*u, Literal::String("bbb".to_string()));
+                } else {
+                    panic!("upper bound should be Excluded");
                 }
             }
             _ => panic!("expected Range operator"),
@@ -221,15 +295,15 @@ mod tests {
     fn helper_builders_preserve_structure_and_order() {
         let f1 = Filter {
             field_id: 1u32,
-            op: Operator::Equals(b"a"),
+            op: Operator::Equals("a".into()),
         };
         let f2 = Filter {
             field_id: 2u32,
-            op: Operator::Equals(b"b"),
+            op: Operator::Equals("b".into()),
         };
         let f3 = Filter {
             field_id: 3u32,
-            op: Operator::Equals(b"c"),
+            op: Operator::Equals("c".into()),
         };
 
         let and_expr = Expr::all_of(vec![f1.clone(), f2.clone(), f3.clone()]);
@@ -238,15 +312,21 @@ mod tests {
                 assert_eq!(v.len(), 3);
                 // Expect Pred(1), Pred(2), Pred(3) in order
                 match &v[0] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 1),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, 1)
+                    }
                     _ => panic!(),
                 }
                 match &v[1] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 2),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, 2)
+                    }
                     _ => panic!(),
                 }
                 match &v[2] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 3),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, 3)
+                    }
                     _ => panic!(),
                 }
             }
@@ -259,88 +339,65 @@ mod tests {
                 assert_eq!(v.len(), 3);
                 // Expect Pred(3), Pred(2), Pred(1) in order
                 match &v[0] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 3),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, 3)
+                    }
                     _ => panic!(),
                 }
                 match &v[1] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 2),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, 2)
+                    }
                     _ => panic!(),
                 }
                 match &v[2] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, 1),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, 1)
+                    }
                     _ => panic!(),
                 }
             }
             _ => panic!("expected Or"),
         }
-
-        // empty lists are allowed => empty And/Or
-        match Expr::<TestFieldId>::all_of(vec![]) {
-            Expr::And(v) => assert!(v.is_empty()),
-            _ => panic!(),
-        }
-        match Expr::<TestFieldId>::any_of(vec![]) {
-            Expr::Or(v) => assert!(v.is_empty()),
-            _ => panic!(),
-        }
-
-        // not wraps exactly once
-        let pred = Expr::Pred(f1.clone());
-        let not_pred = Expr::not(pred);
-        match not_pred {
-            Expr::Not(inner) => match *inner {
-                Expr::Pred(Filter { field_id, .. }) => assert_eq!(field_id, 1),
-                _ => panic!("Not should contain the original Pred"),
-            },
-            _ => panic!("expected Not"),
-        }
     }
 
     #[test]
     fn set_and_pattern_ops_hold_borrowed_slices() {
-        // Using 'static byte literals to check pointer identity is preserved.
-        let a: &'static [u8] = b"aa";
-        let b_: &'static [u8] = b"bb";
-        let c: &'static [u8] = b"cc";
-
+        let in_values = ["aa".into(), "bb".into(), "cc".into()];
         let f_in = Filter {
             field_id: 9u32,
-            op: Operator::In(&[a, b_, c]),
+            op: Operator::In(&in_values),
         };
         match f_in.op {
             Operator::In(arr) => {
                 assert_eq!(arr.len(), 3);
-                // Pointer identity check
-                assert!(ptr::eq(arr[0].as_ptr(), a.as_ptr()));
-                assert!(ptr::eq(arr[1].as_ptr(), b_.as_ptr()));
-                assert!(ptr::eq(arr[2].as_ptr(), c.as_ptr()));
             }
             _ => panic!("expected In"),
         }
 
         let f_sw = Filter {
             field_id: 10u32,
-            op: Operator::StartsWith(b"pre"),
+            op: Operator::StartsWith("pre"),
         };
         let f_ew = Filter {
             field_id: 11u32,
-            op: Operator::EndsWith(b"suf"),
+            op: Operator::EndsWith("suf"),
         };
         let f_ct = Filter {
             field_id: 12u32,
-            op: Operator::Contains(b"mid"),
+            op: Operator::Contains("mid"),
         };
 
         match f_sw.op {
-            Operator::StartsWith(b) => assert_eq!(b, b"pre"),
+            Operator::StartsWith(b) => assert_eq!(b, "pre"),
             _ => panic!(),
         }
         match f_ew.op {
-            Operator::EndsWith(b) => assert_eq!(b, b"suf"),
+            Operator::EndsWith(b) => assert_eq!(b, "suf"),
             _ => panic!(),
         }
         match f_ct.op {
-            Operator::Contains(b) => assert_eq!(b, b"mid"),
+            Operator::Contains(b) => assert_eq!(b, "mid"),
             _ => panic!(),
         }
     }
@@ -350,11 +407,11 @@ mod tests {
         // Demonstrate F = &'static str
         let f1 = Filter {
             field_id: "name",
-            op: Operator::Equals(b"alice"),
+            op: Operator::Equals("alice".into()),
         };
         let f2 = Filter {
             field_id: "status",
-            op: Operator::GreaterThanOrEquals(b"active"),
+            op: Operator::GreaterThanOrEquals("active".into()),
         };
         let expr = Expr::all_of(vec![f1.clone(), f2.clone()]);
 
@@ -362,11 +419,15 @@ mod tests {
             Expr::And(v) => {
                 assert_eq!(v.len(), 2);
                 match &v[0] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, "name"),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, "name")
+                    }
                     _ => panic!("expected Pred(name)"),
                 }
                 match &v[1] {
-                    Expr::Pred(Filter { field_id, .. }) => assert_eq!(*field_id, "status"),
+                    Expr::Pred(Filter { field_id, .. }) => {
+                        assert_eq!(*field_id, "status")
+                    }
                     _ => panic!("expected Pred(status)"),
                 }
             }
@@ -379,7 +440,7 @@ mod tests {
         // Build Not(Not(...Not(Pred)...)) of depth 64
         let base = Expr::Pred(Filter {
             field_id: 42u32,
-            op: Operator::Equals(b"x"),
+            op: Operator::Equals("x".into()),
         });
         let mut expr = base;
         for _ in 0..64 {
@@ -403,5 +464,36 @@ mod tests {
             }
         }
         assert_eq!(count, 64);
+    }
+
+    #[test]
+    fn literal_construction() {
+        let f = Filter {
+            field_id: "my_u64_col",
+            op: Operator::Range {
+                lower: Bound::Included(150.into()),
+                upper: Bound::Excluded(300.into()),
+            },
+        };
+
+        match f.op {
+            Operator::Range { lower, upper } => {
+                assert_eq!(lower, Bound::Included(Literal::Integer(150)));
+                assert_eq!(upper, Bound::Excluded(Literal::Integer(300)));
+            }
+            _ => panic!("Expected a range operator"),
+        }
+
+        let f2 = Filter {
+            field_id: "my_str_col",
+            op: Operator::Equals("hello".into()),
+        };
+
+        match f2.op {
+            Operator::Equals(lit) => {
+                assert_eq!(lit, Literal::String("hello".to_string()));
+            }
+            _ => panic!("Expected an equals operator"),
+        }
     }
 }

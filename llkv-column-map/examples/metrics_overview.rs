@@ -9,100 +9,127 @@
 //! or, when counts differ across columns:
 //!   data: 2 columns; cells per column = {100:3, 999:10} (total=13)
 //!
-//! “cells” = number of (key,value) entries written, i.e., len(items) per column.
+//! “cells” = number of (key,value) entries written, i.e., len(items) per
+//! column.
 
 use llkv_column_map::{
-    ColumnStore,
-    codecs::big_endian::u64_be_vec,
-    storage::pager::MemPager,
-    types::{AppendOptions, BlobLike, LogicalFieldId, Put, ValueMode},
-    views::ValueSlice,
+    ColumnStore, ROW_ID_COLUMN_NAME, debug::ColumnStoreDebug, types::LogicalFieldId,
 };
+use llkv_storage::pager::{InstrumentedPager, IoStats, MemPager};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // -------- simple key/value generators ---------------------------------------
 
-fn fixed_value(row: u64, field: u32, width: usize) -> Vec<u8> {
-    // Stable 8-byte seed then repeat/truncate to requested width
-    let seed = (row ^ field as u64).to_le_bytes();
-    if width <= 8 {
-        seed[..width].to_vec()
-    } else {
-        let mut out = Vec::with_capacity(width);
-        while out.len() < width {
-            let take = core::cmp::min(8, width - out.len());
-            out.extend_from_slice(&seed[..take]);
-        }
-        out
-    }
+use arrow::array::{ArrayRef, BinaryBuilder, UInt64Array};
+use arrow::datatypes::{Field, Schema};
+use arrow::record_batch::RecordBatch;
+
+/// Build a fixed-width u64 column [0..rows) for `field_id`.
+fn build_fixed_u64(field_id: LogicalFieldId, rows: usize) -> (LogicalFieldId, ArrayRef) {
+    let vals: Vec<u64> = (0..rows as u64).collect();
+    (field_id, Arc::new(UInt64Array::from(vals)) as ArrayRef)
 }
 
-fn build_put_fixed(field_id: LogicalFieldId, start: u64, end: u64, width: usize) -> Put<'static> {
-    let mut items = Vec::with_capacity((end - start) as usize);
-    for r in start..end {
-        items.push((u64_be_vec(r).into(), fixed_value(r, field_id, width).into()));
-    }
-    Put { field_id, items }
-}
-
-fn build_put_var(
+fn build_var_binary(
     field_id: LogicalFieldId,
-    start: u64,
-    end: u64,
+    rows: usize,
     min: usize,
     max: usize,
-) -> Put<'static> {
-    let mut items = Vec::with_capacity((end - start) as usize);
-    for r in start..end {
-        // pseudo-var length that depends on (row, field)
+) -> (LogicalFieldId, ArrayRef) {
+    let mut b = BinaryBuilder::new();
+    let fid_u64 = u64::from(field_id);
+    for i in 0..rows {
         let span = (max - min + 1) as u64;
-        let mix = r
+        let mix = (i as u64)
             .wrapping_mul(1103515245)
-            .wrapping_add(field_id as u64)
+            .wrapping_add(fid_u64)
             .rotate_left(13);
         let len = (min as u64 + (mix % span)) as usize;
-        let byte = (((r as u32).wrapping_add(field_id)) & 0xFF) as u8;
-        items.push((u64_be_vec(r).into(), vec![byte; len].into()));
+        let byte = (((i as u64).wrapping_add(fid_u64)) & 0xFF) as u8;
+        b.append_value(vec![byte; len]);
     }
-    Put { field_id, items }
+    (field_id, Arc::new(b.finish()) as ArrayRef)
 }
 
-// -------- I/O metric helpers (compute per-phase delta locally) ---------------
+fn batch_from_columns(cols: &[(LogicalFieldId, ArrayRef)]) -> RecordBatch {
+    let fields: Vec<Field> = cols
+        .iter()
+        .enumerate()
+        .map(|(i, (fid, arr))| {
+            let mut md = std::collections::HashMap::new();
+            md.insert("field_id".to_string(), u64::from(*fid).to_string());
+            Field::new(format!("c{i}"), arr.data_type().clone(), false).with_metadata(md)
+        })
+        .collect();
 
-// TODO: Use `IoStats` directly?
-#[derive(Clone, Copy, Default)]
-struct Counts {
-    batches: u64,
-    put_raw: u64,
-    put_typed: u64,
-    get_raw: u64,
-    get_typed: u64,
-    frees: u64, // number of physical keys freed
+    // The store's append logic requires a `row_id` column.
+    let num_rows = if cols.is_empty() { 0 } else { cols[0].1.len() };
+    let row_id_field = Field::new(
+        ROW_ID_COLUMN_NAME,
+        arrow::datatypes::DataType::UInt64,
+        false,
+    );
+    // Use unique row IDs for each batch to avoid LWW updates in this example.
+    let start_row_id = NEXT_ROW_ID.fetch_add(num_rows as u64, Ordering::Relaxed);
+    let end_row_id = start_row_id + num_rows as u64;
+    let row_id_array =
+        Arc::new(UInt64Array::from_iter_values(start_row_id..end_row_id)) as ArrayRef;
+
+    let mut final_fields = vec![row_id_field];
+    final_fields.extend(fields);
+    let mut final_arrays = vec![row_id_array];
+    final_arrays.extend(cols.iter().map(|(_, a)| Arc::clone(a)));
+
+    let schema = Arc::new(Schema::new(final_fields));
+    RecordBatch::try_new(schema, final_arrays).unwrap()
 }
 
-impl core::ops::Sub for Counts {
-    type Output = Counts;
-    fn sub(self, rhs: Counts) -> Counts {
-        Counts {
-            batches: self.batches.saturating_sub(rhs.batches),
-            put_raw: self.put_raw.saturating_sub(rhs.put_raw),
-            put_typed: self.put_typed.saturating_sub(rhs.put_typed),
-            get_raw: self.get_raw.saturating_sub(rhs.get_raw),
-            get_typed: self.get_typed.saturating_sub(rhs.get_typed),
-            frees: self.frees.saturating_sub(rhs.frees),
+// Global counter to ensure unique row_ids across batches.
+static NEXT_ROW_ID: AtomicU64 = AtomicU64::new(0);
+
+// -------- I/O metric helpers -------------------------------------------------
+
+#[derive(Clone, Copy, Default, Debug)]
+struct CountsSnapshot {
+    get_batches: u64,
+    put_batches: u64,
+    free_batches: u64,
+    alloc_batches: u64,
+    physical_puts: u64,
+    physical_gets: u64,
+    physical_frees: u64,
+    physical_allocs: u64,
+}
+
+impl From<&Arc<IoStats>> for CountsSnapshot {
+    fn from(stats: &Arc<IoStats>) -> Self {
+        Self {
+            get_batches: stats.get_batches.load(Ordering::Relaxed),
+            put_batches: stats.put_batches.load(Ordering::Relaxed),
+            free_batches: stats.free_batches.load(Ordering::Relaxed),
+            alloc_batches: stats.alloc_batches.load(Ordering::Relaxed),
+            physical_puts: stats.physical_puts.load(Ordering::Relaxed),
+            physical_gets: stats.physical_gets.load(Ordering::Relaxed),
+            physical_frees: stats.physical_frees.load(Ordering::Relaxed),
+            physical_allocs: stats.physical_allocs.load(Ordering::Relaxed),
         }
     }
 }
 
-// Uses your actual IoStats field names.
-fn read_counts<P: llkv_column_map::storage::pager::Pager>(store: &ColumnStore<'_, P>) -> Counts {
-    let s = store.io_stats(); // cumulative since process start
-    Counts {
-        batches: s.batches as u64,
-        put_raw: s.put_raw_ops as u64,
-        put_typed: s.put_typed_ops as u64,
-        get_raw: s.get_raw_ops as u64,
-        get_typed: s.get_typed_ops as u64,
-        frees: s.free_ops as u64,
+impl core::ops::Sub for CountsSnapshot {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            get_batches: self.get_batches.saturating_sub(rhs.get_batches),
+            put_batches: self.put_batches.saturating_sub(rhs.put_batches),
+            free_batches: self.free_batches.saturating_sub(rhs.free_batches),
+            alloc_batches: self.alloc_batches.saturating_sub(rhs.alloc_batches),
+            physical_puts: self.physical_puts.saturating_sub(rhs.physical_puts),
+            physical_gets: self.physical_gets.saturating_sub(rhs.physical_gets),
+            physical_frees: self.physical_frees.saturating_sub(rhs.physical_frees),
+            physical_allocs: self.physical_allocs.saturating_sub(rhs.physical_allocs),
+        }
     }
 }
 
@@ -111,15 +138,12 @@ fn read_counts<P: llkv_column_map::storage::pager::Pager>(store: &ColumnStore<'_
 struct AppendSummary {
     num_cols: usize,
     total_cells: usize,
-    // If every column wrote the same number of rows, we fill this.
     uniform_rows_per_col: Option<usize>,
-    // Always available for the per-column fallback line.
     per_col: Vec<(LogicalFieldId, usize)>,
 }
 
-fn summarize_puts(puts: &[Put]) -> AppendSummary {
-    let per_col: Vec<(LogicalFieldId, usize)> =
-        puts.iter().map(|p| (p.field_id, p.items.len())).collect();
+fn summarize_pairs(pairs: &[(LogicalFieldId, usize)]) -> AppendSummary {
+    let per_col = pairs.to_vec();
     let num_cols = per_col.len();
     let total_cells: usize = per_col.iter().map(|(_, n)| *n).sum();
     let uniform_rows_per_col = if num_cols > 0 && per_col.iter().all(|(_, n)| *n == per_col[0].1) {
@@ -145,91 +169,110 @@ fn print_data_summary(label: &str, a: &AppendSummary) {
             );
         }
         None => {
-            // Compact per-column list
             print!("  data: {} columns; cells per column = {{", a.num_cols);
             for (i, (fid, n)) in a.per_col.iter().enumerate() {
                 if i > 0 {
                     print!(", ");
                 }
-                print!("{}:{}", fid, n);
+                print!("{:?}:{}", fid, n);
             }
             println!("}} (total={})", a.total_cells);
         }
     }
 }
 
-// Prints the phase’s data summary and then the per-phase I/O deltas.
-fn show_phase_with_data<P: llkv_column_map::storage::pager::Pager>(
+fn show_phase_with_data(
     label: &str,
-    store: &ColumnStore<'_, P>,
-    prev: &mut Counts,
+    stats: &Arc<IoStats>,
+    prev: &mut CountsSnapshot,
     summary: &AppendSummary,
 ) {
     print_data_summary(label, summary);
-    let now = read_counts(store);
+    let now = CountsSnapshot::from(stats);
     let d = now - *prev;
-    println!("  batches: {}", d.batches);
-    println!("  puts:   raw={} typed={}", d.put_raw, d.put_typed);
-    println!("  gets:   raw={} typed={}", d.get_raw, d.get_typed);
-    println!("  frees:  {}", d.frees);
+    println!(
+        "  batch ops: gets={}, puts={}, frees={}, allocs={}",
+        d.get_batches, d.put_batches, d.free_batches, d.alloc_batches
+    );
+    println!(
+        "  phys ops:  gets={}, puts={}, frees={}, allocs={}",
+        d.physical_gets, d.physical_puts, d.physical_frees, d.physical_allocs
+    );
     println!();
     *prev = now;
 }
 
-// Simple version (no data line), used for phases that don’t write (e.g. init, describe)
-fn show_phase<P: llkv_column_map::storage::pager::Pager>(
-    label: &str,
-    store: &ColumnStore<'_, P>,
-    prev: &mut Counts,
-) {
+fn show_phase(label: &str, stats: &Arc<IoStats>, prev: &mut CountsSnapshot) {
     println!("== {} ==", label);
-    let now = read_counts(store);
+    let now = CountsSnapshot::from(stats);
     let d = now - *prev;
-    println!("  batches: {}", d.batches);
-    println!("  puts:   raw={} typed={}", d.put_raw, d.put_typed);
-    println!("  gets:   raw={} typed={}", d.get_raw, d.get_typed);
-    println!("  frees:  {}", d.frees);
+    println!(
+        "  batch ops: gets={}, puts={}, frees={}, allocs={}",
+        d.get_batches, d.put_batches, d.free_batches, d.alloc_batches
+    );
+    println!(
+        "  phys ops:  gets={}, puts={}, frees={}, allocs={}",
+        d.physical_gets, d.physical_puts, d.physical_frees, d.physical_allocs
+    );
     println!();
     *prev = now;
 }
 
-// -------- pretty read report -------------------------------------------------
+// -------- sample read report + ASCII storage summary ------------------------
 
-use llkv_column_map::types::LogicalFieldId as Fid;
+fn print_read_report_scan(store: &ColumnStore<InstrumentedPager<MemPager>>) {
+    use arrow::array::UInt64Array;
+    use llkv_column_map::store::scan::{PrimitiveVisitor, ScanOptions};
 
-fn fmt_key(k: &[u8]) -> String {
-    if k.len() == 8 {
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(k);
-        format!("u64({})", u64::from_be_bytes(buf))
-    } else {
-        // short hex
-        let mut s = String::with_capacity(k.len() * 2);
-        for b in k {
-            use core::fmt::Write;
-            let _ = write!(s, "{:02x}", b);
+    println!("-- Read report (scan sample) --");
+    for &id in &[100u32, 200, 201, 300, 301, 999] {
+        let field_id = LogicalFieldId::for_user_table_0(id);
+        // Visitor to count up to a small budget and capture last u64 value if applicable.
+        struct Sample {
+            seen: usize,
+            last_u64: Option<u64>,
+            budget: usize,
         }
-        format!("hex({})", s)
-    }
-}
-
-fn print_read_report<B>(
-    heading: &str,
-    queries: &[(Fid, Vec<Vec<u8>>)],
-    results: &[Vec<Option<ValueSlice<B>>>],
-) where
-    B: BlobLike,
-{
-    println!("-- {} --", heading);
-    for (i, (fid, ks)) in queries.iter().enumerate() {
-        print!("col {}: ", fid);
-        for (j, k) in ks.iter().enumerate() {
-            match &results[i][j] {
-                Some(bytes) => print!("{} → HIT {}B;  ", fmt_key(k), bytes.as_ref().len()),
-                None => print!("{} → MISSING;  ", fmt_key(k)),
+        impl PrimitiveVisitor for Sample {
+            fn u64_chunk(&mut self, a: &UInt64Array) {
+                if a.is_empty() {
+                    self.last_u64 = Some(a.value(a.len() - 1));
+                }
+                self.seen = (self.seen + a.len()).min(self.budget);
+            }
+            // fn u32_chunk(&mut self, a: &arrow::array::UInt32Array) {
+            //     self.seen = (self.seen + a.len()).min(self.budget);
+            // }
+            // fn u16_chunk(&mut self, a: &arrow::array::UInt16Array) { self.seen = (self.seen + a.len()).min(self.budget); }
+            // fn u8_chunk(&mut self, a: &arrow::array::UInt8Array) { self.seen = (self.seen + a.len()).min(self.budget); }
+            // fn i64_chunk(&mut self, a: &arrow::array::Int64Array) { self.seen = (self.seen + a.len()).min(self.budget); }
+            // fn i32_chunk(&mut self, a: &arrow::array::Int32Array) { self.seen = (self.seen + a.len()).min(self.budget); }
+            // fn i16_chunk(&mut self, a: &arrow::array::Int16Array) { self.seen = (self.seen + a.len()).min(self.budget); }
+            // fn i8_chunk(&mut self, a: &arrow::array::Int8Array) { self.seen = (self.seen + a.len()).min(self.budget); }
+        }
+        impl llkv_column_map::store::scan::PrimitiveSortedVisitor for Sample {}
+        impl llkv_column_map::store::scan::PrimitiveWithRowIdsVisitor for Sample {}
+        impl llkv_column_map::store::scan::PrimitiveSortedWithRowIdsVisitor for Sample {}
+        let mut v = Sample {
+            seen: 0,
+            last_u64: None,
+            budget: 16,
+        };
+        match store.scan(field_id, ScanOptions::default(), &mut v) {
+            Ok(()) => {
+                println!(
+                    "col {:?}: scanned primitive ints (~{} rows); last_u64={:?}",
+                    field_id, v.seen, v.last_u64
+                );
+            }
+            Err(_) => {
+                // Non-integer columns are not handled by the primitive scan API here.
+                println!(
+                    "col {:?}: scan not supported for this dtype in this example",
+                    field_id
+                );
             }
         }
-        println!();
     }
     println!();
 }
@@ -237,116 +280,97 @@ fn print_read_report<B>(
 // -------- main walkthrough ---------------------------------------------------
 
 fn main() {
-    let pager = MemPager::default();
-    let store = ColumnStore::init_empty(&pager);
+    let (pager, stats) = InstrumentedPager::new(MemPager::default());
+    let pager_arc = Arc::new(pager);
+    let store = ColumnStore::open(Arc::clone(&pager_arc)).unwrap();
 
-    // We'll accumulate a previous snapshot here and compute deltas per phase.
-    let mut prev = read_counts(&store);
+    let mut prev = CountsSnapshot::from(&stats);
 
-    // Phase 0: init (writes manifest+bootstrap before ColumnStore is counting).
-    show_phase("Phase 0: init (bootstrap + manifest)", &store, &mut prev);
+    show_phase("Phase 0: init (bootstrap + manifest)", &stats, &mut prev);
 
-    let mut opts = AppendOptions {
-        mode: ValueMode::Auto,
-        segment_max_entries: 16_384,
-        segment_max_bytes: 2 * 1024 * 1024,
-        last_write_wins_in_batch: true,
-    };
-
-    // ---------------- Phase 1: fixed-width cols 100 & 101 -------------------
     {
-        let put_100 = build_put_fixed(100, 0, 10_000, 8);
-        let put_101 = build_put_fixed(101, 0, 10_000, 8);
-        let puts = vec![put_100, put_101];
-        let summary = summarize_puts(&puts);
-        store.append_many(puts, opts.clone());
+        let c100 = build_fixed_u64(LogicalFieldId::for_user_table_0(100), 10_000);
+        let c101 = build_fixed_u64(LogicalFieldId::for_user_table_0(101), 10_000);
+        let batch = batch_from_columns(&[c100.clone(), c101.clone()]);
+        store.append(&batch).unwrap();
+
+        let summary = summarize_pairs(&[(c100.0, c100.1.len()), (c101.0, c101.1.len())]);
         show_phase_with_data(
             "Phase 1: append fixed-width cols 100 & 101",
-            &store,
+            &stats,
             &mut prev,
             &summary,
         );
     }
 
-    // ------------- Phase 2: variable-width cols 200 & 201 (chunked) ---------
     {
-        let put_200 = build_put_var(200, 0, 12_345, 6, 18);
-        let put_201 = build_put_var(201, 0, 12_345, 6, 18);
-        let puts = vec![put_200, put_201];
-        let summary = summarize_puts(&puts);
-        store.append_many(puts, opts.clone());
+        let c200 = build_var_binary(LogicalFieldId::for_user_table_0(200), 12_345, 6, 18);
+        let c201 = build_var_binary(LogicalFieldId::for_user_table_0(201), 12_345, 6, 18);
+        let batch = batch_from_columns(&[c200.clone(), c201.clone()]);
+        store.append(&batch).unwrap();
+
+        let summary = summarize_pairs(&[(c200.0, c200.1.len()), (c201.0, c201.1.len())]);
         show_phase_with_data(
             "Phase 2: append variable-width cols 200 & 201",
-            &store,
+            &stats,
             &mut prev,
             &summary,
         );
     }
 
-    // ------- Phase 3: add new columns later (forces Manifest update) --------
     {
-        let put_300 = build_put_fixed(300, 0, 2_000, 8);
-        let put_301 = build_put_var(301, 0, 2_000, 10, 30);
-        let puts = vec![put_300, put_301];
-        let summary = summarize_puts(&puts);
-        store.append_many(puts, opts.clone());
+        let c300 = build_fixed_u64(LogicalFieldId::for_user_table_0(300), 2_000);
+        let c301 = build_var_binary(LogicalFieldId::for_user_table_0(301), 2_000, 10, 30);
+        let batch = batch_from_columns(&[c300.clone(), c301.clone()]);
+        store.append(&batch).unwrap();
+
+        let summary = summarize_pairs(&[(c300.0, c300.1.len()), (c301.0, c301.1.len())]);
         show_phase_with_data(
             "Phase 3: append new cols 300 (fixed) & 301 (var) — updates Manifest",
-            &store,
+            &stats,
             &mut prev,
             &summary,
         );
     }
 
-    // ---- Phase 4: mixed append: existing (100) + brand-new (999) -----------
     {
-        // Existing fixed-width col 100: write 3 specific keys (5,7,9).
-        let put_100 = Put {
-            field_id: 100,
-            items: vec![
-                (u64_be_vec(5).into(), fixed_value(5, 100, 8).into()),
-                (u64_be_vec(7).into(), fixed_value(7, 100, 8).into()),
-                (u64_be_vec(9).into(), fixed_value(9, 100, 8).into()),
-            ],
-        };
-        // Brand-new variable-width col 999: write 10 keys [1000..1010).
-        let put_999 = build_put_var(999, 1_000, 1_010, 12, 40);
+        let c100 = (
+            LogicalFieldId::for_user_table_0(100),
+            Arc::new(UInt64Array::from(vec![5u64, 7, 9])) as ArrayRef,
+        );
+        let b100 = batch_from_columns(std::slice::from_ref(&c100));
+        store.append(&b100).unwrap();
 
-        opts.mode = ValueMode::Auto; // allow mixed fixed/var in one append_many
-        let puts = vec![put_100, put_999];
-        let summary = summarize_puts(&puts);
-        store.append_many(puts, opts.clone());
+        let rows_999 = 10usize;
+        let mut bb = BinaryBuilder::new();
+        for r in 1_000..1_000 + rows_999 as u64 {
+            bb.append_value(vec![0xAB; (r % 17 + 12) as usize]);
+        }
+        let c999 = (
+            LogicalFieldId::for_user_table_0(999),
+            Arc::new(bb.finish()) as ArrayRef,
+        );
+        let b999 = batch_from_columns(std::slice::from_ref(&c999));
+        store.append(&b999).unwrap();
+
+        let summary = summarize_pairs(&[
+            (LogicalFieldId::for_user_table_0(100), 3),
+            (LogicalFieldId::for_user_table_0(999), rows_999),
+        ]);
         show_phase_with_data(
             "Phase 4: mixed append (existing col 100 + new col 999)",
-            &store,
+            &stats,
             &mut prev,
             &summary,
         );
     }
 
-    // ---------------- Phase 5: multi-column read + describe ------------------
     {
-        let queries = vec![
-            (
-                100,
-                vec![u64_be_vec(5), u64_be_vec(7), u64_be_vec(9), u64_be_vec(255)],
-            ), // col 100 has 10k rows → all HIT 8B
-            (200, vec![u64_be_vec(1), u64_be_vec(2), u64_be_vec(3)]), // var
-            (
-                201,
-                vec![u64_be_vec(123), u64_be_vec(456), u64_be_vec(9_999)],
-            ), // var
-            (
-                999,
-                vec![u64_be_vec(1_003), u64_be_vec(1_005), u64_be_vec(1_007)],
-            ), // var; all HIT (we wrote [1000..1010))
-        ];
-        let results = store.get_many(queries.iter().map(|(fid, ks)| (*fid, ks.clone())).collect());
-        print_read_report("Read report (get_many)", &queries, &results);
+        print_read_report_scan(&store);
 
-        let ascii = store.render_storage_ascii(); // triggers raw gets to size nodes
-        println!("\n==== STORAGE ASCII ====\n{}", ascii);
+        let layout_table_str = store.render_storage_as_formatted_string();
+        println!("\n==== STORAGE LAYOUT ====\n{}", layout_table_str);
 
-        show_phase("Phase 5: describe_storage + read report", &store, &mut prev);
+        show_phase("Phase 5: describe_storage + read report", &stats, &mut prev);
     }
 }

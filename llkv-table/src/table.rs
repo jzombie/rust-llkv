@@ -1,804 +1,2348 @@
-//! Note: `FxHashMap` and `FxHashSet` are used internally in the table while
-//! exposing a `HashMap` interface via `RowPatch` to make it potentially easier
-//! to upsert from consuming applications.
-
-#![forbid(unsafe_code)]
-
-use crate::codecs::decode_root_id;
-use crate::expr::{Expr, Filter, Operator};
-use crate::types::{
-    ColumnTree, FieldId, IndexKey, IndexKeyCodec, OnRowOf, PrimaryIndexTree, RootId, RootIdBytes,
-    RowId, RowIdCmp, RowIdKeyCodec, RowIdSetTree, RowPatch,
-};
-use crossbeam_channel as xchan;
-use llkv_btree::codecs::KeyCodec;
-use llkv_btree::define_mem_pager;
-use llkv_btree::errors::Error;
-use llkv_btree::iter::{BPlusTreeIter, ScanOpts};
-use llkv_btree::node_cache::NodeCache;
-use llkv_btree::pager::{Pager as BTreePager, SharedPager};
-use llkv_btree::prelude::*;
-use llkv_btree::views::value_view::ValueRef;
-use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::BTreeMap;
+use std::cmp;
 use std::ops::Bound;
-use std::sync::{Arc, RwLock};
-use std::thread;
+use std::sync::Arc;
 
-pub struct TableCfg {
-    pub row_id_cmp: RowIdCmp,
-}
+use crate::constants::STREAM_BATCH_ROWS;
+use crate::scalar_eval::{NumericArrayMap, NumericKernels};
+use crate::types::TableId;
 
-/// The Table manages a collection of B-Trees for columns and indexes.
-pub struct Table<P>
+use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
+
+use llkv_column_map::scan::{
+    PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+    PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
+};
+use llkv_column_map::store::{
+    FilterPrimitive, FilterResult, FilterRun, GatherNullPolicy, Projection, ROW_ID_COLUMN_NAME,
+    dense_row_runs,
+};
+use llkv_column_map::{
+    ColumnStore,
+    types::{LogicalFieldId, Namespace},
+};
+use llkv_storage::pager::{MemPager, Pager};
+use simd_r_drive_entry_handle::EntryHandle;
+
+use crate::sys_catalog::{CATALOG_TID, ColMeta, SysCatalog, TableMeta};
+use crate::types::FieldId;
+use llkv_expr::typed_predicate::build_predicate;
+use llkv_expr::{CompareOp, Expr, Filter, Operator, ScalarExpr};
+use llkv_result::{Error, Result as LlkvResult};
+use rustc_hash::{FxHashMap, FxHashSet};
+
+fn collect_matching_row_ids<T, P>(
+    store: &ColumnStore<P>,
+    field_id: LogicalFieldId,
+    op: &Operator<'_>,
+) -> LlkvResult<Vec<u64>>
 where
-    P: BTreePager<Id = RootId> + Clone + Send + Sync + 'static,
-    <P as BTreePager>::Page: Send + Sync + 'static,
+    T: ArrowPrimitiveType + FilterPrimitive,
+    T::Native: llkv_expr::literal::FromLiteral + Copy,
+    P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    columns: BTreeMap<FieldId, ColumnTree<P>>,
-    indexes: BTreeMap<FieldId, PrimaryIndexTree<P>>,
-    pager: P,
-    shared_node_cache: Arc<RwLock<NodeCache<P>>>,
+    let predicate = build_predicate::<T>(op).map_err(Error::predicate_build)?;
+    store.filter_row_ids::<T, _>(field_id, move |value| predicate.matches(value))
 }
 
-define_mem_pager! {
-    /// In-memory pager with u64 page IDs.
-    name: MemPager64,
-    id: u64,
-    default_page_size: 256
+fn collect_filter_result<T, P>(
+    store: &ColumnStore<P>,
+    field_id: LogicalFieldId,
+    op: &Operator<'_>,
+) -> LlkvResult<FilterResult>
+where
+    T: ArrowPrimitiveType + FilterPrimitive,
+    T::Native: llkv_expr::literal::FromLiteral + Copy,
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let predicate = build_predicate::<T>(op).map_err(Error::predicate_build)?;
+    store.filter_matches::<T, _>(field_id, move |value| predicate.matches(value))
 }
 
-impl Table<SharedPager<MemPager64>> {
-    pub fn new(page_size: usize) -> Self {
-        let base = MemPager64::new(page_size);
-        let pager = SharedPager::new(base);
-        Self::with_pager(pager)
+fn normalize_row_ids(mut row_ids: Vec<u64>) -> Vec<u64> {
+    row_ids.sort_unstable();
+    row_ids.dedup();
+    row_ids
+}
+
+fn intersect_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
+    let mut result = Vec::with_capacity(left.len().min(right.len()));
+    let mut i = 0;
+    let mut j = 0;
+    while i < left.len() && j < right.len() {
+        let lv = left[i];
+        let rv = right[j];
+        if lv == rv {
+            result.push(lv);
+            i += 1;
+            j += 1;
+        } else if lv < rv {
+            i += 1;
+        } else {
+            j += 1;
+        }
     }
+    result
+}
+
+fn union_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
+    if left.is_empty() {
+        return right;
+    }
+    if right.is_empty() {
+        return left;
+    }
+
+    let mut result = Vec::with_capacity(left.len() + right.len());
+    let mut i = 0;
+    let mut j = 0;
+    while i < left.len() && j < right.len() {
+        let lv = left[i];
+        let rv = right[j];
+        if lv == rv {
+            result.push(lv);
+            i += 1;
+            j += 1;
+        } else if lv < rv {
+            result.push(lv);
+            i += 1;
+        } else {
+            result.push(rv);
+            j += 1;
+        }
+    }
+
+    while i < left.len() {
+        result.push(left[i]);
+        i += 1;
+    }
+    while j < right.len() {
+        result.push(right[j]);
+        j += 1;
+    }
+
+    result.dedup();
+    result
+}
+
+fn difference_sorted(base: Vec<u64>, subtract: Vec<u64>) -> Vec<u64> {
+    if base.is_empty() || subtract.is_empty() {
+        return base;
+    }
+
+    let mut result = Vec::with_capacity(base.len());
+    let mut i = 0;
+    let mut j = 0;
+    while i < base.len() && j < subtract.len() {
+        let bv = base[i];
+        let sv = subtract[j];
+        if bv == sv {
+            i += 1;
+            j += 1;
+        } else if bv < sv {
+            result.push(bv);
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    while i < base.len() {
+        result.push(base[i]);
+        i += 1;
+    }
+    result
+}
+
+pub struct Table<P = MemPager>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    store: ColumnStore<P>,
+    table_id: TableId,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScanStreamOptions {
+    /// Preserve null rows emitted by the projected columns when `true`.
+    /// When `false`, the scan gatherer drops rows where all projected
+    /// columns are null or missing before yielding batches. This keeps
+    /// the table scan column-oriented while delegating row-level
+    /// filtering to the column-map layer.
+    pub include_nulls: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum StreamProjection {
+    Column(Projection),
+    Computed {
+        expr: ScalarExpr<FieldId>,
+        alias: String,
+    },
+}
+
+impl StreamProjection {
+    pub fn column<P: Into<Projection>>(proj: P) -> Self {
+        Self::Column(proj.into())
+    }
+
+    pub fn computed<S: Into<String>>(expr: ScalarExpr<FieldId>, alias: S) -> Self {
+        Self::Computed {
+            expr,
+            alias: alias.into(),
+        }
+    }
+}
+
+impl From<Projection> for StreamProjection {
+    fn from(value: Projection) -> Self {
+        StreamProjection::Column(value)
+    }
+}
+
+#[derive(Clone)]
+struct ColumnProjectionInfo {
+    logical_field_id: LogicalFieldId,
+    data_type: DataType,
+    output_name: String,
+}
+
+#[derive(Clone)]
+struct ComputedProjectionInfo {
+    expr: ScalarExpr<FieldId>,
+    alias: String,
+}
+
+#[derive(Clone)]
+enum ProjectionEval {
+    Column(ColumnProjectionInfo),
+    Computed(ComputedProjectionInfo),
 }
 
 impl<P> Table<P>
 where
-    P: BTreePager<Id = RootId> + Clone + Send + Sync + 'static,
-    <P as BTreePager>::Page: Send + Sync + 'static,
+    P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    pub fn with_pager(pager: P) -> Self {
-        let shared_node_cache = Arc::new(RwLock::new(NodeCache::default()));
-        Self {
-            columns: BTreeMap::new(),
-            indexes: BTreeMap::new(),
-            pager,
-            shared_node_cache,
+    pub fn new(table_id: TableId, pager: Arc<P>) -> LlkvResult<Self> {
+        if table_id == CATALOG_TID {
+            return Err(Error::reserved_table_id(table_id));
         }
+
+        let store = ColumnStore::open(pager)?;
+        Ok(Self { store, table_id })
     }
 
-    pub fn add_column(&mut self, field_id: FieldId) {
-        let column_tree = ColumnTree::create_empty(
-            self.pager.clone(),
-            Some(Arc::clone(&self.shared_node_cache)),
-        )
-        .unwrap();
-        self.columns.insert(field_id, column_tree);
-    }
-
-    pub fn add_index(&mut self, field_id: FieldId) {
-        let index_tree = PrimaryIndexTree::create_empty(
-            self.pager.clone(),
-            Some(Arc::clone(&self.shared_node_cache)),
-        )
-        .unwrap();
-        self.indexes.insert(field_id, index_tree);
-    }
-
-    pub fn insert_many(&self, rows: &[RowPatch]) -> Result<(), Error> {
-        // Step 1: Aggregate all writes across all rows (sequentially, this is fast)
-        let mut all_column_writes: BTreeMap<FieldId, Vec<(RowId, &[u8])>> = BTreeMap::new();
-        let mut all_index_updates: BTreeMap<FieldId, Vec<(IndexKey, RowId)>> = BTreeMap::new();
-
-        for (row_id, data) in rows {
-            for (field_id, (index_key, value)) in data {
-                all_column_writes
-                    .entry(*field_id)
-                    .or_default()
-                    .push((*row_id, &**value));
-
-                if self.indexes.contains_key(field_id) {
-                    all_index_updates
-                        .entry(*field_id)
-                        .or_default()
-                        .push((*index_key, *row_id));
-                }
+    pub fn append(&self, batch: &RecordBatch) -> LlkvResult<()> {
+        let mut new_fields = Vec::with_capacity(batch.schema().fields().len());
+        for field in batch.schema().fields() {
+            if field.name() == ROW_ID_COLUMN_NAME {
+                new_fields.push(field.as_ref().clone());
+                continue;
             }
+
+            let user_field_id: FieldId = field
+                .metadata()
+                .get("field_id")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| {
+                    llkv_result::Error::Internal(format!(
+                        "Field '{}' is missing a valid 'field_id' in its \
+                         metadata.",
+                        field.name()
+                    ))
+                })?;
+
+            let lfid = LogicalFieldId::for_user(self.table_id, user_field_id);
+            let mut new_metadata = field.metadata().clone();
+            let lfid_val: u64 = lfid.into();
+            new_metadata.insert("field_id".to_string(), lfid_val.to_string());
+
+            let new_field =
+                Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                    .with_metadata(new_metadata);
+            new_fields.push(new_field);
         }
 
-        // Step 2 & 3: Perform all database writes in parallel using Rayon
-        rayon::join(
-            || {
-                // --- Parallel Column Writes ---
-                all_column_writes
-                    .into_par_iter()
-                    .for_each(|(field_id, writes)| {
-                        if let Some(column_tree) = self.columns.get(&field_id) {
-                            // Assuming BTree::insert_many now takes &self
-                            column_tree.insert_many(&writes).unwrap();
-                        }
-                    });
-            },
-            || {
-                // --- Parallel Index Writes ---
-                all_index_updates
-                    .into_par_iter()
-                    .for_each(|(field_id, updates)| {
-                        if let Some(primary_index) = self.indexes.get(&field_id) {
-                            self.update_index_parallel(primary_index, updates).unwrap();
-                        }
-                    });
-            },
-        );
-
-        Ok(())
+        let new_schema = Arc::new(Schema::new(new_fields));
+        let namespaced_batch = RecordBatch::try_new(new_schema, batch.columns().to_vec())?;
+        self.store.append(&namespaced_batch)
     }
 
-    fn update_index_parallel(
+    /// Stream one or more projected columns as a sequence of RecordBatches.
+    ///
+    /// - Avoids `concat` and large materializations.
+    /// - Uses the same filter machinery as the old `scan` to produce
+    ///   `row_ids`.
+    /// - Splits `row_ids` into fixed-size windows and gathers rows per
+    ///   window to form a small `RecordBatch` that is sent to `on_batch`.
+    pub fn scan_stream<'a, F>(
         &self,
-        primary_index: &PrimaryIndexTree<P>,
-        updates: Vec<(IndexKey, RowId)>,
-    ) -> Result<(), Error> {
-        let mut updates_by_key: BTreeMap<IndexKey, Vec<RowId>> = BTreeMap::new();
-        for (index_key, row_id) in updates {
-            updates_by_key.entry(index_key).or_default().push(row_id);
-        }
-
-        let unique_keys: Vec<IndexKey> = updates_by_key.keys().cloned().collect();
-        let primary_snapshot = primary_index.snapshot();
-        let existing_roots_map: FxHashMap<IndexKey, RootId> = primary_snapshot
-            .get_many(&unique_keys)?
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, root_ref_opt)| {
-                root_ref_opt.map(|r| (unique_keys[i], decode_root_id(&r)))
-            })
+        projections: &[Projection],
+        filter_expr: &Expr<'a, FieldId>,
+        options: ScanStreamOptions,
+        on_batch: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(RecordBatch),
+    {
+        let stream_projections: Vec<StreamProjection> = projections
+            .iter()
+            .cloned()
+            .map(StreamProjection::from)
             .collect();
-
-        let new_primary_entries: Vec<(IndexKey, RootIdBytes)> = updates_by_key
-            .into_par_iter()
-            .filter_map(|(index_key, row_ids)| {
-                if let Some(root_id) = existing_roots_map.get(&index_key) {
-                    let row_id_set = RowIdSetTree::open(self.pager.clone(), *root_id, None);
-                    let writes: Vec<_> = row_ids.iter().map(|rid| (*rid, &[][..])).collect();
-                    row_id_set.insert_many(&writes).ok()?;
-                    None
-                } else {
-                    let new_row_id_set =
-                        RowIdSetTree::create_empty(self.pager.clone(), None).ok()?;
-                    let writes: Vec<_> = row_ids.iter().map(|rid| (*rid, &[][..])).collect();
-                    new_row_id_set.insert_many(&writes).ok()?;
-                    let new_root_id = new_row_id_set.snapshot().root_id();
-                    Some((index_key, new_root_id.to_be_bytes()))
-                }
-            })
-            .collect();
-
-        if !new_primary_entries.is_empty() {
-            let writes_slice: Vec<(IndexKey, &[u8])> = new_primary_entries
-                .iter()
-                .map(|(k, v)| (*k, &v[..]))
-                .collect();
-            primary_index.insert_many(&writes_slice)?;
-        }
-
-        Ok(())
+        self.scan_stream_with_exprs(&stream_projections, filter_expr, options, on_batch)
     }
 
-    pub fn scan<'a>(
-        &'a self,
-        expr: &Expr<'a, FieldId>,
-        projection: &[FieldId],
-        on_row: &mut OnRowOf<P>,
-    ) -> Result<(), Error> {
-        let row_id_stream = self.get_row_id_stream(expr)?;
-        let row_id_stream = match row_id_stream {
-            Some(rx) => rx,
-            None => return Ok(()),
+    pub fn scan_stream_with_exprs<'a, F>(
+        &self,
+        projections: &[StreamProjection],
+        filter_expr: &Expr<'a, FieldId>,
+        options: ScanStreamOptions,
+        mut on_batch: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(RecordBatch),
+    {
+        if projections.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "scan_stream requires at least one projection".into(),
+            ));
+        }
+
+        let mut projection_evals: Vec<ProjectionEval> = Vec::with_capacity(projections.len());
+        let mut unique_index: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();
+        unique_index.reserve(projections.len());
+        let mut unique_lfids: Vec<LogicalFieldId> = Vec::with_capacity(projections.len());
+        let mut numeric_fields: FxHashSet<FieldId> = FxHashSet::default();
+
+        for proj in projections {
+            match proj {
+                StreamProjection::Column(p) => {
+                    let lfid = p.logical_field_id;
+                    if lfid.table_id() != self.table_id {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Projection targets table {} but scan_stream is on table {}",
+                            lfid.table_id(),
+                            self.table_id
+                        )));
+                    }
+                    if lfid.namespace() != Namespace::UserData {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Projection {:?} must target user data namespace",
+                            lfid
+                        )));
+                    }
+                    let dtype = self.store.data_type(lfid)?;
+                    if let std::collections::hash_map::Entry::Vacant(e) = unique_index.entry(lfid) {
+                        e.insert(unique_lfids.len());
+                        unique_lfids.push(lfid);
+                    }
+                    let fallback = lfid.field_id().to_string();
+                    let output_name = p.alias.clone().unwrap_or_else(|| fallback.clone());
+                    projection_evals.push(ProjectionEval::Column(ColumnProjectionInfo {
+                        logical_field_id: lfid,
+                        data_type: dtype,
+                        output_name,
+                    }));
+                }
+                StreamProjection::Computed { expr, alias } => {
+                    if alias.trim().is_empty() {
+                        return Err(Error::InvalidArgumentError(
+                            "Computed projection requires a non-empty alias".into(),
+                        ));
+                    }
+                    let mut fields_set: FxHashSet<FieldId> = FxHashSet::default();
+                    NumericKernels::collect_fields(expr, &mut fields_set);
+                    if fields_set.is_empty() {
+                        return Err(Error::InvalidArgumentError(
+                            "Computed projection must reference at least one column".into(),
+                        ));
+                    }
+                    let mut ordered_fields: Vec<FieldId> = fields_set.into_iter().collect();
+                    ordered_fields.sort_unstable();
+                    for field_id in &ordered_fields {
+                        let lfid = LogicalFieldId::for_user(self.table_id, *field_id);
+                        if lfid.namespace() != Namespace::UserData {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "Computed projection field {:?} must target user data namespace",
+                                lfid
+                            )));
+                        }
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            unique_index.entry(lfid)
+                        {
+                            e.insert(unique_lfids.len());
+                            unique_lfids.push(lfid);
+                        }
+                        numeric_fields.insert(*field_id);
+                    }
+                    projection_evals.push(ProjectionEval::Computed(ComputedProjectionInfo {
+                        expr: expr.clone(),
+                        alias: alias.clone(),
+                    }));
+                }
+            }
+        }
+
+        if let Expr::Pred(filter) = filter_expr
+            && self.try_fast_scan_stream(
+                &projection_evals,
+                &unique_index,
+                &unique_lfids,
+                filter,
+                &options,
+                &mut on_batch,
+            )?
+        {
+            return Ok(());
+        }
+
+        let passthrough_fields: Vec<Option<FieldId>> = projection_evals
+            .iter()
+            .map(|eval| match eval {
+                ProjectionEval::Computed(info) => NumericKernels::passthrough_column(&info.expr),
+                _ => None,
+            })
+            .collect();
+
+        let mut fields: Vec<Field> = Vec::with_capacity(projection_evals.len());
+        for (idx, eval) in projection_evals.iter().enumerate() {
+            match eval {
+                ProjectionEval::Column(info) => {
+                    fields.push(Field::new(
+                        info.output_name.clone(),
+                        info.data_type.clone(),
+                        true,
+                    ));
+                }
+                ProjectionEval::Computed(info) => {
+                    if let Some(fid) = passthrough_fields[idx] {
+                        let lfid = LogicalFieldId::for_user(self.table_id, fid);
+                        let dtype = self.store.data_type(lfid)?;
+                        fields.push(Field::new(info.alias.clone(), dtype, true));
+                    } else {
+                        fields.push(Field::new(info.alias.clone(), DataType::Float64, true));
+                    }
+                }
+            }
+        }
+        let out_schema = Arc::new(Schema::new(fields));
+
+        if try_scan_builder_passthrough(
+            self,
+            &projection_evals,
+            &passthrough_fields,
+            &out_schema,
+            filter_expr,
+            &options,
+            &mut on_batch,
+        )? {
+            return Ok(());
+        }
+        let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
+        let row_ids = self.collect_row_ids_for_expr(filter_expr, &mut all_rows_cache)?;
+
+        if row_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut gather_ctx = self.store.prepare_gather_context(&unique_lfids)?;
+        let mut start = 0usize;
+        let null_policy = if options.include_nulls {
+            GatherNullPolicy::IncludeNulls
+        } else {
+            GatherNullPolicy::DropNulls
         };
-        for row_id in row_id_stream {
-            let mut value_refs: Vec<ValueRef<<P>::Page>> = Vec::with_capacity(projection.len());
-            for field_id in projection {
-                if let Some(column_tree) = self.columns.get(field_id)
-                    && let Some(value_ref) = column_tree.snapshot().get(&row_id)?
-                {
-                    value_refs.push(value_ref);
+        while start < row_ids.len() {
+            let mut end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
+            if let Some((_, _, span_max)) = gather_ctx.chunk_span_for_row(row_ids[start]) {
+                while end < row_ids.len() && row_ids[end - 1] <= span_max {
+                    end += 1;
+                    if end - start >= STREAM_BATCH_ROWS {
+                        break;
+                    }
+                }
+                while end <= row_ids.len() && row_ids[end - 1] > span_max {
+                    end -= 1;
                 }
             }
-            let mut values_iter = value_refs.into_iter();
-            on_row(row_id, &mut values_iter);
+            let end = end.max(start + 1);
+            let window = &row_ids[start..end];
+
+            let gathered = self.store.gather_rows_with_reusable_context(
+                &mut gather_ctx,
+                window,
+                null_policy,
+            )?;
+
+            if gathered.num_columns() == 0 || gathered.num_rows() == 0 {
+                start = end;
+                continue;
+            }
+
+            let unique_arrays = gathered.columns();
+
+            let requires_numeric = projection_evals.iter().zip(passthrough_fields.iter()).any(
+                |(eval, passthrough)| {
+                    matches!(eval, ProjectionEval::Computed(_)) && passthrough.is_none()
+                },
+            );
+
+            let numeric_arrays: Option<NumericArrayMap> = if requires_numeric {
+                Some(NumericKernels::prepare_numeric_arrays(
+                    &unique_lfids,
+                    unique_arrays,
+                    &numeric_fields,
+                )?)
+            } else {
+                None
+            };
+
+            let mut columns = Vec::with_capacity(projection_evals.len());
+            for (idx, eval) in projection_evals.iter().enumerate() {
+                match eval {
+                    ProjectionEval::Column(info) => {
+                        let col_idx = unique_index
+                            .get(&info.logical_field_id)
+                            .copied()
+                            .expect("lfid missing from unique-index");
+                        columns.push(Arc::clone(&unique_arrays[col_idx]));
+                    }
+                    ProjectionEval::Computed(info) => {
+                        if let Some(fid) = passthrough_fields[idx] {
+                            let lfid = LogicalFieldId::for_user(self.table_id, fid);
+                            let col_idx = unique_index
+                                .get(&lfid)
+                                .copied()
+                                .expect("passthrough field missing from unique-index");
+                            columns.push(Arc::clone(&unique_arrays[col_idx]));
+                        } else {
+                            let numeric_arrays = numeric_arrays
+                                .as_ref()
+                                .expect("numeric arrays should exist for computed projection");
+                            let array = NumericKernels::evaluate_batch(
+                                &info.expr,
+                                gathered.num_rows(),
+                                numeric_arrays,
+                            )?;
+                            columns.push(array);
+                        }
+                    }
+                }
+            }
+
+            let batch = RecordBatch::try_new(out_schema.clone(), columns)?;
+            on_batch(batch);
+            start = end;
         }
+
         Ok(())
     }
 
-    fn get_row_id_stream<'b>(
-        &'b self,
-        expr: &Expr<'b, FieldId>,
-    ) -> Result<Option<xchan::Receiver<RowId>>, Error> {
+    fn try_fast_scan_stream<F>(
+        &self,
+        projection_evals: &[ProjectionEval],
+        unique_index: &FxHashMap<LogicalFieldId, usize>,
+        unique_lfids: &[LogicalFieldId],
+        filter: &Filter<'_, FieldId>,
+        options: &ScanStreamOptions,
+        on_batch: &mut F,
+    ) -> LlkvResult<bool>
+    where
+        F: FnMut(RecordBatch),
+    {
+        if projection_evals
+            .iter()
+            .any(|eval| !matches!(eval, ProjectionEval::Column(_)))
+        {
+            return Ok(false);
+        }
+
+        let filter_lfid = LogicalFieldId::for_user(self.table_id, filter.field_id);
+        let dtype = self.store.data_type(filter_lfid)?;
+        let dense_runs = match &filter.op {
+            Operator::Range {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            } => dense_row_runs(&self.store, filter_lfid)?,
+            _ => None,
+        };
+
+        let runs = if let Some(runs) = dense_runs {
+            if runs.is_empty() {
+                return Ok(true);
+            }
+            runs
+        } else {
+            let result = llkv_column_map::with_integer_arrow_type!(
+                dtype.clone(),
+                |ArrowTy| collect_filter_result::<ArrowTy, P>(&self.store, filter_lfid, &filter.op),
+                return Ok(false),
+            )?;
+
+            if result.total_matches() == 0 {
+                return Ok(true);
+            }
+
+            if !result.is_dense() {
+                return Ok(false);
+            }
+
+            match result.into_runs() {
+                Some(runs) if runs.is_empty() => return Ok(true),
+                Some(runs) => runs,
+                None => return Ok(false),
+            }
+        };
+
+        let mut gather_ctx = self.store.prepare_gather_context(unique_lfids)?;
+        if gather_ctx.is_empty() {
+            return Ok(true);
+        }
+
+        let null_policy = if options.include_nulls {
+            GatherNullPolicy::IncludeNulls
+        } else {
+            GatherNullPolicy::DropNulls
+        };
+
+        let fields: Vec<Field> = projection_evals
+            .iter()
+            .map(|eval| match eval {
+                ProjectionEval::Column(info) => {
+                    Field::new(info.output_name.clone(), info.data_type.clone(), true)
+                }
+                _ => unreachable!("fast path only handles direct column projections"),
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+
+        let mut temp_row_ids: Vec<u64> = Vec::with_capacity(STREAM_BATCH_ROWS);
+
+        for run in runs {
+            let mut remaining = run.len;
+            let mut current_row = run.start_row_id;
+
+            let run_last = run.start_row_id + (run.len.saturating_sub(1) as u64);
+            if gather_ctx.chunk_span_for_row(run_last).is_none() {
+                return Ok(false);
+            }
+
+            while remaining > 0 {
+                let (_, _, chunk_max) = match gather_ctx.chunk_span_for_row(current_row) {
+                    Some(span) => span,
+                    None => return Ok(false),
+                };
+                let chunk_limit = (chunk_max - current_row + 1) as usize;
+                let batch_rows = remaining.min(chunk_limit).min(STREAM_BATCH_ROWS);
+
+                temp_row_ids.clear();
+                temp_row_ids.reserve(batch_rows);
+                for offset in 0..batch_rows {
+                    temp_row_ids.push(current_row + offset as u64);
+                }
+
+                let gathered = match self.store.gather_rows_with_reusable_context(
+                    &mut gather_ctx,
+                    &temp_row_ids,
+                    null_policy,
+                ) {
+                    Ok(batch) => batch,
+                    Err(_) => return Ok(false),
+                };
+
+                if gathered.num_rows() > 0 {
+                    let unique_arrays = gathered.columns();
+                    let mut columns = Vec::with_capacity(projection_evals.len());
+                    for eval in projection_evals {
+                        if let ProjectionEval::Column(info) = eval {
+                            let idx = unique_index
+                                .get(&info.logical_field_id)
+                                .copied()
+                                .expect("logical field missing from unique index");
+                            columns.push(Arc::clone(&unique_arrays[idx]));
+                        }
+                    }
+
+                    let batch = RecordBatch::try_new(schema.clone(), columns)?;
+                    on_batch(batch);
+                }
+
+                current_row += batch_rows as u64;
+                remaining -= batch_rows;
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn collect_row_ids_for_filter<'a>(&self, filter: &Filter<'a, FieldId>) -> LlkvResult<Vec<u64>> {
+        let filter_lfid = LogicalFieldId::for_user(self.table_id, filter.field_id);
+        let dtype = self.store.data_type(filter_lfid)?;
+
+        if let Operator::Range {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        } = &filter.op
+            && let Some(runs) = dense_row_runs(&self.store, filter_lfid)?
+        {
+            return Ok(Self::expand_filter_runs(&runs));
+        }
+
+        let row_ids = llkv_column_map::with_integer_arrow_type!(
+            dtype.clone(),
+            |ArrowTy| collect_matching_row_ids::<ArrowTy, P>(&self.store, filter_lfid, &filter.op),
+            Err(Error::Internal(format!(
+                "Filtering on type {:?} is not supported",
+                dtype
+            ))),
+        )?;
+
+        Ok(normalize_row_ids(row_ids))
+    }
+
+    fn collect_row_ids_for_expr<'a>(
+        &self,
+        expr: &Expr<'a, FieldId>,
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
+    ) -> LlkvResult<Vec<u64>> {
         match expr {
-            Expr::Pred(filter) => self.get_stream_for_predicate(filter),
-            Expr::And(sub_expressions) => {
-                let mut streams: Vec<_> = sub_expressions
-                    .iter()
-                    .map(|sub_expr| self.get_row_id_stream(sub_expr))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect();
-
-                if streams.is_empty() {
-                    let (tx, rx) = xchan::unbounded();
-                    drop(tx);
-                    return Ok(Some(rx));
+            Expr::Pred(filter) => self.collect_row_ids_for_filter(filter),
+            Expr::Compare { left, op, right } => {
+                self.collect_row_ids_for_compare(left, *op, right, all_rows_cache)
+            }
+            Expr::And(children) => {
+                if children.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "AND expression requires at least one predicate".into(),
+                    ));
                 }
-
-                let (tx, rx) = xchan::unbounded();
-                thread::spawn(move || {
-                    let mut intersection: FxHashSet<RowId> =
-                        streams.remove(0).into_iter().collect();
-                    for stream in streams {
-                        if intersection.is_empty() {
-                            break;
-                        }
-                        let next_set: FxHashSet<RowId> = stream.into_iter().collect();
-                        intersection.retain(|item| next_set.contains(item));
+                let mut iter = children.iter();
+                let mut acc =
+                    self.collect_row_ids_for_expr(iter.next().unwrap(), all_rows_cache)?;
+                for child in iter {
+                    let next_ids = self.collect_row_ids_for_expr(child, all_rows_cache)?;
+                    if acc.is_empty() || next_ids.is_empty() {
+                        return Ok(Vec::new());
                     }
-
-                    for row_id in intersection {
-                        if tx.send(row_id).is_err() {
-                            break;
-                        }
+                    acc = intersect_sorted(acc, next_ids);
+                    if acc.is_empty() {
+                        break;
                     }
-                });
-                Ok(Some(rx))
+                }
+                Ok(acc)
             }
-            Expr::Or(sub_expressions) => {
-                let streams: Vec<_> = sub_expressions
-                    .iter()
-                    .map(|sub_expr| self.get_row_id_stream(sub_expr))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect();
-
-                let (tx, rx) = xchan::unbounded();
-                thread::spawn(move || {
-                    let mut union_set = FxHashSet::default();
-                    for stream in streams {
-                        for row_id in stream {
-                            union_set.insert(row_id);
-                        }
+            Expr::Or(children) => {
+                if children.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "OR expression requires at least one predicate".into(),
+                    ));
+                }
+                let mut acc = Vec::new();
+                for child in children {
+                    let next_ids = self.collect_row_ids_for_expr(child, all_rows_cache)?;
+                    if acc.is_empty() {
+                        acc = next_ids;
+                    } else if !next_ids.is_empty() {
+                        acc = union_sorted(acc, next_ids);
                     }
-                    for row_id in union_set {
-                        if tx.send(row_id).is_err() {
-                            break;
-                        }
-                    }
-                });
-                Ok(Some(rx))
+                }
+                Ok(acc)
             }
-            Expr::Not(_) => {
-                unimplemented!("`Not` is currently unimplemented");
+            Expr::Not(inner) => {
+                let domain = self.collect_row_ids_domain(inner, all_rows_cache)?;
+                if domain.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let matched = self.collect_row_ids_for_expr(inner, all_rows_cache)?;
+                Ok(difference_sorted(domain, matched))
             }
         }
     }
 
-    fn get_stream_for_predicate<'b>(
-        &'b self,
-        filter: &Filter<'b, FieldId>,
-    ) -> Result<Option<xchan::Receiver<RowId>>, Error> {
-        if let Some(primary_index) = self.indexes.get(&filter.field_id) {
-            match filter.op {
-                Operator::Equals(val) => {
-                    let index_key = IndexKeyCodec::decode_from(val)?;
-                    let primary_snapshot = primary_index.snapshot();
-                    if let Some(root_id_ref) = primary_snapshot.get(&index_key)? {
-                        let root_id = decode_root_id(&root_id_ref);
-                        let (tx, rx) = xchan::unbounded();
-                        let pager = self.pager.clone();
+    #[inline]
+    fn expand_filter_runs(runs: &[FilterRun]) -> Vec<u64> {
+        let total: usize = runs.iter().map(|r| r.len).sum();
+        let mut row_ids = Vec::with_capacity(total);
+        for run in runs {
+            let mut row_id = run.start_row_id;
+            for _ in 0..run.len {
+                row_ids.push(row_id);
+                row_id += 1;
+            }
+        }
+        row_ids
+    }
 
-                        std::thread::spawn(move || {
-                            let row_id_set = RowIdSetTree::open(pager, root_id, None);
-                            let snapshot = row_id_set.snapshot();
-                            if let Ok(iter) = snapshot.iter() {
-                                for (row_id_ref, _) in iter {
-                                    if let Ok(row_id) =
-                                        RowIdKeyCodec::decode_from(row_id_ref.as_ref())
-                                        && tx.send(row_id).is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                        return Ok(Some(rx));
-                    }
+    fn collect_row_ids_for_compare(
+        &self,
+        left: &ScalarExpr<FieldId>,
+        op: CompareOp,
+        right: &ScalarExpr<FieldId>,
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
+    ) -> LlkvResult<Vec<u64>> {
+        let mut fields = FxHashSet::default();
+        NumericKernels::collect_fields(left, &mut fields);
+        NumericKernels::collect_fields(right, &mut fields);
+        if fields.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "Comparison expression must reference at least one column".into(),
+            ));
+        }
+        let mut domain: Option<Vec<u64>> = None;
+        let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
+        ordered_fields.sort_unstable();
+        for fid in &ordered_fields {
+            let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
+            domain = Some(match domain {
+                Some(existing) => intersect_sorted(existing, rows),
+                None => rows,
+            });
+            if let Some(ref d) = domain
+                && d.is_empty()
+            {
+                return Ok(Vec::new());
+            }
+        }
+        let domain = domain.unwrap_or_default();
+        if domain.is_empty() {
+            return Ok(domain);
+        }
+        self.evaluate_compare_over_rows(&domain, &ordered_fields, left, op, right)
+    }
+
+    fn evaluate_compare_over_rows(
+        &self,
+        row_ids: &[u64],
+        fields: &[FieldId],
+        left: &ScalarExpr<FieldId>,
+        op: CompareOp,
+        right: &ScalarExpr<FieldId>,
+    ) -> LlkvResult<Vec<u64>> {
+        if row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lfids: Vec<LogicalFieldId> = fields
+            .iter()
+            .map(|fid| LogicalFieldId::for_user(self.table_id, *fid))
+            .collect();
+        let mut result = Vec::new();
+        let numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
+        let mut start = 0usize;
+        while start < row_ids.len() {
+            let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
+            let window = &row_ids[start..end];
+            let gathered =
+                self.store
+                    .gather_rows(&lfids, window, GatherNullPolicy::IncludeNulls)?;
+            if gathered.num_rows() == 0 {
+                start = end;
+                continue;
+            }
+            let arrays = gathered.columns();
+            let numeric_arrays: NumericArrayMap =
+                NumericKernels::prepare_numeric_arrays(&lfids, arrays, &numeric_fields)?;
+            for (offset, &row_id) in window.iter().enumerate() {
+                let left_val = NumericKernels::evaluate_value(left, offset, &numeric_arrays)?;
+                let right_val = NumericKernels::evaluate_value(right, offset, &numeric_arrays)?;
+                if let (Some(lv), Some(rv)) = (left_val, right_val)
+                    && NumericKernels::compare(op, lv, rv)
+                {
+                    result.push(row_id);
                 }
-                Operator::Range { lower, upper } => {
-                    let lower_key: Option<IndexKey> = match lower {
-                        Bound::Included(b) | Bound::Excluded(b) => {
-                            Some(IndexKeyCodec::decode_from(b)?)
-                        }
-                        Bound::Unbounded => None,
-                    };
+            }
+            start = end;
+        }
+        Ok(result)
+    }
 
-                    let upper_key: Option<IndexKey> = match upper {
-                        Bound::Included(b) | Bound::Excluded(b) => {
-                            Some(IndexKeyCodec::decode_from(b)?)
-                        }
-                        Bound::Unbounded => None,
-                    };
-                    let lower_bound = match (lower, lower_key.as_ref()) {
-                        (Bound::Included(_), Some(k)) => Bound::Included(k),
-                        (Bound::Excluded(_), Some(k)) => Bound::Excluded(k),
-                        _ => Bound::Unbounded,
-                    };
-                    let upper_bound = match (upper, upper_key.as_ref()) {
-                        (Bound::Included(_), Some(k)) => Bound::Included(k),
-                        (Bound::Excluded(_), Some(k)) => Bound::Excluded(k),
-                        _ => Bound::Unbounded,
-                    };
-                    let opts = ScanOpts::forward().with_bounds(lower_bound, upper_bound);
-                    let primary_snapshot = primary_index.snapshot();
-                    let mut root_ids: Vec<RootId> = Vec::new();
-                    if let Ok(primary_iter) = BPlusTreeIter::with_opts(&primary_snapshot, opts) {
-                        for (_, root_id_ref) in primary_iter {
-                            root_ids.push(decode_root_id(&root_id_ref));
-                        }
-                    }
-                    let (tx, rx) = xchan::unbounded();
-                    let pager = self.pager.clone();
-                    rayon::spawn(move || {
-                        root_ids.into_par_iter().for_each(|root_id| {
-                            let row_id_set = RowIdSetTree::open(pager.clone(), root_id, None);
-                            let snapshot = row_id_set.snapshot();
-
-                            if let Ok(iter) = snapshot.iter() {
-                                for (row_id_ref, _) in iter {
-                                    if let Ok(row_id) =
-                                        RowIdKeyCodec::decode_from(row_id_ref.as_ref())
-                                        && tx.send(row_id).is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                            }
-                        });
+    fn collect_row_ids_domain<'a>(
+        &self,
+        expr: &Expr<'a, FieldId>,
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
+    ) -> LlkvResult<Vec<u64>> {
+        match expr {
+            Expr::Pred(filter) => {
+                self.collect_all_row_ids_for_field(filter.field_id, all_rows_cache)
+            }
+            Expr::Compare { left, right, .. } => {
+                let mut fields = FxHashSet::default();
+                NumericKernels::collect_fields(left, &mut fields);
+                NumericKernels::collect_fields(right, &mut fields);
+                if fields.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "Comparison expression must reference at least one column".into(),
+                    ));
+                }
+                let mut domain: Option<Vec<u64>> = None;
+                let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
+                ordered_fields.sort_unstable();
+                for fid in ordered_fields {
+                    let rows = self.collect_all_row_ids_for_field(fid, all_rows_cache)?;
+                    domain = Some(match domain {
+                        Some(existing) => intersect_sorted(existing, rows),
+                        None => rows,
                     });
-                    return Ok(Some(rx));
+                    if let Some(ref d) = domain
+                        && d.is_empty()
+                    {
+                        return Ok(Vec::new());
+                    }
                 }
-                _ => {
-                    unimplemented!()
+                Ok(domain.unwrap_or_default())
+            }
+            Expr::And(children) | Expr::Or(children) => {
+                let mut acc = Vec::new();
+                for child in children {
+                    let next_ids = self.collect_row_ids_domain(child, all_rows_cache)?;
+                    if acc.is_empty() {
+                        acc = next_ids;
+                    } else if !next_ids.is_empty() {
+                        acc = union_sorted(acc, next_ids);
+                    }
                 }
+                Ok(acc)
+            }
+            Expr::Not(inner) => self.collect_row_ids_domain(inner, all_rows_cache),
+        }
+    }
+
+    fn collect_all_row_ids_for_field(
+        &self,
+        field_id: FieldId,
+        cache: &mut FxHashMap<FieldId, Vec<u64>>,
+    ) -> LlkvResult<Vec<u64>> {
+        if let Some(existing) = cache.get(&field_id) {
+            return Ok(existing.clone());
+        }
+
+        let filter = Filter {
+            field_id,
+            op: Operator::Range {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+        };
+
+        let ids = self.collect_row_ids_for_filter(&filter)?;
+        cache.insert(field_id, ids.clone());
+        Ok(ids)
+    }
+
+    #[inline]
+    pub fn catalog(&self) -> SysCatalog<'_, P> {
+        SysCatalog::new(&self.store)
+    }
+
+    #[inline]
+    pub fn put_table_meta(&self, meta: &TableMeta) {
+        debug_assert_eq!(meta.table_id, self.table_id);
+        self.catalog().put_table_meta(meta);
+    }
+
+    #[inline]
+    pub fn get_table_meta(&self) -> Option<TableMeta> {
+        self.catalog().get_table_meta(self.table_id)
+    }
+
+    #[inline]
+    pub fn put_col_meta(&self, meta: &ColMeta) {
+        self.catalog().put_col_meta(self.table_id, meta);
+    }
+
+    #[inline]
+    pub fn get_cols_meta(&self, col_ids: &[FieldId]) -> Vec<Option<ColMeta>> {
+        self.catalog().get_cols_meta(self.table_id, col_ids)
+    }
+
+    pub fn store(&self) -> &ColumnStore<P> {
+        &self.store
+    }
+}
+
+/// Prototype: detect when projections map 1:1 to stored columns and defer to the column-map
+/// `ScanBuilder` for a zero-copy stream. This currently only covers a single `UInt64` column
+/// with an unfiltered range scan, but it demonstrates how we can bypass the gather pipeline.
+fn try_scan_builder_passthrough<'a, P, F>(
+    table: &Table<P>,
+    projection_evals: &[ProjectionEval],
+    passthrough_fields: &[Option<FieldId>],
+    schema: &Arc<Schema>,
+    filter_expr: &Expr<'a, FieldId>,
+    options: &ScanStreamOptions,
+    on_batch: &mut F,
+) -> LlkvResult<bool>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    F: FnMut(RecordBatch),
+{
+    // Out-of-scope scenarios quickly fall back to the existing gather path.
+    if options.include_nulls {
+        return Ok(false);
+    }
+    if projection_evals.len() != 1 {
+        return Ok(false);
+    }
+
+    // Today we only handle either a raw column projection or a computed passthrough that
+    // resolves to a single physical field.
+    let (target_lfid, dtype) = match &projection_evals[0] {
+        ProjectionEval::Column(info) => (info.logical_field_id, info.data_type.clone()),
+        ProjectionEval::Computed(_info) => {
+            let passthrough = match passthrough_fields.first().and_then(|&f| f) {
+                Some(fid) => fid,
+                None => return Ok(false),
+            };
+            let lfid = LogicalFieldId::for_user(table.table_id, passthrough);
+            let dtype = table.store.data_type(lfid)?;
+            (lfid, dtype)
+        }
+    };
+
+    // Limit prototype to UInt64 because that's what the perf regression bench exercises.
+    if !matches!(dtype, DataType::UInt64) {
+        return Ok(false);
+    }
+
+    // Scan builder can natively stream entire columns. Start with the simplest predicate: an
+    // unfiltered range scan (`field BETWEEN -inf AND +inf`).
+    let filter = match filter_expr {
+        Expr::Pred(pred) => pred,
+        _ => return Ok(false),
+    };
+    match &filter.op {
+        Operator::Range {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        } => {}
+        // TODO: extend to handle selective filters (range, point lookups, etc.).
+        _ => return Ok(false),
+    }
+
+    struct BuilderBatchEmitter<'a, F>
+    where
+        F: FnMut(RecordBatch),
+    {
+        schema: Arc<Schema>,
+        on_batch: &'a mut F,
+        error: Option<Error>,
+        emitted: bool,
+    }
+
+    impl<'a, F> PrimitiveVisitor for BuilderBatchEmitter<'a, F>
+    where
+        F: FnMut(RecordBatch),
+    {
+        fn u64_chunk(&mut self, chunk: &UInt64Array) {
+            if self.error.is_some() {
+                return;
+            }
+            let array: ArrayRef = Arc::new(chunk.clone());
+            match RecordBatch::try_new(self.schema.clone(), vec![array]) {
+                Ok(batch) => {
+                    (self.on_batch)(batch);
+                    self.emitted = true;
+                }
+                Err(err) => self.error = Some(Error::from(err)),
             }
         }
-        let (_tx, rx) = xchan::unbounded();
-        Ok(Some(rx))
     }
+
+    impl<'a, F> PrimitiveSortedVisitor for BuilderBatchEmitter<'a, F> where F: FnMut(RecordBatch) {}
+    impl<'a, F> PrimitiveWithRowIdsVisitor for BuilderBatchEmitter<'a, F> where F: FnMut(RecordBatch) {}
+    impl<'a, F> PrimitiveSortedWithRowIdsVisitor for BuilderBatchEmitter<'a, F> where
+        F: FnMut(RecordBatch)
+    {
+    }
+
+    let mut emitter = BuilderBatchEmitter {
+        schema: Arc::clone(schema),
+        on_batch,
+        error: None,
+        emitted: false,
+    };
+
+    let scan_opts = ScanOptions {
+        with_row_ids: false,
+        include_nulls: false,
+        ..Default::default()
+    };
+
+    ScanBuilder::new(&table.store, target_lfid)
+        .options(scan_opts)
+        .run(&mut emitter)?;
+
+    if let Some(err) = emitter.error {
+        return Err(err);
+    }
+
+    Ok(emitter.emitted)
+}
+pub struct ColumnData {
+    pub data: ArrayRef,
+    pub data_type: DataType,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::EMPTY_COL;
-    use crate::expr::Filter;
-    use std::collections::{HashMap, HashSet};
+    use crate::sys_catalog::CATALOG_TID;
+    use crate::types::RowId;
+    use arrow::array::Array;
+    use arrow::array::ArrayRef;
+    use arrow::array::{
+        BinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, UInt8Array, UInt32Array,
+        UInt64Array,
+    };
+    use arrow::compute::{cast, max, min, sum, unary};
+    use llkv_column_map::ColumnStore;
+    use llkv_column_map::store::GatherNullPolicy;
+    use llkv_expr::BinaryOp;
+    use std::collections::HashMap;
+    use std::ops::Bound;
 
-    // All tests from the previous version are included here...
-    // They will pass with this new, correct architecture.
-    #[test]
-    fn it_works_insert_and_scan_using_index() {
-        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
-        table.add_column(1); // Name
-        table.add_index(1);
-        table.add_column(2); // Country
+    fn setup_test_table() -> Table {
+        let pager = Arc::new(MemPager::default());
+        setup_test_table_with_pager(&pager)
+    }
 
-        let row1 = HashMap::from([(1, (100u64, b"Alice".into())), (2, (0u64, b"USA".into()))]);
-        let row2 = HashMap::from([(1, (200u64, b"Bob".into())), (2, (0u64, b"Canada".into()))]);
-        let row3 = HashMap::from([(1, (100u64, b"Alice".into())), (2, (0u64, b"UK".into()))]);
+    fn setup_test_table_with_pager(pager: &Arc<MemPager>) -> Table {
+        let table = Table::new(1, Arc::clone(pager)).unwrap();
+        const COL_A_U64: FieldId = 10;
+        const COL_B_BIN: FieldId = 11;
+        const COL_C_I32: FieldId = 12;
+        const COL_D_F64: FieldId = 13;
+        const COL_E_F32: FieldId = 14;
 
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_A_U64.to_string(),
+            )])),
+            Field::new("b_bin", DataType::Binary, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_B_BIN.to_string(),
+            )])),
+            Field::new("c_i32", DataType::Int32, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_C_I32.to_string(),
+            )])),
+            Field::new("d_f64", DataType::Float64, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_D_F64.to_string(),
+            )])),
+            Field::new("e_f32", DataType::Float32, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_E_F32.to_string(),
+            )])),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(UInt64Array::from(vec![100, 200, 300, 200])),
+                Arc::new(BinaryArray::from(vec![
+                    b"foo" as &[u8],
+                    b"bar",
+                    b"baz",
+                    b"qux",
+                ])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 20])),
+                Arc::new(Float64Array::from(vec![1.5, 2.5, 3.5, 2.5])),
+                Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 2.0])),
+            ],
+        )
+        .unwrap();
+
+        table.append(&batch).unwrap();
         table
-            .insert_many(&[(101, row1), (102, row2), (103, row3)])
-            .unwrap();
+    }
 
-        let filter = Filter {
-            field_id: 1,
-            op: Operator::Equals(&100u64.to_be_bytes()),
-        };
-        let expr = Expr::Pred(filter);
-        let projection = &[2];
+    fn gather_single(
+        store: &ColumnStore<MemPager>,
+        field_id: LogicalFieldId,
+        row_ids: &[u64],
+    ) -> ArrayRef {
+        store
+            .gather_rows(&[field_id], row_ids, GatherNullPolicy::ErrorOnMissing)
+            .unwrap()
+            .column(0)
+            .clone()
+    }
 
-        let mut results = Vec::new();
-        table
-            .scan(&expr, projection, &mut |row_id, values_iter| {
-                let values: Vec<Vec<u8>> = values_iter.map(|v| v.as_slice().to_vec()).collect();
-                results.push((row_id, values));
-            })
-            .unwrap();
+    fn pred_expr<'a>(filter: Filter<'a, FieldId>) -> Expr<'a, FieldId> {
+        Expr::Pred(filter)
+    }
 
-        assert_eq!(results.len(), 2);
+    fn proj(table: &Table, field_id: FieldId) -> Projection {
+        Projection::from(LogicalFieldId::for_user(table.table_id, field_id))
+    }
 
-        let results_set: HashSet<(u64, Vec<Vec<u8>>)> = results.into_iter().collect();
-        let expected_set =
-            HashSet::from([(101, vec![b"USA".to_vec()]), (103, vec![b"UK".to_vec()])]);
-
-        assert_eq!(results_set, expected_set);
+    fn proj_alias<S: Into<String>>(table: &Table, field_id: FieldId, alias: S) -> Projection {
+        Projection::with_alias(LogicalFieldId::for_user(table.table_id, field_id), alias)
     }
 
     #[test]
-    fn it_works_range_scan_using_index() {
-        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
-        table.add_column(1); // User ID
-        table.add_index(1);
-        table.add_column(2); // Data
+    fn table_new_rejects_reserved_table_id() {
+        let result = Table::new(CATALOG_TID, Arc::new(MemPager::default()));
+        assert!(matches!(
+            result,
+            Err(Error::ReservedTableId(id)) if id == CATALOG_TID
+        ));
+    }
 
+    #[test]
+    fn test_scan_with_u64_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let expr = pred_expr(Filter {
+            field_id: COL_A_U64,
+            op: Operator::Equals(200.into()),
+        });
+
+        let mut vals: Vec<Option<i32>> = Vec::new();
         table
-            .insert_many(&[
-                (
-                    1,
-                    HashMap::from([(1, (100u64, EMPTY_COL)), (2, (0u64, b"data_100".into()))]),
-                ),
-                (
-                    2,
-                    HashMap::from([(1, (101u64, EMPTY_COL)), (2, (0u64, b"data_101".into()))]),
-                ),
-                (
-                    3,
-                    HashMap::from([(1, (102u64, EMPTY_COL)), (2, (0u64, b"data_102".into()))]),
-                ),
-                (
-                    4,
-                    HashMap::from([(1, (103u64, EMPTY_COL)), (2, (0u64, b"data_103".into()))]),
-                ),
-                (
-                    5,
-                    HashMap::from([(1, (104u64, EMPTY_COL)), (2, (0u64, b"data_104".into()))]),
-                ),
-                (
-                    6,
-                    HashMap::from([(1, (105u64, EMPTY_COL)), (2, (0u64, b"data_105".into()))]),
-                ),
-            ])
+            .scan_stream(
+                &[proj(&table, COL_C_I32)],
+                &expr,
+                ScanStreamOptions::default(),
+                |b| {
+                    let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                    vals.extend(
+                        (0..a.len()).map(|i| if a.is_null(i) { None } else { Some(a.value(i)) }),
+                    );
+                },
+            )
             .unwrap();
+        assert_eq!(vals, vec![Some(20), Some(20)]);
+    }
 
-        // Define bounds for the range scan: keys >= 102 and < 105
-        let lower_bound_bytes = 102u64.to_be_bytes();
-        let upper_bound_bytes = 105u64.to_be_bytes();
+    #[test]
+    fn test_table_reopen_with_shared_pager() {
+        const TABLE_ALPHA: TableId = 42;
+        const TABLE_BETA: TableId = 43;
+        const TABLE_GAMMA: TableId = 44;
+        const COL_ALPHA_U64: FieldId = 100;
+        const COL_ALPHA_I32: FieldId = 101;
+        const COL_ALPHA_U32: FieldId = 102;
+        const COL_ALPHA_I16: FieldId = 103;
+        const COL_BETA_U64: FieldId = 200;
+        const COL_BETA_U8: FieldId = 201;
+        const COL_GAMMA_I16: FieldId = 300;
 
-        let filter = Filter {
-            field_id: 1,
+        let pager = Arc::new(MemPager::default());
+
+        let alpha_rows: Vec<RowId> = vec![1, 2, 3, 4];
+        let alpha_vals_u64: Vec<u64> = vec![10, 20, 30, 40];
+        let alpha_vals_i32: Vec<i32> = vec![-5, 15, 25, 35];
+        let alpha_vals_u32: Vec<u32> = vec![7, 11, 13, 17];
+        let alpha_vals_i16: Vec<i16> = vec![-2, 4, -6, 8];
+
+        let beta_rows: Vec<u64> = vec![101, 102, 103];
+        let beta_vals_u64: Vec<u64> = vec![900, 901, 902];
+        let beta_vals_u8: Vec<u8> = vec![1, 2, 3];
+
+        let gamma_rows: Vec<u64> = vec![501, 502];
+        let gamma_vals_i16: Vec<i16> = vec![123, -321];
+
+        // First session: create tables and write data.
+        {
+            let table = Table::new(TABLE_ALPHA, Arc::clone(&pager)).unwrap();
+            let schema =
+                Arc::new(Schema::new(vec![
+                    Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+                    Field::new("alpha_u64", DataType::UInt64, false).with_metadata(HashMap::from(
+                        [("field_id".to_string(), COL_ALPHA_U64.to_string())],
+                    )),
+                    Field::new("alpha_i32", DataType::Int32, false).with_metadata(HashMap::from([
+                        ("field_id".to_string(), COL_ALPHA_I32.to_string()),
+                    ])),
+                    Field::new("alpha_u32", DataType::UInt32, false).with_metadata(HashMap::from(
+                        [("field_id".to_string(), COL_ALPHA_U32.to_string())],
+                    )),
+                    Field::new("alpha_i16", DataType::Int16, false).with_metadata(HashMap::from([
+                        ("field_id".to_string(), COL_ALPHA_I16.to_string()),
+                    ])),
+                ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt64Array::from(alpha_rows.clone())),
+                    Arc::new(UInt64Array::from(alpha_vals_u64.clone())),
+                    Arc::new(Int32Array::from(alpha_vals_i32.clone())),
+                    Arc::new(UInt32Array::from(alpha_vals_u32.clone())),
+                    Arc::new(Int16Array::from(alpha_vals_i16.clone())),
+                ],
+            )
+            .unwrap();
+            table.append(&batch).unwrap();
+        }
+
+        {
+            let table = Table::new(TABLE_BETA, Arc::clone(&pager)).unwrap();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+                Field::new("beta_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
+                    "field_id".to_string(),
+                    COL_BETA_U64.to_string(),
+                )])),
+                Field::new("beta_u8", DataType::UInt8, false).with_metadata(HashMap::from([(
+                    "field_id".to_string(),
+                    COL_BETA_U8.to_string(),
+                )])),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt64Array::from(beta_rows.clone())),
+                    Arc::new(UInt64Array::from(beta_vals_u64.clone())),
+                    Arc::new(UInt8Array::from(beta_vals_u8.clone())),
+                ],
+            )
+            .unwrap();
+            table.append(&batch).unwrap();
+        }
+
+        {
+            let table = Table::new(TABLE_GAMMA, Arc::clone(&pager)).unwrap();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+                Field::new("gamma_i16", DataType::Int16, false).with_metadata(HashMap::from([(
+                    "field_id".to_string(),
+                    COL_GAMMA_I16.to_string(),
+                )])),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt64Array::from(gamma_rows.clone())),
+                    Arc::new(Int16Array::from(gamma_vals_i16.clone())),
+                ],
+            )
+            .unwrap();
+            table.append(&batch).unwrap();
+        }
+
+        // Second session: reopen each table and ensure schema and values are intact.
+        {
+            let table = Table::new(TABLE_ALPHA, Arc::clone(&pager)).unwrap();
+            let store = table.store();
+
+            let expectations: &[(FieldId, DataType)] = &[
+                (COL_ALPHA_U64, DataType::UInt64),
+                (COL_ALPHA_I32, DataType::Int32),
+                (COL_ALPHA_U32, DataType::UInt32),
+                (COL_ALPHA_I16, DataType::Int16),
+            ];
+
+            for &(col, ref ty) in expectations {
+                let lfid = LogicalFieldId::for_user(TABLE_ALPHA, col);
+                assert_eq!(store.data_type(lfid).unwrap(), *ty);
+                let arr = gather_single(store, lfid, &alpha_rows);
+                match ty {
+                    DataType::UInt64 => {
+                        let arr = arr.as_any().downcast_ref::<UInt64Array>().unwrap();
+                        assert_eq!(arr.values(), alpha_vals_u64.as_slice());
+                    }
+                    DataType::Int32 => {
+                        let arr = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+                        assert_eq!(arr.values(), alpha_vals_i32.as_slice());
+                    }
+                    DataType::UInt32 => {
+                        let arr = arr.as_any().downcast_ref::<UInt32Array>().unwrap();
+                        assert_eq!(arr.values(), alpha_vals_u32.as_slice());
+                    }
+                    DataType::Int16 => {
+                        let arr = arr.as_any().downcast_ref::<Int16Array>().unwrap();
+                        assert_eq!(arr.values(), alpha_vals_i16.as_slice());
+                    }
+                    other => panic!("unexpected dtype {other:?}"),
+                }
+            }
+        }
+
+        {
+            let table = Table::new(TABLE_BETA, Arc::clone(&pager)).unwrap();
+            let store = table.store();
+
+            let lfid_u64 = LogicalFieldId::for_user(TABLE_BETA, COL_BETA_U64);
+            assert_eq!(store.data_type(lfid_u64).unwrap(), DataType::UInt64);
+            let arr_u64 = gather_single(store, lfid_u64, &beta_rows);
+            let arr_u64 = arr_u64.as_any().downcast_ref::<UInt64Array>().unwrap();
+            assert_eq!(arr_u64.values(), beta_vals_u64.as_slice());
+
+            let lfid_u8 = LogicalFieldId::for_user(TABLE_BETA, COL_BETA_U8);
+            assert_eq!(store.data_type(lfid_u8).unwrap(), DataType::UInt8);
+            let arr_u8 = gather_single(store, lfid_u8, &beta_rows);
+            let arr_u8 = arr_u8.as_any().downcast_ref::<UInt8Array>().unwrap();
+            assert_eq!(arr_u8.values(), beta_vals_u8.as_slice());
+        }
+
+        {
+            let table = Table::new(TABLE_GAMMA, Arc::clone(&pager)).unwrap();
+            let store = table.store();
+            let lfid = LogicalFieldId::for_user(TABLE_GAMMA, COL_GAMMA_I16);
+            assert_eq!(store.data_type(lfid).unwrap(), DataType::Int16);
+            let arr = gather_single(store, lfid, &gamma_rows);
+            let arr = arr.as_any().downcast_ref::<Int16Array>().unwrap();
+            assert_eq!(arr.values(), gamma_vals_i16.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_scan_with_i32_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = pred_expr(Filter {
+            field_id: COL_C_I32,
+            op: Operator::Equals(20.into()),
+        });
+
+        let mut vals: Vec<Option<u64>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    vals.extend(
+                        (0..a.len()).map(|i| if a.is_null(i) { None } else { Some(a.value(i)) }),
+                    );
+                },
+            )
+            .unwrap();
+        assert_eq!(vals, vec![Some(200), Some(200)]);
+    }
+
+    #[test]
+    fn test_scan_with_greater_than_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = pred_expr(Filter {
+            field_id: COL_C_I32,
+            op: Operator::GreaterThan(15.into()),
+        });
+
+        let mut vals: Vec<Option<u64>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    vals.extend(
+                        (0..a.len()).map(|i| if a.is_null(i) { None } else { Some(a.value(i)) }),
+                    );
+                },
+            )
+            .unwrap();
+        assert_eq!(vals, vec![Some(200), Some(300), Some(200)]);
+    }
+
+    #[test]
+    fn test_scan_with_range_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = pred_expr(Filter {
+            field_id: COL_A_U64,
             op: Operator::Range {
-                lower: Bound::Included(&lower_bound_bytes),
-                upper: Bound::Excluded(&upper_bound_bytes),
+                lower: Bound::Included(150.into()),
+                upper: Bound::Excluded(300.into()),
             },
-        };
-        let expr = Expr::Pred(filter);
-        let projection = &[2]; // Project the data column
+        });
 
-        let mut results = Vec::new();
+        let mut vals: Vec<Option<i32>> = Vec::new();
         table
-            .scan(&expr, projection, &mut |row_id, values_iter| {
-                let values: Vec<Vec<u8>> = values_iter.map(|v| v.as_slice().to_vec()).collect();
-                results.push((row_id, values));
-            })
+            .scan_stream(
+                &[proj(&table, COL_C_I32)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                    vals.extend(
+                        (0..a.len()).map(|i| if a.is_null(i) { None } else { Some(a.value(i)) }),
+                    );
+                },
+            )
+            .unwrap();
+        assert_eq!(vals, vec![Some(20), Some(20)]);
+    }
+
+    #[test]
+    fn test_filtered_scan_sum_kernel() {
+        // Trade-off note:
+        // - We use Arrow's sum kernel per batch, then add the partial sums.
+        // - This preserves Arrow null semantics and avoids concat.
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+
+        let filter = pred_expr(Filter {
+            field_id: COL_A_U64,
+            op: Operator::Range {
+                lower: Bound::Included(150.into()),
+                upper: Bound::Excluded(300.into()),
+            },
+        });
+
+        let mut total: u128 = 0;
+        table
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    if let Some(part) = sum(a) {
+                        total += part as u128;
+                    }
+                },
+            )
             .unwrap();
 
-        // Expect to find rows with index keys 102, 103, and 104
-        assert_eq!(results.len(), 3);
+        assert_eq!(total, 400);
+    }
 
-        let results_set: HashSet<(u64, Vec<Vec<u8>>)> = results.into_iter().collect();
-        let expected_set = HashSet::from([
-            (3, vec![b"data_102".to_vec()]),
-            (4, vec![b"data_103".to_vec()]),
-            (5, vec![b"data_104".to_vec()]),
+    #[test]
+    fn test_filtered_scan_sum_i32_kernel() {
+        // Trade-off note:
+        // - Per-batch sum + accumulate avoids building one big Array.
+        // - For tiny batches overhead may match manual loops, but keeps
+        //   Arrow semantics exact.
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let candidates = [100.into(), 300.into()];
+        let filter = pred_expr(Filter {
+            field_id: COL_A_U64,
+            op: Operator::In(&candidates),
+        });
+
+        let mut total: i64 = 0;
+        table
+            .scan_stream(
+                &[proj(&table, COL_C_I32)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                    if let Some(part) = sum(a) {
+                        total += part as i64;
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(total, 40);
+    }
+
+    #[test]
+    fn test_filtered_scan_min_max_kernel() {
+        // Trade-off note:
+        // - min/max are computed per batch and folded. This preserves
+        //   Arrow's null behavior and avoids concat.
+        // - Be mindful of NaN semantics if extended to floats later.
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let candidates = [100.into(), 300.into()];
+        let filter = pred_expr(Filter {
+            field_id: COL_A_U64,
+            op: Operator::In(&candidates),
+        });
+
+        let mut mn: Option<i32> = None;
+        let mut mx: Option<i32> = None;
+        table
+            .scan_stream(
+                &[proj(&table, COL_C_I32)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+
+                    if let Some(part_min) = min(a) {
+                        mn = Some(mn.map_or(part_min, |m| m.min(part_min)));
+                    }
+                    if let Some(part_max) = max(a) {
+                        mx = Some(mx.map_or(part_max, |m| m.max(part_max)));
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(mn, Some(10));
+        assert_eq!(mx, Some(30));
+    }
+
+    #[test]
+    fn test_filtered_scan_float64_column() {
+        let table = setup_test_table();
+        const COL_D_F64: FieldId = 13;
+
+        let filter = pred_expr(Filter {
+            field_id: COL_D_F64,
+            op: Operator::GreaterThan(2.0_f64.into()),
+        });
+
+        let mut got = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_D_F64)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            got.push(arr.value(i));
+                        }
+                    }
+                },
+            )
+            .unwrap();
+
+        assert_eq!(got, vec![2.5, 3.5, 2.5]);
+    }
+
+    #[test]
+    fn test_filtered_scan_float32_in_operator() {
+        let table = setup_test_table();
+        const COL_E_F32: FieldId = 14;
+
+        let candidates = [2.0_f32.into(), 3.0_f32.into()];
+        let filter = pred_expr(Filter {
+            field_id: COL_E_F32,
+            op: Operator::In(&candidates),
+        });
+
+        let mut vals: Vec<Option<f32>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_E_F32)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<Float32Array>().unwrap();
+                    vals.extend((0..arr.len()).map(|i| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    }));
+                },
+            )
+            .unwrap();
+
+        let collected: Vec<f32> = vals.into_iter().flatten().collect();
+        assert_eq!(collected, vec![2.0, 3.0, 2.0]);
+    }
+
+    #[test]
+    fn test_scan_stream_and_expression() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+        const COL_E_F32: FieldId = 14;
+
+        let expr = Expr::all_of(vec![
+            Filter {
+                field_id: COL_C_I32,
+                op: Operator::GreaterThan(15.into()),
+            },
+            Filter {
+                field_id: COL_A_U64,
+                op: Operator::LessThan(250.into()),
+            },
         ]);
 
-        assert_eq!(results_set, expected_set);
+        let mut vals: Vec<Option<f32>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_E_F32)],
+                &expr,
+                ScanStreamOptions::default(),
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<Float32Array>().unwrap();
+                    vals.extend((0..arr.len()).map(|i| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    }));
+                },
+            )
+            .unwrap();
+
+        assert_eq!(vals, vec![Some(2.0_f32), Some(2.0_f32)]);
     }
 
     #[test]
-    fn it_works_complex_multi_column_scans() {
-        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
+    fn test_scan_stream_or_expression() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
 
-        // --- Setup: 10 columns, 3 of which are indexed ---
-        for i in 1..=10 {
-            table.add_column(i);
-        }
-        table.add_index(1); // High cardinality (unique)
-        table.add_index(2); // Medium cardinality (100 unique values)
-        table.add_index(3); // Low cardinality (5 unique values)
-
-        // --- Insert 5000 rows ---
-        let num_rows = 5000;
-        let mut rows_to_insert = Vec::with_capacity(num_rows);
-        for i in 0..num_rows {
-            let row_id = i as RowId;
-            let mut row_data = HashMap::new();
-
-            // Indexed columns
-            row_data.insert(1, (1000 + row_id, EMPTY_COL)); // Unique key
-            row_data.insert(2, (row_id % 100, EMPTY_COL)); // 100 different keys
-            row_data.insert(3, (row_id % 5, EMPTY_COL)); // 5 different keys
-
-            // Non-indexed data payload columns
-            for j in 4..=10 {
-                row_data.insert(
-                    j,
-                    (0, format!("col{}_row{}", j, row_id).into_bytes().into()),
-                );
-            }
-            rows_to_insert.push((row_id, row_data));
-        }
-        table.insert_many(&rows_to_insert).unwrap();
-
-        // --- Test 1: Forward Range Scan on high-cardinality index (Field 1) ---
-        let lower_1 = 3000u64.to_be_bytes();
-        let upper_1 = 4000u64.to_be_bytes();
-        let filter_1 = Filter {
-            field_id: 1,
-            op: Operator::Range {
-                lower: Bound::Included(&lower_1),
-                upper: Bound::Excluded(&upper_1),
+        let expr = Expr::any_of(vec![
+            Filter {
+                field_id: COL_C_I32,
+                op: Operator::Equals(10.into()),
             },
-        };
-        let expr_1 = Expr::Pred(filter_1);
-        let mut results_1 = Vec::new();
-        table
-            .scan(&expr_1, &[4], &mut |row_id, values_iter| {
-                results_1.push((row_id, values_iter.last().unwrap().as_slice().to_vec()));
-            })
-            .unwrap();
-
-        assert_eq!(results_1.len(), 1000); // Should find 1000 rows
-        results_1.sort_by_key(|(k, _)| *k);
-        assert_eq!(results_1[0].0, 2000); // 1000 + 2000 = 3000
-        assert_eq!(results_1[0].1, b"col4_row2000".to_vec());
-        assert_eq!(results_1[999].0, 2999); // 1000 + 2999 = 3999
-        assert_eq!(results_1[999].1, b"col4_row2999".to_vec());
-
-        // --- Test 2: Equality Scan on medium-cardinality index (Field 2) ---
-        let key_2 = 42u64.to_be_bytes();
-        let filter_2 = Filter {
-            field_id: 2,
-            op: Operator::Equals(&key_2),
-        };
-        let expr_2 = Expr::Pred(filter_2);
-        let mut results_2 = Vec::new();
-        table
-            .scan(&expr_2, &[], &mut |row_id, _| {
-                results_2.push(row_id);
-            })
-            .unwrap();
-
-        assert_eq!(results_2.len(), 50); // 5000 / 100 = 50
-        assert!(results_2.iter().all(|&rid| rid % 100 == 42));
-
-        // --- Test 3: Range Scan on low-cardinality index (Field 3) ---
-        let lower_3 = 2u64.to_be_bytes();
-        let upper_3 = 4u64.to_be_bytes();
-        let filter_3 = Filter {
-            field_id: 3,
-            op: Operator::Range {
-                lower: Bound::Included(&lower_3),
-                upper: Bound::Excluded(&upper_3),
+            Filter {
+                field_id: COL_C_I32,
+                op: Operator::Equals(30.into()),
             },
-        };
-        let expr_3 = Expr::Pred(filter_3);
-        let mut results_3 = Vec::new();
+        ]);
+
+        let mut vals: Vec<Option<u64>> = Vec::new();
         table
-            .scan(&expr_3, &[], &mut |row_id, _| {
-                results_3.push(row_id);
-            })
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &expr,
+                ScanStreamOptions::default(),
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    vals.extend((0..arr.len()).map(|i| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    }));
+                },
+            )
             .unwrap();
 
-        // Should find rows where row_id % 5 is 2 or 3.
-        // Each category has 5000 / 5 = 1000 rows. So 2000 total.
-        assert_eq!(results_3.len(), 2000);
-        assert!(results_3.iter().all(|&rid| rid % 5 == 2 || rid % 5 == 3));
+        assert_eq!(vals, vec![Some(100), Some(300)]);
     }
 
     #[test]
-    fn it_works_intersections_and_unions() {
-        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
-        table.add_column(1);
-        table.add_index(1); // City ID
-        table.add_column(2);
-        table.add_index(2); // Category ID
-        table.add_column(3); // Payload
+    fn test_scan_stream_not_predicate() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
 
-        let rows = vec![
-            (
-                10,
-                HashMap::from([
-                    (1, (1, EMPTY_COL)),
-                    (2, (10, EMPTY_COL)),
-                    (3, (0, b"Restaurant in NYC".into())),
-                ]),
-            ),
-            (
-                20,
-                HashMap::from([
-                    (1, (1, EMPTY_COL)),
-                    (2, (20, EMPTY_COL)),
-                    (3, (0, b"Museum in NYC".into())),
-                ]),
-            ),
-            (
-                30,
-                HashMap::from([
-                    (1, (2, EMPTY_COL)),
-                    (2, (10, EMPTY_COL)),
-                    (3, (0, b"Restaurant in London".into())),
-                ]),
-            ),
-            (
-                40,
-                HashMap::from([
-                    (1, (2, EMPTY_COL)),
-                    (2, (30, EMPTY_COL)),
-                    (3, (0, b"Theatre in London".into())),
-                ]),
-            ),
-            (
-                50,
-                HashMap::from([
-                    (1, (1, EMPTY_COL)),
-                    (2, (10, EMPTY_COL)),
-                    (3, (0, b"Another Restaurant in NYC".into())),
-                ]),
+        let expr = Expr::not(pred_expr(Filter {
+            field_id: COL_C_I32,
+            op: Operator::Equals(20.into()),
+        }));
+
+        let mut vals: Vec<Option<u64>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &expr,
+                ScanStreamOptions::default(),
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    vals.extend((0..arr.len()).map(|i| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    }));
+                },
+            )
+            .unwrap();
+
+        assert_eq!(vals, vec![Some(100), Some(300)]);
+    }
+
+    #[test]
+    fn test_scan_stream_not_and_expression() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let expr = Expr::not(Expr::all_of(vec![
+            Filter {
+                field_id: COL_A_U64,
+                op: Operator::GreaterThan(150.into()),
+            },
+            Filter {
+                field_id: COL_C_I32,
+                op: Operator::LessThan(40.into()),
+            },
+        ]));
+
+        let mut vals: Vec<Option<u64>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &expr,
+                ScanStreamOptions::default(),
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    vals.extend((0..arr.len()).map(|i| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    }));
+                },
+            )
+            .unwrap();
+
+        assert_eq!(vals, vec![Some(100)]);
+    }
+
+    #[test]
+    fn test_scan_stream_include_nulls_toggle() {
+        let pager = Arc::new(MemPager::default());
+        let table = setup_test_table_with_pager(&pager);
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+        const COL_B_BIN: FieldId = 11;
+        const COL_D_F64: FieldId = 13;
+        const COL_E_F32: FieldId = 14;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_A_U64.to_string(),
+            )])),
+            Field::new("b_bin", DataType::Binary, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_B_BIN.to_string(),
+            )])),
+            Field::new("c_i32", DataType::Int32, true).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_C_I32.to_string(),
+            )])),
+            Field::new("d_f64", DataType::Float64, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_D_F64.to_string(),
+            )])),
+            Field::new("e_f32", DataType::Float32, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_E_F32.to_string(),
+            )])),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![5, 6])),
+                Arc::new(UInt64Array::from(vec![500, 600])),
+                Arc::new(BinaryArray::from(vec![
+                    Some(&b"new"[..]),
+                    Some(&b"alt"[..]),
+                ])),
+                Arc::new(Int32Array::from(vec![Some(40), None])),
+                Arc::new(Float64Array::from(vec![5.5, 6.5])),
+                Arc::new(Float32Array::from(vec![5.0, 6.0])),
+            ],
+        )
+        .unwrap();
+        table.append(&batch).unwrap();
+
+        let filter = pred_expr(Filter {
+            field_id: COL_A_U64,
+            op: Operator::GreaterThan(450.into()),
+        });
+
+        let mut default_vals: Vec<Option<i32>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_C_I32)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                    default_vals.extend((0..arr.len()).map(|i| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    }));
+                },
+            )
+            .unwrap();
+        assert_eq!(default_vals, vec![Some(40)]);
+
+        let mut include_null_vals: Vec<Option<i32>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_C_I32)],
+                &filter,
+                ScanStreamOptions {
+                    include_nulls: true,
+                },
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+
+                    let mut paired_vals: Vec<(Option<i32>, Option<f64>)> = Vec::new();
+                    table
+                        .scan_stream(
+                            &[proj(&table, COL_C_I32), proj(&table, COL_D_F64)],
+                            &filter,
+                            ScanStreamOptions::default(),
+                            |b| {
+                                assert_eq!(b.num_columns(), 2);
+                                let c_arr =
+                                    b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                                let d_arr =
+                                    b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+                                for i in 0..b.num_rows() {
+                                    let c_val = if c_arr.is_null(i) {
+                                        None
+                                    } else {
+                                        Some(c_arr.value(i))
+                                    };
+                                    let d_val = if d_arr.is_null(i) {
+                                        None
+                                    } else {
+                                        Some(d_arr.value(i))
+                                    };
+                                    paired_vals.push((c_val, d_val));
+                                }
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(paired_vals, vec![(Some(40), Some(5.5)), (None, Some(6.5))]);
+                    include_null_vals.extend((0..arr.len()).map(|i| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    }));
+                },
+            )
+            .unwrap();
+        assert_eq!(include_null_vals, vec![Some(40), None]);
+    }
+
+    #[test]
+    fn test_filtered_scan_int_sqrt_float64() {
+        // Trade-off note:
+        // - We cast per batch and apply a compute unary kernel for sqrt.
+        // - This keeps processing streaming and avoids per-value loops.
+        // - `unary` operates on `PrimitiveArray<T>`; cast and downcast to
+        //   `Float64Array` first.
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = pred_expr(Filter {
+            field_id: COL_C_I32,
+            op: Operator::GreaterThan(15.into()),
+        });
+
+        let mut got: Vec<f64> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let casted = cast(b.column(0), &arrow::datatypes::DataType::Float64).unwrap();
+                    let f64_arr = casted.as_any().downcast_ref::<Float64Array>().unwrap();
+
+                    // unary::<Float64Type, _, Float64Type>(...)
+                    let sqrt_arr = unary::<
+                        arrow::datatypes::Float64Type,
+                        _,
+                        arrow::datatypes::Float64Type,
+                    >(f64_arr, |v: f64| v.sqrt());
+
+                    for i in 0..sqrt_arr.len() {
+                        if !sqrt_arr.is_null(i) {
+                            got.push(sqrt_arr.value(i));
+                        }
+                    }
+                },
+            )
+            .unwrap();
+
+        let expected = [200_f64.sqrt(), 300_f64.sqrt(), 200_f64.sqrt()];
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_multi_field_kernels_with_filters() {
+        // Trade-off note:
+        // - All reductions use per-batch kernels + accumulation to stay
+        //   streaming. No concat or whole-column materialization.
+        use arrow::array::{Int16Array, UInt8Array, UInt32Array};
+
+        let table = Table::new(2, Arc::new(MemPager::default())).unwrap();
+
+        const COL_A_U64: FieldId = 20;
+        const COL_D_U32: FieldId = 21;
+        const COL_E_I16: FieldId = 22;
+        const COL_F_U8: FieldId = 23;
+        const COL_C_I32: FieldId = 24;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_A_U64.to_string(),
+            )])),
+            Field::new("d_u32", DataType::UInt32, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_D_U32.to_string(),
+            )])),
+            Field::new("e_i16", DataType::Int16, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_E_I16.to_string(),
+            )])),
+            Field::new("f_u8", DataType::UInt8, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_F_U8.to_string(),
+            )])),
+            Field::new("c_i32", DataType::Int32, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_C_I32.to_string(),
+            )])),
+        ]));
+
+        // Data: 5 rows. We will filter c_i32 >= 20 -> keep rows 2..5.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(UInt64Array::from(vec![100, 225, 400, 900, 1600])),
+                Arc::new(UInt32Array::from(vec![7, 8, 9, 10, 11])),
+                Arc::new(Int16Array::from(vec![-3, 0, 3, -6, 6])),
+                Arc::new(UInt8Array::from(vec![2, 4, 6, 8, 10])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+
+        table.append(&batch).unwrap();
+
+        // Filter: c_i32 >= 20.
+        let filter = pred_expr(Filter {
+            field_id: COL_C_I32,
+            op: Operator::GreaterThanOrEquals(20.into()),
+        });
+
+        // 1) SUM over d_u32 (per-batch sum + accumulate).
+        let mut d_sum: u128 = 0;
+        table
+            .scan_stream(
+                &[proj(&table, COL_D_U32)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let a = b.column(0).as_any().downcast_ref::<UInt32Array>().unwrap();
+                    if let Some(part) = sum(a) {
+                        d_sum += part as u128;
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(d_sum, (8 + 9 + 10 + 11) as u128);
+
+        // 2) MIN over e_i16 (per-batch min + fold).
+        let mut e_min: Option<i16> = None;
+        table
+            .scan_stream(
+                &[proj(&table, COL_E_I16)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let a = b.column(0).as_any().downcast_ref::<Int16Array>().unwrap();
+                    if let Some(part_min) = min(a) {
+                        e_min = Some(e_min.map_or(part_min, |m| m.min(part_min)));
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(e_min, Some(-6));
+
+        // 3) MAX over f_u8 (per-batch max + fold).
+        let mut f_max: Option<u8> = None;
+        table
+            .scan_stream(
+                &[proj(&table, COL_F_U8)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let a = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::UInt8Array>()
+                        .unwrap();
+                    if let Some(part_max) = max(a) {
+                        f_max = Some(f_max.map_or(part_max, |m| m.max(part_max)));
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(f_max, Some(10));
+
+        // 4) SQRT over a_u64 (cast to f64, then unary sqrt per batch).
+        let mut got: Vec<f64> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let casted = cast(b.column(0), &arrow::datatypes::DataType::Float64).unwrap();
+                    let f64_arr = casted.as_any().downcast_ref::<Float64Array>().unwrap();
+                    let sqrt_arr = unary::<
+                        arrow::datatypes::Float64Type,
+                        _,
+                        arrow::datatypes::Float64Type,
+                    >(f64_arr, |v: f64| v.sqrt());
+
+                    for i in 0..sqrt_arr.len() {
+                        if !sqrt_arr.is_null(i) {
+                            got.push(sqrt_arr.value(i));
+                        }
+                    }
+                },
+            )
+            .unwrap();
+        let expected = [15.0_f64, 20.0, 30.0, 40.0];
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_scan_with_in_filter() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        // IN now uses untyped literals, too.
+        let candidates = [10.into(), 30.into()];
+        let filter = pred_expr(Filter {
+            field_id: COL_C_I32,
+            op: Operator::In(&candidates),
+        });
+
+        let mut vals: Vec<Option<u64>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    vals.extend(
+                        (0..a.len()).map(|i| if a.is_null(i) { None } else { Some(a.value(i)) }),
+                    );
+                },
+            )
+            .unwrap();
+        assert_eq!(vals, vec![Some(100), Some(300)]);
+    }
+
+    #[test]
+    fn test_scan_stream_single_column_batches() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        // Filter c_i32 == 20 -> two rows; stream a_u64 in batches of <= N.
+        let filter = pred_expr(Filter {
+            field_id: COL_C_I32,
+            op: Operator::Equals(20.into()),
+        });
+
+        let mut seen_cols = Vec::<u64>::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    assert_eq!(b.num_columns(), 1);
+                    let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    // No kernel needed; just collect values for shape assertions.
+                    for i in 0..a.len() {
+                        if !a.is_null(i) {
+                            seen_cols.push(a.value(i));
+                        }
+                    }
+                },
+            )
+            .unwrap();
+
+        // In fixture, c_i32 == 20 corresponds to a_u64 values [200, 200].
+        assert_eq!(seen_cols, vec![200, 200]);
+    }
+
+    #[test]
+    fn test_scan_with_multiple_projection_columns() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = pred_expr(Filter {
+            field_id: COL_C_I32,
+            op: Operator::Equals(20.into()),
+        });
+
+        let expected_names = [COL_A_U64.to_string(), COL_C_I32.to_string()];
+
+        let mut combined: Vec<(Option<u64>, Option<i32>)> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_A_U64), proj(&table, COL_C_I32)],
+                &filter,
+                ScanStreamOptions::default(),
+                |b| {
+                    assert_eq!(b.num_columns(), 2);
+                    assert_eq!(b.schema().field(0).name(), &expected_names[0]);
+                    assert_eq!(b.schema().field(1).name(), &expected_names[1]);
+
+                    let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    let c = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+                    for i in 0..b.num_rows() {
+                        let left = if a.is_null(i) { None } else { Some(a.value(i)) };
+                        let right = if c.is_null(i) { None } else { Some(c.value(i)) };
+                        combined.push((left, right));
+                    }
+                },
+            )
+            .unwrap();
+
+        assert_eq!(combined, vec![(Some(200), Some(20)), (Some(200), Some(20))]);
+    }
+
+    #[test]
+    fn test_scan_stream_projection_validation() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = pred_expr(Filter {
+            field_id: COL_C_I32,
+            op: Operator::Equals(20.into()),
+        });
+
+        let empty: [Projection; 0] = [];
+        let result = table.scan_stream(&empty, &filter, ScanStreamOptions::default(), |_batch| {});
+        assert!(matches!(result, Err(Error::InvalidArgumentError(_))));
+
+        // Duplicate projections are allowed: the same column will be
+        // gathered once and duplicated in the output in the requested
+        // order. Verify the call succeeds and produces two identical
+        // columns per batch.
+        let duplicate = [
+            proj(&table, COL_A_U64),
+            proj_alias(&table, COL_A_U64, "alias_a"),
+        ];
+        let mut collected = Vec::<u64>::new();
+        table
+            .scan_stream(&duplicate, &filter, ScanStreamOptions::default(), |b| {
+                assert_eq!(b.num_columns(), 2);
+                assert_eq!(b.schema().field(0).name(), &COL_A_U64.to_string());
+                assert_eq!(b.schema().field(1).name(), "alias_a");
+                let a0 = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                let a1 = b.column(1).as_any().downcast_ref::<UInt64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    if !a0.is_null(i) {
+                        collected.push(a0.value(i));
+                    }
+                    if !a1.is_null(i) {
+                        collected.push(a1.value(i));
+                    }
+                }
+            })
+            .unwrap();
+        // Two matching rows, two columns per row -> four values.
+        assert_eq!(collected, vec![200, 200, 200, 200]);
+    }
+
+    #[test]
+    fn test_scan_stream_computed_projection() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+
+        let projections = [
+            StreamProjection::column(proj(&table, COL_A_U64)),
+            StreamProjection::computed(
+                ScalarExpr::binary(
+                    ScalarExpr::column(COL_A_U64),
+                    BinaryOp::Multiply,
+                    ScalarExpr::literal(2),
+                ),
+                "a_times_two",
             ),
         ];
-        table.insert_many(&rows).unwrap();
 
-        // --- Test 1: Intersection (AND) ---
-        // Find: Restaurants (category 10) in NYC (city 1)
-        let city_nyc = 1u64.to_be_bytes();
-        let cat_restaurant = 10u64.to_be_bytes();
-        let expr_and = Expr::And(vec![
-            Expr::Pred(Filter {
-                field_id: 1,
-                op: Operator::Equals(&city_nyc),
-            }),
-            Expr::Pred(Filter {
-                field_id: 2,
-                op: Operator::Equals(&cat_restaurant),
-            }),
-        ]);
+        let filter = pred_expr(Filter {
+            field_id: COL_A_U64,
+            op: Operator::GreaterThanOrEquals(0.into()),
+        });
 
-        let mut results_and = Vec::new();
+        let mut computed: Vec<(u64, f64)> = Vec::new();
         table
-            .scan(&expr_and, &[], &mut |row_id, _| {
-                results_and.push(row_id);
+            .scan_stream_with_exprs(&projections, &filter, ScanStreamOptions::default(), |b| {
+                assert_eq!(b.num_columns(), 2);
+                let base = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                let comp = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    if base.is_null(i) || comp.is_null(i) {
+                        continue;
+                    }
+                    computed.push((base.value(i), comp.value(i)));
+                }
             })
             .unwrap();
 
-        let expected_and: HashSet<u64> = [10, 50].iter().cloned().collect();
-        let got_and: HashSet<u64> = results_and.into_iter().collect();
-        assert_eq!(got_and, expected_and);
-
-        // --- Test 2: Union (OR) ---
-        // Find: anything in NYC (city 1) OR any Restaurant (category 10)
-        let expr_or = Expr::Or(vec![
-            Expr::Pred(Filter {
-                field_id: 1,
-                op: Operator::Equals(&city_nyc),
-            }),
-            Expr::Pred(Filter {
-                field_id: 2,
-                op: Operator::Equals(&cat_restaurant),
-            }),
-        ]);
-
-        let mut results_or = Vec::new();
-        table
-            .scan(&expr_or, &[], &mut |row_id, _| {
-                results_or.push(row_id);
-            })
-            .unwrap();
-
-        let expected_or: HashSet<u64> = [10, 20, 30, 50].iter().cloned().collect();
-        let got_or: HashSet<u64> = results_or.into_iter().collect();
-        assert_eq!(got_or, expected_or);
+        let expected = vec![(100, 200.0), (200, 400.0), (300, 600.0), (200, 400.0)];
+        assert_eq!(computed, expected);
     }
 
     #[test]
-    fn it_works_large_scale_intersections_and_unions() {
-        let mut table: Table<SharedPager<MemPager64>> = Table::new(4096);
+    fn test_scan_stream_multi_column_filter_compare() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
 
-        // --- Setup: 10 columns, 3 with indexes ---
-        for i in 1..=10 {
-            table.add_column(i);
-        }
-        table.add_index(1); // Country ID (10 values)
-        table.add_index(2); // Status ID (5 values)
-        table.add_index(3); // Category ID (100 values)
+        let expr = Expr::Compare {
+            left: ScalarExpr::binary(
+                ScalarExpr::column(COL_A_U64),
+                BinaryOp::Add,
+                ScalarExpr::column(COL_C_I32),
+            ),
+            op: CompareOp::Gt,
+            right: ScalarExpr::literal(220_i64),
+        };
 
-        // --- Insert 15,000 rows ---
-        let num_rows = 15_000;
-        let mut rows_to_insert = Vec::with_capacity(num_rows);
-        for i in 0..num_rows {
-            let row_id = i as RowId;
-            let mut row_data = HashMap::new();
-            row_data.insert(1, (row_id % 10, EMPTY_COL));
-            row_data.insert(2, (row_id % 5, EMPTY_COL));
-            row_data.insert(3, (row_id % 100, EMPTY_COL));
-            for j in 4..=10 {
-                row_data.insert(j, (0, EMPTY_COL));
-            }
-            rows_to_insert.push((row_id, row_data));
-        }
-        table.insert_many(&rows_to_insert).unwrap();
-
-        // --- Test 1: Intersection (AND) ---
-        // Find rows where Country=7 AND Status=2.
-        let country_7 = 7u64.to_be_bytes();
-        let status_2 = 2u64.to_be_bytes();
-        let expr_and = Expr::And(vec![
-            Expr::Pred(Filter {
-                field_id: 1,
-                op: Operator::Equals(&country_7),
-            }),
-            Expr::Pred(Filter {
-                field_id: 2,
-                op: Operator::Equals(&status_2),
-            }),
-        ]);
-        let mut results_and = Vec::new();
+        let mut vals: Vec<Option<u64>> = Vec::new();
         table
-            .scan(&expr_and, &[], &mut |row_id, _| {
-                results_and.push(row_id);
-            })
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &expr,
+                ScanStreamOptions::default(),
+                |b| {
+                    let col = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    for i in 0..b.num_rows() {
+                        vals.push(if col.is_null(i) {
+                            None
+                        } else {
+                            Some(col.value(i))
+                        });
+                    }
+                },
+            )
             .unwrap();
 
-        let mut expected_and = HashSet::new();
-        for i in 0..num_rows {
-            if i % 10 == 7 && i % 5 == 2 {
-                expected_and.insert(i as u64);
-            }
-        }
-        assert_eq!(
-            results_and.into_iter().collect::<HashSet<u64>>(),
-            expected_and
-        );
-        assert_eq!(expected_and.len(), 1500);
-
-        // --- Test 2: Union (OR) ---
-        // Find rows where Status=1 OR Status=3
-        let status_1 = 1u64.to_be_bytes();
-        let status_3 = 3u64.to_be_bytes();
-        let expr_or = Expr::Or(vec![
-            Expr::Pred(Filter {
-                field_id: 2,
-                op: Operator::Equals(&status_1),
-            }),
-            Expr::Pred(Filter {
-                field_id: 2,
-                op: Operator::Equals(&status_3),
-            }),
-        ]);
-
-        let mut results_or = Vec::new();
-        table
-            .scan(&expr_or, &[], &mut |row_id, _| {
-                results_or.push(row_id);
-            })
-            .unwrap();
-
-        let mut expected_or = HashSet::new();
-        for i in 0..num_rows {
-            if i % 5 == 1 || i % 5 == 3 {
-                expected_or.insert(i as u64);
-            }
-        }
-        assert_eq!(
-            results_or.into_iter().collect::<HashSet<u64>>(),
-            expected_or
-        );
-        assert_eq!(expected_or.len(), 15000 * 2 / 5); // 6000
+        assert_eq!(vals.into_iter().flatten().collect::<Vec<_>>(), vec![300]);
     }
 }

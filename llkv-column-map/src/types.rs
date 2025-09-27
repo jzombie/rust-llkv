@@ -1,174 +1,84 @@
-use std::borrow::Cow;
+//! Core type definitions for the storage engine.
 
-/// Opaque 64-bit address in the KV/pager namespace.
-///
-/// - Treated as an **opaque handle** by higher layers (never interpreted).
-/// - Stable across process restarts if your pager persists it.
-/// - In this crate, **physical key `0` is reserved** for the Bootstrap record.
-/// - Typical implementations allocate keys monotonically, but callers MUST NOT
-///   rely on contiguity or ordering.
-///
-/// Examples: page IDs, log sequence numbers, virtual block addresses.
-pub type PhysicalKey = u64;
+// FIXME: Since upgrading to `rustc 1.90.0 (1159e78c4 2025-09-14)`, this seems
+// to be needed to workaround parenthesis errors in `LogicalFieldId`, which
+// creep up regardless of comments being added or not. This is possibly a bug
+// with Clippy or `modular_bitfield`, or a small incompatibility issue.
+#![allow(unused_parens)]
 
-/// Logical column/field identifier chosen by the application.
-///
-/// - Used to group rows into a “column” in the manifest and to locate that
-///   column’s current `ColumnIndex`.
-/// - Does not need to be dense or sequential; it only needs to be unique per column.
-/// - 32-bit keeps on-disk headers compact while allowing plenty of columns.
-pub type LogicalFieldId = u32;
+use modular_bitfield::prelude::*;
 
-/// Already-encoded **logical key bytes** (application format).
-///
-/// - ColumnStore and index structures treat this as an ordered byte string.
-/// - Sorting is **lexicographical on bytes**. If you need numeric ordering,
-///   encode numbers in **big-endian** (e.g., `u64::to_be_bytes`) so byte order
-///   matches numeric order.
-/// - Duplicates may appear in a single append batch; “last write wins” behavior
-///   is controlled by `AppendOptions::last_write_wins_in_batch`.
-pub type LogicalKeyBytes = Vec<u8>;
-
-/// Number of entries (key/value pairs) in a segment or structure.
-///
-/// - Kept as `u32` to minimize header size.
-/// - Implies a per-segment limit of `< 2^32` entries. If you need more,
-///   split into multiple segments.
-pub type IndexEntryCount = u32;
-
-/// A **width in bytes** for fixed-width layouts.
-///
-/// - Used when all values (or all keys) in a segment share a single width.
-/// - Valid values are `> 0` for non-empty fixed layouts. A width of `0` is
-///   only meaningful for empty segments (no entries).
-pub type ByteWidth = u32;
-
-/// A **byte offset** into a concatenated byte blob (prefix-sum array elements).
-///
-/// - Used by variable-width layouts to delimit slices: slice `i` is
-///   `[offsets[i], offsets[i+1])`.
-/// - Monotonically non-decreasing; the final element equals the total byte len.
-/// - `u32` keeps headers compact and caps any single blob at `< 4 GiB`.
-///   If you need to exceed that, use multiple blobs/segments or switch to 64-bit.
-pub type ByteOffset = u32;
-
-/// A **byte length** of a single slice/value.
-///
-/// - Often used to build prefix-sum offset arrays for variable-width values.
-/// - Summing `ByteLen`s produces the final `ByteOffset` tail value.
-/// - Stored as `u32` for compactness; thus each individual value must be
-///   `< 4 GiB` and any single blob must also remain `< 4 GiB`.
-pub type ByteLen = u32;
-
-/// Any clonable, thread-safe buffer that can be viewed as `&[u8]`.
-pub trait BlobLike: AsRef<[u8]> + Clone + Send + Sync + 'static {}
-impl<T> BlobLike for T where T: AsRef<[u8]> + Clone + Send + Sync + 'static {}
-
-/// Wire tag for typed blobs stored in the pager.
-///
-/// Each persisted metadata object (e.g., `Manifest`, `ColumnIndex`, `IndexSegment`)
-/// is saved as a *typed* bitcode blob. `TypedKind` is the small, stable tag
-/// that tells the pager which concrete type to decode into on read.
-///
-/// Why this exists:
-/// - **Safety:** Prevents decoding a value as the wrong struct when multiple
-///   blob types share the same key space.
-/// - **Speed:** Lets the pager pick the right decode path without trial-and-error.
-/// - **Clarity:** Callers explicitly state what they expect to read.
-///
-/// Versioning notes:
-/// - Treat this as a wire-level enum. Adding new variants is fine, but removing
-///   or reusing existing variants will break compatibility for blobs already
-///   written.
-/// - If you evolve on-disk layouts, version those structs (or the manifest)
-///   rather than reusing a `TypedKind` variant with a new meaning.
-#[derive(Clone, Copy, Debug)]
-pub enum TypedKind {
-    /// Tiny record that points to the current `Manifest` (often at physical key 0).
-    Bootstrap,
-    /// Top-level directory mapping columns to their current `ColumnIndex`.
-    Manifest,
-    /// Per-column list of sealed segments (newest-first) with fast-prune bounds.
-    ColumnIndex,
-    /// Packed logical keys and value layout for one sealed segment (points to data blob).
-    IndexSegment,
+/// Defines the category of data a `LogicalFieldId` refers to.
+/// This enum uses 16 bits, allowing for up to 65,536 distinct namespaces.
+#[derive(Specifier, Debug, PartialEq, Eq, Clone, Copy)]
+#[bits = 16]
+pub enum Namespace {
+    /// Standard user-defined column data.
+    UserData = 0,
+    /// Internal shadow column for row IDs.
+    RowIdShadow = 1,
+    /// Highest sentinel reserved for future expansion.
+    Reserved = 0xFFFF,
 }
 
-/// Type-erased typed value. Concrete structs live in your crate's
-/// `index` module. This avoids `Any`/downcasts at callers.
-#[derive(Clone, Debug)]
-pub enum TypedValue {
-    Bootstrap(crate::column_index::Bootstrap),
-    Manifest(crate::column_index::Manifest),
-    ColumnIndex(crate::column_index::ColumnIndex),
-    IndexSegment(crate::column_index::IndexSegment),
+/// Identifier for a logical table within a [`Namespace`].
+///
+/// `TableId` consumes the middle 16 bits inside [`LogicalFieldId`]. Using a
+/// `u16` keeps IDs compact and (more importantly) guarantees they always fit in
+/// that bitfield without extra checks.
+pub type TableId = u16;
+
+/// Logical column identifier within a table.
+///
+/// `FieldId` is stored inside [`LogicalFieldId::field_id`], which is a 32-bit
+/// lane.  Keep this alias in sync with that width so table metadata and
+/// runtime identifiers can round-trip without truncation.
+pub type FieldId = u32;
+
+/// Row identifier for persisted data.
+///
+/// `ColumnStore` emits row ids as Arrow `UInt64Array`s (see `core.rs`), so this
+/// alias mirrors that width to avoid casts when marshalling data in and out of
+/// the engine.
+pub type RowId = u64;
+
+/// A namespaced logical identifier for a column.
+///
+/// This 64-bit struct is designed to prevent ID collisions by partitioning the key space
+/// into distinct namespaces, table IDs, and field IDs.
+#[bitfield]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(u64)]
+pub struct LogicalFieldId {
+    /// The specific field/column within a table (up to ~4.3 billion).
+    pub field_id: B32,
+    /// The table this field belongs to (up to 65,535).
+    pub table_id: B16,
+    /// The type of data this ID represents (up to 65,536 namespaces).
+    pub namespace: Namespace,
 }
 
-/// Type-erased container for all metadata blobs we persist via `bitcode`.
-///
-/// At write time you construct the concrete value (e.g., `Manifest`) and wrap it
-/// in the corresponding `TypedValue` variant before handing it to the pager.
-/// At read time, you ask the pager for a given `TypedKind`, and it returns a
-/// `TypedValue` you can `match` to regain the concrete type.
-///
-/// Why not `Any`/downcast?
-/// - This enum is **zero-alloc** and **explicit** about what the storage layer
-///   can serialize/deserialize. It’s also friendlier to non-std environments.
-///
-/// Gotchas:
-/// - The `TypedKind` you request **must** match the variant that was written,
-///   or decode will fail (by design).
-/// - Keep these variants aligned with the set of persisted structs in
-///   `crate::column_index`; treat changes as on-disk format changes.
-impl TypedValue {
-    /// Return the wire tag (`TypedKind`) corresponding to this value.
-    ///
-    /// Useful when building batched puts where the pager needs to know the kind
-    /// alongside the encoded bytes.
+impl LogicalFieldId {
+    /// Build a logical field identifier from its namespace, table, and field components.
     #[inline]
-    pub fn kind(&self) -> TypedKind {
-        match self {
-            TypedValue::Bootstrap(_) => TypedKind::Bootstrap,
-            TypedValue::Manifest(_) => TypedKind::Manifest,
-            TypedValue::ColumnIndex(_) => TypedKind::ColumnIndex,
-            TypedValue::IndexSegment(_) => TypedKind::IndexSegment,
-        }
+    pub fn from_parts(namespace: Namespace, table_id: TableId, field_id: FieldId) -> Self {
+        LogicalFieldId::new()
+            .with_namespace(namespace)
+            .with_table_id(table_id)
+            .with_field_id(field_id)
     }
-}
 
-pub type PutItem<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
-pub type PutItems<'a> = Vec<PutItem<'a>>;
+    /// Convenience constructor for user data columns.
+    #[inline]
+    pub fn for_user(table_id: TableId, field_id: FieldId) -> Self {
+        Self::from_parts(Namespace::UserData, table_id, field_id)
+    }
 
-// TODO: Document
-pub struct Put<'a> {
-    pub field_id: LogicalFieldId,
-    pub items: PutItems<'a>,
-}
-
-// TODO: Document
-#[derive(Clone, Copy, Debug)]
-pub enum ValueMode {
-    Auto,
-    ForceFixed(ByteWidth),
-    ForceVariable,
-}
-
-// TODO: Document
-#[derive(Clone, Debug)]
-pub struct AppendOptions {
-    pub mode: ValueMode,
-    pub segment_max_entries: usize,
-    pub segment_max_bytes: usize, // data payload budget per segment
-    pub last_write_wins_in_batch: bool,
-}
-
-impl Default for AppendOptions {
-    fn default() -> Self {
-        Self {
-            mode: ValueMode::Auto,
-            segment_max_entries: u16::MAX as usize,
-            segment_max_bytes: 8 * 1024 * 1024,
-            last_write_wins_in_batch: true,
-        }
+    /// Convenience constructor for user data columns in table 0.
+    ///
+    /// Many tests use table 0 by default; this method avoids repeating the table ID literal.
+    #[inline]
+    pub fn for_user_table_0(field_id: FieldId) -> Self {
+        Self::for_user(0, field_id)
     }
 }

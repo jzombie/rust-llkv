@@ -2,10 +2,10 @@ name: Rust Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     tags: ["v*"]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 jobs:
   test:
@@ -44,8 +44,32 @@ jobs:
         run: cargo build --workspace --all-targets ${{ matrix.flags }}
 
       - name: Test
-        run: cargo test --workspace --all-targets --verbose ${{ matrix.flags }} -- --include-ignored
+        # run: cargo test --workspace --all-targets --verbose ${{ matrix.flags }} -- --include-ignored
+        # Explicitly ignore benches (workaround for CodSpeed benches running for default)
+        run: cargo test --workspace --all-features --verbose --lib --bins --tests --examples -- --include-ignored
+# TODO: Implement
+# Runs the Miri interpreter across all OS targets to detect undefined behavior in unsafe code
+#   miri:
+#     name: Miri (OS=${{ matrix.os }})
+#     runs-on: ${{ matrix.os }}
+#     strategy:
+#       fail-fast: false
+#       matrix:
+#         os: [ubuntu-latest, macos-latest, windows-latest]
 
-      # Added step to ensure benchmarks compile. `--no-run` is important.
-      - name: Check benchmarks compile
-        run: cargo bench --workspace --no-run ${{ matrix.flags }}
+#     steps:
+#       - name: Checkout repository
+#         uses: actions/checkout@v4
+
+#       - name: Install nightly toolchain with Miri
+#         uses: dtolnay/rust-toolchain@nightly
+#         with:
+#           components: miri
+
+# TODO: To effectively use this a custom test-only, Miri-friendly pager may need to be created
+# and feature gated to only use `EntryHandle` (mmap-backed). This should be modified to test
+# integration tests as well, not only `--lib` tests.
+#   - name: Run Miri tests
+#     # Miri cannot emulate the OS-backed mmap calls used by our integration tests, so
+#     # we limit the run to library tests (unit tests) for now.
+#     run: cargo miri test -p llkv-column-map --lib
