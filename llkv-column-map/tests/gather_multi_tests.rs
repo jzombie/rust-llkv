@@ -5,7 +5,7 @@ use arrow::array::{Array, ArrayRef, Int32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ROW_ID_COLUMN_NAME;
-use llkv_column_map::store::ColumnStore;
+use llkv_column_map::store::{ColumnStore, GatherNullPolicy};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_result::Result;
 use llkv_storage::pager::MemPager;
@@ -27,6 +27,17 @@ fn schema_for_nullable_field(field_id: LogicalFieldId, name: &str, dtype: DataTy
     md.insert("field_id".to_string(), u64::from(field_id).to_string());
     let data = Field::new(name, dtype, true).with_metadata(md);
     Arc::new(Schema::new(vec![rid, data]))
+}
+
+fn gather_single(
+    store: &ColumnStore<MemPager>,
+    field_id: LogicalFieldId,
+    row_ids: &[u64],
+    policy: GatherNullPolicy,
+) -> Result<ArrayRef> {
+    store
+        .gather_rows(&[field_id], row_ids, policy)
+        .map(|batch| batch.column(0).clone())
 }
 
 fn seed_store() -> Result<(ColumnStore<MemPager>, LogicalFieldId, LogicalFieldId)> {
@@ -58,11 +69,11 @@ fn gather_rows_multi_matches_single_columns() -> Result<()> {
     let (store, fid_a, fid_b) = seed_store()?;
     let row_ids = vec![0, 3, 5, 9];
 
-    let multi = store.gather_rows_multi(&[fid_a, fid_b], &row_ids, false)?;
+    let multi = store.gather_rows(&[fid_a, fid_b], &row_ids, GatherNullPolicy::ErrorOnMissing)?;
     assert_eq!(multi.num_columns(), 2);
 
-    let single_a = store.gather_rows(fid_a, &row_ids, false)?;
-    let single_b = store.gather_rows(fid_b, &row_ids, false)?;
+    let single_a = gather_single(&store, fid_a, &row_ids, GatherNullPolicy::ErrorOnMissing)?;
+    let single_b = gather_single(&store, fid_b, &row_ids, GatherNullPolicy::ErrorOnMissing)?;
 
     let multi_a = multi
         .column(0)
@@ -87,7 +98,7 @@ fn gather_rows_multi_matches_single_columns() -> Result<()> {
 fn gather_rows_multi_rejects_duplicate_row_ids() -> Result<()> {
     let (store, fid_a, _) = seed_store()?;
     let err = store
-        .gather_rows_multi(&[fid_a], &[1, 1], false)
+        .gather_rows(&[fid_a], &[1, 1], GatherNullPolicy::ErrorOnMissing)
         .expect_err("duplicate row_ids should error");
     assert!(matches!(err, llkv_result::Error::Internal(_)));
     Ok(())
@@ -96,7 +107,7 @@ fn gather_rows_multi_rejects_duplicate_row_ids() -> Result<()> {
 #[test]
 fn gather_rows_multi_empty_row_ids() -> Result<()> {
     let (store, fid_a, fid_b) = seed_store()?;
-    let result = store.gather_rows_multi(&[fid_a, fid_b], &[], false)?;
+    let result = store.gather_rows(&[fid_a, fid_b], &[], GatherNullPolicy::ErrorOnMissing)?;
     assert_eq!(result.num_columns(), 2);
     assert_eq!(result.num_rows(), 0);
     assert_eq!(result.column(0).len(), 0);
@@ -130,7 +141,11 @@ fn gather_rows_multi_with_nulls() -> Result<()> {
 
     let gather_ids: Vec<u64> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 
-    let multi = store.gather_rows_multi(&[fid_dense, fid_sparse], &gather_ids, true)?;
+    let multi = store.gather_rows(
+        &[fid_dense, fid_sparse],
+        &gather_ids,
+        GatherNullPolicy::IncludeNulls,
+    )?;
     assert_eq!(multi.num_columns(), 2);
 
     let dense_arr = multi
@@ -158,7 +173,7 @@ fn gather_rows_multi_with_nulls() -> Result<()> {
     }
 
     let err = store
-        .gather_rows_multi(&[fid_sparse], &gather_ids, false)
+        .gather_rows(&[fid_sparse], &gather_ids, GatherNullPolicy::ErrorOnMissing)
         .expect_err("missing rows should error without null support");
     assert!(matches!(err, llkv_result::Error::Internal(_)));
 
@@ -201,7 +216,11 @@ fn gather_rows_multi_shuffled_with_nulls_preserves_alignment() -> Result<()> {
     shuffled_ids.shuffle(&mut rng);
     assert_eq!(shuffled_ids.len(), all_rids.len());
 
-    let multi = store.gather_rows_multi(&[fid_dense, fid_sparse], &shuffled_ids, true)?;
+    let multi = store.gather_rows(
+        &[fid_dense, fid_sparse],
+        &shuffled_ids,
+        GatherNullPolicy::IncludeNulls,
+    )?;
     assert_eq!(multi.num_columns(), 2);
     assert_eq!(multi.num_rows(), shuffled_ids.len());
 
@@ -237,8 +256,18 @@ fn gather_rows_multi_shuffled_with_nulls_preserves_alignment() -> Result<()> {
         }
     }
 
-    let single_dense = store.gather_rows(fid_dense, &shuffled_ids, false)?;
-    let single_sparse = store.gather_rows(fid_sparse, &shuffled_ids, true)?;
+    let single_dense = gather_single(
+        &store,
+        fid_dense,
+        &shuffled_ids,
+        GatherNullPolicy::ErrorOnMissing,
+    )?;
+    let single_sparse = gather_single(
+        &store,
+        fid_sparse,
+        &shuffled_ids,
+        GatherNullPolicy::IncludeNulls,
+    )?;
 
     let single_dense = single_dense
         .as_any()

@@ -774,11 +774,9 @@ where
         while start < row_ids.len() {
             let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
             let window = &row_ids[start..end];
-            let gathered = self.store.gather_rows_multi_with_policy(
-                &lfids,
-                window,
-                GatherNullPolicy::IncludeNulls,
-            )?;
+            let gathered =
+                self.store
+                    .gather_rows(&lfids, window, GatherNullPolicy::IncludeNulls)?;
             if gathered.num_rows() == 0 {
                 start = end;
                 continue;
@@ -915,11 +913,14 @@ mod tests {
     use crate::sys_catalog::CATALOG_TID;
     use crate::types::RowId;
     use arrow::array::Array;
+    use arrow::array::ArrayRef;
     use arrow::array::{
         BinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, UInt8Array, UInt32Array,
         UInt64Array,
     };
     use arrow::compute::{cast, max, min, sum, unary};
+    use llkv_column_map::ColumnStore;
+    use llkv_column_map::store::GatherNullPolicy;
     use llkv_expr::BinaryOp;
     use std::collections::HashMap;
     use std::ops::Bound;
@@ -981,6 +982,18 @@ mod tests {
 
         table.append(&batch).unwrap();
         table
+    }
+
+    fn gather_single(
+        store: &ColumnStore<MemPager>,
+        field_id: LogicalFieldId,
+        row_ids: &[u64],
+    ) -> ArrayRef {
+        store
+            .gather_rows(&[field_id], row_ids, GatherNullPolicy::ErrorOnMissing)
+            .unwrap()
+            .column(0)
+            .clone()
     }
 
     fn pred_expr<'a>(filter: Filter<'a, FieldId>) -> Expr<'a, FieldId> {
@@ -1153,7 +1166,7 @@ mod tests {
             for &(col, ref ty) in expectations {
                 let lfid = LogicalFieldId::for_user(TABLE_ALPHA, col);
                 assert_eq!(store.data_type(lfid).unwrap(), *ty);
-                let arr = store.gather_rows(lfid, &alpha_rows, false).unwrap();
+                let arr = gather_single(store, lfid, &alpha_rows);
                 match ty {
                     DataType::UInt64 => {
                         let arr = arr.as_any().downcast_ref::<UInt64Array>().unwrap();
@@ -1182,13 +1195,13 @@ mod tests {
 
             let lfid_u64 = LogicalFieldId::for_user(TABLE_BETA, COL_BETA_U64);
             assert_eq!(store.data_type(lfid_u64).unwrap(), DataType::UInt64);
-            let arr_u64 = store.gather_rows(lfid_u64, &beta_rows, false).unwrap();
+            let arr_u64 = gather_single(store, lfid_u64, &beta_rows);
             let arr_u64 = arr_u64.as_any().downcast_ref::<UInt64Array>().unwrap();
             assert_eq!(arr_u64.values(), beta_vals_u64.as_slice());
 
             let lfid_u8 = LogicalFieldId::for_user(TABLE_BETA, COL_BETA_U8);
             assert_eq!(store.data_type(lfid_u8).unwrap(), DataType::UInt8);
-            let arr_u8 = store.gather_rows(lfid_u8, &beta_rows, false).unwrap();
+            let arr_u8 = gather_single(store, lfid_u8, &beta_rows);
             let arr_u8 = arr_u8.as_any().downcast_ref::<UInt8Array>().unwrap();
             assert_eq!(arr_u8.values(), beta_vals_u8.as_slice());
         }
@@ -1198,7 +1211,7 @@ mod tests {
             let store = table.store();
             let lfid = LogicalFieldId::for_user(TABLE_GAMMA, COL_GAMMA_I16);
             assert_eq!(store.data_type(lfid).unwrap(), DataType::Int16);
-            let arr = store.gather_rows(lfid, &gamma_rows, false).unwrap();
+            let arr = gather_single(store, lfid, &gamma_rows);
             let arr = arr.as_any().downcast_ref::<Int16Array>().unwrap();
             assert_eq!(arr.values(), gamma_vals_i16.as_slice());
         }

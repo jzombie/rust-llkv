@@ -218,62 +218,11 @@ impl<P> ColumnStore<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    /// Gathers values for the specified `row_ids`, returned in the same order as provided.
-    /// When `include_nulls` is true, missing rows surface as nulls instead of an error.
-    pub fn gather_rows(
-        &self,
-        field_id: LogicalFieldId,
-        row_ids: &[u64],
-        include_nulls: bool,
-    ) -> Result<ArrayRef> {
-        let policy = if include_nulls {
-            GatherNullPolicy::IncludeNulls
-        } else {
-            GatherNullPolicy::ErrorOnMissing
-        };
-        self.gather_rows_with_policy(field_id, row_ids, policy)
-    }
-
-    /// Gathers values using a configurable null-handling policy. The
-    /// policy controls whether missing rows surfaces as nulls, produce
-    /// errors, or are filtered alongside explicit nulls.
-    pub fn gather_rows_with_policy(
-        &self,
-        field_id: LogicalFieldId,
-        row_ids: &[u64],
-        policy: GatherNullPolicy,
-    ) -> Result<ArrayRef> {
-        let batch = self.gather_rows_multi_with_policy(&[field_id], row_ids, policy)?;
-        batch
-            .columns()
-            .first()
-            .map(Arc::clone)
-            .ok_or_else(|| Error::Internal("gather_rows_multi returned no columns".into()))
-    }
-
-    /// Prototype: gathers multiple primitive columns for the given `row_ids` in a single
-    /// descriptor walk, reducing redundant pager fetches across columns. When `include_nulls`
-    /// is true, missing row ids are surfaced as nulls (rather than producing an error), mirroring
-    /// the semantics of `gather_rows_with_nulls` without requiring an explicit anchor.
-    pub fn gather_rows_multi(
-        &self,
-        field_ids: &[LogicalFieldId],
-        row_ids: &[u64],
-        include_nulls: bool,
-    ) -> Result<RecordBatch> {
-        let policy = if include_nulls {
-            GatherNullPolicy::IncludeNulls
-        } else {
-            GatherNullPolicy::ErrorOnMissing
-        };
-        self.gather_rows_multi_with_policy(field_ids, row_ids, policy)
-    }
-
     /// Gathers multiple columns using a configurable null-handling policy.
     /// When [`GatherNullPolicy::DropNulls`] is selected, rows where all
     /// projected columns are null or missing are removed from the
     /// resulting batch.
-    pub fn gather_rows_multi_with_policy(
+    pub fn gather_rows(
         &self,
         field_ids: &[LogicalFieldId],
         row_ids: &[u64],
