@@ -23,7 +23,7 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::ScanOptions;
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 
 use roaring::RoaringTreemap;
@@ -32,14 +32,6 @@ const NUM_ROWS_SIMPLE: usize = 1_000_000;
 const NUM_ROWS_FRAGMENTED: u64 = 1_000_000;
 const NUM_CHUNKS_FRAGMENTED: u64 = 1_000;
 const CHUNK_SIZE_FRAGMENTED: u64 = NUM_ROWS_FRAGMENTED / NUM_CHUNKS_FRAGMENTED;
-
-/// Test helper to create a standard user-data LogicalFieldId.
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 /// Build a 2-field schema: row_id (u64, non-null) + one data field.
 fn schema_with_row_id(field: Field) -> Arc<Schema> {
@@ -58,7 +50,7 @@ fn bench_column_store_sum(c: &mut Criterion) {
             || {
                 let pager = Arc::new(MemPager::new());
                 let store = ColumnStore::open(pager).unwrap();
-                let field_id = fid(7777);
+                let field_id = LogicalFieldId::for_default_user(7777);
 
                 let mut md = HashMap::new();
                 md.insert("field_id".to_string(), u64::from(field_id).to_string());
@@ -125,7 +117,7 @@ fn bench_column_store_sum(c: &mut Criterion) {
             || {
                 let pager = Arc::new(MemPager::new());
                 let store = ColumnStore::open(pager).unwrap();
-                let field_id = fid(8888);
+                let field_id = LogicalFieldId::for_default_user(8888);
 
                 let mut md = HashMap::new();
                 md.insert("field_id".to_string(), u64::from(field_id).to_string());
@@ -197,7 +189,7 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
     group.bench_function("sum_u64_fragmented_with_deletes", |b| {
         b.iter_batched(
             || {
-                let field_id = fid(9001);
+                let field_id = LogicalFieldId::for_default_user(9001);
                 let pager = Arc::new(MemPager::new());
                 let store = ColumnStore::open(pager).unwrap();
 

@@ -6,19 +6,12 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 use llkv_result::Result;
 use llkv_storage::pager::MemPager;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-
-fn logical_fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 fn schema_for_field(field_id: LogicalFieldId, name: &str, dtype: DataType) -> Arc<Schema> {
     let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
@@ -43,14 +36,14 @@ fn seed_store() -> Result<(ColumnStore<MemPager>, LogicalFieldId, LogicalFieldId
     let rid: Vec<u64> = (0..10u64).collect();
     let rid_arr: ArrayRef = Arc::new(UInt64Array::from(rid.clone()));
 
-    let fid_a = logical_fid(1);
+    let fid_a = LogicalFieldId::for_default_user(1);
     let schema_a = schema_for_field(fid_a, "col_a", DataType::UInt64);
     let vals_a: Vec<u64> = rid.iter().map(|v| v * 2).collect();
     let arr_a: ArrayRef = Arc::new(UInt64Array::from(vals_a));
     let batch_a = RecordBatch::try_new(schema_a, vec![rid_arr.clone(), arr_a])?;
     store.append(&batch_a)?;
 
-    let fid_b = logical_fid(2);
+    let fid_b = LogicalFieldId::for_default_user(2);
     let schema_b = schema_for_field(fid_b, "col_b", DataType::Int32);
     let vals_b: Vec<i32> = rid.iter().map(|v| (*v as i32) - 3).collect();
     let arr_b: ArrayRef = Arc::new(Int32Array::from(vals_b));
@@ -119,14 +112,14 @@ fn gather_rows_multi_with_nulls() -> Result<()> {
     let rid: Vec<u64> = (0..12u64).collect();
     let rid_arr: ArrayRef = Arc::new(UInt64Array::from(rid.clone()));
 
-    let fid_dense = logical_fid(10);
+    let fid_dense = LogicalFieldId::for_default_user(10);
     let schema_dense = schema_for_field(fid_dense, "dense", DataType::UInt64);
     let dense_vals: Vec<u64> = rid.iter().map(|v| v * 7).collect();
     let dense_arr: ArrayRef = Arc::new(UInt64Array::from(dense_vals));
     let dense_batch = RecordBatch::try_new(schema_dense, vec![rid_arr.clone(), dense_arr.clone()])?;
     store.append(&dense_batch)?;
 
-    let fid_sparse = logical_fid(11);
+    let fid_sparse = LogicalFieldId::for_default_user(11);
     let schema_sparse = schema_for_nullable_field(fid_sparse, "sparse", DataType::Int32);
     let sparse_rids: Vec<u64> = rid.iter().copied().filter(|v| v % 3 != 1).collect();
     let sparse_values: Vec<i32> = sparse_rids.iter().map(|v| (*v as i32) - 5).collect();
@@ -180,14 +173,14 @@ fn gather_rows_multi_shuffled_with_nulls_preserves_alignment() -> Result<()> {
     let all_rids: Vec<u64> = (0..12u64).collect();
     let rid_arr: ArrayRef = Arc::new(UInt64Array::from(all_rids.clone()));
 
-    let fid_dense = logical_fid(20);
+    let fid_dense = LogicalFieldId::for_default_user(20);
     let schema_dense = schema_for_field(fid_dense, "dense_shuffle", DataType::UInt64);
     let dense_vals: Vec<u64> = all_rids.iter().map(|rid| rid * 11).collect();
     let dense_arr: ArrayRef = Arc::new(UInt64Array::from(dense_vals.clone()));
     let dense_batch = RecordBatch::try_new(schema_dense, vec![rid_arr.clone(), dense_arr.clone()])?;
     store.append(&dense_batch)?;
 
-    let fid_sparse = logical_fid(21);
+    let fid_sparse = LogicalFieldId::for_default_user(21);
     let schema_sparse = schema_for_nullable_field(fid_sparse, "sparse_shuffle", DataType::Int32);
     let sparse_present_rids: Vec<u64> = all_rids
         .iter()

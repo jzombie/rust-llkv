@@ -19,19 +19,11 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 
 use roaring::RoaringTreemap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-
-/// Test helper to create a standard user-data LogicalFieldId.
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 /// Helper: build a schema with "row_id" inserted at column 0.
 fn schema_with_row_id(mut fields: Vec<Field>) -> Arc<Schema> {
@@ -105,7 +97,7 @@ fn test_lww_updates_single_field_u64() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let field_id = fid(700);
+    let field_id = LogicalFieldId::for_default_user(700);
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);
@@ -150,8 +142,8 @@ fn test_lww_per_field_isolation() {
     let store = ColumnStore::open(pager).unwrap();
 
     // Two fields with different logical ids.
-    let fida = fid(800);
-    let fidb = fid(801);
+    let fida = LogicalFieldId::for_default_user(800);
+    let fidb = LogicalFieldId::for_default_user(801);
 
     let mut mda = HashMap::new();
     mda.insert("field_id".to_string(), u64::from(fida).to_string());
@@ -205,7 +197,7 @@ fn test_deletes_and_updates() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let field_id = fid(820);
+    let field_id = LogicalFieldId::for_default_user(820);
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);

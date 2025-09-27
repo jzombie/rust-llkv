@@ -6,22 +6,15 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::store::{ColumnStore, GatherNullPolicy, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
-
-fn fid_for(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(42)
-        .with_field_id(id)
-}
 
 #[test]
 fn drop_nulls_policy_removes_null_rows() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(Arc::clone(&pager)).expect("store");
 
-    let fid = fid_for(7);
+    let fid = LogicalFieldId::for_user(42, 7);
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(fid).to_string());
 

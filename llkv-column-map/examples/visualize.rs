@@ -37,7 +37,7 @@ use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::{
     ColumnStore,
     store::debug::{ColumnStoreDebug, discover_all_pks},
-    types::{LogicalFieldId, Namespace},
+    types::LogicalFieldId,
 };
 use llkv_storage::{pager::MemPager, types::PhysicalKey};
 
@@ -59,14 +59,6 @@ use arrow::record_batch::RecordBatch;
 // Global counter to ensure unique row_ids across batches.
 static NEXT_ROW_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Helper to create a standard user-data LogicalFieldId.
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
-
 fn build_put_for_col1(start: usize, end: usize) -> Option<(LogicalFieldId, ArrayRef)> {
     let s = start.min(C1_ROWS);
     let e = end.min(C1_ROWS);
@@ -74,7 +66,10 @@ fn build_put_for_col1(start: usize, end: usize) -> Option<(LogicalFieldId, Array
         return None;
     }
     let vals: Vec<u32> = (s..e).map(|i| i as u32).collect();
-    Some((fid(1), Arc::new(UInt32Array::from(vals)) as ArrayRef))
+    Some((
+        LogicalFieldId::for_default_user(1),
+        Arc::new(UInt32Array::from(vals)) as ArrayRef,
+    ))
 }
 
 fn build_put_for_col2(start: usize, end: usize) -> Option<(LogicalFieldId, ArrayRef)> {
@@ -89,7 +84,10 @@ fn build_put_for_col2(start: usize, end: usize) -> Option<(LogicalFieldId, Array
         let len = i % 21 + 1; // 1..21
         b.append_value(vec![b'A' + (i % 26) as u8; len]);
     }
-    Some((fid(2), Arc::new(b.finish()) as ArrayRef))
+    Some((
+        LogicalFieldId::for_default_user(2),
+        Arc::new(b.finish()) as ArrayRef,
+    ))
 }
 
 fn build_put_for_col3(start: usize, end: usize) -> Option<(LogicalFieldId, ArrayRef)> {
@@ -99,7 +97,10 @@ fn build_put_for_col3(start: usize, end: usize) -> Option<(LogicalFieldId, Array
         return None;
     }
     let vals: Vec<u64> = (s..e).map(|_| 0x55u64).collect(); // width=8
-    Some((fid(3), Arc::new(UInt64Array::from(vals)) as ArrayRef))
+    Some((
+        LogicalFieldId::for_default_user(3),
+        Arc::new(UInt64Array::from(vals)) as ArrayRef,
+    ))
 }
 
 /// Build a RecordBatch from per-column arrays (same row count).
@@ -227,7 +228,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     impl PrimitiveSortedWithRowIdsVisitor for Count {}
     static ROWS: AtomicU64 = AtomicU64::new(0);
     for id in [1u32, 2, 3] {
-        let field_id = fid(id);
+        let field_id = LogicalFieldId::for_default_user(id);
         ROWS.store(0, Ordering::Relaxed);
         let mut v = Count;
         match store.scan(field_id, ScanOptions::default(), &mut v) {

@@ -28,7 +28,7 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 
 use rand::rngs::StdRng;
@@ -38,13 +38,6 @@ use rand::{Rng, SeedableRng};
 const N_ROWS: usize = 1_000_000;
 const N_QUERIES: usize = 10_000;
 const SEED: u64 = 0xCBF2_A1B1_D3E4_F905;
-
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 fn schema_with_row_id(field_id: LogicalFieldId) -> Arc<Schema> {
     let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
@@ -58,7 +51,7 @@ fn seed_store_1m() -> (ColumnStore<MemPager>, LogicalFieldId) {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let field_id = fid(42);
+    let field_id = LogicalFieldId::for_default_user(42);
     let schema = schema_with_row_id(field_id);
 
     // row_id 0..N-1; values 0..N-1 shuffled at ingest

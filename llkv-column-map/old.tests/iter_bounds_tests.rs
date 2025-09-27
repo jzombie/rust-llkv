@@ -14,18 +14,10 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::{BoundValue, ColumnStore};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 
 use rand::rng;
 use rand::seq::SliceRandom;
-
-/// Test helper to create a standard user-data LogicalFieldId.
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 /// Ingest shuffled u64 and i32 columns into a single store.
 fn ingest_two_cols(
@@ -125,8 +117,8 @@ fn collect_i32_in_bounds(
 fn u64_bounds_inclusive_middle() {
     const N: usize = 100_000;
     const B: usize = 5;
-    let fid_u64 = fid(501);
-    let fid_i32 = fid(901); // unused here, but present in the store
+    let fid_u64 = LogicalFieldId::for_default_user(501);
+    let fid_i32 = LogicalFieldId::for_default_user(901); // unused here, but present in the store
 
     let store = ingest_two_cols(N, B, fid_u64, fid_i32);
 
@@ -143,8 +135,8 @@ fn u64_bounds_inclusive_middle() {
 fn u64_bounds_open_ends() {
     const N: usize = 64_000;
     const B: usize = 4;
-    let fid_u64 = fid(502);
-    let fid_i32 = fid(902); // unused here
+    let fid_u64 = LogicalFieldId::for_default_user(502);
+    let fid_i32 = LogicalFieldId::for_default_user(902); // unused here
 
     let store = ingest_two_cols(N, B, fid_u64, fid_i32);
 
@@ -165,8 +157,8 @@ fn u64_bounds_open_ends() {
 fn u64_bounds_empty_ranges() {
     const N: usize = 32_768;
     const B: usize = 4;
-    let fid_u64 = fid(503);
-    let fid_i32 = fid(903); // unused here
+    let fid_u64 = LogicalFieldId::for_default_user(503);
+    let fid_i32 = LogicalFieldId::for_default_user(903); // unused here
 
     let store = ingest_two_cols(N, B, fid_u64, fid_i32);
 
@@ -192,8 +184,8 @@ fn u64_bounds_empty_ranges() {
 fn i32_bounds_cross_zero() {
     const N: usize = 80_000;
     const B: usize = 5;
-    let fid_u64 = fid(504); // unused here
-    let fid_i32 = fid(604);
+    let fid_u64 = LogicalFieldId::for_default_user(504); // unused here
+    let fid_i32 = LogicalFieldId::for_default_user(604);
 
     let store = ingest_two_cols(N, B, fid_u64, fid_i32);
 

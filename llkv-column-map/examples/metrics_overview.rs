@@ -13,9 +13,7 @@
 //! column.
 
 use llkv_column_map::{
-    ColumnStore, ROW_ID_COLUMN_NAME,
-    debug::ColumnStoreDebug,
-    types::{LogicalFieldId, Namespace},
+    ColumnStore, ROW_ID_COLUMN_NAME, debug::ColumnStoreDebug, types::LogicalFieldId,
 };
 use llkv_storage::pager::{InstrumentedPager, IoStats, MemPager};
 use std::sync::Arc;
@@ -26,14 +24,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arrow::array::{ArrayRef, BinaryBuilder, UInt64Array};
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
-
-/// Helper to create a standard user-data LogicalFieldId.
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 /// Build a fixed-width u64 column [0..rows) for `field_id`.
 fn build_fixed_u64(field_id: LogicalFieldId, rows: usize) -> (LogicalFieldId, ArrayRef) {
@@ -236,7 +226,7 @@ fn print_read_report_scan(store: &ColumnStore<InstrumentedPager<MemPager>>) {
 
     println!("-- Read report (scan sample) --");
     for &id in &[100u32, 200, 201, 300, 301, 999] {
-        let field_id = fid(id);
+        let field_id = LogicalFieldId::for_default_user(id);
         // Visitor to count up to a small budget and capture last u64 value if applicable.
         struct Sample {
             seen: usize,
@@ -299,8 +289,8 @@ fn main() {
     show_phase("Phase 0: init (bootstrap + manifest)", &stats, &mut prev);
 
     {
-        let c100 = build_fixed_u64(fid(100), 10_000);
-        let c101 = build_fixed_u64(fid(101), 10_000);
+        let c100 = build_fixed_u64(LogicalFieldId::for_default_user(100), 10_000);
+        let c101 = build_fixed_u64(LogicalFieldId::for_default_user(101), 10_000);
         let batch = batch_from_columns(&[c100.clone(), c101.clone()]);
         store.append(&batch).unwrap();
 
@@ -314,8 +304,8 @@ fn main() {
     }
 
     {
-        let c200 = build_var_binary(fid(200), 12_345, 6, 18);
-        let c201 = build_var_binary(fid(201), 12_345, 6, 18);
+        let c200 = build_var_binary(LogicalFieldId::for_default_user(200), 12_345, 6, 18);
+        let c201 = build_var_binary(LogicalFieldId::for_default_user(201), 12_345, 6, 18);
         let batch = batch_from_columns(&[c200.clone(), c201.clone()]);
         store.append(&batch).unwrap();
 
@@ -329,8 +319,8 @@ fn main() {
     }
 
     {
-        let c300 = build_fixed_u64(fid(300), 2_000);
-        let c301 = build_var_binary(fid(301), 2_000, 10, 30);
+        let c300 = build_fixed_u64(LogicalFieldId::for_default_user(300), 2_000);
+        let c301 = build_var_binary(LogicalFieldId::for_default_user(301), 2_000, 10, 30);
         let batch = batch_from_columns(&[c300.clone(), c301.clone()]);
         store.append(&batch).unwrap();
 
@@ -345,7 +335,7 @@ fn main() {
 
     {
         let c100 = (
-            fid(100),
+            LogicalFieldId::for_default_user(100),
             Arc::new(UInt64Array::from(vec![5u64, 7, 9])) as ArrayRef,
         );
         let b100 = batch_from_columns(std::slice::from_ref(&c100));
@@ -356,11 +346,17 @@ fn main() {
         for r in 1_000..1_000 + rows_999 as u64 {
             bb.append_value(vec![0xAB; (r % 17 + 12) as usize]);
         }
-        let c999 = (fid(999), Arc::new(bb.finish()) as ArrayRef);
+        let c999 = (
+            LogicalFieldId::for_default_user(999),
+            Arc::new(bb.finish()) as ArrayRef,
+        );
         let b999 = batch_from_columns(std::slice::from_ref(&c999));
         store.append(&b999).unwrap();
 
-        let summary = summarize_pairs(&[(fid(100), 3), (fid(999), rows_999)]);
+        let summary = summarize_pairs(&[
+            (LogicalFieldId::for_default_user(100), 3),
+            (LogicalFieldId::for_default_user(999), rows_999),
+        ]);
         show_phase_with_data(
             "Phase 4: mixed append (existing col 100 + new col 999)",
             &stats,

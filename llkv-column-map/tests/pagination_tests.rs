@@ -8,15 +8,8 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::store::scan::{PrimitiveSortedVisitor, PrimitiveVisitor, ScanOptions};
 use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
-
-fn fid_user(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 fn make_schema_u64(field_id: LogicalFieldId) -> Arc<Schema> {
     let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
@@ -31,7 +24,7 @@ fn pagination_unsorted_u64() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let field_id = fid_user(42);
+    let field_id = LogicalFieldId::for_default_user(42);
     let schema = make_schema_u64(field_id);
     let n = 1000usize;
     // Use a distinct order to validate unsorted semantics (append order)
@@ -161,7 +154,7 @@ fn pagination_sorted_u64() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let field_id = fid_user(43);
+    let field_id = LogicalFieldId::for_default_user(43);
     let schema = make_schema_u64(field_id);
     let n = 2048usize;
     // Shuffle-like data: descending to ensure sort index changes order

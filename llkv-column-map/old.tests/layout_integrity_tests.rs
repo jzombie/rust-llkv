@@ -3,18 +3,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 use roaring::RoaringTreemap;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-/// Test helper to create a standard user-data LogicalFieldId.
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 /// Helper to build a simple schema with "row_id" and one UInt64 data field.
 fn u64_schema_with_fid(fid: LogicalFieldId) -> Arc<Schema> {
@@ -33,7 +25,7 @@ fn test_layout_integrity_under_churn() {
     // --- 1. Setup ---
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-    let field_id = fid(901);
+    let field_id = LogicalFieldId::for_default_user(901);
     let schema = u64_schema_with_fid(field_id);
 
     // --- 2. Initial Large Ingestion ---

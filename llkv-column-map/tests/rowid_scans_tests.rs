@@ -16,13 +16,6 @@ use llkv_storage::pager::MemPager;
 use rand::seq::SliceRandom;
 use rand::{SeedableRng, rngs::StdRng};
 
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
-
 fn seed_u64_perm(
     n: usize,
     seed: u64,
@@ -35,7 +28,7 @@ fn seed_u64_perm(
 ) {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-    let field_id = fid(1001);
+    let field_id = LogicalFieldId::for_default_user(1001);
 
     // Schema: row_id (u64), data (u64)
     let mut md = HashMap::new();

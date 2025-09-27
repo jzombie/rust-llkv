@@ -36,14 +36,6 @@ where
     store.filter_row_ids::<T, _>(field_id, move |value| predicate.matches(value))
 }
 
-#[inline]
-fn lfid_for(table_id: TableId, column_id: FieldId) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_table_id(table_id)
-        .with_field_id(column_id)
-        .with_namespace(Namespace::UserData)
-}
-
 pub struct Table<P = MemPager>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -95,7 +87,7 @@ where
                     ))
                 })?;
 
-            let lfid = lfid_for(self.table_id, user_field_id);
+            let lfid = LogicalFieldId::for_user(self.table_id, user_field_id);
             let mut new_metadata = field.metadata().clone();
             let lfid_val: u64 = lfid.into();
             new_metadata.insert("field_id".to_string(), lfid_val.to_string());
@@ -167,7 +159,7 @@ where
             }
         }
 
-        let filter_lfid = lfid_for(self.table_id, filter.field_id);
+        let filter_lfid = LogicalFieldId::for_user(self.table_id, filter.field_id);
         let dtype = self.store.data_type(filter_lfid)?;
 
         let row_ids = llkv_column_map::with_integer_arrow_type!(
@@ -412,11 +404,11 @@ mod tests {
     }
 
     fn proj(table: &Table, field_id: FieldId) -> Projection {
-        Projection::from(lfid_for(table.table_id, field_id))
+        Projection::from(LogicalFieldId::for_user(table.table_id, field_id))
     }
 
     fn proj_alias<S: Into<String>>(table: &Table, field_id: FieldId, alias: S) -> Projection {
-        Projection::with_alias(lfid_for(table.table_id, field_id), alias)
+        Projection::with_alias(LogicalFieldId::for_user(table.table_id, field_id), alias)
     }
 
     #[test]
@@ -575,7 +567,7 @@ mod tests {
             ];
 
             for &(col, ref ty) in expectations {
-                let lfid = lfid_for(TABLE_ALPHA, col);
+                let lfid = LogicalFieldId::for_user(TABLE_ALPHA, col);
                 assert_eq!(store.data_type(lfid).unwrap(), *ty);
                 let arr = store.gather_rows(lfid, &alpha_rows, false).unwrap();
                 match ty {
@@ -604,13 +596,13 @@ mod tests {
             let table = Table::new(TABLE_BETA, Arc::clone(&pager)).unwrap();
             let store = table.store();
 
-            let lfid_u64 = lfid_for(TABLE_BETA, COL_BETA_U64);
+            let lfid_u64 = LogicalFieldId::for_user(TABLE_BETA, COL_BETA_U64);
             assert_eq!(store.data_type(lfid_u64).unwrap(), DataType::UInt64);
             let arr_u64 = store.gather_rows(lfid_u64, &beta_rows, false).unwrap();
             let arr_u64 = arr_u64.as_any().downcast_ref::<UInt64Array>().unwrap();
             assert_eq!(arr_u64.values(), beta_vals_u64.as_slice());
 
-            let lfid_u8 = lfid_for(TABLE_BETA, COL_BETA_U8);
+            let lfid_u8 = LogicalFieldId::for_user(TABLE_BETA, COL_BETA_U8);
             assert_eq!(store.data_type(lfid_u8).unwrap(), DataType::UInt8);
             let arr_u8 = store.gather_rows(lfid_u8, &beta_rows, false).unwrap();
             let arr_u8 = arr_u8.as_any().downcast_ref::<UInt8Array>().unwrap();
@@ -620,7 +612,7 @@ mod tests {
         {
             let table = Table::new(TABLE_GAMMA, Arc::clone(&pager)).unwrap();
             let store = table.store();
-            let lfid = lfid_for(TABLE_GAMMA, COL_GAMMA_I16);
+            let lfid = LogicalFieldId::for_user(TABLE_GAMMA, COL_GAMMA_I16);
             assert_eq!(store.data_type(lfid).unwrap(), DataType::Int16);
             let arr = store.gather_rows(lfid, &gamma_rows, false).unwrap();
             let arr = arr.as_any().downcast_ref::<Int16Array>().unwrap();

@@ -9,7 +9,7 @@ use arrow::record_batch::RecordBatch;
 use criterion::{Criterion, criterion_group, criterion_main};
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -23,13 +23,6 @@ const SPARSE_FIELD_COUNT: usize = 3;
 const SPARSE_FIELD_TAKE: usize = 3;
 const SAMPLE_ROW_IDS: usize = 1024;
 const SEED: u64 = 0x9E37_79B9_F701_3CAB;
-
-fn logical_fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 fn schema_with_row_id(field_id: LogicalFieldId, name: &str) -> Arc<Schema> {
     let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
@@ -48,7 +41,7 @@ fn build_fixture() -> (ColumnStore<MemPager>, Vec<LogicalFieldId>, Vec<u64>) {
 
     let mut fields = Vec::with_capacity(FIELD_COUNT);
     for idx in 0..FIELD_COUNT {
-        let fid = logical_fid(idx as u32);
+        let fid = LogicalFieldId::for_default_user(idx as u32);
         fields.push(fid);
         let schema = schema_with_row_id(fid, &format!("col_{idx}"));
         let values: Vec<u64> = (0..ROW_COUNT as u64)
@@ -79,7 +72,7 @@ fn build_sparse_fixture() -> (ColumnStore<MemPager>, Vec<LogicalFieldId>, Vec<u6
     let base_row_ids: Vec<u64> = (0..ROW_COUNT as u64).collect();
     let mut fields = Vec::with_capacity(SPARSE_FIELD_COUNT);
     for idx in 0..SPARSE_FIELD_COUNT {
-        let fid = logical_fid((100 + idx) as u32);
+        let fid = LogicalFieldId::for_default_user((100 + idx) as u32);
         fields.push(fid);
         let schema = schema_with_row_id(fid, &format!("sparse_col_{idx}"));
         let (rid_slice, values): (Vec<u64>, Vec<u64>) = if idx == SPARSE_FIELD_COUNT - 1 {

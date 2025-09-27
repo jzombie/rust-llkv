@@ -14,17 +14,10 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, RangeKey, ScanBuilder, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 
 use rand::seq::SliceRandom;
-
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 fn make_schema(field_id: LogicalFieldId, dt: DataType) -> Arc<Schema> {
     let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
@@ -165,7 +158,7 @@ where
 
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(Arc::clone(&pager)).unwrap();
-    let field_id = fid(1);
+    let field_id = LogicalFieldId::for_default_user(1);
 
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());
@@ -233,7 +226,7 @@ fn scan_all_integer_types_sorted_and_ranges() {
 
     // Helper to test one type end-to-end
     let mut test_type = |dt: DataType, gen_fn: &mut dyn FnMut(usize) -> Vec<i128>| {
-        let field_id = fid(match dt {
+        let field_id = LogicalFieldId::for_default_user(match dt {
             DataType::Int8 => 1,
             DataType::Int16 => 2,
             DataType::Int32 => 3,

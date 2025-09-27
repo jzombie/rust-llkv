@@ -11,17 +11,10 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 
 use rand::seq::SliceRandom;
-
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(2)
-        .with_field_id(id)
-}
 
 fn assert_sorted_f64(values: &[f64]) {
     assert!(
@@ -110,7 +103,7 @@ fn run_float64_case(mut values: Vec<f64>, low: f64, high: f64) {
 
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(Arc::clone(&pager)).unwrap();
-    let field_id = fid(500);
+    let field_id = LogicalFieldId::for_user(2, 500);
 
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());
@@ -188,7 +181,7 @@ fn run_float32_case(mut values: Vec<f32>, low: f32, high: f32) {
 
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(Arc::clone(&pager)).unwrap();
-    let field_id = fid(600);
+    let field_id = LogicalFieldId::for_user(2, 600);
 
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());

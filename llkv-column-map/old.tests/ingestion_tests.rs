@@ -3,17 +3,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-/// Test helper to create a standard user-data LogicalFieldId.
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 #[test]
 fn ingest_and_scan_multiple_columns() {
@@ -24,14 +16,14 @@ fn ingest_and_scan_multiple_columns() {
     // 2. Define the first column (u64 scalars) and its metadata.
     // The "field_id" metadata is critical for the store to identify
     // the column. We now construct a full LogicalFieldId for it.
-    let field_id_1 = fid(101);
+    let field_id_1 = LogicalFieldId::for_default_user(101);
     let mut metadata1 = HashMap::new();
     metadata1.insert("field_id".to_string(), u64::from(field_id_1).to_string());
     let field1 = Field::new("user_id", DataType::UInt64, false).with_metadata(metadata1);
     let array1 = Arc::new(UInt64Array::from(vec![1001, 1002, 1003]));
 
     // 3. Define the second column (2D f32 vectors) and its metadata.
-    let field_id_2 = fid(102);
+    let field_id_2 = LogicalFieldId::for_default_user(102);
     let mut metadata2 = HashMap::new();
     metadata2.insert("field_id".to_string(), u64::from(field_id_2).to_string());
     let list_value_field = Arc::new(Field::new("item", DataType::Float32, true));
