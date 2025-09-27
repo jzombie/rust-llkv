@@ -1066,7 +1066,6 @@ where
         include_nulls: false,
         ..Default::default()
     };
-    
 
     ScanBuilder::new(&table.store, target_lfid)
         .options(scan_opts)
