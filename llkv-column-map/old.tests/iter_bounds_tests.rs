@@ -117,8 +117,8 @@ fn collect_i32_in_bounds(
 fn u64_bounds_inclusive_middle() {
     const N: usize = 100_000;
     const B: usize = 5;
-    let fid_u64 = LogicalFieldId::for_default_user(501);
-    let fid_i32 = LogicalFieldId::for_default_user(901); // unused here, but present in the store
+    let fid_u64 = LogicalFieldId::for_user_table_0(501);
+    let fid_i32 = LogicalFieldId::for_user_table_0(901); // unused here, but present in the store
 
     let store = ingest_two_cols(N, B, fid_u64, fid_i32);
 
@@ -135,8 +135,8 @@ fn u64_bounds_inclusive_middle() {
 fn u64_bounds_open_ends() {
     const N: usize = 64_000;
     const B: usize = 4;
-    let fid_u64 = LogicalFieldId::for_default_user(502);
-    let fid_i32 = LogicalFieldId::for_default_user(902); // unused here
+    let fid_u64 = LogicalFieldId::for_user_table_0(502);
+    let fid_i32 = LogicalFieldId::for_user_table_0(902); // unused here
 
     let store = ingest_two_cols(N, B, fid_u64, fid_i32);
 
@@ -157,8 +157,8 @@ fn u64_bounds_open_ends() {
 fn u64_bounds_empty_ranges() {
     const N: usize = 32_768;
     const B: usize = 4;
-    let fid_u64 = LogicalFieldId::for_default_user(503);
-    let fid_i32 = LogicalFieldId::for_default_user(903); // unused here
+    let fid_u64 = LogicalFieldId::for_user_table_0(503);
+    let fid_i32 = LogicalFieldId::for_user_table_0(903); // unused here
 
     let store = ingest_two_cols(N, B, fid_u64, fid_i32);
 
@@ -184,8 +184,8 @@ fn u64_bounds_empty_ranges() {
 fn i32_bounds_cross_zero() {
     const N: usize = 80_000;
     const B: usize = 5;
-    let fid_u64 = LogicalFieldId::for_default_user(504); // unused here
-    let fid_i32 = LogicalFieldId::for_default_user(604);
+    let fid_u64 = LogicalFieldId::for_user_table_0(504); // unused here
+    let fid_i32 = LogicalFieldId::for_user_table_0(604);
 
     let store = ingest_two_cols(N, B, fid_u64, fid_i32);
 

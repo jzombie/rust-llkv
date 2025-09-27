@@ -58,8 +58,6 @@ pub struct LogicalFieldId {
     pub namespace: Namespace,
 }
 
-
-
 impl LogicalFieldId {
     /// Build a logical field identifier from its namespace, table, and field components.
     #[inline]
@@ -80,7 +78,7 @@ impl LogicalFieldId {
     ///
     /// Many tests use table 0 by default; this method avoids repeating the table ID literal.
     #[inline]
-    pub fn for_default_user(field_id: FieldId) -> Self {
+    pub fn for_user_table_0(field_id: FieldId) -> Self {
         Self::for_user(0, field_id)
     }
 }

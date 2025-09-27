@@ -158,7 +158,7 @@ where
 
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(Arc::clone(&pager)).unwrap();
-    let field_id = LogicalFieldId::for_default_user(1);
+    let field_id = LogicalFieldId::for_user_table_0(1);
 
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());
@@ -226,7 +226,7 @@ fn scan_all_integer_types_sorted_and_ranges() {
 
     // Helper to test one type end-to-end
     let mut test_type = |dt: DataType, gen_fn: &mut dyn FnMut(usize) -> Vec<i128>| {
-        let field_id = LogicalFieldId::for_default_user(match dt {
+        let field_id = LogicalFieldId::for_user_table_0(match dt {
             DataType::Int8 => 1,
             DataType::Int16 => 2,
             DataType::Int32 => 3,

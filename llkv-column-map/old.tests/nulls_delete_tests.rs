@@ -18,7 +18,7 @@ fn nulls_are_lww_deletes_u64_large() {
     const N_BATCHES: usize = 10;
     const BATCH: usize = N_ROWS / N_BATCHES;
 
-    let field_id = LogicalFieldId::for_default_user(710);
+    let field_id = LogicalFieldId::for_user_table_0(710);
 
     // Build store.
     let pager = Arc::new(MemPager::new());

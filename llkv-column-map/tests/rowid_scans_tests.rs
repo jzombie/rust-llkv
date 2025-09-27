@@ -28,7 +28,7 @@ fn seed_u64_perm(
 ) {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-    let field_id = LogicalFieldId::for_default_user(1001);
+    let field_id = LogicalFieldId::for_user_table_0(1001);
 
     // Schema: row_id (u64), data (u64)
     let mut md = HashMap::new();

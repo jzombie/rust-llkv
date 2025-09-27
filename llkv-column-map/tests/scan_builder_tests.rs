@@ -17,7 +17,7 @@ use llkv_storage::pager::MemPager;
 fn scan_builder_sorted_range_u64() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-    let field_id = LogicalFieldId::for_default_user(42);
+    let field_id = LogicalFieldId::for_user_table_0(42);
 
     // Build schema and ingest 0..10000 (shuffled via reverse values)
     let mut md = HashMap::new();
@@ -72,7 +72,7 @@ fn scan_builder_sorted_range_u64() {
 fn scan_builder_sorted_with_row_ids() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-    let field_id = LogicalFieldId::for_default_user(77);
+    let field_id = LogicalFieldId::for_user_table_0(77);
 
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());

@@ -67,7 +67,7 @@ fn build_put_for_col1(start: usize, end: usize) -> Option<(LogicalFieldId, Array
     }
     let vals: Vec<u32> = (s..e).map(|i| i as u32).collect();
     Some((
-        LogicalFieldId::for_default_user(1),
+        LogicalFieldId::for_user_table_0(1),
         Arc::new(UInt32Array::from(vals)) as ArrayRef,
     ))
 }
@@ -85,7 +85,7 @@ fn build_put_for_col2(start: usize, end: usize) -> Option<(LogicalFieldId, Array
         b.append_value(vec![b'A' + (i % 26) as u8; len]);
     }
     Some((
-        LogicalFieldId::for_default_user(2),
+        LogicalFieldId::for_user_table_0(2),
         Arc::new(b.finish()) as ArrayRef,
     ))
 }
@@ -98,7 +98,7 @@ fn build_put_for_col3(start: usize, end: usize) -> Option<(LogicalFieldId, Array
     }
     let vals: Vec<u64> = (s..e).map(|_| 0x55u64).collect(); // width=8
     Some((
-        LogicalFieldId::for_default_user(3),
+        LogicalFieldId::for_user_table_0(3),
         Arc::new(UInt64Array::from(vals)) as ArrayRef,
     ))
 }
@@ -228,7 +228,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     impl PrimitiveSortedWithRowIdsVisitor for Count {}
     static ROWS: AtomicU64 = AtomicU64::new(0);
     for id in [1u32, 2, 3] {
-        let field_id = LogicalFieldId::for_default_user(id);
+        let field_id = LogicalFieldId::for_user_table_0(id);
         ROWS.store(0, Ordering::Relaxed);
         let mut v = Count;
         match store.scan(field_id, ScanOptions::default(), &mut v) {

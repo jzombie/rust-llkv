@@ -50,7 +50,7 @@ fn bench_column_store_sum(c: &mut Criterion) {
             || {
                 let pager = Arc::new(MemPager::new());
                 let store = ColumnStore::open(pager).unwrap();
-                let field_id = LogicalFieldId::for_default_user(7777);
+                let field_id = LogicalFieldId::for_user_table_0(7777);
 
                 let mut md = HashMap::new();
                 md.insert("field_id".to_string(), u64::from(field_id).to_string());
@@ -117,7 +117,7 @@ fn bench_column_store_sum(c: &mut Criterion) {
             || {
                 let pager = Arc::new(MemPager::new());
                 let store = ColumnStore::open(pager).unwrap();
-                let field_id = LogicalFieldId::for_default_user(8888);
+                let field_id = LogicalFieldId::for_user_table_0(8888);
 
                 let mut md = HashMap::new();
                 md.insert("field_id".to_string(), u64::from(field_id).to_string());
@@ -189,7 +189,7 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
     group.bench_function("sum_u64_fragmented_with_deletes", |b| {
         b.iter_batched(
             || {
-                let field_id = LogicalFieldId::for_default_user(9001);
+                let field_id = LogicalFieldId::for_user_table_0(9001);
                 let pager = Arc::new(MemPager::new());
                 let store = ColumnStore::open(pager).unwrap();
 

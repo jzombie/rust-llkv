@@ -19,7 +19,7 @@ fn unsorted_with_nulls_anchor_order() {
     let store = ColumnStore::open(pager).unwrap();
 
     // Anchor rid 0..50
-    let anchor_fid = LogicalFieldId::for_default_user(21);
+    let anchor_fid = LogicalFieldId::for_user_table_0(21);
     let mut md_a = HashMap::new();
     md_a.insert("field_id".to_string(), u64::from(anchor_fid).to_string());
     let schema_a = Arc::new(Schema::new(vec![
@@ -38,7 +38,7 @@ fn unsorted_with_nulls_anchor_order() {
     store.append(&b).unwrap();
 
     // Target: evens only
-    let target_fid = LogicalFieldId::for_default_user(22);
+    let target_fid = LogicalFieldId::for_user_table_0(22);
     let mut md_t = HashMap::new();
     md_t.insert("field_id".to_string(), u64::from(target_fid).to_string());
     let schema_t = Arc::new(Schema::new(vec![

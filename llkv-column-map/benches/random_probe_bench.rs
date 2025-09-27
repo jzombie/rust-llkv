@@ -51,7 +51,7 @@ fn seed_store_1m() -> (ColumnStore<MemPager>, LogicalFieldId) {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let field_id = LogicalFieldId::for_default_user(42);
+    let field_id = LogicalFieldId::for_user_table_0(42);
     let schema = schema_with_row_id(field_id);
 
     // row_id 0..N-1; values 0..N-1 shuffled at ingest

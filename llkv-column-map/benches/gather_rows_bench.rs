@@ -41,7 +41,7 @@ fn build_fixture() -> (ColumnStore<MemPager>, Vec<LogicalFieldId>, Vec<u64>) {
 
     let mut fields = Vec::with_capacity(FIELD_COUNT);
     for idx in 0..FIELD_COUNT {
-        let fid = LogicalFieldId::for_default_user(idx as u32);
+        let fid = LogicalFieldId::for_user_table_0(idx as u32);
         fields.push(fid);
         let schema = schema_with_row_id(fid, &format!("col_{idx}"));
         let values: Vec<u64> = (0..ROW_COUNT as u64)
@@ -72,7 +72,7 @@ fn build_sparse_fixture() -> (ColumnStore<MemPager>, Vec<LogicalFieldId>, Vec<u6
     let base_row_ids: Vec<u64> = (0..ROW_COUNT as u64).collect();
     let mut fields = Vec::with_capacity(SPARSE_FIELD_COUNT);
     for idx in 0..SPARSE_FIELD_COUNT {
-        let fid = LogicalFieldId::for_default_user((100 + idx) as u32);
+        let fid = LogicalFieldId::for_user_table_0((100 + idx) as u32);
         fields.push(fid);
         let schema = schema_with_row_id(fid, &format!("sparse_col_{idx}"));
         let (rid_slice, values): (Vec<u64>, Vec<u64>) = if idx == SPARSE_FIELD_COUNT - 1 {

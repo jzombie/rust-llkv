@@ -64,7 +64,7 @@ fn seed_store_1m() -> (ColumnStore<MemPager>, LogicalFieldId, LogicalFieldId) {
     let store = ColumnStore::open(pager).unwrap();
 
     // Column 1: u64
-    let fid_u64 = LogicalFieldId::for_default_user(1);
+    let fid_u64 = LogicalFieldId::for_user_table_0(1);
     let mut md1 = HashMap::new();
     md1.insert("field_id".to_string(), u64::from(fid_u64).to_string());
     let schema1 = Arc::new(Schema::new(vec![
@@ -81,7 +81,7 @@ fn seed_store_1m() -> (ColumnStore<MemPager>, LogicalFieldId, LogicalFieldId) {
     store.append(&batch1).unwrap();
 
     // Column 2: i32 (not used in this bench, but mirrors workload)
-    let fid_i32 = LogicalFieldId::for_default_user(2);
+    let fid_i32 = LogicalFieldId::for_user_table_0(2);
     let mut md2 = HashMap::new();
     md2.insert("field_id".to_string(), u64::from(fid_i32).to_string());
     let schema2 = Arc::new(Schema::new(vec![
@@ -108,7 +108,7 @@ fn seed_store_1m_fragmented_random(chunks: usize) -> (ColumnStore<MemPager>, Log
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let fid_u64 = LogicalFieldId::for_default_user(101);
+    let fid_u64 = LogicalFieldId::for_user_table_0(101);
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(fid_u64).to_string());
     let schema = Arc::new(Schema::new(vec![

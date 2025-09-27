@@ -44,7 +44,7 @@ fn test_instrumented_paging_io_behavior() {
     // Wrap the MemPager to track I/O operations.
     let (pager, stats) = InstrumentedPager::new(MemPager::new());
     let store = ColumnStore::open(Arc::new(pager)).unwrap();
-    let field_id = LogicalFieldId::for_default_user(950);
+    let field_id = LogicalFieldId::for_user_table_0(950);
     let schema = u64_schema_with_fid(field_id);
 
     // --- Phase 2: Initial Append ---
@@ -131,7 +131,7 @@ fn test_exact_io_counts_for_simple_append() {
     // implementation changes than relational checks.
     let (pager, stats) = InstrumentedPager::new(MemPager::new());
     let store = ColumnStore::open(Arc::new(pager)).unwrap();
-    let field_id = LogicalFieldId::for_default_user(101);
+    let field_id = LogicalFieldId::for_user_table_0(101);
     let schema = u64_schema_with_fid(field_id);
 
     // --- The Operation ---
@@ -181,7 +181,7 @@ fn test_large_scale_churn_io() {
 
     let (pager, stats) = InstrumentedPager::new(MemPager::new());
     let store = ColumnStore::open(Arc::new(pager)).unwrap();
-    let field_id = LogicalFieldId::for_default_user(1001);
+    let field_id = LogicalFieldId::for_user_table_0(1001);
     let schema = u64_schema_with_fid(field_id);
 
     // --- 2. Phase 1: Bulk Upsert (Insert) of 1M Entries in Batches ---

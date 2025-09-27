@@ -29,7 +29,7 @@ fn seed_store_shuffled(
 
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-    let field_id = LogicalFieldId::for_default_user(4242);
+    let field_id = LogicalFieldId::for_user_table_0(4242);
     let schema = schema_with_row_id(field_id);
 
     // Build a single global permutation of 0..N-1 and its inverse mapping value->row_id.

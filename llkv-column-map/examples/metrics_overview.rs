@@ -226,7 +226,7 @@ fn print_read_report_scan(store: &ColumnStore<InstrumentedPager<MemPager>>) {
 
     println!("-- Read report (scan sample) --");
     for &id in &[100u32, 200, 201, 300, 301, 999] {
-        let field_id = LogicalFieldId::for_default_user(id);
+        let field_id = LogicalFieldId::for_user_table_0(id);
         // Visitor to count up to a small budget and capture last u64 value if applicable.
         struct Sample {
             seen: usize,
@@ -289,8 +289,8 @@ fn main() {
     show_phase("Phase 0: init (bootstrap + manifest)", &stats, &mut prev);
 
     {
-        let c100 = build_fixed_u64(LogicalFieldId::for_default_user(100), 10_000);
-        let c101 = build_fixed_u64(LogicalFieldId::for_default_user(101), 10_000);
+        let c100 = build_fixed_u64(LogicalFieldId::for_user_table_0(100), 10_000);
+        let c101 = build_fixed_u64(LogicalFieldId::for_user_table_0(101), 10_000);
         let batch = batch_from_columns(&[c100.clone(), c101.clone()]);
         store.append(&batch).unwrap();
 
@@ -304,8 +304,8 @@ fn main() {
     }
 
     {
-        let c200 = build_var_binary(LogicalFieldId::for_default_user(200), 12_345, 6, 18);
-        let c201 = build_var_binary(LogicalFieldId::for_default_user(201), 12_345, 6, 18);
+        let c200 = build_var_binary(LogicalFieldId::for_user_table_0(200), 12_345, 6, 18);
+        let c201 = build_var_binary(LogicalFieldId::for_user_table_0(201), 12_345, 6, 18);
         let batch = batch_from_columns(&[c200.clone(), c201.clone()]);
         store.append(&batch).unwrap();
 
@@ -319,8 +319,8 @@ fn main() {
     }
 
     {
-        let c300 = build_fixed_u64(LogicalFieldId::for_default_user(300), 2_000);
-        let c301 = build_var_binary(LogicalFieldId::for_default_user(301), 2_000, 10, 30);
+        let c300 = build_fixed_u64(LogicalFieldId::for_user_table_0(300), 2_000);
+        let c301 = build_var_binary(LogicalFieldId::for_user_table_0(301), 2_000, 10, 30);
         let batch = batch_from_columns(&[c300.clone(), c301.clone()]);
         store.append(&batch).unwrap();
 
@@ -335,7 +335,7 @@ fn main() {
 
     {
         let c100 = (
-            LogicalFieldId::for_default_user(100),
+            LogicalFieldId::for_user_table_0(100),
             Arc::new(UInt64Array::from(vec![5u64, 7, 9])) as ArrayRef,
         );
         let b100 = batch_from_columns(std::slice::from_ref(&c100));
@@ -347,15 +347,15 @@ fn main() {
             bb.append_value(vec![0xAB; (r % 17 + 12) as usize]);
         }
         let c999 = (
-            LogicalFieldId::for_default_user(999),
+            LogicalFieldId::for_user_table_0(999),
             Arc::new(bb.finish()) as ArrayRef,
         );
         let b999 = batch_from_columns(std::slice::from_ref(&c999));
         store.append(&b999).unwrap();
 
         let summary = summarize_pairs(&[
-            (LogicalFieldId::for_default_user(100), 3),
-            (LogicalFieldId::for_default_user(999), rows_999),
+            (LogicalFieldId::for_user_table_0(100), 3),
+            (LogicalFieldId::for_user_table_0(999), rows_999),
         ]);
         show_phase_with_data(
             "Phase 4: mixed append (existing col 100 + new col 999)",

@@ -97,7 +97,7 @@ fn test_lww_updates_single_field_u64() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let field_id = LogicalFieldId::for_default_user(700);
+    let field_id = LogicalFieldId::for_user_table_0(700);
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);
@@ -142,8 +142,8 @@ fn test_lww_per_field_isolation() {
     let store = ColumnStore::open(pager).unwrap();
 
     // Two fields with different logical ids.
-    let fida = LogicalFieldId::for_default_user(800);
-    let fidb = LogicalFieldId::for_default_user(801);
+    let fida = LogicalFieldId::for_user_table_0(800);
+    let fidb = LogicalFieldId::for_user_table_0(801);
 
     let mut mda = HashMap::new();
     mda.insert("field_id".to_string(), u64::from(fida).to_string());
@@ -197,7 +197,7 @@ fn test_deletes_and_updates() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let field_id = LogicalFieldId::for_default_user(820);
+    let field_id = LogicalFieldId::for_user_table_0(820);
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);

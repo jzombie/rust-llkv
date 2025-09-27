@@ -25,7 +25,7 @@ fn test_layout_integrity_under_churn() {
     // --- 1. Setup ---
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-    let field_id = LogicalFieldId::for_default_user(901);
+    let field_id = LogicalFieldId::for_user_table_0(901);
     let schema = u64_schema_with_fid(field_id);
 
     // --- 2. Initial Large Ingestion ---

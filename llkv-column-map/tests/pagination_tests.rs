@@ -24,7 +24,7 @@ fn pagination_unsorted_u64() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let field_id = LogicalFieldId::for_default_user(42);
+    let field_id = LogicalFieldId::for_user_table_0(42);
     let schema = make_schema_u64(field_id);
     let n = 1000usize;
     // Use a distinct order to validate unsorted semantics (append order)
@@ -154,7 +154,7 @@ fn pagination_sorted_u64() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let field_id = LogicalFieldId::for_default_user(43);
+    let field_id = LogicalFieldId::for_user_table_0(43);
     let schema = make_schema_u64(field_id);
     let n = 2048usize;
     // Shuffle-like data: descending to ensure sort index changes order

@@ -19,7 +19,7 @@ fn sorted_with_nulls_last_pagination() {
     let store = ColumnStore::open(pager).unwrap();
 
     // Anchor row_id column (dense 0..100)
-    let anchor_fid = LogicalFieldId::for_default_user(1);
+    let anchor_fid = LogicalFieldId::for_user_table_0(1);
     let mut md_anchor = HashMap::new();
     md_anchor.insert("field_id".to_string(), u64::from(anchor_fid).to_string());
     let schema_anchor = Arc::new(Schema::new(vec![
@@ -38,7 +38,7 @@ fn sorted_with_nulls_last_pagination() {
     store.append(&a0).unwrap();
 
     // Target column: only even row_ids present
-    let target_fid = LogicalFieldId::for_default_user(2);
+    let target_fid = LogicalFieldId::for_user_table_0(2);
     let mut md_t = HashMap::new();
     md_t.insert("field_id".to_string(), u64::from(target_fid).to_string());
     let schema_t = Arc::new(Schema::new(vec![

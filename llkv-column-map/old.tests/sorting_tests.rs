@@ -17,7 +17,7 @@ fn test_large_sort_u64() {
     const NUM_ROWS: usize = 1_000_000;
     const NUM_BATCHES: usize = 10;
     const BATCH_SIZE: usize = NUM_ROWS / NUM_BATCHES;
-    let field_id = LogicalFieldId::for_default_user(301);
+    let field_id = LogicalFieldId::for_user_table_0(301);
 
     // --- 1. Setup ---
     let pager = Arc::new(MemPager::new());

@@ -15,7 +15,7 @@ fn presence_index_cross_column_queries() {
     let store = ColumnStore::open(pager).unwrap();
 
     // Column A schema
-    let fid_a = LogicalFieldId::for_default_user(101);
+    let fid_a = LogicalFieldId::for_user_table_0(101);
     let mut md_a = HashMap::new();
     md_a.insert("field_id".to_string(), u64::from(fid_a).to_string());
     let schema_a = Arc::new(Schema::new(vec![
@@ -24,7 +24,7 @@ fn presence_index_cross_column_queries() {
     ]));
 
     // Column B schema
-    let fid_b = LogicalFieldId::for_default_user(102);
+    let fid_b = LogicalFieldId::for_user_table_0(102);
     let mut md_b = HashMap::new();
     md_b.insert("field_id".to_string(), u64::from(fid_b).to_string());
     let schema_b = Arc::new(Schema::new(vec![

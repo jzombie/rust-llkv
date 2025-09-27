@@ -34,8 +34,8 @@ impl PrimitiveSortedWithRowIdsVisitor for TouchVisitor {
 fn indices_persist_after_drop_and_reopen() {
     let pager = Arc::new(MemPager::new());
 
-    let anchor_fid = LogicalFieldId::for_default_user(41);
-    let target_fid = LogicalFieldId::for_default_user(42);
+    let anchor_fid = LogicalFieldId::for_user_table_0(41);
+    let target_fid = LogicalFieldId::for_user_table_0(42);
 
     // Scope 1: create store, seed data, create indices.
     {
@@ -128,7 +128,7 @@ fn indices_persist_after_drop_and_reopen() {
 #[test]
 fn index_can_be_removed_and_persists() {
     let pager = Arc::new(MemPager::new());
-    let target_fid = LogicalFieldId::for_default_user(50);
+    let target_fid = LogicalFieldId::for_user_table_0(50);
 
     // Scope 1: Create store, seed data, create an index, then remove it.
     {
