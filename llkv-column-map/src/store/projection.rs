@@ -165,10 +165,7 @@ impl MultiGatherContext {
                 }
             }
         }
-        let idx = match chunk_idx {
-            Some(idx) => idx,
-            None => return None,
-        };
+        let idx = chunk_idx?;
 
         let mut span_min = u64::MAX;
         let mut span_max = 0u64;
@@ -397,9 +394,7 @@ where
 
             let dense_base = if len == 0 {
                 None
-            } else if len == 1 {
-                Some(row_ids[0])
-            } else if is_non_decreasing && row_ids.windows(2).all(|w| w[1] == w[0] + 1) {
+            } else if len == 1 || is_non_decreasing && row_ids.windows(2).all(|w| w[1] == w[0] + 1) {
                 Some(row_ids[0])
             } else {
                 None
@@ -558,6 +553,7 @@ where
         idx < sorted_row_ids.len() && sorted_row_ids[idx] <= max
     }
 
+    #[allow(clippy::too_many_arguments)] // TODO: Refactor
     fn gather_rows_from_chunks<T>(
         row_ids: &[u64],
         row_locator: RowLocator,
@@ -594,12 +590,10 @@ where
 
             if row_arr.null_count() == 0 && row_ids.windows(2).all(|w| w[0] <= w[1]) {
                 let values = row_arr.values();
-                if let Ok(start_idx) = values.binary_search(&row_ids[0]) {
-                    if start_idx + len <= values.len()
+                if let Ok(start_idx) = values.binary_search(&row_ids[0]) && start_idx + len <= values.len()
                         && row_ids == &values[start_idx..start_idx + len]
-                    {
-                        return Ok(value_any.slice(start_idx, len));
-                    }
+                {
+                    return Ok(value_any.slice(start_idx, len));
                 }
             }
         }
@@ -653,8 +647,8 @@ where
         }
 
         let mut builder = PrimitiveBuilder::<T>::with_capacity(len);
-        for offset in 0..len {
-            if let Some((chunk_idx, value_idx)) = row_scratch[offset] {
+        for row_scratch_item in row_scratch.iter().take(len) {
+            if let Some((chunk_idx, value_idx)) = *row_scratch_item {
                 if let Some(&slot) = chunk_lookup.get(&chunk_idx) {
                     let (idx, value_arr, _) = candidates[slot];
                     debug_assert_eq!(idx, chunk_idx);

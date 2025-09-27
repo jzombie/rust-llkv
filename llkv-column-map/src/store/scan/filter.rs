@@ -485,10 +485,8 @@ where
             return Ok(None);
         }
 
-        if let Some(expected) = expected_next {
-            if start != expected {
-                return Ok(None);
-            }
+        if let Some(expected) = expected_next && start != expected {
+            return Ok(None);
         }
 
         let len = usize::try_from(meta.row_count)
