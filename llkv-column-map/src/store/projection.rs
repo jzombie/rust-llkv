@@ -784,7 +784,7 @@ where
             }
         }
 
-        let array = PrimitiveArray::<T>::from_iter(values.into_iter());
+        let array = PrimitiveArray::<T>::from_iter(values);
         Ok(Arc::new(array) as ArrayRef)
     }
 
