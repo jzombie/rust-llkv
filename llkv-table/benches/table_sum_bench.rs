@@ -10,7 +10,7 @@ use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 
 use llkv_column_map::store::Projection;
 use llkv_column_map::types::LogicalFieldId;
@@ -56,19 +56,10 @@ fn setup_table() -> Table {
     table
 }
 
-fn scan_sum(table: &Table) -> u128 {
-    let projection = Projection::from(LogicalFieldId::for_user(TABLE_ID, FIELD_ID));
-    let filter: Expr<'static, FieldId> = Expr::Pred(Filter {
-        field_id: FIELD_ID,
-        op: Operator::Range {
-            lower: Bound::Unbounded,
-            upper: Bound::Unbounded,
-        },
-    });
-
+fn scan_sum(table: &Table, projections: &[Projection], filter: &Expr<'static, FieldId>) -> u128 {
     let mut total: u128 = 0;
     table
-        .scan_stream(&[projection], &filter, ScanStreamOptions::default(), |batch| {
+        .scan_stream(projections, filter, ScanStreamOptions::default(), |batch| {
             let arr = batch
                 .column(0)
                 .as_any()
@@ -84,19 +75,26 @@ fn scan_sum(table: &Table) -> u128 {
 }
 
 fn bench_table_sum(c: &mut Criterion) {
+    let table = setup_table();
+    let projections = vec![Projection::from(LogicalFieldId::for_user(TABLE_ID, FIELD_ID))];
+    let filter: Expr<'static, FieldId> = Expr::Pred(Filter {
+        field_id: FIELD_ID,
+        op: Operator::Range {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        },
+    });
+    let expected = expected_sum();
+
     let mut group = c.benchmark_group("llkv_table_sum_1M");
     group.sample_size(20);
 
     group.bench_function("scan_stream_sum_u64", |b| {
-        b.iter_batched(
-            setup_table,
-            |table| {
-                let total = scan_sum(&table);
-                assert_eq!(total, expected_sum());
-                black_box(total);
-            },
-            BatchSize::SmallInput,
-        );
+        b.iter(|| {
+            let total = scan_sum(&table, &projections, &filter);
+            assert_eq!(total, expected);
+            black_box(total);
+        });
     });
 
     group.finish();

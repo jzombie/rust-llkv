@@ -373,6 +373,10 @@ where
             return Ok(());
         }
 
+        let mut gather_ctx = self
+            .store
+            .prepare_multi_gather_context(&unique_lfids)?;
+
         let fields: Vec<Field> = projection_evals
             .iter()
             .map(|eval| match eval {
@@ -393,12 +397,27 @@ where
             GatherNullPolicy::DropNulls
         };
         while start < row_ids.len() {
-            let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
+            let chunk_span = gather_ctx
+                .chunk_span_for_row(row_ids[start])
+                .ok_or_else(|| Error::Internal("row id not covered by chunk metadata".into()))?;
+            let mut end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
+            while end < row_ids.len() && row_ids[end - 1] <= chunk_span.2 {
+                end += 1;
+                if end - start >= STREAM_BATCH_ROWS {
+                    break;
+                }
+            }
+            while end <= row_ids.len() && row_ids[end - 1] > chunk_span.2 {
+                end -= 1;
+            }
+            let end = end.max(start + 1);
             let window = &row_ids[start..end];
 
-            let gathered =
-                self.store
-                    .gather_rows_multi_with_policy(&unique_lfids, window, null_policy)?;
+            let gathered = self.store.gather_rows_multi_with_context(
+                &mut gather_ctx,
+                window,
+                null_policy,
+            )?;
 
             if gathered.num_columns() == 0 || gathered.num_rows() == 0 {
                 start = end;
