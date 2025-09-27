@@ -5,12 +5,12 @@ use std::sync::Arc;
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::types::TableId;
 
-use arrow::array::{Array, ArrayRef, Int32Array, RecordBatch, UInt64Array};
+use arrow::array::{ ArrayRef,  RecordBatch, };
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
 use llkv_column_map::store::{FilterPrimitive, GatherNullPolicy, Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{
-    ColumnStore, scan,
+    ColumnStore, 
     types::{LogicalFieldId, Namespace},
 };
 use llkv_storage::pager::{MemPager, Pager};
@@ -472,69 +472,6 @@ pub struct ColumnData {
     pub data_type: DataType,
 }
 
-// FIX: Move helper methods into a trait to satisfy Rust's orphan rule
-pub trait ColumnStoreTestExt {
-    fn get_column_for_test(&self, field_id: LogicalFieldId) -> LlkvResult<ColumnData>;
-}
-
-impl ColumnStoreTestExt for ColumnStore<MemPager> {
-    fn get_column_for_test(&self, field_id: LogicalFieldId) -> LlkvResult<ColumnData> {
-        struct ColVisitor {
-            chunks: Vec<ArrayRef>,
-            data_type: Option<DataType>,
-        }
-        impl scan::PrimitiveVisitor for ColVisitor {
-            fn u64_chunk(&mut self, a: &UInt64Array) {
-                self.data_type.get_or_insert(DataType::UInt64);
-                self.chunks.push(Arc::new(a.clone()));
-            }
-            fn i32_chunk(&mut self, a: &Int32Array) {
-                self.data_type.get_or_insert(DataType::Int32);
-                self.chunks.push(Arc::new(a.clone()));
-            }
-            fn f64_chunk(&mut self, a: &arrow::array::Float64Array) {
-                self.data_type.get_or_insert(DataType::Float64);
-                self.chunks.push(Arc::new(a.clone()));
-            }
-            fn f32_chunk(&mut self, a: &arrow::array::Float32Array) {
-                self.data_type.get_or_insert(DataType::Float32);
-                self.chunks.push(Arc::new(a.clone()));
-            }
-            // FIX: The trait `PrimitiveVisitor` does not have a `binary_chunk`
-            // method. This must be handled by downcasting a generic
-            // `array_chunk` if needed, or by adding the method to the trait in
-            // `column-map`. For now, we remove it to allow compilation.
-            // fn binary_chunk(&mut self, a: &arrow::array::BinaryArray) {
-            //     self.data_type.get_or_insert(DataType::Binary);
-            //     self.chunks.push(Arc::new(a.clone()));
-            // }
-        }
-        impl scan::PrimitiveWithRowIdsVisitor for ColVisitor {}
-        impl scan::PrimitiveSortedVisitor for ColVisitor {}
-        impl scan::PrimitiveSortedWithRowIdsVisitor for ColVisitor {}
-
-        let mut visitor = ColVisitor {
-            chunks: vec![],
-            data_type: None,
-        };
-        self.scan(field_id, Default::default(), &mut visitor)?;
-
-        if visitor.chunks.is_empty() {
-            return Err(Error::Internal("Column not found or is empty".to_string()));
-        }
-
-        // NOTE: This helper still concatenates for tests. Production code
-        // uses streaming via `scan_stream`.
-        let refs: Vec<&dyn Array> = visitor.chunks.iter().map(|c| c.as_ref()).collect();
-        let combined = arrow::compute::concat(&refs)?;
-
-        Ok(ColumnData {
-            data: combined,
-            data_type: visitor.data_type.unwrap(),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,9 +481,11 @@ mod tests {
         BinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, UInt8Array, UInt32Array,
         UInt64Array,
     };
+    use arrow::array::Array;
     use arrow::compute::{cast, max, min, sum, unary};
     use std::collections::HashMap;
     use std::ops::Bound;
+
 
     fn setup_test_table() -> Table {
         let pager = Arc::new(MemPager::default());
