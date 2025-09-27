@@ -395,7 +395,7 @@ where
             .map_err(|e| Error::Internal(format!("gather_rows_multi batch: {e}")))
     }
 
-    pub fn prepare_multi_gather_context(
+    pub fn prepare_gather_context(
         &self,
         field_ids: &[LogicalFieldId],
     ) -> Result<MultiGatherContext> {

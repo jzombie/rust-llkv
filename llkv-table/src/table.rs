@@ -399,7 +399,7 @@ where
             return Ok(());
         }
 
-        let mut gather_ctx = self.store.prepare_multi_gather_context(&unique_lfids)?;
+        let mut gather_ctx = self.store.prepare_gather_context(&unique_lfids)?;
 
         let fields: Vec<Field> = projection_evals
             .iter()
@@ -537,7 +537,7 @@ where
             }
         };
 
-        let mut gather_ctx = self.store.prepare_multi_gather_context(unique_lfids)?;
+        let mut gather_ctx = self.store.prepare_gather_context(unique_lfids)?;
         if gather_ctx.is_empty() {
             return Ok(true);
         }
