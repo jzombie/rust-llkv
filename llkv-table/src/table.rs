@@ -375,48 +375,6 @@ mod tests {
         table
     }
 
-    /// Helper to collect a streamed column into a Vec<Option<T>> using a
-    /// provided extractor function. Avoids concat in tests while keeping
-    /// assertions simple.
-    fn collect_streamed_values<T, FExtract>(
-        table: &Table,
-        proj: FieldId,
-        filter: &Filter<'_, FieldId>,
-        mut extract: FExtract,
-    ) -> Vec<Option<T>>
-    where
-        T: Copy,
-        FExtract: FnMut(&RecordBatch) -> Vec<Option<T>>,
-    {
-        let mut out = Vec::<Option<T>>::new();
-        table
-            .scan_stream(proj, filter, |b| {
-                out.extend(extract(&b));
-            })
-            .unwrap();
-        out
-    }
-
-    fn collect_streamed_values_with_options<T, FExtract>(
-        table: &Table,
-        proj: FieldId,
-        filter: &Filter<'_, FieldId>,
-        options: ScanStreamOptions,
-        mut extract: FExtract,
-    ) -> Vec<Option<T>>
-    where
-        T: Copy,
-        FExtract: FnMut(&RecordBatch) -> Vec<Option<T>>,
-    {
-        let mut out = Vec::<Option<T>>::new();
-        table
-            .scan_stream_with_options(proj, filter, options, |b| {
-                out.extend(extract(&b));
-            })
-            .unwrap();
-        out
-    }
-
     #[test]
     fn table_new_rejects_reserved_table_id() {
         let result = Table::new(CATALOG_TID, Arc::new(MemPager::default()));
@@ -437,12 +395,17 @@ mod tests {
             op: Operator::Equals(200.into()),
         };
 
-        let vals = collect_streamed_values::<i32, _>(&table, COL_C_I32, &filter, |b| {
-            let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-            (0..a.len())
-                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
-                .collect::<Vec<_>>()
-        });
+        let mut vals: Vec<Option<i32>> = Vec::new();
+        table
+            .scan_stream(COL_C_I32, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                vals.extend((0..a.len()).map(
+                    |i| {
+                        if a.is_null(i) { None } else { Some(a.value(i)) }
+                    },
+                ));
+            })
+            .unwrap();
         assert_eq!(vals, vec![Some(20), Some(20)]);
     }
 
@@ -629,12 +592,17 @@ mod tests {
             op: Operator::Equals(20.into()),
         };
 
-        let vals = collect_streamed_values::<u64, _>(&table, COL_A_U64, &filter, |b| {
-            let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
-            (0..a.len())
-                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
-                .collect::<Vec<_>>()
-        });
+        let mut vals: Vec<Option<u64>> = Vec::new();
+        table
+            .scan_stream(COL_A_U64, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                vals.extend((0..a.len()).map(
+                    |i| {
+                        if a.is_null(i) { None } else { Some(a.value(i)) }
+                    },
+                ));
+            })
+            .unwrap();
         assert_eq!(vals, vec![Some(200), Some(200)]);
     }
 
@@ -649,12 +617,17 @@ mod tests {
             op: Operator::GreaterThan(15.into()),
         };
 
-        let vals = collect_streamed_values::<u64, _>(&table, COL_A_U64, &filter, |b| {
-            let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
-            (0..a.len())
-                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
-                .collect::<Vec<_>>()
-        });
+        let mut vals: Vec<Option<u64>> = Vec::new();
+        table
+            .scan_stream(COL_A_U64, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                vals.extend((0..a.len()).map(
+                    |i| {
+                        if a.is_null(i) { None } else { Some(a.value(i)) }
+                    },
+                ));
+            })
+            .unwrap();
         assert_eq!(vals, vec![Some(200), Some(300), Some(200)]);
     }
 
@@ -672,12 +645,17 @@ mod tests {
             },
         };
 
-        let vals = collect_streamed_values::<i32, _>(&table, COL_C_I32, &filter, |b| {
-            let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-            (0..a.len())
-                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
-                .collect::<Vec<_>>()
-        });
+        let mut vals: Vec<Option<i32>> = Vec::new();
+        table
+            .scan_stream(COL_C_I32, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                vals.extend((0..a.len()).map(
+                    |i| {
+                        if a.is_null(i) { None } else { Some(a.value(i)) }
+                    },
+                ));
+            })
+            .unwrap();
         assert_eq!(vals, vec![Some(20), Some(20)]);
     }
 
@@ -808,18 +786,19 @@ mod tests {
             op: Operator::In(&candidates),
         };
 
-        let vals = collect_streamed_values::<f32, _>(&table, COL_E_F32, &filter, |b| {
-            let arr = b.column(0).as_any().downcast_ref::<Float32Array>().unwrap();
-            (0..arr.len())
-                .map(|i| {
+        let mut vals: Vec<Option<f32>> = Vec::new();
+        table
+            .scan_stream(COL_E_F32, &filter, |b| {
+                let arr = b.column(0).as_any().downcast_ref::<Float32Array>().unwrap();
+                vals.extend((0..arr.len()).map(|i| {
                     if arr.is_null(i) {
                         None
                     } else {
                         Some(arr.value(i))
                     }
-                })
-                .collect()
-        });
+                }));
+            })
+            .unwrap();
 
         let collected: Vec<f32> = vals.into_iter().flatten().collect();
         assert_eq!(collected, vec![2.0, 3.0, 2.0]);
@@ -881,40 +860,41 @@ mod tests {
             op: Operator::GreaterThan(450.into()),
         };
 
-        let default_vals = collect_streamed_values::<i32, _>(&table, COL_C_I32, &filter, |b| {
-            let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-            (0..arr.len())
-                .map(|i| {
+        let mut default_vals: Vec<Option<i32>> = Vec::new();
+        table
+            .scan_stream(COL_C_I32, &filter, |b| {
+                let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                default_vals.extend((0..arr.len()).map(|i| {
                     if arr.is_null(i) {
                         None
                     } else {
                         Some(arr.value(i))
                     }
-                })
-                .collect::<Vec<_>>()
-        });
+                }));
+            })
+            .unwrap();
         assert_eq!(default_vals, vec![Some(40)]);
 
-        let include_null_vals = collect_streamed_values_with_options::<i32, _>(
-            &table,
-            COL_C_I32,
-            &filter,
-            ScanStreamOptions {
-                include_nulls: true,
-            },
-            |b| {
-                let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-                (0..arr.len())
-                    .map(|i| {
+        let mut include_null_vals: Vec<Option<i32>> = Vec::new();
+        table
+            .scan_stream_with_options(
+                COL_C_I32,
+                &filter,
+                ScanStreamOptions {
+                    include_nulls: true,
+                },
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                    include_null_vals.extend((0..arr.len()).map(|i| {
                         if arr.is_null(i) {
                             None
                         } else {
                             Some(arr.value(i))
                         }
-                    })
-                    .collect::<Vec<_>>()
-            },
-        );
+                    }));
+                },
+            )
+            .unwrap();
         assert_eq!(include_null_vals, vec![Some(40), None]);
     }
 
@@ -1096,12 +1076,17 @@ mod tests {
             op: Operator::In(&candidates),
         };
 
-        let vals = collect_streamed_values::<u64, _>(&table, COL_A_U64, &filter, |b| {
-            let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
-            (0..a.len())
-                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
-                .collect::<Vec<_>>()
-        });
+        let mut vals: Vec<Option<u64>> = Vec::new();
+        table
+            .scan_stream(COL_A_U64, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                vals.extend((0..a.len()).map(
+                    |i| {
+                        if a.is_null(i) { None } else { Some(a.value(i)) }
+                    },
+                ));
+            })
+            .unwrap();
         assert_eq!(vals, vec![Some(100), Some(300)]);
     }
 
@@ -1149,20 +1134,30 @@ mod tests {
             op: Operator::Equals(20.into()),
         };
 
-        let a_vals = collect_streamed_values::<u64, _>(&table, COL_A_U64, &filter, |b| {
-            let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
-            (0..a.len())
-                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
-                .collect::<Vec<_>>()
-        });
+        let mut a_vals: Vec<Option<u64>> = Vec::new();
+        table
+            .scan_stream(COL_A_U64, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                a_vals.extend((0..a.len()).map(
+                    |i| {
+                        if a.is_null(i) { None } else { Some(a.value(i)) }
+                    },
+                ));
+            })
+            .unwrap();
         assert_eq!(a_vals, vec![Some(200), Some(200)]);
 
-        let c_vals = collect_streamed_values::<i32, _>(&table, COL_C_I32, &filter, |b| {
-            let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-            (0..a.len())
-                .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
-                .collect::<Vec<_>>()
-        });
+        let mut c_vals: Vec<Option<i32>> = Vec::new();
+        table
+            .scan_stream(COL_C_I32, &filter, |b| {
+                let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                c_vals.extend((0..a.len()).map(
+                    |i| {
+                        if a.is_null(i) { None } else { Some(a.value(i)) }
+                    },
+                ));
+            })
+            .unwrap();
         assert_eq!(c_vals, vec![Some(20), Some(20)]);
     }
 }
