@@ -1,7 +1,9 @@
 use super::*;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::types::LogicalFieldId;
-use arrow::array::{new_empty_array, Array, ArrayRef, BooleanArray, PrimitiveArray, PrimitiveBuilder, UInt64Array};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, PrimitiveArray, PrimitiveBuilder, UInt64Array, new_empty_array,
+};
 use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -76,10 +78,7 @@ pub struct MultiGatherContext {
 }
 
 impl MultiGatherContext {
-    fn new(
-        field_infos: Vec<(LogicalFieldId, DataType)>,
-        plans: Vec<FieldPlan>,
-    ) -> Self {
+    fn new(field_infos: Vec<(LogicalFieldId, DataType)>, plans: Vec<FieldPlan>) -> Self {
         Self {
             chunk_cache: FxHashMap::default(),
             row_index: FxHashMap::default(),
@@ -139,15 +138,36 @@ impl MultiGatherContext {
                 break;
             }
         }
-        let idx = chunk_idx?;
-        for plan in &self.plans {
-            let meta = plan.row_metas.get(idx)?;
-            if row_id < meta.min_val_u64 || row_id > meta.max_val_u64 {
-                return None;
+        if chunk_idx.is_none() {
+            let total_chunks = first_plan.row_metas.len();
+            'outer: for idx in 0..total_chunks {
+                for plan in &self.plans {
+                    let meta = &plan.row_metas[idx];
+                    if row_id >= meta.min_val_u64 && row_id <= meta.max_val_u64 {
+                        chunk_idx = Some(idx);
+                        break 'outer;
+                    }
+                }
             }
         }
-        let meta = &first_plan.row_metas[idx];
-        Some((idx, meta.min_val_u64, meta.max_val_u64))
+        let idx = match chunk_idx {
+            Some(idx) => idx,
+            None => return None,
+        };
+
+        let mut span_min = u64::MAX;
+        let mut span_max = 0u64;
+        for plan in &self.plans {
+            let meta = plan.row_metas.get(idx)?;
+            span_min = span_min.min(meta.min_val_u64);
+            span_max = span_max.max(meta.max_val_u64);
+        }
+
+        if span_min > span_max {
+            return None;
+        }
+
+        Some((idx, span_min, span_max))
     }
 }
 
@@ -287,16 +307,12 @@ where
 
         let mut plans = Vec::with_capacity(field_infos.len());
         for ((_, dtype), (value_pk, row_pk)) in field_infos.iter().zip(key_pairs.iter()) {
-            let value_desc_blob = descriptor_map
-                .remove(value_pk)
-                .ok_or(Error::NotFound)?;
+            let value_desc_blob = descriptor_map.remove(value_pk).ok_or(Error::NotFound)?;
             let value_desc = ColumnDescriptor::from_le_bytes(value_desc_blob.as_ref());
             let value_metas =
                 Self::collect_non_empty_metas(self.pager.as_ref(), value_desc.head_page_pk)?;
 
-            let row_desc_blob = descriptor_map
-                .remove(row_pk)
-                .ok_or(Error::NotFound)?;
+            let row_desc_blob = descriptor_map.remove(row_pk).ok_or(Error::NotFound)?;
             let row_desc = ColumnDescriptor::from_le_bytes(row_desc_blob.as_ref());
             let row_metas =
                 Self::collect_non_empty_metas(self.pager.as_ref(), row_desc.head_page_pk)?;

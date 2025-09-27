@@ -18,9 +18,78 @@ use super::{
 use crate::store::ColumnStore;
 use llkv_storage::pager::Pager;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterRun {
+    pub start_row_id: u64,
+    pub len: usize,
+}
+
+impl FilterRun {
+    #[inline]
+    pub fn new(start_row_id: u64) -> Self {
+        Self {
+            start_row_id,
+            len: 1,
+        }
+    }
+
+    #[inline]
+    pub fn end_row_id(&self) -> u64 {
+        self.start_row_id + (self.len.saturating_sub(1) as u64)
+    }
+}
+
+#[derive(Debug)]
+pub struct FilterResult {
+    runs: Vec<FilterRun>,
+    fallback_row_ids: Option<Vec<u64>>,
+    total_matches: usize,
+}
+
+impl FilterResult {
+    pub fn total_matches(&self) -> usize {
+        self.total_matches
+    }
+
+    pub fn is_dense(&self) -> bool {
+        self.fallback_row_ids.is_none()
+    }
+
+    pub fn runs(&self) -> &[FilterRun] {
+        &self.runs
+    }
+
+    pub fn into_runs(self) -> Option<Vec<FilterRun>> {
+        if self.is_dense() {
+            Some(self.runs)
+        } else {
+            None
+        }
+    }
+
+    pub fn into_row_ids(mut self) -> Vec<u64> {
+        if let Some(rows) = self.fallback_row_ids.take() {
+            return rows;
+        }
+
+        let mut out = Vec::with_capacity(self.total_matches);
+        for run in &self.runs {
+            let mut current = run.start_row_id;
+            for _ in 0..run.len {
+                out.push(current);
+                current += 1;
+            }
+        }
+        out
+    }
+}
+
 pub(crate) struct FilterVisitor<T: ArrowPrimitiveType, F: FnMut(T::Native) -> bool> {
     predicate: F,
-    row_ids: Vec<u64>,
+    runs: Vec<FilterRun>,
+    fallback_row_ids: Option<Vec<u64>>,
+    prev_row_id: Option<u64>,
+    total_matches: usize,
     _phantom: PhantomData<T>,
 }
 
@@ -28,13 +97,77 @@ impl<T: ArrowPrimitiveType, F: FnMut(T::Native) -> bool> FilterVisitor<T, F> {
     pub(crate) fn new(predicate: F) -> Self {
         Self {
             predicate,
-            row_ids: Vec::new(),
+            runs: Vec::new(),
+            fallback_row_ids: None,
+            prev_row_id: None,
+            total_matches: 0,
             _phantom: PhantomData,
         }
     }
 
-    pub(crate) fn into_row_ids(self) -> Vec<u64> {
-        self.row_ids
+    pub(crate) fn into_result(self) -> FilterResult {
+        if let Some(rows) = self.fallback_row_ids {
+            FilterResult {
+                runs: Vec::new(),
+                fallback_row_ids: Some(rows),
+                total_matches: self.total_matches,
+            }
+        } else {
+            FilterResult {
+                runs: self.runs,
+                fallback_row_ids: None,
+                total_matches: self.total_matches,
+            }
+        }
+    }
+
+    #[inline]
+    fn record_match(&mut self, row_id: u64) {
+        self.total_matches += 1;
+
+        if let Some(rows) = self.fallback_row_ids.as_mut() {
+            rows.push(row_id);
+            self.prev_row_id = Some(row_id);
+            return;
+        }
+
+        match self.prev_row_id {
+            None => {
+                self.runs.push(FilterRun::new(row_id));
+            }
+            Some(prev) => {
+                if row_id == prev + 1 {
+                    if let Some(last) = self.runs.last_mut() {
+                        last.len += 1;
+                    }
+                } else if row_id > prev {
+                    self.runs.push(FilterRun::new(row_id));
+                } else {
+                    self.demote_to_fallback(row_id);
+                }
+            }
+        }
+
+        self.prev_row_id = Some(row_id);
+    }
+
+    fn demote_to_fallback(&mut self, row_id: u64) {
+        if self.fallback_row_ids.is_none() {
+            let mut rows = Vec::with_capacity(self.total_matches);
+            for run in &self.runs {
+                let mut current = run.start_row_id;
+                for _ in 0..run.len {
+                    rows.push(current);
+                    current += 1;
+                }
+            }
+            self.runs.clear();
+            self.fallback_row_ids = Some(rows);
+        }
+
+        if let Some(rows) = self.fallback_row_ids.as_mut() {
+            rows.push(row_id);
+        }
     }
 }
 
@@ -60,17 +193,18 @@ macro_rules! impl_filter_visitor {
                 let len = values.len();
                 debug_assert_eq!(len, row_ids.len());
                 debug_assert_eq!(row_ids.null_count(), 0);
-                self.row_ids.reserve(len);
-                let predicate = &mut self.predicate;
-
                 if values.null_count() == 0 {
                     for i in 0..len {
                         // SAFETY: `i < len`, and we already checked that there are no nulls.
                         let value = unsafe { values.value_unchecked(i) };
-                        if predicate(value) {
+                        let predicate_passes = {
+                            let predicate = &mut self.predicate;
+                            predicate(value)
+                        };
+                        if predicate_passes {
                             // SAFETY: Row ids share the same length and contain no nulls.
                             let row_id = unsafe { row_ids.value_unchecked(i) };
-                            self.row_ids.push(row_id);
+                            self.record_match(row_id);
                         }
                     }
                 } else {
@@ -80,9 +214,13 @@ macro_rules! impl_filter_visitor {
                         }
                         // SAFETY: guarded by the validity bitmap.
                         let value = unsafe { values.value_unchecked(i) };
-                        if predicate(value) {
+                        let predicate_passes = {
+                            let predicate = &mut self.predicate;
+                            predicate(value)
+                        };
+                        if predicate_passes {
                             let row_id = unsafe { row_ids.value_unchecked(i) };
-                            self.row_ids.push(row_id);
+                            self.record_match(row_id);
                         }
                     }
                 }
@@ -123,6 +261,15 @@ impl_filter_visitor!(
 );
 
 pub trait FilterPrimitive: ArrowPrimitiveType {
+    fn run_filter_with_result<P, F>(
+        store: &ColumnStore<P>,
+        field_id: LogicalFieldId,
+        predicate: F,
+    ) -> Result<FilterResult>
+    where
+        P: Pager<Blob = EntryHandle> + Send + Sync,
+        F: FnMut(Self::Native) -> bool;
+
     fn run_filter<P, F>(
         store: &ColumnStore<P>,
         field_id: LogicalFieldId,
@@ -130,22 +277,25 @@ pub trait FilterPrimitive: ArrowPrimitiveType {
     ) -> Result<Vec<u64>>
     where
         P: Pager<Blob = EntryHandle> + Send + Sync,
-        F: FnMut(Self::Native) -> bool;
+        F: FnMut(Self::Native) -> bool,
+    {
+        Self::run_filter_with_result(store, field_id, predicate).map(|res| res.into_row_ids())
+    }
 }
 
 macro_rules! impl_filter_primitive {
     ($ty:ty) => {
         impl FilterPrimitive for $ty {
-            fn run_filter<P, F>(
+            fn run_filter_with_result<P, F>(
                 store: &ColumnStore<P>,
                 field_id: LogicalFieldId,
                 predicate: F,
-            ) -> Result<Vec<u64>>
+            ) -> Result<FilterResult>
             where
                 P: Pager<Blob = EntryHandle> + Send + Sync,
                 F: FnMut(Self::Native) -> bool,
             {
-                run_filter_for::<P, $ty, F>(store, field_id, predicate)
+                run_filter_for_with_result::<P, $ty, F>(store, field_id, predicate)
             }
         }
     };
@@ -162,11 +312,11 @@ impl_filter_primitive!(arrow::datatypes::Int8Type);
 impl_filter_primitive!(arrow::datatypes::Float64Type);
 impl_filter_primitive!(arrow::datatypes::Float32Type);
 
-pub(crate) fn run_filter_for<P, T, F>(
+pub(crate) fn run_filter_for_with_result<P, T, F>(
     store: &ColumnStore<P>,
     field_id: LogicalFieldId,
     predicate: F,
-) -> Result<Vec<u64>>
+) -> Result<FilterResult>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
     T: ArrowPrimitiveType,
@@ -180,5 +330,5 @@ where
     ScanBuilder::new(store, field_id)
         .with_row_ids(rowid_fid(field_id))
         .run(&mut visitor)?;
-    Ok(visitor.into_row_ids())
+    Ok(visitor.into_result())
 }

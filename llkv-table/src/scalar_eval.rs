@@ -34,7 +34,7 @@ impl NumericKernels {
 
     /// Ensure each referenced column has a `Float64Array`, casting on the fly when needed.
     pub fn prepare_numeric_arrays(
-    lfids: &[LogicalFieldId],
+        lfids: &[LogicalFieldId],
         arrays: &[ArrayRef],
         needed_fields: &FxHashSet<FieldId>,
     ) -> LlkvResult<NumericArrayMap> {

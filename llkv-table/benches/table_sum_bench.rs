@@ -10,16 +10,16 @@ use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
+use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::Projection;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_expr::{Expr, Filter, Operator};
 use llkv_storage::pager::MemPager;
+use llkv_table::Table;
 use llkv_table::table::ScanStreamOptions;
 use llkv_table::types::{FieldId, TableId};
-use llkv_table::Table;
 
 const NUM_ROWS: usize = 1_000_000;
 const TABLE_ID: TableId = 42;
@@ -50,7 +50,8 @@ fn setup_table() -> Table {
     let row_id_array = Arc::new(UInt64Array::from(row_ids));
     let value_array = Arc::new(UInt64Array::from(values));
 
-    let batch = RecordBatch::try_new(schema, vec![row_id_array, value_array]).expect("record batch");
+    let batch =
+        RecordBatch::try_new(schema, vec![row_id_array, value_array]).expect("record batch");
     table.append(&batch).expect("append batch");
 
     table
@@ -76,7 +77,9 @@ fn scan_sum(table: &Table, projections: &[Projection], filter: &Expr<'static, Fi
 
 fn bench_table_sum(c: &mut Criterion) {
     let table = setup_table();
-    let projections = vec![Projection::from(LogicalFieldId::for_user(TABLE_ID, FIELD_ID))];
+    let projections = vec![Projection::from(LogicalFieldId::for_user(
+        TABLE_ID, FIELD_ID,
+    ))];
     let filter: Expr<'static, FieldId> = Expr::Pred(Filter {
         field_id: FIELD_ID,
         op: Operator::Range {

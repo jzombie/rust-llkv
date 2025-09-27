@@ -3,7 +3,7 @@ use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
 };
-use crate::store::scan::FilterPrimitive;
+use crate::store::scan::{FilterPrimitive, FilterResult};
 use crate::types::LogicalFieldId;
 use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, UInt64Array};
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
@@ -82,6 +82,18 @@ where
         F: FnMut(T::Native) -> bool,
     {
         T::run_filter(self, field_id, predicate)
+    }
+
+    pub fn filter_matches<T, F>(
+        &self,
+        field_id: LogicalFieldId,
+        predicate: F,
+    ) -> Result<FilterResult>
+    where
+        T: FilterPrimitive,
+        F: FnMut(T::Native) -> bool,
+    {
+        T::run_filter_with_result(self, field_id, predicate)
     }
 
     /// Lists the names of all persisted indexes for a given column.
