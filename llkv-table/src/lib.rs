@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod constants;
 mod sys_catalog;
 pub mod expr {
     pub use llkv_expr::expr::*;
