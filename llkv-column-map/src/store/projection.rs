@@ -13,6 +13,7 @@ use llkv_storage::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,6 +156,29 @@ struct FieldPlan {
     dtype: DataType,
     value_metas: Vec<ChunkMetadata>,
     row_metas: Vec<ChunkMetadata>,
+}
+
+#[derive(Clone, Copy)]
+enum RowLocator<'a> {
+    Dense { base: u64 },
+    Sparse { index: &'a FxHashMap<u64, usize> },
+}
+
+impl<'a> RowLocator<'a> {
+    #[inline]
+    fn lookup(&self, row_id: u64, len: usize) -> Option<usize> {
+        match self {
+            RowLocator::Dense { base } => {
+                let offset = row_id.checked_sub(*base)?;
+                if offset < len as u64 {
+                    Some(offset as usize)
+                } else {
+                    None
+                }
+            }
+            RowLocator::Sparse { index } => index.get(&row_id).copied(),
+        }
+    }
 }
 
 impl<P> ColumnStore<P>
@@ -320,22 +344,50 @@ where
         let mut row_scratch = ctx.take_row_scratch();
 
         let result: Result<RecordBatch> = (|| {
-            row_index.clear();
-            row_index.reserve(row_ids.len());
-            for (idx, &row_id) in row_ids.iter().enumerate() {
-                if row_index.insert(row_id, idx).is_some() {
-                    return Err(Error::Internal(
-                        "duplicate row_id in gather_rows_multi".into(),
-                    ));
+            let len = row_ids.len();
+            if row_scratch.len() < len {
+                row_scratch.resize(len, None);
+            }
+
+            let is_non_decreasing = len <= 1 || row_ids.windows(2).all(|w| w[0] <= w[1]);
+            let sorted_row_ids_cow: Cow<'_, [u64]> = if is_non_decreasing {
+                Cow::Borrowed(row_ids)
+            } else {
+                let mut buf = row_ids.to_vec();
+                buf.sort_unstable();
+                Cow::Owned(buf)
+            };
+            let sorted_row_ids: &[u64] = sorted_row_ids_cow.as_ref();
+
+            let dense_base = if len == 0 {
+                None
+            } else if len == 1 {
+                Some(row_ids[0])
+            } else if is_non_decreasing && row_ids.windows(2).all(|w| w[1] == w[0] + 1) {
+                Some(row_ids[0])
+            } else {
+                None
+            };
+
+            if dense_base.is_none() {
+                row_index.clear();
+                row_index.reserve(len);
+                for (idx, &row_id) in row_ids.iter().enumerate() {
+                    if row_index.insert(row_id, idx).is_some() {
+                        return Err(Error::Internal(
+                            "duplicate row_id in gather_rows_multi".into(),
+                        ));
+                    }
                 }
+            } else {
+                row_index.clear();
             }
 
-            if row_scratch.len() < row_ids.len() {
-                row_scratch.resize(row_ids.len(), None);
-            }
-
-            let mut sorted_row_ids = row_ids.to_vec();
-            sorted_row_ids.sort_unstable();
+            let row_locator = if let Some(base) = dense_base {
+                RowLocator::Dense { base }
+            } else {
+                RowLocator::Sparse { index: &row_index }
+            };
 
             let field_infos = ctx.field_infos().to_vec();
             let plans = ctx.plans().to_vec();
@@ -345,7 +397,7 @@ where
             for plan in &plans {
                 let mut candidates = Vec::new();
                 for (idx, meta) in plan.row_metas.iter().enumerate() {
-                    if Self::chunk_intersects(&sorted_row_ids, meta) {
+                    if Self::chunk_intersects(sorted_row_ids, meta) {
                         candidates.push(idx);
                         chunk_keys.insert(plan.value_metas[idx].chunk_pk);
                         chunk_keys.insert(plan.row_metas[idx].chunk_pk);
@@ -394,8 +446,8 @@ where
                     |ArrowTy| {
                         Self::gather_rows_from_chunks::<ArrowTy>(
                             row_ids,
-                            &row_index,
-                            row_ids.len(),
+                            row_locator,
+                            len,
                             candidates,
                             plan,
                             &chunk_arrays,
@@ -477,7 +529,7 @@ where
 
     fn gather_rows_from_chunks<T>(
         row_ids: &[u64],
-        row_index: &FxHashMap<u64, usize>,
+        row_locator: RowLocator,
         len: usize,
         candidate_indices: &[usize],
         plan: &FieldPlan,
@@ -553,7 +605,7 @@ where
                     continue;
                 }
                 let row_id = row_arr.value(i);
-                if let Some(&out_idx) = row_index.get(&row_id) {
+                if let Some(out_idx) = row_locator.lookup(row_id, len) {
                     row_scratch[out_idx] = Some((chunk_idx, i));
                 }
             }
