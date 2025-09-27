@@ -3,8 +3,8 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, Float32Array, Float64Array, Float64Builder, Int8Array, Int16Array, Int32Array,
+    Int64Array, RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
@@ -203,6 +203,16 @@ where
         if self.try_scan_builder_passthrough(
             &projection_evals,
             &passthrough_fields,
+            &out_schema,
+            filter_expr,
+            &options,
+            &mut on_batch,
+        )? {
+            return Ok(());
+        }
+
+        if self.try_affine_stream(
+            &projection_evals,
             &out_schema,
             filter_expr,
             &options,
@@ -468,6 +478,78 @@ where
         };
 
         ScanBuilder::new(self.table.store(), target_lfid)
+            .options(scan_opts)
+            .run(&mut emitter)?;
+
+        if let Some(err) = emitter.error {
+            return Err(err);
+        }
+
+        Ok(emitter.emitted)
+    }
+
+    fn try_affine_stream<'expr, F>(
+        &self,
+        projection_evals: &[ProjectionEval],
+        schema: &Arc<Schema>,
+        filter_expr: &Expr<'expr, FieldId>,
+        options: &ScanStreamOptions,
+        on_batch: &mut F,
+    ) -> LlkvResult<bool>
+    where
+        F: FnMut(RecordBatch),
+    {
+        if options.include_nulls {
+            return Ok(false);
+        }
+        if projection_evals.len() != 1 {
+            return Ok(false);
+        }
+
+        let ProjectionEval::Computed(info) = &projection_evals[0] else {
+            return Ok(false);
+        };
+        let Some(affine) = NumericKernels::extract_affine(&info.expr) else {
+            return Ok(false);
+        };
+
+        let filter = match filter_expr {
+            Expr::Pred(pred) => pred,
+            _ => return Ok(false),
+        };
+        match &filter.op {
+            Operator::Range {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            } => {}
+            _ => return Ok(false),
+        }
+
+        let lfid = LogicalFieldId::for_user(self.table.table_id(), affine.field);
+        if lfid.namespace() != Namespace::UserData {
+            return Ok(false);
+        }
+        let dtype = self.table.store().data_type(lfid)?;
+        if !is_supported_numeric(&dtype) {
+            return Ok(false);
+        }
+
+        let mut emitter = AffineComputeEmitter {
+            schema: Arc::clone(schema),
+            scale: affine.scale,
+            offset: affine.offset,
+            on_batch,
+            error: None,
+            emitted: false,
+        };
+
+        let scan_opts = ScanOptions {
+            with_row_ids: false,
+            include_nulls: false,
+            ..Default::default()
+        };
+
+        ScanBuilder::new(self.table.store(), lfid)
             .options(scan_opts)
             .run(&mut emitter)?;
 
@@ -1403,6 +1485,228 @@ where
 }
 
 impl<'a, F> PrimitiveSortedWithRowIdsVisitor for BuilderBatchEmitter<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    fn u64_run_with_rids(
+        &mut self,
+        _v: &UInt64Array,
+        _r: &UInt64Array,
+        _start: usize,
+        _len: usize,
+    ) {
+        self.unsupported();
+    }
+    fn u32_run_with_rids(
+        &mut self,
+        _v: &UInt32Array,
+        _r: &UInt64Array,
+        _start: usize,
+        _len: usize,
+    ) {
+        self.unsupported();
+    }
+    fn u16_run_with_rids(
+        &mut self,
+        _v: &UInt16Array,
+        _r: &UInt64Array,
+        _start: usize,
+        _len: usize,
+    ) {
+        self.unsupported();
+    }
+    fn u8_run_with_rids(&mut self, _v: &UInt8Array, _r: &UInt64Array, _start: usize, _len: usize) {
+        self.unsupported();
+    }
+    fn i64_run_with_rids(&mut self, _v: &Int64Array, _r: &UInt64Array, _start: usize, _len: usize) {
+        self.unsupported();
+    }
+    fn i32_run_with_rids(&mut self, _v: &Int32Array, _r: &UInt64Array, _start: usize, _len: usize) {
+        self.unsupported();
+    }
+    fn i16_run_with_rids(&mut self, _v: &Int16Array, _r: &UInt64Array, _start: usize, _len: usize) {
+        self.unsupported();
+    }
+    fn i8_run_with_rids(&mut self, _v: &Int8Array, _r: &UInt64Array, _start: usize, _len: usize) {
+        self.unsupported();
+    }
+    fn f64_run_with_rids(
+        &mut self,
+        _v: &Float64Array,
+        _r: &UInt64Array,
+        _start: usize,
+        _len: usize,
+    ) {
+        self.unsupported();
+    }
+    fn f32_run_with_rids(
+        &mut self,
+        _v: &Float32Array,
+        _r: &UInt64Array,
+        _start: usize,
+        _len: usize,
+    ) {
+        self.unsupported();
+    }
+    fn null_run(&mut self, _r: &UInt64Array, _start: usize, _len: usize) {
+        self.unsupported();
+    }
+}
+
+struct AffineComputeEmitter<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    schema: Arc<Schema>,
+    scale: f64,
+    offset: f64,
+    on_batch: &'a mut F,
+    error: Option<Error>,
+    emitted: bool,
+}
+
+impl<'a, F> AffineComputeEmitter<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    fn emit_from_iter<GNull, GValue>(
+        &mut self,
+        len: usize,
+        mut is_null: GNull,
+        mut value_at: GValue,
+    ) where
+        GNull: FnMut(usize) -> bool,
+        GValue: FnMut(usize) -> f64,
+    {
+        if self.error.is_some() {
+            return;
+        }
+        let mut builder = Float64Builder::with_capacity(len);
+        let scale = self.scale;
+        let offset = self.offset;
+        for idx in 0..len {
+            if is_null(idx) {
+                builder.append_null();
+            } else {
+                let base = value_at(idx);
+                builder.append_value(scale * base + offset);
+            }
+        }
+        let array = builder.finish();
+        let array_ref = Arc::new(array) as ArrayRef;
+        match RecordBatch::try_new(self.schema.clone(), vec![array_ref]) {
+            Ok(batch) => {
+                (self.on_batch)(batch);
+                self.emitted = true;
+            }
+            Err(err) => self.error = Some(Error::from(err)),
+        }
+    }
+
+    fn unsupported(&mut self) {
+        if self.error.is_none() {
+            self.error = Some(Error::Internal(
+                "scan builder emitted unsupported payload for affine streaming".into(),
+            ));
+        }
+    }
+}
+
+macro_rules! impl_affine_chunk {
+    ($method:ident, $ArrayTy:ty, $cast:expr) => {
+        fn $method(&mut self, array: &$ArrayTy) {
+            let cast = $cast;
+            self.emit_from_iter(
+                array.len(),
+                |idx| array.is_null(idx),
+                |idx| cast(array.value(idx)),
+            );
+        }
+    };
+}
+
+macro_rules! impl_affine_run {
+    ($method:ident, $ArrayTy:ty, $cast:expr) => {
+        fn $method(&mut self, array: &$ArrayTy, start: usize, len: usize) {
+            let cast = $cast;
+            self.emit_from_iter(
+                len,
+                |idx| array.is_null(start + idx),
+                |idx| cast(array.value(start + idx)),
+            );
+        }
+    };
+}
+
+impl<'a, F> PrimitiveVisitor for AffineComputeEmitter<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    impl_affine_chunk!(u64_chunk, UInt64Array, |v: u64| v as f64);
+    impl_affine_chunk!(u32_chunk, UInt32Array, |v: u32| v as f64);
+    impl_affine_chunk!(u16_chunk, UInt16Array, |v: u16| v as f64);
+    impl_affine_chunk!(u8_chunk, UInt8Array, |v: u8| v as f64);
+    impl_affine_chunk!(i64_chunk, Int64Array, |v: i64| v as f64);
+    impl_affine_chunk!(i32_chunk, Int32Array, |v: i32| v as f64);
+    impl_affine_chunk!(i16_chunk, Int16Array, |v: i16| v as f64);
+    impl_affine_chunk!(i8_chunk, Int8Array, |v: i8| v as f64);
+    impl_affine_chunk!(f64_chunk, Float64Array, |v: f64| v);
+    impl_affine_chunk!(f32_chunk, Float32Array, |v: f32| v as f64);
+}
+
+impl<'a, F> PrimitiveWithRowIdsVisitor for AffineComputeEmitter<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    fn u64_chunk_with_rids(&mut self, _v: &UInt64Array, _r: &UInt64Array) {
+        self.unsupported();
+    }
+    fn u32_chunk_with_rids(&mut self, _v: &UInt32Array, _r: &UInt64Array) {
+        self.unsupported();
+    }
+    fn u16_chunk_with_rids(&mut self, _v: &UInt16Array, _r: &UInt64Array) {
+        self.unsupported();
+    }
+    fn u8_chunk_with_rids(&mut self, _v: &UInt8Array, _r: &UInt64Array) {
+        self.unsupported();
+    }
+    fn i64_chunk_with_rids(&mut self, _v: &Int64Array, _r: &UInt64Array) {
+        self.unsupported();
+    }
+    fn i32_chunk_with_rids(&mut self, _v: &Int32Array, _r: &UInt64Array) {
+        self.unsupported();
+    }
+    fn i16_chunk_with_rids(&mut self, _v: &Int16Array, _r: &UInt64Array) {
+        self.unsupported();
+    }
+    fn i8_chunk_with_rids(&mut self, _v: &Int8Array, _r: &UInt64Array) {
+        self.unsupported();
+    }
+    fn f64_chunk_with_rids(&mut self, _v: &Float64Array, _r: &UInt64Array) {
+        self.unsupported();
+    }
+    fn f32_chunk_with_rids(&mut self, _v: &Float32Array, _r: &UInt64Array) {
+        self.unsupported();
+    }
+}
+
+impl<'a, F> PrimitiveSortedVisitor for AffineComputeEmitter<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    impl_affine_run!(u64_run, UInt64Array, |v: u64| v as f64);
+    impl_affine_run!(u32_run, UInt32Array, |v: u32| v as f64);
+    impl_affine_run!(u16_run, UInt16Array, |v: u16| v as f64);
+    impl_affine_run!(u8_run, UInt8Array, |v: u8| v as f64);
+    impl_affine_run!(i64_run, Int64Array, |v: i64| v as f64);
+    impl_affine_run!(i32_run, Int32Array, |v: i32| v as f64);
+    impl_affine_run!(i16_run, Int16Array, |v: i16| v as f64);
+    impl_affine_run!(i8_run, Int8Array, |v: i8| v as f64);
+    impl_affine_run!(f64_run, Float64Array, |v: f64| v);
+    impl_affine_run!(f32_run, Float32Array, |v: f32| v as f64);
+}
+
+impl<'a, F> PrimitiveSortedWithRowIdsVisitor for AffineComputeEmitter<'a, F>
 where
     F: FnMut(RecordBatch),
 {

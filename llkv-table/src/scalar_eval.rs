@@ -13,6 +13,35 @@ use crate::types::FieldId;
 /// Mapping from field identifiers to the numeric Arrow array used for evaluation.
 pub type NumericArrayMap = FxHashMap<FieldId, Arc<Float64Array>>;
 
+#[derive(Clone, Copy, Debug)]
+pub struct AffineExpr {
+    pub field: FieldId,
+    pub scale: f64,
+    pub offset: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AffineState {
+    field: Option<FieldId>,
+    scale: f64,
+    offset: f64,
+}
+
+fn merge_field(lhs: Option<FieldId>, rhs: Option<FieldId>) -> Option<Option<FieldId>> {
+    match (lhs, rhs) {
+        (Some(a), Some(b)) => {
+            if a == b {
+                Some(Some(a))
+            } else {
+                None
+            }
+        }
+        (Some(a), None) => Some(Some(a)),
+        (None, Some(b)) => Some(Some(b)),
+        (None, None) => Some(None),
+    }
+}
+
 enum VectorizedExpr {
     Array(Arc<Float64Array>),
     Scalar(Option<f64>),
@@ -332,6 +361,100 @@ impl NumericKernels {
                 ScalarExpr::binary(left_s, *op, right_s)
             }
         }
+    }
+
+    /// Attempts to represent the expression as `scale * column + offset`.
+    /// Returns `None` when the expression depends on multiple columns or is non-linear.
+    pub fn extract_affine(expr: &ScalarExpr<FieldId>) -> Option<AffineExpr> {
+        let simplified = Self::simplify(expr);
+        let state = Self::affine_state(&simplified)?;
+        let field = state.field?;
+        Some(AffineExpr {
+            field,
+            scale: state.scale,
+            offset: state.offset,
+        })
+    }
+
+    fn affine_state(expr: &ScalarExpr<FieldId>) -> Option<AffineState> {
+        match expr {
+            ScalarExpr::Column(fid) => Some(AffineState {
+                field: Some(*fid),
+                scale: 1.0,
+                offset: 0.0,
+            }),
+            ScalarExpr::Literal(_) => {
+                let value = Self::literal_numeric_value(expr)?;
+                Some(AffineState {
+                    field: None,
+                    scale: 0.0,
+                    offset: value,
+                })
+            }
+            ScalarExpr::Binary { left, op, right } => {
+                let left_state = Self::affine_state(left)?;
+                let right_state = Self::affine_state(right)?;
+                match op {
+                    BinaryOp::Add => Self::affine_add(left_state, right_state),
+                    BinaryOp::Subtract => Self::affine_sub(left_state, right_state),
+                    BinaryOp::Multiply => Self::affine_mul(left_state, right_state),
+                    BinaryOp::Divide => Self::affine_div(left_state, right_state),
+                }
+            }
+        }
+    }
+
+    fn affine_add(lhs: AffineState, rhs: AffineState) -> Option<AffineState> {
+        let field = merge_field(lhs.field, rhs.field)?;
+        Some(AffineState {
+            field,
+            scale: lhs.scale + rhs.scale,
+            offset: lhs.offset + rhs.offset,
+        })
+    }
+
+    fn affine_sub(lhs: AffineState, rhs: AffineState) -> Option<AffineState> {
+        let neg_rhs = AffineState {
+            field: rhs.field,
+            scale: -rhs.scale,
+            offset: -rhs.offset,
+        };
+        Self::affine_add(lhs, neg_rhs)
+    }
+
+    fn affine_mul(lhs: AffineState, rhs: AffineState) -> Option<AffineState> {
+        if rhs.field.is_none() {
+            let factor = rhs.offset;
+            return Some(AffineState {
+                field: lhs.field,
+                scale: lhs.scale * factor,
+                offset: lhs.offset * factor,
+            });
+        }
+        if lhs.field.is_none() {
+            let factor = lhs.offset;
+            return Some(AffineState {
+                field: rhs.field,
+                scale: rhs.scale * factor,
+                offset: rhs.offset * factor,
+            });
+        }
+        None
+    }
+
+    fn affine_div(lhs: AffineState, rhs: AffineState) -> Option<AffineState> {
+        if rhs.field.is_some() {
+            return None;
+        }
+        let denom = rhs.offset;
+        if denom == 0.0 {
+            return None;
+        }
+        Some(AffineState {
+            field: lhs.field,
+            scale: lhs.scale / denom,
+            offset: lhs.offset / denom,
+        })
     }
 
     fn apply_binary_literal(op: BinaryOp, lhs: f64, rhs: f64) -> Option<ScalarExpr<FieldId>> {
