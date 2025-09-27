@@ -228,14 +228,21 @@ where
         row_ids: &[u64],
         policy: GatherNullPolicy,
     ) -> Result<RecordBatch> {
-        if field_ids.is_empty() {
+        let mut ctx = self.prepare_gather_context(field_ids)?;
+        self.gather_rows_single_use(&mut ctx, row_ids, policy)
+    }
+
+    fn gather_rows_single_use(
+        &self,
+        ctx: &mut MultiGatherContext,
+        row_ids: &[u64],
+        policy: GatherNullPolicy,
+    ) -> Result<RecordBatch> {
+        if ctx.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
         }
 
-        let mut field_infos = Vec::with_capacity(field_ids.len());
-        for &fid in field_ids {
-            field_infos.push((fid, self.data_type(fid)?));
-        }
+        let field_infos = ctx.field_infos().to_vec();
 
         if row_ids.is_empty() {
             let mut arrays = Vec::with_capacity(field_infos.len());
@@ -263,74 +270,18 @@ where
         let mut sorted_row_ids = row_ids.to_vec();
         sorted_row_ids.sort_unstable();
 
-        let catalog = self.catalog.read().unwrap();
-        let mut key_pairs = Vec::with_capacity(field_infos.len());
-        for (fid, _) in &field_infos {
-            let value_pk = *catalog.map.get(fid).ok_or(Error::NotFound)?;
-            let row_pk = *catalog.map.get(&rowid_fid(*fid)).ok_or(Error::NotFound)?;
-            key_pairs.push((value_pk, row_pk));
-        }
-        drop(catalog);
-
-        let mut descriptor_requests = Vec::with_capacity(key_pairs.len() * 2);
-        for (value_pk, row_pk) in &key_pairs {
-            descriptor_requests.push(BatchGet::Raw { key: *value_pk });
-            descriptor_requests.push(BatchGet::Raw { key: *row_pk });
-        }
-        let descriptor_results = self.pager.batch_get(&descriptor_requests)?;
-        let mut descriptor_map: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-        for result in descriptor_results {
-            if let GetResult::Raw { key, bytes } = result {
-                descriptor_map.insert(key, bytes);
-            }
-        }
-
-        let mut plans = Vec::with_capacity(field_infos.len());
-        for ((_, dtype), (value_pk, row_pk)) in field_infos.iter().zip(key_pairs.iter()) {
-            let value_desc_blob = descriptor_map.remove(value_pk).ok_or(Error::NotFound)?;
-            let value_desc = ColumnDescriptor::from_le_bytes(value_desc_blob.as_ref());
-            let value_metas =
-                Self::collect_non_empty_metas(self.pager.as_ref(), value_desc.head_page_pk)?;
-
-            let row_desc_blob = descriptor_map.remove(row_pk).ok_or(Error::NotFound)?;
-            let row_desc = ColumnDescriptor::from_le_bytes(row_desc_blob.as_ref());
-            let row_metas =
-                Self::collect_non_empty_metas(self.pager.as_ref(), row_desc.head_page_pk)?;
-
-            if value_metas.len() != row_metas.len() {
-                return Err(Error::Internal(
-                    "gather_rows_multi: chunk count mismatch".into(),
-                ));
-            }
-
-            let mut plan = FieldPlan {
-                dtype: dtype.clone(),
-                value_metas,
-                row_metas,
-                candidate_indices: Vec::new(),
-            };
-
-            plan.candidate_indices = plan
-                .row_metas
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, meta)| {
-                    if Self::chunk_intersects(&sorted_row_ids, meta) {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            plans.push(plan);
-        }
-
         let mut chunk_keys: FxHashSet<PhysicalKey> = FxHashSet::default();
-        for plan in &plans {
-            for &idx in &plan.candidate_indices {
-                chunk_keys.insert(plan.value_metas[idx].chunk_pk);
-                chunk_keys.insert(plan.row_metas[idx].chunk_pk);
+        {
+            let plans_mut = ctx.plans_mut();
+            for plan in plans_mut.iter_mut() {
+                plan.candidate_indices.clear();
+                for (idx, meta) in plan.row_metas.iter().enumerate() {
+                    if Self::chunk_intersects(&sorted_row_ids, meta) {
+                        plan.candidate_indices.push(idx);
+                        chunk_keys.insert(plan.value_metas[idx].chunk_pk);
+                        chunk_keys.insert(plan.row_metas[idx].chunk_pk);
+                    }
+                }
             }
         }
 
@@ -352,15 +303,15 @@ where
 
         let allow_missing = policy.allow_missing();
 
-        let mut outputs = Vec::with_capacity(plans.len());
-        for plan in plans.into_iter() {
+        let mut outputs = Vec::with_capacity(ctx.plans().len());
+        for plan in ctx.plans() {
             let array = crate::with_integer_arrow_type!(
                 plan.dtype.clone(),
                 |ArrowTy| {
                     Self::gather_rows_single_shot::<ArrowTy>(
                         &row_index,
                         row_ids.len(),
-                        &plan,
+                        plan,
                         &mut chunk_map,
                         allow_missing,
                     )
