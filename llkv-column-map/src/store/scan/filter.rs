@@ -59,14 +59,31 @@ macro_rules! impl_filter_visitor {
             fn $method(&mut self, values: &$arr, row_ids: &UInt64Array) {
                 let len = values.len();
                 debug_assert_eq!(len, row_ids.len());
+                debug_assert_eq!(row_ids.null_count(), 0);
+                self.row_ids.reserve(len);
                 let predicate = &mut self.predicate;
-                for i in 0..len {
-                    if values.is_null(i) {
-                        continue;
+
+                if values.null_count() == 0 {
+                    for i in 0..len {
+                        // SAFETY: `i < len`, and we already checked that there are no nulls.
+                        let value = unsafe { values.value_unchecked(i) };
+                        if predicate(value) {
+                            // SAFETY: Row ids share the same length and contain no nulls.
+                            let row_id = unsafe { row_ids.value_unchecked(i) };
+                            self.row_ids.push(row_id);
+                        }
                     }
-                    let value = values.value(i);
-                    if predicate(value) {
-                        self.row_ids.push(row_ids.value(i));
+                } else {
+                    for i in 0..len {
+                        if !values.is_valid(i) {
+                            continue;
+                        }
+                        // SAFETY: guarded by the validity bitmap.
+                        let value = unsafe { values.value_unchecked(i) };
+                        if predicate(value) {
+                            let row_id = unsafe { row_ids.value_unchecked(i) };
+                            self.row_ids.push(row_id);
+                        }
                     }
                 }
             }
