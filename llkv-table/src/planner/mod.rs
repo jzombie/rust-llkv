@@ -122,8 +122,9 @@ where
                             "Computed projection requires a non-empty alias".into(),
                         ));
                     }
+                    let simplified_expr = NumericKernels::simplify(expr);
                     let mut fields_set: FxHashSet<FieldId> = FxHashSet::default();
-                    NumericKernels::collect_fields(expr, &mut fields_set);
+                    NumericKernels::collect_fields(&simplified_expr, &mut fields_set);
                     if fields_set.is_empty() {
                         return Err(Error::InvalidArgumentError(
                             "Computed projection must reference at least one column".into(),
@@ -148,7 +149,7 @@ where
                         numeric_fields.insert(*field_id);
                     }
                     projection_evals.push(ProjectionEval::Computed(ComputedProjectionInfo {
-                        expr: expr.clone(),
+                        expr: simplified_expr,
                         alias: alias.clone(),
                     }));
                 }
