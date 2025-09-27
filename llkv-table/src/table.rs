@@ -6,9 +6,13 @@ use crate::constants::STREAM_BATCH_ROWS;
 use crate::scalar_eval::{NumericArrayMap, NumericKernels};
 use crate::types::TableId;
 
-use arrow::array::{ArrayRef, RecordBatch};
+use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
+use llkv_column_map::scan::{
+    PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+    PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
+};
 use llkv_column_map::store::{
     FilterPrimitive, FilterResult, FilterRun, GatherNullPolicy, Projection, ROW_ID_COLUMN_NAME,
     dense_row_runs,
@@ -392,6 +396,48 @@ where
             return Ok(());
         }
 
+        let passthrough_fields: Vec<Option<FieldId>> = projection_evals
+            .iter()
+            .map(|eval| match eval {
+                ProjectionEval::Computed(info) => NumericKernels::passthrough_column(&info.expr),
+                _ => None,
+            })
+            .collect();
+
+        let mut fields: Vec<Field> = Vec::with_capacity(projection_evals.len());
+        for (idx, eval) in projection_evals.iter().enumerate() {
+            match eval {
+                ProjectionEval::Column(info) => {
+                    fields.push(Field::new(
+                        info.output_name.clone(),
+                        info.data_type.clone(),
+                        true,
+                    ));
+                }
+                ProjectionEval::Computed(info) => {
+                    if let Some(fid) = passthrough_fields[idx] {
+                        let lfid = LogicalFieldId::for_user(self.table_id, fid);
+                        let dtype = self.store.data_type(lfid)?;
+                        fields.push(Field::new(info.alias.clone(), dtype, true));
+                    } else {
+                        fields.push(Field::new(info.alias.clone(), DataType::Float64, true));
+                    }
+                }
+            }
+        }
+        let out_schema = Arc::new(Schema::new(fields));
+
+        if try_scan_builder_passthrough(
+            self,
+            &projection_evals,
+            &passthrough_fields,
+            &out_schema,
+            filter_expr,
+            &options,
+            &mut on_batch,
+        )? {
+            return Ok(());
+        }
         let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
         let row_ids = self.collect_row_ids_for_expr(filter_expr, &mut all_rows_cache)?;
 
@@ -400,20 +446,6 @@ where
         }
 
         let mut gather_ctx = self.store.prepare_gather_context(&unique_lfids)?;
-
-        let fields: Vec<Field> = projection_evals
-            .iter()
-            .map(|eval| match eval {
-                ProjectionEval::Column(info) => {
-                    Field::new(info.output_name.clone(), info.data_type.clone(), true)
-                }
-                ProjectionEval::Computed(info) => {
-                    Field::new(info.alias.clone(), DataType::Float64, true)
-                }
-            })
-            .collect();
-        let out_schema = Arc::new(Schema::new(fields));
-
         let mut start = 0usize;
         let null_policy = if options.include_nulls {
             GatherNullPolicy::IncludeNulls
@@ -448,29 +480,52 @@ where
             }
 
             let unique_arrays = gathered.columns();
-            let numeric_arrays: NumericArrayMap = NumericKernels::prepare_numeric_arrays(
-                &unique_lfids,
-                unique_arrays,
-                &numeric_fields,
-            )?;
+
+            let requires_numeric = projection_evals.iter().zip(passthrough_fields.iter()).any(
+                |(eval, passthrough)| {
+                    matches!(eval, ProjectionEval::Computed(_)) && passthrough.is_none()
+                },
+            );
+
+            let numeric_arrays: Option<NumericArrayMap> = if requires_numeric {
+                Some(NumericKernels::prepare_numeric_arrays(
+                    &unique_lfids,
+                    unique_arrays,
+                    &numeric_fields,
+                )?)
+            } else {
+                None
+            };
 
             let mut columns = Vec::with_capacity(projection_evals.len());
-            for eval in &projection_evals {
+            for (idx, eval) in projection_evals.iter().enumerate() {
                 match eval {
                     ProjectionEval::Column(info) => {
-                        let idx = unique_index
+                        let col_idx = unique_index
                             .get(&info.logical_field_id)
                             .copied()
                             .expect("lfid missing from unique-index");
-                        columns.push(Arc::clone(&unique_arrays[idx]));
+                        columns.push(Arc::clone(&unique_arrays[col_idx]));
                     }
                     ProjectionEval::Computed(info) => {
-                        let array = NumericKernels::evaluate_batch(
-                            &info.expr,
-                            gathered.num_rows(),
-                            &numeric_arrays,
-                        )?;
-                        columns.push(array);
+                        if let Some(fid) = passthrough_fields[idx] {
+                            let lfid = LogicalFieldId::for_user(self.table_id, fid);
+                            let col_idx = unique_index
+                                .get(&lfid)
+                                .copied()
+                                .expect("passthrough field missing from unique-index");
+                            columns.push(Arc::clone(&unique_arrays[col_idx]));
+                        } else {
+                            let numeric_arrays = numeric_arrays
+                                .as_ref()
+                                .expect("numeric arrays should exist for computed projection");
+                            let array = NumericKernels::evaluate_batch(
+                                &info.expr,
+                                gathered.num_rows(),
+                                numeric_arrays,
+                            )?;
+                            columns.push(array);
+                        }
                     }
                 }
             }
@@ -904,6 +959,124 @@ where
     }
 }
 
+/// Prototype: detect when projections map 1:1 to stored columns and defer to the column-map
+/// `ScanBuilder` for a zero-copy stream. This currently only covers a single `UInt64` column
+/// with an unfiltered range scan, but it demonstrates how we can bypass the gather pipeline.
+fn try_scan_builder_passthrough<'a, P, F>(
+    table: &Table<P>,
+    projection_evals: &[ProjectionEval],
+    passthrough_fields: &[Option<FieldId>],
+    schema: &Arc<Schema>,
+    filter_expr: &Expr<'a, FieldId>,
+    options: &ScanStreamOptions,
+    on_batch: &mut F,
+) -> LlkvResult<bool>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    F: FnMut(RecordBatch),
+{
+    // Out-of-scope scenarios quickly fall back to the existing gather path.
+    if options.include_nulls {
+        return Ok(false);
+    }
+    if projection_evals.len() != 1 {
+        return Ok(false);
+    }
+
+    // Today we only handle either a raw column projection or a computed passthrough that
+    // resolves to a single physical field.
+    let (target_lfid, dtype) = match &projection_evals[0] {
+        ProjectionEval::Column(info) => (info.logical_field_id, info.data_type.clone()),
+        ProjectionEval::Computed(_info) => {
+            let passthrough = match passthrough_fields.first().and_then(|&f| f) {
+                Some(fid) => fid,
+                None => return Ok(false),
+            };
+            let lfid = LogicalFieldId::for_user(table.table_id, passthrough);
+            let dtype = table.store.data_type(lfid)?;
+            (lfid, dtype)
+        }
+    };
+
+    // Limit prototype to UInt64 because that's what the perf regression bench exercises.
+    if !matches!(dtype, DataType::UInt64) {
+        return Ok(false);
+    }
+
+    // Scan builder can natively stream entire columns. Start with the simplest predicate: an
+    // unfiltered range scan (`field BETWEEN -inf AND +inf`).
+    let filter = match filter_expr {
+        Expr::Pred(pred) => pred,
+        _ => return Ok(false),
+    };
+    match &filter.op {
+        Operator::Range {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        } => {}
+        // TODO: extend to handle selective filters (range, point lookups, etc.).
+        _ => return Ok(false),
+    }
+
+    struct BuilderBatchEmitter<'a, F>
+    where
+        F: FnMut(RecordBatch),
+    {
+        schema: Arc<Schema>,
+        on_batch: &'a mut F,
+        error: Option<Error>,
+        emitted: bool,
+    }
+
+    impl<'a, F> PrimitiveVisitor for BuilderBatchEmitter<'a, F>
+    where
+        F: FnMut(RecordBatch),
+    {
+        fn u64_chunk(&mut self, chunk: &UInt64Array) {
+            if self.error.is_some() {
+                return;
+            }
+            let array: ArrayRef = Arc::new(chunk.clone());
+            match RecordBatch::try_new(self.schema.clone(), vec![array]) {
+                Ok(batch) => {
+                    (self.on_batch)(batch);
+                    self.emitted = true;
+                }
+                Err(err) => self.error = Some(Error::from(err)),
+            }
+        }
+    }
+
+    impl<'a, F> PrimitiveSortedVisitor for BuilderBatchEmitter<'a, F> where F: FnMut(RecordBatch) {}
+    impl<'a, F> PrimitiveWithRowIdsVisitor for BuilderBatchEmitter<'a, F> where F: FnMut(RecordBatch) {}
+    impl<'a, F> PrimitiveSortedWithRowIdsVisitor for BuilderBatchEmitter<'a, F> where
+        F: FnMut(RecordBatch)
+    {
+    }
+
+    let mut emitter = BuilderBatchEmitter {
+        schema: Arc::clone(schema),
+        on_batch,
+        error: None,
+        emitted: false,
+    };
+
+    let scan_opts = ScanOptions {
+        with_row_ids: false,
+        include_nulls: false,
+        ..Default::default()
+    };
+
+    ScanBuilder::new(&table.store, target_lfid)
+        .options(scan_opts)
+        .run(&mut emitter)?;
+
+    if let Some(err) = emitter.error {
+        return Err(err);
+    }
+
+    Ok(emitter.emitted)
+}
 pub struct ColumnData {
     pub data: ArrayRef,
     pub data_type: DataType,
