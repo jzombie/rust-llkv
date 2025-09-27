@@ -485,7 +485,9 @@ where
             return Ok(None);
         }
 
-        if let Some(expected) = expected_next && start != expected {
+        if let Some(expected) = expected_next
+            && start != expected
+        {
             return Ok(None);
         }
 

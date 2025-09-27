@@ -394,7 +394,8 @@ where
 
             let dense_base = if len == 0 {
                 None
-            } else if len == 1 || is_non_decreasing && row_ids.windows(2).all(|w| w[1] == w[0] + 1) {
+            } else if len == 1 || is_non_decreasing && row_ids.windows(2).all(|w| w[1] == w[0] + 1)
+            {
                 Some(row_ids[0])
             } else {
                 None
@@ -590,8 +591,9 @@ where
 
             if row_arr.null_count() == 0 && row_ids.windows(2).all(|w| w[0] <= w[1]) {
                 let values = row_arr.values();
-                if let Ok(start_idx) = values.binary_search(&row_ids[0]) && start_idx + len <= values.len()
-                        && row_ids == &values[start_idx..start_idx + len]
+                if let Ok(start_idx) = values.binary_search(&row_ids[0])
+                    && start_idx + len <= values.len()
+                    && row_ids == &values[start_idx..start_idx + len]
                 {
                     return Ok(value_any.slice(start_idx, len));
                 }
