@@ -28,7 +28,7 @@ tempfile.workspace = true
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
 
 [[bench]]
-name = "table_sum_bench"
+name = "table_math_bench"
 harness = false
 
 [profile.bench]

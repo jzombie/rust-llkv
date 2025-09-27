@@ -148,8 +148,57 @@ impl NumericKernels {
                         return Self::try_evaluate_vectorized(left, len, arrays);
                     }
                 }
+                let left_array = Self::try_evaluate_vectorized(left, len, arrays)?;
+                let right_array = Self::try_evaluate_vectorized(right, len, arrays)?;
 
-                Ok(None)
+                match (left_array, right_array) {
+                    (Some(left_arr), Some(right_arr)) => {
+                        let left_float = left_arr
+                            .as_ref()
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .ok_or_else(|| Error::Internal("expected Float64 array".into()))?;
+                        let right_float = right_arr
+                            .as_ref()
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .ok_or_else(|| Error::Internal("expected Float64 array".into()))?;
+
+                        if left_float.len() != len || right_float.len() != len {
+                            return Err(Error::Internal(
+                                "scalar expression length mismatch".into(),
+                            ));
+                        }
+
+                        let op = *op;
+                        let values: Vec<Option<f64>> = (0..len)
+                            .map(|idx| {
+                                if left_float.is_null(idx) || right_float.is_null(idx) {
+                                    None
+                                } else {
+                                    let lhs = left_float.value(idx);
+                                    let rhs = right_float.value(idx);
+                                    match op {
+                                        BinaryOp::Add => Some(lhs + rhs),
+                                        BinaryOp::Subtract => Some(lhs - rhs),
+                                        BinaryOp::Multiply => Some(lhs * rhs),
+                                        BinaryOp::Divide => {
+                                            if rhs == 0.0 {
+                                                None
+                                            } else {
+                                                Some(lhs / rhs)
+                                            }
+                                        }
+                                    }
+                                }
+                            })
+                            .collect();
+
+                        let array = Float64Array::from(values);
+                        Ok(Some(Arc::new(array) as ArrayRef))
+                    }
+                    _ => Ok(None),
+                }
             }
         }
     }
@@ -222,5 +271,97 @@ impl NumericKernels {
             CompareOp::Gt => lhs > rhs,
             CompareOp::GtEq => lhs >= rhs,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Float64Array;
+
+    fn array(values: &[Option<f64>]) -> Arc<Float64Array> {
+        Arc::new(Float64Array::from(values.to_vec()))
+    }
+
+    #[test]
+    fn vectorized_add_columns() {
+        const F1: FieldId = 1;
+        const F2: FieldId = 2;
+        let mut arrays: NumericArrayMap = NumericArrayMap::default();
+        arrays.insert(F1, array(&[Some(1.0), Some(2.0), None, Some(-1.0)]));
+        arrays.insert(F2, array(&[Some(5.0), Some(-1.0), Some(3.0), Some(4.0)]));
+
+        let expr = ScalarExpr::binary(
+            ScalarExpr::column(F1),
+            BinaryOp::Add,
+            ScalarExpr::column(F2),
+        );
+
+        let result = NumericKernels::evaluate_batch(&expr, 4, &arrays).unwrap();
+        let result = result
+            .as_ref()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        assert_eq!(result.len(), 4);
+        assert_eq!(result.value(0), 6.0);
+        assert_eq!(result.value(1), 1.0);
+        assert!(result.is_null(2));
+        assert_eq!(result.value(3), 3.0);
+    }
+
+    #[test]
+    fn vectorized_multiply_literal() {
+        const F1: FieldId = 10;
+        let mut arrays: NumericArrayMap = NumericArrayMap::default();
+        arrays.insert(F1, array(&[Some(1.0), Some(-2.5), Some(0.0), None]));
+
+        let expr = ScalarExpr::binary(
+            ScalarExpr::column(F1),
+            BinaryOp::Multiply,
+            ScalarExpr::literal(3),
+        );
+
+        let result = NumericKernels::evaluate_batch(&expr, 4, &arrays).unwrap();
+        let result = result
+            .as_ref()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        assert_eq!(result.len(), 4);
+        assert_eq!(result.value(0), 3.0);
+        assert_eq!(result.value(1), -7.5);
+        assert_eq!(result.value(2), 0.0);
+        assert!(result.is_null(3));
+    }
+
+    #[test]
+    fn vectorized_divide_by_zero_yields_null() {
+        const NUM: FieldId = 20;
+        const DEN: FieldId = 21;
+        let mut arrays: NumericArrayMap = NumericArrayMap::default();
+        arrays.insert(NUM, array(&[Some(4.0), Some(9.0), Some(5.0), Some(-6.0)]));
+        arrays.insert(DEN, array(&[Some(2.0), Some(0.0), None, Some(-3.0)]));
+
+        let expr = ScalarExpr::binary(
+            ScalarExpr::column(NUM),
+            BinaryOp::Divide,
+            ScalarExpr::column(DEN),
+        );
+
+        let result = NumericKernels::evaluate_batch(&expr, 4, &arrays).unwrap();
+        let result = result
+            .as_ref()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        assert_eq!(result.len(), 4);
+        assert_eq!(result.value(0), 2.0);
+        assert!(result.is_null(1));
+        assert!(result.is_null(2));
+        assert_eq!(result.value(3), 2.0);
     }
 }
