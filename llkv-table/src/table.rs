@@ -52,9 +52,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     let predicate = build_predicate::<T>(op).map_err(Error::predicate_build)?;
-    store
-        .filter_matches::<T, _>(field_id, move |value| predicate.matches(value))
-        .map_err(Error::from)
+    store.filter_matches::<T, _>(field_id, move |value| predicate.matches(value))
 }
 
 fn normalize_row_ids(mut row_ids: Vec<u64>) -> Vec<u64> {
@@ -381,17 +379,17 @@ where
             }
         }
 
-        if let Expr::Pred(filter) = filter_expr {
-            if self.try_fast_scan_stream(
+        if let Expr::Pred(filter) = filter_expr
+            && self.try_fast_scan_stream(
                 &projection_evals,
                 &unique_index,
                 &unique_lfids,
                 filter,
                 &options,
                 &mut on_batch,
-            )? {
-                return Ok(());
-            }
+            )?
+        {
+            return Ok(());
         }
 
         let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
@@ -628,10 +626,9 @@ where
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
         } = &filter.op
+            && let Some(runs) = dense_row_runs(&self.store, filter_lfid)?
         {
-            if let Some(runs) = dense_row_runs(&self.store, filter_lfid)? {
-                return Ok(Self::expand_filter_runs(&runs));
-            }
+            return Ok(Self::expand_filter_runs(&runs));
         }
 
         let row_ids = llkv_column_map::with_integer_arrow_type!(
@@ -743,10 +740,10 @@ where
                 Some(existing) => intersect_sorted(existing, rows),
                 None => rows,
             });
-            if let Some(ref d) = domain {
-                if d.is_empty() {
-                    return Ok(Vec::new());
-                }
+            if let Some(ref d) = domain
+                && d.is_empty()
+            {
+                return Ok(Vec::new());
             }
         }
         let domain = domain.unwrap_or_default();
@@ -792,10 +789,10 @@ where
             for (offset, &row_id) in window.iter().enumerate() {
                 let left_val = NumericKernels::evaluate_value(left, offset, &numeric_arrays)?;
                 let right_val = NumericKernels::evaluate_value(right, offset, &numeric_arrays)?;
-                if let (Some(lv), Some(rv)) = (left_val, right_val) {
-                    if NumericKernels::compare(op, lv, rv) {
-                        result.push(row_id);
-                    }
+                if let (Some(lv), Some(rv)) = (left_val, right_val)
+                    && NumericKernels::compare(op, lv, rv)
+                {
+                    result.push(row_id);
                 }
             }
             start = end;
@@ -830,10 +827,10 @@ where
                         Some(existing) => intersect_sorted(existing, rows),
                         None => rows,
                     });
-                    if let Some(ref d) = domain {
-                        if d.is_empty() {
-                            return Ok(Vec::new());
-                        }
+                    if let Some(ref d) = domain
+                        && d.is_empty()
+                    {
+                        return Ok(Vec::new());
                     }
                 }
                 Ok(domain.unwrap_or_default())
