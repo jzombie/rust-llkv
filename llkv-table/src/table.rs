@@ -160,8 +160,9 @@ where
             }
             let dtype = self.store.data_type(lfid)?;
             proj_infos.push((proj.clone(), lfid, dtype));
-            if !unique_index.contains_key(&lfid) {
-                unique_index.insert(lfid, unique_lfids.len());
+
+            if let std::collections::hash_map::Entry::Vacant(e) = unique_index.entry(lfid) {
+                e.insert(unique_lfids.len());
                 unique_lfids.push(lfid);
             }
         }
