@@ -10,7 +10,8 @@ use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
 use llkv_column_map::store::{
-    FilterPrimitive, FilterResult, GatherNullPolicy, Projection, ROW_ID_COLUMN_NAME,
+    FilterPrimitive, FilterResult, FilterRun, GatherNullPolicy, Projection, ROW_ID_COLUMN_NAME,
+    dense_row_runs,
 };
 use llkv_column_map::{
     ColumnStore,
@@ -494,10 +495,6 @@ where
     where
         F: FnMut(RecordBatch),
     {
-        if !options.include_nulls {
-            return Ok(false);
-        }
-
         if projection_evals
             .iter()
             .any(|eval| !matches!(eval, ProjectionEval::Column(_)))
@@ -507,34 +504,51 @@ where
 
         let filter_lfid = LogicalFieldId::for_user(self.table_id, filter.field_id);
         let dtype = self.store.data_type(filter_lfid)?;
-
-        let result = llkv_column_map::with_integer_arrow_type!(
-            dtype.clone(),
-            |ArrowTy| collect_filter_result::<ArrowTy, P>(&self.store, filter_lfid, &filter.op),
-            return Ok(false),
-        )?;
-
-        if result.total_matches() == 0 {
-            return Ok(true);
-        }
-
-        if !result.is_dense() {
-            return Ok(false);
-        }
-
-        let runs = match result.into_runs() {
-            Some(runs) => runs,
-            None => return Ok(false),
+        let dense_runs = match &filter.op {
+            Operator::Range {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            } => dense_row_runs(&self.store, filter_lfid)?,
+            _ => None,
         };
 
-        if runs.is_empty() {
-            return Ok(true);
-        }
+        let runs = if let Some(runs) = dense_runs {
+            if runs.is_empty() {
+                return Ok(true);
+            }
+            runs
+        } else {
+            let result = llkv_column_map::with_integer_arrow_type!(
+                dtype.clone(),
+                |ArrowTy| collect_filter_result::<ArrowTy, P>(&self.store, filter_lfid, &filter.op),
+                return Ok(false),
+            )?;
+
+            if result.total_matches() == 0 {
+                return Ok(true);
+            }
+
+            if !result.is_dense() {
+                return Ok(false);
+            }
+
+            match result.into_runs() {
+                Some(runs) if runs.is_empty() => return Ok(true),
+                Some(runs) => runs,
+                None => return Ok(false),
+            }
+        };
 
         let mut gather_ctx = self.store.prepare_multi_gather_context(unique_lfids)?;
         if gather_ctx.is_empty() {
             return Ok(true);
         }
+
+        let null_policy = if options.include_nulls {
+            GatherNullPolicy::IncludeNulls
+        } else {
+            GatherNullPolicy::DropNulls
+        };
 
         let fields: Vec<Field> = projection_evals
             .iter()
@@ -575,7 +589,7 @@ where
                 let gathered = match self.store.gather_rows_multi_with_context(
                     &mut gather_ctx,
                     &temp_row_ids,
-                    GatherNullPolicy::IncludeNulls,
+                    null_policy,
                 ) {
                     Ok(batch) => batch,
                     Err(_) => return Ok(false),
@@ -609,6 +623,16 @@ where
     fn collect_row_ids_for_filter<'a>(&self, filter: &Filter<'a, FieldId>) -> LlkvResult<Vec<u64>> {
         let filter_lfid = LogicalFieldId::for_user(self.table_id, filter.field_id);
         let dtype = self.store.data_type(filter_lfid)?;
+
+        if let Operator::Range {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        } = &filter.op
+        {
+            if let Some(runs) = dense_row_runs(&self.store, filter_lfid)? {
+                return Ok(Self::expand_filter_runs(&runs));
+            }
+        }
 
         let row_ids = llkv_column_map::with_integer_arrow_type!(
             dtype.clone(),
@@ -679,6 +703,20 @@ where
                 Ok(difference_sorted(domain, matched))
             }
         }
+    }
+
+    #[inline]
+    fn expand_filter_runs(runs: &[FilterRun]) -> Vec<u64> {
+        let total: usize = runs.iter().map(|r| r.len).sum();
+        let mut row_ids = Vec::with_capacity(total);
+        for run in runs {
+            let mut row_id = run.start_row_id;
+            for _ in 0..run.len {
+                row_ids.push(row_id);
+                row_id += 1;
+            }
+        }
+        row_ids
     }
 
     fn collect_row_ids_for_compare(
@@ -832,6 +870,7 @@ where
                 upper: Bound::Unbounded,
             },
         };
+
         let ids = self.collect_row_ids_for_filter(&filter)?;
         cache.insert(field_id, ids.clone());
         Ok(ids)
