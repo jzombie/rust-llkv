@@ -1,5 +1,4 @@
 use std::cmp;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::constants::STREAM_BATCH_ROWS;
@@ -21,6 +20,7 @@ use crate::types::FieldId;
 use llkv_expr::typed_predicate::build_predicate;
 use llkv_expr::{Filter, Operator};
 use llkv_result::{Error, Result as LlkvResult};
+use rustc_hash::FxHashMap;
 
 fn collect_matching_row_ids<T, P>(
     store: &ColumnStore<P>,
@@ -134,20 +134,23 @@ where
             ));
         }
 
-        let mut seen = HashSet::with_capacity(projection_cols.len());
+        // Allow duplicate projection columns. Collect the projection
+        // information in the requested order, but also build a list of
+        // unique LogicalFieldIds so we can gather each column once and
+        // then duplicate the gathered ArrayRefs into the output in the
+        // same order the caller provided.
         let mut proj_infos = Vec::with_capacity(projection_cols.len());
-        let mut proj_lfids = Vec::with_capacity(projection_cols.len());
+        let mut unique_index: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();
+        unique_index.reserve(projection_cols.len());
+        let mut unique_lfids: Vec<LogicalFieldId> = Vec::with_capacity(projection_cols.len());
         for &col in projection_cols {
-            if !seen.insert(col) {
-                return Err(Error::InvalidArgumentError(format!(
-                    "duplicate projection column {col}",
-                )));
-            }
-
             let lfid = lfid_for(self.table_id, col);
             let dtype = self.store.data_type(lfid)?;
             proj_infos.push((col, lfid, dtype));
-            proj_lfids.push(lfid);
+            if !unique_index.contains_key(&lfid) {
+                unique_index.insert(lfid, unique_lfids.len());
+                unique_lfids.push(lfid);
+            }
         }
 
         let filter_lfid = lfid_for(self.table_id, filter.field_id);
@@ -187,18 +190,23 @@ where
 
             let gathered =
                 self.store
-                    .gather_rows_multi_with_policy(&proj_lfids, window, null_policy)?;
+                    .gather_rows_multi_with_policy(&unique_lfids, window, null_policy)?;
 
             if gathered.num_columns() == 0 || gathered.num_rows() == 0 {
                 start = end;
                 continue;
             }
+            debug_assert_eq!(gathered.num_columns(), unique_lfids.len());
 
-            debug_assert_eq!(gathered.num_columns(), proj_infos.len());
-
-            let mut columns = Vec::with_capacity(gathered.num_columns());
-            for array in gathered.columns() {
-                columns.push(Arc::clone(array));
+            // unique_arrays[i] corresponds to unique_lfids[i]. Build the
+            // output columns by mapping each requested projection's lfid
+            // back to the unique array and cloning the Arc.
+            let unique_arrays: Vec<ArrayRef> =
+                gathered.columns().iter().map(|a| Arc::clone(a)).collect();
+            let mut columns = Vec::with_capacity(proj_infos.len());
+            for (_field_id, lfid, _dtype) in proj_infos.iter() {
+                let idx = *unique_index.get(lfid).unwrap();
+                columns.push(Arc::clone(&unique_arrays[idx]));
             }
 
             let batch = RecordBatch::try_new(out_schema.clone(), columns)?;
@@ -1138,7 +1146,7 @@ mod tests {
             op: Operator::Equals(20.into()),
         };
 
-        let mut seen = Vec::<u64>::new();
+        let mut seen_cols = Vec::<u64>::new();
         table
             .scan_stream(&[COL_A_U64], &filter, ScanStreamOptions::default(), |b| {
                 assert_eq!(b.num_columns(), 1);
@@ -1146,14 +1154,14 @@ mod tests {
                 // No kernel needed; just collect values for shape assertions.
                 for i in 0..a.len() {
                     if !a.is_null(i) {
-                        seen.push(a.value(i));
+                        seen_cols.push(a.value(i));
                     }
                 }
             })
             .unwrap();
 
         // In fixture, c_i32 == 20 corresponds to a_u64 values [200, 200].
-        assert_eq!(seen, vec![200, 200]);
+        assert_eq!(seen_cols, vec![200, 200]);
     }
 
     #[test]
@@ -1209,13 +1217,28 @@ mod tests {
         let result = table.scan_stream(&empty, &filter, ScanStreamOptions::default(), |_batch| {});
         assert!(matches!(result, Err(Error::InvalidArgumentError(_))));
 
+        // Duplicate projections are allowed: the same column will be
+        // gathered once and duplicated in the output in the requested
+        // order. Verify the call succeeds and produces two identical
+        // columns per batch.
         let duplicate = [COL_A_U64, COL_A_U64];
-        let result = table.scan_stream(
-            &duplicate,
-            &filter,
-            ScanStreamOptions::default(),
-            |_batch| {},
-        );
-        assert!(matches!(result, Err(Error::InvalidArgumentError(_))));
+        let mut collected = Vec::<u64>::new();
+        table
+            .scan_stream(&duplicate, &filter, ScanStreamOptions::default(), |b| {
+                assert_eq!(b.num_columns(), 2);
+                let a0 = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                let a1 = b.column(1).as_any().downcast_ref::<UInt64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    if !a0.is_null(i) {
+                        collected.push(a0.value(i));
+                    }
+                    if !a1.is_null(i) {
+                        collected.push(a1.value(i));
+                    }
+                }
+            })
+            .unwrap();
+        // Two matching rows, two columns per row -> four values.
+        assert_eq!(collected, vec![200, 200, 200, 200]);
     }
 }
