@@ -5,12 +5,12 @@ use std::sync::Arc;
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::types::TableId;
 
-use arrow::array::{ ArrayRef,  RecordBatch, };
+use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
 use llkv_column_map::store::{FilterPrimitive, GatherNullPolicy, Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{
-    ColumnStore, 
+    ColumnStore,
     types::{LogicalFieldId, Namespace},
 };
 use llkv_storage::pager::{MemPager, Pager};
@@ -477,15 +477,14 @@ mod tests {
     use super::*;
     use crate::sys_catalog::CATALOG_TID;
     use crate::types::RowId;
+    use arrow::array::Array;
     use arrow::array::{
         BinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, UInt8Array, UInt32Array,
         UInt64Array,
     };
-    use arrow::array::Array;
     use arrow::compute::{cast, max, min, sum, unary};
     use std::collections::HashMap;
     use std::ops::Bound;
-
 
     fn setup_test_table() -> Table {
         let pager = Arc::new(MemPager::default());
