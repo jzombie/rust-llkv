@@ -21,22 +21,6 @@ pub enum Namespace {
     Reserved = 0xFFFF,
 }
 
-/// A namespaced logical identifier for a column.
-///
-/// This 64-bit struct is designed to prevent ID collisions by partitioning the key space
-/// into distinct namespaces, table IDs, and field IDs.
-#[bitfield]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
-#[repr(u64)]
-pub struct LogicalFieldId {
-    /// The specific field/column within a table (up to ~4.3 billion).
-    pub field_id: B32,
-    /// The table this field belongs to (up to 65,535).
-    pub table_id: B16,
-    /// The type of data this ID represents (up to 65,536 namespaces).
-    pub namespace: Namespace,
-}
-
 /// Identifier for a logical table within a [`Namespace`].
 ///
 /// `TableId` consumes the middle 16 bits inside [`LogicalFieldId`]. Using a
@@ -57,6 +41,24 @@ pub type FieldId = u32;
 /// alias mirrors that width to avoid casts when marshalling data in and out of
 /// the engine.
 pub type RowId = u64;
+
+/// A namespaced logical identifier for a column.
+///
+/// This 64-bit struct is designed to prevent ID collisions by partitioning the key space
+/// into distinct namespaces, table IDs, and field IDs.
+#[bitfield]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(u64)]
+pub struct LogicalFieldId {
+    /// The specific field/column within a table (up to ~4.3 billion).
+    pub field_id: B32,
+    /// The table this field belongs to (up to 65,535).
+    pub table_id: B16,
+    /// The type of data this ID represents (up to 65,536 namespaces).
+    pub namespace: Namespace,
+}
+
+
 
 impl LogicalFieldId {
     /// Build a logical field identifier from its namespace, table, and field components.
