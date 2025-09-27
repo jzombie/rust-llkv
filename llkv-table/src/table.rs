@@ -436,9 +436,11 @@ where
             let end = end.max(start + 1);
             let window = &row_ids[start..end];
 
-            let gathered =
-                self.store
-                    .gather_rows_with_context(&mut gather_ctx, window, null_policy)?;
+            let gathered = self.store.gather_rows_with_reusable_context(
+                &mut gather_ctx,
+                window,
+                null_policy,
+            )?;
 
             if gathered.num_columns() == 0 || gathered.num_rows() == 0 {
                 start = end;
@@ -584,7 +586,7 @@ where
                     temp_row_ids.push(current_row + offset as u64);
                 }
 
-                let gathered = match self.store.gather_rows_with_context(
+                let gathered = match self.store.gather_rows_with_reusable_context(
                     &mut gather_ctx,
                     &temp_row_ids,
                     null_policy,

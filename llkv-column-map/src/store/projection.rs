@@ -229,10 +229,15 @@ where
         policy: GatherNullPolicy,
     ) -> Result<RecordBatch> {
         let mut ctx = self.prepare_gather_context(field_ids)?;
-        self.gather_rows_single_use(&mut ctx, row_ids, policy)
+        self.execute_gather_single_pass(&mut ctx, row_ids, policy)
     }
 
-    fn gather_rows_single_use(
+    /// Executes a one-off gather using a freshly prepared context.
+    ///
+    /// This path reuses the planning metadata but fetches and decodes
+    /// required chunks for this call only, avoiding the reusable caches
+    /// maintained by [`Self::gather_rows_with_reusable_context`].
+    fn execute_gather_single_pass(
         &self,
         ctx: &mut MultiGatherContext,
         row_ids: &[u64],
@@ -410,7 +415,11 @@ where
         Ok(MultiGatherContext::new(field_infos, plans))
     }
 
-    pub fn gather_rows_with_context(
+    /// Gathers rows while reusing chunk caches and scratch buffers stored in the context.
+    ///
+    /// This path amortizes chunk fetch and decode costs across multiple calls by
+    /// retaining Arrow arrays and scratch state inside the provided context.
+    pub fn gather_rows_with_reusable_context(
         &self,
         ctx: &mut MultiGatherContext,
         row_ids: &[u64],
