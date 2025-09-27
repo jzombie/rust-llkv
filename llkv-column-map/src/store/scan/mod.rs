@@ -16,8 +16,6 @@ use std::ops::{Bound, RangeBounds};
 use arrow::array::*;
 use arrow::compute;
 
-use rustc_hash::FxHashMap;
-
 use super::ColumnStore;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::types::{LogicalFieldId, Namespace};
@@ -105,26 +103,9 @@ where
         if metas.is_empty() {
             return Ok(());
         }
-        let mut gets: Vec<BatchGet> = Vec::with_capacity(metas.len() * 2);
-        for m in &metas {
-            gets.push(BatchGet::Raw { key: m.chunk_pk });
-            gets.push(BatchGet::Raw {
-                key: m.value_order_perm_pk,
-            });
-        }
-        let results = self.pager.batch_get(&gets)?;
-        let mut blobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-        for r in results {
-            if let GetResult::Raw { key, bytes } = r {
-                blobs.insert(key, bytes);
-            }
-        }
-
+        let buffers = sorted::load_sorted_buffers(self.pager.as_ref(), &metas)?;
         let first_any = llkv_storage::serialization::deserialize_array(
-            blobs
-                .get(&metas[0].chunk_pk)
-                .ok_or(Error::NotFound)?
-                .clone(),
+            buffers.value_handle(0).clone(),
         )?;
         crate::with_integer_arrow_type!(
             first_any.data_type().clone(),
@@ -132,7 +113,7 @@ where
                 <ArrowTy as sorted::SortedDispatch>::visit(
                     self.pager.as_ref(),
                     &metas,
-                    &blobs,
+                    &buffers,
                     visitor,
                 )
             },
@@ -184,19 +165,9 @@ where
                 key: m.value_order_perm_pk,
             });
         }
-        let results = self.pager.batch_get(&gets)?;
-        let mut blobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-        for r in results {
-            if let GetResult::Raw { key, bytes } = r {
-                blobs.insert(key, bytes);
-            }
-        }
-
+        let buffers = sorted::load_sorted_buffers(self.pager.as_ref(), &metas)?;
         let first_any = llkv_storage::serialization::deserialize_array(
-            blobs
-                .get(&metas[0].chunk_pk)
-                .ok_or(Error::NotFound)?
-                .clone(),
+            buffers.value_handle(0).clone(),
         )?;
         crate::with_integer_arrow_type!(
             first_any.data_type().clone(),
@@ -204,7 +175,7 @@ where
                 <ArrowTy as sorted::SortedDispatch>::visit_rev(
                     self.pager.as_ref(),
                     &metas,
-                    &blobs,
+                    &buffers,
                     visitor,
                 )
             },
@@ -356,33 +327,13 @@ where
                 ));
             }
 
-            // Batch get: values (chunks + perms) and rids (chunks)
-            let mut gets: Vec<BatchGet> = Vec::with_capacity(metas_val.len() * 3);
-            for (mv, mr) in metas_val.iter().zip(metas_rid.iter()) {
-                gets.push(BatchGet::Raw { key: mv.chunk_pk });
-                gets.push(BatchGet::Raw {
-                    key: mv.value_order_perm_pk,
-                });
-                gets.push(BatchGet::Raw { key: mr.chunk_pk });
-            }
-            let results = self.pager.batch_get(&gets)?;
-            let mut vblobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-            let mut rblobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-            for r in results {
-                if let GetResult::Raw { key, bytes } = r {
-                    // Heuristic: key in rid metas => rid blob, else value blob
-                    if metas_rid.iter().any(|m| m.chunk_pk == key) {
-                        rblobs.insert(key, bytes);
-                    } else {
-                        vblobs.insert(key, bytes);
-                    }
-                }
-            }
+            let buffers = sorted::load_sorted_buffers_with_rids(
+                self.pager.as_ref(),
+                &metas_val,
+                &metas_rid,
+            )?;
             let first_any = llkv_storage::serialization::deserialize_array(
-                vblobs
-                    .get(&metas_val[0].chunk_pk)
-                    .ok_or(Error::NotFound)?
-                    .clone(),
+                buffers.base().value_handle(0).clone(),
             )?;
             if opts.reverse {
                 if paginate {
@@ -399,8 +350,7 @@ where
                                 self.pager.as_ref(),
                                 &metas_val,
                                 &metas_rid,
-                                &vblobs,
-                                &rblobs,
+                                &buffers,
                                 &mut pv,
                             )
                         },
@@ -460,7 +410,10 @@ where
                         let mut present_rids: Vec<UInt64Array> = Vec::new();
                         for mr in &metas_rid {
                             let any = deserialize_array(
-                                rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone(),
+                                buffers
+                                    .rid_by_pk(mr.chunk_pk)
+                                    .ok_or(Error::NotFound)?
+                                    .clone(),
                             )?;
                             let arr = any
                                 .as_any()
@@ -619,8 +572,7 @@ where
                                 self.pager.as_ref(),
                                 &metas_val,
                                 &metas_rid,
-                                &vblobs,
-                                &rblobs,
+                                &buffers,
                                 visitor,
                             )
                         },
@@ -637,8 +589,7 @@ where
                             self.pager.as_ref(),
                             &metas_val,
                             &metas_rid,
-                            &vblobs,
-                            &rblobs,
+                            &buffers,
                             &mut pv,
                         )
                     },
@@ -693,11 +644,14 @@ where
                             }
                         }
                     }
-                    // Build present rids from metas_rid/rblobs
+                    // Build present rids from metas_rid using buffered handles
                     let mut present_rids: Vec<UInt64Array> = Vec::new();
                     for mr in &metas_rid {
                         let any = deserialize_array(
-                            rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone(),
+                            buffers
+                                .rid_by_pk(mr.chunk_pk)
+                                .ok_or(Error::NotFound)?
+                                .clone(),
                         )?;
                         let arr = any
                             .as_any()
@@ -872,7 +826,10 @@ where
                 let mut present_rids: Vec<UInt64Array> = Vec::new();
                 for mr in &metas_rid {
                     let any = deserialize_array(
-                        rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone(),
+                        buffers
+                            .rid_by_pk(mr.chunk_pk)
+                            .ok_or(Error::NotFound)?
+                            .clone(),
                     )?;
                     let arr = any
                         .as_any()
@@ -947,8 +904,7 @@ where
                             self.pager.as_ref(),
                             &metas_val,
                             &metas_rid,
-                            &vblobs,
-                            &rblobs,
+                            &buffers,
                             visitor,
                         )
                     },
@@ -963,8 +919,7 @@ where
                             self.pager.as_ref(),
                             &metas_val,
                             &metas_rid,
-                            &vblobs,
-                            &rblobs,
+                            &buffers,
                             visitor,
                         )
                     },
@@ -1025,7 +980,10 @@ where
                     let mut present_rids: Vec<UInt64Array> = Vec::new();
                     for mr in &metas_rid {
                         let any = deserialize_array(
-                            rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone(),
+                            buffers
+                                .rid_by_pk(mr.chunk_pk)
+                                .ok_or(Error::NotFound)?
+                                .clone(),
                         )?;
                         let arr = any
                             .as_any()

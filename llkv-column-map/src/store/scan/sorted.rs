@@ -1,6 +1,219 @@
 use super::*;
 use crate::types::Namespace;
 use arrow::datatypes::{ArrowPrimitiveType, DataType};
+use rustc_hash::FxHashMap;
+
+#[derive(Debug)]
+pub struct SortedChunkBuffers {
+    values: Vec<EntryHandle>,
+    perms: Vec<EntryHandle>,
+    value_index: FxHashMap<PhysicalKey, usize>,
+    perm_index: FxHashMap<PhysicalKey, usize>,
+}
+
+impl SortedChunkBuffers {
+    pub(crate) fn from_parts(
+        metas: &[ChunkMetadata],
+        values: Vec<EntryHandle>,
+        perms: Vec<EntryHandle>,
+    ) -> Result<Self> {
+        if metas.len() != values.len() || metas.len() != perms.len() {
+            return Err(Error::Internal(
+                "sorted buffers length mismatch".into(),
+            ));
+        }
+        let mut value_index =
+            FxHashMap::with_capacity_and_hasher(metas.len(), Default::default());
+        let mut perm_index =
+            FxHashMap::with_capacity_and_hasher(metas.len(), Default::default());
+        for (idx, meta) in metas.iter().enumerate() {
+            value_index.insert(meta.chunk_pk, idx);
+            perm_index.insert(meta.value_order_perm_pk, idx);
+        }
+        Ok(Self {
+            values,
+            perms,
+            value_index,
+            perm_index,
+        })
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    #[inline]
+    pub fn value_handle(&self, idx: usize) -> &EntryHandle {
+        &self.values[idx]
+    }
+
+    #[inline]
+    pub fn perm_handle(&self, idx: usize) -> &EntryHandle {
+        &self.perms[idx]
+    }
+
+    #[inline]
+    pub fn value_by_pk(&self, pk: PhysicalKey) -> Option<&EntryHandle> {
+        self.value_index
+            .get(&pk)
+            .map(|&idx| &self.values[idx])
+    }
+
+    #[inline]
+    pub fn perm_by_pk(&self, pk: PhysicalKey) -> Option<&EntryHandle> {
+        self.perm_index
+            .get(&pk)
+            .map(|&idx| &self.perms[idx])
+    }
+
+    #[inline]
+    pub fn values(&self) -> &[EntryHandle] {
+        &self.values
+    }
+
+    #[inline]
+    pub fn perms(&self) -> &[EntryHandle] {
+        &self.perms
+    }
+}
+
+#[derive(Debug)]
+pub struct SortedChunkBuffersWithRids {
+    base: SortedChunkBuffers,
+    rids: Vec<EntryHandle>,
+    rid_index: FxHashMap<PhysicalKey, usize>,
+}
+
+impl SortedChunkBuffersWithRids {
+    pub(crate) fn from_parts(
+        metas_val: &[ChunkMetadata],
+        metas_rid: &[ChunkMetadata],
+        values: Vec<EntryHandle>,
+        perms: Vec<EntryHandle>,
+        rids: Vec<EntryHandle>,
+    ) -> Result<Self> {
+        if metas_val.len() != metas_rid.len()
+            || metas_val.len() != values.len()
+            || metas_val.len() != perms.len()
+            || metas_rid.len() != rids.len()
+        {
+            return Err(Error::Internal(
+                "sorted with rids buffers length mismatch".into(),
+            ));
+        }
+        let base = SortedChunkBuffers::from_parts(metas_val, values, perms)?;
+        let mut rid_index =
+            FxHashMap::with_capacity_and_hasher(metas_rid.len(), Default::default());
+        for (idx, meta) in metas_rid.iter().enumerate() {
+            rid_index.insert(meta.chunk_pk, idx);
+        }
+        Ok(Self {
+            base,
+            rids,
+            rid_index,
+        })
+    }
+
+    #[inline]
+    pub fn base(&self) -> &SortedChunkBuffers {
+        &self.base
+    }
+
+    #[inline]
+    pub fn rid_handle(&self, idx: usize) -> &EntryHandle {
+        &self.rids[idx]
+    }
+
+    #[inline]
+    pub fn rid_by_pk(&self, pk: PhysicalKey) -> Option<&EntryHandle> {
+        self.rid_index.get(&pk).map(|&idx| &self.rids[idx])
+    }
+
+    #[inline]
+    pub fn rids(&self) -> &[EntryHandle] {
+        &self.rids
+    }
+}
+
+pub(crate) fn load_sorted_buffers<P: Pager<Blob = EntryHandle>>(
+    pager: &P,
+    metas: &[ChunkMetadata],
+) -> Result<SortedChunkBuffers> {
+    let mut gets: Vec<BatchGet> = Vec::with_capacity(metas.len() * 2);
+    for m in metas {
+        gets.push(BatchGet::Raw { key: m.chunk_pk });
+        gets.push(BatchGet::Raw {
+            key: m.value_order_perm_pk,
+        });
+    }
+    let results = pager.batch_get(&gets)?;
+    let mut values: Vec<EntryHandle> = Vec::with_capacity(metas.len());
+    let mut perms: Vec<EntryHandle> = Vec::with_capacity(metas.len());
+    let mut iter = results.into_iter();
+    for m in metas {
+        match iter.next() {
+            Some(GetResult::Raw { key, bytes }) if key == m.chunk_pk => values.push(bytes),
+            _ => return Err(Error::Internal("sorted: unexpected value blob".into())),
+        }
+        match iter.next() {
+            Some(GetResult::Raw { key, bytes }) if key == m.value_order_perm_pk => {
+                perms.push(bytes)
+            }
+            _ => return Err(Error::Internal("sorted: unexpected perm blob".into())),
+        }
+    }
+    if iter.next().is_some() {
+        return Err(Error::Internal("sorted: extra blobs returned".into()));
+    }
+    SortedChunkBuffers::from_parts(metas, values, perms)
+}
+
+pub(crate) fn load_sorted_buffers_with_rids<P: Pager<Blob = EntryHandle>>(
+    pager: &P,
+    metas_val: &[ChunkMetadata],
+    metas_rid: &[ChunkMetadata],
+) -> Result<SortedChunkBuffersWithRids> {
+    if metas_val.len() != metas_rid.len() {
+        return Err(Error::Internal(
+            "sorted_with_row_ids: chunk count mismatch".into(),
+        ));
+    }
+    let mut gets: Vec<BatchGet> = Vec::with_capacity(metas_val.len() * 3);
+    for (mv, mr) in metas_val.iter().zip(metas_rid.iter()) {
+        gets.push(BatchGet::Raw { key: mv.chunk_pk });
+        gets.push(BatchGet::Raw {
+            key: mv.value_order_perm_pk,
+        });
+        gets.push(BatchGet::Raw { key: mr.chunk_pk });
+    }
+    let results = pager.batch_get(&gets)?;
+    let mut values: Vec<EntryHandle> = Vec::with_capacity(metas_val.len());
+    let mut perms: Vec<EntryHandle> = Vec::with_capacity(metas_val.len());
+    let mut rids: Vec<EntryHandle> = Vec::with_capacity(metas_val.len());
+    let mut iter = results.into_iter();
+    for (mv, mr) in metas_val.iter().zip(metas_rid.iter()) {
+        match iter.next() {
+            Some(GetResult::Raw { key, bytes }) if key == mv.chunk_pk => values.push(bytes),
+            _ => return Err(Error::Internal("sorted: unexpected value blob".into())),
+        }
+        match iter.next() {
+            Some(GetResult::Raw { key, bytes }) if key == mv.value_order_perm_pk => {
+                perms.push(bytes)
+            }
+            _ => return Err(Error::Internal("sorted: unexpected perm blob".into())),
+        }
+        match iter.next() {
+            Some(GetResult::Raw { key, bytes }) if key == mr.chunk_pk => rids.push(bytes),
+            _ => return Err(Error::Internal("sorted: unexpected rid blob".into())),
+        }
+    }
+    if iter.next().is_some() {
+        return Err(Error::Internal("sorted: extra blobs returned".into()));
+    }
+    SortedChunkBuffersWithRids::from_parts(metas_val, metas_rid, values, perms, rids)
+}
+
 use std::cmp::Ordering;
 
 #[derive(Clone, Copy, Debug)]
@@ -68,20 +281,13 @@ macro_rules! sorted_visit_impl {
         pub(crate) fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
             _pager: &P,
             metas: &[ChunkMetadata],
-            blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+            buffers: &SortedChunkBuffers,
             visitor: &mut V,
         ) -> Result<()> {
-            // Materialize sorted arrays per chunk by applying the permutation.
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
-            for m in metas {
-                let data_any =
-                    deserialize_array(blobs.get(&m.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm_any = deserialize_array(
-                    blobs
-                        .get(&m.value_order_perm_pk)
-                        .ok_or(Error::NotFound)?
-                        .clone(),
-                )?;
+            for idx in 0..metas.len() {
+                let data_any = deserialize_array(buffers.value_handle(idx).clone())?;
+                let perm_any = deserialize_array(buffers.perm_handle(idx).clone())?;
                 let perm = perm_any
                     .as_any()
                     .downcast_ref::<UInt32Array>()
@@ -95,8 +301,6 @@ macro_rules! sorted_visit_impl {
                 arrays.push(arr);
             }
 
-            // K-way merge with coalesced runs.
-            // Implement len/get inline for the concrete array type (monomorphized).
             if arrays.is_empty() {
                 return Ok(());
             }
@@ -111,20 +315,13 @@ macro_rules! sorted_visit_impl {
         pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
             _pager: &P,
             metas: &[ChunkMetadata],
-            blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+            buffers: &SortedChunkBuffers,
             visitor: &mut V,
         ) -> Result<()> {
-            // Materialize sorted arrays per chunk by applying the permutation.
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
-            for m in metas {
-                let data_any =
-                    deserialize_array(blobs.get(&m.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm_any = deserialize_array(
-                    blobs
-                        .get(&m.value_order_perm_pk)
-                        .ok_or(Error::NotFound)?
-                        .clone(),
-                )?;
+            for idx in 0..metas.len() {
+                let data_any = deserialize_array(buffers.value_handle(idx).clone())?;
+                let perm_any = deserialize_array(buffers.perm_handle(idx).clone())?;
                 let perm = perm_any
                     .as_any()
                     .downcast_ref::<UInt32Array>()
@@ -165,19 +362,13 @@ macro_rules! sorted_visit_float_impl {
         pub(crate) fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
             _pager: &P,
             metas: &[ChunkMetadata],
-            blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+            buffers: &SortedChunkBuffers,
             visitor: &mut V,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
-            for m in metas {
-                let data_any =
-                    deserialize_array(blobs.get(&m.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm_any = deserialize_array(
-                    blobs
-                        .get(&m.value_order_perm_pk)
-                        .ok_or(Error::NotFound)?
-                        .clone(),
-                )?;
+            for idx in 0..metas.len() {
+                let data_any = deserialize_array(buffers.value_handle(idx).clone())?;
+                let perm_any = deserialize_array(buffers.perm_handle(idx).clone())?;
                 let perm = perm_any
                     .as_any()
                     .downcast_ref::<UInt32Array>()
@@ -204,19 +395,13 @@ macro_rules! sorted_visit_float_impl {
         pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
             _pager: &P,
             metas: &[ChunkMetadata],
-            blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+            buffers: &SortedChunkBuffers,
             visitor: &mut V,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
-            for m in metas {
-                let data_any =
-                    deserialize_array(blobs.get(&m.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm_any = deserialize_array(
-                    blobs
-                        .get(&m.value_order_perm_pk)
-                        .ok_or(Error::NotFound)?
-                        .clone(),
-                )?;
+            for idx in 0..metas.len() {
+                let data_any = deserialize_array(buffers.value_handle(idx).clone())?;
+                let perm_any = deserialize_array(buffers.perm_handle(idx).clone())?;
                 let perm = perm_any
                     .as_any()
                     .downcast_ref::<UInt32Array>()
@@ -266,8 +451,7 @@ macro_rules! sorted_with_rids_impl {
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
-            vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
-            rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+            buffers: &SortedChunkBuffersWithRids,
             visitor: &mut V,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
@@ -277,15 +461,11 @@ macro_rules! sorted_with_rids_impl {
             }
             let mut vals: Vec<$ArrTy> = Vec::with_capacity(metas_val.len());
             let mut rids: Vec<UInt64Array> = Vec::with_capacity(metas_val.len());
-            for (mv, mr) in metas_val.iter().zip(metas_rid.iter()) {
+            for idx in 0..metas_val.len() {
                 let data_any =
-                    deserialize_array(vblobs.get(&mv.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm_any = deserialize_array(
-                    vblobs
-                        .get(&mv.value_order_perm_pk)
-                        .ok_or(Error::NotFound)?
-                        .clone(),
-                )?;
+                    deserialize_array(buffers.base().value_handle(idx).clone())?;
+                let perm_any =
+                    deserialize_array(buffers.base().perm_handle(idx).clone())?;
                 let perm = perm_any
                     .as_any()
                     .downcast_ref::<UInt32Array>()
@@ -297,8 +477,7 @@ macro_rules! sorted_with_rids_impl {
                     .ok_or_else(|| Error::Internal("sorted downcast".into()))?
                     .clone();
                 vals.push(arr);
-                let rid_any =
-                    deserialize_array(rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let rid_any = deserialize_array(buffers.rid_handle(idx).clone())?;
                 let taken_rid_any = compute::take(&rid_any, perm, None)?;
                 let rid = taken_rid_any
                     .as_any()
@@ -325,8 +504,7 @@ macro_rules! sorted_with_rids_impl {
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
-            vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
-            rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+            buffers: &SortedChunkBuffersWithRids,
             visitor: &mut V,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
@@ -336,15 +514,11 @@ macro_rules! sorted_with_rids_impl {
             }
             let mut vals: Vec<$ArrTy> = Vec::with_capacity(metas_val.len());
             let mut rids: Vec<UInt64Array> = Vec::with_capacity(metas_val.len());
-            for (mv, mr) in metas_val.iter().zip(metas_rid.iter()) {
+            for idx in 0..metas_val.len() {
                 let data_any =
-                    deserialize_array(vblobs.get(&mv.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm_any = deserialize_array(
-                    vblobs
-                        .get(&mv.value_order_perm_pk)
-                        .ok_or(Error::NotFound)?
-                        .clone(),
-                )?;
+                    deserialize_array(buffers.base().value_handle(idx).clone())?;
+                let perm_any =
+                    deserialize_array(buffers.base().perm_handle(idx).clone())?;
                 let perm = perm_any
                     .as_any()
                     .downcast_ref::<UInt32Array>()
@@ -356,8 +530,7 @@ macro_rules! sorted_with_rids_impl {
                     .ok_or_else(|| Error::Internal("sorted downcast".into()))?
                     .clone();
                 vals.push(arr);
-                let rid_any =
-                    deserialize_array(rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let rid_any = deserialize_array(buffers.rid_handle(idx).clone())?;
                 let taken_rid_any = compute::take(&rid_any, perm, None)?;
                 let rid = taken_rid_any
                     .as_any()
@@ -435,8 +608,7 @@ macro_rules! sorted_with_rids_float_impl {
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
-            vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
-            rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+            buffers: &SortedChunkBuffersWithRids,
             visitor: &mut V,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
@@ -446,15 +618,11 @@ macro_rules! sorted_with_rids_float_impl {
             }
             let mut vals: Vec<$ArrTy> = Vec::with_capacity(metas_val.len());
             let mut rids: Vec<UInt64Array> = Vec::with_capacity(metas_val.len());
-            for (mv, mr) in metas_val.iter().zip(metas_rid.iter()) {
+            for idx in 0..metas_val.len() {
                 let data_any =
-                    deserialize_array(vblobs.get(&mv.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm_any = deserialize_array(
-                    vblobs
-                        .get(&mv.value_order_perm_pk)
-                        .ok_or(Error::NotFound)?
-                        .clone(),
-                )?;
+                    deserialize_array(buffers.base().value_handle(idx).clone())?;
+                let perm_any =
+                    deserialize_array(buffers.base().perm_handle(idx).clone())?;
                 let perm = perm_any
                     .as_any()
                     .downcast_ref::<UInt32Array>()
@@ -466,8 +634,7 @@ macro_rules! sorted_with_rids_float_impl {
                     .ok_or_else(|| Error::Internal("sorted downcast".into()))?
                     .clone();
                 vals.push(arr);
-                let rid_any =
-                    deserialize_array(rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let rid_any = deserialize_array(buffers.rid_handle(idx).clone())?;
                 let taken_rid_any = compute::take(&rid_any, perm, None)?;
                 let rid = taken_rid_any
                     .as_any()
@@ -494,8 +661,7 @@ macro_rules! sorted_with_rids_float_impl {
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
-            vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
-            rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+            buffers: &SortedChunkBuffersWithRids,
             visitor: &mut V,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
@@ -505,15 +671,11 @@ macro_rules! sorted_with_rids_float_impl {
             }
             let mut vals: Vec<$ArrTy> = Vec::with_capacity(metas_val.len());
             let mut rids: Vec<UInt64Array> = Vec::with_capacity(metas_val.len());
-            for (mv, mr) in metas_val.iter().zip(metas_rid.iter()) {
+            for idx in 0..metas_val.len() {
                 let data_any =
-                    deserialize_array(vblobs.get(&mv.chunk_pk).ok_or(Error::NotFound)?.clone())?;
-                let perm_any = deserialize_array(
-                    vblobs
-                        .get(&mv.value_order_perm_pk)
-                        .ok_or(Error::NotFound)?
-                        .clone(),
-                )?;
+                    deserialize_array(buffers.base().value_handle(idx).clone())?;
+                let perm_any =
+                    deserialize_array(buffers.base().perm_handle(idx).clone())?;
                 let perm = perm_any
                     .as_any()
                     .downcast_ref::<UInt32Array>()
@@ -525,8 +687,7 @@ macro_rules! sorted_with_rids_float_impl {
                     .ok_or_else(|| Error::Internal("sorted downcast".into()))?
                     .clone();
                 vals.push(arr);
-                let rid_any =
-                    deserialize_array(rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let rid_any = deserialize_array(buffers.rid_handle(idx).clone())?;
                 let taken_rid_any = compute::take(&rid_any, perm, None)?;
                 let rid = taken_rid_any
                     .as_any()
@@ -568,7 +729,7 @@ pub(crate) trait SortedDispatch: ArrowPrimitiveType {
     fn visit<P, V>(
         pager: &P,
         metas: &[ChunkMetadata],
-        blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        buffers: &SortedChunkBuffers,
         visitor: &mut V,
     ) -> Result<()>
     where
@@ -578,7 +739,7 @@ pub(crate) trait SortedDispatch: ArrowPrimitiveType {
     fn visit_rev<P, V>(
         pager: &P,
         metas: &[ChunkMetadata],
-        blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        buffers: &SortedChunkBuffers,
         visitor: &mut V,
     ) -> Result<()>
     where
@@ -589,8 +750,7 @@ pub(crate) trait SortedDispatch: ArrowPrimitiveType {
         pager: &P,
         metas_val: &[ChunkMetadata],
         metas_rid: &[ChunkMetadata],
-        vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
-        rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        buffers: &SortedChunkBuffersWithRids,
         visitor: &mut V,
     ) -> Result<()>
     where
@@ -601,8 +761,7 @@ pub(crate) trait SortedDispatch: ArrowPrimitiveType {
         pager: &P,
         metas_val: &[ChunkMetadata],
         metas_rid: &[ChunkMetadata],
-        vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
-        rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+        buffers: &SortedChunkBuffersWithRids,
         visitor: &mut V,
     ) -> Result<()>
     where
@@ -617,28 +776,28 @@ macro_rules! impl_sorted_dispatch {
             fn visit<P, V>(
                 pager: &P,
                 metas: &[ChunkMetadata],
-                blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+                buffers: &SortedChunkBuffers,
                 visitor: &mut V,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
                 V: PrimitiveSortedVisitor,
             {
-                $visit(pager, metas, blobs, visitor)
+                $visit(pager, metas, buffers, visitor)
             }
 
             #[inline]
             fn visit_rev<P, V>(
                 pager: &P,
                 metas: &[ChunkMetadata],
-                blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+                buffers: &SortedChunkBuffers,
                 visitor: &mut V,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
                 V: PrimitiveSortedVisitor,
             {
-                $visit_rev(pager, metas, blobs, visitor)
+                $visit_rev(pager, metas, buffers, visitor)
             }
 
             #[inline]
@@ -646,15 +805,14 @@ macro_rules! impl_sorted_dispatch {
                 pager: &P,
                 metas_val: &[ChunkMetadata],
                 metas_rid: &[ChunkMetadata],
-                vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
-                rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+                buffers: &SortedChunkBuffersWithRids,
                 visitor: &mut V,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
                 V: PrimitiveSortedWithRowIdsVisitor,
             {
-                $with_rids(pager, metas_val, metas_rid, vblobs, rblobs, visitor)
+                $with_rids(pager, metas_val, metas_rid, buffers, visitor)
             }
 
             #[inline]
@@ -662,15 +820,14 @@ macro_rules! impl_sorted_dispatch {
                 pager: &P,
                 metas_val: &[ChunkMetadata],
                 metas_rid: &[ChunkMetadata],
-                vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
-                rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+                buffers: &SortedChunkBuffersWithRids,
                 visitor: &mut V,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
                 V: PrimitiveSortedWithRowIdsVisitor,
             {
-                $with_rids_rev(pager, metas_val, metas_rid, vblobs, rblobs, visitor)
+                $with_rids_rev(pager, metas_val, metas_rid, buffers, visitor)
             }
         }
     };
@@ -752,17 +909,21 @@ macro_rules! sorted_visit_bounds_impl {
         fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
             _pager: &P,
             metas: &[ChunkMetadata],
-            blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+            buffers: &SortedChunkBuffers,
             bounds: (Bound<$ty>, Bound<$ty>),
             visitor: &mut V,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for m in metas {
-                let data_any =
-                    deserialize_array(blobs.get(&m.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let data_any = deserialize_array(
+                    buffers
+                        .value_by_pk(m.chunk_pk)
+                        .ok_or(Error::NotFound)?
+                        .clone(),
+                )?;
                 let perm_any = deserialize_array(
-                    blobs
-                        .get(&m.value_order_perm_pk)
+                    buffers
+                        .perm_by_pk(m.value_order_perm_pk)
                         .ok_or(Error::NotFound)?
                         .clone(),
                 )?;
@@ -824,17 +985,21 @@ macro_rules! sorted_visit_float_bounds_impl {
         fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
             _pager: &P,
             metas: &[ChunkMetadata],
-            blobs: &FxHashMap<PhysicalKey, EntryHandle>,
+            buffers: &SortedChunkBuffers,
             bounds: (Bound<$scalar>, Bound<$scalar>),
             visitor: &mut V,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for m in metas {
-                let data_any =
-                    deserialize_array(blobs.get(&m.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let data_any = deserialize_array(
+                    buffers
+                        .value_by_pk(m.chunk_pk)
+                        .ok_or(Error::NotFound)?
+                        .clone(),
+                )?;
                 let perm_any = deserialize_array(
-                    blobs
-                        .get(&m.value_order_perm_pk)
+                    buffers
+                        .perm_by_pk(m.value_order_perm_pk)
                         .ok_or(Error::NotFound)?
                         .clone(),
                 )?;
@@ -897,8 +1062,7 @@ macro_rules! sorted_with_rids_bounds_impl {
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
-            vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
-            rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+            buffers: &SortedChunkBuffersWithRids,
             bounds: (Bound<$ty>, Bound<$ty>),
             visitor: &mut V,
         ) -> Result<()> {
@@ -910,11 +1074,17 @@ macro_rules! sorted_with_rids_bounds_impl {
             let mut vals: Vec<$ArrTy> = Vec::with_capacity(metas_val.len());
             let mut rids: Vec<UInt64Array> = Vec::with_capacity(metas_val.len());
             for (mv, mr) in metas_val.iter().zip(metas_rid.iter()) {
-                let data_any =
-                    deserialize_array(vblobs.get(&mv.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let data_any = deserialize_array(
+                    buffers
+                        .base()
+                        .value_by_pk(mv.chunk_pk)
+                        .ok_or(Error::NotFound)?
+                        .clone(),
+                )?;
                 let perm_any = deserialize_array(
-                    vblobs
-                        .get(&mv.value_order_perm_pk)
+                    buffers
+                        .base()
+                        .perm_by_pk(mv.value_order_perm_pk)
                         .ok_or(Error::NotFound)?
                         .clone(),
                 )?;
@@ -956,8 +1126,12 @@ macro_rules! sorted_with_rids_bounds_impl {
                     .ok_or_else(|| Error::Internal("sorted downcast".into()))?
                     .clone();
                 vals.push(a);
-                let rid_any =
-                    deserialize_array(rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let rid_any = deserialize_array(
+                    buffers
+                        .rid_by_pk(mr.chunk_pk)
+                        .ok_or(Error::NotFound)?
+                        .clone(),
+                )?;
                 let taken_rid_any = compute::take(&rid_any, &pw, None)?;
                 let ra = taken_rid_any
                     .as_any()
@@ -986,8 +1160,7 @@ macro_rules! sorted_with_rids_float_bounds_impl {
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
-            vblobs: &FxHashMap<PhysicalKey, EntryHandle>,
-            rblobs: &FxHashMap<PhysicalKey, EntryHandle>,
+            buffers: &SortedChunkBuffersWithRids,
             bounds: (Bound<$scalar>, Bound<$scalar>),
             visitor: &mut V,
         ) -> Result<()> {
@@ -999,11 +1172,17 @@ macro_rules! sorted_with_rids_float_bounds_impl {
             let mut vals: Vec<$ArrTy> = Vec::with_capacity(metas_val.len());
             let mut rids: Vec<UInt64Array> = Vec::with_capacity(metas_val.len());
             for (mv, mr) in metas_val.iter().zip(metas_rid.iter()) {
-                let data_any =
-                    deserialize_array(vblobs.get(&mv.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let data_any = deserialize_array(
+                    buffers
+                        .base()
+                        .value_by_pk(mv.chunk_pk)
+                        .ok_or(Error::NotFound)?
+                        .clone(),
+                )?;
                 let perm_any = deserialize_array(
-                    vblobs
-                        .get(&mv.value_order_perm_pk)
+                    buffers
+                        .base()
+                        .perm_by_pk(mv.value_order_perm_pk)
                         .ok_or(Error::NotFound)?
                         .clone(),
                 )?;
@@ -1045,8 +1224,12 @@ macro_rules! sorted_with_rids_float_bounds_impl {
                     .ok_or_else(|| Error::Internal("sorted downcast".into()))?
                     .clone();
                 vals.push(a);
-                let rid_any =
-                    deserialize_array(rblobs.get(&mr.chunk_pk).ok_or(Error::NotFound)?.clone())?;
+                let rid_any = deserialize_array(
+                    buffers
+                        .rid_by_pk(mr.chunk_pk)
+                        .ok_or(Error::NotFound)?
+                        .clone(),
+                )?;
                 let taken_rid_any = compute::take(&rid_any, &pw, None)?;
                 let ra = taken_rid_any
                     .as_any()
@@ -1155,9 +1338,9 @@ sorted_with_rids_float_bounds_impl!(
 );
 
 macro_rules! sorted_bounds_visit {
-    ($ir:expr, $field:ident, $func:ident, $pager:expr, $metas:expr, $blobs:expr, $visitor:expr) => {{
+    ($ir:expr, $field:ident, $func:ident, $pager:expr, $metas:expr, $buffers:expr, $visitor:expr) => {{
         let (lb, ub) = $ir.$field.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-        $func($pager, $metas, $blobs, (lb, ub), $visitor)
+        $func($pager, $metas, $buffers, (lb, ub), $visitor)
     }};
 }
 
@@ -1169,8 +1352,7 @@ macro_rules! sorted_bounds_with_rids_visit {
         $pager:expr,
         $metas_val:expr,
         $metas_rid:expr,
-        $vblobs:expr,
-        $rblobs:expr,
+        $buffers:expr,
         $visitor:expr
     ) => {{
         let (lb, ub) = $ir.$field.unwrap_or((Bound::Unbounded, Bound::Unbounded));
@@ -1178,8 +1360,7 @@ macro_rules! sorted_bounds_with_rids_visit {
             $pager,
             $metas_val,
             $metas_rid,
-            $vblobs,
-            $rblobs,
+            $buffers,
             (lb, ub),
             $visitor,
         )
@@ -1187,7 +1368,7 @@ macro_rules! sorted_bounds_with_rids_visit {
 }
 
 macro_rules! dispatch_sorted_bounds {
-    ($dtype:expr, $pager:expr, $metas:expr, $blobs:expr, $ir:expr, $visitor:expr) => {{
+    ($dtype:expr, $pager:expr, $metas:expr, $buffers:expr, $ir:expr, $visitor:expr) => {{
         match $dtype {
             DataType::UInt64 => sorted_bounds_visit!(
                 $ir,
@@ -1195,7 +1376,7 @@ macro_rules! dispatch_sorted_bounds {
                 sorted_visit_u64_bounds,
                 $pager,
                 $metas,
-                $blobs,
+                $buffers,
                 $visitor
             ),
             DataType::UInt32 => sorted_bounds_visit!(
@@ -1204,7 +1385,7 @@ macro_rules! dispatch_sorted_bounds {
                 sorted_visit_u32_bounds,
                 $pager,
                 $metas,
-                $blobs,
+                $buffers,
                 $visitor
             ),
             DataType::UInt16 => sorted_bounds_visit!(
@@ -1213,7 +1394,7 @@ macro_rules! dispatch_sorted_bounds {
                 sorted_visit_u16_bounds,
                 $pager,
                 $metas,
-                $blobs,
+                $buffers,
                 $visitor
             ),
             DataType::UInt8 => sorted_bounds_visit!(
@@ -1222,7 +1403,7 @@ macro_rules! dispatch_sorted_bounds {
                 sorted_visit_u8_bounds,
                 $pager,
                 $metas,
-                $blobs,
+                $buffers,
                 $visitor
             ),
             DataType::Int64 => sorted_bounds_visit!(
@@ -1231,7 +1412,7 @@ macro_rules! dispatch_sorted_bounds {
                 sorted_visit_i64_bounds,
                 $pager,
                 $metas,
-                $blobs,
+                $buffers,
                 $visitor
             ),
             DataType::Int32 => sorted_bounds_visit!(
@@ -1240,7 +1421,7 @@ macro_rules! dispatch_sorted_bounds {
                 sorted_visit_i32_bounds,
                 $pager,
                 $metas,
-                $blobs,
+                $buffers,
                 $visitor
             ),
             DataType::Int16 => sorted_bounds_visit!(
@@ -1249,7 +1430,7 @@ macro_rules! dispatch_sorted_bounds {
                 sorted_visit_i16_bounds,
                 $pager,
                 $metas,
-                $blobs,
+                $buffers,
                 $visitor
             ),
             DataType::Int8 => sorted_bounds_visit!(
@@ -1258,7 +1439,7 @@ macro_rules! dispatch_sorted_bounds {
                 sorted_visit_i8_bounds,
                 $pager,
                 $metas,
-                $blobs,
+                $buffers,
                 $visitor
             ),
             DataType::Float64 => sorted_bounds_visit!(
@@ -1267,7 +1448,7 @@ macro_rules! dispatch_sorted_bounds {
                 sorted_visit_f64_bounds,
                 $pager,
                 $metas,
-                $blobs,
+                $buffers,
                 $visitor
             ),
             DataType::Float32 => sorted_bounds_visit!(
@@ -1276,7 +1457,7 @@ macro_rules! dispatch_sorted_bounds {
                 sorted_visit_f32_bounds,
                 $pager,
                 $metas,
-                $blobs,
+                $buffers,
                 $visitor
             ),
             _ => Err(Error::Internal("unsupported sorted dtype (builder)".into())),
@@ -1290,8 +1471,7 @@ macro_rules! dispatch_sorted_with_rids_bounds {
         $pager:expr,
         $metas_val:expr,
         $metas_rid:expr,
-        $vblobs:expr,
-        $rblobs:expr,
+        $buffers:expr,
         $ir:expr,
         $visitor:expr
     ) => {{
@@ -1303,8 +1483,7 @@ macro_rules! dispatch_sorted_with_rids_bounds {
                 $pager,
                 $metas_val,
                 $metas_rid,
-                $vblobs,
-                $rblobs,
+                $buffers,
                 $visitor
             ),
             DataType::UInt32 => sorted_bounds_with_rids_visit!(
@@ -1314,8 +1493,7 @@ macro_rules! dispatch_sorted_with_rids_bounds {
                 $pager,
                 $metas_val,
                 $metas_rid,
-                $vblobs,
-                $rblobs,
+                $buffers,
                 $visitor
             ),
             DataType::UInt16 => sorted_bounds_with_rids_visit!(
@@ -1325,8 +1503,7 @@ macro_rules! dispatch_sorted_with_rids_bounds {
                 $pager,
                 $metas_val,
                 $metas_rid,
-                $vblobs,
-                $rblobs,
+                $buffers,
                 $visitor
             ),
             DataType::UInt8 => sorted_bounds_with_rids_visit!(
@@ -1336,8 +1513,7 @@ macro_rules! dispatch_sorted_with_rids_bounds {
                 $pager,
                 $metas_val,
                 $metas_rid,
-                $vblobs,
-                $rblobs,
+                $buffers,
                 $visitor
             ),
             DataType::Int64 => sorted_bounds_with_rids_visit!(
@@ -1347,8 +1523,7 @@ macro_rules! dispatch_sorted_with_rids_bounds {
                 $pager,
                 $metas_val,
                 $metas_rid,
-                $vblobs,
-                $rblobs,
+                $buffers,
                 $visitor
             ),
             DataType::Int32 => sorted_bounds_with_rids_visit!(
@@ -1358,8 +1533,7 @@ macro_rules! dispatch_sorted_with_rids_bounds {
                 $pager,
                 $metas_val,
                 $metas_rid,
-                $vblobs,
-                $rblobs,
+                $buffers,
                 $visitor
             ),
             DataType::Int16 => sorted_bounds_with_rids_visit!(
@@ -1369,8 +1543,7 @@ macro_rules! dispatch_sorted_with_rids_bounds {
                 $pager,
                 $metas_val,
                 $metas_rid,
-                $vblobs,
-                $rblobs,
+                $buffers,
                 $visitor
             ),
             DataType::Int8 => sorted_bounds_with_rids_visit!(
@@ -1380,8 +1553,7 @@ macro_rules! dispatch_sorted_with_rids_bounds {
                 $pager,
                 $metas_val,
                 $metas_rid,
-                $vblobs,
-                $rblobs,
+                $buffers,
                 $visitor
             ),
             DataType::Float64 => sorted_bounds_with_rids_visit!(
@@ -1391,8 +1563,7 @@ macro_rules! dispatch_sorted_with_rids_bounds {
                 $pager,
                 $metas_val,
                 $metas_rid,
-                $vblobs,
-                $rblobs,
+                $buffers,
                 $visitor
             ),
             DataType::Float32 => sorted_bounds_with_rids_visit!(
@@ -1402,8 +1573,7 @@ macro_rules! dispatch_sorted_with_rids_bounds {
                 $pager,
                 $metas_val,
                 $metas_rid,
-                $vblobs,
-                $rblobs,
+                $buffers,
                 $visitor
             ),
             _ => Err(Error::Internal("unsupported sorted dtype (builder)".into())),
@@ -1488,57 +1658,26 @@ where
         return Ok(());
     }
 
-    // Batch gets
-    let mut gets: Vec<BatchGet> =
-        Vec::with_capacity(metas_val.len() * if opts.with_row_ids { 3 } else { 2 });
-    for (i, mv) in metas_val.iter().enumerate() {
-        gets.push(BatchGet::Raw { key: mv.chunk_pk });
-        gets.push(BatchGet::Raw {
-            key: mv.value_order_perm_pk,
-        });
-        if opts.with_row_ids {
-            gets.push(BatchGet::Raw {
-                key: metas_rid[i].chunk_pk,
-            });
-        }
-    }
-    let results = store.pager.batch_get(&gets)?;
-    let mut vblobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-    let mut rblobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
-    for r in results {
-        if let GetResult::Raw { key, bytes } = r {
-            if opts.with_row_ids && metas_rid.iter().any(|m| m.chunk_pk == key) {
-                rblobs.insert(key, bytes);
-            } else {
-                vblobs.insert(key, bytes);
-            }
-        }
-    }
-    let first_any = deserialize_array(
-        vblobs
-            .get(&metas_val[0].chunk_pk)
-            .ok_or(Error::NotFound)?
-            .clone(),
-    )?;
-
-    // Dispatch by dtype + bounds for this dtype only
     if opts.with_row_ids {
+        let buffers = load_sorted_buffers_with_rids(store.pager.as_ref(), &metas_val, &metas_rid)?;
+        let first_any = deserialize_array(buffers.base().value_handle(0).clone())?;
         dispatch_sorted_with_rids_bounds!(
             first_any.data_type(),
             store.pager.as_ref(),
             &metas_val,
             &metas_rid,
-            &vblobs,
-            &rblobs,
+            &buffers,
             ir,
             visitor
         )
     } else {
+        let buffers = load_sorted_buffers(store.pager.as_ref(), &metas_val)?;
+        let first_any = deserialize_array(buffers.value_handle(0).clone())?;
         dispatch_sorted_bounds!(
             first_any.data_type(),
             store.pager.as_ref(),
             &metas_val,
-            &vblobs,
+            &buffers,
             ir,
             visitor
         )

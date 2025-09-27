@@ -1,5 +1,6 @@
 use super::*;
 use arrow::datatypes::DataType;
+use rustc_hash::FxHashMap;
 
 macro_rules! unsorted_visit_arm {
     ($array:ty, $method:ident, $err:literal, $metas:ident, $blobs:ident, $visitor:ident) => {{
