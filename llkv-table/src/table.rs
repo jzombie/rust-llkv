@@ -1,4 +1,5 @@
 use std::cmp;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::constants::STREAM_BATCH_ROWS;
@@ -99,6 +100,34 @@ fn union_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
     }
 
     result.dedup();
+    result
+}
+
+fn difference_sorted(base: Vec<u64>, subtract: Vec<u64>) -> Vec<u64> {
+    if base.is_empty() || subtract.is_empty() {
+        return base;
+    }
+
+    let mut result = Vec::with_capacity(base.len());
+    let mut i = 0;
+    let mut j = 0;
+    while i < base.len() && j < subtract.len() {
+        let bv = base[i];
+        let sv = subtract[j];
+        if bv == sv {
+            i += 1;
+            j += 1;
+        } else if bv < sv {
+            result.push(bv);
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    while i < base.len() {
+        result.push(base[i]);
+        i += 1;
+    }
     result
 }
 
@@ -225,7 +254,8 @@ where
             }
         }
 
-        let row_ids = self.collect_row_ids_for_expr(filter_expr)?;
+        let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
+        let row_ids = self.collect_row_ids_for_expr(filter_expr, &mut all_rows_cache)?;
 
         // If nothing matches, emit nothing.
         if row_ids.is_empty() {
@@ -304,7 +334,11 @@ where
         Ok(normalize_row_ids(row_ids))
     }
 
-    fn collect_row_ids_for_expr<'a>(&self, expr: &Expr<'a, FieldId>) -> LlkvResult<Vec<u64>> {
+    fn collect_row_ids_for_expr<'a>(
+        &self,
+        expr: &Expr<'a, FieldId>,
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
+    ) -> LlkvResult<Vec<u64>> {
         match expr {
             Expr::Pred(filter) => self.collect_row_ids_for_filter(filter),
             Expr::And(children) => {
@@ -314,9 +348,10 @@ where
                     ));
                 }
                 let mut iter = children.iter();
-                let mut acc = self.collect_row_ids_for_expr(iter.next().unwrap())?;
+                let mut acc =
+                    self.collect_row_ids_for_expr(iter.next().unwrap(), all_rows_cache)?;
                 for child in iter {
-                    let next_ids = self.collect_row_ids_for_expr(child)?;
+                    let next_ids = self.collect_row_ids_for_expr(child, all_rows_cache)?;
                     if acc.is_empty() || next_ids.is_empty() {
                         return Ok(Vec::new());
                     }
@@ -335,7 +370,7 @@ where
                 }
                 let mut acc = Vec::new();
                 for child in children {
-                    let next_ids = self.collect_row_ids_for_expr(child)?;
+                    let next_ids = self.collect_row_ids_for_expr(child, all_rows_cache)?;
                     if acc.is_empty() {
                         acc = next_ids;
                     } else if !next_ids.is_empty() {
@@ -344,10 +379,61 @@ where
                 }
                 Ok(acc)
             }
-            Expr::Not(_) => Err(Error::InvalidArgumentError(
-                "NOT expressions are not supported by scan_stream".into(),
-            )),
+            Expr::Not(inner) => {
+                let domain = self.collect_row_ids_domain(inner, all_rows_cache)?;
+                if domain.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let matched = self.collect_row_ids_for_expr(inner, all_rows_cache)?;
+                Ok(difference_sorted(domain, matched))
+            }
         }
+    }
+
+    fn collect_row_ids_domain<'a>(
+        &self,
+        expr: &Expr<'a, FieldId>,
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
+    ) -> LlkvResult<Vec<u64>> {
+        match expr {
+            Expr::Pred(filter) => {
+                self.collect_all_row_ids_for_field(filter.field_id, all_rows_cache)
+            }
+            Expr::And(children) | Expr::Or(children) => {
+                let mut acc = Vec::new();
+                for child in children {
+                    let next_ids = self.collect_row_ids_domain(child, all_rows_cache)?;
+                    if acc.is_empty() {
+                        acc = next_ids;
+                    } else if !next_ids.is_empty() {
+                        acc = union_sorted(acc, next_ids);
+                    }
+                }
+                Ok(acc)
+            }
+            Expr::Not(inner) => self.collect_row_ids_domain(inner, all_rows_cache),
+        }
+    }
+
+    fn collect_all_row_ids_for_field(
+        &self,
+        field_id: FieldId,
+        cache: &mut FxHashMap<FieldId, Vec<u64>>,
+    ) -> LlkvResult<Vec<u64>> {
+        if let Some(existing) = cache.get(&field_id) {
+            return Ok(existing.clone());
+        }
+
+        let filter = Filter {
+            field_id,
+            op: Operator::Range {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+        };
+        let ids = self.collect_row_ids_for_filter(&filter)?;
+        cache.insert(field_id, ids.clone());
+        Ok(ids)
     }
 
     #[inline]
@@ -1076,6 +1162,78 @@ mod tests {
             .unwrap();
 
         assert_eq!(vals, vec![Some(100), Some(300)]);
+    }
+
+    #[test]
+    fn test_scan_stream_not_predicate() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let expr = Expr::not(pred_expr(Filter {
+            field_id: COL_C_I32,
+            op: Operator::Equals(20.into()),
+        }));
+
+        let mut vals: Vec<Option<u64>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &expr,
+                ScanStreamOptions::default(),
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    vals.extend((0..arr.len()).map(|i| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    }));
+                },
+            )
+            .unwrap();
+
+        assert_eq!(vals, vec![Some(100), Some(300)]);
+    }
+
+    #[test]
+    fn test_scan_stream_not_and_expression() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let expr = Expr::not(Expr::all_of(vec![
+            Filter {
+                field_id: COL_A_U64,
+                op: Operator::GreaterThan(150.into()),
+            },
+            Filter {
+                field_id: COL_C_I32,
+                op: Operator::LessThan(40.into()),
+            },
+        ]));
+
+        let mut vals: Vec<Option<u64>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &expr,
+                ScanStreamOptions::default(),
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    vals.extend((0..arr.len()).map(|i| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    }));
+                },
+            )
+            .unwrap();
+
+        assert_eq!(vals, vec![Some(100)]);
     }
 
     #[test]
