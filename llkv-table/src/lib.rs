@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod constants;
+mod planner;
 mod scalar_eval;
 mod sys_catalog;
 pub mod expr {
