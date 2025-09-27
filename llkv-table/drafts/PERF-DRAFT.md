@@ -13,7 +13,7 @@ RawVec::reserve_and_handle (row-id pushes): ~8 %.
 Aggregation in llkv_table::table::collect_rows_for_filter etc. still accounts for another ~30 % once the filter path is optimized, so we have to slim both filtering and the follow-on gather/aggregate stages.
 key leaps to reach 0.75 ms
 1. stop materializing row IDs in the hot path
-Today every filter returns a Vec<u64> of row ids, which then drives gather_rows_multi_with_context.
+Today every filter returns a Vec<u64> of row ids, which then drives gather_rows_with_context.
 Switch to a dense, zero-copy mask (MutableBuffer/BooleanArray) or reuse the row locator’s contiguous windows. Downstream consumers iterate over the mask without vector pushes.
 Expected impact: remove the 20 % filter loop cost + 8 % allocator time (no push/reserve) and cut gather work substantially because we no longer expand sparse row ids back into contiguous spans.
 Estimate: ~30–35 % gain (5.5 ms → ~3.5 ms).

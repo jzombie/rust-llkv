@@ -459,7 +459,7 @@ where
         Ok(MultiGatherContext::new(field_infos, plans))
     }
 
-    pub fn gather_rows_multi_with_context(
+    pub fn gather_rows_with_context(
         &self,
         ctx: &mut MultiGatherContext,
         row_ids: &[u64],
