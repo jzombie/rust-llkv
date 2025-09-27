@@ -1,4 +1,5 @@
 use std::cmp;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::constants::STREAM_BATCH_ROWS;
@@ -53,9 +54,9 @@ where
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScanStreamOptions {
-    /// Preserve null rows emitted by the projection column when `true`.
-    /// When `false`, the scan gatherer drops rows where the projection
-    /// column is null or missing before yielding batches. This keeps
+    /// Preserve null rows emitted by the projected columns when `true`.
+    /// When `false`, the scan gatherer drops rows where all projected
+    /// columns are null or missing before yielding batches. This keeps
     /// the table scan column-oriented while delegating row-level
     /// filtering to the column-map layer.
     pub include_nulls: bool,
@@ -110,22 +111,16 @@ where
         self.store.append(&namespaced_batch)
     }
 
-    /// Stream a single projected column as a sequence of RecordBatches.
+    /// Stream one or more projected columns as a sequence of RecordBatches.
     ///
     /// - Avoids `concat` and large materializations.
     /// - Uses the same filter machinery as the old `scan` to produce
     ///   `row_ids`.
     /// - Splits `row_ids` into fixed-size windows and gathers rows per
     ///   window to form a small `RecordBatch` that is sent to `on_batch`.
-    ///
-    /// Notes:
-    /// - Currently supports exactly 1 projected column. This avoids
-    ///   cross-column chunk alignment problems without changing
-    ///   column-map APIs. We can generalize once a chunk-aligned
-    ///   multi-column scan is exposed upstream.
     pub fn scan_stream<'a, F>(
         &self,
-        projection_col: FieldId,
+        projection_cols: &[FieldId],
         filter: &Filter<'a, FieldId>,
         on_batch: F,
     ) -> LlkvResult<()>
@@ -133,7 +128,7 @@ where
         F: FnMut(RecordBatch),
     {
         self.scan_stream_with_options(
-            projection_col,
+            projection_cols,
             filter,
             ScanStreamOptions::default(),
             on_batch,
@@ -142,7 +137,7 @@ where
 
     pub fn scan_stream_with_options<'a, F>(
         &self,
-        projection_col: FieldId,
+        projection_cols: &[FieldId],
         filter: &Filter<'a, FieldId>,
         options: ScanStreamOptions,
         mut on_batch: F,
@@ -150,6 +145,28 @@ where
     where
         F: FnMut(RecordBatch),
     {
+        if projection_cols.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "scan_stream requires at least one projection column".into(),
+            ));
+        }
+
+        let mut seen = HashSet::with_capacity(projection_cols.len());
+        let mut proj_infos = Vec::with_capacity(projection_cols.len());
+        let mut proj_lfids = Vec::with_capacity(projection_cols.len());
+        for &col in projection_cols {
+            if !seen.insert(col) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "duplicate projection column {col}",
+                )));
+            }
+
+            let lfid = lfid_for(self.table_id, col);
+            let dtype = self.store.data_type(lfid)?;
+            proj_infos.push((col, lfid, dtype));
+            proj_lfids.push(lfid);
+        }
+
         let filter_lfid = lfid_for(self.table_id, filter.field_id);
         let dtype = self.store.data_type(filter_lfid)?;
 
@@ -167,35 +184,41 @@ where
             return Ok(());
         }
 
-        // Prepare schema for the single projected column.
-        let proj_lfid = lfid_for(self.table_id, projection_col);
-        let proj_dtype = self.store.data_type(proj_lfid)?;
-        let proj_field = Field::new(projection_col.to_string(), proj_dtype.clone(), true);
-        let out_schema = Arc::new(Schema::new(vec![proj_field]));
+        // Prepare schema for the projected columns.
+        let fields: Vec<Field> = proj_infos
+            .iter()
+            .map(|(field_id, _, dtype)| Field::new(field_id.to_string(), dtype.clone(), true))
+            .collect();
+        let out_schema = Arc::new(Schema::new(fields));
 
         // Stream in fixed-size windows of row_ids.
         let mut start = 0usize;
+        let null_policy = if options.include_nulls {
+            GatherNullPolicy::IncludeNulls
+        } else {
+            GatherNullPolicy::DropNulls
+        };
         while start < row_ids.len() {
             let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
             let window = &row_ids[start..end];
 
-            // Gather only this window's rows for the projected column.
-            let null_policy = if options.include_nulls {
-                GatherNullPolicy::IncludeNulls
-            } else {
-                GatherNullPolicy::DropNulls
-            };
+            let gathered =
+                self.store
+                    .gather_rows_multi_with_policy(&proj_lfids, window, null_policy)?;
 
-            let col = self
-                .store
-                .gather_rows_with_policy(proj_lfid, window, null_policy)?;
-
-            if col.is_empty() {
+            if gathered.num_columns() == 0 || gathered.num_rows() == 0 {
                 start = end;
                 continue;
             }
 
-            let batch = RecordBatch::try_new(out_schema.clone(), vec![col])?;
+            debug_assert_eq!(gathered.num_columns(), proj_infos.len());
+
+            let mut columns = Vec::with_capacity(gathered.num_columns());
+            for array in gathered.columns() {
+                columns.push(Arc::clone(array));
+            }
+
+            let batch = RecordBatch::try_new(out_schema.clone(), columns)?;
             on_batch(batch);
 
             start = end;
@@ -397,7 +420,7 @@ mod tests {
 
         let mut vals: Vec<Option<i32>> = Vec::new();
         table
-            .scan_stream(COL_C_I32, &filter, |b| {
+            .scan_stream(&[COL_C_I32], &filter, |b| {
                 let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
                 vals.extend((0..a.len()).map(
                     |i| {
@@ -594,7 +617,7 @@ mod tests {
 
         let mut vals: Vec<Option<u64>> = Vec::new();
         table
-            .scan_stream(COL_A_U64, &filter, |b| {
+            .scan_stream(&[COL_A_U64], &filter, |b| {
                 let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
                 vals.extend((0..a.len()).map(
                     |i| {
@@ -619,7 +642,7 @@ mod tests {
 
         let mut vals: Vec<Option<u64>> = Vec::new();
         table
-            .scan_stream(COL_A_U64, &filter, |b| {
+            .scan_stream(&[COL_A_U64], &filter, |b| {
                 let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
                 vals.extend((0..a.len()).map(
                     |i| {
@@ -647,7 +670,7 @@ mod tests {
 
         let mut vals: Vec<Option<i32>> = Vec::new();
         table
-            .scan_stream(COL_C_I32, &filter, |b| {
+            .scan_stream(&[COL_C_I32], &filter, |b| {
                 let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
                 vals.extend((0..a.len()).map(
                     |i| {
@@ -677,7 +700,7 @@ mod tests {
 
         let mut total: u128 = 0;
         table
-            .scan_stream(COL_A_U64, &filter, |b| {
+            .scan_stream(&[COL_A_U64], &filter, |b| {
                 let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
                 if let Some(part) = sum(a) {
                     total += part as u128;
@@ -706,7 +729,7 @@ mod tests {
 
         let mut total: i64 = 0;
         table
-            .scan_stream(COL_C_I32, &filter, |b| {
+            .scan_stream(&[COL_C_I32], &filter, |b| {
                 let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
                 if let Some(part) = sum(a) {
                     total += part as i64;
@@ -735,7 +758,7 @@ mod tests {
         let mut mn: Option<i32> = None;
         let mut mx: Option<i32> = None;
         table
-            .scan_stream(COL_C_I32, &filter, |b| {
+            .scan_stream(&[COL_C_I32], &filter, |b| {
                 let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
 
                 if let Some(part_min) = min(a) {
@@ -762,7 +785,7 @@ mod tests {
 
         let mut got = Vec::new();
         table
-            .scan_stream(COL_D_F64, &filter, |b| {
+            .scan_stream(&[COL_D_F64], &filter, |b| {
                 let arr = b.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
                 for i in 0..arr.len() {
                     if arr.is_valid(i) {
@@ -788,7 +811,7 @@ mod tests {
 
         let mut vals: Vec<Option<f32>> = Vec::new();
         table
-            .scan_stream(COL_E_F32, &filter, |b| {
+            .scan_stream(&[COL_E_F32], &filter, |b| {
                 let arr = b.column(0).as_any().downcast_ref::<Float32Array>().unwrap();
                 vals.extend((0..arr.len()).map(|i| {
                     if arr.is_null(i) {
@@ -862,7 +885,7 @@ mod tests {
 
         let mut default_vals: Vec<Option<i32>> = Vec::new();
         table
-            .scan_stream(COL_C_I32, &filter, |b| {
+            .scan_stream(&[COL_C_I32], &filter, |b| {
                 let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
                 default_vals.extend((0..arr.len()).map(|i| {
                     if arr.is_null(i) {
@@ -878,13 +901,37 @@ mod tests {
         let mut include_null_vals: Vec<Option<i32>> = Vec::new();
         table
             .scan_stream_with_options(
-                COL_C_I32,
+                &[COL_C_I32],
                 &filter,
                 ScanStreamOptions {
                     include_nulls: true,
                 },
                 |b| {
                     let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+
+                    let mut paired_vals: Vec<(Option<i32>, Option<f64>)> = Vec::new();
+                    table
+                        .scan_stream(&[COL_C_I32, COL_D_F64], &filter, |b| {
+                            assert_eq!(b.num_columns(), 2);
+                            let c_arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                            let d_arr =
+                                b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+                            for i in 0..b.num_rows() {
+                                let c_val = if c_arr.is_null(i) {
+                                    None
+                                } else {
+                                    Some(c_arr.value(i))
+                                };
+                                let d_val = if d_arr.is_null(i) {
+                                    None
+                                } else {
+                                    Some(d_arr.value(i))
+                                };
+                                paired_vals.push((c_val, d_val));
+                            }
+                        })
+                        .unwrap();
+                    assert_eq!(paired_vals, vec![(Some(40), Some(5.5)), (None, Some(6.5))]);
                     include_null_vals.extend((0..arr.len()).map(|i| {
                         if arr.is_null(i) {
                             None
@@ -916,7 +963,7 @@ mod tests {
 
         let mut got: Vec<f64> = Vec::new();
         table
-            .scan_stream(COL_A_U64, &filter, |b| {
+            .scan_stream(&[COL_A_U64], &filter, |b| {
                 let casted = cast(b.column(0), &arrow::datatypes::DataType::Float64).unwrap();
                 let f64_arr = casted.as_any().downcast_ref::<Float64Array>().unwrap();
 
@@ -1003,7 +1050,7 @@ mod tests {
         // 1) SUM over d_u32 (per-batch sum + accumulate).
         let mut d_sum: u128 = 0;
         table
-            .scan_stream(COL_D_U32, &filter, |b| {
+            .scan_stream(&[COL_D_U32], &filter, |b| {
                 let a = b.column(0).as_any().downcast_ref::<UInt32Array>().unwrap();
                 if let Some(part) = sum(a) {
                     d_sum += part as u128;
@@ -1015,7 +1062,7 @@ mod tests {
         // 2) MIN over e_i16 (per-batch min + fold).
         let mut e_min: Option<i16> = None;
         table
-            .scan_stream(COL_E_I16, &filter, |b| {
+            .scan_stream(&[COL_E_I16], &filter, |b| {
                 let a = b.column(0).as_any().downcast_ref::<Int16Array>().unwrap();
                 if let Some(part_min) = min(a) {
                     e_min = Some(e_min.map_or(part_min, |m| m.min(part_min)));
@@ -1027,7 +1074,7 @@ mod tests {
         // 3) MAX over f_u8 (per-batch max + fold).
         let mut f_max: Option<u8> = None;
         table
-            .scan_stream(COL_F_U8, &filter, |b| {
+            .scan_stream(&[COL_F_U8], &filter, |b| {
                 let a = b
                     .column(0)
                     .as_any()
@@ -1043,7 +1090,7 @@ mod tests {
         // 4) SQRT over a_u64 (cast to f64, then unary sqrt per batch).
         let mut got: Vec<f64> = Vec::new();
         table
-            .scan_stream(COL_A_U64, &filter, |b| {
+            .scan_stream(&[COL_A_U64], &filter, |b| {
                 let casted = cast(b.column(0), &arrow::datatypes::DataType::Float64).unwrap();
                 let f64_arr = casted.as_any().downcast_ref::<Float64Array>().unwrap();
                 let sqrt_arr = unary::<
@@ -1078,7 +1125,7 @@ mod tests {
 
         let mut vals: Vec<Option<u64>> = Vec::new();
         table
-            .scan_stream(COL_A_U64, &filter, |b| {
+            .scan_stream(&[COL_A_U64], &filter, |b| {
                 let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
                 vals.extend((0..a.len()).map(
                     |i| {
@@ -1104,7 +1151,7 @@ mod tests {
 
         let mut seen = Vec::<u64>::new();
         table
-            .scan_stream(COL_A_U64, &filter, |b| {
+            .scan_stream(&[COL_A_U64], &filter, |b| {
                 assert_eq!(b.num_columns(), 1);
                 let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
                 // No kernel needed; just collect values for shape assertions.
@@ -1122,9 +1169,6 @@ mod tests {
 
     #[test]
     fn test_scan_with_multiple_projection_columns() {
-        // With streaming, scan each column independently using the same
-        // filter and compare results. This keeps the core API streaming-
-        // friendly without multi-column chunk alignment.
         let table = setup_test_table();
         const COL_A_U64: FieldId = 10;
         const COL_C_I32: FieldId = 12;
@@ -1134,30 +1178,45 @@ mod tests {
             op: Operator::Equals(20.into()),
         };
 
-        let mut a_vals: Vec<Option<u64>> = Vec::new();
-        table
-            .scan_stream(COL_A_U64, &filter, |b| {
-                let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
-                a_vals.extend((0..a.len()).map(
-                    |i| {
-                        if a.is_null(i) { None } else { Some(a.value(i)) }
-                    },
-                ));
-            })
-            .unwrap();
-        assert_eq!(a_vals, vec![Some(200), Some(200)]);
+        let expected_names = [COL_A_U64.to_string(), COL_C_I32.to_string()];
 
-        let mut c_vals: Vec<Option<i32>> = Vec::new();
+        let mut combined: Vec<(Option<u64>, Option<i32>)> = Vec::new();
         table
-            .scan_stream(COL_C_I32, &filter, |b| {
-                let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-                c_vals.extend((0..a.len()).map(
-                    |i| {
-                        if a.is_null(i) { None } else { Some(a.value(i)) }
-                    },
-                ));
+            .scan_stream(&[COL_A_U64, COL_C_I32], &filter, |b| {
+                assert_eq!(b.num_columns(), 2);
+                assert_eq!(b.schema().field(0).name(), &expected_names[0]);
+                assert_eq!(b.schema().field(1).name(), &expected_names[1]);
+
+                let a = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                let c = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    let left = if a.is_null(i) { None } else { Some(a.value(i)) };
+                    let right = if c.is_null(i) { None } else { Some(c.value(i)) };
+                    combined.push((left, right));
+                }
             })
             .unwrap();
-        assert_eq!(c_vals, vec![Some(20), Some(20)]);
+
+        assert_eq!(combined, vec![(Some(200), Some(20)), (Some(200), Some(20))]);
+    }
+
+    #[test]
+    fn test_scan_stream_projection_validation() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let filter = Filter {
+            field_id: COL_C_I32,
+            op: Operator::Equals(20.into()),
+        };
+
+        let empty: [FieldId; 0] = [];
+        let result = table.scan_stream(&empty, &filter, |_batch| {});
+        assert!(matches!(result, Err(Error::InvalidArgumentError(_))));
+
+        let duplicate = [COL_A_U64, COL_A_U64];
+        let result = table.scan_stream(&duplicate, &filter, |_batch| {});
+        assert!(matches!(result, Err(Error::InvalidArgumentError(_))));
     }
 }
