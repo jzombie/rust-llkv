@@ -988,7 +988,7 @@ where
     let (target_lfid, dtype) = match &projection_evals[0] {
         ProjectionEval::Column(info) => (info.logical_field_id, info.data_type.clone()),
         ProjectionEval::Computed(_info) => {
-            let passthrough = match passthrough_fields.get(0).and_then(|&f| f) {
+            let passthrough = match passthrough_fields.first().and_then(|&f| f) {
                 Some(fid) => fid,
                 None => return Ok(false),
             };
@@ -1061,14 +1061,16 @@ where
         emitted: false,
     };
 
-    let mut scan_opts = ScanOptions::default();
-    scan_opts.with_row_ids = false;
-    scan_opts.include_nulls = false;
+    let scan_opts = ScanOptions {
+        with_row_ids: false,
+        include_nulls: false,
+        ..Default::default()
+    };
+    
 
     ScanBuilder::new(&table.store, target_lfid)
         .options(scan_opts)
-        .run(&mut emitter)
-        .map_err(Error::from)?;
+        .run(&mut emitter)?;
 
     if let Some(err) = emitter.error {
         return Err(err);
