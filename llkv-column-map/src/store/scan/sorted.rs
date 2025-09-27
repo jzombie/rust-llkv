@@ -44,6 +44,11 @@ impl SortedChunkBuffers {
     }
 
     #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    #[inline]
     pub fn value_handle(&self, idx: usize) -> &EntryHandle {
         &self.values[idx]
     }
