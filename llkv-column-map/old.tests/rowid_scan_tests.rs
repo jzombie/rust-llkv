@@ -13,13 +13,6 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
-
 fn schema_with_row_id(field_id: LogicalFieldId) -> Arc<Schema> {
     let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     let mut md = HashMap::new();
@@ -36,7 +29,7 @@ fn seed_store_shuffled(
 
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-    let field_id = fid(4242);
+    let field_id = LogicalFieldId::for_user_table_0(4242);
     let schema = schema_with_row_id(field_id);
 
     // Build a single global permutation of 0..N-1 and its inverse mapping value->row_id.

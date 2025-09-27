@@ -14,13 +14,6 @@ use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_storage::pager::MemPager;
 
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
-
 // Minimal visitor that records that callbacks occurred (to ensure scan executed).
 struct TouchVisitor {
     pub saw: std::cell::Cell<bool>,
@@ -41,8 +34,8 @@ impl PrimitiveSortedWithRowIdsVisitor for TouchVisitor {
 fn indices_persist_after_drop_and_reopen() {
     let pager = Arc::new(MemPager::new());
 
-    let anchor_fid = fid(41);
-    let target_fid = fid(42);
+    let anchor_fid = LogicalFieldId::for_user_table_0(41);
+    let target_fid = LogicalFieldId::for_user_table_0(42);
 
     // Scope 1: create store, seed data, create indices.
     {
@@ -135,7 +128,7 @@ fn indices_persist_after_drop_and_reopen() {
 #[test]
 fn index_can_be_removed_and_persists() {
     let pager = Arc::new(MemPager::new());
-    let target_fid = fid(50);
+    let target_fid = LogicalFieldId::for_user_table_0(50);
 
     // Scope 1: Create store, seed data, create an index, then remove it.
     {

@@ -9,15 +9,7 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::{LogicalFieldId, Namespace};
-
-/// Helper to build a LogicalFieldId for user data.
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
+use llkv_column_map::types::LogicalFieldId;
 
 #[test]
 fn nulls_are_lww_deletes_u64_large() {
@@ -26,7 +18,7 @@ fn nulls_are_lww_deletes_u64_large() {
     const N_BATCHES: usize = 10;
     const BATCH: usize = N_ROWS / N_BATCHES;
 
-    let field_id = fid(710);
+    let field_id = LogicalFieldId::for_user_table_0(710);
 
     // Build store.
     let pager = Arc::new(MemPager::new());

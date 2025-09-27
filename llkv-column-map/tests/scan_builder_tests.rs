@@ -10,21 +10,14 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
-
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 #[test]
 fn scan_builder_sorted_range_u64() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-    let field_id = fid(42);
+    let field_id = LogicalFieldId::for_user_table_0(42);
 
     // Build schema and ingest 0..10000 (shuffled via reverse values)
     let mut md = HashMap::new();
@@ -79,7 +72,7 @@ fn scan_builder_sorted_range_u64() {
 fn scan_builder_sorted_with_row_ids() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-    let field_id = fid(77);
+    let field_id = LogicalFieldId::for_user_table_0(77);
 
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(field_id).to_string());

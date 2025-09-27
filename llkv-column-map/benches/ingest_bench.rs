@@ -26,18 +26,10 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::debug::ColumnStoreDebug;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 
 const N_ROWS: usize = 1_000_000;
-
-#[inline]
-fn fid_user(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 #[derive(Clone, Copy, Debug)]
 enum ColKind {
@@ -76,7 +68,7 @@ fn schema_for(cols: &[ColKind]) -> Arc<Schema> {
         let mut md = HashMap::new();
         md.insert(
             "field_id".to_string(),
-            u64::from(fid_user(fid_raw)).to_string(),
+            u64::from(LogicalFieldId::for_user_table_0(fid_raw)).to_string(),
         );
         fields.push(Field::new("data", dt, false).with_metadata(md));
     }
@@ -134,7 +126,7 @@ fn build_batch_for_range(
             }
             ColKind::BinShort(fid) => {
                 let mut b = BinaryBuilder::new();
-                let fid_u64 = u64::from(fid_user(fid));
+                let fid_u64 = u64::from(LogicalFieldId::for_user_table_0(fid));
                 for r in start as u64..end as u64 {
                     let len = var_len_for(r, fid_u64, 5, 25);
                     let byte = (((r).wrapping_add(fid_u64)) & 0xFF) as u8;

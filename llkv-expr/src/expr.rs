@@ -17,6 +17,11 @@ pub enum Expr<'a, F> {
     Or(Vec<Expr<'a, F>>),
     Not(Box<Expr<'a, F>>),
     Pred(Filter<'a, F>),
+    Compare {
+        left: ScalarExpr<F>,
+        op: CompareOp,
+        right: ScalarExpr<F>,
+    },
 }
 
 impl<'a, F> Expr<'a, F> {
@@ -38,6 +43,59 @@ impl<'a, F> Expr<'a, F> {
     pub fn not(e: Expr<'a, F>) -> Expr<'a, F> {
         Expr::Not(Box::new(e))
     }
+}
+
+/// Arithmetic scalar expression that can reference multiple fields.
+#[derive(Clone, Debug)]
+pub enum ScalarExpr<F> {
+    Column(F),
+    Literal(Literal),
+    Binary {
+        left: Box<ScalarExpr<F>>,
+        op: BinaryOp,
+        right: Box<ScalarExpr<F>>,
+    },
+}
+
+impl<F> ScalarExpr<F> {
+    #[inline]
+    pub fn column(field: F) -> Self {
+        Self::Column(field)
+    }
+
+    #[inline]
+    pub fn literal<L: Into<Literal>>(lit: L) -> Self {
+        Self::Literal(lit.into())
+    }
+
+    #[inline]
+    pub fn binary(left: Self, op: BinaryOp, right: Self) -> Self {
+        Self::Binary {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        }
+    }
+}
+
+/// Arithmetic operator for [`ScalarExpr`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
+/// Comparison operator for scalar expressions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompareOp {
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
 }
 
 /// Single predicate against a field.

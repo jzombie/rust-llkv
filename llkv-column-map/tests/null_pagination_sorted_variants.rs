@@ -13,18 +13,11 @@ use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_storage::pager::MemPager;
 
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
-
 fn seed_anchor_and_target() -> (ColumnStore<MemPager>, LogicalFieldId, LogicalFieldId) {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
     // Anchor rid 0..100
-    let anchor_fid = fid(11);
+    let anchor_fid = LogicalFieldId::for_user_table_0(11);
     let mut md_a = HashMap::new();
     md_a.insert("field_id".to_string(), u64::from(anchor_fid).to_string());
     let schema_a = Arc::new(Schema::new(vec![
@@ -42,7 +35,7 @@ fn seed_anchor_and_target() -> (ColumnStore<MemPager>, LogicalFieldId, LogicalFi
     .unwrap();
     store.append(&b).unwrap();
     // Target: values only on multiples of 3
-    let target_fid = fid(12);
+    let target_fid = LogicalFieldId::for_user_table_0(12);
     let mut md_t = HashMap::new();
     md_t.insert("field_id".to_string(), u64::from(target_fid).to_string());
     let schema_t = Arc::new(Schema::new(vec![

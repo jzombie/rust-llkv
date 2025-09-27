@@ -10,22 +10,15 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
-
-fn fid_user(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 #[test]
 fn unsorted_scan_works_without_index_u64() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let fid = fid_user(11);
+    let fid = LogicalFieldId::for_user_table_0(11);
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(fid).to_string());
     let schema = Arc::new(Schema::new(vec![
@@ -85,7 +78,7 @@ fn unsorted_with_row_ids_works_without_index() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
-    let fid = fid_user(12);
+    let fid = LogicalFieldId::for_user_table_0(12);
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(fid).to_string());
     let schema = Arc::new(Schema::new(vec![
@@ -139,7 +132,7 @@ fn unsorted_with_row_ids_works_without_index() {
 fn sorted_scan_without_index_returns_error() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
-    let fid = fid_user(13);
+    let fid = LogicalFieldId::for_user_table_0(13);
     let mut md = HashMap::new();
     md.insert("field_id".to_string(), u64::from(fid).to_string());
     let schema = Arc::new(Schema::new(vec![

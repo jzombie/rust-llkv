@@ -4,7 +4,7 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::types::LogicalFieldId;
 
 use rand::rng;
 use rand::seq::SliceRandom;
@@ -12,20 +12,12 @@ use rand::seq::SliceRandom;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Test helper to create a standard user-data LogicalFieldId.
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
-
 #[test]
 fn test_large_sort_u64() {
     const NUM_ROWS: usize = 1_000_000;
     const NUM_BATCHES: usize = 10;
     const BATCH_SIZE: usize = NUM_ROWS / NUM_BATCHES;
-    let field_id = fid(301);
+    let field_id = LogicalFieldId::for_user_table_0(301);
 
     // --- 1. Setup ---
     let pager = Arc::new(MemPager::new());

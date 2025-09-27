@@ -13,20 +13,13 @@ use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_storage::pager::MemPager;
 
-fn fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
-
 #[test]
 fn sorted_with_nulls_last_pagination() {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(pager).unwrap();
 
     // Anchor row_id column (dense 0..100)
-    let anchor_fid = fid(1);
+    let anchor_fid = LogicalFieldId::for_user_table_0(1);
     let mut md_anchor = HashMap::new();
     md_anchor.insert("field_id".to_string(), u64::from(anchor_fid).to_string());
     let schema_anchor = Arc::new(Schema::new(vec![
@@ -45,7 +38,7 @@ fn sorted_with_nulls_last_pagination() {
     store.append(&a0).unwrap();
 
     // Target column: only even row_ids present
-    let target_fid = fid(2);
+    let target_fid = LogicalFieldId::for_user_table_0(2);
     let mut md_t = HashMap::new();
     md_t.insert("field_id".to_string(), u64::from(target_fid).to_string());
     let schema_t = Arc::new(Schema::new(vec![

@@ -5,20 +5,13 @@ use arrow::array::{Array, ArrayRef, Int32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ROW_ID_COLUMN_NAME;
-use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::store::{ColumnStore, GatherNullPolicy};
+use llkv_column_map::types::LogicalFieldId;
 use llkv_result::Result;
 use llkv_storage::pager::MemPager;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-
-fn logical_fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 fn schema_for_field(field_id: LogicalFieldId, name: &str, dtype: DataType) -> Arc<Schema> {
     let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
@@ -36,6 +29,17 @@ fn schema_for_nullable_field(field_id: LogicalFieldId, name: &str, dtype: DataTy
     Arc::new(Schema::new(vec![rid, data]))
 }
 
+fn gather_single(
+    store: &ColumnStore<MemPager>,
+    field_id: LogicalFieldId,
+    row_ids: &[u64],
+    policy: GatherNullPolicy,
+) -> Result<ArrayRef> {
+    store
+        .gather_rows(&[field_id], row_ids, policy)
+        .map(|batch| batch.column(0).clone())
+}
+
 fn seed_store() -> Result<(ColumnStore<MemPager>, LogicalFieldId, LogicalFieldId)> {
     let pager = Arc::new(MemPager::new());
     let store = ColumnStore::open(Arc::clone(&pager))?;
@@ -43,14 +47,14 @@ fn seed_store() -> Result<(ColumnStore<MemPager>, LogicalFieldId, LogicalFieldId
     let rid: Vec<u64> = (0..10u64).collect();
     let rid_arr: ArrayRef = Arc::new(UInt64Array::from(rid.clone()));
 
-    let fid_a = logical_fid(1);
+    let fid_a = LogicalFieldId::for_user_table_0(1);
     let schema_a = schema_for_field(fid_a, "col_a", DataType::UInt64);
     let vals_a: Vec<u64> = rid.iter().map(|v| v * 2).collect();
     let arr_a: ArrayRef = Arc::new(UInt64Array::from(vals_a));
     let batch_a = RecordBatch::try_new(schema_a, vec![rid_arr.clone(), arr_a])?;
     store.append(&batch_a)?;
 
-    let fid_b = logical_fid(2);
+    let fid_b = LogicalFieldId::for_user_table_0(2);
     let schema_b = schema_for_field(fid_b, "col_b", DataType::Int32);
     let vals_b: Vec<i32> = rid.iter().map(|v| (*v as i32) - 3).collect();
     let arr_b: ArrayRef = Arc::new(Int32Array::from(vals_b));
@@ -65,11 +69,11 @@ fn gather_rows_multi_matches_single_columns() -> Result<()> {
     let (store, fid_a, fid_b) = seed_store()?;
     let row_ids = vec![0, 3, 5, 9];
 
-    let multi = store.gather_rows_multi(&[fid_a, fid_b], &row_ids, false)?;
+    let multi = store.gather_rows(&[fid_a, fid_b], &row_ids, GatherNullPolicy::ErrorOnMissing)?;
     assert_eq!(multi.num_columns(), 2);
 
-    let single_a = store.gather_rows(fid_a, &row_ids, false)?;
-    let single_b = store.gather_rows(fid_b, &row_ids, false)?;
+    let single_a = gather_single(&store, fid_a, &row_ids, GatherNullPolicy::ErrorOnMissing)?;
+    let single_b = gather_single(&store, fid_b, &row_ids, GatherNullPolicy::ErrorOnMissing)?;
 
     let multi_a = multi
         .column(0)
@@ -94,7 +98,7 @@ fn gather_rows_multi_matches_single_columns() -> Result<()> {
 fn gather_rows_multi_rejects_duplicate_row_ids() -> Result<()> {
     let (store, fid_a, _) = seed_store()?;
     let err = store
-        .gather_rows_multi(&[fid_a], &[1, 1], false)
+        .gather_rows(&[fid_a], &[1, 1], GatherNullPolicy::ErrorOnMissing)
         .expect_err("duplicate row_ids should error");
     assert!(matches!(err, llkv_result::Error::Internal(_)));
     Ok(())
@@ -103,7 +107,7 @@ fn gather_rows_multi_rejects_duplicate_row_ids() -> Result<()> {
 #[test]
 fn gather_rows_multi_empty_row_ids() -> Result<()> {
     let (store, fid_a, fid_b) = seed_store()?;
-    let result = store.gather_rows_multi(&[fid_a, fid_b], &[], false)?;
+    let result = store.gather_rows(&[fid_a, fid_b], &[], GatherNullPolicy::ErrorOnMissing)?;
     assert_eq!(result.num_columns(), 2);
     assert_eq!(result.num_rows(), 0);
     assert_eq!(result.column(0).len(), 0);
@@ -119,14 +123,14 @@ fn gather_rows_multi_with_nulls() -> Result<()> {
     let rid: Vec<u64> = (0..12u64).collect();
     let rid_arr: ArrayRef = Arc::new(UInt64Array::from(rid.clone()));
 
-    let fid_dense = logical_fid(10);
+    let fid_dense = LogicalFieldId::for_user_table_0(10);
     let schema_dense = schema_for_field(fid_dense, "dense", DataType::UInt64);
     let dense_vals: Vec<u64> = rid.iter().map(|v| v * 7).collect();
     let dense_arr: ArrayRef = Arc::new(UInt64Array::from(dense_vals));
     let dense_batch = RecordBatch::try_new(schema_dense, vec![rid_arr.clone(), dense_arr.clone()])?;
     store.append(&dense_batch)?;
 
-    let fid_sparse = logical_fid(11);
+    let fid_sparse = LogicalFieldId::for_user_table_0(11);
     let schema_sparse = schema_for_nullable_field(fid_sparse, "sparse", DataType::Int32);
     let sparse_rids: Vec<u64> = rid.iter().copied().filter(|v| v % 3 != 1).collect();
     let sparse_values: Vec<i32> = sparse_rids.iter().map(|v| (*v as i32) - 5).collect();
@@ -137,7 +141,11 @@ fn gather_rows_multi_with_nulls() -> Result<()> {
 
     let gather_ids: Vec<u64> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 
-    let multi = store.gather_rows_multi(&[fid_dense, fid_sparse], &gather_ids, true)?;
+    let multi = store.gather_rows(
+        &[fid_dense, fid_sparse],
+        &gather_ids,
+        GatherNullPolicy::IncludeNulls,
+    )?;
     assert_eq!(multi.num_columns(), 2);
 
     let dense_arr = multi
@@ -165,7 +173,7 @@ fn gather_rows_multi_with_nulls() -> Result<()> {
     }
 
     let err = store
-        .gather_rows_multi(&[fid_sparse], &gather_ids, false)
+        .gather_rows(&[fid_sparse], &gather_ids, GatherNullPolicy::ErrorOnMissing)
         .expect_err("missing rows should error without null support");
     assert!(matches!(err, llkv_result::Error::Internal(_)));
 
@@ -180,14 +188,14 @@ fn gather_rows_multi_shuffled_with_nulls_preserves_alignment() -> Result<()> {
     let all_rids: Vec<u64> = (0..12u64).collect();
     let rid_arr: ArrayRef = Arc::new(UInt64Array::from(all_rids.clone()));
 
-    let fid_dense = logical_fid(20);
+    let fid_dense = LogicalFieldId::for_user_table_0(20);
     let schema_dense = schema_for_field(fid_dense, "dense_shuffle", DataType::UInt64);
     let dense_vals: Vec<u64> = all_rids.iter().map(|rid| rid * 11).collect();
     let dense_arr: ArrayRef = Arc::new(UInt64Array::from(dense_vals.clone()));
     let dense_batch = RecordBatch::try_new(schema_dense, vec![rid_arr.clone(), dense_arr.clone()])?;
     store.append(&dense_batch)?;
 
-    let fid_sparse = logical_fid(21);
+    let fid_sparse = LogicalFieldId::for_user_table_0(21);
     let schema_sparse = schema_for_nullable_field(fid_sparse, "sparse_shuffle", DataType::Int32);
     let sparse_present_rids: Vec<u64> = all_rids
         .iter()
@@ -208,7 +216,11 @@ fn gather_rows_multi_shuffled_with_nulls_preserves_alignment() -> Result<()> {
     shuffled_ids.shuffle(&mut rng);
     assert_eq!(shuffled_ids.len(), all_rids.len());
 
-    let multi = store.gather_rows_multi(&[fid_dense, fid_sparse], &shuffled_ids, true)?;
+    let multi = store.gather_rows(
+        &[fid_dense, fid_sparse],
+        &shuffled_ids,
+        GatherNullPolicy::IncludeNulls,
+    )?;
     assert_eq!(multi.num_columns(), 2);
     assert_eq!(multi.num_rows(), shuffled_ids.len());
 
@@ -244,8 +256,18 @@ fn gather_rows_multi_shuffled_with_nulls_preserves_alignment() -> Result<()> {
         }
     }
 
-    let single_dense = store.gather_rows(fid_dense, &shuffled_ids, false)?;
-    let single_sparse = store.gather_rows(fid_sparse, &shuffled_ids, true)?;
+    let single_dense = gather_single(
+        &store,
+        fid_dense,
+        &shuffled_ids,
+        GatherNullPolicy::ErrorOnMissing,
+    )?;
+    let single_sparse = gather_single(
+        &store,
+        fid_sparse,
+        &shuffled_ids,
+        GatherNullPolicy::IncludeNulls,
+    )?;
 
     let single_dense = single_dense
         .as_any()

@@ -8,8 +8,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use criterion::{Criterion, criterion_group, criterion_main};
 use llkv_column_map::ROW_ID_COLUMN_NAME;
-use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::store::{ColumnStore, GatherNullPolicy};
+use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -23,13 +23,6 @@ const SPARSE_FIELD_COUNT: usize = 3;
 const SPARSE_FIELD_TAKE: usize = 3;
 const SAMPLE_ROW_IDS: usize = 1024;
 const SEED: u64 = 0x9E37_79B9_F701_3CAB;
-
-fn logical_fid(id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(0)
-        .with_field_id(id)
-}
 
 fn schema_with_row_id(field_id: LogicalFieldId, name: &str) -> Arc<Schema> {
     let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
@@ -48,7 +41,7 @@ fn build_fixture() -> (ColumnStore<MemPager>, Vec<LogicalFieldId>, Vec<u64>) {
 
     let mut fields = Vec::with_capacity(FIELD_COUNT);
     for idx in 0..FIELD_COUNT {
-        let fid = logical_fid(idx as u32);
+        let fid = LogicalFieldId::for_user_table_0(idx as u32);
         fields.push(fid);
         let schema = schema_with_row_id(fid, &format!("col_{idx}"));
         let values: Vec<u64> = (0..ROW_COUNT as u64)
@@ -79,7 +72,7 @@ fn build_sparse_fixture() -> (ColumnStore<MemPager>, Vec<LogicalFieldId>, Vec<u6
     let base_row_ids: Vec<u64> = (0..ROW_COUNT as u64).collect();
     let mut fields = Vec::with_capacity(SPARSE_FIELD_COUNT);
     for idx in 0..SPARSE_FIELD_COUNT {
-        let fid = logical_fid((100 + idx) as u32);
+        let fid = LogicalFieldId::for_user_table_0((100 + idx) as u32);
         fields.push(fid);
         let schema = schema_with_row_id(fid, &format!("sparse_col_{idx}"));
         let (rid_slice, values): (Vec<u64>, Vec<u64>) = if idx == SPARSE_FIELD_COUNT - 1 {
@@ -121,6 +114,24 @@ fn build_sparse_fixture() -> (ColumnStore<MemPager>, Vec<LogicalFieldId>, Vec<u6
     (store, fields, sample_rows)
 }
 
+fn gather_single(
+    store: &ColumnStore<MemPager>,
+    field_id: LogicalFieldId,
+    row_ids: &[u64],
+    include_nulls: bool,
+) -> ArrayRef {
+    let policy = if include_nulls {
+        GatherNullPolicy::IncludeNulls
+    } else {
+        GatherNullPolicy::ErrorOnMissing
+    };
+    store
+        .gather_rows(&[field_id], row_ids, policy)
+        .expect("gather single")
+        .column(0)
+        .clone()
+}
+
 fn bench_gather_rows(c: &mut Criterion) {
     let (store, field_ids, sample_rows) = build_fixture();
     let (sparse_store, sparse_fields, sparse_rows) = build_sparse_fixture();
@@ -129,9 +140,7 @@ fn bench_gather_rows(c: &mut Criterion) {
     let single_field = field_ids[0];
     group.bench_function("single_column", |b| {
         b.iter(|| {
-            let result = store
-                .gather_rows(single_field, &sample_rows, false)
-                .expect("gather");
+            let result = gather_single(&store, single_field, &sample_rows, false);
             black_box(result);
         });
     });
@@ -139,7 +148,7 @@ fn bench_gather_rows(c: &mut Criterion) {
     group.bench_function("multi_column_sequential", |b| {
         b.iter(|| {
             for &fid in field_ids.iter().take(MULTI_FIELD_TAKE) {
-                let result = store.gather_rows(fid, &sample_rows, false).expect("gather");
+                let result = gather_single(&store, fid, &sample_rows, false);
                 black_box(result);
             }
         });
@@ -149,7 +158,7 @@ fn bench_gather_rows(c: &mut Criterion) {
         let fids: Vec<LogicalFieldId> = field_ids.iter().take(MULTI_FIELD_TAKE).copied().collect();
         b.iter(|| {
             let result = store
-                .gather_rows_multi(&fids, &sample_rows, false)
+                .gather_rows(&fids, &sample_rows, GatherNullPolicy::ErrorOnMissing)
                 .expect("gather multi");
             black_box(result);
         });
@@ -163,7 +172,7 @@ fn bench_gather_rows(c: &mut Criterion) {
             .collect();
         b.iter(|| {
             let result = sparse_store
-                .gather_rows_multi(&fids, &sparse_rows, true)
+                .gather_rows(&fids, &sparse_rows, GatherNullPolicy::IncludeNulls)
                 .expect("gather multi nulls");
             black_box(result);
         });

@@ -986,6 +986,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "bitcode",
+ "codspeed-criterion-compat",
  "crossbeam-channel",
  "llkv-column-map",
  "llkv-expr",

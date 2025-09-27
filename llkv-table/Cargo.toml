@@ -23,5 +23,16 @@ rustc-hash.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile.workspace = true
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
+
+[[bench]]
+name = "table_sum_bench"
+harness = false
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
