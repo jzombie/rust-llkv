@@ -18,7 +18,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 use crate::sys_catalog::{CATALOG_TID, ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
 use llkv_expr::typed_predicate::build_predicate;
-use llkv_expr::{Filter, Operator};
+use llkv_expr::{Expr, Filter, Operator};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::FxHashMap;
 
@@ -34,6 +34,72 @@ where
 {
     let predicate = build_predicate::<T>(op).map_err(Error::predicate_build)?;
     store.filter_row_ids::<T, _>(field_id, move |value| predicate.matches(value))
+}
+
+fn normalize_row_ids(mut row_ids: Vec<u64>) -> Vec<u64> {
+    row_ids.sort_unstable();
+    row_ids.dedup();
+    row_ids
+}
+
+fn intersect_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
+    let mut result = Vec::with_capacity(left.len().min(right.len()));
+    let mut i = 0;
+    let mut j = 0;
+    while i < left.len() && j < right.len() {
+        let lv = left[i];
+        let rv = right[j];
+        if lv == rv {
+            result.push(lv);
+            i += 1;
+            j += 1;
+        } else if lv < rv {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    result
+}
+
+fn union_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
+    if left.is_empty() {
+        return right;
+    }
+    if right.is_empty() {
+        return left;
+    }
+
+    let mut result = Vec::with_capacity(left.len() + right.len());
+    let mut i = 0;
+    let mut j = 0;
+    while i < left.len() && j < right.len() {
+        let lv = left[i];
+        let rv = right[j];
+        if lv == rv {
+            result.push(lv);
+            i += 1;
+            j += 1;
+        } else if lv < rv {
+            result.push(lv);
+            i += 1;
+        } else {
+            result.push(rv);
+            j += 1;
+        }
+    }
+
+    while i < left.len() {
+        result.push(left[i]);
+        i += 1;
+    }
+    while j < right.len() {
+        result.push(right[j]);
+        j += 1;
+    }
+
+    result.dedup();
+    result
 }
 
 pub struct Table<P = MemPager>
@@ -113,7 +179,7 @@ where
     pub fn scan_stream<'a, F>(
         &self,
         projections: &[Projection],
-        filter: &Filter<'a, FieldId>,
+        filter_expr: &Expr<'a, FieldId>,
         options: ScanStreamOptions,
         mut on_batch: F,
     ) -> LlkvResult<()>
@@ -159,17 +225,7 @@ where
             }
         }
 
-        let filter_lfid = LogicalFieldId::for_user(self.table_id, filter.field_id);
-        let dtype = self.store.data_type(filter_lfid)?;
-
-        let row_ids = llkv_column_map::with_integer_arrow_type!(
-            dtype.clone(),
-            |ArrowTy| collect_matching_row_ids::<ArrowTy, P>(&self.store, filter_lfid, &filter.op),
-            Err(Error::Internal(format!(
-                "Filtering on type {:?} is not supported",
-                dtype
-            ))),
-        )?;
+        let row_ids = self.collect_row_ids_for_expr(filter_expr)?;
 
         // If nothing matches, emit nothing.
         if row_ids.is_empty() {
@@ -230,6 +286,68 @@ where
         }
 
         Ok(())
+    }
+
+    fn collect_row_ids_for_filter<'a>(&self, filter: &Filter<'a, FieldId>) -> LlkvResult<Vec<u64>> {
+        let filter_lfid = LogicalFieldId::for_user(self.table_id, filter.field_id);
+        let dtype = self.store.data_type(filter_lfid)?;
+
+        let row_ids = llkv_column_map::with_integer_arrow_type!(
+            dtype.clone(),
+            |ArrowTy| collect_matching_row_ids::<ArrowTy, P>(&self.store, filter_lfid, &filter.op),
+            Err(Error::Internal(format!(
+                "Filtering on type {:?} is not supported",
+                dtype
+            ))),
+        )?;
+
+        Ok(normalize_row_ids(row_ids))
+    }
+
+    fn collect_row_ids_for_expr<'a>(&self, expr: &Expr<'a, FieldId>) -> LlkvResult<Vec<u64>> {
+        match expr {
+            Expr::Pred(filter) => self.collect_row_ids_for_filter(filter),
+            Expr::And(children) => {
+                if children.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "AND expression requires at least one predicate".into(),
+                    ));
+                }
+                let mut iter = children.iter();
+                let mut acc = self.collect_row_ids_for_expr(iter.next().unwrap())?;
+                for child in iter {
+                    let next_ids = self.collect_row_ids_for_expr(child)?;
+                    if acc.is_empty() || next_ids.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    acc = intersect_sorted(acc, next_ids);
+                    if acc.is_empty() {
+                        break;
+                    }
+                }
+                Ok(acc)
+            }
+            Expr::Or(children) => {
+                if children.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "OR expression requires at least one predicate".into(),
+                    ));
+                }
+                let mut acc = Vec::new();
+                for child in children {
+                    let next_ids = self.collect_row_ids_for_expr(child)?;
+                    if acc.is_empty() {
+                        acc = next_ids;
+                    } else if !next_ids.is_empty() {
+                        acc = union_sorted(acc, next_ids);
+                    }
+                }
+                Ok(acc)
+            }
+            Expr::Not(_) => Err(Error::InvalidArgumentError(
+                "NOT expressions are not supported by scan_stream".into(),
+            )),
+        }
     }
 
     #[inline]
@@ -403,6 +521,10 @@ mod tests {
         table
     }
 
+    fn pred_expr<'a>(filter: Filter<'a, FieldId>) -> Expr<'a, FieldId> {
+        Expr::Pred(filter)
+    }
+
     fn proj(table: &Table, field_id: FieldId) -> Projection {
         Projection::from(LogicalFieldId::for_user(table.table_id, field_id))
     }
@@ -426,16 +548,16 @@ mod tests {
         const COL_A_U64: FieldId = 10;
         const COL_C_I32: FieldId = 12;
 
-        let filter = Filter {
+        let expr = pred_expr(Filter {
             field_id: COL_A_U64,
             op: Operator::Equals(200.into()),
-        };
+        });
 
         let mut vals: Vec<Option<i32>> = Vec::new();
         table
             .scan_stream(
                 &[proj(&table, COL_C_I32)],
-                &filter,
+                &expr,
                 ScanStreamOptions::default(),
                 |b| {
                     let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
@@ -626,10 +748,10 @@ mod tests {
         const COL_A_U64: FieldId = 10;
         const COL_C_I32: FieldId = 12;
 
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_C_I32,
             op: Operator::Equals(20.into()),
-        };
+        });
 
         let mut vals: Vec<Option<u64>> = Vec::new();
         table
@@ -654,10 +776,10 @@ mod tests {
         const COL_A_U64: FieldId = 10;
         const COL_C_I32: FieldId = 12;
 
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_C_I32,
             op: Operator::GreaterThan(15.into()),
-        };
+        });
 
         let mut vals: Vec<Option<u64>> = Vec::new();
         table
@@ -682,13 +804,13 @@ mod tests {
         const COL_A_U64: FieldId = 10;
         const COL_C_I32: FieldId = 12;
 
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_A_U64,
             op: Operator::Range {
                 lower: Bound::Included(150.into()),
                 upper: Bound::Excluded(300.into()),
             },
-        };
+        });
 
         let mut vals: Vec<Option<i32>> = Vec::new();
         table
@@ -715,13 +837,13 @@ mod tests {
         let table = setup_test_table();
         const COL_A_U64: FieldId = 10;
 
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_A_U64,
             op: Operator::Range {
                 lower: Bound::Included(150.into()),
                 upper: Bound::Excluded(300.into()),
             },
-        };
+        });
 
         let mut total: u128 = 0;
         table
@@ -752,10 +874,10 @@ mod tests {
         const COL_C_I32: FieldId = 12;
 
         let candidates = [100.into(), 300.into()];
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_A_U64,
             op: Operator::In(&candidates),
-        };
+        });
 
         let mut total: i64 = 0;
         table
@@ -785,10 +907,10 @@ mod tests {
         const COL_C_I32: FieldId = 12;
 
         let candidates = [100.into(), 300.into()];
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_A_U64,
             op: Operator::In(&candidates),
-        };
+        });
 
         let mut mn: Option<i32> = None;
         let mut mx: Option<i32> = None;
@@ -818,10 +940,10 @@ mod tests {
         let table = setup_test_table();
         const COL_D_F64: FieldId = 13;
 
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_D_F64,
             op: Operator::GreaterThan(2.0_f64.into()),
-        };
+        });
 
         let mut got = Vec::new();
         table
@@ -849,10 +971,10 @@ mod tests {
         const COL_E_F32: FieldId = 14;
 
         let candidates = [2.0_f32.into(), 3.0_f32.into()];
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_E_F32,
             op: Operator::In(&candidates),
-        };
+        });
 
         let mut vals: Vec<Option<f32>> = Vec::new();
         table
@@ -875,6 +997,85 @@ mod tests {
 
         let collected: Vec<f32> = vals.into_iter().flatten().collect();
         assert_eq!(collected, vec![2.0, 3.0, 2.0]);
+    }
+
+    #[test]
+    fn test_scan_stream_and_expression() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+        const COL_E_F32: FieldId = 14;
+
+        let expr = Expr::all_of(vec![
+            Filter {
+                field_id: COL_C_I32,
+                op: Operator::GreaterThan(15.into()),
+            },
+            Filter {
+                field_id: COL_A_U64,
+                op: Operator::LessThan(250.into()),
+            },
+        ]);
+
+        let mut vals: Vec<Option<f32>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_E_F32)],
+                &expr,
+                ScanStreamOptions::default(),
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<Float32Array>().unwrap();
+                    vals.extend((0..arr.len()).map(|i| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    }));
+                },
+            )
+            .unwrap();
+
+        assert_eq!(vals, vec![Some(2.0_f32), Some(2.0_f32)]);
+    }
+
+    #[test]
+    fn test_scan_stream_or_expression() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let expr = Expr::any_of(vec![
+            Filter {
+                field_id: COL_C_I32,
+                op: Operator::Equals(10.into()),
+            },
+            Filter {
+                field_id: COL_C_I32,
+                op: Operator::Equals(30.into()),
+            },
+        ]);
+
+        let mut vals: Vec<Option<u64>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &expr,
+                ScanStreamOptions::default(),
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    vals.extend((0..arr.len()).map(|i| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    }));
+                },
+            )
+            .unwrap();
+
+        assert_eq!(vals, vec![Some(100), Some(300)]);
     }
 
     #[test]
@@ -928,10 +1129,10 @@ mod tests {
         .unwrap();
         table.append(&batch).unwrap();
 
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_A_U64,
             op: Operator::GreaterThan(450.into()),
-        };
+        });
 
         let mut default_vals: Vec<Option<i32>> = Vec::new();
         table
@@ -1017,10 +1218,10 @@ mod tests {
         const COL_A_U64: FieldId = 10;
         const COL_C_I32: FieldId = 12;
 
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_C_I32,
             op: Operator::GreaterThan(15.into()),
-        };
+        });
 
         let mut got: Vec<f64> = Vec::new();
         table
@@ -1108,10 +1309,10 @@ mod tests {
         table.append(&batch).unwrap();
 
         // Filter: c_i32 >= 20.
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_C_I32,
             op: Operator::GreaterThanOrEquals(20.into()),
-        };
+        });
 
         // 1) SUM over d_u32 (per-batch sum + accumulate).
         let mut d_sum: u128 = 0;
@@ -1204,10 +1405,10 @@ mod tests {
 
         // IN now uses untyped literals, too.
         let candidates = [10.into(), 30.into()];
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_C_I32,
             op: Operator::In(&candidates),
-        };
+        });
 
         let mut vals: Vec<Option<u64>> = Vec::new();
         table
@@ -1233,10 +1434,10 @@ mod tests {
         const COL_C_I32: FieldId = 12;
 
         // Filter c_i32 == 20 -> two rows; stream a_u64 in batches of <= N.
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_C_I32,
             op: Operator::Equals(20.into()),
-        };
+        });
 
         let mut seen_cols = Vec::<u64>::new();
         table
@@ -1267,10 +1468,10 @@ mod tests {
         const COL_A_U64: FieldId = 10;
         const COL_C_I32: FieldId = 12;
 
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_C_I32,
             op: Operator::Equals(20.into()),
-        };
+        });
 
         let expected_names = [COL_A_U64.to_string(), COL_C_I32.to_string()];
 
@@ -1305,10 +1506,10 @@ mod tests {
         const COL_A_U64: FieldId = 10;
         const COL_C_I32: FieldId = 12;
 
-        let filter = Filter {
+        let filter = pred_expr(Filter {
             field_id: COL_C_I32,
             op: Operator::Equals(20.into()),
-        };
+        });
 
         let empty: [Projection; 0] = [];
         let result = table.scan_stream(&empty, &filter, ScanStreamOptions::default(), |_batch| {});
