@@ -3,11 +3,11 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::constants::STREAM_BATCH_ROWS;
+use crate::scalar_eval::{NumericArrayMap, NumericKernels};
 use crate::types::TableId;
 
-use arrow::array::{Array, ArrayRef, Float64Array, RecordBatch};
+use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
-use arrow::compute::cast;
 
 use llkv_column_map::store::{FilterPrimitive, GatherNullPolicy, Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{
@@ -20,7 +20,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 use crate::sys_catalog::{CATALOG_TID, ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
 use llkv_expr::typed_predicate::build_predicate;
-use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
+use llkv_expr::{CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -42,124 +42,6 @@ fn normalize_row_ids(mut row_ids: Vec<u64>) -> Vec<u64> {
     row_ids.sort_unstable();
     row_ids.dedup();
     row_ids
-}
-
-fn collect_scalar_fields(expr: &ScalarExpr<FieldId>, acc: &mut FxHashSet<FieldId>) {
-    match expr {
-        ScalarExpr::Column(fid) => {
-            acc.insert(*fid);
-        }
-        ScalarExpr::Literal(_) => {}
-        ScalarExpr::Binary { left, right, .. } => {
-            collect_scalar_fields(left, acc);
-            collect_scalar_fields(right, acc);
-        }
-    }
-}
-
-fn prepare_numeric_arrays(
-    lfids: &[LogicalFieldId],
-    arrays: &[ArrayRef],
-    needed_fields: &FxHashSet<FieldId>,
-) -> LlkvResult<FxHashMap<FieldId, Arc<Float64Array>>> {
-    let mut out: FxHashMap<FieldId, Arc<Float64Array>> = FxHashMap::default();
-    if needed_fields.is_empty() {
-        return Ok(out);
-    }
-    for (lfid, array) in lfids.iter().zip(arrays.iter()) {
-        let fid = lfid.field_id();
-        if !needed_fields.contains(&fid) {
-            continue;
-        }
-        let f64_array = if matches!(array.data_type(), DataType::Float64) {
-            array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| Error::Internal("expected Float64 array".into()))?
-                .clone()
-        } else {
-            let casted = cast(array.as_ref(), &DataType::Float64)
-                .map_err(|e| Error::Internal(format!("cast to Float64 failed: {e}")))?;
-            casted
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| Error::Internal("cast produced non-Float64 array".into()))?
-                .clone()
-        };
-        out.insert(fid, Arc::new(f64_array));
-    }
-    Ok(out)
-}
-
-fn evaluate_scalar_expr_value(
-    expr: &ScalarExpr<FieldId>,
-    idx: usize,
-    arrays: &FxHashMap<FieldId, Arc<Float64Array>>,
-) -> LlkvResult<Option<f64>> {
-    match expr {
-        ScalarExpr::Column(fid) => {
-            let arr = arrays
-                .get(fid)
-                .ok_or_else(|| Error::Internal(format!("missing column for field {fid}")))?
-                .as_ref();
-            if arr.is_null(idx) {
-                Ok(None)
-            } else {
-                Ok(Some(arr.value(idx)))
-            }
-        }
-        ScalarExpr::Literal(lit) => match lit {
-            llkv_expr::literal::Literal::Float(f) => Ok(Some(*f)),
-            llkv_expr::literal::Literal::Integer(i) => Ok(Some(*i as f64)),
-            llkv_expr::literal::Literal::String(_) => Err(Error::InvalidArgumentError(
-                "String literals are not supported in numeric expressions".into(),
-            )),
-        },
-        ScalarExpr::Binary { left, op, right } => {
-            let l = evaluate_scalar_expr_value(left, idx, arrays)?;
-            let r = evaluate_scalar_expr_value(right, idx, arrays)?;
-            match (l, r) {
-                (Some(lv), Some(rv)) => {
-                    let result = match op {
-                        BinaryOp::Add => lv + rv,
-                        BinaryOp::Subtract => lv - rv,
-                        BinaryOp::Multiply => lv * rv,
-                        BinaryOp::Divide => {
-                            if rv == 0.0 {
-                                return Ok(None);
-                            }
-                            lv / rv
-                        }
-                    };
-                    Ok(Some(result))
-                }
-                _ => Ok(None),
-            }
-        }
-    }
-}
-
-fn evaluate_scalar_expr_batch(
-    expr: &ScalarExpr<FieldId>,
-    len: usize,
-    arrays: &FxHashMap<FieldId, Arc<Float64Array>>,
-) -> LlkvResult<ArrayRef> {
-    let mut values: Vec<Option<f64>> = Vec::with_capacity(len);
-    for idx in 0..len {
-        values.push(evaluate_scalar_expr_value(expr, idx, arrays)?);
-    }
-    Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
-}
-
-fn compare_f64(op: CompareOp, left: f64, right: f64) -> bool {
-    match op {
-        CompareOp::Eq => left == right,
-        CompareOp::NotEq => left != right,
-        CompareOp::Lt => left < right,
-        CompareOp::LtEq => left <= right,
-        CompareOp::Gt => left > right,
-        CompareOp::GtEq => left >= right,
-    }
 }
 
 fn intersect_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
@@ -452,7 +334,7 @@ where
                         ));
                     }
                     let mut fields_set: FxHashSet<FieldId> = FxHashSet::default();
-                    collect_scalar_fields(expr, &mut fields_set);
+                    NumericKernels::collect_fields(expr, &mut fields_set);
                     if fields_set.is_empty() {
                         return Err(Error::InvalidArgumentError(
                             "Computed projection must reference at least one column".into(),
@@ -524,8 +406,8 @@ where
             }
 
             let unique_arrays = gathered.columns();
-            let numeric_arrays =
-                prepare_numeric_arrays(&unique_lfids, unique_arrays, &numeric_fields)?;
+            let numeric_arrays: NumericArrayMap =
+                NumericKernels::prepare_numeric_arrays(&unique_lfids, unique_arrays, &numeric_fields)?;
 
             let mut columns = Vec::with_capacity(projection_evals.len());
             for eval in &projection_evals {
@@ -538,7 +420,7 @@ where
                         columns.push(Arc::clone(&unique_arrays[idx]));
                     }
                     ProjectionEval::Computed(info) => {
-                        let array = evaluate_scalar_expr_batch(
+                        let array = NumericKernels::evaluate_batch(
                             &info.expr,
                             gathered.num_rows(),
                             &numeric_arrays,
@@ -639,8 +521,8 @@ where
         all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
     ) -> LlkvResult<Vec<u64>> {
         let mut fields = FxHashSet::default();
-        collect_scalar_fields(left, &mut fields);
-        collect_scalar_fields(right, &mut fields);
+    NumericKernels::collect_fields(left, &mut fields);
+    NumericKernels::collect_fields(right, &mut fields);
         if fields.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "Comparison expression must reference at least one column".into(),
@@ -699,12 +581,13 @@ where
                 continue;
             }
             let arrays = gathered.columns();
-            let numeric_arrays = prepare_numeric_arrays(&lfids, arrays, &numeric_fields)?;
+            let numeric_arrays: NumericArrayMap =
+                NumericKernels::prepare_numeric_arrays(&lfids, arrays, &numeric_fields)?;
             for (offset, &row_id) in window.iter().enumerate() {
-                let left_val = evaluate_scalar_expr_value(left, offset, &numeric_arrays)?;
-                let right_val = evaluate_scalar_expr_value(right, offset, &numeric_arrays)?;
+                let left_val = NumericKernels::evaluate_value(left, offset, &numeric_arrays)?;
+                let right_val = NumericKernels::evaluate_value(right, offset, &numeric_arrays)?;
                 if let (Some(lv), Some(rv)) = (left_val, right_val) {
-                    if compare_f64(op, lv, rv) {
+                    if NumericKernels::compare(op, lv, rv) {
                         result.push(row_id);
                     }
                 }
@@ -725,8 +608,8 @@ where
             }
             Expr::Compare { left, right, .. } => {
                 let mut fields = FxHashSet::default();
-                collect_scalar_fields(left, &mut fields);
-                collect_scalar_fields(right, &mut fields);
+                NumericKernels::collect_fields(left, &mut fields);
+                NumericKernels::collect_fields(right, &mut fields);
                 if fields.is_empty() {
                     return Err(Error::InvalidArgumentError(
                         "Comparison expression must reference at least one column".into(),
@@ -835,6 +718,7 @@ mod tests {
     use arrow::compute::{cast, max, min, sum, unary};
     use std::collections::HashMap;
     use std::ops::Bound;
+    use llkv_expr::BinaryOp;
 
     fn setup_test_table() -> Table {
         let pager = Arc::new(MemPager::default());
