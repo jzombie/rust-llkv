@@ -305,7 +305,6 @@ where
             on_batch(batch);
             start = end;
         }
-
         Ok(())
     }
 
@@ -365,16 +364,9 @@ where
             }
         };
 
-        let mut gather_ctx = self.table.store().prepare_gather_context(unique_lfids)?;
-        if gather_ctx.is_empty() {
-            return Ok(true);
+        if options.include_nulls {
+            return Ok(false);
         }
-
-        let null_policy = if options.include_nulls {
-            GatherNullPolicy::IncludeNulls
-        } else {
-            GatherNullPolicy::DropNulls
-        };
 
         let fields: Vec<Field> = projection_evals
             .iter()
@@ -387,63 +379,30 @@ where
             .collect();
         let schema = Arc::new(Schema::new(fields));
 
-        let mut temp_row_ids: Vec<u64> = Vec::with_capacity(STREAM_BATCH_ROWS);
-
-        for run in runs {
-            let mut remaining = run.len;
-            let mut current_row = run.start_row_id;
-
-            let run_last = run.start_row_id + (run.len.saturating_sub(1) as u64);
-            if gather_ctx.chunk_span_for_row(run_last).is_none() {
-                return Ok(false);
-            }
-
-            while remaining > 0 {
-                let (_, _, chunk_max) = match gather_ctx.chunk_span_for_row(current_row) {
-                    Some(span) => span,
-                    None => return Ok(false),
-                };
-                let chunk_limit = (chunk_max - current_row + 1) as usize;
-                let batch_rows = remaining.min(chunk_limit).min(STREAM_BATCH_ROWS);
-
-                temp_row_ids.clear();
-                temp_row_ids.reserve(batch_rows);
-                for offset in 0..batch_rows {
-                    temp_row_ids.push(current_row + offset as u64);
-                }
-
-                let gathered = match self.table.store().gather_rows_with_reusable_context(
-                    &mut gather_ctx,
-                    &temp_row_ids,
-                    null_policy,
-                ) {
-                    Ok(batch) => batch,
-                    Err(_) => return Ok(false),
-                };
-
-                if gathered.num_rows() > 0 {
-                    let unique_arrays = gathered.columns();
-                    let mut columns = Vec::with_capacity(projection_evals.len());
-                    for eval in projection_evals {
-                        if let ProjectionEval::Column(info) = eval {
-                            let idx = unique_index
-                                .get(&info.logical_field_id)
-                                .copied()
-                                .expect("logical field missing from unique index");
-                            columns.push(Arc::clone(&unique_arrays[idx]));
-                        }
-                    }
-
-                    let batch = RecordBatch::try_new(schema.clone(), columns)?;
-                    on_batch(batch);
-                }
-
-                current_row += batch_rows as u64;
-                remaining -= batch_rows;
-            }
+        let mut column_chunks: Vec<ColumnChunks> = Vec::with_capacity(unique_lfids.len());
+        for &lfid in unique_lfids {
+            let mut collector = ColumnChunkCollector::new();
+            let mut scan_opts = ScanOptions::default();
+            scan_opts.with_row_ids = true;
+            ScanBuilder::new(self.table.store(), lfid)
+                .options(scan_opts)
+                .run(&mut collector)?;
+            column_chunks.push(collector.finish()?);
         }
 
-        Ok(true)
+        if column_chunks.iter().any(|chunks| {
+            chunks
+                .entries
+                .iter()
+                .any(|entry| entry.values.null_count() > 0)
+        }) {
+            return Ok(false);
+        }
+
+        let mut streamer =
+            DenseRunStreamer::new(projection_evals, unique_index, schema, column_chunks);
+
+        streamer.stream(&runs, on_batch)
     }
 
     fn try_scan_builder_passthrough<'expr, F>(
@@ -793,6 +752,400 @@ fn normalize_row_ids(mut row_ids: Vec<u64>) -> Vec<u64> {
     row_ids.sort_unstable();
     row_ids.dedup();
     row_ids
+}
+
+struct ColumnChunk {
+    values: ArrayRef,
+    row_ids: Arc<UInt64Array>,
+}
+
+struct ColumnChunks {
+    entries: Vec<ColumnChunk>,
+}
+
+impl ColumnChunks {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn align_cursor(&self, cursor: &mut ColumnCursor, target: u64) -> bool {
+        while cursor.chunk_idx < self.entries.len() {
+            let entry = &self.entries[cursor.chunk_idx];
+            let row_ids = entry.row_ids.as_ref();
+            if row_ids.is_empty() {
+                cursor.chunk_idx += 1;
+                cursor.offset = 0;
+                continue;
+            }
+
+            while cursor.offset < row_ids.len() {
+                let rid = row_ids.value(cursor.offset);
+                if rid < target {
+                    cursor.offset += 1;
+                    continue;
+                }
+                if rid == target {
+                    return true;
+                }
+                return false;
+            }
+
+            cursor.chunk_idx += 1;
+            cursor.offset = 0;
+        }
+
+        false
+    }
+
+    fn contiguous_len(&self, cursor: &ColumnCursor, limit: usize, start: u64) -> usize {
+        if cursor.chunk_idx >= self.entries.len() {
+            return 0;
+        }
+        let entry = &self.entries[cursor.chunk_idx];
+        let row_ids = entry.row_ids.as_ref();
+        if cursor.offset >= row_ids.len() {
+            return 0;
+        }
+
+        let max = limit.min(row_ids.len() - cursor.offset);
+        let mut count = 0usize;
+        while count < max {
+            let rid = row_ids.value(cursor.offset + count);
+            if rid != start + count as u64 {
+                break;
+            }
+            count += 1;
+        }
+        count
+    }
+
+    fn advance_cursor(&self, cursor: &mut ColumnCursor, mut consumed: usize) {
+        while consumed > 0 && cursor.chunk_idx < self.entries.len() {
+            let entry = &self.entries[cursor.chunk_idx];
+            let remaining = entry.row_ids.len().saturating_sub(cursor.offset);
+            if consumed < remaining {
+                cursor.offset += consumed;
+                return;
+            }
+            consumed -= remaining;
+            cursor.chunk_idx += 1;
+            cursor.offset = 0;
+        }
+    }
+
+    fn covers_range(&self, mut cursor: ColumnCursor, start: u64, end: u64) -> bool {
+        let mut row = start;
+        while row < end {
+            if !self.align_cursor(&mut cursor, row) {
+                return false;
+            }
+            let remaining = (end - row) as usize;
+            let contiguous = self.contiguous_len(&cursor, remaining, row);
+            if contiguous == 0 {
+                return false;
+            }
+            self.advance_cursor(&mut cursor, contiguous);
+            row += contiguous as u64;
+        }
+        true
+    }
+}
+
+struct ColumnChunkCollector {
+    entries: Vec<ColumnChunk>,
+}
+
+impl ColumnChunkCollector {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn push_chunk<A>(&mut self, values: &A, row_ids: &UInt64Array)
+    where
+        A: Array + Clone + 'static,
+    {
+        debug_assert_eq!(values.len(), row_ids.len());
+        let values_ref: ArrayRef = Arc::new(values.clone()) as ArrayRef;
+        let row_ids_ref = Arc::new(row_ids.clone());
+        self.entries.push(ColumnChunk {
+            values: values_ref,
+            row_ids: row_ids_ref,
+        });
+    }
+
+    fn finish(self) -> LlkvResult<ColumnChunks> {
+        let mut prev: Option<u64> = None;
+        for entry in &self.entries {
+            let row_ids = entry.row_ids.as_ref();
+            if row_ids.is_empty() {
+                continue;
+            }
+            if let Some(last) = prev {
+                if row_ids.value(0) <= last {
+                    return Err(Error::Internal(
+                        "column chunks row-ids are not strictly increasing".into(),
+                    ));
+                }
+            }
+            prev = Some(row_ids.value(row_ids.len() - 1));
+        }
+        Ok(ColumnChunks {
+            entries: self.entries,
+        })
+    }
+}
+
+macro_rules! impl_collect_with_rids {
+    ($method:ident, $ArrayTy:ty) => {
+        fn $method(&mut self, values: &$ArrayTy, row_ids: &UInt64Array) {
+            self.push_chunk(values, row_ids);
+        }
+    };
+}
+
+impl PrimitiveVisitor for ColumnChunkCollector {
+    fn u64_chunk(&mut self, _a: &UInt64Array) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn u32_chunk(&mut self, _a: &UInt32Array) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn u16_chunk(&mut self, _a: &UInt16Array) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn u8_chunk(&mut self, _a: &UInt8Array) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn i64_chunk(&mut self, _a: &Int64Array) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn i32_chunk(&mut self, _a: &Int32Array) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn i16_chunk(&mut self, _a: &Int16Array) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn i8_chunk(&mut self, _a: &Int8Array) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn f64_chunk(&mut self, _a: &Float64Array) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn f32_chunk(&mut self, _a: &Float32Array) {
+        unreachable!("row-id aware scan expected");
+    }
+}
+
+impl PrimitiveWithRowIdsVisitor for ColumnChunkCollector {
+    impl_collect_with_rids!(u64_chunk_with_rids, UInt64Array);
+    impl_collect_with_rids!(u32_chunk_with_rids, UInt32Array);
+    impl_collect_with_rids!(u16_chunk_with_rids, UInt16Array);
+    impl_collect_with_rids!(u8_chunk_with_rids, UInt8Array);
+    impl_collect_with_rids!(i64_chunk_with_rids, Int64Array);
+    impl_collect_with_rids!(i32_chunk_with_rids, Int32Array);
+    impl_collect_with_rids!(i16_chunk_with_rids, Int16Array);
+    impl_collect_with_rids!(i8_chunk_with_rids, Int8Array);
+    impl_collect_with_rids!(f64_chunk_with_rids, Float64Array);
+    impl_collect_with_rids!(f32_chunk_with_rids, Float32Array);
+}
+
+impl PrimitiveSortedVisitor for ColumnChunkCollector {
+    fn u64_run(&mut self, _: &UInt64Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn u32_run(&mut self, _: &UInt32Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn u16_run(&mut self, _: &UInt16Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn u8_run(&mut self, _: &UInt8Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn i64_run(&mut self, _: &Int64Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn i32_run(&mut self, _: &Int32Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn i16_run(&mut self, _: &Int16Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn i8_run(&mut self, _: &Int8Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn f64_run(&mut self, _: &Float64Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn f32_run(&mut self, _: &Float32Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+}
+
+impl PrimitiveSortedWithRowIdsVisitor for ColumnChunkCollector {
+    fn u64_run_with_rids(&mut self, _: &UInt64Array, _: &UInt64Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn u32_run_with_rids(&mut self, _: &UInt32Array, _: &UInt64Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn u16_run_with_rids(&mut self, _: &UInt16Array, _: &UInt64Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn u8_run_with_rids(&mut self, _: &UInt8Array, _: &UInt64Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn i64_run_with_rids(&mut self, _: &Int64Array, _: &UInt64Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn i32_run_with_rids(&mut self, _: &Int32Array, _: &UInt64Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn i16_run_with_rids(&mut self, _: &Int16Array, _: &UInt64Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn i8_run_with_rids(&mut self, _: &Int8Array, _: &UInt64Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn f64_run_with_rids(&mut self, _: &Float64Array, _: &UInt64Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn f32_run_with_rids(&mut self, _: &Float32Array, _: &UInt64Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+    fn null_run(&mut self, _: &UInt64Array, _: usize, _: usize) {
+        unreachable!("row-id aware scan expected");
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ColumnCursor {
+    chunk_idx: usize,
+    offset: usize,
+}
+
+impl ColumnCursor {
+    fn new() -> Self {
+        Self {
+            chunk_idx: 0,
+            offset: 0,
+        }
+    }
+}
+
+struct DenseRunStreamer<'a> {
+    projection_evals: &'a [ProjectionEval],
+    unique_index: &'a FxHashMap<LogicalFieldId, usize>,
+    schema: Arc<Schema>,
+    unique_chunks: Vec<ColumnChunks>,
+}
+
+impl<'a> DenseRunStreamer<'a> {
+    fn new(
+        projection_evals: &'a [ProjectionEval],
+        unique_index: &'a FxHashMap<LogicalFieldId, usize>,
+        schema: Arc<Schema>,
+        unique_chunks: Vec<ColumnChunks>,
+    ) -> Self {
+        Self {
+            projection_evals,
+            unique_index,
+            schema,
+            unique_chunks,
+        }
+    }
+
+    fn stream<F>(&mut self, runs: &[FilterRun], on_batch: &mut F) -> LlkvResult<bool>
+    where
+        F: FnMut(RecordBatch),
+    {
+        if runs.is_empty() {
+            return Ok(true);
+        }
+        if self.unique_chunks.is_empty() {
+            return Ok(true);
+        }
+        if self.unique_chunks.iter().any(|chunks| chunks.is_empty()) {
+            return Ok(true);
+        }
+
+        let mut cursors: Vec<ColumnCursor> = self
+            .unique_chunks
+            .iter()
+            .map(|_| ColumnCursor::new())
+            .collect();
+
+        for run in runs {
+            let mut current_row = run.start_row_id;
+            let run_end = current_row + run.len as u64;
+
+            for (idx, chunks) in self.unique_chunks.iter().enumerate() {
+                if !chunks.align_cursor(&mut cursors[idx], current_row) {
+                    return Ok(false);
+                }
+            }
+
+            for (idx, chunks) in self.unique_chunks.iter().enumerate() {
+                if !chunks.covers_range(cursors[idx], current_row, run_end) {
+                    return Ok(false);
+                }
+            }
+
+            while current_row < run_end {
+                let mut target_batch = ((run_end - current_row) as usize).min(STREAM_BATCH_ROWS);
+
+                for (idx, chunks) in self.unique_chunks.iter().enumerate() {
+                    let contiguous =
+                        chunks.contiguous_len(&cursors[idx], target_batch, current_row);
+                    if contiguous == 0 {
+                        return Ok(false);
+                    }
+                    target_batch = target_batch.min(contiguous);
+                }
+
+                let mut unique_slices: Vec<ArrayRef> = Vec::with_capacity(self.unique_chunks.len());
+                for (idx, chunks) in self.unique_chunks.iter().enumerate() {
+                    let cursor = cursors[idx];
+                    let entry = &chunks.entries[cursor.chunk_idx];
+                    unique_slices.push(entry.values.slice(cursor.offset, target_batch));
+                }
+
+                let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.projection_evals.len());
+                for eval in self.projection_evals {
+                    if let ProjectionEval::Column(info) = eval {
+                        let idx = self
+                            .unique_index
+                            .get(&info.logical_field_id)
+                            .copied()
+                            .expect("logical field missing from unique index");
+                        columns.push(unique_slices[idx].clone());
+                    } else {
+                        unreachable!("dense run streamer only handles column projections");
+                    }
+                }
+
+                let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
+                on_batch(batch);
+
+                let next_row = current_row + (target_batch as u64);
+
+                for (idx, chunks) in self.unique_chunks.iter().enumerate() {
+                    chunks.advance_cursor(&mut cursors[idx], target_batch);
+                    if next_row < run_end {
+                        if !chunks.align_cursor(&mut cursors[idx], next_row) {
+                            return Ok(false);
+                        }
+                    }
+                }
+
+                current_row = next_row;
+            }
+        }
+
+        Ok(true)
+    }
 }
 
 fn intersect_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
