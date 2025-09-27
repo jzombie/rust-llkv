@@ -398,9 +398,9 @@ where
                 keep.fill(true);
                 break;
             }
-            for i in 0..len {
+            for (i, keep_item) in keep.iter_mut().enumerate().take(len) {
                 if array.is_valid(i) {
-                    keep[i] = true;
+                    *keep_item = true;
                 }
             }
             if keep.iter().all(|flag| *flag) {

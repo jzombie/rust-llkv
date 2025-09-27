@@ -190,7 +190,7 @@ where
                 .store
                 .gather_rows_with_policy(proj_lfid, window, null_policy)?;
 
-            if col.len() == 0 {
+            if col.is_empty() {
                 start = end;
                 continue;
             }
