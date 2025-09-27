@@ -5,8 +5,9 @@ use std::sync::Arc;
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::types::TableId;
 
-use arrow::array::{ArrayRef, RecordBatch};
+use arrow::array::{Array, ArrayRef, Float64Array, RecordBatch};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
+use arrow::compute::cast;
 
 use llkv_column_map::store::{FilterPrimitive, GatherNullPolicy, Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{
@@ -19,9 +20,9 @@ use simd_r_drive_entry_handle::EntryHandle;
 use crate::sys_catalog::{CATALOG_TID, ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
 use llkv_expr::typed_predicate::build_predicate;
-use llkv_expr::{Expr, Filter, Operator};
+use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 fn collect_matching_row_ids<T, P>(
     store: &ColumnStore<P>,
@@ -41,6 +42,124 @@ fn normalize_row_ids(mut row_ids: Vec<u64>) -> Vec<u64> {
     row_ids.sort_unstable();
     row_ids.dedup();
     row_ids
+}
+
+fn collect_scalar_fields(expr: &ScalarExpr<FieldId>, acc: &mut FxHashSet<FieldId>) {
+    match expr {
+        ScalarExpr::Column(fid) => {
+            acc.insert(*fid);
+        }
+        ScalarExpr::Literal(_) => {}
+        ScalarExpr::Binary { left, right, .. } => {
+            collect_scalar_fields(left, acc);
+            collect_scalar_fields(right, acc);
+        }
+    }
+}
+
+fn prepare_numeric_arrays(
+    lfids: &[LogicalFieldId],
+    arrays: &[ArrayRef],
+    needed_fields: &FxHashSet<FieldId>,
+) -> LlkvResult<FxHashMap<FieldId, Arc<Float64Array>>> {
+    let mut out: FxHashMap<FieldId, Arc<Float64Array>> = FxHashMap::default();
+    if needed_fields.is_empty() {
+        return Ok(out);
+    }
+    for (lfid, array) in lfids.iter().zip(arrays.iter()) {
+        let fid = lfid.field_id();
+        if !needed_fields.contains(&fid) {
+            continue;
+        }
+        let f64_array = if matches!(array.data_type(), DataType::Float64) {
+            array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| Error::Internal("expected Float64 array".into()))?
+                .clone()
+        } else {
+            let casted = cast(array.as_ref(), &DataType::Float64)
+                .map_err(|e| Error::Internal(format!("cast to Float64 failed: {e}")))?;
+            casted
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| Error::Internal("cast produced non-Float64 array".into()))?
+                .clone()
+        };
+        out.insert(fid, Arc::new(f64_array));
+    }
+    Ok(out)
+}
+
+fn evaluate_scalar_expr_value(
+    expr: &ScalarExpr<FieldId>,
+    idx: usize,
+    arrays: &FxHashMap<FieldId, Arc<Float64Array>>,
+) -> LlkvResult<Option<f64>> {
+    match expr {
+        ScalarExpr::Column(fid) => {
+            let arr = arrays
+                .get(fid)
+                .ok_or_else(|| Error::Internal(format!("missing column for field {fid}")))?
+                .as_ref();
+            if arr.is_null(idx) {
+                Ok(None)
+            } else {
+                Ok(Some(arr.value(idx)))
+            }
+        }
+        ScalarExpr::Literal(lit) => match lit {
+            llkv_expr::literal::Literal::Float(f) => Ok(Some(*f)),
+            llkv_expr::literal::Literal::Integer(i) => Ok(Some(*i as f64)),
+            llkv_expr::literal::Literal::String(_) => Err(Error::InvalidArgumentError(
+                "String literals are not supported in numeric expressions".into(),
+            )),
+        },
+        ScalarExpr::Binary { left, op, right } => {
+            let l = evaluate_scalar_expr_value(left, idx, arrays)?;
+            let r = evaluate_scalar_expr_value(right, idx, arrays)?;
+            match (l, r) {
+                (Some(lv), Some(rv)) => {
+                    let result = match op {
+                        BinaryOp::Add => lv + rv,
+                        BinaryOp::Subtract => lv - rv,
+                        BinaryOp::Multiply => lv * rv,
+                        BinaryOp::Divide => {
+                            if rv == 0.0 {
+                                return Ok(None);
+                            }
+                            lv / rv
+                        }
+                    };
+                    Ok(Some(result))
+                }
+                _ => Ok(None),
+            }
+        }
+    }
+}
+
+fn evaluate_scalar_expr_batch(
+    expr: &ScalarExpr<FieldId>,
+    len: usize,
+    arrays: &FxHashMap<FieldId, Arc<Float64Array>>,
+) -> LlkvResult<ArrayRef> {
+    let mut values: Vec<Option<f64>> = Vec::with_capacity(len);
+    for idx in 0..len {
+        values.push(evaluate_scalar_expr_value(expr, idx, arrays)?);
+    }
+    Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+}
+
+fn compare_f64(op: CompareOp, left: f64, right: f64) -> bool {
+    match op {
+        CompareOp::Eq => left == right,
+        CompareOp::NotEq => left != right,
+        CompareOp::Lt => left < right,
+        CompareOp::LtEq => left <= right,
+        CompareOp::Gt => left > right,
+        CompareOp::GtEq => left >= right,
+    }
 }
 
 fn intersect_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
@@ -149,6 +268,53 @@ pub struct ScanStreamOptions {
     pub include_nulls: bool,
 }
 
+#[derive(Clone, Debug)]
+pub enum StreamProjection {
+    Column(Projection),
+    Computed {
+        expr: ScalarExpr<FieldId>,
+        alias: String,
+    },
+}
+
+impl StreamProjection {
+    pub fn column<P: Into<Projection>>(proj: P) -> Self {
+        Self::Column(proj.into())
+    }
+
+    pub fn computed<S: Into<String>>(expr: ScalarExpr<FieldId>, alias: S) -> Self {
+        Self::Computed {
+            expr,
+            alias: alias.into(),
+        }
+    }
+}
+
+impl From<Projection> for StreamProjection {
+    fn from(value: Projection) -> Self {
+        StreamProjection::Column(value)
+    }
+}
+
+#[derive(Clone)]
+struct ColumnProjectionInfo {
+    logical_field_id: LogicalFieldId,
+    data_type: DataType,
+    output_name: String,
+}
+
+#[derive(Clone)]
+struct ComputedProjectionInfo {
+    expr: ScalarExpr<FieldId>,
+    alias: String,
+}
+
+#[derive(Clone)]
+enum ProjectionEval {
+    Column(ColumnProjectionInfo),
+    Computed(ComputedProjectionInfo),
+}
+
 impl<P> Table<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -210,6 +376,24 @@ where
         projections: &[Projection],
         filter_expr: &Expr<'a, FieldId>,
         options: ScanStreamOptions,
+        on_batch: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(RecordBatch),
+    {
+        let stream_projections: Vec<StreamProjection> = projections
+            .iter()
+            .cloned()
+            .map(StreamProjection::from)
+            .collect();
+        self.scan_stream_with_exprs(&stream_projections, filter_expr, options, on_batch)
+    }
+
+    pub fn scan_stream_with_exprs<'a, F>(
+        &self,
+        projections: &[StreamProjection],
+        filter_expr: &Expr<'a, FieldId>,
+        options: ScanStreamOptions,
         mut on_batch: F,
     ) -> LlkvResult<()>
     where
@@ -217,65 +401,109 @@ where
     {
         if projections.is_empty() {
             return Err(Error::InvalidArgumentError(
-                "scan_stream requires at least one projection column".into(),
+                "scan_stream requires at least one projection".into(),
             ));
         }
 
-        // Allow duplicate projection columns. Collect the projection
-        // information in the requested order, but also build a list of
-        // unique LogicalFieldIds so we can gather each column once and
-        // then duplicate the gathered ArrayRefs into the output in the
-        // same order the caller provided.
-        let mut proj_infos = Vec::with_capacity(projections.len());
+        let mut projection_evals: Vec<ProjectionEval> = Vec::with_capacity(projections.len());
         let mut unique_index: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();
         unique_index.reserve(projections.len());
         let mut unique_lfids: Vec<LogicalFieldId> = Vec::with_capacity(projections.len());
-        for proj in projections {
-            let lfid = proj.logical_field_id;
-            if lfid.table_id() != self.table_id {
-                return Err(Error::InvalidArgumentError(format!(
-                    "Projection targets table {} but scan_stream is on table {}",
-                    lfid.table_id(),
-                    self.table_id
-                )));
-            }
-            if lfid.namespace() != Namespace::UserData {
-                return Err(Error::InvalidArgumentError(format!(
-                    "Projection {:?} must target user data namespace",
-                    lfid
-                )));
-            }
-            let dtype = self.store.data_type(lfid)?;
-            proj_infos.push((proj.clone(), lfid, dtype));
+        let mut numeric_fields: FxHashSet<FieldId> = FxHashSet::default();
 
-            if let std::collections::hash_map::Entry::Vacant(e) = unique_index.entry(lfid) {
-                e.insert(unique_lfids.len());
-                unique_lfids.push(lfid);
+        for proj in projections {
+            match proj {
+                StreamProjection::Column(p) => {
+                    let lfid = p.logical_field_id;
+                    if lfid.table_id() != self.table_id {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Projection targets table {} but scan_stream is on table {}",
+                            lfid.table_id(),
+                            self.table_id
+                        )));
+                    }
+                    if lfid.namespace() != Namespace::UserData {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Projection {:?} must target user data namespace",
+                            lfid
+                        )));
+                    }
+                    let dtype = self.store.data_type(lfid)?;
+                    if let std::collections::hash_map::Entry::Vacant(e) = unique_index.entry(lfid)
+                    {
+                        e.insert(unique_lfids.len());
+                        unique_lfids.push(lfid);
+                    }
+                    let fallback = lfid.field_id().to_string();
+                    let output_name = p
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| fallback.clone());
+                    projection_evals.push(ProjectionEval::Column(ColumnProjectionInfo {
+                        logical_field_id: lfid,
+                        data_type: dtype,
+                        output_name,
+                    }));
+                }
+                StreamProjection::Computed { expr, alias } => {
+                    if alias.trim().is_empty() {
+                        return Err(Error::InvalidArgumentError(
+                            "Computed projection requires a non-empty alias".into(),
+                        ));
+                    }
+                    let mut fields_set: FxHashSet<FieldId> = FxHashSet::default();
+                    collect_scalar_fields(expr, &mut fields_set);
+                    if fields_set.is_empty() {
+                        return Err(Error::InvalidArgumentError(
+                            "Computed projection must reference at least one column".into(),
+                        ));
+                    }
+                    let mut ordered_fields: Vec<FieldId> = fields_set.into_iter().collect();
+                    ordered_fields.sort_unstable();
+                    for field_id in &ordered_fields {
+                        let lfid = LogicalFieldId::for_user(self.table_id, *field_id);
+                        if lfid.namespace() != Namespace::UserData {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "Computed projection field {:?} must target user data namespace",
+                                lfid
+                            )));
+                        }
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            unique_index.entry(lfid)
+                        {
+                            e.insert(unique_lfids.len());
+                            unique_lfids.push(lfid);
+                        }
+                        numeric_fields.insert(*field_id);
+                    }
+                    projection_evals.push(ProjectionEval::Computed(ComputedProjectionInfo {
+                        expr: expr.clone(),
+                        alias: alias.clone(),
+                    }));
+                }
             }
         }
 
         let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
         let row_ids = self.collect_row_ids_for_expr(filter_expr, &mut all_rows_cache)?;
 
-        // If nothing matches, emit nothing.
         if row_ids.is_empty() {
             return Ok(());
         }
 
-        // Prepare schema for the projected columns.
-        let fields: Vec<Field> = proj_infos
+        let fields: Vec<Field> = projection_evals
             .iter()
-            .map(|(proj, _, dtype)| {
-                let name = proj
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| proj.logical_field_id.field_id().to_string());
-                Field::new(name, dtype.clone(), true)
+            .map(|eval| match eval {
+                ProjectionEval::Column(info) => {
+                    Field::new(info.output_name.clone(), info.data_type.clone(), true)
+                }
+                ProjectionEval::Computed(info) => {
+                    Field::new(info.alias.clone(), DataType::Float64, true)
+                }
             })
             .collect();
         let out_schema = Arc::new(Schema::new(fields));
 
-        // Stream in fixed-size windows of row_ids.
         let mut start = 0usize;
         let null_policy = if options.include_nulls {
             GatherNullPolicy::IncludeNulls
@@ -294,24 +522,34 @@ where
                 start = end;
                 continue;
             }
-            debug_assert_eq!(gathered.num_columns(), unique_lfids.len());
 
-            // unique_arrays[i] corresponds to unique_lfids[i]. Build the
-            // output columns by mapping each requested projection's lfid
-            // back to the unique array and cloning the Arc.
             let unique_arrays = gathered.columns();
-            let mut columns = Vec::with_capacity(proj_infos.len());
-            for (_proj, lfid, _dtype) in proj_infos.iter() {
-                let idx = unique_index
-                    .get(lfid)
-                    .copied()
-                    .expect("lfid missing from unique-index");
-                columns.push(Arc::clone(&unique_arrays[idx]));
+            let numeric_arrays =
+                prepare_numeric_arrays(&unique_lfids, unique_arrays, &numeric_fields)?;
+
+            let mut columns = Vec::with_capacity(projection_evals.len());
+            for eval in &projection_evals {
+                match eval {
+                    ProjectionEval::Column(info) => {
+                        let idx = unique_index
+                            .get(&info.logical_field_id)
+                            .copied()
+                            .expect("lfid missing from unique-index");
+                        columns.push(Arc::clone(&unique_arrays[idx]));
+                    }
+                    ProjectionEval::Computed(info) => {
+                        let array = evaluate_scalar_expr_batch(
+                            &info.expr,
+                            gathered.num_rows(),
+                            &numeric_arrays,
+                        )?;
+                        columns.push(array);
+                    }
+                }
             }
 
             let batch = RecordBatch::try_new(out_schema.clone(), columns)?;
             on_batch(batch);
-
             start = end;
         }
 
@@ -341,6 +579,9 @@ where
     ) -> LlkvResult<Vec<u64>> {
         match expr {
             Expr::Pred(filter) => self.collect_row_ids_for_filter(filter),
+            Expr::Compare { left, op, right } => {
+                self.collect_row_ids_for_compare(left, *op, right, all_rows_cache)
+            }
             Expr::And(children) => {
                 if children.is_empty() {
                     return Err(Error::InvalidArgumentError(
@@ -390,6 +631,89 @@ where
         }
     }
 
+    fn collect_row_ids_for_compare(
+        &self,
+        left: &ScalarExpr<FieldId>,
+        op: CompareOp,
+        right: &ScalarExpr<FieldId>,
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
+    ) -> LlkvResult<Vec<u64>> {
+        let mut fields = FxHashSet::default();
+        collect_scalar_fields(left, &mut fields);
+        collect_scalar_fields(right, &mut fields);
+        if fields.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "Comparison expression must reference at least one column".into(),
+            ));
+        }
+        let mut domain: Option<Vec<u64>> = None;
+        let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
+        ordered_fields.sort_unstable();
+        for fid in &ordered_fields {
+            let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
+            domain = Some(match domain {
+                Some(existing) => intersect_sorted(existing, rows),
+                None => rows,
+            });
+            if let Some(ref d) = domain {
+                if d.is_empty() {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+        let domain = domain.unwrap_or_default();
+        if domain.is_empty() {
+            return Ok(domain);
+        }
+        self.evaluate_compare_over_rows(&domain, &ordered_fields, left, op, right)
+    }
+
+    fn evaluate_compare_over_rows(
+        &self,
+        row_ids: &[u64],
+        fields: &[FieldId],
+        left: &ScalarExpr<FieldId>,
+        op: CompareOp,
+        right: &ScalarExpr<FieldId>,
+    ) -> LlkvResult<Vec<u64>> {
+        if row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lfids: Vec<LogicalFieldId> = fields
+            .iter()
+            .map(|fid| LogicalFieldId::for_user(self.table_id, *fid))
+            .collect();
+        let mut result = Vec::new();
+        let numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
+        let mut start = 0usize;
+        while start < row_ids.len() {
+            let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
+            let window = &row_ids[start..end];
+            let gathered = self.store.gather_rows_multi_with_policy(
+                &lfids,
+                window,
+                GatherNullPolicy::IncludeNulls,
+            )?;
+            if gathered.num_rows() == 0 {
+                start = end;
+                continue;
+            }
+            let arrays = gathered.columns();
+            let numeric_arrays = prepare_numeric_arrays(&lfids, arrays, &numeric_fields)?;
+            for (offset, &row_id) in window.iter().enumerate() {
+                let left_val = evaluate_scalar_expr_value(left, offset, &numeric_arrays)?;
+                let right_val = evaluate_scalar_expr_value(right, offset, &numeric_arrays)?;
+                if let (Some(lv), Some(rv)) = (left_val, right_val) {
+                    if compare_f64(op, lv, rv) {
+                        result.push(row_id);
+                    }
+                }
+            }
+            start = end;
+        }
+        Ok(result)
+    }
+
     fn collect_row_ids_domain<'a>(
         &self,
         expr: &Expr<'a, FieldId>,
@@ -398,6 +722,32 @@ where
         match expr {
             Expr::Pred(filter) => {
                 self.collect_all_row_ids_for_field(filter.field_id, all_rows_cache)
+            }
+            Expr::Compare { left, right, .. } => {
+                let mut fields = FxHashSet::default();
+                collect_scalar_fields(left, &mut fields);
+                collect_scalar_fields(right, &mut fields);
+                if fields.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "Comparison expression must reference at least one column".into(),
+                    ));
+                }
+                let mut domain: Option<Vec<u64>> = None;
+                let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
+                ordered_fields.sort_unstable();
+                for fid in ordered_fields {
+                    let rows = self.collect_all_row_ids_for_field(fid, all_rows_cache)?;
+                    domain = Some(match domain {
+                        Some(existing) => intersect_sorted(existing, rows),
+                        None => rows,
+                    });
+                    if let Some(ref d) = domain {
+                        if d.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                    }
+                }
+                Ok(domain.unwrap_or_default())
             }
             Expr::And(children) | Expr::Or(children) => {
                 let mut acc = Vec::new();
@@ -1639,5 +1989,84 @@ mod tests {
             .unwrap();
         // Two matching rows, two columns per row -> four values.
         assert_eq!(collected, vec![200, 200, 200, 200]);
+    }
+
+    #[test]
+    fn test_scan_stream_computed_projection() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+
+        let projections = [
+            StreamProjection::column(proj(&table, COL_A_U64)),
+            StreamProjection::computed(
+                ScalarExpr::binary(
+                    ScalarExpr::column(COL_A_U64),
+                    BinaryOp::Multiply,
+                    ScalarExpr::literal(2),
+                ),
+                "a_times_two",
+            ),
+        ];
+
+        let filter = pred_expr(Filter {
+            field_id: COL_A_U64,
+            op: Operator::GreaterThanOrEquals(0.into()),
+        });
+
+        let mut computed: Vec<(u64, f64)> = Vec::new();
+        table
+            .scan_stream_with_exprs(&projections, &filter, ScanStreamOptions::default(), |b| {
+                assert_eq!(b.num_columns(), 2);
+                let base = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                let comp = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    if base.is_null(i) || comp.is_null(i) {
+                        continue;
+                    }
+                    computed.push((base.value(i), comp.value(i)));
+                }
+            })
+            .unwrap();
+
+        let expected = vec![(100, 200.0), (200, 400.0), (300, 600.0), (200, 400.0)];
+        assert_eq!(computed, expected);
+    }
+
+    #[test]
+    fn test_scan_stream_multi_column_filter_compare() {
+        let table = setup_test_table();
+        const COL_A_U64: FieldId = 10;
+        const COL_C_I32: FieldId = 12;
+
+        let expr = Expr::Compare {
+            left: ScalarExpr::binary(
+                ScalarExpr::column(COL_A_U64),
+                BinaryOp::Add,
+                ScalarExpr::column(COL_C_I32),
+            ),
+            op: CompareOp::Gt,
+            right: ScalarExpr::literal(220_i64),
+        };
+
+        let mut vals: Vec<Option<u64>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_A_U64)],
+                &expr,
+                ScanStreamOptions::default(),
+                |b| {
+                    let col = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    for i in 0..b.num_rows() {
+                        vals.push(if col.is_null(i) {
+                            None
+                        } else {
+                            Some(col.value(i))
+                        });
+                    }
+                },
+            )
+            .unwrap();
+
+        assert_eq!(vals.into_iter().flatten().collect::<Vec<_>>(), vec![300]);
     }
 }
