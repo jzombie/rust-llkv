@@ -26,6 +26,7 @@ pub mod scan;
 pub use scan::*;
 
 mod projection;
+pub use projection::GatherNullPolicy;
 
 mod slicing;
 use slicing::*;

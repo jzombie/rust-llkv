@@ -4,10 +4,10 @@ use std::sync::Arc;
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::types::TableId;
 
-use arrow::array::{Array, ArrayRef, Int32Array, PrimitiveArray, RecordBatch, UInt64Array};
+use arrow::array::{Array, ArrayRef, Int32Array, RecordBatch, UInt64Array};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
-use llkv_column_map::store::{FilterPrimitive, ROW_ID_COLUMN_NAME};
+use llkv_column_map::store::{FilterPrimitive, GatherNullPolicy, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{
     ColumnStore, scan,
     types::{LogicalFieldId, Namespace},
@@ -53,6 +53,11 @@ where
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScanStreamOptions {
+    /// Preserve null rows emitted by the projection column when `true`.
+    /// When `false`, the scan gatherer drops rows where the projection
+    /// column is null or missing before yielding batches. This keeps
+    /// the table scan column-oriented while delegating row-level
+    /// filtering to the column-map layer.
     pub include_nulls: bool,
 }
 
@@ -175,32 +180,17 @@ where
             let window = &row_ids[start..end];
 
             // Gather only this window's rows for the projected column.
-            let arr = match self
-                .store
-                .gather_rows(proj_lfid, window, options.include_nulls)
-            {
-                Ok(values) => values,
-                Err(err) if !options.include_nulls => match err {
-                    Error::Internal(_) | Error::NotFound => {
-                        self.store.gather_rows(proj_lfid, window, true)?
-                    }
-                    _ => return Err(err),
-                },
-                Err(err) => return Err(err),
-            };
-
-            let maybe_arr = if options.include_nulls {
-                Some(arr)
+            let null_policy = if options.include_nulls {
+                GatherNullPolicy::IncludeNulls
             } else {
-                drop_nulls(arr)
+                GatherNullPolicy::DropNulls
             };
 
-            let Some(col) = maybe_arr else {
-                start = end;
-                continue;
-            };
+            let col = self
+                .store
+                .gather_rows_with_policy(proj_lfid, window, null_policy)?;
 
-            if col.is_empty() {
+            if col.len() == 0 {
                 start = end;
                 continue;
             }
@@ -242,98 +232,6 @@ where
 
     pub fn store(&self) -> &ColumnStore<P> {
         &self.store
-    }
-}
-
-fn drop_nulls(arr: ArrayRef) -> Option<ArrayRef> {
-    if arr.null_count() == 0 {
-        return Some(arr);
-    }
-
-    fn filter_primitive<T>(array: &PrimitiveArray<T>) -> Option<ArrayRef>
-    where
-        T: ArrowPrimitiveType,
-    {
-        let values: Vec<T::Native> = array.iter().flatten().collect();
-        if values.is_empty() {
-            None
-        } else {
-            Some(Arc::new(PrimitiveArray::<T>::from_iter_values(values)) as ArrayRef)
-        }
-    }
-
-    match arr.data_type() {
-        DataType::UInt64 => {
-            let prim = arr
-                .as_any()
-                .downcast_ref::<PrimitiveArray<arrow::datatypes::UInt64Type>>()
-                .unwrap();
-            filter_primitive(prim)
-        }
-        DataType::UInt32 => {
-            let prim = arr
-                .as_any()
-                .downcast_ref::<PrimitiveArray<arrow::datatypes::UInt32Type>>()
-                .unwrap();
-            filter_primitive(prim)
-        }
-        DataType::UInt16 => {
-            let prim = arr
-                .as_any()
-                .downcast_ref::<PrimitiveArray<arrow::datatypes::UInt16Type>>()
-                .unwrap();
-            filter_primitive(prim)
-        }
-        DataType::UInt8 => {
-            let prim = arr
-                .as_any()
-                .downcast_ref::<PrimitiveArray<arrow::datatypes::UInt8Type>>()
-                .unwrap();
-            filter_primitive(prim)
-        }
-        DataType::Int64 => {
-            let prim = arr
-                .as_any()
-                .downcast_ref::<PrimitiveArray<arrow::datatypes::Int64Type>>()
-                .unwrap();
-            filter_primitive(prim)
-        }
-        DataType::Int32 => {
-            let prim = arr
-                .as_any()
-                .downcast_ref::<PrimitiveArray<arrow::datatypes::Int32Type>>()
-                .unwrap();
-            filter_primitive(prim)
-        }
-        DataType::Int16 => {
-            let prim = arr
-                .as_any()
-                .downcast_ref::<PrimitiveArray<arrow::datatypes::Int16Type>>()
-                .unwrap();
-            filter_primitive(prim)
-        }
-        DataType::Int8 => {
-            let prim = arr
-                .as_any()
-                .downcast_ref::<PrimitiveArray<arrow::datatypes::Int8Type>>()
-                .unwrap();
-            filter_primitive(prim)
-        }
-        DataType::Float64 => {
-            let prim = arr
-                .as_any()
-                .downcast_ref::<PrimitiveArray<arrow::datatypes::Float64Type>>()
-                .unwrap();
-            filter_primitive(prim)
-        }
-        DataType::Float32 => {
-            let prim = arr
-                .as_any()
-                .downcast_ref::<PrimitiveArray<arrow::datatypes::Float32Type>>()
-                .unwrap();
-            filter_primitive(prim)
-        }
-        _ => Some(arr),
     }
 }
 

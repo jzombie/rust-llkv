@@ -1,7 +1,8 @@
 use super::*;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::types::LogicalFieldId;
-use arrow::array::{Array, ArrayRef, PrimitiveArray, UInt64Array, new_empty_array};
+use arrow::array::{Array, ArrayRef, BooleanArray, PrimitiveArray, UInt64Array, new_empty_array};
+use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
@@ -13,6 +14,23 @@ use llkv_storage::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatherNullPolicy {
+    /// Any missing row ID results in an error.
+    ErrorOnMissing,
+    /// Missing rows surface as nulls in the result arrays.
+    IncludeNulls,
+    /// Missing rows and rows where all projected columns are null are dropped from the output.
+    DropNulls,
+}
+
+impl GatherNullPolicy {
+    #[inline]
+    fn allow_missing(self) -> bool {
+        !matches!(self, Self::ErrorOnMissing)
+    }
+}
 
 impl<P> ColumnStore<P>
 where
@@ -26,7 +44,24 @@ where
         row_ids: &[u64],
         include_nulls: bool,
     ) -> Result<ArrayRef> {
-        let batch = self.gather_rows_multi(&[field_id], row_ids, include_nulls)?;
+        let policy = if include_nulls {
+            GatherNullPolicy::IncludeNulls
+        } else {
+            GatherNullPolicy::ErrorOnMissing
+        };
+        self.gather_rows_with_policy(field_id, row_ids, policy)
+    }
+
+    /// Gathers values using a configurable null-handling policy. The
+    /// policy controls whether missing rows surfaces as nulls, produce
+    /// errors, or are filtered alongside explicit nulls.
+    pub fn gather_rows_with_policy(
+        &self,
+        field_id: LogicalFieldId,
+        row_ids: &[u64],
+        policy: GatherNullPolicy,
+    ) -> Result<ArrayRef> {
+        let batch = self.gather_rows_multi_with_policy(&[field_id], row_ids, policy)?;
         batch
             .columns()
             .first()
@@ -43,6 +78,24 @@ where
         field_ids: &[LogicalFieldId],
         row_ids: &[u64],
         include_nulls: bool,
+    ) -> Result<RecordBatch> {
+        let policy = if include_nulls {
+            GatherNullPolicy::IncludeNulls
+        } else {
+            GatherNullPolicy::ErrorOnMissing
+        };
+        self.gather_rows_multi_with_policy(field_ids, row_ids, policy)
+    }
+
+    /// Gathers multiple columns using a configurable null-handling policy.
+    /// When [`GatherNullPolicy::DropNulls`] is selected, rows where all
+    /// projected columns are null or missing are removed from the
+    /// resulting batch.
+    pub fn gather_rows_multi_with_policy(
+        &self,
+        field_ids: &[LogicalFieldId],
+        row_ids: &[u64],
+        policy: GatherNullPolicy,
     ) -> Result<RecordBatch> {
         if field_ids.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
@@ -176,9 +229,10 @@ where
             }
         }
 
+        let allow_missing = policy.allow_missing();
+
         let mut outputs = Vec::with_capacity(plans.len());
-        let mut fields = Vec::with_capacity(plans.len());
-        for (idx, plan) in plans.into_iter().enumerate() {
+        for plan in plans.into_iter() {
             let array = crate::with_integer_arrow_type!(
                 plan.dtype.clone(),
                 |ArrowTy| {
@@ -189,7 +243,7 @@ where
                         &plan.value_metas,
                         &plan.row_metas,
                         &mut chunk_map,
-                        include_nulls,
+                        allow_missing,
                     )
                 },
                 Err(Error::Internal(format!(
@@ -197,10 +251,24 @@ where
                     plan.dtype
                 ))),
             )?;
-            let field_name = format!("field_{}", u64::from(field_infos[idx].0));
-            let nullable = include_nulls || array.null_count() > 0;
-            fields.push(Field::new(field_name, field_infos[idx].1.clone(), nullable));
             outputs.push(array);
+        }
+
+        let outputs = if matches!(policy, GatherNullPolicy::DropNulls) {
+            Self::filter_rows_with_non_null(outputs)?
+        } else {
+            outputs
+        };
+
+        let mut fields = Vec::with_capacity(field_infos.len());
+        for (idx, (fid, dtype)) in field_infos.iter().enumerate() {
+            let array = &outputs[idx];
+            let field_name = format!("field_{}", u64::from(*fid));
+            let nullable = match policy {
+                GatherNullPolicy::IncludeNulls => true,
+                _ => array.null_count() > 0,
+            };
+            fields.push(Field::new(field_name, dtype.clone(), nullable));
         }
 
         let schema = Arc::new(Schema::new(fields));
@@ -311,5 +379,47 @@ where
 
         let array = PrimitiveArray::<T>::from_iter(values);
         Ok(Arc::new(array) as ArrayRef)
+    }
+
+    fn filter_rows_with_non_null(columns: Vec<ArrayRef>) -> Result<Vec<ArrayRef>> {
+        if columns.is_empty() {
+            return Ok(columns);
+        }
+
+        let len = columns[0].len();
+        if len == 0 {
+            return Ok(columns);
+        }
+
+        let mut keep = vec![false; len];
+        for array in &columns {
+            debug_assert_eq!(array.len(), len);
+            if array.null_count() == 0 {
+                keep.fill(true);
+                break;
+            }
+            for i in 0..len {
+                if array.is_valid(i) {
+                    keep[i] = true;
+                }
+            }
+            if keep.iter().all(|flag| *flag) {
+                break;
+            }
+        }
+
+        if keep.iter().all(|flag| *flag) {
+            return Ok(columns);
+        }
+
+        let mask = BooleanArray::from(keep);
+
+        let mut filtered = Vec::with_capacity(columns.len());
+        for array in columns {
+            let filtered_column = compute::filter(array.as_ref(), &mask)
+                .map_err(|e| Error::Internal(format!("gather_rows_multi filter: {e}")))?;
+            filtered.push(filtered_column);
+        }
+        Ok(filtered)
     }
 }
