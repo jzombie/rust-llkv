@@ -10,7 +10,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use llkv_column_map::store::ROW_ID_COLUMN_NAME;
+use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
 use llkv_table::Table;
 use llkv_table::types::{FieldId, RowId, TableId};
 
@@ -111,8 +111,15 @@ fn table_persistence_many_columns_simd_r_drive() {
         macro_rules! assert_prim_eq {
             ($fid:expr, $dt:expr, $cast:ty, $expect:expr) => {{
                 assert_eq!(store.data_type(lfid($fid)).unwrap(), $dt);
-                let arr = store.gather_rows(lfid($fid), &rows, false).unwrap();
-                let arr = arr.as_any().downcast_ref::<$cast>().unwrap();
+                let batch = store
+                    .gather_rows(&[lfid($fid)], &rows, GatherNullPolicy::ErrorOnMissing)
+                    .unwrap();
+                let arr = batch
+                    .column(0)
+                    .as_ref()
+                    .as_any()
+                    .downcast_ref::<$cast>()
+                    .unwrap();
                 assert_eq!(arr.values(), $expect.as_slice());
             }};
         }

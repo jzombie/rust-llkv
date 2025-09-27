@@ -29,9 +29,10 @@ fn drop_nulls_policy_removes_null_rows() {
     store.append(&batch).expect("append");
 
     let raw = store
-        .gather_rows_with_policy(fid, &[1, 2, 3, 4], GatherNullPolicy::IncludeNulls)
+        .gather_rows(&[fid], &[1, 2, 3, 4], GatherNullPolicy::IncludeNulls)
         .expect("include nulls");
     let raw = raw
+        .column(0)
         .as_any()
         .downcast_ref::<Int32Array>()
         .expect("int32 array");
@@ -40,9 +41,10 @@ fn drop_nulls_policy_removes_null_rows() {
     assert!(raw.is_null(3));
 
     let dropped = store
-        .gather_rows_with_policy(fid, &[1, 2, 3, 4], GatherNullPolicy::DropNulls)
+        .gather_rows(&[fid], &[1, 2, 3, 4], GatherNullPolicy::DropNulls)
         .expect("drop nulls");
     let dropped = dropped
+        .column(0)
         .as_any()
         .downcast_ref::<Int32Array>()
         .expect("int32 array");
