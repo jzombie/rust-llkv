@@ -18,14 +18,10 @@ impl SortedChunkBuffers {
         perms: Vec<EntryHandle>,
     ) -> Result<Self> {
         if metas.len() != values.len() || metas.len() != perms.len() {
-            return Err(Error::Internal(
-                "sorted buffers length mismatch".into(),
-            ));
+            return Err(Error::Internal("sorted buffers length mismatch".into()));
         }
-        let mut value_index =
-            FxHashMap::with_capacity_and_hasher(metas.len(), Default::default());
-        let mut perm_index =
-            FxHashMap::with_capacity_and_hasher(metas.len(), Default::default());
+        let mut value_index = FxHashMap::with_capacity_and_hasher(metas.len(), Default::default());
+        let mut perm_index = FxHashMap::with_capacity_and_hasher(metas.len(), Default::default());
         for (idx, meta) in metas.iter().enumerate() {
             value_index.insert(meta.chunk_pk, idx);
             perm_index.insert(meta.value_order_perm_pk, idx);
@@ -60,16 +56,12 @@ impl SortedChunkBuffers {
 
     #[inline]
     pub fn value_by_pk(&self, pk: PhysicalKey) -> Option<&EntryHandle> {
-        self.value_index
-            .get(&pk)
-            .map(|&idx| &self.values[idx])
+        self.value_index.get(&pk).map(|&idx| &self.values[idx])
     }
 
     #[inline]
     pub fn perm_by_pk(&self, pk: PhysicalKey) -> Option<&EntryHandle> {
-        self.perm_index
-            .get(&pk)
-            .map(|&idx| &self.perms[idx])
+        self.perm_index.get(&pk).map(|&idx| &self.perms[idx])
     }
 
     #[inline]
@@ -467,10 +459,8 @@ macro_rules! sorted_with_rids_impl {
             let mut vals: Vec<$ArrTy> = Vec::with_capacity(metas_val.len());
             let mut rids: Vec<UInt64Array> = Vec::with_capacity(metas_val.len());
             for idx in 0..metas_val.len() {
-                let data_any =
-                    deserialize_array(buffers.base().value_handle(idx).clone())?;
-                let perm_any =
-                    deserialize_array(buffers.base().perm_handle(idx).clone())?;
+                let data_any = deserialize_array(buffers.base().value_handle(idx).clone())?;
+                let perm_any = deserialize_array(buffers.base().perm_handle(idx).clone())?;
                 let perm = perm_any
                     .as_any()
                     .downcast_ref::<UInt32Array>()
@@ -520,10 +510,8 @@ macro_rules! sorted_with_rids_impl {
             let mut vals: Vec<$ArrTy> = Vec::with_capacity(metas_val.len());
             let mut rids: Vec<UInt64Array> = Vec::with_capacity(metas_val.len());
             for idx in 0..metas_val.len() {
-                let data_any =
-                    deserialize_array(buffers.base().value_handle(idx).clone())?;
-                let perm_any =
-                    deserialize_array(buffers.base().perm_handle(idx).clone())?;
+                let data_any = deserialize_array(buffers.base().value_handle(idx).clone())?;
+                let perm_any = deserialize_array(buffers.base().perm_handle(idx).clone())?;
                 let perm = perm_any
                     .as_any()
                     .downcast_ref::<UInt32Array>()
@@ -624,10 +612,8 @@ macro_rules! sorted_with_rids_float_impl {
             let mut vals: Vec<$ArrTy> = Vec::with_capacity(metas_val.len());
             let mut rids: Vec<UInt64Array> = Vec::with_capacity(metas_val.len());
             for idx in 0..metas_val.len() {
-                let data_any =
-                    deserialize_array(buffers.base().value_handle(idx).clone())?;
-                let perm_any =
-                    deserialize_array(buffers.base().perm_handle(idx).clone())?;
+                let data_any = deserialize_array(buffers.base().value_handle(idx).clone())?;
+                let perm_any = deserialize_array(buffers.base().perm_handle(idx).clone())?;
                 let perm = perm_any
                     .as_any()
                     .downcast_ref::<UInt32Array>()
@@ -677,10 +663,8 @@ macro_rules! sorted_with_rids_float_impl {
             let mut vals: Vec<$ArrTy> = Vec::with_capacity(metas_val.len());
             let mut rids: Vec<UInt64Array> = Vec::with_capacity(metas_val.len());
             for idx in 0..metas_val.len() {
-                let data_any =
-                    deserialize_array(buffers.base().value_handle(idx).clone())?;
-                let perm_any =
-                    deserialize_array(buffers.base().perm_handle(idx).clone())?;
+                let data_any = deserialize_array(buffers.base().value_handle(idx).clone())?;
+                let perm_any = deserialize_array(buffers.base().perm_handle(idx).clone())?;
                 let perm = perm_any
                     .as_any()
                     .downcast_ref::<UInt32Array>()
@@ -1361,14 +1345,7 @@ macro_rules! sorted_bounds_with_rids_visit {
         $visitor:expr
     ) => {{
         let (lb, ub) = $ir.$field.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-        $func(
-            $pager,
-            $metas_val,
-            $metas_rid,
-            $buffers,
-            (lb, ub),
-            $visitor,
-        )
+        $func($pager, $metas_val, $metas_rid, $buffers, (lb, ub), $visitor)
     }};
 }
 

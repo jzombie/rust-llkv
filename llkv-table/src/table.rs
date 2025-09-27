@@ -1,8 +1,7 @@
 use std::cmp;
-use std::fmt;
-use std::ops::Bound;
 use std::sync::Arc;
 
+use crate::constants::STREAM_BATCH_ROWS;
 use crate::types::TableId;
 
 use arrow::array::{Array, ArrayRef, Int32Array, PrimitiveArray, RecordBatch, UInt64Array};
@@ -18,156 +17,22 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::sys_catalog::{CATALOG_TID, ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
-use llkv_expr::{
-    literal::FromLiteral,
-    {Filter, LiteralCastError, Operator, bound_to_native, literal_to_native},
-};
-
-// TODO: Extract to constants
-/// Default max rows per streamed batch. Tune as needed.
-const STREAM_BATCH_ROWS: usize = 8192;
-
-// TODO: Move to `llkv-expr`?
-enum RangeLimit<T> {
-    Included(T),
-    Excluded(T),
-}
-
-// TODO: Move to `llkv-expr`?
-enum Predicate<T>
-where
-    T: ArrowPrimitiveType + FilterPrimitive,
-{
-    All,
-    Equals(T::Native),
-    GreaterThan(T::Native),
-    GreaterThanOrEquals(T::Native),
-    LessThan(T::Native),
-    LessThanOrEquals(T::Native),
-    Range {
-        lower: Option<RangeLimit<T::Native>>,
-        upper: Option<RangeLimit<T::Native>>,
-    },
-    In(Vec<T::Native>),
-}
-
-impl<T> Predicate<T>
-where
-    T: ArrowPrimitiveType + FilterPrimitive,
-{
-    fn build(op: &Operator<'_>) -> Result<Predicate<T>, TableError>
-    where
-        T: ArrowPrimitiveType + FilterPrimitive,
-        T::Native: FromLiteral + Copy,
-    {
-        match op {
-            Operator::Equals(lit) => Ok(Predicate::Equals(literal_to_native::<T::Native>(lit)?)),
-            Operator::GreaterThan(lit) => {
-                Ok(Predicate::GreaterThan(literal_to_native::<T::Native>(lit)?))
-            }
-            Operator::GreaterThanOrEquals(lit) => {
-                Ok(Predicate::GreaterThanOrEquals(literal_to_native::<
-                    T::Native,
-                >(lit)?))
-            }
-            Operator::LessThan(lit) => {
-                Ok(Predicate::LessThan(literal_to_native::<T::Native>(lit)?))
-            }
-            Operator::LessThanOrEquals(lit) => Ok(Predicate::LessThanOrEquals(
-                literal_to_native::<T::Native>(lit)?,
-            )),
-            Operator::Range { lower, upper } => {
-                let lb = match bound_to_native::<T>(lower)? {
-                    Bound::Unbounded => None,
-                    Bound::Included(v) => Some(RangeLimit::Included(v)),
-                    Bound::Excluded(v) => Some(RangeLimit::Excluded(v)),
-                };
-                let ub = match bound_to_native::<T>(upper)? {
-                    Bound::Unbounded => None,
-                    Bound::Included(v) => Some(RangeLimit::Included(v)),
-                    Bound::Excluded(v) => Some(RangeLimit::Excluded(v)),
-                };
-                if lb.is_none() && ub.is_none() {
-                    Ok(Predicate::All)
-                } else {
-                    Ok(Predicate::Range {
-                        lower: lb,
-                        upper: ub,
-                    })
-                }
-            }
-            Operator::In(values) => {
-                let mut natives = Vec::with_capacity(values.len());
-                for lit in *values {
-                    natives.push(literal_to_native::<T::Native>(lit)?);
-                }
-                Ok(Predicate::In(natives))
-            }
-            // Pattern/string ops are not supported in this numeric predicate path.
-            _ => Err(TableError::Internal(
-                "Filter operator does not contain a supported typed value".to_string(),
-            )),
-        }
-    }
-
-    fn matches(&self, value: T::Native) -> bool {
-        match self {
-            Predicate::All => true,
-            Predicate::Equals(target) => value == *target,
-            Predicate::GreaterThan(target) => value > *target,
-            Predicate::GreaterThanOrEquals(target) => value >= *target,
-            Predicate::LessThan(target) => value < *target,
-            Predicate::LessThanOrEquals(target) => value <= *target,
-            Predicate::Range { lower, upper } => {
-                if let Some(limit) = lower {
-                    match limit {
-                        RangeLimit::Included(bound) => {
-                            if value < *bound {
-                                return false;
-                            }
-                        }
-                        RangeLimit::Excluded(bound) => {
-                            if value <= *bound {
-                                return false;
-                            }
-                        }
-                    }
-                }
-                if let Some(limit) = upper {
-                    match limit {
-                        RangeLimit::Included(bound) => {
-                            if value > *bound {
-                                return false;
-                            }
-                        }
-                        RangeLimit::Excluded(bound) => {
-                            if value >= *bound {
-                                return false;
-                            }
-                        }
-                    }
-                }
-                true
-            }
-            Predicate::In(values) => values.contains(&value),
-        }
-    }
-}
+use llkv_expr::typed_predicate::build_predicate;
+use llkv_expr::{Filter, Operator};
+use llkv_result::{Error, Result as LlkvResult};
 
 fn collect_matching_row_ids<T, P>(
     store: &ColumnStore<P>,
     field_id: LogicalFieldId,
     op: &Operator<'_>,
-) -> Result<Vec<u64>, TableError>
+) -> LlkvResult<Vec<u64>>
 where
     T: ArrowPrimitiveType + FilterPrimitive,
-    T::Native: FromLiteral + Copy,
+    T::Native: llkv_expr::literal::FromLiteral + Copy,
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    let predicate = Predicate::<T>::build(op)?;
-    store
-        .filter_row_ids::<T, _>(field_id, move |value| predicate.matches(value))
-        .map_err(TableError::from)
+    let predicate = build_predicate::<T>(op).map_err(Error::predicate_build)?;
+    store.filter_row_ids::<T, _>(field_id, move |value| predicate.matches(value))
 }
 
 #[inline]
@@ -176,60 +41,6 @@ fn lfid_for(table_id: TableId, column_id: FieldId) -> LogicalFieldId {
         .with_table_id(table_id)
         .with_field_id(column_id)
         .with_namespace(Namespace::UserData)
-}
-
-// TODO: Migrate to `llkv-result`
-#[derive(Debug)]
-pub enum TableError {
-    ColumnMap(llkv_result::Error),
-    Arrow(arrow::error::ArrowError),
-    ExprCast(LiteralCastError),
-    ReservedTableId(TableId),
-    Internal(String),
-}
-
-impl fmt::Display for TableError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TableError::ColumnMap(err) => write!(f, "column map error: {err}"),
-            TableError::Arrow(err) => write!(f, "arrow error: {err}"),
-            TableError::ExprCast(err) => write!(f, "expression cast error: {err}"),
-            TableError::ReservedTableId(table_id) => {
-                write!(f, "table id {table_id} is reserved for system catalogs")
-            }
-            TableError::Internal(msg) => write!(f, "internal table error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for TableError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            TableError::ColumnMap(err) => Some(err),
-            TableError::Arrow(err) => Some(err),
-            TableError::ExprCast(err) => Some(err),
-            TableError::ReservedTableId(_) => None,
-            TableError::Internal(_) => None,
-        }
-    }
-}
-
-impl From<llkv_result::Error> for TableError {
-    fn from(e: llkv_result::Error) -> Self {
-        TableError::ColumnMap(e)
-    }
-}
-
-impl From<arrow::error::ArrowError> for TableError {
-    fn from(e: arrow::error::ArrowError) -> Self {
-        TableError::Arrow(e)
-    }
-}
-
-impl From<LiteralCastError> for TableError {
-    fn from(e: LiteralCastError) -> Self {
-        TableError::ExprCast(e)
-    }
 }
 
 pub struct Table<P = MemPager>
@@ -249,16 +60,16 @@ impl<P> Table<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    pub fn new(table_id: TableId, pager: Arc<P>) -> Result<Self, TableError> {
+    pub fn new(table_id: TableId, pager: Arc<P>) -> LlkvResult<Self> {
         if table_id == CATALOG_TID {
-            return Err(TableError::ReservedTableId(table_id));
+            return Err(Error::reserved_table_id(table_id));
         }
 
         let store = ColumnStore::open(pager)?;
         Ok(Self { store, table_id })
     }
 
-    pub fn append(&self, batch: &RecordBatch) -> Result<(), llkv_result::Error> {
+    pub fn append(&self, batch: &RecordBatch) -> LlkvResult<()> {
         let mut new_fields = Vec::with_capacity(batch.schema().fields().len());
         for field in batch.schema().fields() {
             if field.name() == ROW_ID_COLUMN_NAME {
@@ -312,7 +123,7 @@ where
         projection_col: FieldId,
         filter: &Filter<'a, FieldId>,
         on_batch: F,
-    ) -> Result<(), TableError>
+    ) -> LlkvResult<()>
     where
         F: FnMut(RecordBatch),
     {
@@ -330,7 +141,7 @@ where
         filter: &Filter<'a, FieldId>,
         options: ScanStreamOptions,
         mut on_batch: F,
-    ) -> Result<(), TableError>
+    ) -> LlkvResult<()>
     where
         F: FnMut(RecordBatch),
     {
@@ -340,7 +151,7 @@ where
         let row_ids = llkv_column_map::with_integer_arrow_type!(
             dtype.clone(),
             |ArrowTy| collect_matching_row_ids::<ArrowTy, P>(&self.store, filter_lfid, &filter.op),
-            Err(TableError::Internal(format!(
+            Err(Error::Internal(format!(
                 "Filtering on type {:?} is not supported",
                 dtype
             ))),
@@ -370,13 +181,12 @@ where
             {
                 Ok(values) => values,
                 Err(err) if !options.include_nulls => match err {
-                    llkv_result::Error::Internal(_) | llkv_result::Error::NotFound => self
-                        .store
-                        .gather_rows(proj_lfid, window, true)
-                        .map_err(TableError::from)?,
-                    _ => return Err(TableError::from(err)),
+                    Error::Internal(_) | Error::NotFound => {
+                        self.store.gather_rows(proj_lfid, window, true)?
+                    }
+                    _ => return Err(err),
                 },
-                Err(err) => return Err(TableError::from(err)),
+                Err(err) => return Err(err),
             };
 
             let maybe_arr = if options.include_nulls {
@@ -534,11 +344,11 @@ pub struct ColumnData {
 
 // FIX: Move helper methods into a trait to satisfy Rust's orphan rule
 pub trait ColumnStoreTestExt {
-    fn get_column_for_test(&self, field_id: LogicalFieldId) -> Result<ColumnData, TableError>;
+    fn get_column_for_test(&self, field_id: LogicalFieldId) -> LlkvResult<ColumnData>;
 }
 
 impl ColumnStoreTestExt for ColumnStore<MemPager> {
-    fn get_column_for_test(&self, field_id: LogicalFieldId) -> Result<ColumnData, TableError> {
+    fn get_column_for_test(&self, field_id: LogicalFieldId) -> LlkvResult<ColumnData> {
         struct ColVisitor {
             chunks: Vec<ArrayRef>,
             data_type: Option<DataType>,
@@ -580,9 +390,7 @@ impl ColumnStoreTestExt for ColumnStore<MemPager> {
         self.scan(field_id, Default::default(), &mut visitor)?;
 
         if visitor.chunks.is_empty() {
-            return Err(TableError::Internal(
-                "Column not found or is empty".to_string(),
-            ));
+            return Err(Error::Internal("Column not found or is empty".to_string()));
         }
 
         // NOTE: This helper still concatenates for tests. Production code
@@ -608,6 +416,7 @@ mod tests {
     };
     use arrow::compute::{cast, max, min, sum, unary};
     use std::collections::HashMap;
+    use std::ops::Bound;
 
     fn setup_test_table() -> Table {
         let pager = Arc::new(MemPager::default());
@@ -715,7 +524,7 @@ mod tests {
         let result = Table::new(CATALOG_TID, Arc::new(MemPager::default()));
         assert!(matches!(
             result,
-            Err(TableError::ReservedTableId(id)) if id == CATALOG_TID
+            Err(Error::ReservedTableId(id)) if id == CATALOG_TID
         ));
     }
 
