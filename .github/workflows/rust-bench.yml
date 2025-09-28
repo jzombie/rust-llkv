@@ -12,34 +12,9 @@ jobs:
   benchmarks:
     name: Run Rust workspace benchmarks
     runs-on: ubuntu-latest
-    # Allow longer runs for building and benchmarking large workspaces.
-    timeout-minutes: 60
-    # Limit parallelism and tune codegen to reduce memory pressure during
-    # large instrumentation builds which can cause the runner to OOM (exit 143).
-    env:
-      CARGO_BUILD_JOBS: 1
-      # Reduce rustc parallel codegen units which can lower memory pressure.
-      RUSTFLAGS: "-C codegen-units=1"
 
     steps:
       - uses: actions/checkout@v4
-
-      # Warm the Cargo registry/cache to improve cache hits and reduce peak build work
-      - name: Cargo fetch
-        run: cargo fetch --all-features || true
-
-      # Cache target and cargo registry to avoid rebuilding everything each run.
-      - name: Cache cargo target and registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            target
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
 
       # Sets up Rust + cache and installs the cargo-codspeed binary
       - name: Setup Rust toolchain, cache, and cargo-codspeed
@@ -51,10 +26,10 @@ jobs:
 
       # Build all benches in the workspace with instrumentation
       - name: Build CodSpeed benchmarks (workspace)
-        run: cargo codspeed build --workspace --all-features --jobs ${CARGO_BUILD_JOBS}
+        run: cargo codspeed build --workspace --all-features
 
       # Run all benches in the workspace and upload results to CodSpeed
-      - name: Run CodSpeed benchmarks (non-interactive)
+      - name: Run CodSpeed benchmarks
         uses: CodSpeedHQ/action@v4
         with:
           mode: instrumentation
