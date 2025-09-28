@@ -3,8 +3,8 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Float32Array, Float64Array, Float64Builder, Int8Array, Int16Array, Int32Array,
-    Int64Array, RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
@@ -1569,7 +1569,38 @@ impl<'a, F> AffineComputeEmitter<'a, F>
 where
     F: FnMut(RecordBatch),
 {
-    fn emit_from_iter<GNull, GValue>(
+    fn emit_array(&mut self, array: Float64Array) {
+        if self.error.is_some() {
+            return;
+        }
+        let array_ref = Arc::new(array) as ArrayRef;
+        match RecordBatch::try_new(self.schema.clone(), vec![array_ref]) {
+            Ok(batch) => {
+                (self.on_batch)(batch);
+                self.emitted = true;
+            }
+            Err(err) => self.error = Some(Error::from(err)),
+        }
+    }
+
+    fn emit_no_nulls<GValue>(&mut self, len: usize, mut value_at: GValue)
+    where
+        GValue: FnMut(usize) -> f64,
+    {
+        if self.error.is_some() {
+            return;
+        }
+        let scale = self.scale;
+        let offset = self.offset;
+        let iter = (0..len).map(|idx| {
+            let base = value_at(idx);
+            scale * base + offset
+        });
+        let array = Float64Array::from_iter_values(iter);
+        self.emit_array(array);
+    }
+
+    fn emit_with_nulls<GNull, GValue>(
         &mut self,
         len: usize,
         mut is_null: GNull,
@@ -1581,26 +1612,18 @@ where
         if self.error.is_some() {
             return;
         }
-        let mut builder = Float64Builder::with_capacity(len);
         let scale = self.scale;
         let offset = self.offset;
-        for idx in 0..len {
+        let iter = (0..len).map(|idx| {
             if is_null(idx) {
-                builder.append_null();
+                None
             } else {
                 let base = value_at(idx);
-                builder.append_value(scale * base + offset);
+                Some(scale * base + offset)
             }
-        }
-        let array = builder.finish();
-        let array_ref = Arc::new(array) as ArrayRef;
-        match RecordBatch::try_new(self.schema.clone(), vec![array_ref]) {
-            Ok(batch) => {
-                (self.on_batch)(batch);
-                self.emitted = true;
-            }
-            Err(err) => self.error = Some(Error::from(err)),
-        }
+        });
+        let array = Float64Array::from_iter(iter);
+        self.emit_array(array);
     }
 
     fn unsupported(&mut self) {
@@ -1616,11 +1639,16 @@ macro_rules! impl_affine_chunk {
     ($method:ident, $ArrayTy:ty, $cast:expr) => {
         fn $method(&mut self, array: &$ArrayTy) {
             let cast = $cast;
-            self.emit_from_iter(
-                array.len(),
-                |idx| array.is_null(idx),
-                |idx| cast(array.value(idx)),
-            );
+            if array.null_count() == 0 {
+                let values = array.values();
+                self.emit_no_nulls(values.len(), |idx| cast(values[idx]));
+            } else {
+                self.emit_with_nulls(
+                    array.len(),
+                    |idx| array.is_null(idx),
+                    |idx| cast(array.value(idx)),
+                );
+            }
         }
     };
 }
@@ -1629,11 +1657,16 @@ macro_rules! impl_affine_run {
     ($method:ident, $ArrayTy:ty, $cast:expr) => {
         fn $method(&mut self, array: &$ArrayTy, start: usize, len: usize) {
             let cast = $cast;
-            self.emit_from_iter(
-                len,
-                |idx| array.is_null(start + idx),
-                |idx| cast(array.value(start + idx)),
-            );
+            if array.null_count() == 0 {
+                let values = array.values();
+                self.emit_no_nulls(len, |idx| cast(values[start + idx]));
+            } else {
+                self.emit_with_nulls(
+                    len,
+                    |idx| array.is_null(start + idx),
+                    |idx| cast(array.value(start + idx)),
+                );
+            }
         }
     };
 }
