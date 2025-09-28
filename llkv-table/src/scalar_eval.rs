@@ -52,12 +52,12 @@ impl VectorizedExpr {
         match self {
             VectorizedExpr::Array(array) => array as ArrayRef,
             VectorizedExpr::Scalar(Some(value)) => {
-                let iter = iter::repeat(Some(value)).take(len);
+                let iter = iter::repeat_n(Some(value), len);
                 let array = Float64Array::from_iter(iter);
                 Arc::new(array) as ArrayRef
             }
             VectorizedExpr::Scalar(None) => {
-                let iter = iter::repeat(None).take(len);
+                let iter = iter::repeat_n(None, len);
                 let array = Float64Array::from_iter(iter);
                 Arc::new(array) as ArrayRef
             }
@@ -318,10 +318,9 @@ impl NumericKernels {
                 if let (Some(lv), Some(rv)) = (
                     Self::literal_numeric_value(&left_s),
                     Self::literal_numeric_value(&right_s),
-                ) {
-                    if let Some(lit) = Self::apply_binary_literal(*op, lv, rv) {
-                        return lit;
-                    }
+                ) && let Some(lit) = Self::apply_binary_literal(*op, lv, rv)
+                {
+                    return lit;
                 }
 
                 match op {

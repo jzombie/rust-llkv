@@ -393,8 +393,11 @@ where
         let mut column_chunks: Vec<ColumnChunks> = Vec::with_capacity(unique_lfids.len());
         for &lfid in unique_lfids {
             let mut collector = ColumnChunkCollector::new();
-            let mut scan_opts = ScanOptions::default();
-            scan_opts.with_row_ids = true;
+            let scan_opts = ScanOptions {
+                with_row_ids: true,
+                ..Default::default()
+            };
+
             ScanBuilder::new(self.table.store(), lfid)
                 .options(scan_opts)
                 .run(&mut collector)?;
@@ -965,12 +968,12 @@ impl ColumnChunkCollector {
             if row_ids.is_empty() {
                 continue;
             }
-            if let Some(last) = prev {
-                if row_ids.value(0) <= last {
-                    return Err(Error::Internal(
-                        "column chunks row-ids are not strictly increasing".into(),
-                    ));
-                }
+            if let Some(last) = prev
+                && row_ids.value(0) <= last
+            {
+                return Err(Error::Internal(
+                    "column chunks row-ids are not strictly increasing".into(),
+                ));
             }
             prev = Some(row_ids.value(row_ids.len() - 1));
         }
@@ -1216,10 +1219,8 @@ impl<'a> DenseRunStreamer<'a> {
 
                 for (idx, chunks) in self.unique_chunks.iter().enumerate() {
                     chunks.advance_cursor(&mut cursors[idx], target_batch);
-                    if next_row < run_end {
-                        if !chunks.align_cursor(&mut cursors[idx], next_row) {
-                            return Ok(false);
-                        }
+                    if next_row < run_end && !chunks.align_cursor(&mut cursors[idx], next_row) {
+                        return Ok(false);
                     }
                 }
 
