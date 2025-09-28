@@ -12,6 +12,8 @@ jobs:
   benchmarks:
     name: Run Rust workspace benchmarks
     runs-on: ubuntu-latest
+    # Allow longer runs for building and benchmarking large workspaces.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -29,10 +31,12 @@ jobs:
         run: cargo codspeed build --workspace --all-features
 
       # Run all benches in the workspace and upload results to CodSpeed
-      - name: Run CodSpeed benchmarks
+      - name: Run CodSpeed benchmarks (non-interactive)
         uses: CodSpeedHQ/action@v4
         with:
           mode: instrumentation
-          run: cargo codspeed run --workspace
+          # Pass Criterion flags after `--` to ensure non-interactive
+          # behaviour and limit profile time to keep CI runs bounded.
+          run: cargo codspeed run --workspace -- --noplot --quiet --profile-time 10
           # Required for private repos; optional for public
           token: ${{ secrets.CODSPEED_TOKEN }}
