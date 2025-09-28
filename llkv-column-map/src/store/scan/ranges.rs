@@ -1,5 +1,6 @@
 use super::*;
 
+// TODO: Rename to ScalarRanges?
 #[derive(Default, Clone, Copy)]
 pub struct IntRanges {
     pub u64_r: Option<(Bound<u64>, Bound<u64>)>,
