@@ -220,6 +220,7 @@ where
             return range_sorted_dispatch(self.store, self.field_id, self.opts, self.ir, visitor);
         }
 
+        // TODO: Implement unsorted range filtering efficiently.
         // Range-filtering adapter for unsorted runs. (Pass-through today.)
         struct RangeAdapter<'v, V> {
             inner: &'v mut V,
