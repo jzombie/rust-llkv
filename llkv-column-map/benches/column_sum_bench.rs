@@ -197,15 +197,12 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
 
         let rid_arr = Arc::new(UInt64Array::from(rid));
         let val_arr = Arc::new(UInt64Array::from(vals));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![rid_arr, val_arr]).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![rid_arr, val_arr]).unwrap();
         store.append(&batch).unwrap();
     }
 
     // 2) Delete every 10th row (absolute row index).
-    let rows_to_delete: RoaringTreemap = (0..NUM_ROWS_FRAGMENTED)
-        .step_by(10)
-        .collect();
+    let rows_to_delete: RoaringTreemap = (0..NUM_ROWS_FRAGMENTED).step_by(10).collect();
     store.delete_rows(field_id, &rows_to_delete).unwrap();
 
     // 3) Append one more chunk after deletions.
@@ -217,8 +214,7 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
 
     let rid_arr_new = Arc::new(UInt64Array::from(rid_new.clone()));
     let val_arr_new = Arc::new(UInt64Array::from(vals_new.clone()));
-    let batch_new =
-        RecordBatch::try_new(schema.clone(), vec![rid_arr_new, val_arr_new]).unwrap();
+    let batch_new = RecordBatch::try_new(schema.clone(), vec![rid_arr_new, val_arr_new]).unwrap();
     store.append(&batch_new).unwrap();
 
     // 4) Calculate expected final sum for verification

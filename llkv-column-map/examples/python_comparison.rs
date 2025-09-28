@@ -2,14 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{UInt64Array};
+use arrow::array::UInt64Array;
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::store::scan::{PrimitiveVisitor, PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveWithRowIdsVisitor, ScanOptions};
+use llkv_column_map::store::scan::{
+    PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+    PrimitiveWithRowIdsVisitor, ScanOptions,
+};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 
@@ -89,7 +92,7 @@ fn benchmark_rust_llkv() -> (u128, f64) {
     // Now measure 100 iterations like Python
     let mut times = Vec::new();
     let mut final_sum = 0u128;
-    
+
     for _ in 0..100 {
         let mut visitor = SumVisitor::new();
         let start = Instant::now();
@@ -136,7 +139,7 @@ fn benchmark_arrow_direct() -> (u128, f64) {
     // Measure 100 iterations
     let mut times = Vec::new();
     let mut final_sum = 0u128;
-    
+
     for _ in 0..100 {
         let start = Instant::now();
         if let Some(s) = compute::sum(&arr) {
@@ -155,13 +158,22 @@ fn main() {
 
     println!("Testing direct Arrow compute::sum (no storage overhead)...");
     let (arrow_sum, arrow_time) = benchmark_arrow_direct();
-    println!("Arrow direct sum: {} (avg of 100 runs: {:.3} ms)\n", arrow_sum, arrow_time);
+    println!(
+        "Arrow direct sum: {} (avg of 100 runs: {:.3} ms)\n",
+        arrow_sum, arrow_time
+    );
 
     println!("Testing LLKV ColumnStore scan...");
     let (llkv_sum, llkv_time) = benchmark_rust_llkv();
-    println!("LLKV scan sum: {} (avg of 100 runs: {:.3} ms)\n", llkv_sum, llkv_time);
+    println!(
+        "LLKV scan sum: {} (avg of 100 runs: {:.3} ms)\n",
+        llkv_sum, llkv_time
+    );
 
-    println!("Storage overhead: {:.1}x (LLKV vs Arrow direct)", llkv_time / arrow_time);
+    println!(
+        "Storage overhead: {:.1}x (LLKV vs Arrow direct)",
+        llkv_time / arrow_time
+    );
     println!();
     println!("Run the Python benchmark separately for external comparison.");
 }
