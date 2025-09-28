@@ -31,8 +31,8 @@ llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
 name = "table_math_bench"
 harness = false
 
-[profile.bench]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-debug = false
+# [profile.bench]
+# opt-level = 3
+# lto = "thin"
+# codegen-units = 1
+# debug = false
