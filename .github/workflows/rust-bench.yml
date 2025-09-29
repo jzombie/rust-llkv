@@ -6,6 +6,7 @@ on:
       - "main"
       - "dev"
   pull_request: # so PRs get perf reports
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch: # optional: allows CodSpeed to trigger backtests
 
 jobs:
