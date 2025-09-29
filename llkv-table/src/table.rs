@@ -130,16 +130,20 @@ where
     ///   `row_ids`.
     /// - Splits `row_ids` into fixed-size windows and gathers rows per
     ///   window to form a small `RecordBatch` that is sent to `on_batch`.
-    pub fn scan_stream<'a, I, T, F>(&self, projections: I, filter_expr: &Expr<'a, FieldId>, options: ScanStreamOptions, on_batch: F) -> LlkvResult<()> 
+    pub fn scan_stream<'a, I, T, F>(
+        &self,
+        projections: I,
+        filter_expr: &Expr<'a, FieldId>,
+        options: ScanStreamOptions,
+        on_batch: F,
+    ) -> LlkvResult<()>
     where
         I: IntoIterator<Item = T>,
         T: Into<ScanProjection>,
         F: FnMut(RecordBatch),
     {
-        let stream_projections: Vec<ScanProjection> = projections
-            .into_iter()
-            .map(|p| p.into())
-            .collect();
+        let stream_projections: Vec<ScanProjection> =
+            projections.into_iter().map(|p| p.into()).collect();
         self.scan_stream_with_exprs(&stream_projections, filter_expr, options, on_batch)
     }
 

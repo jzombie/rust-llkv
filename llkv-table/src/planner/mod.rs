@@ -60,7 +60,7 @@ where
 
     pub(crate) fn scan_stream_with_exprs<'expr, F>(
         &self,
-    projections: &[ScanProjection],
+        projections: &[ScanProjection],
         filter_expr: &Expr<'expr, FieldId>,
         options: ScanStreamOptions,
         mut on_batch: F,
@@ -278,7 +278,7 @@ where
 
     fn try_single_column_direct_scan<'expr, F>(
         &self,
-    projections: &[ScanProjection],
+        projections: &[ScanProjection],
         filter_expr: &Expr<'expr, FieldId>,
         options: ScanStreamOptions,
         on_batch: &mut F,
