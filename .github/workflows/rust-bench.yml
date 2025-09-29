@@ -32,18 +32,45 @@ jobs:
     env:
       BENCHER_PROJECT: llkv
       BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+      # The branch name to report to Bencher. For pull_request events use the
+      # head ref, otherwise use the ref name (branch on push).
+      BENCHER_BRANCH: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+      # A simple testbed identifier. You can change this to better describe the
+      # runner (eg: self-hosted-mac-arm64, github-ubuntu-latest, etc.).
+      BENCHER_TESTBED: ci
+      # Optional: set threshold flags here to create Thresholds/Models when the
+      # bench run executes. Leave empty to skip creating/updating Thresholds.
+      # https://bencher.dev/docs/explanation/thresholds/
+      THRESHOLD_FLAGS: --threshold-measure latency --threshold-test t_test --threshold-max-sample-size 64 --threshold-upper-boundary 0.99 --thresholds-reset --err
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - uses: bencherdev/bencher@main
-      - name: Run benches via Bencher
+      - name: Run benches via Bencher (in-repo PRs)
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false }}
-        # Note: The `--github-actions` flag automatically creates a new comment on the PR
-        # https://github.com/bencherdev/bencher?tab=readme-ov-file#comment-on-prs
-        run: bencher run --github-actions "${{ secrets.GITHUB_TOKEN }}" "cargo bench"
+        # Note: The `--github-actions` flag will allow Bencher to create a PR
+        # comment/check using the provided GITHUB_TOKEN. This step passes the
+        # branch/testbed and any optional threshold flags.
+        run: |
+          bencher run \
+            --project "${BENCHER_PROJECT}" \
+            --branch "${BENCHER_BRANCH}" \
+            --testbed "${BENCHER_TESTBED}" \
+            ${THRESHOLD_FLAGS} \
+            --github-actions "${{ secrets.GITHUB_TOKEN }}" \
+            "cargo bench"
 
-      - name: Run benches via Bencher (from fork)
+      - name: Run benches via Bencher (pushes / forked PRs)
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == true }}
-        run: bencher run "cargo bench"
+        # For forked PRs secrets are not available — this runs Bencher locally
+        # (no GitHub comment). It still accepts the same branch/testbed and
+        # threshold flags, but without uploading results if no API token is set.
+        run: |
+          bencher run \
+            --project "${BENCHER_PROJECT}" \
+            --branch "${BENCHER_BRANCH}" \
+            --testbed "${BENCHER_TESTBED}" \
+            ${THRESHOLD_FLAGS} \
+            "cargo bench"
