@@ -18,7 +18,7 @@ use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::{BinaryOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
-use llkv_table::table::{ScanStreamOptions, StreamProjection};
+use llkv_table::table::{ScanProjection, ScanStreamOptions};
 use llkv_table::types::{FieldId, TableId};
 
 const NUM_ROWS: usize = 1_000_000;
@@ -84,7 +84,7 @@ fn scan_expr_total(
     expr: &ScalarExpr<FieldId>,
     filter: &Expr<'static, FieldId>,
 ) -> f64 {
-    let projections = vec![StreamProjection::computed(expr.clone(), "expr")];
+    let projections = vec![ScanProjection::computed(expr.clone(), "expr")];
     let mut total: f64 = 0.0;
 
     table

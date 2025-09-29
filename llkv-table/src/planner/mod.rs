@@ -21,7 +21,7 @@ use llkv_storage::pager::Pager;
 
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::scalar_eval::{NumericArrayMap, NumericKernels};
-use crate::table::{ScanStreamOptions, StreamProjection, Table};
+use crate::table::{ScanProjection, ScanStreamOptions, Table};
 use crate::types::FieldId;
 
 #[derive(Clone)]
@@ -60,7 +60,7 @@ where
 
     pub(crate) fn scan_stream_with_exprs<'expr, F>(
         &self,
-        projections: &[StreamProjection],
+    projections: &[ScanProjection],
         filter_expr: &Expr<'expr, FieldId>,
         options: ScanStreamOptions,
         mut on_batch: F,
@@ -86,7 +86,7 @@ where
 
         for proj in projections {
             match proj {
-                StreamProjection::Column(p) => {
+                ScanProjection::Column(p) => {
                     let lfid = p.logical_field_id;
                     if lfid.table_id() != self.table.table_id() {
                         return Err(Error::InvalidArgumentError(format!(
@@ -118,7 +118,7 @@ where
                         output_name,
                     }));
                 }
-                StreamProjection::Computed { expr, alias } => {
+                ScanProjection::Computed { expr, alias } => {
                     if alias.trim().is_empty() {
                         return Err(Error::InvalidArgumentError(
                             "Computed projection requires a non-empty alias".into(),
@@ -278,7 +278,7 @@ where
 
     fn try_single_column_direct_scan<'expr, F>(
         &self,
-        projections: &[StreamProjection],
+    projections: &[ScanProjection],
         filter_expr: &Expr<'expr, FieldId>,
         options: ScanStreamOptions,
         on_batch: &mut F,
@@ -291,7 +291,7 @@ where
         }
 
         match &projections[0] {
-            StreamProjection::Column(p) => {
+            ScanProjection::Column(p) => {
                 if p.logical_field_id.table_id() != self.table.table_id() {
                     return Err(Error::InvalidArgumentError(format!(
                         "Projection targets table {} but scan_stream is on table {}",
@@ -322,7 +322,7 @@ where
                 visitor.finish()?;
                 Ok(true)
             }
-            StreamProjection::Computed { expr, alias } => {
+            ScanProjection::Computed { expr, alias } => {
                 let simplified = NumericKernels::simplify(expr);
                 let mut fields_set: FxHashSet<FieldId> = FxHashSet::default();
                 NumericKernels::collect_fields(&simplified, &mut fields_set);

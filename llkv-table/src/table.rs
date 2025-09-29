@@ -35,7 +35,7 @@ pub struct ScanStreamOptions {
 }
 
 #[derive(Clone, Debug)]
-pub enum StreamProjection {
+pub enum ScanProjection {
     Column(Projection),
     Computed {
         expr: ScalarExpr<FieldId>,
@@ -43,7 +43,7 @@ pub enum StreamProjection {
     },
 }
 
-impl StreamProjection {
+impl ScanProjection {
     pub fn column<P: Into<Projection>>(proj: P) -> Self {
         Self::Column(proj.into())
     }
@@ -56,9 +56,21 @@ impl StreamProjection {
     }
 }
 
-impl From<Projection> for StreamProjection {
+impl From<Projection> for ScanProjection {
     fn from(value: Projection) -> Self {
-        StreamProjection::Column(value)
+        ScanProjection::Column(value)
+    }
+}
+
+impl From<&Projection> for ScanProjection {
+    fn from(value: &Projection) -> Self {
+        ScanProjection::Column(value.clone())
+    }
+}
+
+impl From<&ScanProjection> for ScanProjection {
+    fn from(value: &ScanProjection) -> Self {
+        value.clone()
     }
 }
 
@@ -118,27 +130,22 @@ where
     ///   `row_ids`.
     /// - Splits `row_ids` into fixed-size windows and gathers rows per
     ///   window to form a small `RecordBatch` that is sent to `on_batch`.
-    pub fn scan_stream<'a, F>(
-        &self,
-        projections: &[Projection],
-        filter_expr: &Expr<'a, FieldId>,
-        options: ScanStreamOptions,
-        on_batch: F,
-    ) -> LlkvResult<()>
+    pub fn scan_stream<'a, I, T, F>(&self, projections: I, filter_expr: &Expr<'a, FieldId>, options: ScanStreamOptions, on_batch: F) -> LlkvResult<()> 
     where
+        I: IntoIterator<Item = T>,
+        T: Into<ScanProjection>,
         F: FnMut(RecordBatch),
     {
-        let stream_projections: Vec<StreamProjection> = projections
-            .iter()
-            .cloned()
-            .map(StreamProjection::from)
+        let stream_projections: Vec<ScanProjection> = projections
+            .into_iter()
+            .map(|p| p.into())
             .collect();
         self.scan_stream_with_exprs(&stream_projections, filter_expr, options, on_batch)
     }
 
     pub fn scan_stream_with_exprs<'a, F>(
         &self,
-        projections: &[StreamProjection],
+        projections: &[ScanProjection],
         filter_expr: &Expr<'a, FieldId>,
         options: ScanStreamOptions,
         on_batch: F,
@@ -1377,8 +1384,8 @@ mod tests {
         const COL_A_U64: FieldId = 10;
 
         let projections = [
-            StreamProjection::column(proj(&table, COL_A_U64)),
-            StreamProjection::computed(
+            ScanProjection::column(proj(&table, COL_A_U64)),
+            ScanProjection::computed(
                 ScalarExpr::binary(
                     ScalarExpr::column(COL_A_U64),
                     BinaryOp::Multiply,
