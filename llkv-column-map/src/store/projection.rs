@@ -310,7 +310,7 @@ where
 
         let mut outputs = Vec::with_capacity(ctx.plans().len());
         for plan in ctx.plans() {
-            let array = crate::with_integer_arrow_type!(
+            let array = with_integer_arrow_type!(
                 plan.dtype.clone(),
                 |ArrowTy| {
                     Self::gather_rows_single_shot::<ArrowTy>(
@@ -539,7 +539,7 @@ where
 
             let mut outputs = Vec::with_capacity(ctx.plans().len());
             for plan in ctx.plans() {
-                let array = crate::with_integer_arrow_type!(
+                let array = with_integer_arrow_type!(
                     plan.dtype.clone(),
                     |ArrowTy| {
                         Self::gather_rows_from_chunks::<ArrowTy>(
