@@ -1,45 +1,34 @@
-name: CodSpeed Benchmarks
+name: CodSpeed Bench (self-hosted mac d17-4)
 
 on:
+  pull_request:
   push:
-    branches:
-      - "main"
-      - "dev"
-  pull_request: # so PRs get perf reports
-    types: [opened, synchronize, reopened, ready_for_review]
-  workflow_dispatch: # optional: allows CodSpeed to trigger backtests
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  benchmarks:
+  benches:
     # Only run this job for non-draft pull requests. We still want the job to run
     # for pushes and manual `workflow_dispatch` events. GitHub exposes
     # `github.event.pull_request.draft` (true for draft PRs), so require it to
     # be false when the event is a pull_request.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
-    name: Run Rust workspace benchmarks
-    # runs-on: ubuntu-latest
-    runs-on: codspeed-macro
+
+    runs-on: [self-hosted, d17-4]
 
     steps:
       - uses: actions/checkout@v4
 
-      # Sets up Rust + cache and installs the cargo-codspeed binary
-      - name: Setup Rust toolchain, cache, and cargo-codspeed
-        uses: moonrepo/setup-rust@v0
-        with:
-          channel: stable
-          cache-target: release
-          bins: cargo-codspeed
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      # Build all benches in the workspace with instrumentation
-      - name: Build CodSpeed benchmarks (workspace)
-        run: cargo codspeed build --workspace --all-features
+      - name: Install CodSpeed CLI
+        run: cargo install cargo-codspeed --locked
 
-      # Run all benches in the workspace and upload results to CodSpeed
-      - name: Run CodSpeed benchmarks
-        uses: CodSpeedHQ/action@v4
-        with:
-          mode: instrumentation
-          run: cargo codspeed run --workspace
-          # Required for private repos; optional for public
-          token: ${{ secrets.CODSPEED_TOKEN }}
+      - name: Build benches with CodSpeed
+        run: cargo codspeed build
+
+      - name: Run + upload to CodSpeed
+        env:
+          CODSPEED_TOKEN: ${{ secrets.CODSPEED_TOKEN }}
+        run: cargo codspeed run
