@@ -7,6 +7,16 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
+# Grant the minimum permissions required for the action to create PR comments.
+# By default GITHUB_TOKEN is read-only for many scopes; explicitly allow write
+# access to issues/pull-requests so Bencher can post comments on PRs.
+# Note: For runs triggered by forks, secrets (including GITHUB_TOKEN) are not
+# available and commenting will fail — this is a GitHub security restriction.
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
 jobs:
   benchmark_with_bencher:
     # Only run this job for non-draft pull requests. We still want the job to run
@@ -47,6 +57,11 @@ jobs:
 
       - uses: bencherdev/bencher@main
       - name: Run benches via Bencher
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false }}
         # Note: The `--github-actions` flag automatically creates a new comment on the PR
         # https://github.com/bencherdev/bencher?tab=readme-ov-file#comment-on-prs
         run: bencher run --github-actions "${{ secrets.GITHUB_TOKEN }}" "cargo bench"
+
+      - name: Run benches via Bencher (from fork)
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == true }}
+        run: bencher run "cargo bench"
