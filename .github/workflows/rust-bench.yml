@@ -15,7 +15,7 @@ jobs:
     # be false when the event is a pull_request.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
 
-    runs-on: [self-hosted, d17-4]
+    runs-on: [self-hosted, macOS, ARM64, d17-4]
 
     steps:
       - uses: actions/checkout@v4
