@@ -1,3 +1,8 @@
+// NOTE: rustfmt appears to repeatedly re-indent portions of some macros in
+// this file when running `cargo fmt` (likely a rustfmt bug). To avoid noisy
+// diffs and churn, skip automatic formatting on the affected macro_rules!
+// declarations. Keep the rest of the module formatted normally.
+
 use super::*;
 use rustc_hash::FxHashMap;
 
@@ -43,6 +48,7 @@ macro_rules! unsorted_with_rids_arm {
     }};
 }
 
+#[rustfmt::skip]
 macro_rules! dispatch_unsorted_visit {
     ($dtype:expr, $metas:ident, $blobs:ident, $visitor:ident) => {{
         let dtype_value = $dtype;
@@ -74,12 +80,13 @@ macro_rules! dispatch_unsorted_visit {
             };
         }
 
-        crate::llkv_for_each_arrow_numeric!(try_dispatch_unsorted);
+    llkv_for_each_arrow_numeric!(try_dispatch_unsorted);
 
         result.unwrap_or_else(|| Err(Error::Internal("unsorted_visit: unsupported dtype".into())))
     }};
 }
 
+#[rustfmt::skip]
 macro_rules! dispatch_unsorted_with_rids_visit {
     (
         $dtype:expr,
@@ -120,7 +127,7 @@ macro_rules! dispatch_unsorted_with_rids_visit {
             };
         }
 
-        crate::llkv_for_each_arrow_numeric!(try_dispatch_unsorted_with_rids);
+    llkv_for_each_arrow_numeric!(try_dispatch_unsorted_with_rids);
 
         result.unwrap_or_else(|| {
             Err(Error::Internal(
@@ -130,6 +137,7 @@ macro_rules! dispatch_unsorted_with_rids_visit {
     }};
 }
 
+#[rustfmt::skip]
 macro_rules! dispatch_unsorted_nulls {
     ($dtype:expr) => {{
         let dtype_value = $dtype;
@@ -158,7 +166,7 @@ macro_rules! dispatch_unsorted_nulls {
             };
         }
 
-        crate::llkv_for_each_arrow_numeric!(try_dispatch_unsorted_nulls);
+    llkv_for_each_arrow_numeric!(try_dispatch_unsorted_nulls);
 
         result.unwrap_or_else(|| {
             Err(Error::Internal(

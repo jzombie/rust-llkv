@@ -106,7 +106,7 @@ where
         let buffers = sorted::load_sorted_buffers(self.pager.as_ref(), &metas)?;
         let first_any =
             llkv_storage::serialization::deserialize_array(buffers.value_handle(0).clone())?;
-        crate::with_integer_arrow_type!(
+        with_integer_arrow_type!(
             first_any.data_type().clone(),
             |ArrowTy| {
                 <ArrowTy as sorted::SortedDispatch>::visit(
@@ -167,7 +167,7 @@ where
         let buffers = sorted::load_sorted_buffers(self.pager.as_ref(), &metas)?;
         let first_any =
             llkv_storage::serialization::deserialize_array(buffers.value_handle(0).clone())?;
-        crate::with_integer_arrow_type!(
+        with_integer_arrow_type!(
             first_any.data_type().clone(),
             |ArrowTy| {
                 <ArrowTy as sorted::SortedDispatch>::visit_rev(
@@ -338,7 +338,7 @@ where
                         opts.limit,
                         true,
                     );
-                    let vals_res = crate::with_integer_arrow_type!(
+                    let vals_res = with_integer_arrow_type!(
                         first_any.data_type().clone(),
                         |ArrowTy| {
                             <ArrowTy as sorted::SortedDispatch>::visit_with_rids_rev(
@@ -560,7 +560,7 @@ where
                         vals_res
                     }
                 } else {
-                    crate::with_integer_arrow_type!(
+                    with_integer_arrow_type!(
                         first_any.data_type().clone(),
                         |ArrowTy| {
                             <ArrowTy as sorted::SortedDispatch>::visit_with_rids_rev(
@@ -577,7 +577,7 @@ where
             } else if paginate {
                 let mut pv =
                     crate::store::scan::PaginateVisitor::new(visitor, opts.offset, opts.limit);
-                let vals_res = crate::with_integer_arrow_type!(
+                let vals_res = with_integer_arrow_type!(
                     first_any.data_type().clone(),
                     |ArrowTy| {
                         <ArrowTy as sorted::SortedDispatch>::visit_with_rids(
@@ -892,7 +892,7 @@ where
                 }
                 flush(&mut buf)?;
                 // Then emit values
-                crate::with_integer_arrow_type!(
+                with_integer_arrow_type!(
                     first_any.data_type().clone(),
                     |ArrowTy| {
                         <ArrowTy as sorted::SortedDispatch>::visit_with_rids(
@@ -907,7 +907,7 @@ where
                 )
             } else {
                 // Values first
-                let res = crate::with_integer_arrow_type!(
+                let res = with_integer_arrow_type!(
                     first_any.data_type().clone(),
                     |ArrowTy| {
                         <ArrowTy as sorted::SortedDispatch>::visit_with_rids(

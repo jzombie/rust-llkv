@@ -1437,7 +1437,7 @@ where
     P: Pager<Blob = EntryHandle>,
     V: PrimitiveSortedVisitor,
 {
-    crate::with_integer_arrow_type!(
+    with_integer_arrow_type!(
         dtype,
         |ArrowTy| <ArrowTy as SortedDispatch>::visit_bounds(pager, metas, buffers, ir, visitor),
         Err(Error::Internal("unsupported sorted dtype (builder)".into())),
@@ -1457,7 +1457,7 @@ where
     P: Pager<Blob = EntryHandle>,
     V: PrimitiveSortedWithRowIdsVisitor,
 {
-    crate::with_integer_arrow_type!(
+    with_integer_arrow_type!(
         dtype,
         |ArrowTy| {
             <ArrowTy as SortedDispatch>::visit_with_rids_bounds(

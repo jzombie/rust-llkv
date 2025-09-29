@@ -1,21 +1,14 @@
-pub mod store;
-pub mod types;
-
-pub use llkv_result::{Error, Result};
-pub use store::{
-    ColumnStore, IndexKind, ROW_ID_COLUMN_NAME,
-    scan::{self, ScanBuilder},
-};
-
-pub mod debug {
-    pub use super::store::debug::*;
-}
+// NOTE: rustfmt appears to repeatedly re-indent portions of some macros in
+// this file when running `cargo fmt` (likely a rustfmt bug). To avoid noisy
+// diffs and churn, skip automatic formatting on the affected macro_rules!
+// declarations. Keep the rest of the module formatted normally.
 
 /// Expands to the provided body with `$ty` bound to the concrete Arrow primitive type that
 /// matches the supplied `DataType`. Integer and floating-point primitives are supported; any
 /// other `DataType` triggers the `$unsupported` expression. This is used to avoid dynamic
 /// dispatch in hot paths like scans and row gathers.
 #[macro_export]
+#[rustfmt::skip]
 macro_rules! with_integer_arrow_type {
     ($dtype:expr, |$ty:ident| $body:expr, $unsupported:expr $(,)?) => {{
         use std::borrow::Borrow;
@@ -44,31 +37,15 @@ macro_rules! with_integer_arrow_type {
             };
         }
 
-        $crate::llkv_for_each_arrow_numeric!(__llkv_dispatch_integer_arrow_type);
+        llkv_for_each_arrow_numeric!(__llkv_dispatch_integer_arrow_type);
 
         result.unwrap_or_else(|| $unsupported)
     }};
 }
 
 /// Invokes `$macro` with metadata for each supported Arrow numeric primitive.
-///
-/// The callback receives the following tokens per invocation:
-///
-/// ```text
-/// $macro!(
-///     $base,               // identifier prefix (e.g. u64)
-///     $chunk_fn,           // chunk visitor method name (e.g. u64_chunk)
-///     $chunk_rids_fn,      // chunk-with-row-ids method name
-///     $run_fn,             // sorted run method name
-///     $run_rids_fn,        // sorted run-with-row-ids method name
-///     $array_ty,           // Arrow array type (e.g. arrow::array::UInt64Array)
-///     $physical_ty,        // Arrow physical type (e.g. arrow::datatypes::UInt64Type)
-///     $dtype_expr,         // arrow::datatypes::DataType variant expression
-///     $native_ty,          // native Rust value type (e.g. u64)
-///     $cast_expr           // expression that casts native values to f64
-/// );
-/// ```
 #[macro_export]
+#[rustfmt::skip]
 macro_rules! llkv_for_each_arrow_numeric {
     ($macro:ident) => {
         $macro!(
@@ -192,4 +169,17 @@ macro_rules! llkv_for_each_arrow_numeric {
             |v: f32| v as f64
         );
     };
+}
+
+pub mod store;
+pub mod types;
+
+pub use llkv_result::{Error, Result};
+pub use store::{
+    ColumnStore, IndexKind, ROW_ID_COLUMN_NAME,
+    scan::{self, ScanBuilder},
+};
+
+pub mod debug {
+    pub use super::store::debug::*;
 }

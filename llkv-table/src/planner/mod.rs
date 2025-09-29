@@ -1426,3 +1426,36 @@ fn is_supported_numeric(dtype: &DataType) -> bool {
             | DataType::Float32
     )
 }
+
+// Ensure macro_rules! definitions above are considered used by the compiler.
+// We do this by invoking `llkv_for_each_arrow_numeric!` with a tiny no-op
+// implementation macro inside a private module. This avoids exporting the
+// macros from this crate while preventing `unused_macros` warnings.
+mod __planner_macro_uses {
+    // Import the helper macro from the column-map crate.
+    use llkv_column_map::llkv_for_each_arrow_numeric;
+
+    // A no-op macro that matches the same shape as the impl_* macros and
+    // expands to nothing. It's only used here to exercise the macro_rules!
+    // definitions so the compiler treats them as referenced.
+    macro_rules! __planner_noop_impl {
+        (
+            $_base:ident,
+            $_chunk:ident,
+            $_chunk_with_rids:ident,
+            $_run:ident,
+            $_run_with_rids:ident,
+            $array_ty:ty,
+            $_arrow_ty:ty,
+            $_dtype:expr,
+            $_native_ty:ty,
+            $_cast:expr
+        ) => {};
+    }
+
+    // Invoke the dispatcher to expand `__planner_noop_impl` for each numeric
+    // type. The expansion is a no-op, but it counts as a use of the impl_*
+    // macros above because they are referenced indirectly by other macro
+    // expansions in this module.
+    llkv_for_each_arrow_numeric!(__planner_noop_impl);
+}

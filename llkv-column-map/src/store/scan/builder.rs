@@ -478,13 +478,13 @@ where
         where
             V: crate::store::scan::PrimitiveSortedVisitor,
         {
-            crate::llkv_for_each_arrow_numeric!(declare_sorted_range_filter_for_type);
+            llkv_for_each_arrow_numeric!(declare_sorted_range_filter_for_type);
         }
         impl<'v, V> crate::store::scan::PrimitiveSortedWithRowIdsVisitor for RangeAdapter<'v, V>
         where
             V: crate::store::scan::PrimitiveSortedWithRowIdsVisitor,
         {
-            crate::llkv_for_each_arrow_numeric!(declare_sorted_with_rids_range_filter_for_type);
+            llkv_for_each_arrow_numeric!(declare_sorted_with_rids_range_filter_for_type);
         }
 
         let mut adapter = RangeAdapter {
