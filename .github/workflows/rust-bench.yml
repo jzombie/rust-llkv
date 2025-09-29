@@ -20,21 +20,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Ensure the mounted runner path exists and provide a no-space symlink
-      # so subsequent steps can safely reference a path without spaces.
-      - name: Ensure runner mount path and create symlink
-        run: |
-          TARGET='/Volumes/2TB Storage Vault/github-actions-runner'
-          echo "Checking for runner target: $TARGET"
-          if [ ! -d "$TARGET" ]; then
-            echo "Target does not exist; creating directory (may be a placeholder until the volume is mounted)"
-            mkdir -p "$TARGET"
-          fi
-          # Create an always-available, no-space symlink for scripts to use.
-          ln -sfn "$TARGET" /opt/github-actions-runner || true
-          echo "/opt/github-actions-runner -> $(readlink /opt/github-actions-runner)"
-        shell: bash
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
