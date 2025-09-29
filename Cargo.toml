@@ -13,6 +13,7 @@ llkv-expr = { path = "./llkv-expr", version = "0.1.0-alpha" }
 llkv-result = { path = "./llkv-result", version = "0.1.0-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.1.0-alpha" }
 llkv-table = { path = "./llkv-table", version = "0.1.0-alpha" }
+llkv-plan = { path = "./llkv-plan", version = "0.1.0-alpha" }
 simd-r-drive = "0.15.0-alpha"
 simd-r-drive-entry-handle = "0.15.0-alpha"
 
@@ -42,6 +43,7 @@ members = [
     "llkv-column-map",
     # "llkv-csv",
     "llkv-expr",
+    "llkv-plan",
     "llkv-result",
     "llkv-storage",
     "llkv-table"

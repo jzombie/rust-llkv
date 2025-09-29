@@ -861,6 +861,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-plan"
+version = "0.1.0-alpha"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "llkv-result"
 version = "0.1.0-alpha"
 dependencies = [
@@ -894,15 +903,13 @@ dependencies = [
  "crossbeam-channel",
  "llkv-column-map",
  "llkv-expr",
+ "llkv-plan",
  "llkv-result",
  "llkv-storage",
  "rayon",
  "rustc-hash",
- "serde",
- "serde_json",
  "simd-r-drive-entry-handle",
  "tempfile",
- "thiserror",
 ]
 
 [[package]]
