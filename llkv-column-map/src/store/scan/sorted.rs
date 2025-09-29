@@ -756,10 +756,42 @@ pub(crate) trait SortedDispatch: ArrowPrimitiveType {
     where
         P: Pager<Blob = EntryHandle>,
         V: PrimitiveSortedWithRowIdsVisitor;
+
+    fn visit_bounds<P, V>(
+        pager: &P,
+        metas: &[ChunkMetadata],
+        buffers: &SortedChunkBuffers,
+        ir: &IntRanges,
+        visitor: &mut V,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+        V: PrimitiveSortedVisitor;
+
+    fn visit_with_rids_bounds<P, V>(
+        pager: &P,
+        metas_val: &[ChunkMetadata],
+        metas_rid: &[ChunkMetadata],
+        buffers: &SortedChunkBuffersWithRids,
+        ir: &IntRanges,
+        visitor: &mut V,
+    ) -> Result<()>
+    where
+        P: Pager<Blob = EntryHandle>,
+        V: PrimitiveSortedWithRowIdsVisitor;
 }
 
 macro_rules! impl_sorted_dispatch {
-    ($ty:ty, $visit:ident, $visit_rev:ident, $with_rids:ident, $with_rids_rev:ident) => {
+    (
+        $ty:ty,
+        $visit:ident,
+        $visit_rev:ident,
+        $with_rids:ident,
+        $with_rids_rev:ident,
+        $bounds:ident,
+        $bounds_with_rids:ident,
+        $range_field:ident
+    ) => {
         impl SortedDispatch for $ty {
             #[inline]
             fn visit<P, V>(
@@ -818,6 +850,43 @@ macro_rules! impl_sorted_dispatch {
             {
                 $with_rids_rev(pager, metas_val, metas_rid, buffers, visitor)
             }
+
+            #[inline]
+            fn visit_bounds<P, V>(
+                pager: &P,
+                metas: &[ChunkMetadata],
+                buffers: &SortedChunkBuffers,
+                ir: &IntRanges,
+                visitor: &mut V,
+            ) -> Result<()>
+            where
+                P: Pager<Blob = EntryHandle>,
+                V: PrimitiveSortedVisitor,
+            {
+                let bounds = ir
+                    .$range_field
+                    .unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                $bounds(pager, metas, buffers, bounds, visitor)
+            }
+
+            #[inline]
+            fn visit_with_rids_bounds<P, V>(
+                pager: &P,
+                metas_val: &[ChunkMetadata],
+                metas_rid: &[ChunkMetadata],
+                buffers: &SortedChunkBuffersWithRids,
+                ir: &IntRanges,
+                visitor: &mut V,
+            ) -> Result<()>
+            where
+                P: Pager<Blob = EntryHandle>,
+                V: PrimitiveSortedWithRowIdsVisitor,
+            {
+                let bounds = ir
+                    .$range_field
+                    .unwrap_or((Bound::Unbounded, Bound::Unbounded));
+                $bounds_with_rids(pager, metas_val, metas_rid, buffers, bounds, visitor)
+            }
         }
     };
 }
@@ -827,70 +896,100 @@ impl_sorted_dispatch!(
     sorted_visit_u64,
     sorted_visit_u64_rev,
     sorted_visit_with_rids_u64,
-    sorted_visit_with_rids_u64_rev
+    sorted_visit_with_rids_u64_rev,
+    sorted_visit_u64_bounds,
+    sorted_visit_with_rids_u64_bounds,
+    u64_r
 );
 impl_sorted_dispatch!(
     arrow::datatypes::UInt32Type,
     sorted_visit_u32,
     sorted_visit_u32_rev,
     sorted_visit_with_rids_u32,
-    sorted_visit_with_rids_u32_rev
+    sorted_visit_with_rids_u32_rev,
+    sorted_visit_u32_bounds,
+    sorted_visit_with_rids_u32_bounds,
+    u32_r
 );
 impl_sorted_dispatch!(
     arrow::datatypes::UInt16Type,
     sorted_visit_u16,
     sorted_visit_u16_rev,
     sorted_visit_with_rids_u16,
-    sorted_visit_with_rids_u16_rev
+    sorted_visit_with_rids_u16_rev,
+    sorted_visit_u16_bounds,
+    sorted_visit_with_rids_u16_bounds,
+    u16_r
 );
 impl_sorted_dispatch!(
     arrow::datatypes::UInt8Type,
     sorted_visit_u8,
     sorted_visit_u8_rev,
     sorted_visit_with_rids_u8,
-    sorted_visit_with_rids_u8_rev
+    sorted_visit_with_rids_u8_rev,
+    sorted_visit_u8_bounds,
+    sorted_visit_with_rids_u8_bounds,
+    u8_r
 );
 impl_sorted_dispatch!(
     arrow::datatypes::Int64Type,
     sorted_visit_i64,
     sorted_visit_i64_rev,
     sorted_visit_with_rids_i64,
-    sorted_visit_with_rids_i64_rev
+    sorted_visit_with_rids_i64_rev,
+    sorted_visit_i64_bounds,
+    sorted_visit_with_rids_i64_bounds,
+    i64_r
 );
 impl_sorted_dispatch!(
     arrow::datatypes::Int32Type,
     sorted_visit_i32,
     sorted_visit_i32_rev,
     sorted_visit_with_rids_i32,
-    sorted_visit_with_rids_i32_rev
+    sorted_visit_with_rids_i32_rev,
+    sorted_visit_i32_bounds,
+    sorted_visit_with_rids_i32_bounds,
+    i32_r
 );
 impl_sorted_dispatch!(
     arrow::datatypes::Int16Type,
     sorted_visit_i16,
     sorted_visit_i16_rev,
     sorted_visit_with_rids_i16,
-    sorted_visit_with_rids_i16_rev
+    sorted_visit_with_rids_i16_rev,
+    sorted_visit_i16_bounds,
+    sorted_visit_with_rids_i16_bounds,
+    i16_r
 );
 impl_sorted_dispatch!(
     arrow::datatypes::Int8Type,
     sorted_visit_i8,
     sorted_visit_i8_rev,
     sorted_visit_with_rids_i8,
-    sorted_visit_with_rids_i8_rev
+    sorted_visit_with_rids_i8_rev,
+    sorted_visit_i8_bounds,
+    sorted_visit_with_rids_i8_bounds,
+    i8_r
 );
 impl_sorted_dispatch!(
     arrow::datatypes::Float64Type,
     sorted_visit_f64,
     sorted_visit_f64_rev,
     sorted_visit_with_rids_f64,
-    sorted_visit_with_rids_f64_rev
+    sorted_visit_with_rids_f64_rev,
+    sorted_visit_f64_bounds,
+    sorted_visit_with_rids_f64_bounds,
+    f64_r
 );
 impl_sorted_dispatch!(
     arrow::datatypes::Float32Type,
     sorted_visit_f32,
     sorted_visit_f32_rev,
     sorted_visit_with_rids_f32,
-    sorted_visit_with_rids_f32_rev
+    sorted_visit_with_rids_f32_rev,
+    sorted_visit_f32_bounds,
+    sorted_visit_with_rids_f32_bounds,
+    f32_r
 );
 
 macro_rules! sorted_visit_bounds_impl {
@@ -1326,241 +1425,52 @@ sorted_with_rids_float_bounds_impl!(
     f32_run_with_rids
 );
 
-macro_rules! sorted_bounds_visit {
-    ($ir:expr, $field:ident, $func:ident, $pager:expr, $metas:expr, $buffers:expr, $visitor:expr) => {{
-        let (lb, ub) = $ir.$field.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-        $func($pager, $metas, $buffers, (lb, ub), $visitor)
-    }};
+fn dispatch_sorted_bounds<P, V>(
+    dtype: &DataType,
+    pager: &P,
+    metas: &[ChunkMetadata],
+    buffers: &SortedChunkBuffers,
+    ir: &IntRanges,
+    visitor: &mut V,
+) -> Result<()>
+where
+    P: Pager<Blob = EntryHandle>,
+    V: PrimitiveSortedVisitor,
+{
+    crate::with_integer_arrow_type!(
+        dtype,
+        |ArrowTy| <ArrowTy as SortedDispatch>::visit_bounds(pager, metas, buffers, ir, visitor),
+        Err(Error::Internal("unsupported sorted dtype (builder)".into())),
+    )
 }
 
-macro_rules! sorted_bounds_with_rids_visit {
-    (
-        $ir:expr,
-        $field:ident,
-        $func:ident,
-        $pager:expr,
-        $metas_val:expr,
-        $metas_rid:expr,
-        $buffers:expr,
-        $visitor:expr
-    ) => {{
-        let (lb, ub) = $ir.$field.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-        $func($pager, $metas_val, $metas_rid, $buffers, (lb, ub), $visitor)
-    }};
-}
-
-macro_rules! dispatch_sorted_bounds {
-    ($dtype:expr, $pager:expr, $metas:expr, $buffers:expr, $ir:expr, $visitor:expr) => {{
-        match $dtype {
-            DataType::UInt64 => sorted_bounds_visit!(
-                $ir,
-                u64_r,
-                sorted_visit_u64_bounds,
-                $pager,
-                $metas,
-                $buffers,
-                $visitor
-            ),
-            DataType::UInt32 => sorted_bounds_visit!(
-                $ir,
-                u32_r,
-                sorted_visit_u32_bounds,
-                $pager,
-                $metas,
-                $buffers,
-                $visitor
-            ),
-            DataType::UInt16 => sorted_bounds_visit!(
-                $ir,
-                u16_r,
-                sorted_visit_u16_bounds,
-                $pager,
-                $metas,
-                $buffers,
-                $visitor
-            ),
-            DataType::UInt8 => sorted_bounds_visit!(
-                $ir,
-                u8_r,
-                sorted_visit_u8_bounds,
-                $pager,
-                $metas,
-                $buffers,
-                $visitor
-            ),
-            DataType::Int64 => sorted_bounds_visit!(
-                $ir,
-                i64_r,
-                sorted_visit_i64_bounds,
-                $pager,
-                $metas,
-                $buffers,
-                $visitor
-            ),
-            DataType::Int32 => sorted_bounds_visit!(
-                $ir,
-                i32_r,
-                sorted_visit_i32_bounds,
-                $pager,
-                $metas,
-                $buffers,
-                $visitor
-            ),
-            DataType::Int16 => sorted_bounds_visit!(
-                $ir,
-                i16_r,
-                sorted_visit_i16_bounds,
-                $pager,
-                $metas,
-                $buffers,
-                $visitor
-            ),
-            DataType::Int8 => sorted_bounds_visit!(
-                $ir,
-                i8_r,
-                sorted_visit_i8_bounds,
-                $pager,
-                $metas,
-                $buffers,
-                $visitor
-            ),
-            DataType::Float64 => sorted_bounds_visit!(
-                $ir,
-                f64_r,
-                sorted_visit_f64_bounds,
-                $pager,
-                $metas,
-                $buffers,
-                $visitor
-            ),
-            DataType::Float32 => sorted_bounds_visit!(
-                $ir,
-                f32_r,
-                sorted_visit_f32_bounds,
-                $pager,
-                $metas,
-                $buffers,
-                $visitor
-            ),
-            _ => Err(Error::Internal("unsupported sorted dtype (builder)".into())),
-        }
-    }};
-}
-
-macro_rules! dispatch_sorted_with_rids_bounds {
-    (
-        $dtype:expr,
-        $pager:expr,
-        $metas_val:expr,
-        $metas_rid:expr,
-        $buffers:expr,
-        $ir:expr,
-        $visitor:expr
-    ) => {{
-        match $dtype {
-            DataType::UInt64 => sorted_bounds_with_rids_visit!(
-                $ir,
-                u64_r,
-                sorted_visit_with_rids_u64_bounds,
-                $pager,
-                $metas_val,
-                $metas_rid,
-                $buffers,
-                $visitor
-            ),
-            DataType::UInt32 => sorted_bounds_with_rids_visit!(
-                $ir,
-                u32_r,
-                sorted_visit_with_rids_u32_bounds,
-                $pager,
-                $metas_val,
-                $metas_rid,
-                $buffers,
-                $visitor
-            ),
-            DataType::UInt16 => sorted_bounds_with_rids_visit!(
-                $ir,
-                u16_r,
-                sorted_visit_with_rids_u16_bounds,
-                $pager,
-                $metas_val,
-                $metas_rid,
-                $buffers,
-                $visitor
-            ),
-            DataType::UInt8 => sorted_bounds_with_rids_visit!(
-                $ir,
-                u8_r,
-                sorted_visit_with_rids_u8_bounds,
-                $pager,
-                $metas_val,
-                $metas_rid,
-                $buffers,
-                $visitor
-            ),
-            DataType::Int64 => sorted_bounds_with_rids_visit!(
-                $ir,
-                i64_r,
-                sorted_visit_with_rids_i64_bounds,
-                $pager,
-                $metas_val,
-                $metas_rid,
-                $buffers,
-                $visitor
-            ),
-            DataType::Int32 => sorted_bounds_with_rids_visit!(
-                $ir,
-                i32_r,
-                sorted_visit_with_rids_i32_bounds,
-                $pager,
-                $metas_val,
-                $metas_rid,
-                $buffers,
-                $visitor
-            ),
-            DataType::Int16 => sorted_bounds_with_rids_visit!(
-                $ir,
-                i16_r,
-                sorted_visit_with_rids_i16_bounds,
-                $pager,
-                $metas_val,
-                $metas_rid,
-                $buffers,
-                $visitor
-            ),
-            DataType::Int8 => sorted_bounds_with_rids_visit!(
-                $ir,
-                i8_r,
-                sorted_visit_with_rids_i8_bounds,
-                $pager,
-                $metas_val,
-                $metas_rid,
-                $buffers,
-                $visitor
-            ),
-            DataType::Float64 => sorted_bounds_with_rids_visit!(
-                $ir,
-                f64_r,
-                sorted_visit_with_rids_f64_bounds,
-                $pager,
-                $metas_val,
-                $metas_rid,
-                $buffers,
-                $visitor
-            ),
-            DataType::Float32 => sorted_bounds_with_rids_visit!(
-                $ir,
-                f32_r,
-                sorted_visit_with_rids_f32_bounds,
-                $pager,
-                $metas_val,
-                $metas_rid,
-                $buffers,
-                $visitor
-            ),
-            _ => Err(Error::Internal("unsupported sorted dtype (builder)".into())),
-        }
-    }};
+fn dispatch_sorted_with_rids_bounds<P, V>(
+    dtype: &DataType,
+    pager: &P,
+    metas_val: &[ChunkMetadata],
+    metas_rid: &[ChunkMetadata],
+    buffers: &SortedChunkBuffersWithRids,
+    ir: &IntRanges,
+    visitor: &mut V,
+) -> Result<()>
+where
+    P: Pager<Blob = EntryHandle>,
+    V: PrimitiveSortedWithRowIdsVisitor,
+{
+    crate::with_integer_arrow_type!(
+        dtype,
+        |ArrowTy| {
+            <ArrowTy as SortedDispatch>::visit_with_rids_bounds(
+                pager,
+                metas_val,
+                metas_rid,
+                buffers,
+                ir,
+                visitor,
+            )
+        },
+        Err(Error::Internal("unsupported sorted dtype (builder)".into())),
+    )
 }
 
 pub fn range_sorted_dispatch<P, V>(
@@ -1643,25 +1553,25 @@ where
     if opts.with_row_ids {
         let buffers = load_sorted_buffers_with_rids(store.pager.as_ref(), &metas_val, &metas_rid)?;
         let first_any = deserialize_array(buffers.base().value_handle(0).clone())?;
-        dispatch_sorted_with_rids_bounds!(
+        dispatch_sorted_with_rids_bounds(
             first_any.data_type(),
             store.pager.as_ref(),
             &metas_val,
             &metas_rid,
             &buffers,
-            ir,
-            visitor
+            &ir,
+            visitor,
         )
     } else {
         let buffers = load_sorted_buffers(store.pager.as_ref(), &metas_val)?;
         let first_any = deserialize_array(buffers.value_handle(0).clone())?;
-        dispatch_sorted_bounds!(
+        dispatch_sorted_bounds(
             first_any.data_type(),
             store.pager.as_ref(),
             &metas_val,
             &buffers,
-            ir,
-            visitor
+            &ir,
+            visitor,
         )
     }
 }

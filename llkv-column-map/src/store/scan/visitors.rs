@@ -1,157 +1,104 @@
 use super::*;
 
+macro_rules! declare_primitive_trait_methods {
+    (
+        $base:ident,
+        $chunk_fn:ident,
+        $chunk_with_rids_fn:ident,
+        $run_fn:ident,
+        $run_with_rids_fn:ident,
+        $array_ty:ty,
+        $physical_ty:ty,
+        $dtype:expr,
+        $native_ty:ty,
+        $cast_expr:expr
+    ) => {
+        fn $chunk_fn(&mut self, _a: &$array_ty) {
+            unimplemented!(concat!("`", stringify!($chunk_fn), "` not implemented"))
+        }
+    };
+}
+
+macro_rules! declare_primitive_with_rids_trait_methods {
+    (
+        $base:ident,
+        $chunk_fn:ident,
+        $chunk_with_rids_fn:ident,
+        $run_fn:ident,
+        $run_with_rids_fn:ident,
+        $array_ty:ty,
+        $physical_ty:ty,
+        $dtype:expr,
+        $native_ty:ty,
+        $cast_expr:expr
+    ) => {
+        fn $chunk_with_rids_fn(&mut self, _v: &$array_ty, _r: &UInt64Array) {
+            unimplemented!(concat!("`", stringify!($chunk_with_rids_fn), "` not implemented"))
+        }
+    };
+}
+
+macro_rules! declare_sorted_trait_methods {
+    (
+        $base:ident,
+        $chunk_fn:ident,
+        $chunk_with_rids_fn:ident,
+        $run_fn:ident,
+        $run_with_rids_fn:ident,
+        $array_ty:ty,
+        $physical_ty:ty,
+        $dtype:expr,
+        $native_ty:ty,
+        $cast_expr:expr
+    ) => {
+        fn $run_fn(&mut self, _a: &$array_ty, _start: usize, _len: usize) {
+            unimplemented!(concat!("`", stringify!($run_fn), "` not implemented"))
+        }
+    };
+}
+
+macro_rules! declare_sorted_with_rids_trait_methods {
+    (
+        $base:ident,
+        $chunk_fn:ident,
+        $chunk_with_rids_fn:ident,
+        $run_fn:ident,
+        $run_with_rids_fn:ident,
+        $array_ty:ty,
+        $physical_ty:ty,
+        $dtype:expr,
+        $native_ty:ty,
+        $cast_expr:expr
+    ) => {
+        fn $run_with_rids_fn(
+            &mut self,
+            _v: &$array_ty,
+            _r: &UInt64Array,
+            _start: usize,
+            _len: usize,
+        ) {
+        }
+    };
+}
+
 /// Unsorted primitive visitor: one callback per chunk per type.
 pub trait PrimitiveVisitor {
-    fn u64_chunk(&mut self, _a: &UInt64Array) {
-        unimplemented!("`u64_chunk` not implemented")
-    }
-    fn u32_chunk(&mut self, _a: &UInt32Array) {
-        unimplemented!("`u32_chunk` not implemented")
-    }
-    fn u16_chunk(&mut self, _a: &UInt16Array) {
-        unimplemented!("`u16_chunk` not implemented")
-    }
-    fn u8_chunk(&mut self, _a: &UInt8Array) {
-        unimplemented!("`u8_chunk` not implemented")
-    }
-    fn i64_chunk(&mut self, _a: &Int64Array) {
-        unimplemented!("`i64_chunk` not implemented")
-    }
-    fn i32_chunk(&mut self, _a: &Int32Array) {
-        unimplemented!("`i32_chunk` not implemented")
-    }
-    fn i16_chunk(&mut self, _a: &Int16Array) {
-        unimplemented!("`i16_chunk` not implemented")
-    }
-    fn i8_chunk(&mut self, _a: &Int8Array) {
-        unimplemented!("`i8_chunk` not implemented")
-    }
-    fn f64_chunk(&mut self, _a: &Float64Array) {
-        unimplemented!("`f64_chunk` not implemented")
-    }
-    fn f32_chunk(&mut self, _a: &Float32Array) {
-        unimplemented!("`f32_chunk` not implemented")
-    }
+    crate::llkv_for_each_arrow_numeric!(declare_primitive_trait_methods);
 }
 
 /// Unsorted primitive visitor with row ids (u64).
 pub trait PrimitiveWithRowIdsVisitor {
-    fn u64_chunk_with_rids(&mut self, _v: &UInt64Array, _r: &UInt64Array) {
-        unimplemented!("`u64_chunk_with_rids` not implemented")
-    }
-    fn u32_chunk_with_rids(&mut self, _v: &UInt32Array, _r: &UInt64Array) {
-        unimplemented!("`u32_chunk_with_rids` not implemented")
-    }
-    fn u16_chunk_with_rids(&mut self, _v: &UInt16Array, _r: &UInt64Array) {
-        unimplemented!("`u16_chunk_with_rids` not implemented")
-    }
-    fn u8_chunk_with_rids(&mut self, _v: &UInt8Array, _r: &UInt64Array) {
-        unimplemented!("`u8_chunk_with_rids` not implemented")
-    }
-    fn i64_chunk_with_rids(&mut self, _v: &Int64Array, _r: &UInt64Array) {
-        unimplemented!("`i64_chunk_with_rids` not implemented")
-    }
-    fn i32_chunk_with_rids(&mut self, _v: &Int32Array, _r: &UInt64Array) {
-        unimplemented!("`i32_chunk_with_rids` not implemented")
-    }
-    fn i16_chunk_with_rids(&mut self, _v: &Int16Array, _r: &UInt64Array) {
-        unimplemented!("`i16_chunk_with_rids` not implemented")
-    }
-    fn i8_chunk_with_rids(&mut self, _v: &Int8Array, _r: &UInt64Array) {
-        unimplemented!("`i8_chunk_with_rids` not implemented")
-    }
-    fn f64_chunk_with_rids(&mut self, _v: &Float64Array, _r: &UInt64Array) {
-        unimplemented!("`f64_chunk_with_rids` not implemented")
-    }
-    fn f32_chunk_with_rids(&mut self, _v: &Float32Array, _r: &UInt64Array) {
-        unimplemented!("`f32_chunk_with_rids` not implemented")
-    }
+    crate::llkv_for_each_arrow_numeric!(declare_primitive_with_rids_trait_methods);
 }
 
 /// Sorted visitor fed with coalesced runs (start,len) within a typed array.
 pub trait PrimitiveSortedVisitor {
-    fn u64_run(&mut self, _a: &UInt64Array, _start: usize, _len: usize) {
-        unimplemented!("`u64_run` not implemented")
-    }
-    fn u32_run(&mut self, _a: &UInt32Array, _start: usize, _len: usize) {
-        unimplemented!("`u32_run` not implemented")
-    }
-    fn u16_run(&mut self, _a: &UInt16Array, _start: usize, _len: usize) {
-        unimplemented!("`u16_run` not implemented")
-    }
-    fn u8_run(&mut self, _a: &UInt8Array, _start: usize, _len: usize) {
-        unimplemented!("`u8_run` not implemented")
-    }
-    fn i64_run(&mut self, _a: &Int64Array, _start: usize, _len: usize) {
-        unimplemented!("`i64_run` not implemented")
-    }
-    fn i32_run(&mut self, _a: &Int32Array, _start: usize, _len: usize) {
-        unimplemented!("`i32_run` not implemented")
-    }
-    fn i16_run(&mut self, _a: &Int16Array, _start: usize, _len: usize) {
-        unimplemented!("`i16_run` not implemented")
-    }
-    fn i8_run(&mut self, _a: &Int8Array, _start: usize, _len: usize) {
-        unimplemented!("`i8_run` not implemented")
-    }
-    fn f64_run(&mut self, _a: &Float64Array, _start: usize, _len: usize) {
-        unimplemented!("`f64_run` not implemented")
-    }
-    fn f32_run(&mut self, _a: &Float32Array, _start: usize, _len: usize) {
-        unimplemented!("`f32_run` not implemented")
-    }
+    crate::llkv_for_each_arrow_numeric!(declare_sorted_trait_methods);
 }
 
 /// Sorted visitor with row ids.
 pub trait PrimitiveSortedWithRowIdsVisitor {
-    fn u64_run_with_rids(
-        &mut self,
-        _v: &UInt64Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-    }
-    fn u32_run_with_rids(
-        &mut self,
-        _v: &UInt32Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-    }
-    fn u16_run_with_rids(
-        &mut self,
-        _v: &UInt16Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-    }
-    fn u8_run_with_rids(&mut self, _v: &UInt8Array, _r: &UInt64Array, _start: usize, _len: usize) {}
-    fn i64_run_with_rids(&mut self, _v: &Int64Array, _r: &UInt64Array, _start: usize, _len: usize) {
-    }
-    fn i32_run_with_rids(&mut self, _v: &Int32Array, _r: &UInt64Array, _start: usize, _len: usize) {
-    }
-    fn i16_run_with_rids(&mut self, _v: &Int16Array, _r: &UInt64Array, _start: usize, _len: usize) {
-    }
-    fn i8_run_with_rids(&mut self, _v: &Int8Array, _r: &UInt64Array, _start: usize, _len: usize) {}
-    fn f64_run_with_rids(
-        &mut self,
-        _v: &Float64Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-    }
-    fn f32_run_with_rids(
-        &mut self,
-        _v: &Float32Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-    }
+    crate::llkv_for_each_arrow_numeric!(declare_sorted_with_rids_trait_methods);
     /// Null-only run: values are missing; emits only row_ids.
     fn null_run(&mut self, _r: &UInt64Array, _start: usize, _len: usize) {}
 }
@@ -242,20 +189,28 @@ macro_rules! impl_unsorted_paginate_for_type {
     };
 }
 
+macro_rules! expand_unsorted_paginate {
+    (
+        $base:ident,
+        $chunk_fn:ident,
+        $chunk_with_rids_fn:ident,
+        $run_fn:ident,
+        $run_with_rids_fn:ident,
+        $array_ty:ty,
+        $physical_ty:ty,
+        $dtype:expr,
+        $native_ty:ty,
+        $cast_expr:expr
+    ) => {
+        impl_unsorted_paginate_for_type!($chunk_fn, $array_ty);
+    };
+}
+
 impl<'a, V> PrimitiveVisitor for PaginateVisitor<'a, V>
 where
     V: PrimitiveVisitor,
 {
-    impl_unsorted_paginate_for_type!(u64_chunk, UInt64Array);
-    impl_unsorted_paginate_for_type!(u32_chunk, UInt32Array);
-    impl_unsorted_paginate_for_type!(u16_chunk, UInt16Array);
-    impl_unsorted_paginate_for_type!(u8_chunk, UInt8Array);
-    impl_unsorted_paginate_for_type!(i64_chunk, Int64Array);
-    impl_unsorted_paginate_for_type!(i32_chunk, Int32Array);
-    impl_unsorted_paginate_for_type!(i16_chunk, Int16Array);
-    impl_unsorted_paginate_for_type!(i8_chunk, Int8Array);
-    impl_unsorted_paginate_for_type!(f64_chunk, Float64Array);
-    impl_unsorted_paginate_for_type!(f32_chunk, Float32Array);
+    crate::llkv_for_each_arrow_numeric!(expand_unsorted_paginate);
 }
 
 macro_rules! impl_unsorted_with_rids_paginate_for_type {
@@ -277,20 +232,28 @@ macro_rules! impl_unsorted_with_rids_paginate_for_type {
     };
 }
 
+macro_rules! expand_unsorted_with_rids_paginate {
+    (
+        $base:ident,
+        $chunk_fn:ident,
+        $chunk_with_rids_fn:ident,
+        $run_fn:ident,
+        $run_with_rids_fn:ident,
+        $array_ty:ty,
+        $physical_ty:ty,
+        $dtype:expr,
+        $native_ty:ty,
+        $cast_expr:expr
+    ) => {
+        impl_unsorted_with_rids_paginate_for_type!($chunk_with_rids_fn, $array_ty);
+    };
+}
+
 impl<'a, V> PrimitiveWithRowIdsVisitor for PaginateVisitor<'a, V>
 where
     V: PrimitiveWithRowIdsVisitor,
 {
-    impl_unsorted_with_rids_paginate_for_type!(u64_chunk_with_rids, UInt64Array);
-    impl_unsorted_with_rids_paginate_for_type!(u32_chunk_with_rids, UInt32Array);
-    impl_unsorted_with_rids_paginate_for_type!(u16_chunk_with_rids, UInt16Array);
-    impl_unsorted_with_rids_paginate_for_type!(u8_chunk_with_rids, UInt8Array);
-    impl_unsorted_with_rids_paginate_for_type!(i64_chunk_with_rids, Int64Array);
-    impl_unsorted_with_rids_paginate_for_type!(i32_chunk_with_rids, Int32Array);
-    impl_unsorted_with_rids_paginate_for_type!(i16_chunk_with_rids, Int16Array);
-    impl_unsorted_with_rids_paginate_for_type!(i8_chunk_with_rids, Int8Array);
-    impl_unsorted_with_rids_paginate_for_type!(f64_chunk_with_rids, Float64Array);
-    impl_unsorted_with_rids_paginate_for_type!(f32_chunk_with_rids, Float32Array);
+    crate::llkv_for_each_arrow_numeric!(expand_unsorted_with_rids_paginate);
 }
 
 macro_rules! impl_sorted_paginate_for_type {
@@ -315,20 +278,28 @@ macro_rules! impl_sorted_paginate_for_type {
     };
 }
 
+macro_rules! expand_sorted_paginate {
+    (
+        $base:ident,
+        $chunk_fn:ident,
+        $chunk_with_rids_fn:ident,
+        $run_fn:ident,
+        $run_with_rids_fn:ident,
+        $array_ty:ty,
+        $physical_ty:ty,
+        $dtype:expr,
+        $native_ty:ty,
+        $cast_expr:expr
+    ) => {
+        impl_sorted_paginate_for_type!($run_fn, $array_ty);
+    };
+}
+
 impl<'a, V> PrimitiveSortedVisitor for PaginateVisitor<'a, V>
 where
     V: PrimitiveSortedVisitor,
 {
-    impl_sorted_paginate_for_type!(u64_run, UInt64Array);
-    impl_sorted_paginate_for_type!(u32_run, UInt32Array);
-    impl_sorted_paginate_for_type!(u16_run, UInt16Array);
-    impl_sorted_paginate_for_type!(u8_run, UInt8Array);
-    impl_sorted_paginate_for_type!(i64_run, Int64Array);
-    impl_sorted_paginate_for_type!(i32_run, Int32Array);
-    impl_sorted_paginate_for_type!(i16_run, Int16Array);
-    impl_sorted_paginate_for_type!(i8_run, Int8Array);
-    impl_sorted_paginate_for_type!(f64_run, Float64Array);
-    impl_sorted_paginate_for_type!(f32_run, Float32Array);
+    crate::llkv_for_each_arrow_numeric!(expand_sorted_paginate);
 }
 
 macro_rules! impl_sorted_with_rids_paginate_for_type {
@@ -351,20 +322,28 @@ macro_rules! impl_sorted_with_rids_paginate_for_type {
     };
 }
 
+macro_rules! expand_sorted_with_rids_paginate {
+    (
+        $base:ident,
+        $chunk_fn:ident,
+        $chunk_with_rids_fn:ident,
+        $run_fn:ident,
+        $run_with_rids_fn:ident,
+        $array_ty:ty,
+        $physical_ty:ty,
+        $dtype:expr,
+        $native_ty:ty,
+        $cast_expr:expr
+    ) => {
+        impl_sorted_with_rids_paginate_for_type!($run_with_rids_fn, $array_ty);
+    };
+}
+
 impl<'a, V> PrimitiveSortedWithRowIdsVisitor for PaginateVisitor<'a, V>
 where
     V: PrimitiveSortedWithRowIdsVisitor,
 {
-    impl_sorted_with_rids_paginate_for_type!(u64_run_with_rids, UInt64Array);
-    impl_sorted_with_rids_paginate_for_type!(u32_run_with_rids, UInt32Array);
-    impl_sorted_with_rids_paginate_for_type!(u16_run_with_rids, UInt16Array);
-    impl_sorted_with_rids_paginate_for_type!(u8_run_with_rids, UInt8Array);
-    impl_sorted_with_rids_paginate_for_type!(i64_run_with_rids, Int64Array);
-    impl_sorted_with_rids_paginate_for_type!(i32_run_with_rids, Int32Array);
-    impl_sorted_with_rids_paginate_for_type!(i16_run_with_rids, Int16Array);
-    impl_sorted_with_rids_paginate_for_type!(i8_run_with_rids, Int8Array);
-    impl_sorted_with_rids_paginate_for_type!(f64_run_with_rids, Float64Array);
-    impl_sorted_with_rids_paginate_for_type!(f32_run_with_rids, Float32Array);
+    crate::llkv_for_each_arrow_numeric!(expand_sorted_with_rids_paginate);
     fn null_run(&mut self, r: &UInt64Array, start: usize, len: usize) {
         if self.done() {
             return;
