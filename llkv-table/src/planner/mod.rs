@@ -14,7 +14,7 @@ use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_expr::literal::{FromLiteral, Literal};
-use llkv_expr::typed_predicate::{build_fixed_width_predicate, build_var_width_predicate};
+use llkv_expr::typed_predicate::{build_fixed_width_predicate, build_var_width_predicate, PredicateValue};
 use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1103,12 +1103,14 @@ where
     ) -> LlkvResult<Vec<u64>>
     where
         T: FilterPrimitive,
-        T::Native: FromLiteral + Copy,
+        T::Native: FromLiteral + Copy + PredicateValue,
     {
         let predicate = build_fixed_width_predicate::<T>(op).map_err(Error::predicate_build)?;
         self.table
             .store()
-            .filter_row_ids::<T, _>(field_id, move |value| predicate.matches(value))
+            .filter_row_ids::<T, _>(field_id, move |value| {
+                predicate.matches(<T::Native as PredicateValue>::borrowed(&value))
+            })
     }
 
     fn collect_matching_row_ids_string<O>(
