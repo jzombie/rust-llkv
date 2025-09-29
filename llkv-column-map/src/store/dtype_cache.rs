@@ -93,7 +93,7 @@ where
             })
             .ok_or(Error::NotFound)?;
         let mut desc =
-            crate::store::descriptor::ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+            crate::store::descriptor::ColumnDescriptor::decode_rkyv(desc_blob.as_ref())?;
 
         // If descriptor carries a fingerprint, try to fast-path known monomorphized types.
         let fp = Self::desc_dtype_fingerprint(&desc);
@@ -138,7 +138,7 @@ where
         let fp_new = Self::dtype_fingerprint(&dt);
         if fp_new != fp {
             Self::set_desc_dtype_fingerprint(&mut desc, fp_new);
-            let updated = desc.to_le_bytes();
+            let updated = desc.encode_rkyv()?;
             let _ = self.pager.batch_put(&[BatchPut::Raw {
                 key: descriptor_pk,
                 bytes: updated,

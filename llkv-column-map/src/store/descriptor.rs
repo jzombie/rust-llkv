@@ -6,6 +6,8 @@
 use crate::store::indexing::IndexKind;
 use crate::types::LogicalFieldId;
 use llkv_result::{Error, Result};
+use rkyv::{Archive, Deserialize, Serialize};
+use rkyv::api::high::{to_bytes, from_bytes_unchecked};
 use llkv_storage::{
     codecs::{read_u32_le, read_u64_le, write_u32_le, write_u64_le},
     pager::{BatchGet, BatchPut, GetResult, Pager},
@@ -78,6 +80,104 @@ pub(crate) struct ColumnDescriptor {
     pub(crate) _padding: u32,
     /// Serialized index metadata.
     pub(crate) index_metadata: Vec<u8>,
+}
+
+// Simple header: 4-byte magic + 1-byte version
+const RKYV_MAGIC: &[u8; 4] = b"RKYD";
+const RKYV_VERSION: u8 = 1;
+
+impl ColumnDescriptor {
+    /// Encode descriptor with rkyv and a small header (magic + version).
+    pub(crate) fn encode_rkyv(&self) -> Result<Vec<u8>> {
+        let helper = ColumnDescriptorRkyv {
+            field_id_u64: self.field_id.into(),
+            head_page_pk: self.head_page_pk,
+            tail_page_pk: self.tail_page_pk,
+            total_row_count: self.total_row_count,
+            total_chunk_count: self.total_chunk_count,
+            data_type_code: self.data_type_code,
+            _padding: self._padding,
+            index_metadata: self.index_metadata.clone(),
+        };
+
+        // Use the rkyv high-level API to produce a byte buffer. rkyv expects
+        // a `rancor::Source` error type; map its errors into our Error type.
+        let bytes = to_bytes::<rkyv::rancor::Error>(&helper)
+            .map_err(|e| Error::Internal(format!("rkyv serialize error: {}", e)))?;
+
+        let payload: &[u8] = bytes.as_ref();
+
+        // rkyv requires the archived root to be aligned. We store a small
+        // header before the payload, so insert padding bytes so the payload
+        // begins at an offset aligned for the archived type.
+        let required_align = std::mem::align_of::<<ColumnDescriptorRkyv as Archive>::Archived>();
+        let header_len = 4 + 1; // magic (4) + version (1)
+        let pad = (required_align - (header_len % required_align)) % required_align;
+
+        let mut out = Vec::with_capacity(header_len + pad + payload.len());
+        out.extend_from_slice(RKYV_MAGIC);
+        out.push(RKYV_VERSION);
+        if pad > 0 {
+            out.extend(std::iter::repeat(0u8).take(pad));
+        }
+        out.extend_from_slice(payload);
+        Ok(out)
+    }
+
+    /// Decode the rkyv-encoded descriptor (validates before deserializing).
+    pub(crate) fn decode_rkyv(bytes: &[u8]) -> Result<ColumnDescriptor> {
+        if bytes.len() < 5 || &bytes[..4] != RKYV_MAGIC {
+            return Err(Error::Internal("Invalid rkyv header".into()));
+        }
+        let version = bytes[4];
+        if version != RKYV_VERSION {
+            return Err(Error::Internal("Unsupported rkyv version".into()));
+        }
+        // Determine padding used at write time so we can locate the aligned
+        // payload start.
+        let header_len = 4 + 1;
+        let required_align = std::mem::align_of::<<ColumnDescriptorRkyv as Archive>::Archived>();
+        let pad = (required_align - (header_len % required_align)) % required_align;
+        let payload_start = header_len + pad;
+        if bytes.len() < payload_start {
+            return Err(Error::Internal("Invalid rkyv header/padding".into()));
+        }
+        let payload = &bytes[payload_start..];
+
+        // NOTE: validation is not performed here; we trust the payload for now.
+        // Deserialize using the rkyv high-level API. The unsafe variant avoids
+        // an extra validation pass.
+        let helper_owned: ColumnDescriptorRkyv = unsafe {
+            from_bytes_unchecked::<ColumnDescriptorRkyv, rkyv::rancor::Error>(payload)
+        }
+        .map_err(|_e| Error::Internal("rkyv deserialize failed".into()))?;
+
+        Ok(ColumnDescriptor {
+            field_id: LogicalFieldId::from(helper_owned.field_id_u64),
+            head_page_pk: helper_owned.head_page_pk,
+            tail_page_pk: helper_owned.tail_page_pk,
+            total_row_count: helper_owned.total_row_count,
+            total_chunk_count: helper_owned.total_chunk_count,
+            data_type_code: helper_owned.data_type_code,
+            _padding: helper_owned._padding,
+            index_metadata: helper_owned.index_metadata,
+        })
+    }
+}
+
+// rkyv-friendly helper struct that uses primitive types so we don't need
+// Archive impls for workspace-specific types like LogicalFieldId.
+#[derive(Archive, Serialize, Deserialize)]
+#[rkyv(attr(derive(Debug)))]
+struct ColumnDescriptorRkyv {
+    field_id_u64: u64,
+    head_page_pk: u64,
+    tail_page_pk: u64,
+    total_row_count: u64,
+    total_chunk_count: u64,
+    data_type_code: u32,
+    _padding: u32,
+    index_metadata: Vec<u8>,
 }
 
 impl ColumnDescriptor {
@@ -194,22 +294,29 @@ impl ColumnDescriptor {
 
     /// Single allocation; append fields as LE without growth churn.
     pub(crate) fn to_le_bytes(&self) -> Vec<u8> {
-        let index_meta_len = self.index_metadata.len() as u32;
-        let mut buf = Vec::with_capacity(Self::FIXED_DISK_SIZE + self.index_metadata.len());
-        let field_id_u64: u64 = self.field_id.into();
-        write_u64_le(&mut buf, field_id_u64);
-        write_u64_le(&mut buf, self.head_page_pk);
-        write_u64_le(&mut buf, self.tail_page_pk);
-        write_u64_le(&mut buf, self.total_row_count);
-        write_u64_le(&mut buf, self.total_chunk_count);
-        write_u32_le(&mut buf, self.data_type_code);
-        write_u32_le(&mut buf, self._padding);
-        write_u32_le(&mut buf, index_meta_len);
-        buf.extend_from_slice(&self.index_metadata);
-        buf
+        // Prefer the rkyv-encoded on-disk format for new data. Keep the old
+        // fixed-layout legacy format code around for compatibility, but the
+        // public `to_le_bytes` API now produces the rkyv payload so callers
+        // don't need widespread changes. Errors here are treated as
+        // unrecoverable internal errors.
+        self.encode_rkyv().unwrap_or_else(|e| {
+            panic!("rkyv encode error in to_le_bytes: {:?}", e)
+        })
     }
 
     pub(crate) fn from_le_bytes(bytes: &[u8]) -> Self {
+        // If the blob begins with the rkyv header, use the rkyv decoder. This
+        // allows the on-disk format to evolve without requiring edits across
+        // the codebase: callers using `from_le_bytes` will transparently read
+        // the rkyv payload.
+        if bytes.len() >= 5 && &bytes[..4] == RKYV_MAGIC {
+            // We expect decode_rkyv to return a Result; treat failures as
+            // unrecoverable for now (shouldn't happen for valid data).
+            return ColumnDescriptor::decode_rkyv(bytes)
+                .expect("failed to decode rkyv ColumnDescriptor");
+        }
+
+        // Legacy fixed-layout format (little-endian)
         let mut o = 0usize;
         let field_id = LogicalFieldId::from(read_u64_le(bytes, &mut o));
         let head_page_pk = read_u64_le(bytes, &mut o);

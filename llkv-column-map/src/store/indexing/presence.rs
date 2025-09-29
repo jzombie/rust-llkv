@@ -57,7 +57,7 @@ impl<P: Pager<Blob = EntryHandle>> IndexOps<P> for PresenceIndexOps {
                 _ => None,
             })
             .ok_or(Error::NotFound)?;
-        let mut rid_desc = ColumnDescriptor::from_le_bytes(rid_desc_blob.as_ref());
+    let mut rid_desc = ColumnDescriptor::decode_rkyv(rid_desc_blob.as_ref())?;
 
         let mut modified_rid_metas = Vec::new();
         for meta_result in
@@ -128,7 +128,7 @@ impl<P: Pager<Blob = EntryHandle>> IndexOps<P> for PresenceIndexOps {
                 _ => None,
             })
             .ok_or(Error::NotFound)?;
-        let mut rid_desc = ColumnDescriptor::from_le_bytes(rid_desc_blob.as_ref());
+    let mut rid_desc = ColumnDescriptor::decode_rkyv(rid_desc_blob.as_ref())?;
 
         let mut rid_metas: Vec<ChunkMetadata> =
             DescriptorIterator::new(index_manager.pager.as_ref(), rid_desc.head_page_pk)
@@ -147,7 +147,7 @@ impl<P: Pager<Blob = EntryHandle>> IndexOps<P> for PresenceIndexOps {
         // Stage the write for the main descriptor.
         puts.push(BatchPut::Raw {
             key: descriptor_pk,
-            bytes: descriptor.to_le_bytes(),
+            bytes: descriptor.encode_rkyv()?,
         });
 
         // Then rewrite the now-modified shadow descriptor chain.
