@@ -5,7 +5,7 @@ use crate::store::descriptor::{
 };
 use crate::store::scan::{FilterPrimitive, FilterResult};
 use crate::types::LogicalFieldId;
-use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, UInt64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, OffsetSizeTrait, UInt32Array, UInt64Array};
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -114,6 +114,18 @@ where
 
         let kinds = descriptor.get_indexes()?;
         Ok(kinds)
+    }
+
+    pub fn filter_row_ids_string<O, F>(
+        &self,
+        field_id: LogicalFieldId,
+        predicate: F,
+    ) -> Result<Vec<u64>>
+    where
+        O: OffsetSizeTrait,
+        F: FnMut(&str) -> bool,
+    {
+        scan::filter::run_filter_for_string::<P, O, F>(self, field_id, predicate)
     }
 
     /// Fast presence check using the presence index (row-id permutation) if available.

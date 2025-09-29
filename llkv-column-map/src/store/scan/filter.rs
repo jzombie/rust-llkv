@@ -1,12 +1,12 @@
 use std::marker::PhantomData;
 
 use arrow::array::{
-    Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Array, Float32Array, Float64Array, GenericStringArray, Int8Array, Int16Array, Int32Array,
+    Int64Array, OffsetSizeTrait, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::ArrowPrimitiveType;
 
-use crate::store::descriptor::{ColumnDescriptor, DescriptorIterator};
+use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::store::rowid_fid;
 use crate::types::LogicalFieldId;
 use llkv_result::{Error, Result};
@@ -18,6 +18,7 @@ use super::{
 };
 use crate::store::ColumnStore;
 use llkv_storage::pager::{BatchGet, GetResult, Pager};
+use llkv_storage::serialization::deserialize_array;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilterRun {
@@ -544,4 +545,129 @@ where
         .with_row_ids(rowid_fid(field_id))
         .run(&mut visitor)?;
     Ok(visitor.into_row_ids())
+}
+
+pub(crate) fn run_filter_for_string<P, O, F>(
+    store: &ColumnStore<P>,
+    field_id: LogicalFieldId,
+    mut predicate: F,
+) -> Result<Vec<u64>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    O: OffsetSizeTrait,
+    F: FnMut(&str) -> bool,
+{
+    let row_field = rowid_fid(field_id);
+    let catalog = store.catalog.read().unwrap();
+    let value_desc_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+    let row_desc_pk = *catalog.map.get(&row_field).ok_or(Error::NotFound)?;
+    drop(catalog);
+
+    let descriptors = store.pager.batch_get(&[
+        BatchGet::Raw { key: value_desc_pk },
+        BatchGet::Raw { key: row_desc_pk },
+    ])?;
+
+    let mut value_desc_blob: Option<EntryHandle> = None;
+    let mut row_desc_blob: Option<EntryHandle> = None;
+    for res in descriptors {
+        if let GetResult::Raw { key, bytes } = res {
+            if key == value_desc_pk {
+                value_desc_blob = Some(bytes);
+            } else if key == row_desc_pk {
+                row_desc_blob = Some(bytes);
+            }
+        }
+    }
+
+    let value_desc_blob = value_desc_blob.ok_or(Error::NotFound)?;
+    let row_desc_blob = row_desc_blob.ok_or(Error::NotFound)?;
+    let value_desc = ColumnDescriptor::from_le_bytes(value_desc_blob.as_ref());
+    let row_desc = ColumnDescriptor::from_le_bytes(row_desc_blob.as_ref());
+
+    let mut value_metas: Vec<ChunkMetadata> = Vec::new();
+    for meta in DescriptorIterator::new(store.pager.as_ref(), value_desc.head_page_pk) {
+        let meta = meta?;
+        if meta.row_count == 0 {
+            continue;
+        }
+        value_metas.push(meta);
+    }
+
+    let mut row_metas: Vec<ChunkMetadata> = Vec::new();
+    for meta in DescriptorIterator::new(store.pager.as_ref(), row_desc.head_page_pk) {
+        let meta = meta?;
+        if meta.row_count == 0 {
+            continue;
+        }
+        row_metas.push(meta);
+    }
+
+    if value_metas.len() != row_metas.len() {
+        return Err(Error::Internal(
+            "string filter: chunk count mismatch between value and row columns".into(),
+        ));
+    }
+
+    let mut matches = Vec::new();
+
+    for (value_meta, row_meta) in value_metas.iter().zip(row_metas.iter()) {
+        let requests = [
+            BatchGet::Raw {
+                key: value_meta.chunk_pk,
+            },
+            BatchGet::Raw {
+                key: row_meta.chunk_pk,
+            },
+        ];
+        let results = store.pager.batch_get(&requests)?;
+        let mut value_blob: Option<EntryHandle> = None;
+        let mut row_blob: Option<EntryHandle> = None;
+        for res in results {
+            if let GetResult::Raw { key, bytes } = res {
+                if key == value_meta.chunk_pk {
+                    value_blob = Some(bytes);
+                } else if key == row_meta.chunk_pk {
+                    row_blob = Some(bytes);
+                }
+            }
+        }
+
+        let value_blob = value_blob.ok_or(Error::NotFound)?;
+        let row_blob = row_blob.ok_or(Error::NotFound)?;
+
+        let value_any = deserialize_array(value_blob)?;
+        let value_arr = value_any
+            .as_any()
+            .downcast_ref::<GenericStringArray<O>>()
+            .ok_or_else(|| Error::Internal("string filter: value chunk dtype mismatch".into()))?;
+
+        let row_any = deserialize_array(row_blob)?;
+        let row_arr = row_any
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::Internal("string filter: row_id chunk downcast".into()))?;
+
+        if value_arr.len() != row_arr.len() {
+            return Err(Error::Internal(
+                "string filter: value/row chunk length mismatch".into(),
+            ));
+        }
+
+        for i in 0..value_arr.len() {
+            if !row_arr.is_valid(i) {
+                continue;
+            }
+            if value_arr.is_null(i) {
+                continue;
+            }
+            let row_id = row_arr.value(i);
+            let text = value_arr.value(i);
+            if predicate(text) {
+                matches.push(row_id);
+            }
+        }
+    }
+
+    Ok(matches)
 }

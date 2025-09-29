@@ -4,7 +4,7 @@ use std::cmp;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, RecordBatch};
+use arrow::array::{Array, ArrayRef, OffsetSizeTrait, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 
 use llkv_column_map::ScanBuilder;
@@ -14,7 +14,7 @@ use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_expr::literal::{FromLiteral, Literal};
-use llkv_expr::typed_predicate::build_predicate;
+use llkv_expr::typed_predicate::{build_predicate, build_string_predicate};
 use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -737,6 +737,9 @@ where
                 }
 
                 let dtype = self.table.store().data_type(p.logical_field_id)?;
+                if matches!(dtype, DataType::Utf8 | DataType::LargeUtf8) {
+                    return Ok(false);
+                }
                 let field_name = p
                     .alias
                     .clone()
@@ -919,14 +922,20 @@ where
             return Ok(expand_filter_runs(&runs));
         }
 
-        let row_ids = llkv_column_map::with_integer_arrow_type!(
-            dtype.clone(),
-            |ArrowTy| self.collect_matching_row_ids::<ArrowTy>(filter_lfid, &filter.op),
-            Err(Error::Internal(format!(
-                "Filtering on type {:?} is not supported",
-                dtype
-            ))),
-        )?;
+        let row_ids = match &dtype {
+            DataType::Utf8 => self.collect_matching_row_ids_string::<i32>(filter_lfid, &filter.op),
+            DataType::LargeUtf8 => {
+                self.collect_matching_row_ids_string::<i64>(filter_lfid, &filter.op)
+            }
+            other => llkv_column_map::with_integer_arrow_type!(
+                other.clone(),
+                |ArrowTy| self.collect_matching_row_ids::<ArrowTy>(filter_lfid, &filter.op),
+                Err(Error::Internal(format!(
+                    "Filtering on type {:?} is not supported",
+                    other
+                ))),
+            ),
+        }?;
 
         Ok(normalize_row_ids(row_ids))
     }
@@ -1100,6 +1109,20 @@ where
         self.table
             .store()
             .filter_row_ids::<T, _>(field_id, move |value| predicate.matches(value))
+    }
+
+    fn collect_matching_row_ids_string<O>(
+        &self,
+        field_id: LogicalFieldId,
+        op: &Operator<'_>,
+    ) -> LlkvResult<Vec<u64>>
+    where
+        O: OffsetSizeTrait,
+    {
+        let predicate = build_string_predicate(op).map_err(Error::predicate_build)?;
+        self.table
+            .store()
+            .filter_row_ids_string::<O, _>(field_id, move |value| predicate.matches(value))
     }
 }
 

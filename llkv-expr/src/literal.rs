@@ -135,6 +135,25 @@ impl FromLiteral for f64 {
     }
 }
 
+fn literal_type_name(lit: &Literal) -> &'static str {
+    match lit {
+        Literal::Integer(_) => "integer",
+        Literal::Float(_) => "float",
+        Literal::String(_) => "string",
+    }
+}
+
+/// Convert a `Literal` into an owned `String`.
+pub fn literal_to_string(lit: &Literal) -> Result<String, LiteralCastError> {
+    match lit {
+        Literal::String(s) => Ok(s.clone()),
+        _ => Err(LiteralCastError::TypeMismatch {
+            expected: "string",
+            got: literal_type_name(lit),
+        }),
+    }
+}
+
 /// Convert a `Literal` into a concrete native type `T`.
 pub fn literal_to_native<T>(lit: &Literal) -> Result<T, LiteralCastError>
 where

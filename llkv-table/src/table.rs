@@ -204,8 +204,8 @@ mod tests {
     use arrow::array::Array;
     use arrow::array::ArrayRef;
     use arrow::array::{
-        BinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, UInt8Array, UInt32Array,
-        UInt64Array,
+        BinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, StringArray, UInt8Array,
+        UInt32Array, UInt64Array,
     };
     use arrow::compute::{cast, max, min, sum, unary};
     use arrow::datatypes::DataType;
@@ -333,6 +333,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(vals, vec![Some(20), Some(20)]);
+    }
+
+    #[test]
+    fn test_scan_with_string_filter() {
+        let pager = Arc::new(MemPager::default());
+        let table = Table::new(500, Arc::clone(&pager)).unwrap();
+
+        const COL_STR: FieldId = 42;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("name", DataType::Utf8, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_STR.to_string(),
+            )])),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["alice", "bob", "albert", "carol"])),
+            ],
+        )
+        .unwrap();
+        table.append(&batch).unwrap();
+
+        let expr = pred_expr(Filter {
+            field_id: COL_STR,
+            op: Operator::StartsWith("al"),
+        });
+
+        let mut collected: Vec<Option<String>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_STR)],
+                &expr,
+                ScanStreamOptions::default(),
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                    collected.extend(arr.iter().map(|v| v.map(|s| s.to_string())));
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            collected,
+            vec![Some("alice".to_string()), Some("albert".to_string())]
+        );
     }
 
     #[test]
