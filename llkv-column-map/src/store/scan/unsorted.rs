@@ -50,17 +50,17 @@ macro_rules! dispatch_unsorted_visit {
 
         macro_rules! try_dispatch_unsorted {
             (
-                    $base:ident,
-                    $chunk_fn:ident,
-                    $chunk_with_rids_fn:ident,
-                    $run_fn:ident,
-                    $run_with_rids_fn:ident,
-                    $array_ty:ty,
-                    $physical_ty:ty,
-                    $dtype_expr:expr,
-                    $native_ty:ty,
-                    $cast_expr:expr
-                ) => {
+                        $base:ident,
+                        $chunk_fn:ident,
+                        $chunk_with_rids_fn:ident,
+                        $run_fn:ident,
+                        $run_with_rids_fn:ident,
+                        $array_ty:ty,
+                        $physical_ty:ty,
+                        $dtype_expr:expr,
+                        $native_ty:ty,
+                        $cast_expr:expr
+                    ) => {
                 if dtype_value == &$dtype_expr {
                     result = Some(unsorted_visit_arm!(
                         $array_ty,
@@ -94,17 +94,17 @@ macro_rules! dispatch_unsorted_with_rids_visit {
 
         macro_rules! try_dispatch_unsorted_with_rids {
             (
-                    $base:ident,
-                    $chunk_fn:ident,
-                    $chunk_with_rids_fn:ident,
-                    $run_fn:ident,
-                    $run_with_rids_fn:ident,
-                    $array_ty:ty,
-                    $physical_ty:ty,
-                    $dtype_expr:expr,
-                    $native_ty:ty,
-                    $cast_expr:expr
-                ) => {
+                        $base:ident,
+                        $chunk_fn:ident,
+                        $chunk_with_rids_fn:ident,
+                        $run_fn:ident,
+                        $run_with_rids_fn:ident,
+                        $array_ty:ty,
+                        $physical_ty:ty,
+                        $dtype_expr:expr,
+                        $native_ty:ty,
+                        $cast_expr:expr
+                    ) => {
                 if dtype_value == &$dtype_expr {
                     result = Some(unsorted_with_rids_arm!(
                         $array_ty,
@@ -137,17 +137,17 @@ macro_rules! dispatch_unsorted_nulls {
 
         macro_rules! try_dispatch_unsorted_nulls {
             (
-                    $base:ident,
-                    $chunk_fn:ident,
-                    $chunk_with_rids_fn:ident,
-                    $run_fn:ident,
-                    $run_with_rids_fn:ident,
-                    $array_ty:ty,
-                    $physical_ty:ty,
-                    $dtype_expr:expr,
-                    $native_ty:ty,
-                    $cast_expr:expr
-                ) => {
+                        $base:ident,
+                        $chunk_fn:ident,
+                        $chunk_with_rids_fn:ident,
+                        $run_fn:ident,
+                        $run_with_rids_fn:ident,
+                        $array_ty:ty,
+                        $physical_ty:ty,
+                        $dtype_expr:expr,
+                        $native_ty:ty,
+                        $cast_expr:expr
+                    ) => {
                 if dtype_value == &$dtype_expr {
                     result = Some(emit_unsorted_nulls!(
                         $array_ty,

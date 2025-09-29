@@ -26,17 +26,17 @@ macro_rules! with_integer_arrow_type {
 
         macro_rules! __llkv_dispatch_integer_arrow_type {
             (
-                    $base:ident,
-                    $chunk_fn:ident,
-                    $chunk_with_rids_fn:ident,
-                    $run_fn:ident,
-                    $run_with_rids_fn:ident,
-                    $array_ty:ty,
-                    $physical_ty:ty,
-                    $dtype_expr:expr,
-                    $native_ty:ty,
-                    $cast_expr:expr
-                ) => {
+                        $base:ident,
+                        $chunk_fn:ident,
+                        $chunk_with_rids_fn:ident,
+                        $run_fn:ident,
+                        $run_with_rids_fn:ident,
+                        $array_ty:ty,
+                        $physical_ty:ty,
+                        $dtype_expr:expr,
+                        $native_ty:ty,
+                        $cast_expr:expr
+                    ) => {
                 if dtype_ref == &$dtype_expr {
                     type $ty = $physical_ty;
                     result = Some($body);
