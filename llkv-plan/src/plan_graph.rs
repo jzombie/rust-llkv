@@ -428,6 +428,7 @@ impl PlanGraph {
         }
 
         // Validate inputs and outputs line up with edges.
+        #[allow(clippy::type_complexity)] // TODO: Refactor
         let mut expected_inputs: BTreeMap<
             PlanNodeId,
             Vec<(PlanNodeId, Option<String>, Vec<(String, String)>)>,
@@ -448,7 +449,12 @@ impl PlanGraph {
         }
 
         for node in &self.nodes {
-            let mut actual_inputs: Vec<(PlanNodeId, Option<String>, Vec<(String, String)>)> = node
+            #[allow(clippy::type_complexity)] // TODO: Refactor
+            let mut actual_inputs: Vec<(
+                PlanNodeId,
+                Option<String>,
+                Vec<(String, String)>,
+            )> = node
                 .inputs
                 .iter()
                 .map(|input| {
