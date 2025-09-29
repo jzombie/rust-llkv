@@ -23,7 +23,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 use llkv_storage::pager::Pager;
 
 use crate::constants::STREAM_BATCH_ROWS;
-use crate::scalar_eval::{NumericArrayMap, NumericKernels};
+use crate::scalar_eval::{AffineExpr, NumericArrayMap, NumericKernels};
 use crate::table::{ScanProjection, ScanStreamOptions, Table};
 use crate::types::FieldId;
 
@@ -323,6 +323,9 @@ struct ColumnProjectionInfo {
 struct ComputedProjectionInfo {
     expr: ScalarExpr<FieldId>,
     alias: String,
+    fields: FxHashSet<FieldId>,
+    passthrough: Option<FieldId>,
+    affine: Option<AffineExpr>,
 }
 
 #[derive(Clone)]
@@ -332,7 +335,11 @@ enum ProjectionEval {
 }
 
 struct PlannedScan<'expr> {
-    projections: Vec<ScanProjection>,
+    projection_evals: Vec<ProjectionEval>,
+    unique_index: FxHashMap<LogicalFieldId, usize>,
+    unique_lfids: Vec<LogicalFieldId>,
+    numeric_fields: FxHashSet<FieldId>,
+    field_dtypes: FxHashMap<FieldId, DataType>,
     filter_expr: Expr<'expr, FieldId>,
     options: ScanStreamOptions,
     plan_graph: PlanGraph,
@@ -386,12 +393,118 @@ where
             ));
         }
 
-        let projections_vec = projections.to_vec();
+        let mut projection_evals: Vec<ProjectionEval> = Vec::with_capacity(projections.len());
+        let mut unique_index: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();
+        let mut unique_lfids: Vec<LogicalFieldId> = Vec::new();
+        let mut numeric_fields: FxHashSet<FieldId> = FxHashSet::default();
+        let mut field_dtypes: FxHashMap<FieldId, DataType> = FxHashMap::default();
+
+        for projection in projections {
+            match projection {
+                ScanProjection::Column(proj) => {
+                    let lfid = proj.logical_field_id;
+                    if lfid.table_id() != self.table.table_id() {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Projection targets table {} but scan_stream is on table {}",
+                            lfid.table_id(),
+                            self.table.table_id()
+                        )));
+                    }
+                    if lfid.namespace() != Namespace::UserData {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Projection {:?} must target user data namespace",
+                            lfid
+                        )));
+                    }
+
+                    let dtype = self.table.store().data_type(lfid)?;
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        unique_index.entry(lfid)
+                    {
+                        entry.insert(unique_lfids.len());
+                        unique_lfids.push(lfid);
+                    }
+                    field_dtypes
+                        .entry(lfid.field_id())
+                        .or_insert_with(|| dtype.clone());
+                    let output_name = proj
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| lfid.field_id().to_string());
+                    projection_evals.push(ProjectionEval::Column(ColumnProjectionInfo {
+                        logical_field_id: lfid,
+                        data_type: dtype,
+                        output_name,
+                    }));
+                }
+                ScanProjection::Computed { expr, alias } => {
+                    if alias.trim().is_empty() {
+                        return Err(Error::InvalidArgumentError(
+                            "Computed projection requires a non-empty alias".into(),
+                        ));
+                    }
+
+                    let simplified = NumericKernels::simplify(expr);
+                    let mut fields_set: FxHashSet<FieldId> = FxHashSet::default();
+                    NumericKernels::collect_fields(&simplified, &mut fields_set);
+                    if fields_set.is_empty() {
+                        return Err(Error::InvalidArgumentError(
+                            "Computed projection must reference at least one column".into(),
+                        ));
+                    }
+
+                    for field_id in fields_set.iter().copied() {
+                        numeric_fields.insert(field_id);
+                        let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
+                        if lfid.namespace() != Namespace::UserData {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "Computed projection field {:?} must target user data namespace",
+                                lfid
+                            )));
+                        }
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            unique_index.entry(lfid)
+                        {
+                            entry.insert(unique_lfids.len());
+                            unique_lfids.push(lfid);
+                        }
+                        let dtype = self.table.store().data_type(lfid)?;
+                        field_dtypes
+                            .entry(field_id)
+                            .or_insert_with(|| dtype.clone());
+                    }
+
+                    let passthrough = NumericKernels::passthrough_column(&simplified);
+                    if let Some(fid) = passthrough {
+                        if !fields_set.contains(&fid) {
+                            return Err(Error::Internal(
+                                "passthrough field missing from computed projection".into(),
+                            ));
+                        }
+                    }
+                    let affine = NumericKernels::extract_affine_simplified(&simplified);
+
+                    projection_evals.push(ProjectionEval::Computed(ComputedProjectionInfo {
+                        expr: simplified,
+                        alias: alias.clone(),
+                        fields: fields_set,
+                        passthrough,
+                        affine,
+                    }));
+                }
+            }
+        }
+
         let filter_clone = filter_expr.clone();
-        let plan_graph = self.build_plan_graph(&projections_vec, &filter_clone, options)?;
+        let plan_graph =
+            self.build_plan_graph(&projection_evals, &filter_clone, options, &field_dtypes)?;
 
         Ok(PlannedScan {
-            projections: projections_vec,
+            projection_evals,
+            unique_index,
+            unique_lfids,
+            numeric_fields,
+            field_dtypes,
             filter_expr: filter_clone,
             options,
             plan_graph,
@@ -400,9 +513,10 @@ where
 
     fn build_plan_graph(
         &self,
-        projections: &[ScanProjection],
+        projection_evals: &[ProjectionEval],
         filter_expr: &Expr<'_, FieldId>,
         options: ScanStreamOptions,
+        field_dtypes: &FxHashMap<FieldId, DataType>,
     ) -> LlkvResult<PlanGraph> {
         let mut builder = PlanGraphBuilder::new();
 
@@ -413,7 +527,7 @@ where
             .insert("table_id", self.table.table_id().to_string());
         scan_node
             .metadata
-            .insert("projection_count", projections.len().to_string());
+            .insert("projection_count", projection_evals.len().to_string());
         builder.add_node(scan_node).map_err(plan_graph_err)?;
         builder.add_root(scan_node_id).map_err(plan_graph_err)?;
 
@@ -436,27 +550,37 @@ where
         next_node += 1;
         let mut project_node = PlanNode::new(project_node_id, PlanOperator::Project);
 
-        for projection in projections {
-            match projection {
-                ScanProjection::Column(proj) => {
-                    let alias = proj
-                        .alias
-                        .clone()
-                        .unwrap_or_else(|| proj.logical_field_id.field_id().to_string());
-                    let dtype = self.table.store().data_type(proj.logical_field_id)?;
-                    project_node.add_projection(PlanExpression::new(format!("column({})", alias)));
+        for eval in projection_evals {
+            match eval {
+                ProjectionEval::Column(info) => {
+                    project_node.add_projection(PlanExpression::new(format!(
+                        "column({})",
+                        info.output_name
+                    )));
                     project_node.add_field(
-                        PlanField::new(alias.clone(), format!("{dtype:?}")).with_nullability(true),
+                        PlanField::new(info.output_name.clone(), format!("{:?}", info.data_type))
+                            .with_nullability(true),
                     );
                 }
-                ScanProjection::Computed { expr, alias } => {
+                ProjectionEval::Computed(info) => {
                     project_node.add_projection(PlanExpression::new(format!(
                         "{} := {}",
-                        alias,
-                        format_scalar_expr(expr)
+                        info.alias,
+                        format_scalar_expr(&info.expr)
                     )));
-                    project_node
-                        .add_field(PlanField::new(alias.clone(), "Float64").with_nullability(true));
+                    if let Some(fid) = info.passthrough {
+                        let dtype = field_dtypes.get(&fid).ok_or_else(|| {
+                            Error::Internal("missing dtype for passthrough projection".into())
+                        })?;
+                        project_node.add_field(
+                            PlanField::new(info.alias.clone(), format!("{dtype:?}"))
+                                .with_nullability(true),
+                        );
+                    } else {
+                        project_node.add_field(
+                            PlanField::new(info.alias.clone(), "Float64").with_nullability(true),
+                        );
+                    }
                 }
             }
         }
@@ -500,109 +624,28 @@ where
         F: FnMut(RecordBatch),
     {
         let PlannedScan {
-            projections,
+            projection_evals,
+            unique_index,
+            unique_lfids,
+            numeric_fields,
+            field_dtypes,
             filter_expr,
             options,
             plan_graph: _plan_graph,
         } = plan;
 
-        if self.try_single_column_direct_scan(&projections, &filter_expr, options, &mut on_batch)? {
+        if self.try_single_column_direct_scan(
+            &projection_evals,
+            &filter_expr,
+            options,
+            &field_dtypes,
+            &mut on_batch,
+        )? {
             return Ok(());
         }
 
-        let mut projection_evals = Vec::with_capacity(projections.len());
-        let mut unique_index: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();
-        let mut unique_lfids: Vec<LogicalFieldId> = Vec::new();
-        let mut numeric_fields: FxHashSet<FieldId> = FxHashSet::default();
-        let mut lfid_dtypes: FxHashMap<LogicalFieldId, DataType> = FxHashMap::default();
-
-        for proj in &projections {
-            match proj {
-                ScanProjection::Column(p) => {
-                    let lfid = p.logical_field_id;
-                    if lfid.table_id() != self.table.table_id() {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "Projection targets table {} but scan_stream is on table {}",
-                            lfid.table_id(),
-                            self.table.table_id()
-                        )));
-                    }
-                    if lfid.namespace() != Namespace::UserData {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "Projection {:?} must target user data namespace",
-                            lfid
-                        )));
-                    }
-
-                    let dtype = self.table.store().data_type(lfid)?;
-                    lfid_dtypes.entry(lfid).or_insert_with(|| dtype.clone());
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        unique_index.entry(lfid)
-                    {
-                        entry.insert(unique_lfids.len());
-                        unique_lfids.push(lfid);
-                    }
-                    let fallback = lfid.field_id().to_string();
-                    let output_name = p.alias.clone().unwrap_or(fallback);
-                    projection_evals.push(ProjectionEval::Column(ColumnProjectionInfo {
-                        logical_field_id: lfid,
-                        data_type: dtype,
-                        output_name,
-                    }));
-                }
-                ScanProjection::Computed { expr, alias } => {
-                    if alias.trim().is_empty() {
-                        return Err(Error::InvalidArgumentError(
-                            "Computed projection requires a non-empty alias".into(),
-                        ));
-                    }
-
-                    let simplified = NumericKernels::simplify(expr);
-                    let mut fields_set: FxHashSet<FieldId> = FxHashSet::default();
-                    NumericKernels::collect_fields(&simplified, &mut fields_set);
-                    if fields_set.is_empty() {
-                        return Err(Error::InvalidArgumentError(
-                            "Computed projection must reference at least one column".into(),
-                        ));
-                    }
-
-                    for field_id in fields_set.iter().copied() {
-                        numeric_fields.insert(field_id);
-                        let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
-                        if lfid.namespace() != Namespace::UserData {
-                            return Err(Error::InvalidArgumentError(format!(
-                                "Computed projection field {:?} must target user data namespace",
-                                lfid
-                            )));
-                        }
-                        let dtype = self.table.store().data_type(lfid)?;
-                        lfid_dtypes.entry(lfid).or_insert_with(|| dtype.clone());
-                        if let std::collections::hash_map::Entry::Vacant(entry) =
-                            unique_index.entry(lfid)
-                        {
-                            entry.insert(unique_lfids.len());
-                            unique_lfids.push(lfid);
-                        }
-                    }
-
-                    projection_evals.push(ProjectionEval::Computed(ComputedProjectionInfo {
-                        expr: simplified,
-                        alias: alias.clone(),
-                    }));
-                }
-            }
-        }
-
-        let passthrough_fields: Vec<Option<FieldId>> = projection_evals
-            .iter()
-            .map(|eval| match eval {
-                ProjectionEval::Computed(info) => NumericKernels::passthrough_column(&info.expr),
-                _ => None,
-            })
-            .collect();
-
         let mut schema_fields: Vec<Field> = Vec::with_capacity(projection_evals.len());
-        for (idx, eval) in projection_evals.iter().enumerate() {
+        for eval in &projection_evals {
             match eval {
                 ProjectionEval::Column(info) => schema_fields.push(Field::new(
                     info.output_name.clone(),
@@ -610,9 +653,8 @@ where
                     true,
                 )),
                 ProjectionEval::Computed(info) => {
-                    if let Some(fid) = passthrough_fields[idx] {
-                        let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
-                        let dtype = lfid_dtypes.get(&lfid).cloned().ok_or_else(|| {
+                    if let Some(fid) = info.passthrough {
+                        let dtype = field_dtypes.get(&fid).cloned().ok_or_else(|| {
                             Error::Internal("missing dtype for passthrough".into())
                         })?;
                         schema_fields.push(Field::new(info.alias.clone(), dtype, true));
@@ -638,9 +680,9 @@ where
 
         let mut gather_ctx = self.table.store().prepare_gather_context(&unique_lfids)?;
 
-        let requires_numeric = projection_evals.iter().enumerate().any(|(idx, eval)| {
-            matches!(eval, ProjectionEval::Computed(_)) && passthrough_fields[idx].is_none()
-        });
+        let requires_numeric = projection_evals.iter().any(
+            |eval| matches!(eval, ProjectionEval::Computed(info) if info.passthrough.is_none()),
+        );
 
         let mut offset = 0usize;
         while offset < row_ids.len() {
@@ -670,7 +712,7 @@ where
             };
 
             let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
-            for (idx, eval) in projection_evals.iter().enumerate() {
+            for eval in &projection_evals {
                 match eval {
                     ProjectionEval::Column(info) => {
                         let arr_idx = *unique_index
@@ -679,7 +721,7 @@ where
                         columns.push(Arc::clone(&unique_arrays[arr_idx]));
                     }
                     ProjectionEval::Computed(info) => {
-                        if let Some(fid) = passthrough_fields[idx] {
+                        if let Some(fid) = info.passthrough {
                             let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
                             let arr_idx = *unique_index
                                 .get(&lfid)
@@ -689,7 +731,7 @@ where
                             let numeric_arrays = numeric_arrays
                                 .as_ref()
                                 .expect("numeric arrays should exist for computed projection");
-                            let array = NumericKernels::evaluate_batch(
+                            let array = NumericKernels::evaluate_batch_simplified(
                                 &info.expr,
                                 batch.num_rows(),
                                 numeric_arrays,
@@ -710,64 +752,57 @@ where
 
     fn try_single_column_direct_scan<'expr, F>(
         &self,
-        projections: &[ScanProjection],
+        projection_evals: &[ProjectionEval],
         filter_expr: &Expr<'expr, FieldId>,
         options: ScanStreamOptions,
+        field_dtypes: &FxHashMap<FieldId, DataType>,
         on_batch: &mut F,
     ) -> LlkvResult<bool>
     where
         F: FnMut(RecordBatch),
     {
-        if options.include_nulls || projections.len() != 1 {
+        if options.include_nulls || projection_evals.len() != 1 {
             return Ok(false);
         }
 
-        match &projections[0] {
-            ScanProjection::Column(p) => {
-                if p.logical_field_id.table_id() != self.table.table_id() {
+        match &projection_evals[0] {
+            ProjectionEval::Column(info) => {
+                if info.logical_field_id.table_id() != self.table.table_id() {
                     return Err(Error::InvalidArgumentError(format!(
                         "Projection targets table {} but scan_stream is on table {}",
-                        p.logical_field_id.table_id(),
+                        info.logical_field_id.table_id(),
                         self.table.table_id()
                     )));
                 }
 
-                if !is_full_range_filter(filter_expr, p.logical_field_id.field_id()) {
+                if !is_full_range_filter(filter_expr, info.logical_field_id.field_id()) {
                     return Ok(false);
                 }
 
-                let dtype = self.table.store().data_type(p.logical_field_id)?;
-                let field_name = p
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| p.logical_field_id.field_id().to_string());
                 let schema = Arc::new(Schema::new(vec![Field::new(
-                    field_name,
-                    dtype.clone(),
+                    info.output_name.clone(),
+                    info.data_type.clone(),
                     true,
                 )]));
 
                 let mut visitor = SingleColumnStreamVisitor::new(schema, on_batch);
-                ScanBuilder::new(self.table.store(), p.logical_field_id)
+                ScanBuilder::new(self.table.store(), info.logical_field_id)
                     .options(ScanOptions::default())
                     .run(&mut visitor)?;
                 visitor.finish()?;
                 Ok(true)
             }
-            ScanProjection::Computed { expr, alias } => {
-                let simplified = NumericKernels::simplify(expr);
-                let mut fields_set: FxHashSet<FieldId> = FxHashSet::default();
-                NumericKernels::collect_fields(&simplified, &mut fields_set);
-                if fields_set.len() != 1 {
+            ProjectionEval::Computed(info) => {
+                if info.fields.len() != 1 {
                     return Ok(false);
                 }
 
-                let field_id = *fields_set.iter().next().unwrap();
-                let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
+                let field_id = *info.fields.iter().next().unwrap();
                 if !is_full_range_filter(filter_expr, field_id) {
                     return Ok(false);
                 }
 
+                let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
                 if lfid.namespace() != Namespace::UserData {
                     return Err(Error::InvalidArgumentError(format!(
                         "Computed projection field {:?} must target user data namespace",
@@ -775,17 +810,18 @@ where
                     )));
                 }
 
-                let field_alias = alias.clone();
-                let dtype = self.table.store().data_type(lfid)?;
+                let dtype = field_dtypes.get(&field_id).cloned().ok_or_else(|| {
+                    Error::Internal("missing dtype for computed projection field".into())
+                })?;
 
-                if let Some(passthrough_fid) = NumericKernels::passthrough_column(&simplified) {
+                if let Some(passthrough_fid) = info.passthrough {
                     if passthrough_fid != field_id {
                         return Err(Error::InvalidArgumentError(
                             "computed projection passthrough resolved to unexpected field".into(),
                         ));
                     }
                     let schema = Arc::new(Schema::new(vec![Field::new(
-                        field_alias.clone(),
+                        info.alias.clone(),
                         dtype.clone(),
                         true,
                     )]));
@@ -797,7 +833,7 @@ where
                     return Ok(true);
                 }
 
-                if let Some(affine) = NumericKernels::extract_affine(&simplified) {
+                if let Some(affine) = info.affine {
                     if affine.field != field_id {
                         return Err(Error::InvalidArgumentError(
                             "affine extraction resolved to unexpected field".into(),
@@ -807,7 +843,7 @@ where
                         return Ok(false);
                     }
                     let schema = Arc::new(Schema::new(vec![Field::new(
-                        field_alias.clone(),
+                        info.alias.clone(),
                         DataType::Float64,
                         true,
                     )]));
@@ -824,18 +860,18 @@ where
                     return Ok(true);
                 }
 
-                let mut numeric_fields: FxHashSet<FieldId> = FxHashSet::default();
-                numeric_fields.insert(field_id);
+                let mut single_numeric_fields: FxHashSet<FieldId> = FxHashSet::default();
+                single_numeric_fields.insert(field_id);
                 let schema = Arc::new(Schema::new(vec![Field::new(
-                    field_alias.clone(),
+                    info.alias.clone(),
                     DataType::Float64,
                     true,
                 )]));
                 let mut visitor = ComputedSingleColumnVisitor::new(
                     schema,
-                    simplified,
+                    info.expr.clone(),
                     lfid,
-                    numeric_fields,
+                    single_numeric_fields,
                     on_batch,
                 );
                 ScanBuilder::new(self.table.store(), lfid)
@@ -1368,13 +1404,14 @@ where
             };
 
         let len = array.len();
-        let evaluated = match NumericKernels::evaluate_batch(&self.expr, len, &numeric_arrays) {
-            Ok(arr) => arr,
-            Err(err) => {
-                self.error = Some(err);
-                return;
-            }
-        };
+        let evaluated =
+            match NumericKernels::evaluate_batch_simplified(&self.expr, len, &numeric_arrays) {
+                Ok(arr) => arr,
+                Err(err) => {
+                    self.error = Some(err);
+                    return;
+                }
+            };
 
         if let Err(err) = RecordBatch::try_new(self.schema.clone(), vec![evaluated])
             .map(|batch| (self.on_batch)(batch))

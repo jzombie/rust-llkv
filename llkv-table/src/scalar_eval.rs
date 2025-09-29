@@ -152,19 +152,29 @@ impl NumericKernels {
     }
 
     /// Evaluate a scalar expression for every row in the batch.
+    #[allow(dead_code)]
     pub fn evaluate_batch(
         expr: &ScalarExpr<FieldId>,
         len: usize,
         arrays: &NumericArrayMap,
     ) -> LlkvResult<ArrayRef> {
         let simplified = Self::simplify(expr);
-        if let Some(vectorized) = Self::try_evaluate_vectorized(&simplified, len, arrays)? {
+        Self::evaluate_batch_simplified(&simplified, len, arrays)
+    }
+
+    /// Evaluate a scalar expression that has already been simplified.
+    pub fn evaluate_batch_simplified(
+        expr: &ScalarExpr<FieldId>,
+        len: usize,
+        arrays: &NumericArrayMap,
+    ) -> LlkvResult<ArrayRef> {
+        if let Some(vectorized) = Self::try_evaluate_vectorized(expr, len, arrays)? {
             return Ok(vectorized.materialize(len));
         }
 
         let mut values: Vec<Option<f64>> = Vec::with_capacity(len);
         for idx in 0..len {
-            values.push(Self::evaluate_value(&simplified, idx, arrays)?);
+            values.push(Self::evaluate_value(expr, idx, arrays)?);
         }
         Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
     }
@@ -364,9 +374,15 @@ impl NumericKernels {
 
     /// Attempts to represent the expression as `scale * column + offset`.
     /// Returns `None` when the expression depends on multiple columns or is non-linear.
+    #[allow(dead_code)]
     pub fn extract_affine(expr: &ScalarExpr<FieldId>) -> Option<AffineExpr> {
         let simplified = Self::simplify(expr);
-        let state = Self::affine_state(&simplified)?;
+        Self::extract_affine_simplified(&simplified)
+    }
+
+    /// Variant of [`extract_affine`] that assumes `expr` is already simplified.
+    pub fn extract_affine_simplified(expr: &ScalarExpr<FieldId>) -> Option<AffineExpr> {
+        let state = Self::affine_state(expr)?;
         let field = state.field?;
         Some(AffineExpr {
             field,
