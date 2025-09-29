@@ -28,4 +28,6 @@ jobs:
 
       - uses: bencherdev/bencher@main
       - name: Run benches via Bencher
-        run: bencher run "cargo bench"
+        # Note: The `--github-actions` flag automatically creates a new comment on the PR
+        # https://github.com/bencherdev/bencher?tab=readme-ov-file#comment-on-prs
+        run: bencher run --github-actions "${{ secrets.GITHUB_TOKEN }}" "cargo bench"
