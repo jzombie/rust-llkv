@@ -162,13 +162,9 @@ macro_rules! declare_sorted_range_filter_for_type {
         );
     };
     (u8, $chunk_fn:ident, $chunk_with_rids_fn:ident, $run_fn:ident, $run_with_rids_fn:ident, $array_ty:ty, $physical_ty:ty, $dtype_expr:expr, $native_ty:ty, $cast_expr:expr) => {
-        impl_sorted_range_filter!(
-            $run_fn,
-            $array_ty,
-            u8_r,
-            |x| x,
-            |array: &$array_ty, idx| array.value(idx)
-        );
+        impl_sorted_range_filter!($run_fn, $array_ty, u8_r, |x| x, |array: &$array_ty, idx| {
+            array.value(idx)
+        });
     };
     (i64, $chunk_fn:ident, $chunk_with_rids_fn:ident, $run_fn:ident, $run_with_rids_fn:ident, $array_ty:ty, $physical_ty:ty, $dtype_expr:expr, $native_ty:ty, $cast_expr:expr) => {
         impl_sorted_range_filter!(
@@ -198,13 +194,9 @@ macro_rules! declare_sorted_range_filter_for_type {
         );
     };
     (i8, $chunk_fn:ident, $chunk_with_rids_fn:ident, $run_fn:ident, $run_with_rids_fn:ident, $array_ty:ty, $physical_ty:ty, $dtype_expr:expr, $native_ty:ty, $cast_expr:expr) => {
-        impl_sorted_range_filter!(
-            $run_fn,
-            $array_ty,
-            i8_r,
-            |x| x,
-            |array: &$array_ty, idx| array.value(idx)
-        );
+        impl_sorted_range_filter!($run_fn, $array_ty, i8_r, |x| x, |array: &$array_ty, idx| {
+            array.value(idx)
+        });
     };
     (f64, $chunk_fn:ident, $chunk_with_rids_fn:ident, $run_fn:ident, $run_with_rids_fn:ident, $array_ty:ty, $physical_ty:ty, $dtype_expr:expr, $native_ty:ty, $cast_expr:expr) => {
         impl_sorted_range_filter!(

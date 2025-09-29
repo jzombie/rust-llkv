@@ -1461,12 +1461,7 @@ where
         dtype,
         |ArrowTy| {
             <ArrowTy as SortedDispatch>::visit_with_rids_bounds(
-                pager,
-                metas_val,
-                metas_rid,
-                buffers,
-                ir,
-                visitor,
+                pager, metas_val, metas_rid, buffers, ir, visitor,
             )
         },
         Err(Error::Internal("unsupported sorted dtype (builder)".into())),

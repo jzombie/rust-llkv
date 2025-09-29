@@ -5,8 +5,8 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 
-use llkv_column_map::llkv_for_each_arrow_numeric;
 use llkv_column_map::ScanBuilder;
+use llkv_column_map::llkv_for_each_arrow_numeric;
 use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::store::scan::ScanOptions;
@@ -57,11 +57,7 @@ macro_rules! impl_single_column_reject_chunk_with_rids {
         $_native_ty:ty,
         $_cast:expr
     ) => {
-        fn $chunk_with_rids(
-            &mut self,
-            _: &$array_ty,
-            _: &arrow::array::UInt64Array,
-        ) {
+        fn $chunk_with_rids(&mut self, _: &$array_ty, _: &arrow::array::UInt64Array) {
             self.reject_row_ids();
         }
     };
@@ -148,11 +144,7 @@ macro_rules! impl_computed_reject_chunk_with_rids {
         $_native_ty:ty,
         $_cast:expr
     ) => {
-        fn $chunk_with_rids(
-            &mut self,
-            _: &$array_ty,
-            _: &arrow::array::UInt64Array,
-        ) {
+        fn $chunk_with_rids(&mut self, _: &$array_ty, _: &arrow::array::UInt64Array) {
             self.reject_row_ids();
         }
     };
@@ -250,11 +242,7 @@ macro_rules! impl_affine_reject_chunk_with_rids {
         $_native_ty:ty,
         $_cast:expr
     ) => {
-        fn $chunk_with_rids(
-            &mut self,
-            _: &$array_ty,
-            _: &arrow::array::UInt64Array,
-        ) {
+        fn $chunk_with_rids(&mut self, _: &$array_ty, _: &arrow::array::UInt64Array) {
             self.reject_row_ids();
         }
     };

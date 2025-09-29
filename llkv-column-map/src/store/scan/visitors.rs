@@ -33,7 +33,11 @@ macro_rules! declare_primitive_with_rids_trait_methods {
         $cast_expr:expr
     ) => {
         fn $chunk_with_rids_fn(&mut self, _v: &$array_ty, _r: &UInt64Array) {
-            unimplemented!(concat!("`", stringify!($chunk_with_rids_fn), "` not implemented"))
+            unimplemented!(concat!(
+                "`",
+                stringify!($chunk_with_rids_fn),
+                "` not implemented"
+            ))
         }
     };
 }
