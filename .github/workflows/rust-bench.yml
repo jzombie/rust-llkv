@@ -32,6 +32,10 @@ jobs:
     env:
       BENCHER_PROJECT: llkv
       BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+      # Use a workspace-local CARGO_HOME to avoid writing into the runner's
+      # $HOME/.cargo. This keeps installs and registry/git cache inside the
+      # repository workspace (useful for self-hosted runners).
+      CARGO_HOME: "${{ github.workspace }}/.cargo"
       # The branch name to report to Bencher. For pull_request events use the
       # head ref, otherwise use the ref name (branch on push).
       BENCHER_BRANCH: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
@@ -42,10 +46,32 @@ jobs:
       # bench run executes. Leave empty to skip creating/updating Thresholds.
       # https://bencher.dev/docs/explanation/thresholds/
       THRESHOLD_FLAGS: --threshold-measure latency --threshold-test t_test --threshold-max-sample-size 64 --threshold-upper-boundary 0.99 --thresholds-reset --err
+      # Enable sccache integration for the job. If the sccache action runs it
+      # will configure the wrapper; setting these here is harmless and makes
+      # sccache behavior explicit for all steps.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache Cargo registry and build target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.cargo/registry
+            ${{ github.workspace }}/.cargo/git
+            ${{ github.workspace }}/.cargo/bin
+            target
+            ./.sccache
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Run sccache setup
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - uses: bencherdev/bencher@main
       - name: Run benches via Bencher (in-repo PRs)
