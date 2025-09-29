@@ -31,29 +31,10 @@ jobs:
     env:
       BENCHER_PROJECT: llkv
       BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
-      RUSTC_WRAPPER: sccache
-      SCCACHE_DIR: "${{ github.workspace }}/.sccache"
     steps:
       - uses: actions/checkout@v4
-
-      - name: Cache Cargo registry and build target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-            ./.sccache
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Install sccache
-        run: |
-          cargo install sccache --locked || true
 
       - uses: bencherdev/bencher@main
       - name: Run benches via Bencher
