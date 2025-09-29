@@ -10,7 +10,7 @@ use crate::literal::{
 };
 
 #[derive(Debug, Clone)]
-pub enum Predicate<T>
+pub enum FixedWidthPredicate<T>
 where
     T: ArrowPrimitiveType + FilterPrimitive,
 {
@@ -27,19 +27,19 @@ where
     In(Vec<T::Native>),
 }
 
-impl<T> Predicate<T>
+impl<T> FixedWidthPredicate<T>
 where
     T: ArrowPrimitiveType + FilterPrimitive,
 {
     pub fn matches(&self, value: T::Native) -> bool {
         match self {
-            Predicate::All => true,
-            Predicate::Equals(target) => value == *target,
-            Predicate::GreaterThan(target) => value > *target,
-            Predicate::GreaterThanOrEquals(target) => value >= *target,
-            Predicate::LessThan(target) => value < *target,
-            Predicate::LessThanOrEquals(target) => value <= *target,
-            Predicate::Range { lower, upper } => {
+            FixedWidthPredicate::All => true,
+            FixedWidthPredicate::Equals(target) => value == *target,
+            FixedWidthPredicate::GreaterThan(target) => value > *target,
+            FixedWidthPredicate::GreaterThanOrEquals(target) => value >= *target,
+            FixedWidthPredicate::LessThan(target) => value < *target,
+            FixedWidthPredicate::LessThanOrEquals(target) => value <= *target,
+            FixedWidthPredicate::Range { lower, upper } => {
                 if let Some(limit) = lower {
                     match limit {
                         Bound::Included(bound) => {
@@ -72,14 +72,13 @@ where
                 }
                 true
             }
-            Predicate::In(values) => values.contains(&value),
+            FixedWidthPredicate::In(values) => values.contains(&value),
         }
     }
 }
 
-// TODO: Why can't this reuse Predicate<T>?
 #[derive(Debug, Clone)]
-pub enum StringPredicate {
+pub enum VarWidthPredicate {
     All,
     Equals(String),
     GreaterThan(String),
@@ -96,16 +95,16 @@ pub enum StringPredicate {
     Contains(String),
 }
 
-impl StringPredicate {
+impl VarWidthPredicate {
     pub fn matches(&self, value: &str) -> bool {
         match self {
-            StringPredicate::All => true,
-            StringPredicate::Equals(target) => value == target,
-            StringPredicate::GreaterThan(target) => value > target.as_str(),
-            StringPredicate::GreaterThanOrEquals(target) => value >= target.as_str(),
-            StringPredicate::LessThan(target) => value < target.as_str(),
-            StringPredicate::LessThanOrEquals(target) => value <= target.as_str(),
-            StringPredicate::Range { lower, upper } => {
+            VarWidthPredicate::All => true,
+            VarWidthPredicate::Equals(target) => value == target,
+            VarWidthPredicate::GreaterThan(target) => value > target.as_str(),
+            VarWidthPredicate::GreaterThanOrEquals(target) => value >= target.as_str(),
+            VarWidthPredicate::LessThan(target) => value < target.as_str(),
+            VarWidthPredicate::LessThanOrEquals(target) => value <= target.as_str(),
+            VarWidthPredicate::Range { lower, upper } => {
                 if let Some(bound) = lower {
                     match bound {
                         Bound::Included(min) => {
@@ -138,10 +137,10 @@ impl StringPredicate {
                 }
                 true
             }
-            StringPredicate::In(values) => values.iter().any(|v| v == value),
-            StringPredicate::StartsWith(prefix) => value.starts_with(prefix),
-            StringPredicate::EndsWith(suffix) => value.ends_with(suffix),
-            StringPredicate::Contains(substr) => value.contains(substr),
+            VarWidthPredicate::In(values) => values.iter().any(|v| v == value),
+            VarWidthPredicate::StartsWith(prefix) => value.starts_with(prefix),
+            VarWidthPredicate::EndsWith(suffix) => value.ends_with(suffix),
+            VarWidthPredicate::Contains(substr) => value.contains(substr),
         }
     }
 }
@@ -178,25 +177,27 @@ impl From<LiteralCastError> for PredicateBuildError {
     }
 }
 
-pub fn build_predicate<T>(op: &Operator<'_>) -> Result<Predicate<T>, PredicateBuildError>
+pub fn build_fixed_width_predicate<T>(
+    op: &Operator<'_>,
+) -> Result<FixedWidthPredicate<T>, PredicateBuildError>
 where
     T: ArrowPrimitiveType + FilterPrimitive,
     T::Native: FromLiteral + Copy,
 {
     match op {
-        Operator::Equals(lit) => Ok(Predicate::Equals(
+        Operator::Equals(lit) => Ok(FixedWidthPredicate::Equals(
             literal_to_native::<T::Native>(lit).map_err(PredicateBuildError::from)?,
         )),
-        Operator::GreaterThan(lit) => Ok(Predicate::GreaterThan(
+        Operator::GreaterThan(lit) => Ok(FixedWidthPredicate::GreaterThan(
             literal_to_native::<T::Native>(lit).map_err(PredicateBuildError::from)?,
         )),
-        Operator::GreaterThanOrEquals(lit) => Ok(Predicate::GreaterThanOrEquals(
+        Operator::GreaterThanOrEquals(lit) => Ok(FixedWidthPredicate::GreaterThanOrEquals(
             literal_to_native::<T::Native>(lit).map_err(PredicateBuildError::from)?,
         )),
-        Operator::LessThan(lit) => Ok(Predicate::LessThan(
+        Operator::LessThan(lit) => Ok(FixedWidthPredicate::LessThan(
             literal_to_native::<T::Native>(lit).map_err(PredicateBuildError::from)?,
         )),
-        Operator::LessThanOrEquals(lit) => Ok(Predicate::LessThanOrEquals(
+        Operator::LessThanOrEquals(lit) => Ok(FixedWidthPredicate::LessThanOrEquals(
             literal_to_native::<T::Native>(lit).map_err(PredicateBuildError::from)?,
         )),
         Operator::Range { lower, upper } => {
@@ -210,9 +211,9 @@ where
             };
 
             if lb.is_none() && ub.is_none() {
-                Ok(Predicate::All)
+                Ok(FixedWidthPredicate::All)
             } else {
-                Ok(Predicate::Range {
+                Ok(FixedWidthPredicate::Range {
                     lower: lb,
                     upper: ub,
                 })
@@ -224,7 +225,7 @@ where
                 natives
                     .push(literal_to_native::<T::Native>(lit).map_err(PredicateBuildError::from)?);
             }
-            Ok(Predicate::In(natives))
+            Ok(FixedWidthPredicate::In(natives))
         }
         _ => Err(PredicateBuildError::UnsupportedOperator(
             "operator lacks typed literal support",
@@ -246,30 +247,32 @@ fn parse_string_bound(
     }
 }
 
-pub fn build_string_predicate(op: &Operator<'_>) -> Result<StringPredicate, PredicateBuildError> {
+pub fn build_var_width_predicate(
+    op: &Operator<'_>,
+) -> Result<VarWidthPredicate, PredicateBuildError> {
     match op {
-        Operator::Equals(lit) => Ok(StringPredicate::Equals(
+        Operator::Equals(lit) => Ok(VarWidthPredicate::Equals(
             literal_to_string(lit).map_err(PredicateBuildError::from)?,
         )),
-        Operator::GreaterThan(lit) => Ok(StringPredicate::GreaterThan(
+        Operator::GreaterThan(lit) => Ok(VarWidthPredicate::GreaterThan(
             literal_to_string(lit).map_err(PredicateBuildError::from)?,
         )),
-        Operator::GreaterThanOrEquals(lit) => Ok(StringPredicate::GreaterThanOrEquals(
+        Operator::GreaterThanOrEquals(lit) => Ok(VarWidthPredicate::GreaterThanOrEquals(
             literal_to_string(lit).map_err(PredicateBuildError::from)?,
         )),
-        Operator::LessThan(lit) => Ok(StringPredicate::LessThan(
+        Operator::LessThan(lit) => Ok(VarWidthPredicate::LessThan(
             literal_to_string(lit).map_err(PredicateBuildError::from)?,
         )),
-        Operator::LessThanOrEquals(lit) => Ok(StringPredicate::LessThanOrEquals(
+        Operator::LessThanOrEquals(lit) => Ok(VarWidthPredicate::LessThanOrEquals(
             literal_to_string(lit).map_err(PredicateBuildError::from)?,
         )),
         Operator::Range { lower, upper } => {
             let lb = parse_string_bound(lower)?;
             let ub = parse_string_bound(upper)?;
             if lb.is_none() && ub.is_none() {
-                Ok(StringPredicate::All)
+                Ok(VarWidthPredicate::All)
             } else {
-                Ok(StringPredicate::Range {
+                Ok(VarWidthPredicate::Range {
                     lower: lb,
                     upper: ub,
                 })
@@ -280,11 +283,11 @@ pub fn build_string_predicate(op: &Operator<'_>) -> Result<StringPredicate, Pred
             for lit in *values {
                 out.push(literal_to_string(lit).map_err(PredicateBuildError::from)?);
             }
-            Ok(StringPredicate::In(out))
+            Ok(VarWidthPredicate::In(out))
         }
-        Operator::StartsWith(prefix) => Ok(StringPredicate::StartsWith(prefix.to_string())),
-        Operator::EndsWith(suffix) => Ok(StringPredicate::EndsWith(suffix.to_string())),
-        Operator::Contains(substr) => Ok(StringPredicate::Contains(substr.to_string())),
+        Operator::StartsWith(prefix) => Ok(VarWidthPredicate::StartsWith(prefix.to_string())),
+        Operator::EndsWith(suffix) => Ok(VarWidthPredicate::EndsWith(suffix.to_string())),
+        Operator::Contains(substr) => Ok(VarWidthPredicate::Contains(substr.to_string())),
     }
 }
 
@@ -297,7 +300,7 @@ mod tests {
     #[test]
     fn predicate_matches_equals() {
         let op = Operator::Equals(42_i64.into());
-        let predicate = build_predicate::<arrow::datatypes::Int64Type>(&op).unwrap();
+        let predicate = build_fixed_width_predicate::<arrow::datatypes::Int64Type>(&op).unwrap();
         assert!(predicate.matches(42));
         assert!(!predicate.matches(7));
     }
@@ -308,7 +311,7 @@ mod tests {
             lower: Bound::Included(10.into()),
             upper: Bound::Excluded(20.into()),
         };
-        let predicate = build_predicate::<arrow::datatypes::Int32Type>(&op).unwrap();
+        let predicate = build_fixed_width_predicate::<arrow::datatypes::Int32Type>(&op).unwrap();
         assert!(predicate.matches(10));
         assert!(predicate.matches(19));
         assert!(!predicate.matches(9));
@@ -319,7 +322,7 @@ mod tests {
     fn predicate_in_operator() {
         let values = [1.into(), 2.into(), 3.into()];
         let op = Operator::In(&values);
-        let predicate = build_predicate::<arrow::datatypes::UInt8Type>(&op).unwrap();
+        let predicate = build_fixed_width_predicate::<arrow::datatypes::UInt8Type>(&op).unwrap();
         assert!(predicate.matches(2));
         assert!(!predicate.matches(5));
     }
@@ -327,14 +330,14 @@ mod tests {
     #[test]
     fn unsupported_operator_errors() {
         let op = Operator::StartsWith("foo");
-        let err = build_predicate::<arrow::datatypes::UInt32Type>(&op).unwrap_err();
+        let err = build_fixed_width_predicate::<arrow::datatypes::UInt32Type>(&op).unwrap_err();
         assert!(matches!(err, PredicateBuildError::UnsupportedOperator(_)));
     }
 
     #[test]
     fn literal_cast_error_propagates() {
         let op = Operator::Equals("foo".into());
-        let err = build_predicate::<arrow::datatypes::UInt16Type>(&op).unwrap_err();
+        let err = build_fixed_width_predicate::<arrow::datatypes::UInt16Type>(&op).unwrap_err();
         assert!(matches!(err, PredicateBuildError::LiteralCast(_)));
     }
 
@@ -344,7 +347,7 @@ mod tests {
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
         };
-        let predicate = build_predicate::<arrow::datatypes::UInt32Type>(&op).unwrap();
+        let predicate = build_fixed_width_predicate::<arrow::datatypes::UInt32Type>(&op).unwrap();
         assert!(predicate.matches(123));
     }
 
@@ -352,14 +355,14 @@ mod tests {
     fn matches_all_for_empty_in_list() {
         let values: [Literal; 0] = [];
         let op = Operator::In(&values);
-        let predicate = build_predicate::<arrow::datatypes::Float32Type>(&op).unwrap();
+        let predicate = build_fixed_width_predicate::<arrow::datatypes::Float32Type>(&op).unwrap();
         assert!(!predicate.matches(1.23));
     }
 
     #[test]
     fn string_predicate_equals() {
         let op = Operator::Equals("foo".into());
-        let predicate = build_string_predicate(&op).unwrap();
+        let predicate = build_var_width_predicate(&op).unwrap();
         assert!(predicate.matches("foo"));
         assert!(!predicate.matches("bar"));
     }
@@ -370,7 +373,7 @@ mod tests {
             lower: Bound::Included("alpha".into()),
             upper: Bound::Excluded("omega".into()),
         };
-        let predicate = build_string_predicate(&op).unwrap();
+        let predicate = build_var_width_predicate(&op).unwrap();
         assert!(predicate.matches("delta"));
         assert!(!predicate.matches("zzz"));
     }
@@ -379,20 +382,21 @@ mod tests {
     fn string_predicate_in_and_patterns() {
         let vals = ["x".into(), "y".into()];
         let op = Operator::In(&vals);
-        let predicate = build_string_predicate(&op).unwrap();
+        let predicate = build_var_width_predicate(&op).unwrap();
         assert!(predicate.matches("x"));
         assert!(!predicate.matches("z"));
 
         let sw =
-            build_string_predicate(&Operator::StartsWith("pre")).expect("starts with predicate");
+            build_var_width_predicate(&Operator::StartsWith("pre")).expect("starts with predicate");
         assert!(sw.matches("prefix"));
         assert!(!sw.matches("post"));
 
-        let ew = build_string_predicate(&Operator::EndsWith("suf")).expect("ends with predicate");
+        let ew =
+            build_var_width_predicate(&Operator::EndsWith("suf")).expect("ends with predicate");
         assert!(ew.matches("endsuf"));
         assert!(!ew.matches("suffixless"));
 
-        let ct = build_string_predicate(&Operator::Contains("mid")).expect("contains predicate");
+        let ct = build_var_width_predicate(&Operator::Contains("mid")).expect("contains predicate");
         assert!(ct.matches("amidst"));
         assert!(!ct.matches("edge"));
     }
