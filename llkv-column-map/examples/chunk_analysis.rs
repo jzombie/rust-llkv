@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{UInt64Array};
+use arrow::array::UInt64Array;
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::store::scan::{PrimitiveVisitor, PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveWithRowIdsVisitor, ScanOptions};
+use llkv_column_map::store::scan::{
+    PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+    PrimitiveWithRowIdsVisitor, ScanOptions,
+};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 
@@ -125,7 +128,7 @@ fn main() {
         for chunk_id in 0..1000u64 {
             let start = chunk_id * 1000;
             let end = start + 1000;
-            
+
             let rid: Vec<u64> = (start..end).collect();
             let vals: Vec<u64> = (start..end).collect();
 

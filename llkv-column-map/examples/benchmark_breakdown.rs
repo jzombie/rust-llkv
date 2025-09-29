@@ -2,14 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{UInt64Array};
+use arrow::array::UInt64Array;
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::store::scan::{PrimitiveVisitor, PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveWithRowIdsVisitor, ScanOptions};
+use llkv_column_map::store::scan::{
+    PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+    PrimitiveWithRowIdsVisitor, ScanOptions,
+};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 
@@ -72,48 +75,55 @@ fn main() {
     // Append to the main store
     store.append(&batch).unwrap();
 
-    println!("Setup overhead (create store + append): {:.3} ms", setup_time.as_secs_f64() * 1000.0);
+    println!(
+        "Setup overhead (create store + append): {:.3} ms",
+        setup_time.as_secs_f64() * 1000.0
+    );
 
     // Now measure pure scanning performance
     let mut scan_times = Vec::new();
-    
+
     // Warm up
     for _ in 0..5 {
         let mut visitor = SumVisitor::new();
-        store.scan(
-            field_id,
-            ScanOptions {
-                sorted: false,
-                reverse: false,
-                with_row_ids: false,
-                limit: None,
-                offset: 0,
-                include_nulls: false,
-                nulls_first: false,
-                anchor_row_id_field: None,
-            },
-            &mut visitor,
-        ).unwrap();
+        store
+            .scan(
+                field_id,
+                ScanOptions {
+                    sorted: false,
+                    reverse: false,
+                    with_row_ids: false,
+                    limit: None,
+                    offset: 0,
+                    include_nulls: false,
+                    nulls_first: false,
+                    anchor_row_id_field: None,
+                },
+                &mut visitor,
+            )
+            .unwrap();
     }
 
     // Measure scan-only performance
     for _ in 0..100 {
         let mut visitor = SumVisitor::new();
         let start = Instant::now();
-        store.scan(
-            field_id,
-            ScanOptions {
-                sorted: false,
-                reverse: false,
-                with_row_ids: false,
-                limit: None,
-                offset: 0,
-                include_nulls: false,
-                nulls_first: false,
-                anchor_row_id_field: None,
-            },
-            &mut visitor,
-        ).unwrap();
+        store
+            .scan(
+                field_id,
+                ScanOptions {
+                    sorted: false,
+                    reverse: false,
+                    with_row_ids: false,
+                    limit: None,
+                    offset: 0,
+                    include_nulls: false,
+                    nulls_first: false,
+                    anchor_row_id_field: None,
+                },
+                &mut visitor,
+            )
+            .unwrap();
         let scan_time = start.elapsed();
         scan_times.push(scan_time.as_secs_f64() * 1000.0);
     }
@@ -130,10 +140,10 @@ fn main() {
 
     // Now measure the full Criterion-style benchmark (setup + scan)
     let mut full_times = Vec::new();
-    
+
     for _ in 0..20 {
         let start = Instant::now();
-        
+
         // Full Criterion benchmark equivalent
         let pager = Arc::new(MemPager::new());
         let store = ColumnStore::open(pager).unwrap();
@@ -154,35 +164,44 @@ fn main() {
         store.append(&batch).unwrap();
 
         let mut visitor = SumVisitor::new();
-        store.scan(
-            field_id,
-            ScanOptions {
-                sorted: false,
-                reverse: false,
-                with_row_ids: false,
-                limit: None,
-                offset: 0,
-                include_nulls: false,
-                nulls_first: false,
-                anchor_row_id_field: None,
-            },
-            &mut visitor,
-        ).unwrap();
+        store
+            .scan(
+                field_id,
+                ScanOptions {
+                    sorted: false,
+                    reverse: false,
+                    with_row_ids: false,
+                    limit: None,
+                    offset: 0,
+                    include_nulls: false,
+                    nulls_first: false,
+                    anchor_row_id_field: None,
+                },
+                &mut visitor,
+            )
+            .unwrap();
 
         let full_time = start.elapsed();
         full_times.push(full_time.as_secs_f64() * 1000.0);
     }
 
     let avg_full = full_times.iter().sum::<f64>() / full_times.len() as f64;
-    
+
     println!("Full benchmark (setup + scan, 20 iterations):");
     println!("  Average: {:.3} ms", avg_full);
     println!("  This matches Criterion: ~{:.3} ms", 797.0 / 1000.0);
     println!();
 
     println!("=== Performance Analysis ===");
-    println!("Setup overhead: {:.1}% of total benchmark time", (setup_time.as_secs_f64() * 1000.0) / avg_full * 100.0);
-    println!("Scan performance: {:.3} ms ({:.1}% of benchmark)", avg_scan, avg_scan / avg_full * 100.0);
+    println!(
+        "Setup overhead: {:.1}% of total benchmark time",
+        (setup_time.as_secs_f64() * 1000.0) / avg_full * 100.0
+    );
+    println!(
+        "Scan performance: {:.3} ms ({:.1}% of benchmark)",
+        avg_scan,
+        avg_scan / avg_full * 100.0
+    );
     println!();
     println!("=== Analysis Complete ===");
     println!("LLKV scan-only performance: {:.3} ms", avg_scan);
