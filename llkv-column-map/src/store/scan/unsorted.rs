@@ -1,6 +1,12 @@
+// NOTE: rustfmt appears to repeatedly re-indent portions of some macros in
+// this file when running `cargo fmt` (likely a rustfmt bug). To avoid noisy
+// diffs and churn, skip automatic formatting on the affected macro_rules!
+// declarations. Keep the rest of the module formatted normally.
+
 use super::*;
 use rustc_hash::FxHashMap;
 
+#[rustfmt::skip]
 macro_rules! unsorted_visit_arm {
     ($array:ty, $method:ident, $err:expr, $metas:ident, $blobs:ident, $visitor:ident) => {{
         for m in $metas.iter() {
@@ -15,6 +21,7 @@ macro_rules! unsorted_visit_arm {
     }};
 }
 
+#[rustfmt::skip]
 macro_rules! unsorted_with_rids_arm {
     (
         $array:ty,
@@ -43,6 +50,7 @@ macro_rules! unsorted_with_rids_arm {
     }};
 }
 
+#[rustfmt::skip]
 macro_rules! dispatch_unsorted_visit {
     ($dtype:expr, $metas:ident, $blobs:ident, $visitor:ident) => {{
         let dtype_value = $dtype;
@@ -50,17 +58,17 @@ macro_rules! dispatch_unsorted_visit {
 
         macro_rules! try_dispatch_unsorted {
             (
-                        $base:ident,
-                        $chunk_fn:ident,
-                        $chunk_with_rids_fn:ident,
-                        $run_fn:ident,
-                        $run_with_rids_fn:ident,
-                        $array_ty:ty,
-                        $physical_ty:ty,
-                        $dtype_expr:expr,
-                        $native_ty:ty,
-                        $cast_expr:expr
-                    ) => {
+                $base:ident,
+                $chunk_fn:ident,
+                $chunk_with_rids_fn:ident,
+                $run_fn:ident,
+                $run_with_rids_fn:ident,
+                $array_ty:ty,
+                $physical_ty:ty,
+                $dtype_expr:expr,
+                $native_ty:ty,
+                $cast_expr:expr
+            ) => {
                 if dtype_value == &$dtype_expr {
                     result = Some(unsorted_visit_arm!(
                         $array_ty,
@@ -80,6 +88,7 @@ macro_rules! dispatch_unsorted_visit {
     }};
 }
 
+#[rustfmt::skip]
 macro_rules! dispatch_unsorted_with_rids_visit {
     (
         $dtype:expr,
@@ -94,17 +103,17 @@ macro_rules! dispatch_unsorted_with_rids_visit {
 
         macro_rules! try_dispatch_unsorted_with_rids {
             (
-                        $base:ident,
-                        $chunk_fn:ident,
-                        $chunk_with_rids_fn:ident,
-                        $run_fn:ident,
-                        $run_with_rids_fn:ident,
-                        $array_ty:ty,
-                        $physical_ty:ty,
-                        $dtype_expr:expr,
-                        $native_ty:ty,
-                        $cast_expr:expr
-                    ) => {
+                $base:ident,
+                $chunk_fn:ident,
+                $chunk_with_rids_fn:ident,
+                $run_fn:ident,
+                $run_with_rids_fn:ident,
+                $array_ty:ty,
+                $physical_ty:ty,
+                $dtype_expr:expr,
+                $native_ty:ty,
+                $cast_expr:expr
+            ) => {
                 if dtype_value == &$dtype_expr {
                     result = Some(unsorted_with_rids_arm!(
                         $array_ty,
@@ -130,6 +139,7 @@ macro_rules! dispatch_unsorted_with_rids_visit {
     }};
 }
 
+#[rustfmt::skip]
 macro_rules! dispatch_unsorted_nulls {
     ($dtype:expr) => {{
         let dtype_value = $dtype;
@@ -137,17 +147,17 @@ macro_rules! dispatch_unsorted_nulls {
 
         macro_rules! try_dispatch_unsorted_nulls {
             (
-                        $base:ident,
-                        $chunk_fn:ident,
-                        $chunk_with_rids_fn:ident,
-                        $run_fn:ident,
-                        $run_with_rids_fn:ident,
-                        $array_ty:ty,
-                        $physical_ty:ty,
-                        $dtype_expr:expr,
-                        $native_ty:ty,
-                        $cast_expr:expr
-                    ) => {
+                $base:ident,
+                $chunk_fn:ident,
+                $chunk_with_rids_fn:ident,
+                $run_fn:ident,
+                $run_with_rids_fn:ident,
+                $array_ty:ty,
+                $physical_ty:ty,
+                $dtype_expr:expr,
+                $native_ty:ty,
+                $cast_expr:expr
+            ) => {
                 if dtype_value == &$dtype_expr {
                     result = Some(emit_unsorted_nulls!(
                         $array_ty,

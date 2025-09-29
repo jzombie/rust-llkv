@@ -1,3 +1,8 @@
+// NOTE: rustfmt appears to repeatedly re-indent portions of some macros in
+// this file when running `cargo fmt` (likely a rustfmt bug). To avoid noisy
+// diffs and churn, skip automatic formatting on the affected macro_rules!
+// declarations. Keep the rest of the module formatted normally.
+
 pub mod store;
 pub mod types;
 
@@ -15,6 +20,7 @@ pub mod debug {
 /// matches the supplied `DataType`. Integer and floating-point primitives are supported; any
 /// other `DataType` triggers the `$unsupported` expression. This is used to avoid dynamic
 /// dispatch in hot paths like scans and row gathers.
+#[rustfmt::skip]
 #[macro_export]
 macro_rules! with_integer_arrow_type {
     ($dtype:expr, |$ty:ident| $body:expr, $unsupported:expr $(,)?) => {{
@@ -26,17 +32,17 @@ macro_rules! with_integer_arrow_type {
 
         macro_rules! __llkv_dispatch_integer_arrow_type {
             (
-                        $base:ident,
-                        $chunk_fn:ident,
-                        $chunk_with_rids_fn:ident,
-                        $run_fn:ident,
-                        $run_with_rids_fn:ident,
-                        $array_ty:ty,
-                        $physical_ty:ty,
-                        $dtype_expr:expr,
-                        $native_ty:ty,
-                        $cast_expr:expr
-                    ) => {
+                $base:ident,
+                $chunk_fn:ident,
+                $chunk_with_rids_fn:ident,
+                $run_fn:ident,
+                $run_with_rids_fn:ident,
+                $array_ty:ty,
+                $physical_ty:ty,
+                $dtype_expr:expr,
+                $native_ty:ty,
+                $cast_expr:expr
+            ) => {
                 if dtype_ref == &$dtype_expr {
                     type $ty = $physical_ty;
                     result = Some($body);
