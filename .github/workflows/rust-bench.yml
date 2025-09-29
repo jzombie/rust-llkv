@@ -10,8 +10,14 @@ on:
 
 jobs:
   benchmarks:
+    # Only run this job for non-draft pull requests. We still want the job to run
+    # for pushes and manual `workflow_dispatch` events. GitHub exposes
+    # `github.event.pull_request.draft` (true for draft PRs), so require it to
+    # be false when the event is a pull_request.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     name: Run Rust workspace benchmarks
-    runs-on: ubuntu-latest
+    # runs-on: ubuntu-latest
+    runs-on: codspeed-macro
 
     steps:
       - uses: actions/checkout@v4
