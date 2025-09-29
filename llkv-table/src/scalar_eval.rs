@@ -380,7 +380,7 @@ impl NumericKernels {
         Self::extract_affine_simplified(&simplified)
     }
 
-    /// Variant of [`extract_affine`] that assumes `expr` is already simplified.
+    /// Variant of \[`extract_affine`\] that assumes `expr` is already simplified.
     pub fn extract_affine_simplified(expr: &ScalarExpr<FieldId>) -> Option<AffineExpr> {
         let state = Self::affine_state(expr)?;
         let field = state.field?;
