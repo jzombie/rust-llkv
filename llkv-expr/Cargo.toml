@@ -11,4 +11,3 @@ publish.workspace = true
 [dependencies]
 arrow.workspace = true
 arrow-array.workspace = true
-llkv-column-map.workspace = true

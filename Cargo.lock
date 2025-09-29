@@ -841,6 +841,7 @@ dependencies = [
  "arrow-ord",
  "criterion",
  "line-ending",
+ "llkv-expr",
  "llkv-result",
  "llkv-storage",
  "modular-bitfield",
@@ -857,7 +858,6 @@ version = "0.1.0-alpha"
 dependencies = [
  "arrow",
  "arrow-array",
- "llkv-column-map",
 ]
 
 [[package]]

@@ -1,14 +1,16 @@
 use std::marker::PhantomData;
 
 use arrow::array::{
-    Array, Float32Array, Float64Array, GenericStringArray, Int8Array, Int16Array, Int32Array,
-    Int64Array, OffsetSizeTrait, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BooleanArray, Float32Array, Float64Array, GenericStringArray, Int8Array, Int16Array,
+    Int32Array, Int64Array, OffsetSizeTrait, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::ArrowPrimitiveType;
+use arrow::error::Result as ArrowResult;
 
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::store::rowid_fid;
 use crate::types::LogicalFieldId;
+use llkv_expr::typed_predicate::{Predicate, PredicateValue};
 use llkv_result::{Error, Result};
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -83,6 +85,96 @@ impl FilterResult {
             }
         }
         out
+    }
+}
+
+pub trait StringContainsKernel: OffsetSizeTrait {
+    fn contains(array: &GenericStringArray<Self>, needle: &str) -> ArrowResult<BooleanArray>;
+}
+
+#[allow(deprecated)]
+impl StringContainsKernel for i32 {
+    fn contains(array: &GenericStringArray<Self>, needle: &str) -> ArrowResult<BooleanArray> {
+        #[allow(deprecated)]
+        {
+            arrow::compute::kernels::comparison::contains_utf8_scalar(array, needle)
+        }
+    }
+}
+
+#[allow(deprecated)]
+impl StringContainsKernel for i64 {
+    fn contains(array: &GenericStringArray<Self>, needle: &str) -> ArrowResult<BooleanArray> {
+        #[allow(deprecated)]
+        {
+            arrow::compute::kernels::comparison::contains_utf8_scalar(array, needle)
+        }
+    }
+}
+
+pub trait FilterDispatch {
+    type Value: PredicateValue + Clone;
+
+    fn run_filter<P>(
+        store: &ColumnStore<P>,
+        field_id: LogicalFieldId,
+        predicate: &Predicate<Self::Value>,
+    ) -> Result<Vec<u64>>
+    where
+        P: Pager<Blob = EntryHandle> + Send + Sync;
+}
+
+impl<T> FilterDispatch for T
+where
+    T: FilterPrimitive,
+    T::Native: PredicateValue + Clone,
+{
+    type Value = T::Native;
+
+    fn run_filter<P>(
+        store: &ColumnStore<P>,
+        field_id: LogicalFieldId,
+        predicate: &Predicate<Self::Value>,
+    ) -> Result<Vec<u64>>
+    where
+        P: Pager<Blob = EntryHandle> + Send + Sync,
+    {
+        let predicate = predicate.clone();
+        T::run_filter(store, field_id, move |value| {
+            predicate.matches(<T::Native as PredicateValue>::borrowed(&value))
+        })
+    }
+}
+
+pub struct Utf8Filter<O>(PhantomData<O>)
+where
+    O: OffsetSizeTrait + StringContainsKernel;
+
+impl<O> FilterDispatch for Utf8Filter<O>
+where
+    O: OffsetSizeTrait + StringContainsKernel,
+{
+    type Value = String;
+
+    fn run_filter<P>(
+        store: &ColumnStore<P>,
+        field_id: LogicalFieldId,
+        predicate: &Predicate<Self::Value>,
+    ) -> Result<Vec<u64>>
+    where
+        P: Pager<Blob = EntryHandle> + Send + Sync,
+    {
+        match predicate {
+            Predicate::Contains(fragment) => {
+                run_filter_for_string_contains::<P, O>(store, field_id, fragment.as_str())
+            }
+            _ => {
+                let predicate = predicate.clone();
+                run_filter_for_string::<P, O, _>(store, field_id, move |value| {
+                    predicate.matches(value)
+                })
+            }
+        }
     }
 }
 
@@ -547,15 +639,15 @@ where
     Ok(visitor.into_row_ids())
 }
 
-pub(crate) fn run_filter_for_string<P, O, F>(
+fn visit_string_chunks<P, O, F>(
     store: &ColumnStore<P>,
     field_id: LogicalFieldId,
-    mut predicate: F,
-) -> Result<Vec<u64>>
+    mut visit: F,
+) -> Result<()>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
     O: OffsetSizeTrait,
-    F: FnMut(&str) -> bool,
+    F: FnMut(&GenericStringArray<O>, &UInt64Array) -> Result<()>,
 {
     let row_field = rowid_fid(field_id);
     let catalog = store.catalog.read().unwrap();
@@ -609,8 +701,6 @@ where
         ));
     }
 
-    let mut matches = Vec::new();
-
     for (value_meta, row_meta) in value_metas.iter().zip(row_metas.iter()) {
         let requests = [
             BatchGet::Raw {
@@ -654,20 +744,78 @@ where
             ));
         }
 
+        visit(value_arr, row_arr)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn run_filter_for_string<P, O, F>(
+    store: &ColumnStore<P>,
+    field_id: LogicalFieldId,
+    predicate: F,
+) -> Result<Vec<u64>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    O: OffsetSizeTrait,
+    F: FnMut(&str) -> bool,
+{
+    let mut matches = Vec::new();
+    let mut pred = predicate;
+    visit_string_chunks::<P, O, _>(store, field_id, |value_arr, row_arr| {
         for i in 0..value_arr.len() {
-            if !row_arr.is_valid(i) {
-                continue;
-            }
-            if value_arr.is_null(i) {
+            if !row_arr.is_valid(i) || value_arr.is_null(i) {
                 continue;
             }
             let row_id = row_arr.value(i);
             let text = value_arr.value(i);
-            if predicate(text) {
+            if pred(text) {
                 matches.push(row_id);
             }
         }
-    }
+        Ok(())
+    })?;
+
+    Ok(matches)
+}
+
+pub(crate) fn run_filter_for_string_contains<P, O>(
+    store: &ColumnStore<P>,
+    field_id: LogicalFieldId,
+    needle: &str,
+) -> Result<Vec<u64>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    O: OffsetSizeTrait + StringContainsKernel,
+{
+    let mut matches = Vec::new();
+    let needle_is_empty = needle.is_empty();
+
+    visit_string_chunks::<P, O, _>(store, field_id, |value_arr, row_arr| {
+        if needle_is_empty {
+            for i in 0..value_arr.len() {
+                if !row_arr.is_valid(i) || value_arr.is_null(i) {
+                    continue;
+                }
+                matches.push(row_arr.value(i));
+            }
+            return Ok(());
+        }
+
+        let mask = <O as StringContainsKernel>::contains(value_arr, needle).map_err(Error::from)?;
+
+        for i in 0..mask.len() {
+            if !row_arr.is_valid(i) {
+                continue;
+            }
+            if !mask.is_valid(i) || !mask.value(i) {
+                continue;
+            }
+            matches.push(row_arr.value(i));
+        }
+
+        Ok(())
+    })?;
 
     Ok(matches)
 }

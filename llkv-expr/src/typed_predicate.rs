@@ -3,7 +3,6 @@ use std::fmt;
 use std::ops::Bound;
 
 use arrow::datatypes::ArrowPrimitiveType;
-use llkv_column_map::store::FilterPrimitive;
 
 use crate::expr::Operator;
 use crate::literal::{
@@ -209,7 +208,7 @@ pub fn build_fixed_width_predicate<T>(
     op: &Operator<'_>,
 ) -> Result<Predicate<T::Native>, PredicateBuildError>
 where
-    T: ArrowPrimitiveType + FilterPrimitive,
+    T: ArrowPrimitiveType,
     T::Native: FromLiteral + Copy + PredicateValue,
 {
     match op {

@@ -1,20 +1,26 @@
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
 use std::hint::black_box;
+use std::sync::Arc;
 
-use arrow::array::{Array, StringArray};
+use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
 use llkv_column_map::ROW_ID_COLUMN_NAME;
-use llkv_table::Table;
+use llkv_column_map::store::Projection;
+use llkv_column_map::types::LogicalFieldId;
+use llkv_expr::{Expr, Filter, Operator};
 use llkv_storage::pager::MemPager;
+use llkv_table::Table;
+use llkv_table::table::ScanStreamOptions;
+use llkv_table::types::FieldId;
 
 const NUM_ROWS: usize = 1_000_000;
 const TABLE_ID: llkv_table::types::TableId = 42;
+const FIELD_ID: FieldId = 1_001;
 
 fn schema_with_row_id(field: Field) -> Arc<Schema> {
     let row_id = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
@@ -26,7 +32,7 @@ fn setup_table() -> Table {
     let table = Table::new(TABLE_ID, Arc::clone(&pager)).expect("table creation");
 
     let mut metadata = std::collections::HashMap::new();
-    metadata.insert("field_id".to_string(), "1001".to_string());
+    metadata.insert("field_id".to_string(), FIELD_ID.to_string());
     let data_field = Field::new("data", DataType::Utf8, false).with_metadata(metadata);
     let schema = schema_with_row_id(data_field);
 
@@ -46,37 +52,32 @@ fn setup_table() -> Table {
     let row_id_array = Arc::new(arrow::array::UInt64Array::from(row_ids));
     let value_array = Arc::new(StringArray::from(values));
 
-    let batch = RecordBatch::try_new(schema, vec![row_id_array, value_array]).expect("record batch");
+    let batch =
+        RecordBatch::try_new(schema, vec![row_id_array, value_array]).expect("record batch");
     table.append(&batch).expect("append batch");
 
     table
 }
 
 fn bench_substring_scan(table: &Table) -> usize {
-    // Scan the column by reading the projection directly from the store via scan_stream
-    let mut found = 0usize;
-    let projections = vec![llkv_column_map::store::Projection::from( llkv_column_map::types::LogicalFieldId::for_user(TABLE_ID, 1001))];
-    let filter = llkv_expr::Expr::Pred(llkv_expr::Filter {
-        field_id: 1001,
-        op: llkv_expr::Operator::Range { lower: std::ops::Bound::Unbounded, upper: std::ops::Bound::Unbounded },
+    let logical_field_id = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
+    let projections = vec![Projection::from(logical_field_id)];
+    let filter = Expr::Pred(Filter {
+        field_id: FIELD_ID,
+        op: Operator::Contains("needle"),
     });
 
+    let mut found = 0usize;
     table
-        .scan_stream(&projections, &filter, llkv_table::table::ScanStreamOptions::default(), |batch| {
-            let arr = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("projection yields StringArray");
-
-            for i in 0..arr.len() {
-                let s = arr.value(i);
-                if s.contains("needle") {
-                    found += 1;
-                }
-            }
-        })
-        .expect("scan_stream succeeds");
+        .scan_stream(
+            &projections,
+            &filter,
+            ScanStreamOptions::default(),
+            |batch| {
+                found += batch.num_rows();
+            },
+        )
+        .expect("scan_stream contains substring");
 
     found
 }

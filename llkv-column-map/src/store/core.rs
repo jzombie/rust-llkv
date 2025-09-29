@@ -3,12 +3,14 @@ use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
 };
+use crate::store::scan::filter::FilterDispatch;
 use crate::store::scan::{FilterPrimitive, FilterResult};
 use crate::types::LogicalFieldId;
-use arrow::array::{Array, ArrayRef, BooleanArray, OffsetSizeTrait, UInt32Array, UInt64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, UInt64Array};
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use llkv_expr::typed_predicate::Predicate;
 use llkv_result::{Error, Result};
 use llkv_storage::{
     constants::CATALOG_ROOT_PKEY,
@@ -76,10 +78,13 @@ where
     }
 
     /// Collects the row ids whose values satisfy the provided predicate.
-    pub fn filter_row_ids<T, F>(&self, field_id: LogicalFieldId, predicate: F) -> Result<Vec<u64>>
+    pub fn filter_row_ids<T>(
+        &self,
+        field_id: LogicalFieldId,
+        predicate: &Predicate<T::Value>,
+    ) -> Result<Vec<u64>>
     where
-        T: FilterPrimitive,
-        F: FnMut(T::Native) -> bool,
+        T: FilterDispatch,
     {
         T::run_filter(self, field_id, predicate)
     }
@@ -114,18 +119,6 @@ where
 
         let kinds = descriptor.get_indexes()?;
         Ok(kinds)
-    }
-
-    pub fn filter_row_ids_string<O, F>(
-        &self,
-        field_id: LogicalFieldId,
-        predicate: F,
-    ) -> Result<Vec<u64>>
-    where
-        O: OffsetSizeTrait,
-        F: FnMut(&str) -> bool,
-    {
-        scan::filter::run_filter_for_string::<P, O, F>(self, field_id, predicate)
     }
 
     /// Fast presence check using the presence index (row-id permutation) if available.

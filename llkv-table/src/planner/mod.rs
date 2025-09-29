@@ -1108,11 +1108,7 @@ where
         T::Native: FromLiteral + Copy + PredicateValue,
     {
         let predicate = build_fixed_width_predicate::<T>(op).map_err(Error::predicate_build)?;
-        self.table
-            .store()
-            .filter_row_ids::<T, _>(field_id, move |value| {
-                predicate.matches(<T::Native as PredicateValue>::borrowed(&value))
-            })
+        self.table.store().filter_row_ids::<T>(field_id, &predicate)
     }
 
     fn collect_matching_row_ids_string<O>(
@@ -1121,12 +1117,14 @@ where
         op: &Operator<'_>,
     ) -> LlkvResult<Vec<u64>>
     where
-        O: OffsetSizeTrait,
+        O: OffsetSizeTrait + llkv_column_map::store::scan::filter::StringContainsKernel,
     {
         let predicate = build_var_width_predicate(op).map_err(Error::predicate_build)?;
         self.table
             .store()
-            .filter_row_ids_string::<O, _>(field_id, move |value| predicate.matches(value))
+            .filter_row_ids::<llkv_column_map::store::scan::filter::Utf8Filter<O>>(
+                field_id, &predicate,
+            )
     }
 }
 
