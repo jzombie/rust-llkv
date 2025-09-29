@@ -13,3 +13,9 @@ pub mod types;
 
 pub use table::Table;
 pub use types::{FieldId, RowId};
+
+pub use planner::plan_graph::{
+    PLAN_GRAPH_VERSION, PlanAnnotations, PlanEdge, PlanEdgeMetadata, PlanExpression, PlanField,
+    PlanGraph, PlanGraphBuilder, PlanGraphError, PlanGraphResult, PlanGraphVersion, PlanInput,
+    PlanNode, PlanNodeId, PlanOperator,
+};

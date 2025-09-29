@@ -1,3 +1,5 @@
+pub mod plan_graph;
+
 use std::cmp;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -11,9 +13,9 @@ use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
-use llkv_expr::literal::FromLiteral;
+use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::build_predicate;
-use llkv_expr::{CompareOp, Expr, Filter, Operator, ScalarExpr};
+use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -24,6 +26,11 @@ use crate::constants::STREAM_BATCH_ROWS;
 use crate::scalar_eval::{NumericArrayMap, NumericKernels};
 use crate::table::{ScanProjection, ScanStreamOptions, Table};
 use crate::types::FieldId;
+
+use self::plan_graph::{
+    PlanEdge, PlanExpression, PlanField, PlanGraph, PlanGraphBuilder, PlanGraphError, PlanNode,
+    PlanNodeId, PlanOperator,
+};
 
 macro_rules! impl_single_column_emit_chunk {
     (
@@ -324,6 +331,20 @@ enum ProjectionEval {
     Computed(ComputedProjectionInfo),
 }
 
+struct PlannedScan<'expr> {
+    projections: Vec<ScanProjection>,
+    filter_expr: Expr<'expr, FieldId>,
+    options: ScanStreamOptions,
+    plan_graph: PlanGraph,
+}
+
+pub(crate) struct TableExecutor<'a, P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    table: &'a Table<P>,
+}
+
 pub(crate) struct TablePlanner<'a, P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -344,18 +365,148 @@ where
         projections: &[ScanProjection],
         filter_expr: &Expr<'expr, FieldId>,
         options: ScanStreamOptions,
-        mut on_batch: F,
+        on_batch: F,
     ) -> LlkvResult<()>
     where
         F: FnMut(RecordBatch),
     {
+        let plan = self.plan_scan(projections, filter_expr, options)?;
+        TableExecutor::new(self.table).execute(plan, on_batch)
+    }
+
+    fn plan_scan<'expr>(
+        &self,
+        projections: &[ScanProjection],
+        filter_expr: &Expr<'expr, FieldId>,
+        options: ScanStreamOptions,
+    ) -> LlkvResult<PlannedScan<'expr>> {
         if projections.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "scan_stream requires at least one projection".into(),
             ));
         }
 
-        if self.try_single_column_direct_scan(projections, filter_expr, options, &mut on_batch)? {
+        let projections_vec = projections.to_vec();
+        let filter_clone = filter_expr.clone();
+        let plan_graph = self.build_plan_graph(&projections_vec, &filter_clone, options)?;
+
+        Ok(PlannedScan {
+            projections: projections_vec,
+            filter_expr: filter_clone,
+            options,
+            plan_graph,
+        })
+    }
+
+    fn build_plan_graph(
+        &self,
+        projections: &[ScanProjection],
+        filter_expr: &Expr<'_, FieldId>,
+        options: ScanStreamOptions,
+    ) -> LlkvResult<PlanGraph> {
+        let mut builder = PlanGraphBuilder::new();
+
+        let scan_node_id = PlanNodeId::new(1);
+        let mut scan_node = PlanNode::new(scan_node_id, PlanOperator::TableScan);
+        scan_node
+            .metadata
+            .insert("table_id", self.table.table_id().to_string());
+        scan_node
+            .metadata
+            .insert("projection_count", projections.len().to_string());
+        builder.add_node(scan_node).map_err(plan_graph_err)?;
+        builder.add_root(scan_node_id).map_err(plan_graph_err)?;
+
+        let mut next_node = 2u32;
+        let mut parent = scan_node_id;
+
+        if !is_trivial_filter(filter_expr) {
+            let filter_node_id = PlanNodeId::new(next_node);
+            next_node += 1;
+            let mut filter_node = PlanNode::new(filter_node_id, PlanOperator::Filter);
+            filter_node.add_predicate(PlanExpression::new(format_expr(filter_expr)));
+            builder.add_node(filter_node).map_err(plan_graph_err)?;
+            builder
+                .add_edge(PlanEdge::new(parent, filter_node_id))
+                .map_err(plan_graph_err)?;
+            parent = filter_node_id;
+        }
+
+        let project_node_id = PlanNodeId::new(next_node);
+        next_node += 1;
+        let mut project_node = PlanNode::new(project_node_id, PlanOperator::Project);
+
+        for projection in projections {
+            match projection {
+                ScanProjection::Column(proj) => {
+                    let alias = proj
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| proj.logical_field_id.field_id().to_string());
+                    let dtype = self.table.store().data_type(proj.logical_field_id)?;
+                    project_node.add_projection(PlanExpression::new(format!("column({})", alias)));
+                    project_node.add_field(
+                        PlanField::new(alias.clone(), format!("{dtype:?}")).with_nullability(true),
+                    );
+                }
+                ScanProjection::Computed { expr, alias } => {
+                    project_node.add_projection(PlanExpression::new(format!(
+                        "{} := {}",
+                        alias,
+                        format_scalar_expr(expr)
+                    )));
+                    project_node
+                        .add_field(PlanField::new(alias.clone(), "Float64").with_nullability(true));
+                }
+            }
+        }
+
+        builder.add_node(project_node).map_err(plan_graph_err)?;
+        builder
+            .add_edge(PlanEdge::new(parent, project_node_id))
+            .map_err(plan_graph_err)?;
+        parent = project_node_id;
+
+        let output_node_id = PlanNodeId::new(next_node);
+        let mut output_node = PlanNode::new(output_node_id, PlanOperator::Output);
+        output_node
+            .metadata
+            .insert("include_nulls", options.include_nulls.to_string());
+        builder.add_node(output_node).map_err(plan_graph_err)?;
+        builder
+            .add_edge(PlanEdge::new(parent, output_node_id))
+            .map_err(plan_graph_err)?;
+
+        let annotations = builder.annotations_mut();
+        annotations.description = Some("table.scan_stream".to_string());
+        annotations
+            .properties
+            .insert("table_id".to_string(), self.table.table_id().to_string());
+
+        builder.finish().map_err(plan_graph_err)
+    }
+}
+
+impl<'a, P> TableExecutor<'a, P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    pub(crate) fn new(table: &'a Table<P>) -> Self {
+        Self { table }
+    }
+
+    fn execute<'expr, F>(&self, plan: PlannedScan<'expr>, mut on_batch: F) -> LlkvResult<()>
+    where
+        F: FnMut(RecordBatch),
+    {
+        let PlannedScan {
+            projections,
+            filter_expr,
+            options,
+            plan_graph: _plan_graph,
+        } = plan;
+
+        if self.try_single_column_direct_scan(&projections, &filter_expr, options, &mut on_batch)? {
             return Ok(());
         }
 
@@ -365,7 +516,7 @@ where
         let mut numeric_fields: FxHashSet<FieldId> = FxHashSet::default();
         let mut lfid_dtypes: FxHashMap<LogicalFieldId, DataType> = FxHashMap::default();
 
-        for proj in projections {
+        for proj in &projections {
             match proj {
                 ScanProjection::Column(p) => {
                     let lfid = p.logical_field_id;
@@ -474,7 +625,7 @@ where
         let out_schema = Arc::new(Schema::new(schema_fields));
 
         let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
-        let row_ids = self.collect_row_ids_for_expr(filter_expr, &mut all_rows_cache)?;
+        let row_ids = self.collect_row_ids_for_expr(&filter_expr, &mut all_rows_cache)?;
         if row_ids.is_empty() {
             return Ok(());
         }
@@ -950,6 +1101,145 @@ where
             .store()
             .filter_row_ids::<T, _>(field_id, move |value| predicate.matches(value))
     }
+}
+
+fn plan_graph_err(err: PlanGraphError) -> Error {
+    Error::Internal(format!("plan graph construction failed: {err}"))
+}
+
+fn is_trivial_filter(expr: &Expr<'_, FieldId>) -> bool {
+    matches!(
+        expr,
+        Expr::Pred(Filter {
+            op: Operator::Range {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            ..
+        })
+    )
+}
+
+fn format_expr(expr: &Expr<'_, FieldId>) -> String {
+    match expr {
+        Expr::And(children) => {
+            if children.is_empty() {
+                "TRUE".to_string()
+            } else {
+                children
+                    .iter()
+                    .map(format_expr)
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            }
+        }
+        Expr::Or(children) => {
+            if children.is_empty() {
+                "FALSE".to_string()
+            } else {
+                children
+                    .iter()
+                    .map(format_expr)
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            }
+        }
+        Expr::Not(inner) => format!("NOT ({})", format_expr(inner)),
+        Expr::Pred(filter) => format_filter(filter),
+        Expr::Compare { left, op, right } => format!(
+            "{} {} {}",
+            format_scalar_expr(left),
+            format_compare_op(*op),
+            format_scalar_expr(right)
+        ),
+    }
+}
+
+fn format_filter(filter: &Filter<'_, FieldId>) -> String {
+    format!("field#{} {}", filter.field_id, format_operator(&filter.op))
+}
+
+fn format_operator(op: &Operator<'_>) -> String {
+    match op {
+        Operator::Equals(lit) => format!("= {}", format_literal(lit)),
+        Operator::Range { lower, upper } => format!(
+            "IN {} .. {}",
+            format_range_bound_lower(lower),
+            format_range_bound_upper(upper)
+        ),
+        Operator::GreaterThan(lit) => format!("> {}", format_literal(lit)),
+        Operator::GreaterThanOrEquals(lit) => format!(">= {}", format_literal(lit)),
+        Operator::LessThan(lit) => format!("< {}", format_literal(lit)),
+        Operator::LessThanOrEquals(lit) => format!("<= {}", format_literal(lit)),
+        Operator::In(values) => {
+            let rendered: Vec<String> = values.iter().map(format_literal).collect();
+            format!("IN {{{}}}", rendered.join(", "))
+        }
+        Operator::StartsWith(prefix) => format!("STARTS WITH \"{}\"", escape_string(prefix)),
+        Operator::EndsWith(suffix) => format!("ENDS WITH \"{}\"", escape_string(suffix)),
+        Operator::Contains(fragment) => format!("CONTAINS \"{}\"", escape_string(fragment)),
+    }
+}
+
+fn format_range_bound_lower(bound: &Bound<Literal>) -> String {
+    match bound {
+        Bound::Unbounded => "-inf".to_string(),
+        Bound::Included(lit) => format!("[{}", format_literal(lit)),
+        Bound::Excluded(lit) => format!("({}", format_literal(lit)),
+    }
+}
+
+fn format_range_bound_upper(bound: &Bound<Literal>) -> String {
+    match bound {
+        Bound::Unbounded => "+inf".to_string(),
+        Bound::Included(lit) => format!("{}]", format_literal(lit)),
+        Bound::Excluded(lit) => format!("{})", format_literal(lit)),
+    }
+}
+
+fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
+    match expr {
+        ScalarExpr::Column(fid) => format!("col#{}", fid),
+        ScalarExpr::Literal(lit) => format_literal(lit),
+        ScalarExpr::Binary { left, op, right } => format!(
+            "({} {} {})",
+            format_scalar_expr(left),
+            format_binary_op(*op),
+            format_scalar_expr(right)
+        ),
+    }
+}
+
+fn format_binary_op(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "+",
+        BinaryOp::Subtract => "-",
+        BinaryOp::Multiply => "*",
+        BinaryOp::Divide => "/",
+    }
+}
+
+fn format_compare_op(op: CompareOp) -> &'static str {
+    match op {
+        CompareOp::Eq => "=",
+        CompareOp::NotEq => "!=",
+        CompareOp::Lt => "<",
+        CompareOp::LtEq => "<=",
+        CompareOp::Gt => ">",
+        CompareOp::GtEq => ">=",
+    }
+}
+
+fn format_literal(lit: &Literal) -> String {
+    match lit {
+        Literal::Integer(i) => i.to_string(),
+        Literal::Float(f) => f.to_string(),
+        Literal::String(s) => format!("\"{}\"", escape_string(s)),
+    }
+}
+
+fn escape_string(value: &str) -> String {
+    value.chars().flat_map(|c| c.escape_default()).collect()
 }
 
 fn is_full_range_filter(expr: &Expr<'_, FieldId>, expected_field: FieldId) -> bool {

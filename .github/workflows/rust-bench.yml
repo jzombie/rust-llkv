@@ -18,6 +18,12 @@ permissions:
   pull-requests: write
   checks: write
 
+# Ensure only one run per branch/PR at a time. If new commits are pushed,
+# older benchmark jobs will be automatically canceled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   benchmark_with_bencher:
     # Only run this job for non-draft pull requests. We still want the job to run
@@ -31,6 +37,9 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64]
     env:
       BENCHER_PROJECT: llkv
+      # The Bencher adapter to use for the benchmark run.
+      # https://bencher.dev/docs/explanation/adapters
+      BENCHER_ADAPTER: rust_criterion
       BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
       # Use a workspace-local CARGO_HOME to avoid writing into the runner's
       # $HOME/.cargo. This keeps installs and registry/git cache inside the
@@ -81,6 +90,7 @@ jobs:
         # branch/testbed and any optional threshold flags.
         run: |
           bencher run \
+            --adapter ${BENCHER_ADAPTER} \
             --project "${BENCHER_PROJECT}" \
             --branch "${BENCHER_BRANCH}" \
             --testbed "${BENCHER_TESTBED}" \
@@ -95,6 +105,7 @@ jobs:
         # threshold flags, but without uploading results if no API token is set.
         run: |
           bencher run \
+            --adapter ${BENCHER_ADAPTER} \
             --project "${BENCHER_PROJECT}" \
             --branch "${BENCHER_BRANCH}" \
             --testbed "${BENCHER_TESTBED}" \
