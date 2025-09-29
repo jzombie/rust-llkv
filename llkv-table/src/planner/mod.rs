@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 
+use llkv_column_map::llkv_for_each_arrow_numeric;
 use llkv_column_map::ScanBuilder;
 use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
 use llkv_column_map::store::GatherNullPolicy;
@@ -23,6 +24,298 @@ use crate::constants::STREAM_BATCH_ROWS;
 use crate::scalar_eval::{NumericArrayMap, NumericKernels};
 use crate::table::{ScanProjection, ScanStreamOptions, Table};
 use crate::types::FieldId;
+
+macro_rules! impl_single_column_emit_chunk {
+    (
+        $_base:ident,
+        $chunk:ident,
+        $_chunk_with_rids:ident,
+        $_run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $chunk(&mut self, values: &$array_ty) {
+            self.emit_array(values);
+        }
+    };
+}
+
+macro_rules! impl_single_column_reject_chunk_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $chunk_with_rids:ident,
+        $_run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $chunk_with_rids(
+            &mut self,
+            _: &$array_ty,
+            _: &arrow::array::UInt64Array,
+        ) {
+            self.reject_row_ids();
+        }
+    };
+}
+
+macro_rules! impl_single_column_emit_sorted_run {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $_chunk_with_rids:ident,
+        $run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $run(&mut self, values: &$array_ty, start: usize, len: usize) {
+            if self.error.is_some() || len == 0 {
+                return;
+            }
+            let slice = values.slice(start, len);
+            let array: ArrayRef = Arc::new(slice) as ArrayRef;
+            self.emit_array_ref(array);
+        }
+    };
+}
+
+macro_rules! impl_single_column_reject_sorted_run_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $_chunk_with_rids:ident,
+        $_run:ident,
+        $run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $run_with_rids(
+            &mut self,
+            _: &$array_ty,
+            _: &arrow::array::UInt64Array,
+            _: usize,
+            _: usize,
+        ) {
+            self.reject_row_ids();
+        }
+    };
+}
+
+macro_rules! impl_computed_emit_chunk {
+    (
+        $_base:ident,
+        $chunk:ident,
+        $_chunk_with_rids:ident,
+        $_run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $chunk(&mut self, values: &$array_ty) {
+            self.process_values(values);
+        }
+    };
+}
+
+macro_rules! impl_computed_reject_chunk_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $chunk_with_rids:ident,
+        $_run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $chunk_with_rids(
+            &mut self,
+            _: &$array_ty,
+            _: &arrow::array::UInt64Array,
+        ) {
+            self.reject_row_ids();
+        }
+    };
+}
+
+macro_rules! impl_computed_emit_sorted_run {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $_chunk_with_rids:ident,
+        $run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $run(&mut self, values: &$array_ty, start: usize, len: usize) {
+            if self.error.is_some() || len == 0 {
+                return;
+            }
+            let slice = values.slice(start, len);
+            let array: ArrayRef = Arc::new(slice) as ArrayRef;
+            self.process_array(array);
+        }
+    };
+}
+
+macro_rules! impl_computed_reject_sorted_run_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $_chunk_with_rids:ident,
+        $_run:ident,
+        $run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $run_with_rids(
+            &mut self,
+            _: &$array_ty,
+            _: &arrow::array::UInt64Array,
+            _: usize,
+            _: usize,
+        ) {
+            self.reject_row_ids();
+        }
+    };
+}
+
+macro_rules! impl_affine_emit_chunk {
+    (
+        $_base:ident,
+        $chunk:ident,
+        $_chunk_with_rids:ident,
+        $_run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $cast:expr
+    ) => {
+        fn $chunk(&mut self, values: &$array_ty) {
+            let cast = $cast;
+            if values.null_count() == 0 {
+                let slice = values.values();
+                self.emit_no_nulls(slice.len(), |idx| cast(slice[idx]));
+            } else {
+                let len = values.len();
+                self.emit_with_nulls(
+                    len,
+                    |idx| values.is_null(idx),
+                    |idx| cast(values.value(idx)),
+                );
+            }
+        }
+    };
+}
+
+macro_rules! impl_affine_reject_chunk_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $chunk_with_rids:ident,
+        $_run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $chunk_with_rids(
+            &mut self,
+            _: &$array_ty,
+            _: &arrow::array::UInt64Array,
+        ) {
+            self.reject_row_ids();
+        }
+    };
+}
+
+macro_rules! impl_affine_emit_sorted_run {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $_chunk_with_rids:ident,
+        $run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $cast:expr
+    ) => {
+        fn $run(&mut self, values: &$array_ty, start: usize, len: usize) {
+            if len == 0 {
+                return;
+            }
+            let cast = $cast;
+            if values.null_count() == 0 {
+                let slice = values.values();
+                self.emit_no_nulls(len, |idx| cast(slice[start + idx]));
+            } else {
+                self.emit_with_nulls(
+                    len,
+                    |idx| values.is_null(start + idx),
+                    |idx| cast(values.value(start + idx)),
+                );
+            }
+        }
+    };
+}
+
+macro_rules! impl_affine_reject_sorted_run_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $_chunk_with_rids:ident,
+        $_run:ident,
+        $run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $run_with_rids(
+            &mut self,
+            _: &$array_ty,
+            _: &arrow::array::UInt64Array,
+            _: usize,
+            _: usize,
+        ) {
+            self.reject_row_ids();
+        }
+    };
+}
 
 #[derive(Clone)]
 struct ColumnProjectionInfo {
@@ -747,22 +1040,6 @@ where
     }
 }
 
-macro_rules! emit_primitive_chunk {
-    ($name:ident, $array_ty:ty) => {
-        fn $name(&mut self, values: &$array_ty) {
-            self.emit_array(values);
-        }
-    };
-}
-
-macro_rules! reject_row_ids_method {
-    ($name:ident, $array_ty:ty) => {
-        fn $name(&mut self, _values: &$array_ty, _row_ids: &arrow::array::UInt64Array) {
-            self.reject_row_ids();
-        }
-    };
-}
-
 struct ComputedSingleColumnVisitor<'a, F>
 where
     F: FnMut(RecordBatch),
@@ -855,114 +1132,25 @@ where
     }
 }
 
-macro_rules! computed_chunk {
-    ($name:ident, $array_ty:ty) => {
-        fn $name(&mut self, values: &$array_ty) {
-            self.process_values(values);
-        }
-    };
-}
-
-macro_rules! computed_sorted_run {
-    ($name:ident, $array_ty:ty) => {
-        fn $name(&mut self, values: &$array_ty, start: usize, end: usize) {
-            if self.error.is_some() || end <= start {
-                return;
-            }
-            let len = end - start;
-            let slice = values.slice(start, len);
-            let array: ArrayRef = Arc::new(slice) as ArrayRef;
-            self.process_array(array);
-        }
-    };
-}
-
 impl<'a, F> llkv_column_map::scan::PrimitiveVisitor for ComputedSingleColumnVisitor<'a, F>
 where
     F: FnMut(RecordBatch),
 {
-    computed_chunk!(u64_chunk, arrow::array::UInt64Array);
-    computed_chunk!(u32_chunk, arrow::array::UInt32Array);
-    computed_chunk!(u16_chunk, arrow::array::UInt16Array);
-    computed_chunk!(u8_chunk, arrow::array::UInt8Array);
-    computed_chunk!(i64_chunk, arrow::array::Int64Array);
-    computed_chunk!(i32_chunk, arrow::array::Int32Array);
-    computed_chunk!(i16_chunk, arrow::array::Int16Array);
-    computed_chunk!(i8_chunk, arrow::array::Int8Array);
-    computed_chunk!(f64_chunk, arrow::array::Float64Array);
-    computed_chunk!(f32_chunk, arrow::array::Float32Array);
+    llkv_for_each_arrow_numeric!(impl_computed_emit_chunk);
 }
 
 impl<'a, F> llkv_column_map::scan::PrimitiveWithRowIdsVisitor for ComputedSingleColumnVisitor<'a, F>
 where
     F: FnMut(RecordBatch),
 {
-    fn u64_chunk_with_rids(
-        &mut self,
-        _: &arrow::array::UInt64Array,
-        _: &arrow::array::UInt64Array,
-    ) {
-        self.reject_row_ids();
-    }
-    fn u32_chunk_with_rids(
-        &mut self,
-        _: &arrow::array::UInt32Array,
-        _: &arrow::array::UInt64Array,
-    ) {
-        self.reject_row_ids();
-    }
-    fn u16_chunk_with_rids(
-        &mut self,
-        _: &arrow::array::UInt16Array,
-        _: &arrow::array::UInt64Array,
-    ) {
-        self.reject_row_ids();
-    }
-    fn u8_chunk_with_rids(&mut self, _: &arrow::array::UInt8Array, _: &arrow::array::UInt64Array) {
-        self.reject_row_ids();
-    }
-    fn i64_chunk_with_rids(&mut self, _: &arrow::array::Int64Array, _: &arrow::array::UInt64Array) {
-        self.reject_row_ids();
-    }
-    fn i32_chunk_with_rids(&mut self, _: &arrow::array::Int32Array, _: &arrow::array::UInt64Array) {
-        self.reject_row_ids();
-    }
-    fn i16_chunk_with_rids(&mut self, _: &arrow::array::Int16Array, _: &arrow::array::UInt64Array) {
-        self.reject_row_ids();
-    }
-    fn i8_chunk_with_rids(&mut self, _: &arrow::array::Int8Array, _: &arrow::array::UInt64Array) {
-        self.reject_row_ids();
-    }
-    fn f64_chunk_with_rids(
-        &mut self,
-        _: &arrow::array::Float64Array,
-        _: &arrow::array::UInt64Array,
-    ) {
-        self.reject_row_ids();
-    }
-    fn f32_chunk_with_rids(
-        &mut self,
-        _: &arrow::array::Float32Array,
-        _: &arrow::array::UInt64Array,
-    ) {
-        self.reject_row_ids();
-    }
+    llkv_for_each_arrow_numeric!(impl_computed_reject_chunk_with_rids);
 }
 
 impl<'a, F> llkv_column_map::scan::PrimitiveSortedVisitor for ComputedSingleColumnVisitor<'a, F>
 where
     F: FnMut(RecordBatch),
 {
-    computed_sorted_run!(u64_run, arrow::array::UInt64Array);
-    computed_sorted_run!(u32_run, arrow::array::UInt32Array);
-    computed_sorted_run!(u16_run, arrow::array::UInt16Array);
-    computed_sorted_run!(u8_run, arrow::array::UInt8Array);
-    computed_sorted_run!(i64_run, arrow::array::Int64Array);
-    computed_sorted_run!(i32_run, arrow::array::Int32Array);
-    computed_sorted_run!(i16_run, arrow::array::Int16Array);
-    computed_sorted_run!(i8_run, arrow::array::Int8Array);
-    computed_sorted_run!(f64_run, arrow::array::Float64Array);
-    computed_sorted_run!(f32_run, arrow::array::Float32Array);
+    llkv_for_each_arrow_numeric!(impl_computed_emit_sorted_run);
 }
 
 impl<'a, F> llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor
@@ -970,181 +1158,28 @@ impl<'a, F> llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor
 where
     F: FnMut(RecordBatch),
 {
-    fn u64_run_with_rids(
-        &mut self,
-        _: &arrow::array::UInt64Array,
-        _: &arrow::array::UInt64Array,
-        _: usize,
-        _: usize,
-    ) {
-        self.reject_row_ids();
-    }
-
-    fn u32_run_with_rids(
-        &mut self,
-        _: &arrow::array::UInt32Array,
-        _: &arrow::array::UInt64Array,
-        _: usize,
-        _: usize,
-    ) {
-        self.reject_row_ids();
-    }
-
-    fn u16_run_with_rids(
-        &mut self,
-        _: &arrow::array::UInt16Array,
-        _: &arrow::array::UInt64Array,
-        _: usize,
-        _: usize,
-    ) {
-        self.reject_row_ids();
-    }
-
-    fn u8_run_with_rids(
-        &mut self,
-        _: &arrow::array::UInt8Array,
-        _: &arrow::array::UInt64Array,
-        _: usize,
-        _: usize,
-    ) {
-        self.reject_row_ids();
-    }
-
-    fn i64_run_with_rids(
-        &mut self,
-        _: &arrow::array::Int64Array,
-        _: &arrow::array::UInt64Array,
-        _: usize,
-        _: usize,
-    ) {
-        self.reject_row_ids();
-    }
-
-    fn i32_run_with_rids(
-        &mut self,
-        _: &arrow::array::Int32Array,
-        _: &arrow::array::UInt64Array,
-        _: usize,
-        _: usize,
-    ) {
-        self.reject_row_ids();
-    }
-
-    fn i16_run_with_rids(
-        &mut self,
-        _: &arrow::array::Int16Array,
-        _: &arrow::array::UInt64Array,
-        _: usize,
-        _: usize,
-    ) {
-        self.reject_row_ids();
-    }
-
-    fn i8_run_with_rids(
-        &mut self,
-        _: &arrow::array::Int8Array,
-        _: &arrow::array::UInt64Array,
-        _: usize,
-        _: usize,
-    ) {
-        self.reject_row_ids();
-    }
-
-    fn f64_run_with_rids(
-        &mut self,
-        _: &arrow::array::Float64Array,
-        _: &arrow::array::UInt64Array,
-        _: usize,
-        _: usize,
-    ) {
-        self.reject_row_ids();
-    }
-
-    fn f32_run_with_rids(
-        &mut self,
-        _: &arrow::array::Float32Array,
-        _: &arrow::array::UInt64Array,
-        _: usize,
-        _: usize,
-    ) {
-        self.reject_row_ids();
-    }
-}
-
-macro_rules! emit_sorted_run {
-    ($name:ident, $array_ty:ty) => {
-        fn $name(&mut self, values: &$array_ty, start: usize, end: usize) {
-            if self.error.is_some() || end <= start {
-                return;
-            }
-            let len = end - start;
-            let slice = values.slice(start, len);
-            let array: ArrayRef = Arc::new(slice) as ArrayRef;
-            self.emit_array_ref(array);
-        }
-    };
-}
-
-macro_rules! reject_sorted_row_ids_run {
-    ($name:ident, $array_ty:ty) => {
-        fn $name(
-            &mut self,
-            _values: &$array_ty,
-            _row_ids: &arrow::array::UInt64Array,
-            _start: usize,
-            _end: usize,
-        ) {
-            self.reject_row_ids();
-        }
-    };
+    llkv_for_each_arrow_numeric!(impl_computed_reject_sorted_run_with_rids);
 }
 
 impl<'a, F> llkv_column_map::scan::PrimitiveVisitor for SingleColumnStreamVisitor<'a, F>
 where
     F: FnMut(RecordBatch),
 {
-    emit_primitive_chunk!(u64_chunk, arrow::array::UInt64Array);
-    emit_primitive_chunk!(u32_chunk, arrow::array::UInt32Array);
-    emit_primitive_chunk!(u16_chunk, arrow::array::UInt16Array);
-    emit_primitive_chunk!(u8_chunk, arrow::array::UInt8Array);
-    emit_primitive_chunk!(i64_chunk, arrow::array::Int64Array);
-    emit_primitive_chunk!(i32_chunk, arrow::array::Int32Array);
-    emit_primitive_chunk!(i16_chunk, arrow::array::Int16Array);
-    emit_primitive_chunk!(i8_chunk, arrow::array::Int8Array);
-    emit_primitive_chunk!(f64_chunk, arrow::array::Float64Array);
-    emit_primitive_chunk!(f32_chunk, arrow::array::Float32Array);
+    llkv_for_each_arrow_numeric!(impl_single_column_emit_chunk);
 }
 
 impl<'a, F> llkv_column_map::scan::PrimitiveWithRowIdsVisitor for SingleColumnStreamVisitor<'a, F>
 where
     F: FnMut(RecordBatch),
 {
-    reject_row_ids_method!(u64_chunk_with_rids, arrow::array::UInt64Array);
-    reject_row_ids_method!(u32_chunk_with_rids, arrow::array::UInt32Array);
-    reject_row_ids_method!(u16_chunk_with_rids, arrow::array::UInt16Array);
-    reject_row_ids_method!(u8_chunk_with_rids, arrow::array::UInt8Array);
-    reject_row_ids_method!(i64_chunk_with_rids, arrow::array::Int64Array);
-    reject_row_ids_method!(i32_chunk_with_rids, arrow::array::Int32Array);
-    reject_row_ids_method!(i16_chunk_with_rids, arrow::array::Int16Array);
-    reject_row_ids_method!(i8_chunk_with_rids, arrow::array::Int8Array);
-    reject_row_ids_method!(f64_chunk_with_rids, arrow::array::Float64Array);
-    reject_row_ids_method!(f32_chunk_with_rids, arrow::array::Float32Array);
+    llkv_for_each_arrow_numeric!(impl_single_column_reject_chunk_with_rids);
 }
 
 impl<'a, F> llkv_column_map::scan::PrimitiveSortedVisitor for SingleColumnStreamVisitor<'a, F>
 where
     F: FnMut(RecordBatch),
 {
-    emit_sorted_run!(u64_run, arrow::array::UInt64Array);
-    emit_sorted_run!(u32_run, arrow::array::UInt32Array);
-    emit_sorted_run!(u16_run, arrow::array::UInt16Array);
-    emit_sorted_run!(u8_run, arrow::array::UInt8Array);
-    emit_sorted_run!(i64_run, arrow::array::Int64Array);
-    emit_sorted_run!(i32_run, arrow::array::Int32Array);
-    emit_sorted_run!(i16_run, arrow::array::Int16Array);
-    emit_sorted_run!(i8_run, arrow::array::Int8Array);
-    emit_sorted_run!(f64_run, arrow::array::Float64Array);
-    emit_sorted_run!(f32_run, arrow::array::Float32Array);
+    llkv_for_each_arrow_numeric!(impl_single_column_emit_sorted_run);
 }
 
 impl<'a, F> llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor
@@ -1152,16 +1187,7 @@ impl<'a, F> llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor
 where
     F: FnMut(RecordBatch),
 {
-    reject_sorted_row_ids_run!(u64_run_with_rids, arrow::array::UInt64Array);
-    reject_sorted_row_ids_run!(u32_run_with_rids, arrow::array::UInt32Array);
-    reject_sorted_row_ids_run!(u16_run_with_rids, arrow::array::UInt16Array);
-    reject_sorted_row_ids_run!(u8_run_with_rids, arrow::array::UInt8Array);
-    reject_sorted_row_ids_run!(i64_run_with_rids, arrow::array::Int64Array);
-    reject_sorted_row_ids_run!(i32_run_with_rids, arrow::array::Int32Array);
-    reject_sorted_row_ids_run!(i16_run_with_rids, arrow::array::Int16Array);
-    reject_sorted_row_ids_run!(i8_run_with_rids, arrow::array::Int8Array);
-    reject_sorted_row_ids_run!(f64_run_with_rids, arrow::array::Float64Array);
-    reject_sorted_row_ids_run!(f32_run_with_rids, arrow::array::Float32Array);
+    llkv_for_each_arrow_numeric!(impl_single_column_reject_sorted_run_with_rids);
 }
 
 struct AffineSingleColumnVisitor<'a, F>
@@ -1261,108 +1287,25 @@ where
     }
 }
 
-macro_rules! affine_chunk {
-    ($name:ident, $array_ty:ty, $cast:expr) => {
-        fn $name(&mut self, values: &$array_ty) {
-            let cast = $cast;
-            if values.null_count() == 0 {
-                let slice = values.values();
-                self.emit_no_nulls(slice.len(), |idx| cast(slice[idx]));
-            } else {
-                let len = values.len();
-                self.emit_with_nulls(
-                    len,
-                    |idx| values.is_null(idx),
-                    |idx| cast(values.value(idx)),
-                );
-            }
-        }
-    };
-}
-
-macro_rules! affine_run {
-    ($name:ident, $array_ty:ty, $cast:expr) => {
-        fn $name(&mut self, values: &$array_ty, start: usize, len: usize) {
-            if len == 0 {
-                return;
-            }
-            let cast = $cast;
-            if values.null_count() == 0 {
-                let slice = values.values();
-                self.emit_no_nulls(len, |idx| cast(slice[start + idx]));
-            } else {
-                self.emit_with_nulls(
-                    len,
-                    |idx| values.is_null(start + idx),
-                    |idx| cast(values.value(start + idx)),
-                );
-            }
-        }
-    };
-}
-
-macro_rules! affine_row_ids_chunk {
-    ($name:ident, $array_ty:ty) => {
-        fn $name(&mut self, _: &$array_ty, _: &arrow::array::UInt64Array) {
-            self.reject_row_ids();
-        }
-    };
-}
-
-macro_rules! affine_row_ids_run {
-    ($name:ident, $array_ty:ty) => {
-        fn $name(&mut self, _: &$array_ty, _: &arrow::array::UInt64Array, _: usize, _: usize) {
-            self.reject_row_ids();
-        }
-    };
-}
-
 impl<'a, F> llkv_column_map::scan::PrimitiveVisitor for AffineSingleColumnVisitor<'a, F>
 where
     F: FnMut(RecordBatch),
 {
-    affine_chunk!(u64_chunk, arrow::array::UInt64Array, |v: u64| v as f64);
-    affine_chunk!(u32_chunk, arrow::array::UInt32Array, |v: u32| v as f64);
-    affine_chunk!(u16_chunk, arrow::array::UInt16Array, |v: u16| v as f64);
-    affine_chunk!(u8_chunk, arrow::array::UInt8Array, |v: u8| v as f64);
-    affine_chunk!(i64_chunk, arrow::array::Int64Array, |v: i64| v as f64);
-    affine_chunk!(i32_chunk, arrow::array::Int32Array, |v: i32| v as f64);
-    affine_chunk!(i16_chunk, arrow::array::Int16Array, |v: i16| v as f64);
-    affine_chunk!(i8_chunk, arrow::array::Int8Array, |v: i8| v as f64);
-    affine_chunk!(f64_chunk, arrow::array::Float64Array, |v: f64| v);
-    affine_chunk!(f32_chunk, arrow::array::Float32Array, |v: f32| v as f64);
+    llkv_for_each_arrow_numeric!(impl_affine_emit_chunk);
 }
 
 impl<'a, F> llkv_column_map::scan::PrimitiveWithRowIdsVisitor for AffineSingleColumnVisitor<'a, F>
 where
     F: FnMut(RecordBatch),
 {
-    affine_row_ids_chunk!(u64_chunk_with_rids, arrow::array::UInt64Array);
-    affine_row_ids_chunk!(u32_chunk_with_rids, arrow::array::UInt32Array);
-    affine_row_ids_chunk!(u16_chunk_with_rids, arrow::array::UInt16Array);
-    affine_row_ids_chunk!(u8_chunk_with_rids, arrow::array::UInt8Array);
-    affine_row_ids_chunk!(i64_chunk_with_rids, arrow::array::Int64Array);
-    affine_row_ids_chunk!(i32_chunk_with_rids, arrow::array::Int32Array);
-    affine_row_ids_chunk!(i16_chunk_with_rids, arrow::array::Int16Array);
-    affine_row_ids_chunk!(i8_chunk_with_rids, arrow::array::Int8Array);
-    affine_row_ids_chunk!(f64_chunk_with_rids, arrow::array::Float64Array);
-    affine_row_ids_chunk!(f32_chunk_with_rids, arrow::array::Float32Array);
+    llkv_for_each_arrow_numeric!(impl_affine_reject_chunk_with_rids);
 }
 
 impl<'a, F> llkv_column_map::scan::PrimitiveSortedVisitor for AffineSingleColumnVisitor<'a, F>
 where
     F: FnMut(RecordBatch),
 {
-    affine_run!(u64_run, arrow::array::UInt64Array, |v: u64| v as f64);
-    affine_run!(u32_run, arrow::array::UInt32Array, |v: u32| v as f64);
-    affine_run!(u16_run, arrow::array::UInt16Array, |v: u16| v as f64);
-    affine_run!(u8_run, arrow::array::UInt8Array, |v: u8| v as f64);
-    affine_run!(i64_run, arrow::array::Int64Array, |v: i64| v as f64);
-    affine_run!(i32_run, arrow::array::Int32Array, |v: i32| v as f64);
-    affine_run!(i16_run, arrow::array::Int16Array, |v: i16| v as f64);
-    affine_run!(i8_run, arrow::array::Int8Array, |v: i8| v as f64);
-    affine_run!(f64_run, arrow::array::Float64Array, |v: f64| v);
-    affine_run!(f32_run, arrow::array::Float32Array, |v: f32| v as f64);
+    llkv_for_each_arrow_numeric!(impl_affine_emit_sorted_run);
 }
 
 impl<'a, F> llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor
@@ -1370,16 +1313,7 @@ impl<'a, F> llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor
 where
     F: FnMut(RecordBatch),
 {
-    affine_row_ids_run!(u64_run_with_rids, arrow::array::UInt64Array);
-    affine_row_ids_run!(u32_run_with_rids, arrow::array::UInt32Array);
-    affine_row_ids_run!(u16_run_with_rids, arrow::array::UInt16Array);
-    affine_row_ids_run!(u8_run_with_rids, arrow::array::UInt8Array);
-    affine_row_ids_run!(i64_run_with_rids, arrow::array::Int64Array);
-    affine_row_ids_run!(i32_run_with_rids, arrow::array::Int32Array);
-    affine_row_ids_run!(i16_run_with_rids, arrow::array::Int16Array);
-    affine_row_ids_run!(i8_run_with_rids, arrow::array::Int8Array);
-    affine_row_ids_run!(f64_run_with_rids, arrow::array::Float64Array);
-    affine_row_ids_run!(f32_run_with_rids, arrow::array::Float32Array);
+    llkv_for_each_arrow_numeric!(impl_affine_reject_sorted_run_with_rids);
 }
 
 fn normalize_row_ids(mut row_ids: Vec<u64>) -> Vec<u64> {

@@ -1,10 +1,9 @@
 use super::*;
-use arrow::datatypes::DataType;
 use rustc_hash::FxHashMap;
 
 macro_rules! unsorted_visit_arm {
-    ($array:ty, $method:ident, $err:literal, $metas:ident, $blobs:ident, $visitor:ident) => {{
-        for m in $metas {
+    ($array:ty, $method:ident, $err:expr, $metas:ident, $blobs:ident, $visitor:ident) => {{
+        for m in $metas.iter() {
             let a_any = deserialize_array($blobs.remove(&m.chunk_pk).ok_or(Error::NotFound)?)?;
             let a = a_any
                 .as_any()
@@ -20,14 +19,14 @@ macro_rules! unsorted_with_rids_arm {
     (
         $array:ty,
         $method:ident,
-        $err:literal,
+        $err:expr,
         $v_metas:ident,
         $r_metas:ident,
         $vals_blobs:ident,
         $rids_blobs:ident,
         $visitor:ident
     ) => {{
-        for (vm, rm) in $v_metas.into_iter().zip($r_metas.into_iter()) {
+        for (vm, rm) in $v_metas.iter().zip($r_metas.iter()) {
             let va = deserialize_array($vals_blobs.remove(&vm.chunk_pk).ok_or(Error::NotFound)?)?;
             let ra = deserialize_array($rids_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?)?;
             let v = va
@@ -46,89 +45,38 @@ macro_rules! unsorted_with_rids_arm {
 
 macro_rules! dispatch_unsorted_visit {
     ($dtype:expr, $metas:ident, $blobs:ident, $visitor:ident) => {{
-        match $dtype {
-            DataType::UInt64 => unsorted_visit_arm!(
-                UInt64Array,
-                u64_chunk,
-                "downcast UInt64",
-                $metas,
-                $blobs,
-                $visitor
-            ),
-            DataType::UInt32 => unsorted_visit_arm!(
-                UInt32Array,
-                u32_chunk,
-                "downcast UInt32",
-                $metas,
-                $blobs,
-                $visitor
-            ),
-            DataType::UInt16 => unsorted_visit_arm!(
-                UInt16Array,
-                u16_chunk,
-                "downcast UInt16",
-                $metas,
-                $blobs,
-                $visitor
-            ),
-            DataType::UInt8 => unsorted_visit_arm!(
-                UInt8Array,
-                u8_chunk,
-                "downcast UInt8",
-                $metas,
-                $blobs,
-                $visitor
-            ),
-            DataType::Int64 => unsorted_visit_arm!(
-                Int64Array,
-                i64_chunk,
-                "downcast Int64",
-                $metas,
-                $blobs,
-                $visitor
-            ),
-            DataType::Int32 => unsorted_visit_arm!(
-                Int32Array,
-                i32_chunk,
-                "downcast Int32",
-                $metas,
-                $blobs,
-                $visitor
-            ),
-            DataType::Int16 => unsorted_visit_arm!(
-                Int16Array,
-                i16_chunk,
-                "downcast Int16",
-                $metas,
-                $blobs,
-                $visitor
-            ),
-            DataType::Int8 => unsorted_visit_arm!(
-                Int8Array,
-                i8_chunk,
-                "downcast Int8",
-                $metas,
-                $blobs,
-                $visitor
-            ),
-            DataType::Float64 => unsorted_visit_arm!(
-                Float64Array,
-                f64_chunk,
-                "downcast Float64",
-                $metas,
-                $blobs,
-                $visitor
-            ),
-            DataType::Float32 => unsorted_visit_arm!(
-                Float32Array,
-                f32_chunk,
-                "downcast Float32",
-                $metas,
-                $blobs,
-                $visitor
-            ),
-            _ => Err(Error::Internal("unsorted_visit: unsupported dtype".into())),
+        let dtype_value = $dtype;
+        let mut result: Option<Result<()>> = None;
+
+        macro_rules! try_dispatch_unsorted {
+            (
+                $base:ident,
+                $chunk_fn:ident,
+                $chunk_with_rids_fn:ident,
+                $run_fn:ident,
+                $run_with_rids_fn:ident,
+                $array_ty:ty,
+                $physical_ty:ty,
+                $dtype_expr:expr,
+                $native_ty:ty,
+                $cast_expr:expr
+            ) => {
+                if dtype_value == &$dtype_expr {
+                    result = Some(unsorted_visit_arm!(
+                        $array_ty,
+                        $chunk_fn,
+                        concat!("downcast ", stringify!($base)),
+                        $metas,
+                        $blobs,
+                        $visitor
+                    ));
+                }
+            };
         }
+
+        crate::llkv_for_each_arrow_numeric!(try_dispatch_unsorted);
+
+        result.unwrap_or_else(|| Err(Error::Internal("unsorted_visit: unsupported dtype".into())))
     }};
 }
 
@@ -141,147 +89,82 @@ macro_rules! dispatch_unsorted_with_rids_visit {
         $rids_blobs:ident,
         $visitor:ident
     ) => {{
-        match $dtype {
-            DataType::UInt64 => unsorted_with_rids_arm!(
-                UInt64Array,
-                u64_chunk_with_rids,
-                "downcast u64",
-                $v_metas,
-                $r_metas,
-                $vals_blobs,
-                $rids_blobs,
-                $visitor
-            ),
-            DataType::UInt32 => unsorted_with_rids_arm!(
-                UInt32Array,
-                u32_chunk_with_rids,
-                "downcast u32",
-                $v_metas,
-                $r_metas,
-                $vals_blobs,
-                $rids_blobs,
-                $visitor
-            ),
-            DataType::UInt16 => unsorted_with_rids_arm!(
-                UInt16Array,
-                u16_chunk_with_rids,
-                "downcast u16",
-                $v_metas,
-                $r_metas,
-                $vals_blobs,
-                $rids_blobs,
-                $visitor
-            ),
-            DataType::UInt8 => unsorted_with_rids_arm!(
-                UInt8Array,
-                u8_chunk_with_rids,
-                "downcast u8",
-                $v_metas,
-                $r_metas,
-                $vals_blobs,
-                $rids_blobs,
-                $visitor
-            ),
-            DataType::Int64 => unsorted_with_rids_arm!(
-                Int64Array,
-                i64_chunk_with_rids,
-                "downcast i64",
-                $v_metas,
-                $r_metas,
-                $vals_blobs,
-                $rids_blobs,
-                $visitor
-            ),
-            DataType::Int32 => unsorted_with_rids_arm!(
-                Int32Array,
-                i32_chunk_with_rids,
-                "downcast i32",
-                $v_metas,
-                $r_metas,
-                $vals_blobs,
-                $rids_blobs,
-                $visitor
-            ),
-            DataType::Int16 => unsorted_with_rids_arm!(
-                Int16Array,
-                i16_chunk_with_rids,
-                "downcast i16",
-                $v_metas,
-                $r_metas,
-                $vals_blobs,
-                $rids_blobs,
-                $visitor
-            ),
-            DataType::Int8 => unsorted_with_rids_arm!(
-                Int8Array,
-                i8_chunk_with_rids,
-                "downcast i8",
-                $v_metas,
-                $r_metas,
-                $vals_blobs,
-                $rids_blobs,
-                $visitor
-            ),
-            DataType::Float64 => unsorted_with_rids_arm!(
-                Float64Array,
-                f64_chunk_with_rids,
-                "downcast f64",
-                $v_metas,
-                $r_metas,
-                $vals_blobs,
-                $rids_blobs,
-                $visitor
-            ),
-            DataType::Float32 => unsorted_with_rids_arm!(
-                Float32Array,
-                f32_chunk_with_rids,
-                "downcast f32",
-                $v_metas,
-                $r_metas,
-                $vals_blobs,
-                $rids_blobs,
-                $visitor
-            ),
-            _ => Err(Error::Internal(
-                "unsorted_with_row_ids: unsupported dtype".into(),
-            )),
+        let dtype_value = $dtype;
+        let mut result: Option<Result<()>> = None;
+
+        macro_rules! try_dispatch_unsorted_with_rids {
+            (
+                $base:ident,
+                $chunk_fn:ident,
+                $chunk_with_rids_fn:ident,
+                $run_fn:ident,
+                $run_with_rids_fn:ident,
+                $array_ty:ty,
+                $physical_ty:ty,
+                $dtype_expr:expr,
+                $native_ty:ty,
+                $cast_expr:expr
+            ) => {
+                if dtype_value == &$dtype_expr {
+                    result = Some(unsorted_with_rids_arm!(
+                        $array_ty,
+                        $chunk_with_rids_fn,
+                        concat!("downcast ", stringify!($base)),
+                        $v_metas,
+                        $r_metas,
+                        $vals_blobs,
+                        $rids_blobs,
+                        $visitor
+                    ));
+                }
+            };
         }
+
+        crate::llkv_for_each_arrow_numeric!(try_dispatch_unsorted_with_rids);
+
+        result.unwrap_or_else(|| {
+            Err(Error::Internal(
+                "unsorted_with_row_ids: unsupported dtype".into(),
+            ))
+        })
     }};
 }
 
 macro_rules! dispatch_unsorted_nulls {
     ($dtype:expr) => {{
-        match $dtype {
-            DataType::UInt64 => {
-                emit_unsorted_nulls!(UInt64Array, u64_chunk_with_rids, "downcast u64")
-            }
-            DataType::UInt32 => {
-                emit_unsorted_nulls!(UInt32Array, u32_chunk_with_rids, "downcast u32")
-            }
-            DataType::UInt16 => {
-                emit_unsorted_nulls!(UInt16Array, u16_chunk_with_rids, "downcast u16")
-            }
-            DataType::UInt8 => emit_unsorted_nulls!(UInt8Array, u8_chunk_with_rids, "downcast u8"),
-            DataType::Int64 => {
-                emit_unsorted_nulls!(Int64Array, i64_chunk_with_rids, "downcast i64")
-            }
-            DataType::Int32 => {
-                emit_unsorted_nulls!(Int32Array, i32_chunk_with_rids, "downcast i32")
-            }
-            DataType::Int16 => {
-                emit_unsorted_nulls!(Int16Array, i16_chunk_with_rids, "downcast i16")
-            }
-            DataType::Int8 => emit_unsorted_nulls!(Int8Array, i8_chunk_with_rids, "downcast i8"),
-            DataType::Float64 => {
-                emit_unsorted_nulls!(Float64Array, f64_chunk_with_rids, "downcast f64")
-            }
-            DataType::Float32 => {
-                emit_unsorted_nulls!(Float32Array, f32_chunk_with_rids, "downcast f32")
-            }
-            _ => Err(Error::Internal(
-                "unsorted_with_nulls: dtype not supported".into(),
-            )),
+        let dtype_value = $dtype;
+        let mut result: Option<Result<()>> = None;
+
+        macro_rules! try_dispatch_unsorted_nulls {
+            (
+                $base:ident,
+                $chunk_fn:ident,
+                $chunk_with_rids_fn:ident,
+                $run_fn:ident,
+                $run_with_rids_fn:ident,
+                $array_ty:ty,
+                $physical_ty:ty,
+                $dtype_expr:expr,
+                $native_ty:ty,
+                $cast_expr:expr
+            ) => {
+                if dtype_value == &$dtype_expr {
+                    result = Some(emit_unsorted_nulls!(
+                        $array_ty,
+                        $chunk_with_rids_fn,
+                        concat!("downcast ", stringify!($base))
+                    ));
+                }
+            };
         }
+
+        crate::llkv_for_each_arrow_numeric!(try_dispatch_unsorted_nulls);
+
+        result.unwrap_or_else(|| {
+            Err(Error::Internal(
+                "unsorted_with_nulls: dtype not supported".into(),
+            ))
+        })
     }};
 }
 
@@ -546,7 +429,7 @@ pub fn unsorted_with_row_ids_and_nulls_visit<
             .clone(),
     )?;
     macro_rules! emit_unsorted_nulls {
-        ($array_ty:ty, $visit:ident, $err:literal) => {{
+        ($array_ty:ty, $visit:ident, $err:expr) => {{
             let mut ai = 0usize;
             let mut aj = 0usize;
             let mut pi = 0usize;
