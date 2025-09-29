@@ -29,6 +29,10 @@ tempfile.workspace = true
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
 
 [[bench]]
+name = "string_substring_bench"
+harness = false
+
+[[bench]]
 name = "table_math_bench"
 harness = false
 
