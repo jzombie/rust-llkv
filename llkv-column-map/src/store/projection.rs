@@ -906,14 +906,14 @@ where
         }
 
         let mut total_bytes = 0usize;
-        for idx in 0..len {
-            if let Some((chunk_idx, value_idx)) = row_scratch[idx] {
-                let slot = *chunk_lookup.get(&chunk_idx).ok_or_else(|| {
+        for row_scratch_item in row_scratch.iter().take(len) {
+            if let Some((chunk_idx, value_idx)) = row_scratch_item {
+                let slot = *chunk_lookup.get(chunk_idx).ok_or_else(|| {
                     Error::Internal("gather_rows_multi: chunk lookup missing".into())
                 })?;
                 let (_, value_arr, _) = candidates[slot];
-                if !value_arr.is_null(value_idx) {
-                    total_bytes += value_arr.value(value_idx).len();
+                if !value_arr.is_null(*value_idx) {
+                    total_bytes += value_arr.value(*value_idx).len();
                 }
             } else if !allow_missing {
                 return Err(Error::Internal(
@@ -923,17 +923,17 @@ where
         }
 
         let mut builder = GenericStringBuilder::<O>::with_capacity(len, total_bytes);
-        for idx in 0..len {
-            match row_scratch[idx] {
+        for row_scratch_item in row_scratch.iter().take(len) {
+            match row_scratch_item {
                 Some((chunk_idx, value_idx)) => {
-                    let slot = *chunk_lookup.get(&chunk_idx).ok_or_else(|| {
+                    let slot = *chunk_lookup.get(chunk_idx).ok_or_else(|| {
                         Error::Internal("gather_rows_multi: chunk lookup missing".into())
                     })?;
                     let (_, value_arr, _) = candidates[slot];
-                    if value_arr.is_null(value_idx) {
+                    if value_arr.is_null(*value_idx) {
                         builder.append_null();
                     } else {
-                        builder.append_value(value_arr.value(value_idx));
+                        builder.append_value(value_arr.value(*value_idx));
                     }
                 }
                 None => {
@@ -952,6 +952,7 @@ where
         Ok(Arc::new(builder.finish()) as ArrayRef)
     }
 
+    #[allow(clippy::too_many_arguments)] // TODO: Refactor
     fn gather_rows_from_chunks<T>(
         row_ids: &[u64],
         row_locator: RowLocator,

@@ -61,55 +61,51 @@ where
         match self {
             Predicate::All => true,
             Predicate::Equals(target) => V::equals(value, target),
-            Predicate::GreaterThan(target) => matches!(
-                V::compare(value, target),
-                Some(Ordering::Greater)
-            ),
+            Predicate::GreaterThan(target) => {
+                matches!(V::compare(value, target), Some(Ordering::Greater))
+            }
             Predicate::GreaterThanOrEquals(target) => {
                 matches!(
                     V::compare(value, target),
                     Some(Ordering::Greater | Ordering::Equal)
                 )
             }
-            Predicate::LessThan(target) => matches!(
-                V::compare(value, target),
-                Some(Ordering::Less)
-            ),
+            Predicate::LessThan(target) => {
+                matches!(V::compare(value, target), Some(Ordering::Less))
+            }
             Predicate::LessThanOrEquals(target) => matches!(
                 V::compare(value, target),
                 Some(Ordering::Less | Ordering::Equal)
             ),
             Predicate::Range { lower, upper } => {
-                if let Some(bound) = lower {
-                    if !match bound {
+                if let Some(bound) = lower
+                    && !match bound {
                         Bound::Included(target) => matches!(
                             V::compare(value, target),
                             Some(Ordering::Greater | Ordering::Equal)
                         ),
-                        Bound::Excluded(target) => matches!(
-                            V::compare(value, target),
-                            Some(Ordering::Greater)
-                        ),
+                        Bound::Excluded(target) => {
+                            matches!(V::compare(value, target), Some(Ordering::Greater))
+                        }
                         Bound::Unbounded => true,
-                    } {
-                        return false;
                     }
+                {
+                    return false;
                 }
 
-                if let Some(bound) = upper {
-                    if !match bound {
+                if let Some(bound) = upper
+                    && !match bound {
                         Bound::Included(target) => matches!(
                             V::compare(value, target),
                             Some(Ordering::Less | Ordering::Equal)
                         ),
-                        Bound::Excluded(target) => matches!(
-                            V::compare(value, target),
-                            Some(Ordering::Less)
-                        ),
+                        Bound::Excluded(target) => {
+                            matches!(V::compare(value, target), Some(Ordering::Less))
+                        }
                         Bound::Unbounded => true,
-                    } {
-                        return false;
                     }
+                {
+                    return false;
                 }
 
                 true
@@ -144,12 +140,13 @@ macro_rules! impl_predicate_value_for_primitive {
     };
 }
 
-impl_predicate_value_for_primitive!(
-    u64, u32, u16, u8, i64, i32, i16, i8, f64, f32, bool
-);
+impl_predicate_value_for_primitive!(u64, u32, u16, u8, i64, i32, i16, i8, f64, f32, bool);
 
 impl PredicateValue for String {
-    type Borrowed<'a> = str where Self: 'a;
+    type Borrowed<'a>
+        = str
+    where
+        Self: 'a;
 
     fn borrowed(value: &Self) -> &Self::Borrowed<'_> {
         value.as_str()

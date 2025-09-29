@@ -14,7 +14,9 @@ use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_expr::literal::{FromLiteral, Literal};
-use llkv_expr::typed_predicate::{build_fixed_width_predicate, build_var_width_predicate, PredicateValue};
+use llkv_expr::typed_predicate::{
+    PredicateValue, build_fixed_width_predicate, build_var_width_predicate,
+};
 use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
