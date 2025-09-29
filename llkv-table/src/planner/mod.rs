@@ -1,3 +1,5 @@
+pub mod plan_graph;
+
 use std::cmp;
 use std::ops::Bound;
 use std::sync::Arc;
