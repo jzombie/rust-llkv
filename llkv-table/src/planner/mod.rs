@@ -2,19 +2,13 @@ use std::cmp;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-};
-use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
+use arrow::array::{Array, ArrayRef, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema};
 
-use llkv_column_map::scan::{
-    PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
-    PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
-};
-use llkv_column_map::store::{
-    FilterPrimitive, FilterResult, FilterRun, GatherNullPolicy, dense_row_runs,
-};
+use llkv_column_map::ScanBuilder;
+use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
+use llkv_column_map::store::GatherNullPolicy;
+use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_expr::literal::FromLiteral;
 use llkv_expr::typed_predicate::build_predicate;
@@ -80,11 +74,15 @@ where
             ));
         }
 
-        let mut projection_evals: Vec<ProjectionEval> = Vec::with_capacity(projections.len());
+        if self.try_single_column_direct_scan(projections, filter_expr, options, &mut on_batch)? {
+            return Ok(());
+        }
+
+        let mut projection_evals = Vec::with_capacity(projections.len());
         let mut unique_index: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();
-        unique_index.reserve(projections.len());
-        let mut unique_lfids: Vec<LogicalFieldId> = Vec::with_capacity(projections.len());
+        let mut unique_lfids: Vec<LogicalFieldId> = Vec::new();
         let mut numeric_fields: FxHashSet<FieldId> = FxHashSet::default();
+        let mut lfid_dtypes: FxHashMap<LogicalFieldId, DataType> = FxHashMap::default();
 
         for proj in projections {
             match proj {
@@ -103,13 +101,17 @@ where
                             lfid
                         )));
                     }
+
                     let dtype = self.table.store().data_type(lfid)?;
-                    if let std::collections::hash_map::Entry::Vacant(e) = unique_index.entry(lfid) {
-                        e.insert(unique_lfids.len());
+                    lfid_dtypes.entry(lfid).or_insert_with(|| dtype.clone());
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        unique_index.entry(lfid)
+                    {
+                        entry.insert(unique_lfids.len());
                         unique_lfids.push(lfid);
                     }
                     let fallback = lfid.field_id().to_string();
-                    let output_name = p.alias.clone().unwrap_or_else(|| fallback.clone());
+                    let output_name = p.alias.clone().unwrap_or(fallback);
                     projection_evals.push(ProjectionEval::Column(ColumnProjectionInfo {
                         logical_field_id: lfid,
                         data_type: dtype,
@@ -122,51 +124,41 @@ where
                             "Computed projection requires a non-empty alias".into(),
                         ));
                     }
-                    let simplified_expr = NumericKernels::simplify(expr);
+
+                    let simplified = NumericKernels::simplify(expr);
                     let mut fields_set: FxHashSet<FieldId> = FxHashSet::default();
-                    NumericKernels::collect_fields(&simplified_expr, &mut fields_set);
+                    NumericKernels::collect_fields(&simplified, &mut fields_set);
                     if fields_set.is_empty() {
                         return Err(Error::InvalidArgumentError(
                             "Computed projection must reference at least one column".into(),
                         ));
                     }
-                    let mut ordered_fields: Vec<FieldId> = fields_set.into_iter().collect();
-                    ordered_fields.sort_unstable();
-                    for field_id in &ordered_fields {
-                        let lfid = LogicalFieldId::for_user(self.table.table_id(), *field_id);
+
+                    for field_id in fields_set.iter().copied() {
+                        numeric_fields.insert(field_id);
+                        let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
                         if lfid.namespace() != Namespace::UserData {
                             return Err(Error::InvalidArgumentError(format!(
                                 "Computed projection field {:?} must target user data namespace",
                                 lfid
                             )));
                         }
-                        if let std::collections::hash_map::Entry::Vacant(e) =
+                        let dtype = self.table.store().data_type(lfid)?;
+                        lfid_dtypes.entry(lfid).or_insert_with(|| dtype.clone());
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
                             unique_index.entry(lfid)
                         {
-                            e.insert(unique_lfids.len());
+                            entry.insert(unique_lfids.len());
                             unique_lfids.push(lfid);
                         }
-                        numeric_fields.insert(*field_id);
                     }
+
                     projection_evals.push(ProjectionEval::Computed(ComputedProjectionInfo {
-                        expr: simplified_expr,
+                        expr: simplified,
                         alias: alias.clone(),
                     }));
                 }
             }
-        }
-
-        if let Expr::Pred(filter) = filter_expr
-            && self.try_fast_scan_stream(
-                &projection_evals,
-                &unique_index,
-                &unique_lfids,
-                filter,
-                &options,
-                &mut on_batch,
-            )?
-        {
-            return Ok(());
         }
 
         let passthrough_fields: Vec<Option<FieldId>> = projection_evals
@@ -177,98 +169,64 @@ where
             })
             .collect();
 
-        let mut fields: Vec<Field> = Vec::with_capacity(projection_evals.len());
+        let mut schema_fields: Vec<Field> = Vec::with_capacity(projection_evals.len());
         for (idx, eval) in projection_evals.iter().enumerate() {
             match eval {
-                ProjectionEval::Column(info) => {
-                    fields.push(Field::new(
-                        info.output_name.clone(),
-                        info.data_type.clone(),
-                        true,
-                    ));
-                }
+                ProjectionEval::Column(info) => schema_fields.push(Field::new(
+                    info.output_name.clone(),
+                    info.data_type.clone(),
+                    true,
+                )),
                 ProjectionEval::Computed(info) => {
                     if let Some(fid) = passthrough_fields[idx] {
                         let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
-                        let dtype = self.table.store().data_type(lfid)?;
-                        fields.push(Field::new(info.alias.clone(), dtype, true));
+                        let dtype = lfid_dtypes.get(&lfid).cloned().ok_or_else(|| {
+                            Error::Internal("missing dtype for passthrough".into())
+                        })?;
+                        schema_fields.push(Field::new(info.alias.clone(), dtype, true));
                     } else {
-                        fields.push(Field::new(info.alias.clone(), DataType::Float64, true));
+                        schema_fields.push(Field::new(info.alias.clone(), DataType::Float64, true));
                     }
                 }
             }
         }
-        let out_schema = Arc::new(Schema::new(fields));
-
-        if self.try_scan_builder_passthrough(
-            &projection_evals,
-            &passthrough_fields,
-            &out_schema,
-            filter_expr,
-            &options,
-            &mut on_batch,
-        )? {
-            return Ok(());
-        }
-
-        if self.try_affine_stream(
-            &projection_evals,
-            &out_schema,
-            filter_expr,
-            &options,
-            &mut on_batch,
-        )? {
-            return Ok(());
-        }
+        let out_schema = Arc::new(Schema::new(schema_fields));
 
         let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
         let row_ids = self.collect_row_ids_for_expr(filter_expr, &mut all_rows_cache)?;
-
         if row_ids.is_empty() {
             return Ok(());
         }
 
-        let mut gather_ctx = self.table.store().prepare_gather_context(&unique_lfids)?;
-        let mut start = 0usize;
         let null_policy = if options.include_nulls {
             GatherNullPolicy::IncludeNulls
         } else {
             GatherNullPolicy::DropNulls
         };
-        while start < row_ids.len() {
-            let mut end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
-            if let Some((_, _, span_max)) = gather_ctx.chunk_span_for_row(row_ids[start]) {
-                while end < row_ids.len() && row_ids[end - 1] <= span_max {
-                    end += 1;
-                    if end - start >= STREAM_BATCH_ROWS {
-                        break;
-                    }
-                }
-                while end <= row_ids.len() && row_ids[end - 1] > span_max {
-                    end -= 1;
-                }
-            }
-            let end = end.max(start + 1);
-            let window = &row_ids[start..end];
 
-            let gathered = self.table.store().gather_rows_with_reusable_context(
+        let mut gather_ctx = self.table.store().prepare_gather_context(&unique_lfids)?;
+
+        let requires_numeric = projection_evals.iter().enumerate().any(|(idx, eval)| {
+            matches!(eval, ProjectionEval::Computed(_)) && passthrough_fields[idx].is_none()
+        });
+
+        let mut offset = 0usize;
+        while offset < row_ids.len() {
+            let end = cmp::min(offset + STREAM_BATCH_ROWS, row_ids.len());
+            let window = &row_ids[offset..end];
+
+            let batch = self.table.store().gather_rows_with_reusable_context(
                 &mut gather_ctx,
                 window,
                 null_policy,
             )?;
 
-            if gathered.num_columns() == 0 || gathered.num_rows() == 0 {
-                start = end;
+            if batch.num_rows() == 0 {
+                offset = end;
                 continue;
             }
 
-            let unique_arrays = gathered.columns();
-            let requires_numeric = projection_evals.iter().zip(passthrough_fields.iter()).any(
-                |(eval, passthrough)| {
-                    matches!(eval, ProjectionEval::Computed(_)) && passthrough.is_none()
-                },
-            );
-
+            let unique_arrays = batch.columns();
             let numeric_arrays: Option<NumericArrayMap> = if requires_numeric {
                 Some(NumericKernels::prepare_numeric_arrays(
                     &unique_lfids,
@@ -279,31 +237,29 @@ where
                 None
             };
 
-            let mut columns = Vec::with_capacity(projection_evals.len());
+            let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
             for (idx, eval) in projection_evals.iter().enumerate() {
                 match eval {
                     ProjectionEval::Column(info) => {
-                        let col_idx = unique_index
+                        let arr_idx = *unique_index
                             .get(&info.logical_field_id)
-                            .copied()
-                            .expect("lfid missing from unique-index");
-                        columns.push(Arc::clone(&unique_arrays[col_idx]));
+                            .expect("logical field id missing from index");
+                        columns.push(Arc::clone(&unique_arrays[arr_idx]));
                     }
                     ProjectionEval::Computed(info) => {
                         if let Some(fid) = passthrough_fields[idx] {
                             let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
-                            let col_idx = unique_index
+                            let arr_idx = *unique_index
                                 .get(&lfid)
-                                .copied()
-                                .expect("passthrough field missing from unique-index");
-                            columns.push(Arc::clone(&unique_arrays[col_idx]));
+                                .expect("passthrough field missing from index");
+                            columns.push(Arc::clone(&unique_arrays[arr_idx]));
                         } else {
                             let numeric_arrays = numeric_arrays
                                 .as_ref()
                                 .expect("numeric arrays should exist for computed projection");
                             let array = NumericKernels::evaluate_batch(
                                 &info.expr,
-                                gathered.num_rows(),
+                                batch.num_rows(),
                                 numeric_arrays,
                             )?;
                             columns.push(array);
@@ -312,280 +268,151 @@ where
                 }
             }
 
-            let batch = RecordBatch::try_new(out_schema.clone(), columns)?;
-            on_batch(batch);
-            start = end;
+            let output_batch = RecordBatch::try_new(out_schema.clone(), columns)?;
+            on_batch(output_batch);
+            offset = end;
         }
+
         Ok(())
     }
 
-    fn try_fast_scan_stream<F>(
+    fn try_single_column_direct_scan<'expr, F>(
         &self,
-        projection_evals: &[ProjectionEval],
-        unique_index: &FxHashMap<LogicalFieldId, usize>,
-        unique_lfids: &[LogicalFieldId],
-        filter: &Filter<'_, FieldId>,
-        options: &ScanStreamOptions,
+        projections: &[StreamProjection],
+        filter_expr: &Expr<'expr, FieldId>,
+        options: ScanStreamOptions,
         on_batch: &mut F,
     ) -> LlkvResult<bool>
     where
         F: FnMut(RecordBatch),
     {
-        if projection_evals
-            .iter()
-            .any(|eval| !matches!(eval, ProjectionEval::Column(_)))
-        {
+        if options.include_nulls || projections.len() != 1 {
             return Ok(false);
         }
 
-        let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), filter.field_id);
-        let dtype = self.table.store().data_type(filter_lfid)?;
-        let dense_runs = match &filter.op {
-            Operator::Range {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            } => dense_row_runs(self.table.store(), filter_lfid)?,
-            _ => None,
-        };
-
-        let runs = if let Some(runs) = dense_runs {
-            if runs.is_empty() {
-                return Ok(true);
-            }
-            runs
-        } else {
-            let result = llkv_column_map::with_integer_arrow_type!(
-                dtype.clone(),
-                |ArrowTy| self.collect_filter_result::<ArrowTy>(filter_lfid, &filter.op),
-                return Ok(false),
-            )?;
-
-            if result.total_matches() == 0 {
-                return Ok(true);
-            }
-
-            if !result.is_dense() {
-                return Ok(false);
-            }
-
-            match result.into_runs() {
-                Some(runs) if runs.is_empty() => return Ok(true),
-                Some(runs) => runs,
-                None => return Ok(false),
-            }
-        };
-
-        if options.include_nulls {
-            return Ok(false);
-        }
-
-        let fields: Vec<Field> = projection_evals
-            .iter()
-            .map(|eval| match eval {
-                ProjectionEval::Column(info) => {
-                    Field::new(info.output_name.clone(), info.data_type.clone(), true)
+        match &projections[0] {
+            StreamProjection::Column(p) => {
+                if p.logical_field_id.table_id() != self.table.table_id() {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Projection targets table {} but scan_stream is on table {}",
+                        p.logical_field_id.table_id(),
+                        self.table.table_id()
+                    )));
                 }
-                _ => unreachable!("fast path only handles direct column projections"),
-            })
-            .collect();
-        let schema = Arc::new(Schema::new(fields));
 
-        let mut column_chunks: Vec<ColumnChunks> = Vec::with_capacity(unique_lfids.len());
-        for &lfid in unique_lfids {
-            let mut collector = ColumnChunkCollector::new();
-            let scan_opts = ScanOptions {
-                with_row_ids: true,
-                ..Default::default()
-            };
+                if !is_full_range_filter(filter_expr, p.logical_field_id.field_id()) {
+                    return Ok(false);
+                }
 
-            ScanBuilder::new(self.table.store(), lfid)
-                .options(scan_opts)
-                .run(&mut collector)?;
-            column_chunks.push(collector.finish()?);
-        }
+                let dtype = self.table.store().data_type(p.logical_field_id)?;
+                let field_name = p
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| p.logical_field_id.field_id().to_string());
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    field_name,
+                    dtype.clone(),
+                    true,
+                )]));
 
-        if column_chunks.iter().any(|chunks| {
-            chunks
-                .entries
-                .iter()
-                .any(|entry| entry.values.null_count() > 0)
-        }) {
-            return Ok(false);
-        }
-
-        let mut streamer =
-            DenseRunStreamer::new(projection_evals, unique_index, schema, column_chunks);
-
-        streamer.stream(&runs, on_batch)
-    }
-
-    fn try_scan_builder_passthrough<'expr, F>(
-        &self,
-        projection_evals: &[ProjectionEval],
-        passthrough_fields: &[Option<FieldId>],
-        schema: &Arc<Schema>,
-        filter_expr: &Expr<'expr, FieldId>,
-        options: &ScanStreamOptions,
-        on_batch: &mut F,
-    ) -> LlkvResult<bool>
-    where
-        F: FnMut(RecordBatch),
-    {
-        if options.include_nulls {
-            return Ok(false);
-        }
-        if projection_evals.len() != 1 {
-            return Ok(false);
-        }
-
-        let (target_lfid, dtype) = match &projection_evals[0] {
-            ProjectionEval::Column(info) => (info.logical_field_id, info.data_type.clone()),
-            ProjectionEval::Computed(_info) => {
-                let passthrough = match passthrough_fields.first().and_then(|&f| f) {
-                    Some(fid) => fid,
-                    None => return Ok(false),
-                };
-                let lfid = LogicalFieldId::for_user(self.table.table_id(), passthrough);
-                let dtype = self.table.store().data_type(lfid)?;
-                (lfid, dtype)
+                let mut visitor = SingleColumnStreamVisitor::new(schema, on_batch);
+                ScanBuilder::new(self.table.store(), p.logical_field_id)
+                    .options(ScanOptions::default())
+                    .run(&mut visitor)?;
+                visitor.finish()?;
+                Ok(true)
             }
-        };
+            StreamProjection::Computed { expr, alias } => {
+                let simplified = NumericKernels::simplify(expr);
+                let mut fields_set: FxHashSet<FieldId> = FxHashSet::default();
+                NumericKernels::collect_fields(&simplified, &mut fields_set);
+                if fields_set.len() != 1 {
+                    return Ok(false);
+                }
 
-        if !is_supported_numeric(&dtype) {
-            return Ok(false);
+                let field_id = *fields_set.iter().next().unwrap();
+                let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
+                if !is_full_range_filter(filter_expr, field_id) {
+                    return Ok(false);
+                }
+
+                if lfid.namespace() != Namespace::UserData {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Computed projection field {:?} must target user data namespace",
+                        lfid
+                    )));
+                }
+
+                let field_alias = alias.clone();
+                let dtype = self.table.store().data_type(lfid)?;
+
+                if let Some(passthrough_fid) = NumericKernels::passthrough_column(&simplified) {
+                    if passthrough_fid != field_id {
+                        return Err(Error::InvalidArgumentError(
+                            "computed projection passthrough resolved to unexpected field".into(),
+                        ));
+                    }
+                    let schema = Arc::new(Schema::new(vec![Field::new(
+                        field_alias.clone(),
+                        dtype.clone(),
+                        true,
+                    )]));
+                    let mut visitor = SingleColumnStreamVisitor::new(schema, on_batch);
+                    ScanBuilder::new(self.table.store(), lfid)
+                        .options(ScanOptions::default())
+                        .run(&mut visitor)?;
+                    visitor.finish()?;
+                    return Ok(true);
+                }
+
+                if let Some(affine) = NumericKernels::extract_affine(&simplified) {
+                    if affine.field != field_id {
+                        return Err(Error::InvalidArgumentError(
+                            "affine extraction resolved to unexpected field".into(),
+                        ));
+                    }
+                    if !is_supported_numeric(&dtype) {
+                        return Ok(false);
+                    }
+                    let schema = Arc::new(Schema::new(vec![Field::new(
+                        field_alias.clone(),
+                        DataType::Float64,
+                        true,
+                    )]));
+                    let mut visitor = AffineSingleColumnVisitor::new(
+                        schema,
+                        affine.scale,
+                        affine.offset,
+                        on_batch,
+                    );
+                    ScanBuilder::new(self.table.store(), lfid)
+                        .options(ScanOptions::default())
+                        .run(&mut visitor)?;
+                    visitor.finish()?;
+                    return Ok(true);
+                }
+
+                let mut numeric_fields: FxHashSet<FieldId> = FxHashSet::default();
+                numeric_fields.insert(field_id);
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    field_alias.clone(),
+                    DataType::Float64,
+                    true,
+                )]));
+                let mut visitor = ComputedSingleColumnVisitor::new(
+                    schema,
+                    simplified,
+                    lfid,
+                    numeric_fields,
+                    on_batch,
+                );
+                ScanBuilder::new(self.table.store(), lfid)
+                    .options(ScanOptions::default())
+                    .run(&mut visitor)?;
+                visitor.finish()?;
+                Ok(true)
+            }
         }
-
-        let filter = match filter_expr {
-            Expr::Pred(pred) => pred,
-            _ => return Ok(false),
-        };
-        match &filter.op {
-            Operator::Range {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            } => {}
-            _ => return Ok(false),
-        }
-
-        let mut emitter = BuilderBatchEmitter {
-            schema: Arc::clone(schema),
-            on_batch,
-            error: None,
-            emitted: false,
-        };
-
-        let scan_opts = ScanOptions {
-            with_row_ids: false,
-            include_nulls: false,
-            ..Default::default()
-        };
-
-        ScanBuilder::new(self.table.store(), target_lfid)
-            .options(scan_opts)
-            .run(&mut emitter)?;
-
-        if let Some(err) = emitter.error {
-            return Err(err);
-        }
-
-        Ok(emitter.emitted)
-    }
-
-    fn try_affine_stream<'expr, F>(
-        &self,
-        projection_evals: &[ProjectionEval],
-        schema: &Arc<Schema>,
-        filter_expr: &Expr<'expr, FieldId>,
-        options: &ScanStreamOptions,
-        on_batch: &mut F,
-    ) -> LlkvResult<bool>
-    where
-        F: FnMut(RecordBatch),
-    {
-        if options.include_nulls {
-            return Ok(false);
-        }
-        if projection_evals.len() != 1 {
-            return Ok(false);
-        }
-
-        let ProjectionEval::Computed(info) = &projection_evals[0] else {
-            return Ok(false);
-        };
-        let Some(affine) = NumericKernels::extract_affine(&info.expr) else {
-            return Ok(false);
-        };
-
-        let filter = match filter_expr {
-            Expr::Pred(pred) => pred,
-            _ => return Ok(false),
-        };
-        match &filter.op {
-            Operator::Range {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            } => {}
-            _ => return Ok(false),
-        }
-
-        let lfid = LogicalFieldId::for_user(self.table.table_id(), affine.field);
-        if lfid.namespace() != Namespace::UserData {
-            return Ok(false);
-        }
-        let dtype = self.table.store().data_type(lfid)?;
-        if !is_supported_numeric(&dtype) {
-            return Ok(false);
-        }
-
-        let mut emitter = AffineComputeEmitter {
-            schema: Arc::clone(schema),
-            scale: affine.scale,
-            offset: affine.offset,
-            on_batch,
-            error: None,
-            emitted: false,
-        };
-
-        let scan_opts = ScanOptions {
-            with_row_ids: false,
-            include_nulls: false,
-            ..Default::default()
-        };
-
-        ScanBuilder::new(self.table.store(), lfid)
-            .options(scan_opts)
-            .run(&mut emitter)?;
-
-        if let Some(err) = emitter.error {
-            return Err(err);
-        }
-
-        Ok(emitter.emitted)
-    }
-
-    fn collect_row_ids_for_filter(&self, filter: &Filter<'_, FieldId>) -> LlkvResult<Vec<u64>> {
-        let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), filter.field_id);
-        let dtype = self.table.store().data_type(filter_lfid)?;
-
-        if let Operator::Range {
-            lower: Bound::Unbounded,
-            upper: Bound::Unbounded,
-        } = &filter.op
-            && let Some(runs) = dense_row_runs(self.table.store(), filter_lfid)?
-        {
-            return Ok(expand_filter_runs(&runs));
-        }
-
-        let row_ids = llkv_column_map::with_integer_arrow_type!(
-            dtype.clone(),
-            |ArrowTy| self.collect_matching_row_ids::<ArrowTy>(filter_lfid, &filter.op),
-            Err(Error::Internal(format!(
-                "Filtering on type {:?} is not supported",
-                dtype
-            ))),
-        )?;
-
-        Ok(normalize_row_ids(row_ids))
     }
 
     fn collect_row_ids_for_expr(
@@ -645,6 +472,31 @@ where
                 Ok(difference_sorted(domain, matched))
             }
         }
+    }
+
+    fn collect_row_ids_for_filter(&self, filter: &Filter<'_, FieldId>) -> LlkvResult<Vec<u64>> {
+        let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), filter.field_id);
+        let dtype = self.table.store().data_type(filter_lfid)?;
+
+        if let Operator::Range {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        } = &filter.op
+            && let Some(runs) = dense_row_runs(self.table.store(), filter_lfid)?
+        {
+            return Ok(expand_filter_runs(&runs));
+        }
+
+        let row_ids = llkv_column_map::with_integer_arrow_type!(
+            dtype.clone(),
+            |ArrowTy| self.collect_matching_row_ids::<ArrowTy>(filter_lfid, &filter.op),
+            Err(Error::Internal(format!(
+                "Filtering on type {:?} is not supported",
+                dtype
+            ))),
+        )?;
+
+        Ok(normalize_row_ids(row_ids))
     }
 
     fn collect_row_ids_for_compare(
@@ -809,7 +661,7 @@ where
         op: &Operator<'_>,
     ) -> LlkvResult<Vec<u64>>
     where
-        T: ArrowPrimitiveType + FilterPrimitive,
+        T: FilterPrimitive,
         T::Native: FromLiteral + Copy,
     {
         let predicate = build_predicate::<T>(op).map_err(Error::predicate_build)?;
@@ -817,419 +669,723 @@ where
             .store()
             .filter_row_ids::<T, _>(field_id, move |value| predicate.matches(value))
     }
+}
 
-    fn collect_filter_result<T>(
-        &self,
-        field_id: LogicalFieldId,
-        op: &Operator<'_>,
-    ) -> LlkvResult<FilterResult>
-    where
-        T: ArrowPrimitiveType + FilterPrimitive,
-        T::Native: FromLiteral + Copy,
-    {
-        let predicate = build_predicate::<T>(op).map_err(Error::predicate_build)?;
-        self.table
-            .store()
-            .filter_matches::<T, _>(field_id, move |value| predicate.matches(value))
+fn is_full_range_filter(expr: &Expr<'_, FieldId>, expected_field: FieldId) -> bool {
+    matches!(
+        expr,
+        Expr::Pred(Filter {
+            field_id,
+            op:
+                Operator::Range {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+        }) if *field_id == expected_field
+    )
+}
+
+struct SingleColumnStreamVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    schema: Arc<Schema>,
+    on_batch: &'a mut F,
+    error: Option<Error>,
+}
+
+impl<'a, F> SingleColumnStreamVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    fn new(schema: Arc<Schema>, on_batch: &'a mut F) -> Self {
+        Self {
+            schema,
+            on_batch,
+            error: None,
+        }
     }
+
+    fn emit_array_ref(&mut self, array: ArrayRef) {
+        if self.error.is_some() {
+            return;
+        }
+
+        match RecordBatch::try_new(self.schema.clone(), vec![array]) {
+            Ok(batch) => (self.on_batch)(batch),
+            Err(e) => {
+                self.error = Some(Error::Internal(format!("arrow error: {e}")));
+            }
+        }
+    }
+
+    fn emit_array<A>(&mut self, values: &A)
+    where
+        A: Array + Clone + 'static,
+    {
+        if self.error.is_some() {
+            return;
+        }
+
+        let array: ArrayRef = Arc::new(values.clone()) as ArrayRef;
+        self.emit_array_ref(array);
+    }
+
+    fn reject_row_ids(&mut self) {
+        if self.error.is_none() {
+            self.error = Some(Error::Internal(
+                "unexpected row-id payload in single-column fast path".into(),
+            ));
+        }
+    }
+
+    fn finish(self) -> LlkvResult<()> {
+        match self.error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
+macro_rules! emit_primitive_chunk {
+    ($name:ident, $array_ty:ty) => {
+        fn $name(&mut self, values: &$array_ty) {
+            self.emit_array(values);
+        }
+    };
+}
+
+macro_rules! reject_row_ids_method {
+    ($name:ident, $array_ty:ty) => {
+        fn $name(&mut self, _values: &$array_ty, _row_ids: &arrow::array::UInt64Array) {
+            self.reject_row_ids();
+        }
+    };
+}
+
+struct ComputedSingleColumnVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    schema: Arc<Schema>,
+    expr: ScalarExpr<FieldId>,
+    lfid: LogicalFieldId,
+    numeric_fields: FxHashSet<FieldId>,
+    on_batch: &'a mut F,
+    error: Option<Error>,
+}
+
+impl<'a, F> ComputedSingleColumnVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    fn new(
+        schema: Arc<Schema>,
+        expr: ScalarExpr<FieldId>,
+        lfid: LogicalFieldId,
+        numeric_fields: FxHashSet<FieldId>,
+        on_batch: &'a mut F,
+    ) -> Self {
+        Self {
+            schema,
+            expr,
+            lfid,
+            numeric_fields,
+            on_batch,
+            error: None,
+        }
+    }
+
+    fn process_array(&mut self, array: ArrayRef) {
+        if self.error.is_some() || array.is_empty() {
+            return;
+        }
+
+        let lfids = [self.lfid];
+        let arrays = vec![array.clone()];
+        let numeric_arrays =
+            match NumericKernels::prepare_numeric_arrays(&lfids, &arrays, &self.numeric_fields) {
+                Ok(map) => map,
+                Err(err) => {
+                    self.error = Some(err);
+                    return;
+                }
+            };
+
+        let len = array.len();
+        let evaluated = match NumericKernels::evaluate_batch(&self.expr, len, &numeric_arrays) {
+            Ok(arr) => arr,
+            Err(err) => {
+                self.error = Some(err);
+                return;
+            }
+        };
+
+        if let Err(err) = RecordBatch::try_new(self.schema.clone(), vec![evaluated])
+            .map(|batch| (self.on_batch)(batch))
+        {
+            self.error = Some(Error::Internal(format!("arrow error: {err}")));
+        }
+    }
+
+    fn process_values<A>(&mut self, values: &A)
+    where
+        A: Array + Clone + 'static,
+    {
+        if self.error.is_some() {
+            return;
+        }
+        let array: ArrayRef = Arc::new(values.clone()) as ArrayRef;
+        self.process_array(array);
+    }
+
+    fn reject_row_ids(&mut self) {
+        if self.error.is_none() {
+            self.error = Some(Error::Internal(
+                "unexpected row-id payload in computed single-column fast path".into(),
+            ));
+        }
+    }
+
+    fn finish(self) -> LlkvResult<()> {
+        match self.error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
+macro_rules! computed_chunk {
+    ($name:ident, $array_ty:ty) => {
+        fn $name(&mut self, values: &$array_ty) {
+            self.process_values(values);
+        }
+    };
+}
+
+macro_rules! computed_sorted_run {
+    ($name:ident, $array_ty:ty) => {
+        fn $name(&mut self, values: &$array_ty, start: usize, end: usize) {
+            if self.error.is_some() || end <= start {
+                return;
+            }
+            let len = end - start;
+            let slice = values.slice(start, len);
+            let array: ArrayRef = Arc::new(slice) as ArrayRef;
+            self.process_array(array);
+        }
+    };
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveVisitor for ComputedSingleColumnVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    computed_chunk!(u64_chunk, arrow::array::UInt64Array);
+    computed_chunk!(u32_chunk, arrow::array::UInt32Array);
+    computed_chunk!(u16_chunk, arrow::array::UInt16Array);
+    computed_chunk!(u8_chunk, arrow::array::UInt8Array);
+    computed_chunk!(i64_chunk, arrow::array::Int64Array);
+    computed_chunk!(i32_chunk, arrow::array::Int32Array);
+    computed_chunk!(i16_chunk, arrow::array::Int16Array);
+    computed_chunk!(i8_chunk, arrow::array::Int8Array);
+    computed_chunk!(f64_chunk, arrow::array::Float64Array);
+    computed_chunk!(f32_chunk, arrow::array::Float32Array);
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveWithRowIdsVisitor for ComputedSingleColumnVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    fn u64_chunk_with_rids(
+        &mut self,
+        _: &arrow::array::UInt64Array,
+        _: &arrow::array::UInt64Array,
+    ) {
+        self.reject_row_ids();
+    }
+    fn u32_chunk_with_rids(
+        &mut self,
+        _: &arrow::array::UInt32Array,
+        _: &arrow::array::UInt64Array,
+    ) {
+        self.reject_row_ids();
+    }
+    fn u16_chunk_with_rids(
+        &mut self,
+        _: &arrow::array::UInt16Array,
+        _: &arrow::array::UInt64Array,
+    ) {
+        self.reject_row_ids();
+    }
+    fn u8_chunk_with_rids(&mut self, _: &arrow::array::UInt8Array, _: &arrow::array::UInt64Array) {
+        self.reject_row_ids();
+    }
+    fn i64_chunk_with_rids(&mut self, _: &arrow::array::Int64Array, _: &arrow::array::UInt64Array) {
+        self.reject_row_ids();
+    }
+    fn i32_chunk_with_rids(&mut self, _: &arrow::array::Int32Array, _: &arrow::array::UInt64Array) {
+        self.reject_row_ids();
+    }
+    fn i16_chunk_with_rids(&mut self, _: &arrow::array::Int16Array, _: &arrow::array::UInt64Array) {
+        self.reject_row_ids();
+    }
+    fn i8_chunk_with_rids(&mut self, _: &arrow::array::Int8Array, _: &arrow::array::UInt64Array) {
+        self.reject_row_ids();
+    }
+    fn f64_chunk_with_rids(
+        &mut self,
+        _: &arrow::array::Float64Array,
+        _: &arrow::array::UInt64Array,
+    ) {
+        self.reject_row_ids();
+    }
+    fn f32_chunk_with_rids(
+        &mut self,
+        _: &arrow::array::Float32Array,
+        _: &arrow::array::UInt64Array,
+    ) {
+        self.reject_row_ids();
+    }
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveSortedVisitor for ComputedSingleColumnVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    computed_sorted_run!(u64_run, arrow::array::UInt64Array);
+    computed_sorted_run!(u32_run, arrow::array::UInt32Array);
+    computed_sorted_run!(u16_run, arrow::array::UInt16Array);
+    computed_sorted_run!(u8_run, arrow::array::UInt8Array);
+    computed_sorted_run!(i64_run, arrow::array::Int64Array);
+    computed_sorted_run!(i32_run, arrow::array::Int32Array);
+    computed_sorted_run!(i16_run, arrow::array::Int16Array);
+    computed_sorted_run!(i8_run, arrow::array::Int8Array);
+    computed_sorted_run!(f64_run, arrow::array::Float64Array);
+    computed_sorted_run!(f32_run, arrow::array::Float32Array);
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor
+    for ComputedSingleColumnVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    fn u64_run_with_rids(
+        &mut self,
+        _: &arrow::array::UInt64Array,
+        _: &arrow::array::UInt64Array,
+        _: usize,
+        _: usize,
+    ) {
+        self.reject_row_ids();
+    }
+
+    fn u32_run_with_rids(
+        &mut self,
+        _: &arrow::array::UInt32Array,
+        _: &arrow::array::UInt64Array,
+        _: usize,
+        _: usize,
+    ) {
+        self.reject_row_ids();
+    }
+
+    fn u16_run_with_rids(
+        &mut self,
+        _: &arrow::array::UInt16Array,
+        _: &arrow::array::UInt64Array,
+        _: usize,
+        _: usize,
+    ) {
+        self.reject_row_ids();
+    }
+
+    fn u8_run_with_rids(
+        &mut self,
+        _: &arrow::array::UInt8Array,
+        _: &arrow::array::UInt64Array,
+        _: usize,
+        _: usize,
+    ) {
+        self.reject_row_ids();
+    }
+
+    fn i64_run_with_rids(
+        &mut self,
+        _: &arrow::array::Int64Array,
+        _: &arrow::array::UInt64Array,
+        _: usize,
+        _: usize,
+    ) {
+        self.reject_row_ids();
+    }
+
+    fn i32_run_with_rids(
+        &mut self,
+        _: &arrow::array::Int32Array,
+        _: &arrow::array::UInt64Array,
+        _: usize,
+        _: usize,
+    ) {
+        self.reject_row_ids();
+    }
+
+    fn i16_run_with_rids(
+        &mut self,
+        _: &arrow::array::Int16Array,
+        _: &arrow::array::UInt64Array,
+        _: usize,
+        _: usize,
+    ) {
+        self.reject_row_ids();
+    }
+
+    fn i8_run_with_rids(
+        &mut self,
+        _: &arrow::array::Int8Array,
+        _: &arrow::array::UInt64Array,
+        _: usize,
+        _: usize,
+    ) {
+        self.reject_row_ids();
+    }
+
+    fn f64_run_with_rids(
+        &mut self,
+        _: &arrow::array::Float64Array,
+        _: &arrow::array::UInt64Array,
+        _: usize,
+        _: usize,
+    ) {
+        self.reject_row_ids();
+    }
+
+    fn f32_run_with_rids(
+        &mut self,
+        _: &arrow::array::Float32Array,
+        _: &arrow::array::UInt64Array,
+        _: usize,
+        _: usize,
+    ) {
+        self.reject_row_ids();
+    }
+}
+
+macro_rules! emit_sorted_run {
+    ($name:ident, $array_ty:ty) => {
+        fn $name(&mut self, values: &$array_ty, start: usize, end: usize) {
+            if self.error.is_some() || end <= start {
+                return;
+            }
+            let len = end - start;
+            let slice = values.slice(start, len);
+            let array: ArrayRef = Arc::new(slice) as ArrayRef;
+            self.emit_array_ref(array);
+        }
+    };
+}
+
+macro_rules! reject_sorted_row_ids_run {
+    ($name:ident, $array_ty:ty) => {
+        fn $name(
+            &mut self,
+            _values: &$array_ty,
+            _row_ids: &arrow::array::UInt64Array,
+            _start: usize,
+            _end: usize,
+        ) {
+            self.reject_row_ids();
+        }
+    };
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveVisitor for SingleColumnStreamVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    emit_primitive_chunk!(u64_chunk, arrow::array::UInt64Array);
+    emit_primitive_chunk!(u32_chunk, arrow::array::UInt32Array);
+    emit_primitive_chunk!(u16_chunk, arrow::array::UInt16Array);
+    emit_primitive_chunk!(u8_chunk, arrow::array::UInt8Array);
+    emit_primitive_chunk!(i64_chunk, arrow::array::Int64Array);
+    emit_primitive_chunk!(i32_chunk, arrow::array::Int32Array);
+    emit_primitive_chunk!(i16_chunk, arrow::array::Int16Array);
+    emit_primitive_chunk!(i8_chunk, arrow::array::Int8Array);
+    emit_primitive_chunk!(f64_chunk, arrow::array::Float64Array);
+    emit_primitive_chunk!(f32_chunk, arrow::array::Float32Array);
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveWithRowIdsVisitor for SingleColumnStreamVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    reject_row_ids_method!(u64_chunk_with_rids, arrow::array::UInt64Array);
+    reject_row_ids_method!(u32_chunk_with_rids, arrow::array::UInt32Array);
+    reject_row_ids_method!(u16_chunk_with_rids, arrow::array::UInt16Array);
+    reject_row_ids_method!(u8_chunk_with_rids, arrow::array::UInt8Array);
+    reject_row_ids_method!(i64_chunk_with_rids, arrow::array::Int64Array);
+    reject_row_ids_method!(i32_chunk_with_rids, arrow::array::Int32Array);
+    reject_row_ids_method!(i16_chunk_with_rids, arrow::array::Int16Array);
+    reject_row_ids_method!(i8_chunk_with_rids, arrow::array::Int8Array);
+    reject_row_ids_method!(f64_chunk_with_rids, arrow::array::Float64Array);
+    reject_row_ids_method!(f32_chunk_with_rids, arrow::array::Float32Array);
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveSortedVisitor for SingleColumnStreamVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    emit_sorted_run!(u64_run, arrow::array::UInt64Array);
+    emit_sorted_run!(u32_run, arrow::array::UInt32Array);
+    emit_sorted_run!(u16_run, arrow::array::UInt16Array);
+    emit_sorted_run!(u8_run, arrow::array::UInt8Array);
+    emit_sorted_run!(i64_run, arrow::array::Int64Array);
+    emit_sorted_run!(i32_run, arrow::array::Int32Array);
+    emit_sorted_run!(i16_run, arrow::array::Int16Array);
+    emit_sorted_run!(i8_run, arrow::array::Int8Array);
+    emit_sorted_run!(f64_run, arrow::array::Float64Array);
+    emit_sorted_run!(f32_run, arrow::array::Float32Array);
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor
+    for SingleColumnStreamVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    reject_sorted_row_ids_run!(u64_run_with_rids, arrow::array::UInt64Array);
+    reject_sorted_row_ids_run!(u32_run_with_rids, arrow::array::UInt32Array);
+    reject_sorted_row_ids_run!(u16_run_with_rids, arrow::array::UInt16Array);
+    reject_sorted_row_ids_run!(u8_run_with_rids, arrow::array::UInt8Array);
+    reject_sorted_row_ids_run!(i64_run_with_rids, arrow::array::Int64Array);
+    reject_sorted_row_ids_run!(i32_run_with_rids, arrow::array::Int32Array);
+    reject_sorted_row_ids_run!(i16_run_with_rids, arrow::array::Int16Array);
+    reject_sorted_row_ids_run!(i8_run_with_rids, arrow::array::Int8Array);
+    reject_sorted_row_ids_run!(f64_run_with_rids, arrow::array::Float64Array);
+    reject_sorted_row_ids_run!(f32_run_with_rids, arrow::array::Float32Array);
+}
+
+struct AffineSingleColumnVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    schema: Arc<Schema>,
+    scale: f64,
+    offset: f64,
+    on_batch: &'a mut F,
+    error: Option<Error>,
+}
+
+impl<'a, F> AffineSingleColumnVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    fn new(schema: Arc<Schema>, scale: f64, offset: f64, on_batch: &'a mut F) -> Self {
+        Self {
+            schema,
+            scale,
+            offset,
+            on_batch,
+            error: None,
+        }
+    }
+
+    fn emit_array(&mut self, array: arrow::array::Float64Array) {
+        if self.error.is_some() {
+            return;
+        }
+        let array_ref: ArrayRef = Arc::new(array) as ArrayRef;
+        match RecordBatch::try_new(self.schema.clone(), vec![array_ref]) {
+            Ok(batch) => (self.on_batch)(batch),
+            Err(err) => {
+                self.error = Some(Error::Internal(format!("arrow error: {err}")));
+            }
+        }
+    }
+
+    fn emit_no_nulls<G>(&mut self, len: usize, mut value_at: G)
+    where
+        G: FnMut(usize) -> f64,
+    {
+        if self.error.is_some() || len == 0 {
+            return;
+        }
+        let scale = self.scale;
+        let offset = self.offset;
+        let iter = (0..len).map(|idx| {
+            let base = value_at(idx);
+            scale * base + offset
+        });
+        let array = arrow::array::Float64Array::from_iter_values(iter);
+        self.emit_array(array);
+    }
+
+    fn emit_with_nulls<GNull, GValue>(
+        &mut self,
+        len: usize,
+        mut is_null: GNull,
+        mut value_at: GValue,
+    ) where
+        GNull: FnMut(usize) -> bool,
+        GValue: FnMut(usize) -> f64,
+    {
+        if self.error.is_some() || len == 0 {
+            return;
+        }
+        let scale = self.scale;
+        let offset = self.offset;
+        let iter = (0..len).map(|idx| {
+            if is_null(idx) {
+                None
+            } else {
+                let base = value_at(idx);
+                Some(scale * base + offset)
+            }
+        });
+        let array = arrow::array::Float64Array::from_iter(iter);
+        self.emit_array(array);
+    }
+
+    fn reject_row_ids(&mut self) {
+        if self.error.is_none() {
+            self.error = Some(Error::Internal(
+                "unexpected row-id payload in affine single-column fast path".into(),
+            ));
+        }
+    }
+
+    fn finish(self) -> LlkvResult<()> {
+        match self.error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
+macro_rules! affine_chunk {
+    ($name:ident, $array_ty:ty, $cast:expr) => {
+        fn $name(&mut self, values: &$array_ty) {
+            let cast = $cast;
+            if values.null_count() == 0 {
+                let slice = values.values();
+                self.emit_no_nulls(slice.len(), |idx| cast(slice[idx]));
+            } else {
+                let len = values.len();
+                self.emit_with_nulls(
+                    len,
+                    |idx| values.is_null(idx),
+                    |idx| cast(values.value(idx)),
+                );
+            }
+        }
+    };
+}
+
+macro_rules! affine_run {
+    ($name:ident, $array_ty:ty, $cast:expr) => {
+        fn $name(&mut self, values: &$array_ty, start: usize, len: usize) {
+            if len == 0 {
+                return;
+            }
+            let cast = $cast;
+            if values.null_count() == 0 {
+                let slice = values.values();
+                self.emit_no_nulls(len, |idx| cast(slice[start + idx]));
+            } else {
+                self.emit_with_nulls(
+                    len,
+                    |idx| values.is_null(start + idx),
+                    |idx| cast(values.value(start + idx)),
+                );
+            }
+        }
+    };
+}
+
+macro_rules! affine_row_ids_chunk {
+    ($name:ident, $array_ty:ty) => {
+        fn $name(&mut self, _: &$array_ty, _: &arrow::array::UInt64Array) {
+            self.reject_row_ids();
+        }
+    };
+}
+
+macro_rules! affine_row_ids_run {
+    ($name:ident, $array_ty:ty) => {
+        fn $name(&mut self, _: &$array_ty, _: &arrow::array::UInt64Array, _: usize, _: usize) {
+            self.reject_row_ids();
+        }
+    };
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveVisitor for AffineSingleColumnVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    affine_chunk!(u64_chunk, arrow::array::UInt64Array, |v: u64| v as f64);
+    affine_chunk!(u32_chunk, arrow::array::UInt32Array, |v: u32| v as f64);
+    affine_chunk!(u16_chunk, arrow::array::UInt16Array, |v: u16| v as f64);
+    affine_chunk!(u8_chunk, arrow::array::UInt8Array, |v: u8| v as f64);
+    affine_chunk!(i64_chunk, arrow::array::Int64Array, |v: i64| v as f64);
+    affine_chunk!(i32_chunk, arrow::array::Int32Array, |v: i32| v as f64);
+    affine_chunk!(i16_chunk, arrow::array::Int16Array, |v: i16| v as f64);
+    affine_chunk!(i8_chunk, arrow::array::Int8Array, |v: i8| v as f64);
+    affine_chunk!(f64_chunk, arrow::array::Float64Array, |v: f64| v);
+    affine_chunk!(f32_chunk, arrow::array::Float32Array, |v: f32| v as f64);
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveWithRowIdsVisitor for AffineSingleColumnVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    affine_row_ids_chunk!(u64_chunk_with_rids, arrow::array::UInt64Array);
+    affine_row_ids_chunk!(u32_chunk_with_rids, arrow::array::UInt32Array);
+    affine_row_ids_chunk!(u16_chunk_with_rids, arrow::array::UInt16Array);
+    affine_row_ids_chunk!(u8_chunk_with_rids, arrow::array::UInt8Array);
+    affine_row_ids_chunk!(i64_chunk_with_rids, arrow::array::Int64Array);
+    affine_row_ids_chunk!(i32_chunk_with_rids, arrow::array::Int32Array);
+    affine_row_ids_chunk!(i16_chunk_with_rids, arrow::array::Int16Array);
+    affine_row_ids_chunk!(i8_chunk_with_rids, arrow::array::Int8Array);
+    affine_row_ids_chunk!(f64_chunk_with_rids, arrow::array::Float64Array);
+    affine_row_ids_chunk!(f32_chunk_with_rids, arrow::array::Float32Array);
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveSortedVisitor for AffineSingleColumnVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    affine_run!(u64_run, arrow::array::UInt64Array, |v: u64| v as f64);
+    affine_run!(u32_run, arrow::array::UInt32Array, |v: u32| v as f64);
+    affine_run!(u16_run, arrow::array::UInt16Array, |v: u16| v as f64);
+    affine_run!(u8_run, arrow::array::UInt8Array, |v: u8| v as f64);
+    affine_run!(i64_run, arrow::array::Int64Array, |v: i64| v as f64);
+    affine_run!(i32_run, arrow::array::Int32Array, |v: i32| v as f64);
+    affine_run!(i16_run, arrow::array::Int16Array, |v: i16| v as f64);
+    affine_run!(i8_run, arrow::array::Int8Array, |v: i8| v as f64);
+    affine_run!(f64_run, arrow::array::Float64Array, |v: f64| v);
+    affine_run!(f32_run, arrow::array::Float32Array, |v: f32| v as f64);
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor
+    for AffineSingleColumnVisitor<'a, F>
+where
+    F: FnMut(RecordBatch),
+{
+    affine_row_ids_run!(u64_run_with_rids, arrow::array::UInt64Array);
+    affine_row_ids_run!(u32_run_with_rids, arrow::array::UInt32Array);
+    affine_row_ids_run!(u16_run_with_rids, arrow::array::UInt16Array);
+    affine_row_ids_run!(u8_run_with_rids, arrow::array::UInt8Array);
+    affine_row_ids_run!(i64_run_with_rids, arrow::array::Int64Array);
+    affine_row_ids_run!(i32_run_with_rids, arrow::array::Int32Array);
+    affine_row_ids_run!(i16_run_with_rids, arrow::array::Int16Array);
+    affine_row_ids_run!(i8_run_with_rids, arrow::array::Int8Array);
+    affine_row_ids_run!(f64_run_with_rids, arrow::array::Float64Array);
+    affine_row_ids_run!(f32_run_with_rids, arrow::array::Float32Array);
 }
 
 fn normalize_row_ids(mut row_ids: Vec<u64>) -> Vec<u64> {
     row_ids.sort_unstable();
     row_ids.dedup();
     row_ids
-}
-
-struct ColumnChunk {
-    values: ArrayRef,
-    row_ids: Arc<UInt64Array>,
-}
-
-struct ColumnChunks {
-    entries: Vec<ColumnChunk>,
-}
-
-impl ColumnChunks {
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    fn align_cursor(&self, cursor: &mut ColumnCursor, target: u64) -> bool {
-        while cursor.chunk_idx < self.entries.len() {
-            let entry = &self.entries[cursor.chunk_idx];
-            let row_ids = entry.row_ids.as_ref();
-            if row_ids.is_empty() {
-                cursor.chunk_idx += 1;
-                cursor.offset = 0;
-                continue;
-            }
-
-            while cursor.offset < row_ids.len() {
-                let rid = row_ids.value(cursor.offset);
-                if rid < target {
-                    cursor.offset += 1;
-                    continue;
-                }
-                if rid == target {
-                    return true;
-                }
-                return false;
-            }
-
-            cursor.chunk_idx += 1;
-            cursor.offset = 0;
-        }
-
-        false
-    }
-
-    fn contiguous_len(&self, cursor: &ColumnCursor, limit: usize, start: u64) -> usize {
-        if cursor.chunk_idx >= self.entries.len() {
-            return 0;
-        }
-        let entry = &self.entries[cursor.chunk_idx];
-        let row_ids = entry.row_ids.as_ref();
-        if cursor.offset >= row_ids.len() {
-            return 0;
-        }
-
-        let max = limit.min(row_ids.len() - cursor.offset);
-        let mut count = 0usize;
-        while count < max {
-            let rid = row_ids.value(cursor.offset + count);
-            if rid != start + count as u64 {
-                break;
-            }
-            count += 1;
-        }
-        count
-    }
-
-    fn advance_cursor(&self, cursor: &mut ColumnCursor, mut consumed: usize) {
-        while consumed > 0 && cursor.chunk_idx < self.entries.len() {
-            let entry = &self.entries[cursor.chunk_idx];
-            let remaining = entry.row_ids.len().saturating_sub(cursor.offset);
-            if consumed < remaining {
-                cursor.offset += consumed;
-                return;
-            }
-            consumed -= remaining;
-            cursor.chunk_idx += 1;
-            cursor.offset = 0;
-        }
-    }
-
-    fn covers_range(&self, mut cursor: ColumnCursor, start: u64, end: u64) -> bool {
-        let mut row = start;
-        while row < end {
-            if !self.align_cursor(&mut cursor, row) {
-                return false;
-            }
-            let remaining = (end - row) as usize;
-            let contiguous = self.contiguous_len(&cursor, remaining, row);
-            if contiguous == 0 {
-                return false;
-            }
-            self.advance_cursor(&mut cursor, contiguous);
-            row += contiguous as u64;
-        }
-        true
-    }
-}
-
-struct ColumnChunkCollector {
-    entries: Vec<ColumnChunk>,
-}
-
-impl ColumnChunkCollector {
-    fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    fn push_chunk<A>(&mut self, values: &A, row_ids: &UInt64Array)
-    where
-        A: Array + Clone + 'static,
-    {
-        debug_assert_eq!(values.len(), row_ids.len());
-        let values_ref: ArrayRef = Arc::new(values.clone()) as ArrayRef;
-        let row_ids_ref = Arc::new(row_ids.clone());
-        self.entries.push(ColumnChunk {
-            values: values_ref,
-            row_ids: row_ids_ref,
-        });
-    }
-
-    fn finish(self) -> LlkvResult<ColumnChunks> {
-        let mut prev: Option<u64> = None;
-        for entry in &self.entries {
-            let row_ids = entry.row_ids.as_ref();
-            if row_ids.is_empty() {
-                continue;
-            }
-            if let Some(last) = prev
-                && row_ids.value(0) <= last
-            {
-                return Err(Error::Internal(
-                    "column chunks row-ids are not strictly increasing".into(),
-                ));
-            }
-            prev = Some(row_ids.value(row_ids.len() - 1));
-        }
-        Ok(ColumnChunks {
-            entries: self.entries,
-        })
-    }
-}
-
-macro_rules! impl_collect_with_rids {
-    ($method:ident, $ArrayTy:ty) => {
-        fn $method(&mut self, values: &$ArrayTy, row_ids: &UInt64Array) {
-            self.push_chunk(values, row_ids);
-        }
-    };
-}
-
-impl PrimitiveVisitor for ColumnChunkCollector {
-    fn u64_chunk(&mut self, _a: &UInt64Array) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn u32_chunk(&mut self, _a: &UInt32Array) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn u16_chunk(&mut self, _a: &UInt16Array) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn u8_chunk(&mut self, _a: &UInt8Array) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn i64_chunk(&mut self, _a: &Int64Array) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn i32_chunk(&mut self, _a: &Int32Array) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn i16_chunk(&mut self, _a: &Int16Array) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn i8_chunk(&mut self, _a: &Int8Array) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn f64_chunk(&mut self, _a: &Float64Array) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn f32_chunk(&mut self, _a: &Float32Array) {
-        unreachable!("row-id aware scan expected");
-    }
-}
-
-impl PrimitiveWithRowIdsVisitor for ColumnChunkCollector {
-    impl_collect_with_rids!(u64_chunk_with_rids, UInt64Array);
-    impl_collect_with_rids!(u32_chunk_with_rids, UInt32Array);
-    impl_collect_with_rids!(u16_chunk_with_rids, UInt16Array);
-    impl_collect_with_rids!(u8_chunk_with_rids, UInt8Array);
-    impl_collect_with_rids!(i64_chunk_with_rids, Int64Array);
-    impl_collect_with_rids!(i32_chunk_with_rids, Int32Array);
-    impl_collect_with_rids!(i16_chunk_with_rids, Int16Array);
-    impl_collect_with_rids!(i8_chunk_with_rids, Int8Array);
-    impl_collect_with_rids!(f64_chunk_with_rids, Float64Array);
-    impl_collect_with_rids!(f32_chunk_with_rids, Float32Array);
-}
-
-impl PrimitiveSortedVisitor for ColumnChunkCollector {
-    fn u64_run(&mut self, _: &UInt64Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn u32_run(&mut self, _: &UInt32Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn u16_run(&mut self, _: &UInt16Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn u8_run(&mut self, _: &UInt8Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn i64_run(&mut self, _: &Int64Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn i32_run(&mut self, _: &Int32Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn i16_run(&mut self, _: &Int16Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn i8_run(&mut self, _: &Int8Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn f64_run(&mut self, _: &Float64Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn f32_run(&mut self, _: &Float32Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-}
-
-impl PrimitiveSortedWithRowIdsVisitor for ColumnChunkCollector {
-    fn u64_run_with_rids(&mut self, _: &UInt64Array, _: &UInt64Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn u32_run_with_rids(&mut self, _: &UInt32Array, _: &UInt64Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn u16_run_with_rids(&mut self, _: &UInt16Array, _: &UInt64Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn u8_run_with_rids(&mut self, _: &UInt8Array, _: &UInt64Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn i64_run_with_rids(&mut self, _: &Int64Array, _: &UInt64Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn i32_run_with_rids(&mut self, _: &Int32Array, _: &UInt64Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn i16_run_with_rids(&mut self, _: &Int16Array, _: &UInt64Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn i8_run_with_rids(&mut self, _: &Int8Array, _: &UInt64Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn f64_run_with_rids(&mut self, _: &Float64Array, _: &UInt64Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn f32_run_with_rids(&mut self, _: &Float32Array, _: &UInt64Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-    fn null_run(&mut self, _: &UInt64Array, _: usize, _: usize) {
-        unreachable!("row-id aware scan expected");
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ColumnCursor {
-    chunk_idx: usize,
-    offset: usize,
-}
-
-impl ColumnCursor {
-    fn new() -> Self {
-        Self {
-            chunk_idx: 0,
-            offset: 0,
-        }
-    }
-}
-
-struct DenseRunStreamer<'a> {
-    projection_evals: &'a [ProjectionEval],
-    unique_index: &'a FxHashMap<LogicalFieldId, usize>,
-    schema: Arc<Schema>,
-    unique_chunks: Vec<ColumnChunks>,
-}
-
-impl<'a> DenseRunStreamer<'a> {
-    fn new(
-        projection_evals: &'a [ProjectionEval],
-        unique_index: &'a FxHashMap<LogicalFieldId, usize>,
-        schema: Arc<Schema>,
-        unique_chunks: Vec<ColumnChunks>,
-    ) -> Self {
-        Self {
-            projection_evals,
-            unique_index,
-            schema,
-            unique_chunks,
-        }
-    }
-
-    fn stream<F>(&mut self, runs: &[FilterRun], on_batch: &mut F) -> LlkvResult<bool>
-    where
-        F: FnMut(RecordBatch),
-    {
-        if runs.is_empty() {
-            return Ok(true);
-        }
-        if self.unique_chunks.is_empty() {
-            return Ok(true);
-        }
-        if self.unique_chunks.iter().any(|chunks| chunks.is_empty()) {
-            return Ok(true);
-        }
-
-        let mut cursors: Vec<ColumnCursor> = self
-            .unique_chunks
-            .iter()
-            .map(|_| ColumnCursor::new())
-            .collect();
-
-        for run in runs {
-            let mut current_row = run.start_row_id;
-            let run_end = current_row + run.len as u64;
-
-            for (idx, chunks) in self.unique_chunks.iter().enumerate() {
-                if !chunks.align_cursor(&mut cursors[idx], current_row) {
-                    return Ok(false);
-                }
-            }
-
-            for (idx, chunks) in self.unique_chunks.iter().enumerate() {
-                if !chunks.covers_range(cursors[idx], current_row, run_end) {
-                    return Ok(false);
-                }
-            }
-
-            while current_row < run_end {
-                let mut target_batch = ((run_end - current_row) as usize).min(STREAM_BATCH_ROWS);
-
-                for (idx, chunks) in self.unique_chunks.iter().enumerate() {
-                    let contiguous =
-                        chunks.contiguous_len(&cursors[idx], target_batch, current_row);
-                    if contiguous == 0 {
-                        return Ok(false);
-                    }
-                    target_batch = target_batch.min(contiguous);
-                }
-
-                let mut unique_slices: Vec<ArrayRef> = Vec::with_capacity(self.unique_chunks.len());
-                for (idx, chunks) in self.unique_chunks.iter().enumerate() {
-                    let cursor = cursors[idx];
-                    let entry = &chunks.entries[cursor.chunk_idx];
-                    unique_slices.push(entry.values.slice(cursor.offset, target_batch));
-                }
-
-                let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.projection_evals.len());
-                for eval in self.projection_evals {
-                    if let ProjectionEval::Column(info) = eval {
-                        let idx = self
-                            .unique_index
-                            .get(&info.logical_field_id)
-                            .copied()
-                            .expect("logical field missing from unique index");
-                        columns.push(unique_slices[idx].clone());
-                    } else {
-                        unreachable!("dense run streamer only handles column projections");
-                    }
-                }
-
-                let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
-                on_batch(batch);
-
-                let next_row = current_row + (target_batch as u64);
-
-                for (idx, chunks) in self.unique_chunks.iter().enumerate() {
-                    chunks.advance_cursor(&mut cursors[idx], target_batch);
-                    if next_row < run_end && !chunks.align_cursor(&mut cursors[idx], next_row) {
-                        return Ok(false);
-                    }
-                }
-
-                current_row = next_row;
-            }
-        }
-
-        Ok(true)
-    }
 }
 
 fn intersect_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
@@ -1347,464 +1503,4 @@ fn is_supported_numeric(dtype: &DataType) -> bool {
             | DataType::Float64
             | DataType::Float32
     )
-}
-
-struct BuilderBatchEmitter<'a, F>
-where
-    F: FnMut(RecordBatch),
-{
-    schema: Arc<Schema>,
-    on_batch: &'a mut F,
-    error: Option<Error>,
-    emitted: bool,
-}
-
-impl<'a, F> BuilderBatchEmitter<'a, F>
-where
-    F: FnMut(RecordBatch),
-{
-    fn emit_array(&mut self, array: ArrayRef) {
-        if self.error.is_some() {
-            return;
-        }
-        match RecordBatch::try_new(self.schema.clone(), vec![array]) {
-            Ok(batch) => {
-                (self.on_batch)(batch);
-                self.emitted = true;
-            }
-            Err(err) => self.error = Some(Error::from(err)),
-        }
-    }
-
-    fn emit_chunk<A>(&mut self, array: &A)
-    where
-        A: Array + Clone + 'static,
-    {
-        let array_ref: ArrayRef = Arc::new(array.clone()) as ArrayRef;
-        self.emit_array(array_ref);
-    }
-
-    fn emit_slice<A>(&mut self, array: &A, start: usize, len: usize)
-    where
-        A: Array + Clone + 'static,
-    {
-        let slice = array.slice(start, len);
-        self.emit_array(slice);
-    }
-
-    fn unsupported(&mut self) {
-        if self.error.is_none() {
-            self.error = Some(Error::Internal(
-                "scan builder emitted unsupported row-id payload".into(),
-            ));
-        }
-    }
-}
-
-macro_rules! impl_emit_chunk {
-    ($method:ident, $ArrayTy:ty) => {
-        fn $method(&mut self, array: &$ArrayTy) {
-            self.emit_chunk(array);
-        }
-    };
-}
-
-macro_rules! impl_emit_run {
-    ($method:ident, $ArrayTy:ty) => {
-        fn $method(&mut self, array: &$ArrayTy, start: usize, len: usize) {
-            self.emit_slice(array, start, len);
-        }
-    };
-}
-
-impl<'a, F> PrimitiveVisitor for BuilderBatchEmitter<'a, F>
-where
-    F: FnMut(RecordBatch),
-{
-    impl_emit_chunk!(u64_chunk, UInt64Array);
-    impl_emit_chunk!(u32_chunk, UInt32Array);
-    impl_emit_chunk!(u16_chunk, UInt16Array);
-    impl_emit_chunk!(u8_chunk, UInt8Array);
-    impl_emit_chunk!(i64_chunk, Int64Array);
-    impl_emit_chunk!(i32_chunk, Int32Array);
-    impl_emit_chunk!(i16_chunk, Int16Array);
-    impl_emit_chunk!(i8_chunk, Int8Array);
-    impl_emit_chunk!(f64_chunk, Float64Array);
-    impl_emit_chunk!(f32_chunk, Float32Array);
-}
-
-impl<'a, F> PrimitiveWithRowIdsVisitor for BuilderBatchEmitter<'a, F>
-where
-    F: FnMut(RecordBatch),
-{
-    fn u64_chunk_with_rids(&mut self, _v: &UInt64Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn u32_chunk_with_rids(&mut self, _v: &UInt32Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn u16_chunk_with_rids(&mut self, _v: &UInt16Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn u8_chunk_with_rids(&mut self, _v: &UInt8Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn i64_chunk_with_rids(&mut self, _v: &Int64Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn i32_chunk_with_rids(&mut self, _v: &Int32Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn i16_chunk_with_rids(&mut self, _v: &Int16Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn i8_chunk_with_rids(&mut self, _v: &Int8Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn f64_chunk_with_rids(&mut self, _v: &Float64Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn f32_chunk_with_rids(&mut self, _v: &Float32Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-}
-
-impl<'a, F> PrimitiveSortedVisitor for BuilderBatchEmitter<'a, F>
-where
-    F: FnMut(RecordBatch),
-{
-    impl_emit_run!(u64_run, UInt64Array);
-    impl_emit_run!(u32_run, UInt32Array);
-    impl_emit_run!(u16_run, UInt16Array);
-    impl_emit_run!(u8_run, UInt8Array);
-    impl_emit_run!(i64_run, Int64Array);
-    impl_emit_run!(i32_run, Int32Array);
-    impl_emit_run!(i16_run, Int16Array);
-    impl_emit_run!(i8_run, Int8Array);
-    impl_emit_run!(f64_run, Float64Array);
-    impl_emit_run!(f32_run, Float32Array);
-}
-
-impl<'a, F> PrimitiveSortedWithRowIdsVisitor for BuilderBatchEmitter<'a, F>
-where
-    F: FnMut(RecordBatch),
-{
-    fn u64_run_with_rids(
-        &mut self,
-        _v: &UInt64Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-        self.unsupported();
-    }
-    fn u32_run_with_rids(
-        &mut self,
-        _v: &UInt32Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-        self.unsupported();
-    }
-    fn u16_run_with_rids(
-        &mut self,
-        _v: &UInt16Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-        self.unsupported();
-    }
-    fn u8_run_with_rids(&mut self, _v: &UInt8Array, _r: &UInt64Array, _start: usize, _len: usize) {
-        self.unsupported();
-    }
-    fn i64_run_with_rids(&mut self, _v: &Int64Array, _r: &UInt64Array, _start: usize, _len: usize) {
-        self.unsupported();
-    }
-    fn i32_run_with_rids(&mut self, _v: &Int32Array, _r: &UInt64Array, _start: usize, _len: usize) {
-        self.unsupported();
-    }
-    fn i16_run_with_rids(&mut self, _v: &Int16Array, _r: &UInt64Array, _start: usize, _len: usize) {
-        self.unsupported();
-    }
-    fn i8_run_with_rids(&mut self, _v: &Int8Array, _r: &UInt64Array, _start: usize, _len: usize) {
-        self.unsupported();
-    }
-    fn f64_run_with_rids(
-        &mut self,
-        _v: &Float64Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-        self.unsupported();
-    }
-    fn f32_run_with_rids(
-        &mut self,
-        _v: &Float32Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-        self.unsupported();
-    }
-    fn null_run(&mut self, _r: &UInt64Array, _start: usize, _len: usize) {
-        self.unsupported();
-    }
-}
-
-struct AffineComputeEmitter<'a, F>
-where
-    F: FnMut(RecordBatch),
-{
-    schema: Arc<Schema>,
-    scale: f64,
-    offset: f64,
-    on_batch: &'a mut F,
-    error: Option<Error>,
-    emitted: bool,
-}
-
-impl<'a, F> AffineComputeEmitter<'a, F>
-where
-    F: FnMut(RecordBatch),
-{
-    fn emit_array(&mut self, array: Float64Array) {
-        if self.error.is_some() {
-            return;
-        }
-        let array_ref = Arc::new(array) as ArrayRef;
-        match RecordBatch::try_new(self.schema.clone(), vec![array_ref]) {
-            Ok(batch) => {
-                (self.on_batch)(batch);
-                self.emitted = true;
-            }
-            Err(err) => self.error = Some(Error::from(err)),
-        }
-    }
-
-    fn emit_no_nulls<GValue>(&mut self, len: usize, mut value_at: GValue)
-    where
-        GValue: FnMut(usize) -> f64,
-    {
-        if self.error.is_some() {
-            return;
-        }
-        let scale = self.scale;
-        let offset = self.offset;
-        let iter = (0..len).map(|idx| {
-            let base = value_at(idx);
-            scale * base + offset
-        });
-        let array = Float64Array::from_iter_values(iter);
-        self.emit_array(array);
-    }
-
-    fn emit_with_nulls<GNull, GValue>(
-        &mut self,
-        len: usize,
-        mut is_null: GNull,
-        mut value_at: GValue,
-    ) where
-        GNull: FnMut(usize) -> bool,
-        GValue: FnMut(usize) -> f64,
-    {
-        if self.error.is_some() {
-            return;
-        }
-        let scale = self.scale;
-        let offset = self.offset;
-        let iter = (0..len).map(|idx| {
-            if is_null(idx) {
-                None
-            } else {
-                let base = value_at(idx);
-                Some(scale * base + offset)
-            }
-        });
-        let array = Float64Array::from_iter(iter);
-        self.emit_array(array);
-    }
-
-    fn unsupported(&mut self) {
-        if self.error.is_none() {
-            self.error = Some(Error::Internal(
-                "scan builder emitted unsupported payload for affine streaming".into(),
-            ));
-        }
-    }
-}
-
-macro_rules! impl_affine_chunk {
-    ($method:ident, $ArrayTy:ty, $cast:expr) => {
-        fn $method(&mut self, array: &$ArrayTy) {
-            let cast = $cast;
-            if array.null_count() == 0 {
-                let values = array.values();
-                self.emit_no_nulls(values.len(), |idx| cast(values[idx]));
-            } else {
-                self.emit_with_nulls(
-                    array.len(),
-                    |idx| array.is_null(idx),
-                    |idx| cast(array.value(idx)),
-                );
-            }
-        }
-    };
-}
-
-macro_rules! impl_affine_run {
-    ($method:ident, $ArrayTy:ty, $cast:expr) => {
-        fn $method(&mut self, array: &$ArrayTy, start: usize, len: usize) {
-            let cast = $cast;
-            if array.null_count() == 0 {
-                let values = array.values();
-                self.emit_no_nulls(len, |idx| cast(values[start + idx]));
-            } else {
-                self.emit_with_nulls(
-                    len,
-                    |idx| array.is_null(start + idx),
-                    |idx| cast(array.value(start + idx)),
-                );
-            }
-        }
-    };
-}
-
-impl<'a, F> PrimitiveVisitor for AffineComputeEmitter<'a, F>
-where
-    F: FnMut(RecordBatch),
-{
-    impl_affine_chunk!(u64_chunk, UInt64Array, |v: u64| v as f64);
-    impl_affine_chunk!(u32_chunk, UInt32Array, |v: u32| v as f64);
-    impl_affine_chunk!(u16_chunk, UInt16Array, |v: u16| v as f64);
-    impl_affine_chunk!(u8_chunk, UInt8Array, |v: u8| v as f64);
-    impl_affine_chunk!(i64_chunk, Int64Array, |v: i64| v as f64);
-    impl_affine_chunk!(i32_chunk, Int32Array, |v: i32| v as f64);
-    impl_affine_chunk!(i16_chunk, Int16Array, |v: i16| v as f64);
-    impl_affine_chunk!(i8_chunk, Int8Array, |v: i8| v as f64);
-    impl_affine_chunk!(f64_chunk, Float64Array, |v: f64| v);
-    impl_affine_chunk!(f32_chunk, Float32Array, |v: f32| v as f64);
-}
-
-impl<'a, F> PrimitiveWithRowIdsVisitor for AffineComputeEmitter<'a, F>
-where
-    F: FnMut(RecordBatch),
-{
-    fn u64_chunk_with_rids(&mut self, _v: &UInt64Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn u32_chunk_with_rids(&mut self, _v: &UInt32Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn u16_chunk_with_rids(&mut self, _v: &UInt16Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn u8_chunk_with_rids(&mut self, _v: &UInt8Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn i64_chunk_with_rids(&mut self, _v: &Int64Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn i32_chunk_with_rids(&mut self, _v: &Int32Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn i16_chunk_with_rids(&mut self, _v: &Int16Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn i8_chunk_with_rids(&mut self, _v: &Int8Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn f64_chunk_with_rids(&mut self, _v: &Float64Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-    fn f32_chunk_with_rids(&mut self, _v: &Float32Array, _r: &UInt64Array) {
-        self.unsupported();
-    }
-}
-
-impl<'a, F> PrimitiveSortedVisitor for AffineComputeEmitter<'a, F>
-where
-    F: FnMut(RecordBatch),
-{
-    impl_affine_run!(u64_run, UInt64Array, |v: u64| v as f64);
-    impl_affine_run!(u32_run, UInt32Array, |v: u32| v as f64);
-    impl_affine_run!(u16_run, UInt16Array, |v: u16| v as f64);
-    impl_affine_run!(u8_run, UInt8Array, |v: u8| v as f64);
-    impl_affine_run!(i64_run, Int64Array, |v: i64| v as f64);
-    impl_affine_run!(i32_run, Int32Array, |v: i32| v as f64);
-    impl_affine_run!(i16_run, Int16Array, |v: i16| v as f64);
-    impl_affine_run!(i8_run, Int8Array, |v: i8| v as f64);
-    impl_affine_run!(f64_run, Float64Array, |v: f64| v);
-    impl_affine_run!(f32_run, Float32Array, |v: f32| v as f64);
-}
-
-impl<'a, F> PrimitiveSortedWithRowIdsVisitor for AffineComputeEmitter<'a, F>
-where
-    F: FnMut(RecordBatch),
-{
-    fn u64_run_with_rids(
-        &mut self,
-        _v: &UInt64Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-        self.unsupported();
-    }
-    fn u32_run_with_rids(
-        &mut self,
-        _v: &UInt32Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-        self.unsupported();
-    }
-    fn u16_run_with_rids(
-        &mut self,
-        _v: &UInt16Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-        self.unsupported();
-    }
-    fn u8_run_with_rids(&mut self, _v: &UInt8Array, _r: &UInt64Array, _start: usize, _len: usize) {
-        self.unsupported();
-    }
-    fn i64_run_with_rids(&mut self, _v: &Int64Array, _r: &UInt64Array, _start: usize, _len: usize) {
-        self.unsupported();
-    }
-    fn i32_run_with_rids(&mut self, _v: &Int32Array, _r: &UInt64Array, _start: usize, _len: usize) {
-        self.unsupported();
-    }
-    fn i16_run_with_rids(&mut self, _v: &Int16Array, _r: &UInt64Array, _start: usize, _len: usize) {
-        self.unsupported();
-    }
-    fn i8_run_with_rids(&mut self, _v: &Int8Array, _r: &UInt64Array, _start: usize, _len: usize) {
-        self.unsupported();
-    }
-    fn f64_run_with_rids(
-        &mut self,
-        _v: &Float64Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-        self.unsupported();
-    }
-    fn f32_run_with_rids(
-        &mut self,
-        _v: &Float32Array,
-        _r: &UInt64Array,
-        _start: usize,
-        _len: usize,
-    ) {
-        self.unsupported();
-    }
-    fn null_run(&mut self, _r: &UInt64Array, _start: usize, _len: usize) {
-        self.unsupported();
-    }
 }
