@@ -12,10 +12,11 @@ on:
 # access to issues/pull-requests so Bencher can post comments on PRs.
 # Note: For runs triggered by forks, secrets (including GITHUB_TOKEN) are not
 # available and commenting will fail — this is a GitHub security restriction.
+#
+# https://bencher.dev/docs/explanation/bencher-run/#--github-actions-github_token
 permissions:
-  contents: read
-  issues: write
   pull-requests: write
+  checks: write
 
 jobs:
   benchmark_with_bencher:
