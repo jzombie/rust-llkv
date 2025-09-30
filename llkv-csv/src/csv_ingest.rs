@@ -15,6 +15,7 @@ use llkv_table::{ColMeta, Table, types::FieldId};
 
 use crate::{CsvReadOptions, open_csv_reader};
 
+// TODO: Migrate to common type utils
 fn convert_row_id(array: &ArrayRef) -> LlkvResult<ArrayRef> {
     match array.data_type() {
         DataType::UInt64 => Ok(Arc::clone(array)),
