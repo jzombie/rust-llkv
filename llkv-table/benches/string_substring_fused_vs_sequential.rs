@@ -19,8 +19,39 @@ use llkv_table::table::ScanStreamOptions;
 use llkv_table::types::FieldId;
 
 const NUM_ROWS: usize = 1_000_000;
+const EXPECTED_MATCHES: usize = NUM_ROWS / 1000;
 const TABLE_ID: llkv_table::types::TableId = 4242;
 const FIELD_ID: FieldId = 1_001;
+
+#[derive(Clone, Copy)]
+struct Scenario {
+    name: &'static str,
+    contains_case_sensitive: bool,
+    starts_with_case_sensitive: bool,
+}
+
+const SCENARIOS: [Scenario; 4] = [
+    Scenario {
+        name: "both_case_sensitive",
+        contains_case_sensitive: true,
+        starts_with_case_sensitive: true,
+    },
+    Scenario {
+        name: "contains_case_insensitive",
+        contains_case_sensitive: false,
+        starts_with_case_sensitive: true,
+    },
+    Scenario {
+        name: "starts_case_insensitive",
+        contains_case_sensitive: true,
+        starts_with_case_sensitive: false,
+    },
+    Scenario {
+        name: "both_case_insensitive",
+        contains_case_sensitive: false,
+        starts_with_case_sensitive: false,
+    },
+];
 
 fn schema_with_row_id(field: Field) -> Arc<Schema> {
     let row_id = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
@@ -58,18 +89,18 @@ fn setup_table() -> Table {
     table
 }
 
-fn bench_planner_fused(table: &Table) -> usize {
+fn bench_planner_fused(table: &Table, scenario: Scenario) -> usize {
     let logical_field_id = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
     let projections = vec![Projection::from(logical_field_id)];
     // Build AND of two contains predicates; planner should fuse these into a single run
     let filter = Expr::And(vec![
         Expr::Pred(Filter {
             field_id: FIELD_ID,
-            op: Operator::contains("needle", true),
+            op: Operator::contains("needle", scenario.contains_case_sensitive),
         }),
         Expr::Pred(Filter {
             field_id: FIELD_ID,
-            op: Operator::starts_with("row-", true),
+            op: Operator::starts_with("row-", scenario.starts_with_case_sensitive),
         }),
     ]);
 
@@ -87,15 +118,19 @@ fn bench_planner_fused(table: &Table) -> usize {
     found
 }
 
-fn bench_sequential_store(table: &Table) -> usize {
+fn run_store_sequential(table: &Table, scenario: Scenario) -> usize {
     use llkv_column_map::store::scan::filter::Utf8Filter;
     let lf = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
-    let p1 =
-        llkv_expr::typed_predicate::build_var_width_predicate(&Operator::contains("needle", true))
-            .unwrap();
-    let p2 =
-        llkv_expr::typed_predicate::build_var_width_predicate(&Operator::starts_with("row-", true))
-            .unwrap();
+    let p1 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::contains(
+        "needle",
+        scenario.contains_case_sensitive,
+    ))
+    .unwrap();
+    let p2 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::starts_with(
+        "row-",
+        scenario.starts_with_case_sensitive,
+    ))
+    .unwrap();
     let ids1 = table
         .store()
         .filter_row_ids::<Utf8Filter<i32>>(lf, &p1)
@@ -122,27 +157,53 @@ fn bench_sequential_store(table: &Table) -> usize {
     out.len()
 }
 
+fn run_store_fused(table: &Table, scenario: Scenario) -> usize {
+    let lf = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
+    let p1 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::contains(
+        "needle",
+        scenario.contains_case_sensitive,
+    ))
+    .unwrap();
+    let p2 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::starts_with(
+        "row-",
+        scenario.starts_with_case_sensitive,
+    ))
+    .unwrap();
+    let preds = vec![p1, p2];
+    <llkv_column_map::store::scan::filter::Utf8Filter<i32> as llkv_column_map::store::scan::filter::FilterDispatch>::run_fused(
+        table.store(),
+        lf,
+        &preds,
+    )
+    .expect("fused run")
+    .len()
+}
+
 fn bench_fused_vs_sequential(c: &mut Criterion) {
     let table = setup_table();
 
     let mut group = c.benchmark_group("string_substring_fused_vs_sequential");
     group.sample_size(20);
 
-    group.bench_function("planner_fused_scan", |b| {
-        b.iter(|| {
-            let n = bench_planner_fused(&table);
-            assert_eq!(n, NUM_ROWS / 1000);
-            black_box(n);
-        })
-    });
+    for scenario in SCENARIOS {
+        let fused_label = format!("planner_fused_{}", scenario.name);
+        group.bench_function(fused_label, |b| {
+            b.iter(|| {
+                let n = bench_planner_fused(&table, scenario);
+                assert_eq!(n, EXPECTED_MATCHES);
+                black_box(n);
+            })
+        });
 
-    group.bench_function("sequential_two_scans", |b| {
-        b.iter(|| {
-            let n = bench_sequential_store(&table);
-            assert_eq!(n, NUM_ROWS / 1000);
-            black_box(n);
-        })
-    });
+        let seq_label = format!("store_sequential_{}", scenario.name);
+        group.bench_function(seq_label, |b| {
+            b.iter(|| {
+                let n = run_store_sequential(&table, scenario);
+                assert_eq!(n, EXPECTED_MATCHES);
+                black_box(n);
+            })
+        });
+    }
 
     group.finish();
 
@@ -150,58 +211,25 @@ fn bench_fused_vs_sequential(c: &mut Criterion) {
     let mut group2 = c.benchmark_group("string_substring_storage_only");
     group2.sample_size(20);
 
-    group2.bench_function("storage_fused_run", |b| {
-        b.iter(|| {
-            // Build predicates and call fused dispatch directly
-            let lf = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
-            let p1 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::contains("needle", true)).unwrap();
-            let p2 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::starts_with("row-", true)).unwrap();
-            let preds = vec![p1.clone(), p2.clone()];
-            let ids = <llkv_column_map::store::scan::filter::Utf8Filter<i32> as llkv_column_map::store::scan::filter::FilterDispatch>::run_fused(table.store(), lf, &preds).expect("fused");
-            assert_eq!(ids.len(), NUM_ROWS / 1000);
-            black_box(ids.len());
-        })
-    });
+    for scenario in SCENARIOS {
+        let fused_label = format!("storage_fused_{}", scenario.name);
+        group2.bench_function(fused_label, |b| {
+            b.iter(|| {
+                let n = run_store_fused(&table, scenario);
+                assert_eq!(n, EXPECTED_MATCHES);
+                black_box(n);
+            })
+        });
 
-    group2.bench_function("storage_sequential_two_runs", |b| {
-        b.iter(|| {
-            use llkv_column_map::store::scan::filter::Utf8Filter;
-            let lf = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
-            let p1 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::contains(
-                "needle", true,
-            ))
-            .unwrap();
-            let p2 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::starts_with(
-                "row-", true,
-            ))
-            .unwrap();
-            let ids1 = table
-                .store()
-                .filter_row_ids::<Utf8Filter<i32>>(lf, &p1)
-                .expect("ids1");
-            let ids2 = table
-                .store()
-                .filter_row_ids::<Utf8Filter<i32>>(lf, &p2)
-                .expect("ids2");
-            // intersect
-            let mut i = 0usize;
-            let mut j = 0usize;
-            let mut out = Vec::new();
-            while i < ids1.len() && j < ids2.len() {
-                match ids1[i].cmp(&ids2[j]) {
-                    std::cmp::Ordering::Less => i += 1,
-                    std::cmp::Ordering::Greater => j += 1,
-                    std::cmp::Ordering::Equal => {
-                        out.push(ids1[i]);
-                        i += 1;
-                        j += 1;
-                    }
-                }
-            }
-            assert_eq!(out.len(), NUM_ROWS / 1000);
-            black_box(out.len());
-        })
-    });
+        let seq_label = format!("storage_sequential_{}", scenario.name);
+        group2.bench_function(seq_label, |b| {
+            b.iter(|| {
+                let n = run_store_sequential(&table, scenario);
+                assert_eq!(n, EXPECTED_MATCHES);
+                black_box(n);
+            })
+        });
+    }
 
     group2.finish();
 }

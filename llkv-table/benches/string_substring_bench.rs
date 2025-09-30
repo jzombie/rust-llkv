@@ -19,6 +19,7 @@ use llkv_table::table::ScanStreamOptions;
 use llkv_table::types::FieldId;
 
 const NUM_ROWS: usize = 1_000_000;
+const EXPECTED_MATCHES: usize = NUM_ROWS / 1000;
 const TABLE_ID: llkv_table::types::TableId = 42;
 const FIELD_ID: FieldId = 1_001;
 
@@ -59,12 +60,12 @@ fn setup_table() -> Table {
     table
 }
 
-fn bench_substring_scan(table: &Table) -> usize {
+fn bench_substring_scan(table: &Table, case_sensitive: bool) -> usize {
     let logical_field_id = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
     let projections = vec![Projection::from(logical_field_id)];
     let filter = Expr::Pred(Filter {
         field_id: FIELD_ID,
-        op: Operator::contains("needle", true),
+        op: Operator::contains("needle", case_sensitive),
     });
 
     let mut found = 0usize;
@@ -88,11 +89,18 @@ fn bench_string_substring(c: &mut Criterion) {
     let mut group = c.benchmark_group("string_substring_search");
     group.sample_size(20);
 
-    group.bench_function("scan_contains_needle", |b| {
+    group.bench_function("scan_contains_needle_case_sensitive", |b| {
         b.iter(|| {
-            let n = bench_substring_scan(&table);
-            // We expect roughly NUM_ROWS / 1000 matches
-            assert_eq!(n, NUM_ROWS / 1000);
+            let n = bench_substring_scan(&table, true);
+            assert_eq!(n, EXPECTED_MATCHES);
+            black_box(n);
+        })
+    });
+
+    group.bench_function("scan_contains_needle_case_insensitive", |b| {
+        b.iter(|| {
+            let n = bench_substring_scan(&table, false);
+            assert_eq!(n, EXPECTED_MATCHES);
             black_box(n);
         })
     });
