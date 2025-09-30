@@ -32,7 +32,7 @@ fn write_sample_csv_with_nulls() -> NamedTempFile {
     .unwrap();
     writeln!(tmp, "0,10,1.5,hello,true,2024-01-01,anchor").unwrap();
     writeln!(tmp, "1,,2.5,,false,2024-01-02,anchor").unwrap();
-    writeln!(tmp, "2,30,,world,true,,anchor").unwrap();
+    writeln!(tmp, "2,30,,world,,,anchor").unwrap();
     tmp
 }
 
@@ -243,6 +243,6 @@ fn csv_append_preserves_nulls() {
         texts,
         vec![Some("hello".to_string()), None, Some("world".to_string())]
     );
-    assert_eq!(bools, vec![Some(true), Some(false), Some(true)]);
+    assert_eq!(bools, vec![Some(true), Some(false), None]);
     assert_eq!(dates, vec![Some(19723), Some(19724), None]);
 }
