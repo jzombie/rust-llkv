@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-    GenericStringArray, Int8Array, Int16Array, Int32Array, Int64Array, OffsetSizeTrait,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    GenericStringArray, Int8Array, Int16Array, Int32Array, Int64Array, OffsetSizeTrait, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::error::Result as ArrowResult;

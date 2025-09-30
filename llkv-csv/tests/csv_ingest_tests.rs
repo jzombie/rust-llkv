@@ -44,9 +44,9 @@ fn csv_append_roundtrip() {
     let projections = vec![
         Projection::from(LogicalFieldId::for_user(table.table_id(), 1)),
         Projection::from(LogicalFieldId::for_user(table.table_id(), 2)),
-    Projection::from(LogicalFieldId::for_user(table.table_id(), 3)),
-    Projection::from(LogicalFieldId::for_user(table.table_id(), 4)),
-    Projection::from(LogicalFieldId::for_user(table.table_id(), 5)),
+        Projection::from(LogicalFieldId::for_user(table.table_id(), 3)),
+        Projection::from(LogicalFieldId::for_user(table.table_id(), 4)),
+        Projection::from(LogicalFieldId::for_user(table.table_id(), 5)),
     ];
 
     let filter_all_rows = Expr::Pred(Filter {

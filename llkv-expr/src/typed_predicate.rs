@@ -302,9 +302,7 @@ fn parse_bool_bound(bound: &Bound<Literal>) -> Result<Option<Bound<bool>>, Predi
     })
 }
 
-pub fn build_bool_predicate(
-    op: &Operator<'_>,
-) -> Result<Predicate<bool>, PredicateBuildError> {
+pub fn build_bool_predicate(op: &Operator<'_>) -> Result<Predicate<bool>, PredicateBuildError> {
     match op {
         Operator::Equals(lit) => Ok(Predicate::Equals(
             literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
@@ -327,14 +325,16 @@ pub fn build_bool_predicate(
             if lb.is_none() && ub.is_none() {
                 Ok(Predicate::All)
             } else {
-                Ok(Predicate::Range { lower: lb, upper: ub })
+                Ok(Predicate::Range {
+                    lower: lb,
+                    upper: ub,
+                })
             }
         }
         Operator::In(values) => {
             let mut natives = Vec::with_capacity(values.len());
             for lit in *values {
-                natives
-                    .push(literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?);
+                natives.push(literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?);
             }
             Ok(Predicate::In(natives))
         }

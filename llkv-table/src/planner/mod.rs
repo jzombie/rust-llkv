@@ -1343,8 +1343,9 @@ where
         T: FilterPrimitive<Native = <T as ArrowPrimitiveType>::Native> + ArrowPrimitiveType,
         <T as ArrowPrimitiveType>::Native: FromLiteral + Copy + PredicateValue,
     {
-        let mut preds: Vec<llkv_expr::typed_predicate::Predicate<<T as ArrowPrimitiveType>::Native>> =
-            Vec::with_capacity(ops.len());
+        let mut preds: Vec<
+            llkv_expr::typed_predicate::Predicate<<T as ArrowPrimitiveType>::Native>,
+        > = Vec::with_capacity(ops.len());
         for op in ops {
             let p = build_fixed_width_predicate::<T>(op).map_err(Error::predicate_build)?;
             preds.push(p);

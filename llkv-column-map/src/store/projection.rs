@@ -816,12 +816,10 @@ where
             }
         }
 
-        if !allow_missing {
-            if found.iter().any(|f| !*f) {
-                return Err(Error::Internal(
-                    "gather_rows_multi: one or more requested row IDs were not found".into(),
-                ));
-            }
+        if !allow_missing && found.iter().any(|f| !*f) {
+            return Err(Error::Internal(
+                "gather_rows_multi: one or more requested row IDs were not found".into(),
+            ));
         }
 
         let array = BooleanArray::from(values);
@@ -1126,14 +1124,14 @@ where
 
         let mut values: Vec<Option<bool>> = vec![None; len];
         for (out_idx, row_scratch_item) in row_scratch.iter().take(len).enumerate() {
-            if let Some((chunk_idx, value_idx)) = row_scratch_item {
-                if let Some(&slot) = chunk_lookup.get(chunk_idx) {
-                    let (_idx, value_arr, _) = &candidates[slot];
-                    if value_arr.is_null(*value_idx) {
-                        values[out_idx] = None;
-                    } else {
-                        values[out_idx] = Some(value_arr.value(*value_idx));
-                    }
+            if let Some((chunk_idx, value_idx)) = row_scratch_item
+                && let Some(&slot) = chunk_lookup.get(chunk_idx)
+            {
+                let (_idx, value_arr, _) = &candidates[slot];
+                if value_arr.is_null(*value_idx) {
+                    values[out_idx] = None;
+                } else {
+                    values[out_idx] = Some(value_arr.value(*value_idx));
                 }
             }
         }

@@ -51,9 +51,9 @@ fn convert_row_id(array: &ArrayRef) -> LlkvResult<ArrayRef> {
 
 fn ensure_supported_type(data_type: &DataType, column: &str) -> LlkvResult<()> {
     llkv_column_map::ensure_supported_arrow_type(data_type).map_err(|err| match err {
-        Error::InvalidArgumentError(msg) => Error::InvalidArgumentError(format!(
-            "column '{column}': {msg}"
-        )),
+        Error::InvalidArgumentError(msg) => {
+            Error::InvalidArgumentError(format!("column '{column}': {msg}"))
+        }
         other => other,
     })
 }
@@ -115,12 +115,12 @@ where
     C: AsRef<Path>,
 {
     let csv_path_ref = csv_path.as_ref();
-    let (schema, mut reader) = open_csv_reader(csv_path_ref, csv_options)
+    let (schema, reader) = open_csv_reader(csv_path_ref, csv_options)
         .map_err(|err| Error::Internal(format!("failed to open CSV: {err}")))?;
 
     let (schema_with_metadata, row_id_index) = build_schema_with_metadata(&schema, field_mapping)?;
 
-    while let Some(batch_result) = reader.next() {
+    for batch_result in reader {
         let batch = batch_result
             .map_err(|err| Error::Internal(format!("failed to read CSV batch: {err}")))?;
 
@@ -128,7 +128,7 @@ where
             continue;
         }
 
-        let mut columns: Vec<ArrayRef> = batch.columns().iter().cloned().collect();
+        let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
         let row_id_array = convert_row_id(&columns[row_id_index])?;
         columns[row_id_index] = row_id_array;
 
