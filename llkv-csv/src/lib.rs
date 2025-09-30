@@ -1,115 +1,50 @@
-//! CSV ingest for llkv-table (FS-agnostic).
-//!
-//! Parses CSV rows from any `Read` and batches `Table::insert_many`.
-//! The mapping closure returns an optional `RowPatch<'static>`.
-//! Returning `None` skips that row. Only the example binary should
-//! touch the filesystem.
+use std::error::Error;
+use std::fs::File;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::path::Path;
+use std::sync::Arc;
 
-#![forbid(unsafe_code)]
+use arrow::datatypes::{Field, Schema, DataType};
 
-use csv::{ReaderBuilder, StringRecord};
-use llkv_table::Table;
-use llkv_table::types::RowPatch;
-use std::io::Read;
-
-/// Simple error type for this crate.
-#[derive(Debug)]
-pub enum CsvError {
-    /// CSV parsing failed.
-    Parse,
-}
-
-impl std::fmt::Display for CsvError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CsvError::Parse => write!(f, "csv parse error"),
-        }
-    }
-}
-
-impl std::error::Error for CsvError {}
-
-/// CSV parser configuration.
-#[derive(Clone, Debug)]
-pub struct CsvConfig {
-    /// Field delimiter (default: b',').
-    pub delimiter: u8,
-    /// Whether the first row is headers.
-    pub has_headers: bool,
-    /// Batch size for grouped inserts to `insert_many`.
-    pub insert_batch: usize,
-}
-
-impl Default for CsvConfig {
-    fn default() -> Self {
-        Self {
-            delimiter: b',',
-            has_headers: true,
-            insert_batch: 8192,
-        }
-    }
-}
-
-/// CSV stream bound to a generic reader.
-pub struct CsvSource<R: Read> {
-    rdr: csv::Reader<R>,
-}
-
-impl<R: Read> CsvSource<R> {
-    /// Build a CSV source from any `Read` using `CsvConfig`.
-    pub fn from_reader(reader: R, cfg: &CsvConfig) -> Self {
-        let rdr = ReaderBuilder::new()
-            .has_headers(cfg.has_headers)
-            .delimiter(cfg.delimiter)
-            .flexible(true)
-            .from_reader(reader);
-        Self { rdr }
-    }
-
-    /// Stream `StringRecord`s from the underlying reader.
-    pub fn records(&mut self) -> csv::StringRecordsIter<'_, R> {
-        self.rdr.records()
-    }
-}
-
-/// Stream CSV rows into a `Table` using a mapping closure.
+/// Infer a simple Arrow schema from the first line (header) of a CSV file.
 ///
-/// The `map` closure converts each CSV record into an optional
-/// `RowPatch<'static>`. Return `None` to skip malformed rows.
-/// Insertions are batched; the last partial batch is flushed at end.
-pub fn load_into_table<R, F>(
-    reader: R,
-    cfg: &CsvConfig,
-    table: &Table,
-    mut map: F,
-) -> Result<(), CsvError>
-where
-    R: Read,
-    F: FnMut(StringRecord) -> Option<RowPatch<'static>>,
-{
-    let mut src = CsvSource::from_reader(reader, cfg);
+/// This builds a Schema where every column in the header is assigned DataType::Utf8
+/// and is nullable. This is small, deterministic, and useful for quick validation tests.
+pub fn infer_schema_from_header(path: &Path) -> Result<Arc<Schema>, Box<dyn Error>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
 
-    // Only batch-sized buffering. Never loads the whole file.
-    let mut buf: Vec<RowPatch<'static>> = Vec::with_capacity(cfg.insert_batch);
+    let mut header_line = String::new();
+    let _ = reader.read_line(&mut header_line)?;
+    let header_line = header_line.trim_end_matches(['\n', '\r'].as_slice());
+    let names: Vec<&str> = header_line.split(',').collect();
 
-    for rec_res in src.records() {
-        let rec = match rec_res {
-            Ok(r) => r,
-            Err(_e) => return Err(CsvError::Parse),
-        };
+    let fields = names
+        .into_iter()
+        .map(|name| Field::new(name, DataType::Utf8, true))
+        .collect::<Vec<Field>>();
 
-        if let Some(row_patch) = map(rec) {
-            buf.push(row_patch);
-            if buf.len() >= cfg.insert_batch {
-                table.insert_many(&buf);
-                buf.clear();
-            }
-        }
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+    use std::io::Write;
+
+    #[test]
+    fn infer_schema_simple_header() {
+        let mut tmp = NamedTempFile::new().expect("create tmp");
+        writeln!(tmp, "a,b,c").unwrap();
+        writeln!(tmp, "1,2,3").unwrap();
+
+        let schema = infer_schema_from_header(tmp.path()).expect("infer");
+        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.field(0).name(), "a");
+        assert_eq!(schema.field(1).name(), "b");
+        assert_eq!(schema.field(2).name(), "c");
+        assert!(matches!(schema.field(0).data_type(), DataType::Utf8));
     }
-
-    if !buf.is_empty() {
-        table.insert_many(&buf);
-    }
-
-    Ok(())
 }

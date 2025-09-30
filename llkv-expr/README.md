@@ -19,6 +19,7 @@ Expressions can be used with [llkv-table](../llkv-table/) for querying.
 - **Ergonomic builders**: `Expr::all_of`, `Expr::any_of`, `Expr::not`
 - **Zero-copy friendly**: operands are borrowed; no implicit allocation or decoding is performed here.
 
+
 ## License
 
 Licensed under the [Apache-2.0 License](../LICENSE).
