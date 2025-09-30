@@ -1,6 +1,6 @@
 use super::*;
 use crate::types::Namespace;
-use arrow::datatypes::{ArrowPrimitiveType, DataType};
+use arrow::datatypes::DataType;
 use rustc_hash::FxHashMap;
 
 #[derive(Debug)]
@@ -439,6 +439,24 @@ sorted_visit_float_impl!(
     f32_run,
     FloatOrd32
 );
+sorted_visit_impl!(
+    sorted_visit_bool,
+    sorted_visit_bool_rev,
+    BooleanArray,
+    bool_run
+);
+sorted_visit_impl!(
+    sorted_visit_date64,
+    sorted_visit_date64_rev,
+    Date64Array,
+    date64_run
+);
+sorted_visit_impl!(
+    sorted_visit_date32,
+    sorted_visit_date32_rev,
+    Date32Array,
+    date32_run
+);
 
 // Note: A sorted-with-row-ids variant can be added similarly if needed.
 
@@ -594,6 +612,24 @@ sorted_with_rids_impl!(
     Int8Array,
     i8_run_with_rids
 );
+sorted_with_rids_impl!(
+    sorted_visit_with_rids_bool,
+    sorted_visit_with_rids_bool_rev,
+    BooleanArray,
+    bool_run_with_rids
+);
+sorted_with_rids_impl!(
+    sorted_visit_with_rids_date64,
+    sorted_visit_with_rids_date64_rev,
+    Date64Array,
+    date64_run_with_rids
+);
+sorted_with_rids_impl!(
+    sorted_visit_with_rids_date32,
+    sorted_visit_with_rids_date32_rev,
+    Date32Array,
+    date32_run_with_rids
+);
 
 macro_rules! sorted_with_rids_float_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident, $key:ty) => {
@@ -714,7 +750,7 @@ sorted_with_rids_float_impl!(
     FloatOrd32
 );
 
-pub(crate) trait SortedDispatch: ArrowPrimitiveType {
+pub(crate) trait SortedDispatch {
     fn visit<P, V>(
         pager: &P,
         metas: &[ChunkMetadata],
@@ -990,6 +1026,36 @@ impl_sorted_dispatch!(
     sorted_visit_f32_bounds,
     sorted_visit_with_rids_f32_bounds,
     f32_r
+);
+impl_sorted_dispatch!(
+    arrow::datatypes::BooleanType,
+    sorted_visit_bool,
+    sorted_visit_bool_rev,
+    sorted_visit_with_rids_bool,
+    sorted_visit_with_rids_bool_rev,
+    sorted_visit_bool_bounds,
+    sorted_visit_with_rids_bool_bounds,
+    bool_r
+);
+impl_sorted_dispatch!(
+    arrow::datatypes::Date64Type,
+    sorted_visit_date64,
+    sorted_visit_date64_rev,
+    sorted_visit_with_rids_date64,
+    sorted_visit_with_rids_date64_rev,
+    sorted_visit_date64_bounds,
+    sorted_visit_with_rids_date64_bounds,
+    i64_r
+);
+impl_sorted_dispatch!(
+    arrow::datatypes::Date32Type,
+    sorted_visit_date32,
+    sorted_visit_date32_rev,
+    sorted_visit_with_rids_date32,
+    sorted_visit_with_rids_date32_rev,
+    sorted_visit_date32_bounds,
+    sorted_visit_with_rids_date32_bounds,
+    i32_r
 );
 
 macro_rules! sorted_visit_bounds_impl {
@@ -1347,6 +1413,9 @@ sorted_visit_bounds_impl!(sorted_visit_i64_bounds, Int64Array, i64, i64_run);
 sorted_visit_bounds_impl!(sorted_visit_i32_bounds, Int32Array, i32, i32_run);
 sorted_visit_bounds_impl!(sorted_visit_i16_bounds, Int16Array, i16, i16_run);
 sorted_visit_bounds_impl!(sorted_visit_i8_bounds, Int8Array, i8, i8_run);
+sorted_visit_bounds_impl!(sorted_visit_bool_bounds, BooleanArray, bool, bool_run);
+sorted_visit_bounds_impl!(sorted_visit_date64_bounds, Date64Array, i64, date64_run);
+sorted_visit_bounds_impl!(sorted_visit_date32_bounds, Date32Array, i32, date32_run);
 sorted_visit_float_bounds_impl!(
     sorted_visit_f64_bounds,
     Float64Array,
@@ -1409,6 +1478,24 @@ sorted_with_rids_bounds_impl!(
     Int8Array,
     i8,
     i8_run_with_rids
+);
+sorted_with_rids_bounds_impl!(
+    sorted_visit_with_rids_bool_bounds,
+    BooleanArray,
+    bool,
+    bool_run_with_rids
+);
+sorted_with_rids_bounds_impl!(
+    sorted_visit_with_rids_date64_bounds,
+    Date64Array,
+    i64,
+    date64_run_with_rids
+);
+sorted_with_rids_bounds_impl!(
+    sorted_visit_with_rids_date32_bounds,
+    Date32Array,
+    i32,
+    date32_run_with_rids
 );
 sorted_with_rids_float_bounds_impl!(
     sorted_visit_with_rids_f64_bounds,

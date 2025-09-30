@@ -326,6 +326,13 @@ where
                     &mut chunk_map,
                     allow_missing,
                 ),
+                DataType::Boolean => Self::gather_rows_single_shot_bool(
+                    &row_index,
+                    row_ids.len(),
+                    plan,
+                    &mut chunk_map,
+                    allow_missing,
+                ),
                 other => with_integer_arrow_type!(
                     other.clone(),
                     |ArrowTy| {
@@ -577,6 +584,16 @@ where
                         &mut row_scratch,
                         allow_missing,
                     ),
+                    DataType::Boolean => Self::gather_rows_from_chunks_bool(
+                        row_ids,
+                        row_locator,
+                        len,
+                        &plan.candidate_indices,
+                        plan,
+                        ctx.chunk_cache(),
+                        &mut row_scratch,
+                        allow_missing,
+                    ),
                     other => with_integer_arrow_type!(
                         other.clone(),
                         |ArrowTy| {
@@ -746,6 +763,69 @@ where
         }
 
         Ok(Arc::new(builder.finish()) as ArrayRef)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gather_rows_single_shot_bool(
+        row_index: &FxHashMap<u64, usize>,
+        len: usize,
+        plan: &FieldPlan,
+        chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
+        allow_missing: bool,
+    ) -> Result<ArrayRef> {
+        if len == 0 {
+            let empty = BooleanArray::from(Vec::<bool>::new());
+            return Ok(Arc::new(empty) as ArrayRef);
+        }
+
+        let mut values: Vec<Option<bool>> = vec![None; len];
+        let mut found: Vec<bool> = vec![false; len];
+
+        for &idx in &plan.candidate_indices {
+            let value_chunk = chunk_blobs
+                .remove(&plan.value_metas[idx].chunk_pk)
+                .ok_or(Error::NotFound)?;
+            let row_chunk = chunk_blobs
+                .remove(&plan.row_metas[idx].chunk_pk)
+                .ok_or(Error::NotFound)?;
+
+            let value_any = deserialize_array(value_chunk)?;
+            let value_arr = value_any
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
+            let row_any = deserialize_array(row_chunk)?;
+            let row_arr = row_any
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
+
+            for i in 0..row_arr.len() {
+                if !row_arr.is_valid(i) {
+                    continue;
+                }
+                let row_id = row_arr.value(i);
+                if let Some(&out_idx) = row_index.get(&row_id) {
+                    found[out_idx] = true;
+                    if value_arr.is_null(i) {
+                        values[out_idx] = None;
+                    } else {
+                        values[out_idx] = Some(value_arr.value(i));
+                    }
+                }
+            }
+        }
+
+        if !allow_missing {
+            if found.iter().any(|f| !*f) {
+                return Err(Error::Internal(
+                    "gather_rows_multi: one or more requested row IDs were not found".into(),
+                ));
+            }
+        }
+
+        let array = BooleanArray::from(values);
+        Ok(Arc::new(array) as ArrayRef)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -950,6 +1030,116 @@ where
         }
 
         Ok(Arc::new(builder.finish()) as ArrayRef)
+    }
+
+    #[allow(clippy::too_many_arguments)] // TODO: Refactor
+    fn gather_rows_from_chunks_bool(
+        row_ids: &[u64],
+        row_locator: RowLocator,
+        len: usize,
+        candidate_indices: &[usize],
+        plan: &FieldPlan,
+        chunk_arrays: &FxHashMap<PhysicalKey, ArrayRef>,
+        row_scratch: &mut [Option<(usize, usize)>],
+        allow_missing: bool,
+    ) -> Result<ArrayRef> {
+        if len == 0 {
+            let empty = BooleanArray::from(Vec::<bool>::new());
+            return Ok(Arc::new(empty) as ArrayRef);
+        }
+
+        if candidate_indices.len() == 1 {
+            let chunk_idx = candidate_indices[0];
+            let value_any = chunk_arrays
+                .get(&plan.value_metas[chunk_idx].chunk_pk)
+                .ok_or(Error::NotFound)?;
+            let row_any = chunk_arrays
+                .get(&plan.row_metas[chunk_idx].chunk_pk)
+                .ok_or(Error::NotFound)?;
+            let _value_arr = value_any
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
+            let row_arr = row_any
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
+
+            if row_arr.null_count() == 0 && row_ids.windows(2).all(|w| w[0] <= w[1]) {
+                let values = row_arr.values();
+                if let Ok(start_idx) = values.binary_search(&row_ids[0])
+                    && start_idx + len <= values.len()
+                    && row_ids == &values[start_idx..start_idx + len]
+                {
+                    return Ok(value_any.slice(start_idx, len));
+                }
+            }
+        }
+
+        for slot in row_scratch.iter_mut().take(len) {
+            *slot = None;
+        }
+
+        let mut candidates: Vec<(usize, &BooleanArray, &UInt64Array)> =
+            Vec::with_capacity(candidate_indices.len());
+        let mut chunk_lookup: FxHashMap<usize, usize> = FxHashMap::default();
+
+        for (slot, &chunk_idx) in candidate_indices.iter().enumerate() {
+            let value_any = chunk_arrays
+                .get(&plan.value_metas[chunk_idx].chunk_pk)
+                .ok_or(Error::NotFound)?;
+            let value_arr = value_any
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
+            let row_any = chunk_arrays
+                .get(&plan.row_metas[chunk_idx].chunk_pk)
+                .ok_or(Error::NotFound)?;
+            let row_arr = row_any
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
+
+            candidates.push((chunk_idx, value_arr, row_arr));
+            chunk_lookup.insert(chunk_idx, slot);
+
+            for i in 0..row_arr.len() {
+                if !row_arr.is_valid(i) {
+                    continue;
+                }
+                let row_id = row_arr.value(i);
+                if let Some(out_idx) = row_locator.lookup(row_id, len) {
+                    row_scratch[out_idx] = Some((chunk_idx, i));
+                }
+            }
+        }
+
+        if !allow_missing {
+            for slot in row_scratch.iter().take(len) {
+                if slot.is_none() {
+                    return Err(Error::Internal(
+                        "gather_rows_multi: one or more requested row IDs were not found".into(),
+                    ));
+                }
+            }
+        }
+
+        let mut values: Vec<Option<bool>> = vec![None; len];
+        for (out_idx, row_scratch_item) in row_scratch.iter().take(len).enumerate() {
+            if let Some((chunk_idx, value_idx)) = row_scratch_item {
+                if let Some(&slot) = chunk_lookup.get(chunk_idx) {
+                    let (_idx, value_arr, _) = &candidates[slot];
+                    if value_arr.is_null(*value_idx) {
+                        values[out_idx] = None;
+                    } else {
+                        values[out_idx] = Some(value_arr.value(*value_idx));
+                    }
+                }
+            }
+        }
+
+        let array = BooleanArray::from(values);
+        Ok(Arc::new(array) as ArrayRef)
     }
 
     #[allow(clippy::too_many_arguments)] // TODO: Refactor

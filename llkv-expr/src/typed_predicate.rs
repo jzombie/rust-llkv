@@ -290,6 +290,60 @@ where
     }
 }
 
+fn parse_bool_bound(bound: &Bound<Literal>) -> Result<Option<Bound<bool>>, PredicateBuildError> {
+    Ok(match bound {
+        Bound::Unbounded => None,
+        Bound::Included(lit) => Some(Bound::Included(
+            literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
+        )),
+        Bound::Excluded(lit) => Some(Bound::Excluded(
+            literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
+        )),
+    })
+}
+
+pub fn build_bool_predicate(
+    op: &Operator<'_>,
+) -> Result<Predicate<bool>, PredicateBuildError> {
+    match op {
+        Operator::Equals(lit) => Ok(Predicate::Equals(
+            literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
+        )),
+        Operator::GreaterThan(lit) => Ok(Predicate::GreaterThan(
+            literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
+        )),
+        Operator::GreaterThanOrEquals(lit) => Ok(Predicate::GreaterThanOrEquals(
+            literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
+        )),
+        Operator::LessThan(lit) => Ok(Predicate::LessThan(
+            literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
+        )),
+        Operator::LessThanOrEquals(lit) => Ok(Predicate::LessThanOrEquals(
+            literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
+        )),
+        Operator::Range { lower, upper } => {
+            let lb = parse_bool_bound(lower)?;
+            let ub = parse_bool_bound(upper)?;
+            if lb.is_none() && ub.is_none() {
+                Ok(Predicate::All)
+            } else {
+                Ok(Predicate::Range { lower: lb, upper: ub })
+            }
+        }
+        Operator::In(values) => {
+            let mut natives = Vec::with_capacity(values.len());
+            for lit in *values {
+                natives
+                    .push(literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?);
+            }
+            Ok(Predicate::In(natives))
+        }
+        _ => Err(PredicateBuildError::UnsupportedOperator(
+            "operator lacks boolean literal support",
+        )),
+    }
+}
+
 fn parse_string_bound(
     bound: &Bound<Literal>,
 ) -> Result<Option<Bound<String>>, PredicateBuildError> {

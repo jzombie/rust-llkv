@@ -5,7 +5,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, OffsetSizeTrait, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
 use llkv_column_map::ScanBuilder;
 use llkv_column_map::llkv_for_each_arrow_numeric;
@@ -16,7 +16,7 @@ use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::{
-    PredicateValue, build_fixed_width_predicate, build_var_width_predicate,
+    PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
 };
 use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
@@ -996,6 +996,9 @@ where
                             DataType::LargeUtf8 => {
                                 self.collect_matching_row_ids_string_fused::<i64>(filter_lfid, &ops)
                             }
+                            DataType::Boolean => {
+                                self.collect_matching_row_ids_bool_fused(filter_lfid, &ops)
+                            }
                             other => llkv_column_map::with_integer_arrow_type!(
                                 other.clone(),
                                 |ArrowTy| self
@@ -1078,6 +1081,7 @@ where
             DataType::LargeUtf8 => {
                 self.collect_matching_row_ids_string::<i64>(filter_lfid, &filter.op)
             }
+            DataType::Boolean => self.collect_matching_row_ids_bool(filter_lfid, &filter.op),
             other => llkv_column_map::with_integer_arrow_type!(
                 other.clone(),
                 |ArrowTy| self.collect_matching_row_ids::<ArrowTy>(filter_lfid, &filter.op),
@@ -1253,8 +1257,8 @@ where
         op: &Operator<'_>,
     ) -> LlkvResult<Vec<u64>>
     where
-        T: FilterPrimitive,
-        T::Native: FromLiteral + Copy + PredicateValue,
+        T: FilterPrimitive<Native = <T as ArrowPrimitiveType>::Native> + ArrowPrimitiveType,
+        <T as ArrowPrimitiveType>::Native: FromLiteral + Copy + PredicateValue,
     {
         let predicate = build_fixed_width_predicate::<T>(op).map_err(Error::predicate_build)?;
         self.table.store().filter_row_ids::<T>(field_id, &predicate)
@@ -1300,16 +1304,46 @@ where
         Ok(fused)
     }
 
+    fn collect_matching_row_ids_bool(
+        &self,
+        field_id: LogicalFieldId,
+        op: &Operator<'_>,
+    ) -> LlkvResult<Vec<u64>> {
+        let predicate = build_bool_predicate(op).map_err(Error::predicate_build)?;
+        self.table
+            .store()
+            .filter_row_ids::<arrow::datatypes::BooleanType>(field_id, &predicate)
+    }
+
+    fn collect_matching_row_ids_bool_fused(
+        &self,
+        field_id: LogicalFieldId,
+        ops: &[Operator<'_>],
+    ) -> LlkvResult<Vec<u64>> {
+        let mut preds: Vec<llkv_expr::typed_predicate::Predicate<bool>> =
+            Vec::with_capacity(ops.len());
+        for op in ops {
+            let p = build_bool_predicate(op).map_err(Error::predicate_build)?;
+            preds.push(p);
+        }
+        let fused = <arrow::datatypes::BooleanType as llkv_column_map::store::scan::filter::FilterDispatch>::run_fused(
+            self.table.store(),
+            field_id,
+            &preds,
+        )?;
+        Ok(fused)
+    }
+
     fn collect_matching_row_ids_fused<T>(
         &self,
         field_id: LogicalFieldId,
         ops: &[Operator<'_>],
     ) -> LlkvResult<Vec<u64>>
     where
-        T: FilterPrimitive,
-        T::Native: FromLiteral + Copy + PredicateValue,
+        T: FilterPrimitive<Native = <T as ArrowPrimitiveType>::Native> + ArrowPrimitiveType,
+        <T as ArrowPrimitiveType>::Native: FromLiteral + Copy + PredicateValue,
     {
-        let mut preds: Vec<llkv_expr::typed_predicate::Predicate<T::Native>> =
+        let mut preds: Vec<llkv_expr::typed_predicate::Predicate<<T as ArrowPrimitiveType>::Native>> =
             Vec::with_capacity(ops.len());
         for op in ops {
             let p = build_fixed_width_predicate::<T>(op).map_err(Error::predicate_build)?;
