@@ -54,11 +54,11 @@ fn fused_equals_sequential_string_contains() {
     // Two contains predicates on same field
     let pred1 = Expr::Pred(Filter {
         field_id: FIELD,
-        op: Operator::Contains("needle"),
+        op: Operator::contains("needle", true),
     });
     let pred2 = Expr::Pred(Filter {
         field_id: FIELD,
-        op: Operator::StartsWith("row-1"),
+        op: Operator::starts_with("row-1", true),
     });
 
     // Fused: planner should detect AND of same-field preds
@@ -81,10 +81,13 @@ fn fused_equals_sequential_string_contains() {
     // Sequential: run two single-predicate scans and intersect row ids
     use llkv_column_map::store::scan::filter::Utf8Filter;
     let lf = LogicalFieldId::for_user(table.table_id(), FIELD);
-    let p1 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::Contains("needle"))
-        .unwrap();
-    let p2 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::StartsWith("row-1"))
-        .unwrap();
+    let p1 =
+        llkv_expr::typed_predicate::build_var_width_predicate(&Operator::contains("needle", true))
+            .unwrap();
+    let p2 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::starts_with(
+        "row-1", true,
+    ))
+    .unwrap();
     let ids1 = table
         .store()
         .filter_row_ids::<Utf8Filter<i32>>(lf, &p1)

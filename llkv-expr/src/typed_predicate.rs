@@ -17,16 +17,16 @@ pub trait PredicateValue: Clone {
     fn borrowed(value: &Self) -> &Self::Borrowed<'_>;
     fn equals(value: &Self::Borrowed<'_>, target: &Self) -> bool;
     fn compare(value: &Self::Borrowed<'_>, target: &Self) -> Option<Ordering>;
-    fn contains(value: &Self::Borrowed<'_>, target: &Self) -> bool {
-        let _ = (value, target);
+    fn contains(value: &Self::Borrowed<'_>, target: &Self, case_sensitive: bool) -> bool {
+        let _ = (value, target, case_sensitive);
         false
     }
-    fn starts_with(value: &Self::Borrowed<'_>, target: &Self) -> bool {
-        let _ = (value, target);
+    fn starts_with(value: &Self::Borrowed<'_>, target: &Self, case_sensitive: bool) -> bool {
+        let _ = (value, target, case_sensitive);
         false
     }
-    fn ends_with(value: &Self::Borrowed<'_>, target: &Self) -> bool {
-        let _ = (value, target);
+    fn ends_with(value: &Self::Borrowed<'_>, target: &Self, case_sensitive: bool) -> bool {
+        let _ = (value, target, case_sensitive);
         false
     }
 }
@@ -47,9 +47,18 @@ where
         upper: Option<Bound<V>>,
     },
     In(Vec<V>),
-    StartsWith(V),
-    EndsWith(V),
-    Contains(V),
+    StartsWith {
+        pattern: V,
+        case_sensitive: bool,
+    },
+    EndsWith {
+        pattern: V,
+        case_sensitive: bool,
+    },
+    Contains {
+        pattern: V,
+        case_sensitive: bool,
+    },
 }
 
 impl<V> Predicate<V>
@@ -110,9 +119,18 @@ where
                 true
             }
             Predicate::In(values) => values.iter().any(|target| V::equals(value, target)),
-            Predicate::StartsWith(target) => V::starts_with(value, target),
-            Predicate::EndsWith(target) => V::ends_with(value, target),
-            Predicate::Contains(target) => V::contains(value, target),
+            Predicate::StartsWith {
+                pattern,
+                case_sensitive,
+            } => V::starts_with(value, pattern, *case_sensitive),
+            Predicate::EndsWith {
+                pattern,
+                case_sensitive,
+            } => V::ends_with(value, pattern, *case_sensitive),
+            Predicate::Contains {
+                pattern,
+                case_sensitive,
+            } => V::contains(value, pattern, *case_sensitive),
         }
     }
 }
@@ -159,16 +177,28 @@ impl PredicateValue for String {
         Some(value.cmp(target.as_str()))
     }
 
-    fn contains(value: &Self::Borrowed<'_>, target: &Self) -> bool {
-        value.contains(target.as_str())
+    fn contains(value: &Self::Borrowed<'_>, target: &Self, case_sensitive: bool) -> bool {
+        if case_sensitive {
+            value.contains(target.as_str())
+        } else {
+            value.to_lowercase().contains(&target.to_lowercase())
+        }
     }
 
-    fn starts_with(value: &Self::Borrowed<'_>, target: &Self) -> bool {
-        value.starts_with(target.as_str())
+    fn starts_with(value: &Self::Borrowed<'_>, target: &Self, case_sensitive: bool) -> bool {
+        if case_sensitive {
+            value.starts_with(target.as_str())
+        } else {
+            value.to_lowercase().starts_with(&target.to_lowercase())
+        }
     }
 
-    fn ends_with(value: &Self::Borrowed<'_>, target: &Self) -> bool {
-        value.ends_with(target.as_str())
+    fn ends_with(value: &Self::Borrowed<'_>, target: &Self, case_sensitive: bool) -> bool {
+        if case_sensitive {
+            value.ends_with(target.as_str())
+        } else {
+            value.to_lowercase().ends_with(&target.to_lowercase())
+        }
     }
 }
 
@@ -312,9 +342,27 @@ pub fn build_var_width_predicate(
             }
             Ok(Predicate::In(out))
         }
-        Operator::StartsWith(prefix) => Ok(Predicate::StartsWith(prefix.to_string())),
-        Operator::EndsWith(suffix) => Ok(Predicate::EndsWith(suffix.to_string())),
-        Operator::Contains(substr) => Ok(Predicate::Contains(substr.to_string())),
+        Operator::StartsWith {
+            pattern,
+            case_sensitive,
+        } => Ok(Predicate::StartsWith {
+            pattern: pattern.to_string(),
+            case_sensitive: *case_sensitive,
+        }),
+        Operator::EndsWith {
+            pattern,
+            case_sensitive,
+        } => Ok(Predicate::EndsWith {
+            pattern: pattern.to_string(),
+            case_sensitive: *case_sensitive,
+        }),
+        Operator::Contains {
+            pattern,
+            case_sensitive,
+        } => Ok(Predicate::Contains {
+            pattern: pattern.to_string(),
+            case_sensitive: *case_sensitive,
+        }),
     }
 }
 
@@ -360,7 +408,7 @@ mod tests {
 
     #[test]
     fn unsupported_operator_errors() {
-        let op = Operator::StartsWith("foo");
+        let op = Operator::starts_with("foo", true);
         let err = build_fixed_width_predicate::<arrow::datatypes::UInt32Type>(&op).unwrap_err();
         assert!(matches!(err, PredicateBuildError::UnsupportedOperator(_)));
     }
@@ -417,18 +465,34 @@ mod tests {
         assert!(predicate.matches("x"));
         assert!(!predicate.matches("z"));
 
-        let sw =
-            build_var_width_predicate(&Operator::StartsWith("pre")).expect("starts with predicate");
-        assert!(sw.matches("prefix"));
-        assert!(!sw.matches("post"));
+        let sw_sensitive = build_var_width_predicate(&Operator::starts_with("pre", true))
+            .expect("starts with predicate");
+        assert!(sw_sensitive.matches("prefix"));
+        assert!(!sw_sensitive.matches("Prefix"));
 
-        let ew =
-            build_var_width_predicate(&Operator::EndsWith("suf")).expect("ends with predicate");
-        assert!(ew.matches("endsuf"));
-        assert!(!ew.matches("suffixless"));
+        let sw_insensitive = build_var_width_predicate(&Operator::starts_with("Pre", false))
+            .expect("starts with predicate");
+        assert!(sw_insensitive.matches("prefix"));
+        assert!(sw_insensitive.matches("Prefix"));
 
-        let ct = build_var_width_predicate(&Operator::Contains("mid")).expect("contains predicate");
-        assert!(ct.matches("amidst"));
-        assert!(!ct.matches("edge"));
+        let ew_sensitive = build_var_width_predicate(&Operator::ends_with("suf", true))
+            .expect("ends with predicate");
+        assert!(ew_sensitive.matches("datsuf"));
+        assert!(!ew_sensitive.matches("datSuf"));
+
+        let ew_insensitive = build_var_width_predicate(&Operator::ends_with("SUF", false))
+            .expect("ends with predicate");
+        assert!(ew_insensitive.matches("datsuf"));
+        assert!(ew_insensitive.matches("datSuf"));
+
+        let ct_sensitive = build_var_width_predicate(&Operator::contains("mid", true))
+            .expect("contains predicate");
+        assert!(ct_sensitive.matches("amidst"));
+        assert!(!ct_sensitive.matches("aMidst"));
+
+        let ct_insensitive = build_var_width_predicate(&Operator::contains("MiD", false))
+            .expect("contains predicate");
+        assert!(ct_insensitive.matches("amidst"));
+        assert!(ct_insensitive.matches("aMidst"));
     }
 }

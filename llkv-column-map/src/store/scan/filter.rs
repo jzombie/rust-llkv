@@ -305,8 +305,11 @@ where
         P: Pager<Blob = EntryHandle> + Send + Sync,
     {
         match predicate {
-            Predicate::Contains(fragment) => {
-                run_filter_for_string_contains::<P, O>(store, field_id, fragment.as_str())
+            Predicate::Contains {
+                pattern,
+                case_sensitive,
+            } if *case_sensitive => {
+                run_filter_for_string_contains::<P, O>(store, field_id, pattern.as_str())
             }
             _ => {
                 let predicate = predicate.clone();
@@ -334,7 +337,10 @@ where
         let mut others: Vec<Predicate<String>> = Vec::new();
         for p in predicates {
             match p {
-                Predicate::Contains(s) => contains.push(s.clone()),
+                Predicate::Contains {
+                    pattern,
+                    case_sensitive,
+                } if *case_sensitive => contains.push(pattern.clone()),
                 _ => others.push(p.clone()),
             }
         }

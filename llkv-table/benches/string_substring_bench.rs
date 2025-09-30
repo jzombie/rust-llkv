@@ -64,7 +64,7 @@ fn bench_substring_scan(table: &Table) -> usize {
     let projections = vec![Projection::from(logical_field_id)];
     let filter = Expr::Pred(Filter {
         field_id: FIELD_ID,
-        op: Operator::Contains("needle"),
+        op: Operator::contains("needle", true),
     });
 
     let mut found = 0usize;

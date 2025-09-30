@@ -365,7 +365,7 @@ impl PredicateFusionCache {
             Expr::Pred(filter) => {
                 let entry = self.per_field.entry(filter.field_id).or_default();
                 entry.total += 1;
-                if matches!(filter.op, Operator::Contains(_)) {
+                if matches!(filter.op, Operator::Contains { .. }) {
                     entry.contains += 1;
                 }
             }
@@ -1397,10 +1397,27 @@ fn format_operator(op: &Operator<'_>) -> String {
             let rendered: Vec<String> = values.iter().map(format_literal).collect();
             format!("IN {{{}}}", rendered.join(", "))
         }
-        Operator::StartsWith(prefix) => format!("STARTS WITH \"{}\"", escape_string(prefix)),
-        Operator::EndsWith(suffix) => format!("ENDS WITH \"{}\"", escape_string(suffix)),
-        Operator::Contains(fragment) => format!("CONTAINS \"{}\"", escape_string(fragment)),
+        Operator::StartsWith {
+            pattern,
+            case_sensitive,
+        } => format_pattern_op("STARTS WITH", pattern, *case_sensitive),
+        Operator::EndsWith {
+            pattern,
+            case_sensitive,
+        } => format_pattern_op("ENDS WITH", pattern, *case_sensitive),
+        Operator::Contains {
+            pattern,
+            case_sensitive,
+        } => format_pattern_op("CONTAINS", pattern, *case_sensitive),
     }
+}
+
+fn format_pattern_op(op_name: &str, pattern: &str, case_sensitive: bool) -> String {
+    let mut rendered = format!("{} \"{}\"", op_name, escape_string(pattern));
+    if !case_sensitive {
+        rendered.push_str(" (case-insensitive)");
+    }
+    rendered
 }
 
 fn format_range_bound_lower(bound: &Bound<Literal>) -> String {

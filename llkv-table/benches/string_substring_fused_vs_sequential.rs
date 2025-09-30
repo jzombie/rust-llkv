@@ -65,11 +65,11 @@ fn bench_planner_fused(table: &Table) -> usize {
     let filter = Expr::And(vec![
         Expr::Pred(Filter {
             field_id: FIELD_ID,
-            op: Operator::Contains("needle"),
+            op: Operator::contains("needle", true),
         }),
         Expr::Pred(Filter {
             field_id: FIELD_ID,
-            op: Operator::StartsWith("row-"),
+            op: Operator::starts_with("row-", true),
         }),
     ]);
 
@@ -90,10 +90,12 @@ fn bench_planner_fused(table: &Table) -> usize {
 fn bench_sequential_store(table: &Table) -> usize {
     use llkv_column_map::store::scan::filter::Utf8Filter;
     let lf = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
-    let p1 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::Contains("needle"))
-        .unwrap();
-    let p2 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::StartsWith("row-"))
-        .unwrap();
+    let p1 =
+        llkv_expr::typed_predicate::build_var_width_predicate(&Operator::contains("needle", true))
+            .unwrap();
+    let p2 =
+        llkv_expr::typed_predicate::build_var_width_predicate(&Operator::starts_with("row-", true))
+            .unwrap();
     let ids1 = table
         .store()
         .filter_row_ids::<Utf8Filter<i32>>(lf, &p1)
@@ -152,8 +154,8 @@ fn bench_fused_vs_sequential(c: &mut Criterion) {
         b.iter(|| {
             // Build predicates and call fused dispatch directly
             let lf = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
-            let p1 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::Contains("needle")).unwrap();
-            let p2 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::StartsWith("row-" )).unwrap();
+            let p1 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::contains("needle", true)).unwrap();
+            let p2 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::starts_with("row-", true)).unwrap();
             let preds = vec![p1.clone(), p2.clone()];
             let ids = <llkv_column_map::store::scan::filter::Utf8Filter<i32> as llkv_column_map::store::scan::filter::FilterDispatch>::run_fused(table.store(), lf, &preds).expect("fused");
             assert_eq!(ids.len(), NUM_ROWS / 1000);
@@ -165,12 +167,12 @@ fn bench_fused_vs_sequential(c: &mut Criterion) {
         b.iter(|| {
             use llkv_column_map::store::scan::filter::Utf8Filter;
             let lf = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
-            let p1 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::Contains(
-                "needle",
+            let p1 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::contains(
+                "needle", true,
             ))
             .unwrap();
-            let p2 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::StartsWith(
-                "row-",
+            let p2 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::starts_with(
+                "row-", true,
             ))
             .unwrap();
             let ids1 = table
