@@ -846,6 +846,7 @@ dependencies = [
  "llkv-storage",
  "modular-bitfield",
  "rand",
+ "rayon",
  "roaring",
  "rustc-hash",
  "simd-r-drive-entry-handle",

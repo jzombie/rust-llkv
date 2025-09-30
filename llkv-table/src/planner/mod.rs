@@ -9,6 +9,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use llkv_column_map::ScanBuilder;
 use llkv_column_map::llkv_for_each_arrow_numeric;
+use llkv_column_map::parallel;
 use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::store::scan::ScanOptions;
@@ -23,6 +24,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use llkv_storage::pager::Pager;
+use rayon::prelude::*;
 
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::scalar_eval::{NumericArrayMap, NumericKernels};
@@ -689,73 +691,104 @@ where
             GatherNullPolicy::DropNulls
         };
 
-        let mut gather_ctx = self.table.store().prepare_gather_context(&unique_lfids)?;
-
         let requires_numeric = projection_evals.iter().enumerate().any(|(idx, eval)| {
             matches!(eval, ProjectionEval::Computed(_)) && passthrough_fields[idx].is_none()
         });
 
-        let mut offset = 0usize;
-        while offset < row_ids.len() {
-            let end = cmp::min(offset + STREAM_BATCH_ROWS, row_ids.len());
-            let window = &row_ids[offset..end];
+        let table_id = self.table.table_id();
+        let store = self.table.store();
+        let unique_lfids = Arc::new(unique_lfids);
+        let projection_evals = Arc::new(projection_evals);
+        let passthrough_fields = Arc::new(passthrough_fields);
+        let unique_index = Arc::new(unique_index);
+        let numeric_fields = Arc::new(numeric_fields);
 
-            let batch = self.table.store().gather_rows_with_reusable_context(
-                &mut gather_ctx,
-                window,
-                null_policy,
-            )?;
+        let chunk_ranges: Vec<(usize, usize)> = (0..row_ids.len())
+            .step_by(STREAM_BATCH_ROWS)
+            .map(|start| {
+                let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
+                (start, end)
+            })
+            .collect();
 
-            if batch.num_rows() == 0 {
-                offset = end;
-                continue;
-            }
-
-            let unique_arrays = batch.columns();
-            let numeric_arrays: Option<NumericArrayMap> = if requires_numeric {
-                Some(NumericKernels::prepare_numeric_arrays(
-                    &unique_lfids,
-                    unique_arrays,
-                    &numeric_fields,
-                )?)
-            } else {
-                None
-            };
-
-            let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
-            for (idx, eval) in projection_evals.iter().enumerate() {
-                match eval {
-                    ProjectionEval::Column(info) => {
-                        let arr_idx = *unique_index
-                            .get(&info.logical_field_id)
-                            .expect("logical field id missing from index");
-                        columns.push(Arc::clone(&unique_arrays[arr_idx]));
-                    }
-                    ProjectionEval::Computed(info) => {
-                        if let Some(fid) = passthrough_fields[idx] {
-                            let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
-                            let arr_idx = *unique_index
-                                .get(&lfid)
-                                .expect("passthrough field missing from index");
-                            columns.push(Arc::clone(&unique_arrays[arr_idx]));
-                        } else {
-                            let numeric_arrays = numeric_arrays
-                                .as_ref()
-                                .expect("numeric arrays should exist for computed projection");
-                            let array = NumericKernels::evaluate_batch(
-                                &info.expr,
-                                batch.num_rows(),
-                                numeric_arrays,
-                            )?;
-                            columns.push(array);
+        let chunk_batches: Vec<LlkvResult<Option<RecordBatch>>> =
+            parallel::with_thread_pool(move || {
+                chunk_ranges
+                    .into_par_iter()
+                    .map(|(start, end)| -> LlkvResult<Option<RecordBatch>> {
+                        let window = &row_ids[start..end];
+                        if window.is_empty() {
+                            return Ok(None);
                         }
-                    }
-                }
-            }
 
-            let output_batch = RecordBatch::try_new(out_schema.clone(), columns)?;
-            on_batch(output_batch);
-            offset = end;
+                        let unique_lfids = Arc::clone(&unique_lfids);
+                        let projection_evals = Arc::clone(&projection_evals);
+                        let passthrough_fields = Arc::clone(&passthrough_fields);
+                        let unique_index = Arc::clone(&unique_index);
+                        let numeric_fields = Arc::clone(&numeric_fields);
+
+                        let mut gather_ctx = store.prepare_gather_context(unique_lfids.as_ref())?;
+                        let batch = store.gather_rows_with_reusable_context(
+                            &mut gather_ctx,
+                            window,
+                            null_policy,
+                        )?;
+                        if batch.num_rows() == 0 {
+                            return Ok(None);
+                        }
+
+                        let unique_arrays = batch.columns();
+                        let numeric_arrays: Option<NumericArrayMap> = if requires_numeric {
+                            Some(NumericKernels::prepare_numeric_arrays(
+                                unique_lfids.as_ref(),
+                                unique_arrays,
+                                numeric_fields.as_ref(),
+                            )?)
+                        } else {
+                            None
+                        };
+
+                        let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
+                        for (idx, eval) in projection_evals.iter().enumerate() {
+                            match eval {
+                                ProjectionEval::Column(info) => {
+                                    let arr_idx = *unique_index
+                                        .get(&info.logical_field_id)
+                                        .expect("logical field id missing from index");
+                                    columns.push(Arc::clone(&unique_arrays[arr_idx]));
+                                }
+                                ProjectionEval::Computed(info) => {
+                                    if let Some(fid) = passthrough_fields[idx] {
+                                        let lfid = LogicalFieldId::for_user(table_id, fid);
+                                        let arr_idx = *unique_index
+                                            .get(&lfid)
+                                            .expect("passthrough field missing from index");
+                                        columns.push(Arc::clone(&unique_arrays[arr_idx]));
+                                    } else {
+                                        let numeric_arrays = numeric_arrays.as_ref().expect(
+                                            "numeric arrays should exist for computed projection",
+                                        );
+                                        let array = NumericKernels::evaluate_batch(
+                                            &info.expr,
+                                            batch.num_rows(),
+                                            numeric_arrays,
+                                        )?;
+                                        columns.push(array);
+                                    }
+                                }
+                            }
+                        }
+
+                        let output_batch = RecordBatch::try_new(Arc::clone(&out_schema), columns)?;
+                        Ok(Some(output_batch))
+                    })
+                    .collect()
+            });
+
+        for batch_result in chunk_batches {
+            if let Some(batch) = batch_result? {
+                on_batch(batch);
+            }
         }
 
         Ok(())

@@ -171,6 +171,7 @@ macro_rules! llkv_for_each_arrow_numeric {
     };
 }
 
+pub mod parallel;
 pub mod store;
 pub mod types;
 

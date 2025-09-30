@@ -1,12 +1,15 @@
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use arrow::array::{
-    Array, BooleanArray, Float32Array, Float64Array, GenericStringArray, Int8Array, Int16Array,
-    Int32Array, Int64Array, OffsetSizeTrait, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, GenericStringArray, Int8Array,
+    Int16Array, Int32Array, Int64Array, OffsetSizeTrait, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::error::Result as ArrowResult;
 
+use crate::parallel;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::store::rowid_fid;
 use crate::types::LogicalFieldId;
@@ -21,6 +24,7 @@ use super::{
 use crate::store::ColumnStore;
 use llkv_storage::pager::{BatchGet, GetResult, Pager};
 use llkv_storage::serialization::deserialize_array;
+use rayon::prelude::*;
 
 // Packed bitset used by fused string predicate evaluation. Stores bits in u64 words
 // with LSB corresponding to lower indices. Provides small helpers for common ops.
@@ -326,11 +330,11 @@ where
         }
 
         // Separate vectorizable 'contains' predicates from others.
-        let mut contains: Vec<&String> = Vec::new();
+        let mut contains: Vec<String> = Vec::new();
         let mut others: Vec<Predicate<String>> = Vec::new();
         for p in predicates {
             match p {
-                Predicate::Contains(s) => contains.push(s),
+                Predicate::Contains(s) => contains.push(s.clone()),
                 _ => others.push(p.clone()),
             }
         }
@@ -349,88 +353,131 @@ where
             return run_filter_for_string::<P, O, _>(store, field_id, combined);
         }
 
-        // Vectorized path: compute combined contains mask per chunk using a packed bitset,
-        // then apply remaining predicates per-row for surviving candidates.
-        let mut matches: Vec<u64> = Vec::new();
+        let contains = Arc::new(contains);
+        let others = Arc::new(others);
 
-        // Reusable bit-packed mask buffer.
-        let mut bitmask = BitMask::new();
+        let (value_metas, row_metas) = string_chunk_metadata(store, field_id)?;
 
-        visit_string_chunks::<P, O, _>(store, field_id, |value_arr, row_arr| {
-            let len = value_arr.len();
-            if len == 0 {
-                return Ok(());
-            }
+        let chunk_results: Vec<Result<Vec<u64>>> = parallel::with_thread_pool(|| {
+            value_metas
+                .par_iter()
+                .zip(row_metas.par_iter())
+                .map(|(value_meta, row_meta)| {
+                    let contains = Arc::clone(&contains);
+                    let others = Arc::clone(&others);
 
-            bitmask.resize(len);
-            bitmask.fill_ones();
+                    let (value_any, row_any) =
+                        load_string_chunk_arrays(store, value_meta, row_meta)?;
 
-            let mut candidates = len;
+                    let value_arr = value_any
+                        .as_any()
+                        .downcast_ref::<GenericStringArray<O>>()
+                        .ok_or_else(|| {
+                            Error::Internal("string filter: value chunk dtype mismatch".into())
+                        })?;
+                    let row_arr =
+                        row_any
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .ok_or_else(|| {
+                                Error::Internal("string filter: row_id chunk downcast".into())
+                            })?;
 
-            if let Some(row_nulls) = row_arr.nulls() {
-                let removed = bitmask.and_with_iter(row_nulls.inner().bit_chunks().iter_padded());
-                candidates = candidates.saturating_sub(removed);
-                if candidates == 0 {
-                    return Ok(());
-                }
-            }
+                    if value_arr.len() != row_arr.len() {
+                        return Err(Error::Internal(
+                            "string filter: value/row chunk length mismatch".into(),
+                        ));
+                    }
 
-            if let Some(value_nulls) = value_arr.nulls() {
-                let removed = bitmask.and_with_iter(value_nulls.inner().bit_chunks().iter_padded());
-                candidates = candidates.saturating_sub(removed);
-                if candidates == 0 {
-                    return Ok(());
-                }
-            }
+                    let len: usize = value_arr.len();
+                    if len == 0 {
+                        return Ok(Vec::new());
+                    }
 
-            for frag in &contains {
-                if frag.is_empty() {
-                    continue;
-                }
+                    let mut bitmask = BitMask::new();
+                    bitmask.resize(len);
+                    bitmask.fill_ones();
 
-                let arr_mask = <O as StringContainsKernel>::contains(value_arr, frag.as_str())
-                    .map_err(Error::from)?;
+                    let mut candidates: usize = len;
 
-                let removed = bitmask.and_with_iter(arr_mask.values().bit_chunks().iter_padded());
-                candidates = candidates.saturating_sub(removed);
-                if candidates == 0 {
-                    break;
-                }
+                    if let Some(row_nulls) = row_arr.nulls() {
+                        let removed =
+                            bitmask.and_with_iter(row_nulls.inner().bit_chunks().iter_padded());
+                        candidates = candidates.saturating_sub(removed);
+                        if candidates == 0 {
+                            return Ok(Vec::new());
+                        }
+                    }
 
-                if let Some(mask_nulls) = arr_mask.nulls() {
-                    let removed =
-                        bitmask.and_with_iter(mask_nulls.inner().bit_chunks().iter_padded());
-                    candidates = candidates.saturating_sub(removed);
+                    if let Some(value_nulls) = value_arr.nulls() {
+                        let removed =
+                            bitmask.and_with_iter(value_nulls.inner().bit_chunks().iter_padded());
+                        candidates = candidates.saturating_sub(removed);
+                        if candidates == 0 {
+                            return Ok(Vec::new());
+                        }
+                    }
+
+                    for frag in contains.as_ref() {
+                        if frag.is_empty() {
+                            continue;
+                        }
+
+                        let arr_mask =
+                            <O as StringContainsKernel>::contains(value_arr, frag.as_str())
+                                .map_err(Error::from)?;
+
+                        let removed =
+                            bitmask.and_with_iter(arr_mask.values().bit_chunks().iter_padded());
+                        candidates = candidates.saturating_sub(removed);
+                        if candidates == 0 {
+                            return Ok(Vec::new());
+                        }
+
+                        if let Some(mask_nulls) = arr_mask.nulls() {
+                            let removed = bitmask
+                                .and_with_iter(mask_nulls.inner().bit_chunks().iter_padded());
+                            candidates = candidates.saturating_sub(removed);
+                            if candidates == 0 {
+                                return Ok(Vec::new());
+                            }
+                        }
+                    }
+
                     if candidates == 0 {
-                        break;
+                        return Ok(Vec::new());
                     }
-                }
-            }
 
-            if candidates == 0 {
-                return Ok(());
-            }
+                    let mut local_matches = Vec::with_capacity(candidates);
+                    if others.as_ref().is_empty() {
+                        bitmask.for_each_set_bit(|idx| {
+                            if idx < len {
+                                local_matches.push(row_arr.value(idx));
+                            }
+                        });
+                    } else {
+                        let other_preds = others.as_ref();
+                        bitmask.for_each_set_bit(|idx| {
+                            if idx >= len {
+                                return;
+                            }
+                            let text = value_arr.value(idx);
+                            if other_preds.iter().all(|p| p.matches(text)) {
+                                local_matches.push(row_arr.value(idx));
+                            }
+                        });
+                    }
 
-            if others.is_empty() {
-                bitmask.for_each_set_bit(|idx| {
-                    if idx < len {
-                        matches.push(row_arr.value(idx));
-                    }
-                });
-            } else {
-                bitmask.for_each_set_bit(|idx| {
-                    if idx >= len {
-                        return;
-                    }
-                    let text = value_arr.value(idx);
-                    if others.iter().all(|p| p.matches(text)) {
-                        matches.push(row_arr.value(idx));
-                    }
-                });
-            }
+                    Ok(local_matches)
+                })
+                .collect()
+        });
 
-            Ok(())
-        })?;
+        let mut matches = Vec::new();
+        for chunk in chunk_results {
+            let mut chunk_matches = chunk?;
+            matches.append(&mut chunk_matches);
+        }
 
         Ok(matches)
     }
@@ -897,15 +944,12 @@ where
     Ok(visitor.into_row_ids())
 }
 
-fn visit_string_chunks<P, O, F>(
+fn string_chunk_metadata<P>(
     store: &ColumnStore<P>,
     field_id: LogicalFieldId,
-    mut visit: F,
-) -> Result<()>
+) -> Result<(Vec<ChunkMetadata>, Vec<ChunkMetadata>)>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
-    O: OffsetSizeTrait,
-    F: FnMut(&GenericStringArray<O>, &UInt64Array) -> Result<()>,
 {
     let row_field = rowid_fid(field_id);
     let catalog = store.catalog.read().unwrap();
@@ -959,38 +1003,66 @@ where
         ));
     }
 
-    for (value_meta, row_meta) in value_metas.iter().zip(row_metas.iter()) {
-        let requests = [
-            BatchGet::Raw {
-                key: value_meta.chunk_pk,
-            },
-            BatchGet::Raw {
-                key: row_meta.chunk_pk,
-            },
-        ];
-        let results = store.pager.batch_get(&requests)?;
-        let mut value_blob: Option<EntryHandle> = None;
-        let mut row_blob: Option<EntryHandle> = None;
-        for res in results {
-            if let GetResult::Raw { key, bytes } = res {
-                if key == value_meta.chunk_pk {
-                    value_blob = Some(bytes);
-                } else if key == row_meta.chunk_pk {
-                    row_blob = Some(bytes);
-                }
+    Ok((value_metas, row_metas))
+}
+
+fn load_string_chunk_arrays<P>(
+    store: &ColumnStore<P>,
+    value_meta: &ChunkMetadata,
+    row_meta: &ChunkMetadata,
+) -> Result<(ArrayRef, ArrayRef)>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let requests = [
+        BatchGet::Raw {
+            key: value_meta.chunk_pk,
+        },
+        BatchGet::Raw {
+            key: row_meta.chunk_pk,
+        },
+    ];
+    let results = store.pager.batch_get(&requests)?;
+    let mut value_blob: Option<EntryHandle> = None;
+    let mut row_blob: Option<EntryHandle> = None;
+    for res in results {
+        if let GetResult::Raw { key, bytes } = res {
+            if key == value_meta.chunk_pk {
+                value_blob = Some(bytes);
+            } else if key == row_meta.chunk_pk {
+                row_blob = Some(bytes);
             }
         }
+    }
 
-        let value_blob = value_blob.ok_or(Error::NotFound)?;
-        let row_blob = row_blob.ok_or(Error::NotFound)?;
+    let value_blob = value_blob.ok_or(Error::NotFound)?;
+    let row_blob = row_blob.ok_or(Error::NotFound)?;
 
-        let value_any = deserialize_array(value_blob)?;
+    let value_any = deserialize_array(value_blob)?;
+    let row_any = deserialize_array(row_blob)?;
+    Ok((value_any, row_any))
+}
+
+fn visit_string_chunks<P, O, F>(
+    store: &ColumnStore<P>,
+    field_id: LogicalFieldId,
+    mut visit: F,
+) -> Result<()>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    O: OffsetSizeTrait,
+    F: FnMut(&GenericStringArray<O>, &UInt64Array) -> Result<()>,
+{
+    let (value_metas, row_metas) = string_chunk_metadata(store, field_id)?;
+
+    for (value_meta, row_meta) in value_metas.iter().zip(row_metas.iter()) {
+        let (value_any, row_any) = load_string_chunk_arrays(store, value_meta, row_meta)?;
+
         let value_arr = value_any
             .as_any()
             .downcast_ref::<GenericStringArray<O>>()
             .ok_or_else(|| Error::Internal("string filter: value chunk dtype mismatch".into()))?;
 
-        let row_any = deserialize_array(row_blob)?;
         let row_arr = row_any
             .as_any()
             .downcast_ref::<UInt64Array>()
