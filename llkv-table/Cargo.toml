@@ -19,6 +19,7 @@ llkv-expr.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true
 llkv-plan.workspace = true
+llkv-csv.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
