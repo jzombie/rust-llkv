@@ -340,6 +340,55 @@ struct PlannedScan<'expr> {
     plan_graph: PlanGraph,
 }
 
+#[derive(Default, Clone, Copy)]
+struct FieldPredicateStats {
+    total: usize,
+    contains: usize,
+}
+
+#[derive(Default)]
+struct PredicateFusionCache {
+    per_field: FxHashMap<FieldId, FieldPredicateStats>,
+}
+
+impl PredicateFusionCache {
+    fn from_expr(expr: &Expr<'_, FieldId>) -> Self {
+        let mut cache = Self::default();
+        cache.record_expr(expr);
+        cache
+    }
+
+    fn record_expr(&mut self, expr: &Expr<'_, FieldId>) {
+        match expr {
+            Expr::Pred(filter) => {
+                let entry = self.per_field.entry(filter.field_id).or_default();
+                entry.total += 1;
+                if matches!(filter.op, Operator::Contains(_)) {
+                    entry.contains += 1;
+                }
+            }
+            Expr::And(children) | Expr::Or(children) => {
+                for child in children {
+                    self.record_expr(child);
+                }
+            }
+            Expr::Not(inner) => self.record_expr(inner),
+            Expr::Compare { .. } => {}
+        }
+    }
+
+    fn should_fuse(&self, field_id: FieldId, dtype: &DataType) -> bool {
+        let Some(stats) = self.per_field.get(&field_id) else {
+            return false;
+        };
+
+        match dtype {
+            DataType::Utf8 | DataType::LargeUtf8 => stats.contains >= 1 && stats.total >= 2,
+            _ => stats.total >= 2,
+        }
+    }
+}
+
 pub(crate) struct TableExecutor<'a, P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -626,8 +675,10 @@ where
         }
         let out_schema = Arc::new(Schema::new(schema_fields));
 
+        let fusion_cache = PredicateFusionCache::from_expr(&filter_expr);
         let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
-        let row_ids = self.collect_row_ids_for_expr(&filter_expr, &mut all_rows_cache)?;
+        let row_ids =
+            self.collect_row_ids_for_expr(&filter_expr, &fusion_cache, &mut all_rows_cache)?;
         if row_ids.is_empty() {
             return Ok(());
         }
@@ -855,6 +906,7 @@ where
     fn collect_row_ids_for_expr(
         &self,
         expr: &Expr<'_, FieldId>,
+        fusion_cache: &PredicateFusionCache,
         all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
     ) -> LlkvResult<Vec<u64>> {
         match expr {
@@ -894,42 +946,48 @@ where
                     let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
                     let dtype = self.table.store().data_type(filter_lfid)?;
 
-                    // Collect operator list
-                    let ops: Vec<Operator<'_>> = children
-                        .iter()
-                        .map(|c| match c {
-                            Expr::Pred(f) => f.op.clone(),
-                            _ => unreachable!(),
-                        })
-                        .collect();
+                    if fusion_cache.should_fuse(fid, &dtype) {
+                        // Collect operator list
+                        let ops: Vec<Operator<'_>> = children
+                            .iter()
+                            .map(|c| match c {
+                                Expr::Pred(f) => f.op.clone(),
+                                _ => unreachable!(),
+                            })
+                            .collect();
 
-                    let row_ids = match &dtype {
-                        DataType::Utf8 => {
-                            self.collect_matching_row_ids_string_fused::<i32>(filter_lfid, &ops)
-                        }
-                        DataType::LargeUtf8 => {
-                            self.collect_matching_row_ids_string_fused::<i64>(filter_lfid, &ops)
-                        }
-                        other => llkv_column_map::with_integer_arrow_type!(
-                            other.clone(),
-                            |ArrowTy| self
-                                .collect_matching_row_ids_fused::<ArrowTy>(filter_lfid, &ops,),
-                            Err(Error::Internal(format!(
-                                "Filtering on type {:?} is not supported",
-                                other
-                            ))),
-                        ),
-                    }?;
+                        let row_ids = match &dtype {
+                            DataType::Utf8 => {
+                                self.collect_matching_row_ids_string_fused::<i32>(filter_lfid, &ops)
+                            }
+                            DataType::LargeUtf8 => {
+                                self.collect_matching_row_ids_string_fused::<i64>(filter_lfid, &ops)
+                            }
+                            other => llkv_column_map::with_integer_arrow_type!(
+                                other.clone(),
+                                |ArrowTy| self
+                                    .collect_matching_row_ids_fused::<ArrowTy>(filter_lfid, &ops,),
+                                Err(Error::Internal(format!(
+                                    "Filtering on type {:?} is not supported",
+                                    other
+                                ))),
+                            ),
+                        }?;
 
-                    return Ok(normalize_row_ids(row_ids));
+                        return Ok(normalize_row_ids(row_ids));
+                    }
                 }
 
                 // Fallback to existing iterative intersection for mixed expressions.
                 let mut iter = children.iter();
-                let mut acc =
-                    self.collect_row_ids_for_expr(iter.next().unwrap(), all_rows_cache)?;
+                let mut acc = self.collect_row_ids_for_expr(
+                    iter.next().unwrap(),
+                    fusion_cache,
+                    all_rows_cache,
+                )?;
                 for child in iter {
-                    let next_ids = self.collect_row_ids_for_expr(child, all_rows_cache)?;
+                    let next_ids =
+                        self.collect_row_ids_for_expr(child, fusion_cache, all_rows_cache)?;
                     if acc.is_empty() || next_ids.is_empty() {
                         return Ok(Vec::new());
                     }
@@ -948,7 +1006,8 @@ where
                 }
                 let mut acc = Vec::new();
                 for child in children {
-                    let next_ids = self.collect_row_ids_for_expr(child, all_rows_cache)?;
+                    let next_ids =
+                        self.collect_row_ids_for_expr(child, fusion_cache, all_rows_cache)?;
                     if acc.is_empty() {
                         acc = next_ids;
                     } else if !next_ids.is_empty() {
@@ -962,7 +1021,7 @@ where
                 if domain.is_empty() {
                     return Ok(Vec::new());
                 }
-                let matched = self.collect_row_ids_for_expr(inner, all_rows_cache)?;
+                let matched = self.collect_row_ids_for_expr(inner, fusion_cache, all_rows_cache)?;
                 Ok(difference_sorted(domain, matched))
             }
         }

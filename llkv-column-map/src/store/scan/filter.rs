@@ -39,7 +39,7 @@ impl BitMask {
 
     fn resize(&mut self, new_len: usize) {
         self.len = new_len;
-        let words = (new_len + 63) / 64;
+        let words = new_len.div_ceil(64);
         if self.bits.len() < words {
             self.bits.resize(words, 0);
         } else if self.bits.len() > words {
@@ -69,23 +69,19 @@ impl BitMask {
         self.clear_trailing_bits();
     }
 
-    fn retain<F>(&mut self, mut predicate: F) -> usize
+    fn and_with_iter<I>(&mut self, iter: I) -> usize
     where
-        F: FnMut(usize) -> bool,
+        I: IntoIterator<Item = u64>,
     {
         let mut removed = 0usize;
-        for word_idx in 0..self.bits.len() {
-            let mut word = self.bits[word_idx];
-            while word != 0 {
-                let bit = word.trailing_zeros() as usize;
-                let idx = word_idx * 64 + bit;
-                if idx >= self.len || !predicate(idx) {
-                    self.bits[word_idx] &= !(1u64 << bit);
-                    removed += (idx < self.len) as usize;
-                }
-                word &= word - 1;
-            }
+        let mut chunks = iter.into_iter();
+        for word in &mut self.bits {
+            let before = *word;
+            let chunk = chunks.next().unwrap_or(0);
+            *word &= chunk;
+            removed += (before.count_ones() - word.count_ones()) as usize;
         }
+        self.clear_trailing_bits();
         removed
     }
 
@@ -365,39 +361,49 @@ where
             if len == 0 {
                 return Ok(());
             }
+
             bitmask.resize(len);
             bitmask.fill_ones();
 
             let mut candidates = len;
 
-            if row_arr.null_count() > 0 {
-                let removed = bitmask.retain(|idx| row_arr.is_valid(idx));
+            if let Some(row_nulls) = row_arr.nulls() {
+                let removed = bitmask.and_with_iter(row_nulls.inner().bit_chunks().iter_padded());
                 candidates = candidates.saturating_sub(removed);
                 if candidates == 0 {
                     return Ok(());
                 }
             }
 
-            if value_arr.null_count() > 0 {
-                let removed = bitmask.retain(|idx| !value_arr.is_null(idx));
+            if let Some(value_nulls) = value_arr.nulls() {
+                let removed = bitmask.and_with_iter(value_nulls.inner().bit_chunks().iter_padded());
                 candidates = candidates.saturating_sub(removed);
                 if candidates == 0 {
                     return Ok(());
                 }
             }
 
-            // AND with contains masks; operate only on surviving candidates.
             for frag in &contains {
                 if frag.is_empty() {
-                    // empty fragment matches non-null entries; no change
                     continue;
                 }
+
                 let arr_mask = <O as StringContainsKernel>::contains(value_arr, frag.as_str())
                     .map_err(Error::from)?;
-                let removed = bitmask.retain(|idx| arr_mask.is_valid(idx) && arr_mask.value(idx));
+
+                let removed = bitmask.and_with_iter(arr_mask.values().bit_chunks().iter_padded());
                 candidates = candidates.saturating_sub(removed);
                 if candidates == 0 {
                     break;
+                }
+
+                if let Some(mask_nulls) = arr_mask.nulls() {
+                    let removed =
+                        bitmask.and_with_iter(mask_nulls.inner().bit_chunks().iter_padded());
+                    candidates = candidates.saturating_sub(removed);
+                    if candidates == 0 {
+                        break;
+                    }
                 }
             }
 
@@ -405,14 +411,23 @@ where
                 return Ok(());
             }
 
-            bitmask.for_each_set_bit(|idx| {
-                if idx < len {
+            if others.is_empty() {
+                bitmask.for_each_set_bit(|idx| {
+                    if idx < len {
+                        matches.push(row_arr.value(idx));
+                    }
+                });
+            } else {
+                bitmask.for_each_set_bit(|idx| {
+                    if idx >= len {
+                        return;
+                    }
                     let text = value_arr.value(idx);
                     if others.iter().all(|p| p.matches(text)) {
                         matches.push(row_arr.value(idx));
                     }
-                }
-            });
+                });
+            }
 
             Ok(())
         })?;
