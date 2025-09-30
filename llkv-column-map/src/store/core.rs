@@ -171,6 +171,19 @@ where
         }
     }
 
+    /// Return the logical field identifiers for all user columns in `table_id`.
+    pub fn user_field_ids_for_table(&self, table_id: crate::types::TableId) -> Vec<LogicalFieldId> {
+        use crate::types::Namespace;
+
+        let catalog = self.catalog.read().unwrap();
+        catalog
+            .map
+            .keys()
+            .filter(|fid| fid.namespace() == Namespace::UserData && fid.table_id() == table_id)
+            .copied()
+            .collect()
+    }
+
     /// Fast presence check using the presence index (row-id permutation) if available.
     /// Returns true if `row_id` exists in the column; false otherwise.
     pub fn has_row_id(&self, field_id: LogicalFieldId, row_id: u64) -> Result<bool> {

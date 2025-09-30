@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,7 +11,7 @@ use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-use llkv_table::{Table, types::FieldId};
+use llkv_table::{ColMeta, Table, types::FieldId};
 
 use crate::{CsvReadOptions, open_csv_reader};
 
@@ -56,6 +56,125 @@ fn ensure_supported_type(data_type: &DataType, column: &str) -> LlkvResult<()> {
         }
         other => other,
     })
+}
+
+fn existing_column_mapping<P>(table: &Table<P>) -> HashMap<String, FieldId>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let logical_fields = table.store().user_field_ids_for_table(table.table_id());
+    if logical_fields.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut field_ids: Vec<FieldId> = Vec::new();
+    for lfid in logical_fields {
+        let fid = lfid.field_id();
+        if fid != 0 {
+            field_ids.push(fid);
+        }
+    }
+
+    if field_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let metas = table.catalog().get_cols_meta(table.table_id(), &field_ids);
+    let mut mapping = HashMap::with_capacity(metas.len());
+    for (fid, meta_opt) in field_ids.into_iter().zip(metas.into_iter()) {
+        if let Some(meta) = meta_opt {
+            if let Some(name) = meta.name {
+                mapping.insert(name, fid);
+            }
+        }
+    }
+    mapping
+}
+
+fn infer_field_mapping<'a, P>(
+    table: &Table<P>,
+    schema: &'a Schema,
+    provided: Option<&'a HashMap<String, FieldId>>,
+) -> LlkvResult<HashMap<String, FieldId>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let mut mapping = HashMap::new();
+    let mut existing = existing_column_mapping(table);
+    let mut used_ids: HashSet<FieldId> = existing.values().copied().collect();
+    let mut next_field_id: FieldId = existing.values().copied().max().unwrap_or(0);
+
+    for field in schema.fields() {
+        if field.name() == ROW_ID_COLUMN_NAME {
+            continue;
+        }
+
+        ensure_supported_type(field.data_type(), field.name())?;
+
+        let mut chosen: Option<FieldId> = None;
+        let mut should_register_meta = false;
+
+        if let Some(manual) = provided {
+            if let Some(&fid) = manual.get(field.name()) {
+                if let Some(&existing_fid) = existing.get(field.name()) {
+                    if existing_fid != fid {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "column '{}' mapped to field_id {} but existing schema expects {}",
+                            field.name(),
+                            fid,
+                            existing_fid
+                        )));
+                    }
+                } else {
+                    should_register_meta = true;
+                }
+                chosen = Some(fid);
+            }
+        }
+
+        if chosen.is_none() {
+            if let Some(&fid) = existing.get(field.name()) {
+                chosen = Some(fid);
+            }
+        }
+
+        if chosen.is_none() {
+            next_field_id = next_field_id
+                .checked_add(1)
+                .ok_or_else(|| Error::Internal("field_id overflow when inferring schema".into()))?;
+            let fid = next_field_id;
+            should_register_meta = true;
+            chosen = Some(fid);
+        }
+
+        let fid = chosen.unwrap();
+        if should_register_meta {
+            let meta = ColMeta {
+                col_id: fid,
+                name: Some(field.name().to_string()),
+                flags: 0,
+                default: None,
+            };
+            table.put_col_meta(&meta);
+            existing.insert(field.name().to_string(), fid);
+        }
+        if fid == 0 {
+            return Err(Error::InvalidArgumentError(format!(
+                "column '{}' cannot map to reserved field_id 0",
+                field.name()
+            )));
+        }
+        if !used_ids.insert(fid) {
+            return Err(Error::InvalidArgumentError(format!(
+                "field_id {} assigned to multiple columns during schema inference",
+                fid
+            )));
+        }
+
+        mapping.insert(field.name().to_string(), fid);
+    }
+
+    Ok(mapping)
 }
 
 fn build_schema_with_metadata(
@@ -104,11 +223,11 @@ fn build_schema_with_metadata(
     Ok((Arc::new(Schema::new(fields_with_metadata)), row_id_index))
 }
 
-pub fn append_csv_into_table<P, C>(
+fn append_csv_into_table_internal<P, C>(
     table: &Table<P>,
     csv_path: C,
-    field_mapping: &HashMap<String, FieldId>,
     csv_options: &CsvReadOptions,
+    field_mapping_override: Option<&HashMap<String, FieldId>>,
 ) -> LlkvResult<()>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -118,7 +237,9 @@ where
     let (schema, reader) = open_csv_reader(csv_path_ref, csv_options)
         .map_err(|err| Error::Internal(format!("failed to open CSV: {err}")))?;
 
-    let (schema_with_metadata, row_id_index) = build_schema_with_metadata(&schema, field_mapping)?;
+    let inferred_mapping = infer_field_mapping(table, schema.as_ref(), field_mapping_override)?;
+    let (schema_with_metadata, row_id_index) =
+        build_schema_with_metadata(&schema, &inferred_mapping)?;
 
     for batch_result in reader {
         let batch = batch_result
@@ -137,4 +258,29 @@ where
     }
 
     Ok(())
+}
+
+pub fn append_csv_into_table<P, C>(
+    table: &Table<P>,
+    csv_path: C,
+    csv_options: &CsvReadOptions,
+) -> LlkvResult<()>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    C: AsRef<Path>,
+{
+    append_csv_into_table_internal(table, csv_path, csv_options, None)
+}
+
+pub fn append_csv_into_table_with_mapping<P, C>(
+    table: &Table<P>,
+    csv_path: C,
+    field_mapping: &HashMap<String, FieldId>,
+    csv_options: &CsvReadOptions,
+) -> LlkvResult<()>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    C: AsRef<Path>,
+{
+    append_csv_into_table_internal(table, csv_path, csv_options, Some(field_mapping))
 }

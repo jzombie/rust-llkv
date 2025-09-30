@@ -6,12 +6,11 @@ use std::sync::Arc;
 use arrow::array::{Array, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray};
 use llkv_column_map::store::Projection;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_csv::{CsvReadOptions, append_csv_into_table};
+use llkv_csv::{CsvReadOptions, append_csv_into_table, append_csv_into_table_with_mapping};
 use llkv_storage::pager::MemPager;
-use llkv_table::Table;
 use llkv_table::expr::{Expr, Filter, Operator};
 use llkv_table::table::ScanStreamOptions;
-use llkv_table::types::FieldId;
+use llkv_table::{Table, types::FieldId};
 use tempfile::NamedTempFile;
 
 fn write_sample_csv() -> NamedTempFile {
@@ -36,6 +35,14 @@ fn write_sample_csv_with_nulls() -> NamedTempFile {
     tmp
 }
 
+fn write_additional_csv_rows() -> NamedTempFile {
+    let mut tmp = NamedTempFile::new().expect("create tmp csv with extra rows");
+    writeln!(tmp, "row_id,int_col,float_col,text_col,bool_col,date_col").unwrap();
+    writeln!(tmp, "3,40,4.5,again,false,2024-01-04").unwrap();
+    writeln!(tmp, "4,50,5.5,more,true,2024-01-05").unwrap();
+    tmp
+}
+
 #[test]
 fn csv_append_roundtrip() {
     let pager = Arc::new(MemPager::default());
@@ -44,15 +51,7 @@ fn csv_append_roundtrip() {
     let csv_file = write_sample_csv();
     let options = CsvReadOptions::default();
 
-    let mut field_mapping: HashMap<String, FieldId> = HashMap::new();
-    field_mapping.insert("int_col".to_string(), 1);
-    field_mapping.insert("float_col".to_string(), 2);
-    field_mapping.insert("text_col".to_string(), 3);
-    field_mapping.insert("bool_col".to_string(), 4);
-    field_mapping.insert("date_col".to_string(), 5);
-
-    append_csv_into_table(&table, csv_file.path(), &field_mapping, &options)
-        .expect("append csv into table");
+    append_csv_into_table(&table, csv_file.path(), &options).expect("append csv into table");
 
     let projections = vec![
         Projection::from(LogicalFieldId::for_user(table.table_id(), 1)),
@@ -125,6 +124,150 @@ fn csv_append_roundtrip() {
 }
 
 #[test]
+fn csv_auto_schema_reuses_field_ids() {
+    let pager = Arc::new(MemPager::default());
+    let table = Table::new(44, Arc::clone(&pager)).expect("create table");
+
+    let options = CsvReadOptions::default();
+
+    let first_csv = write_sample_csv();
+    append_csv_into_table(&table, first_csv.path(), &options).expect("append initial csv");
+
+    let second_csv = write_additional_csv_rows();
+    append_csv_into_table(&table, second_csv.path(), &options).expect("append additional csv");
+
+    let projections = vec![
+        Projection::from(LogicalFieldId::for_user(table.table_id(), 1)),
+        Projection::from(LogicalFieldId::for_user(table.table_id(), 2)),
+    ];
+
+    let filter_all_rows = Expr::Pred(Filter {
+        field_id: 1,
+        op: Operator::Range {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        },
+    });
+
+    let mut ints: Vec<i64> = Vec::new();
+    let mut floats: Vec<f64> = Vec::new();
+
+    table
+        .scan_stream(
+            &projections,
+            &filter_all_rows,
+            ScanStreamOptions::default(),
+            |batch| {
+                let int_col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int column");
+                let float_col = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("float column");
+
+                ints.extend_from_slice(int_col.values());
+                floats.extend_from_slice(float_col.values());
+            },
+        )
+        .expect("scan appended rows");
+
+    assert_eq!(ints, vec![10, 20, 30, 40, 50]);
+    assert_eq!(floats, vec![1.5, 2.5, 3.5, 4.5, 5.5]);
+}
+
+#[test]
+fn csv_append_with_manual_mapping() {
+    let pager = Arc::new(MemPager::default());
+    let table = Table::new(45, Arc::clone(&pager)).expect("create table");
+
+    let mut field_mapping: HashMap<String, FieldId> = HashMap::new();
+    field_mapping.insert("int_col".to_string(), 10);
+    field_mapping.insert("float_col".to_string(), 20);
+    field_mapping.insert("text_col".to_string(), 30);
+    field_mapping.insert("bool_col".to_string(), 40);
+    field_mapping.insert("date_col".to_string(), 50);
+
+    let options = CsvReadOptions::default();
+    let csv_file = write_sample_csv();
+
+    append_csv_into_table_with_mapping(&table, csv_file.path(), &field_mapping, &options)
+        .expect("append csv with manual mapping");
+
+    let projections = vec![
+        Projection::from(LogicalFieldId::for_user(table.table_id(), 10)),
+        Projection::from(LogicalFieldId::for_user(table.table_id(), 20)),
+        Projection::from(LogicalFieldId::for_user(table.table_id(), 30)),
+        Projection::from(LogicalFieldId::for_user(table.table_id(), 40)),
+        Projection::from(LogicalFieldId::for_user(table.table_id(), 50)),
+    ];
+
+    let filter_all_rows = Expr::Pred(Filter {
+        field_id: 10,
+        op: Operator::Range {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        },
+    });
+
+    let mut ints: Vec<i64> = Vec::new();
+    let mut floats: Vec<f64> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    let mut bools: Vec<bool> = Vec::new();
+    let mut dates: Vec<i32> = Vec::new();
+
+    table
+        .scan_stream(
+            &projections,
+            &filter_all_rows,
+            ScanStreamOptions::default(),
+            |batch| {
+                let int_col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int column");
+                let float_col = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("float column");
+                let text_col = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("text column");
+                let bool_col = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("bool column");
+                let date_col = batch
+                    .column(4)
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .expect("date column");
+
+                ints.extend_from_slice(int_col.values());
+                floats.extend_from_slice(float_col.values());
+                texts.extend(text_col.iter().map(|s| s.unwrap().to_string()));
+                bools.extend(bool_col.iter().map(|b| b.unwrap()));
+                dates.extend(date_col.values().iter().copied());
+            },
+        )
+        .expect("scan manual mapping rows");
+
+    assert_eq!(ints, vec![10, 20, 30]);
+    assert_eq!(floats, vec![1.5, 2.5, 3.5]);
+    assert_eq!(texts, vec!["hello", "world", "test"]);
+    assert_eq!(bools, vec![true, false, true]);
+    assert_eq!(dates, vec![19723, 19724, 19725]);
+}
+
+#[test]
 fn csv_append_preserves_nulls() {
     let pager = Arc::new(MemPager::default());
     let table = Table::new(43, Arc::clone(&pager)).expect("create table");
@@ -141,16 +284,7 @@ fn csv_append_preserves_nulls() {
     assert_eq!(schema.field(5).data_type(), &DataType::Date32);
     assert_eq!(schema.field(6).data_type(), &DataType::Utf8);
 
-    let mut field_mapping: HashMap<String, FieldId> = HashMap::new();
-    field_mapping.insert("int_col".to_string(), 1);
-    field_mapping.insert("float_col".to_string(), 2);
-    field_mapping.insert("text_col".to_string(), 3);
-    field_mapping.insert("bool_col".to_string(), 4);
-    field_mapping.insert("date_col".to_string(), 5);
-    field_mapping.insert("anchor_col".to_string(), 6);
-
-    append_csv_into_table(&table, csv_file.path(), &field_mapping, &options)
-        .expect("append csv with nulls");
+    append_csv_into_table(&table, csv_file.path(), &options).expect("append csv with nulls");
 
     let projections = vec![
         Projection::from(LogicalFieldId::for_user(table.table_id(), 1)),

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{BinaryArray, UInt64Array};
+use arrow::array::{Array, BinaryArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bitcode::{Decode, Encode};
@@ -15,7 +15,11 @@ use llkv_column_map::store::scan::{
 };
 
 use llkv_column_map::types::LogicalFieldId;
-use llkv_column_map::{ColumnStore, store::ROW_ID_COLUMN_NAME, types::Namespace};
+use llkv_column_map::{
+    ColumnStore,
+    store::{GatherNullPolicy, ROW_ID_COLUMN_NAME},
+    types::Namespace,
+};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -170,46 +174,38 @@ where
 
     /// Batch fetch specific column metas by col_id using a shared keyset.
     pub fn get_cols_meta(&self, table_id: TableId, col_ids: &[u32]) -> Vec<Option<ColMeta>> {
-        let results = vec![None; col_ids.len()];
-        let target_rids: HashMap<u64, usize> = col_ids
+        if col_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let row_ids: Vec<u64> = col_ids.iter().map(|&cid| rid_col(table_id, cid)).collect();
+        let catalog_field = lfid(CATALOG_TID, F_COL_META);
+
+        let batch =
+            match self
+                .store
+                .gather_rows(&[catalog_field], &row_ids, GatherNullPolicy::IncludeNulls)
+            {
+                Ok(batch) => batch,
+                Err(_) => return vec![None; col_ids.len()],
+            };
+
+        let meta_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("catalog meta column should be Binary");
+
+        col_ids
             .iter()
             .enumerate()
-            .map(|(i, &cid)| (rid_col(table_id, cid), i))
-            .collect();
-
-        struct MetaVisitor<'a> {
-            target_rids: &'a HashMap<u64, usize>,
-            // results: &'a mut Vec<Option<ColMeta>>,
-        }
-        impl<'a> PrimitiveVisitor for MetaVisitor<'a> {}
-        impl<'a> PrimitiveWithRowIdsVisitor for MetaVisitor<'a> {
-            fn u64_chunk_with_rids(&mut self, v: &UInt64Array, r: &UInt64Array) {
-                for i in 0..r.len() {
-                    let rid = r.value(i);
-                    if let Some(&_idx) = self.target_rids.get(&rid) {
-                        // TODO: Build out?
-                        // Placeholder logic, as in get_table_meta.
-                        let _bytes = v.value(i);
-                        // self.results[idx] = Some(bitcode::decode(&bytes.to_be_bytes()).unwrap());
-                    }
+            .map(|(idx, _)| {
+                if meta_col.is_null(idx) {
+                    None
+                } else {
+                    bitcode::decode(meta_col.value(idx)).ok()
                 }
-            }
-        }
-        impl<'a> PrimitiveSortedVisitor for MetaVisitor<'a> {}
-        impl<'a> PrimitiveSortedWithRowIdsVisitor for MetaVisitor<'a> {}
-
-        let mut visitor = MetaVisitor {
-            target_rids: &target_rids,
-            // results: &mut results,
-        };
-        let scan_opts = llkv_column_map::store::scan::ScanOptions {
-            with_row_ids: true,
-            ..Default::default()
-        };
-
-        let _ = self
-            .store
-            .scan(lfid(CATALOG_TID, F_COL_META), scan_opts, &mut visitor);
-        results
+            })
+            .collect()
     }
 }
