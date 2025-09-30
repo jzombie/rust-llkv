@@ -141,6 +141,9 @@ enum PrimType {
     Utf8 = 12,
     LargeBinary = 13,
     LargeUtf8 = 14,
+    Boolean = 15,
+    Date32 = 16,
+    Date64 = 17,
 }
 
 // Re-export convenience helpers from codecs to keep call sites tidy.
@@ -165,6 +168,9 @@ fn prim_from_datatype(dt: &DataType) -> Result<PrimType> {
         Utf8 => PrimType::Utf8,
         LargeBinary => PrimType::LargeBinary,
         LargeUtf8 => PrimType::LargeUtf8,
+        Boolean => PrimType::Boolean,
+        Date32 => PrimType::Date32,
+        Date64 => PrimType::Date64,
         _ => return Err(Error::Internal("unsupported Arrow type".into())),
     };
     Ok(p)
@@ -189,6 +195,9 @@ fn datatype_from_prim(p: PrimType) -> Result<DataType> {
         PrimType::Utf8 => Utf8,
         PrimType::LargeBinary => LargeBinary,
         PrimType::LargeUtf8 => LargeUtf8,
+        PrimType::Boolean => Boolean,
+        PrimType::Date32 => Date32,
+        PrimType::Date64 => Date64,
     };
     Ok(dt)
 }
@@ -435,4 +444,7 @@ const _: () = {
     ["code changed"][!(PrimType::Utf8 as u8 == 12) as usize];
     ["code changed"][!(PrimType::LargeBinary as u8 == 13) as usize];
     ["code changed"][!(PrimType::LargeUtf8 as u8 == 14) as usize];
+    ["code changed"][!(PrimType::Boolean as u8 == 15) as usize];
+    ["code changed"][!(PrimType::Date32 as u8 == 16) as usize];
+    ["code changed"][!(PrimType::Date64 as u8 == 17) as usize];
 };

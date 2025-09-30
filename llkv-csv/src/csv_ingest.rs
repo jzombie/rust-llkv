@@ -49,11 +49,17 @@ fn convert_row_id(array: &ArrayRef) -> LlkvResult<ArrayRef> {
     }
 }
 
+// TODO: Move this into `llkv-column-map` as a utility function?
 fn ensure_supported_type(data_type: &DataType, column: &str) -> LlkvResult<()> {
     match data_type {
-        DataType::Int64 | DataType::Float64 | DataType::Utf8 => Ok(()),
+        DataType::Int64
+        | DataType::Float64
+        | DataType::Utf8
+        | DataType::Boolean
+        | DataType::Date32
+        | DataType::Date64 => Ok(()),
         _ => Err(Error::InvalidArgumentError(format!(
-            "column '{column}' has unsupported type {data_type:?}; supported types are Int64, Float64, and Utf8"
+            "column '{column}' has unsupported type {data_type:?}; supported types are Int64, Float64, Boolean, Date32, Date64, and Utf8"
         ))),
     }
 }
