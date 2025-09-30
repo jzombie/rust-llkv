@@ -22,6 +22,92 @@ use crate::store::ColumnStore;
 use llkv_storage::pager::{BatchGet, GetResult, Pager};
 use llkv_storage::serialization::deserialize_array;
 
+// Packed bitset used by fused string predicate evaluation. Stores bits in u64 words
+// with LSB corresponding to lower indices. Provides small helpers for common ops.
+struct BitMask {
+    bits: Vec<u64>,
+    len: usize,
+}
+
+impl BitMask {
+    fn new() -> Self {
+        Self {
+            bits: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn resize(&mut self, new_len: usize) {
+        self.len = new_len;
+        let words = (new_len + 63) / 64;
+        if self.bits.len() < words {
+            self.bits.resize(words, 0);
+        } else if self.bits.len() > words {
+            self.bits.truncate(words);
+        }
+        self.clear_trailing_bits();
+    }
+
+    fn clear_trailing_bits(&mut self) {
+        if self.len == 0 || self.bits.is_empty() {
+            return;
+        }
+        let words = self.bits.len();
+        let valid_bits = self.len % 64;
+        if valid_bits == 0 {
+            return;
+        }
+        let mask = (1u64 << valid_bits) - 1u64;
+        let last = words - 1;
+        self.bits[last] &= mask;
+    }
+
+    fn fill_ones(&mut self) {
+        for w in &mut self.bits {
+            *w = u64::MAX;
+        }
+        self.clear_trailing_bits();
+    }
+
+    fn retain<F>(&mut self, mut predicate: F) -> usize
+    where
+        F: FnMut(usize) -> bool,
+    {
+        let mut removed = 0usize;
+        for word_idx in 0..self.bits.len() {
+            let mut word = self.bits[word_idx];
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                let idx = word_idx * 64 + bit;
+                if idx >= self.len || !predicate(idx) {
+                    self.bits[word_idx] &= !(1u64 << bit);
+                    removed += (idx < self.len) as usize;
+                }
+                word &= word - 1;
+            }
+        }
+        removed
+    }
+
+    fn for_each_set_bit<F>(&self, mut f: F)
+    where
+        F: FnMut(usize),
+    {
+        for (word_idx, word) in self.bits.iter().enumerate() {
+            let mut current = *word;
+            while current != 0 {
+                let bit = current.trailing_zeros() as usize;
+                let idx = word_idx * 64 + bit;
+                if idx >= self.len {
+                    break;
+                }
+                f(idx);
+                current &= current - 1;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilterRun {
     pub start_row_id: u64,
@@ -122,6 +208,60 @@ pub trait FilterDispatch {
     ) -> Result<Vec<u64>>
     where
         P: Pager<Blob = EntryHandle> + Send + Sync;
+
+    /// Run multiple predicates fused into a single pass over the data.
+    fn run_fused<P>(
+        store: &ColumnStore<P>,
+        field_id: LogicalFieldId,
+        predicates: &[Predicate<Self::Value>],
+    ) -> Result<Vec<u64>>
+    where
+        P: Pager<Blob = EntryHandle> + Send + Sync,
+    {
+        // Conservative default: run each predicate separately and intersect the resulting
+        // row-id lists. Implementors (e.g., Utf8Filter) should override to provide a
+        // single-pass, vectorized evaluation for better performance.
+        if predicates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Collect per-predicate result vectors
+        let mut sets: Vec<Vec<u64>> = Vec::with_capacity(predicates.len());
+        for p in predicates {
+            let ids = Self::run_filter(store, field_id, p)?;
+            sets.push(ids);
+            // early exit: if any predicate matched nothing, intersection is empty
+            if sets.last().map(|v| v.is_empty()).unwrap_or(false) {
+                return Ok(Vec::new());
+            }
+        }
+
+        // Intersect all vectors (they are returned in ascending order by run_filter).
+        // Start with the smallest vector to minimize work.
+        sets.sort_by_key(|v| v.len());
+        let mut result = sets[0].clone();
+        for other in sets.iter().skip(1) {
+            let mut i = 0usize;
+            let mut j = 0usize;
+            let mut out: Vec<u64> = Vec::with_capacity(result.len().min(other.len()));
+            while i < result.len() && j < other.len() {
+                match result[i].cmp(&other[j]) {
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                    std::cmp::Ordering::Equal => {
+                        out.push(result[i]);
+                        i += 1;
+                        j += 1;
+                    }
+                }
+            }
+            result = out;
+            if result.is_empty() {
+                break;
+            }
+        }
+        Ok(result)
+    }
 }
 
 impl<T> FilterDispatch for T
@@ -175,6 +315,109 @@ where
                 })
             }
         }
+    }
+
+    fn run_fused<P>(
+        store: &ColumnStore<P>,
+        field_id: LogicalFieldId,
+        predicates: &[Predicate<Self::Value>],
+    ) -> Result<Vec<u64>>
+    where
+        P: Pager<Blob = EntryHandle> + Send + Sync,
+    {
+        if predicates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Separate vectorizable 'contains' predicates from others.
+        let mut contains: Vec<&String> = Vec::new();
+        let mut others: Vec<Predicate<String>> = Vec::new();
+        for p in predicates {
+            match p {
+                Predicate::Contains(s) => contains.push(s),
+                _ => others.push(p.clone()),
+            }
+        }
+
+        // If there are no contains predicates, fall back to per-row evaluation of all predicates.
+        if contains.is_empty() {
+            let preds = predicates.to_vec();
+            let combined = move |value: &str| {
+                for p in &preds {
+                    if !p.matches(value) {
+                        return false;
+                    }
+                }
+                true
+            };
+            return run_filter_for_string::<P, O, _>(store, field_id, combined);
+        }
+
+        // Vectorized path: compute combined contains mask per chunk using a packed bitset,
+        // then apply remaining predicates per-row for surviving candidates.
+        let mut matches: Vec<u64> = Vec::new();
+
+        // Reusable bit-packed mask buffer.
+        let mut bitmask = BitMask::new();
+
+        visit_string_chunks::<P, O, _>(store, field_id, |value_arr, row_arr| {
+            let len = value_arr.len();
+            if len == 0 {
+                return Ok(());
+            }
+            bitmask.resize(len);
+            bitmask.fill_ones();
+
+            let mut candidates = len;
+
+            if row_arr.null_count() > 0 {
+                let removed = bitmask.retain(|idx| row_arr.is_valid(idx));
+                candidates = candidates.saturating_sub(removed);
+                if candidates == 0 {
+                    return Ok(());
+                }
+            }
+
+            if value_arr.null_count() > 0 {
+                let removed = bitmask.retain(|idx| !value_arr.is_null(idx));
+                candidates = candidates.saturating_sub(removed);
+                if candidates == 0 {
+                    return Ok(());
+                }
+            }
+
+            // AND with contains masks; operate only on surviving candidates.
+            for frag in &contains {
+                if frag.is_empty() {
+                    // empty fragment matches non-null entries; no change
+                    continue;
+                }
+                let arr_mask = <O as StringContainsKernel>::contains(value_arr, frag.as_str())
+                    .map_err(Error::from)?;
+                let removed = bitmask.retain(|idx| arr_mask.is_valid(idx) && arr_mask.value(idx));
+                candidates = candidates.saturating_sub(removed);
+                if candidates == 0 {
+                    break;
+                }
+            }
+
+            if candidates == 0 {
+                return Ok(());
+            }
+
+            bitmask.for_each_set_bit(|idx| {
+                if idx < len {
+                    let text = value_arr.value(idx);
+                    if others.iter().all(|p| p.matches(text)) {
+                        matches.push(row_arr.value(idx));
+                    }
+                }
+            });
+
+            Ok(())
+        })?;
+
+        Ok(matches)
     }
 }
 

@@ -868,6 +868,63 @@ where
                         "AND expression requires at least one predicate".into(),
                     ));
                 }
+                // Fast-path fusion: if this AND is composed solely of Pred nodes on the
+                // same field, build typed predicates and call the storage fused runtime
+                // entrypoint. This avoids multiple scans over the same column.
+                let mut same_field: Option<FieldId> = None;
+                let mut all_preds_same_field = true;
+                for child in children.iter() {
+                    if let Expr::Pred(f) = child {
+                        if let Some(sf) = same_field {
+                            if f.field_id != sf {
+                                all_preds_same_field = false;
+                                break;
+                            }
+                        } else {
+                            same_field = Some(f.field_id);
+                        }
+                    } else {
+                        all_preds_same_field = false;
+                        break;
+                    }
+                }
+
+                if all_preds_same_field {
+                    let fid = same_field.expect("non-empty children checked");
+                    let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
+                    let dtype = self.table.store().data_type(filter_lfid)?;
+
+                    // Collect operator list
+                    let ops: Vec<Operator<'_>> = children
+                        .iter()
+                        .map(|c| match c {
+                            Expr::Pred(f) => f.op.clone(),
+                            _ => unreachable!(),
+                        })
+                        .collect();
+
+                    let row_ids = match &dtype {
+                        DataType::Utf8 => {
+                            self.collect_matching_row_ids_string_fused::<i32>(filter_lfid, &ops)
+                        }
+                        DataType::LargeUtf8 => {
+                            self.collect_matching_row_ids_string_fused::<i64>(filter_lfid, &ops)
+                        }
+                        other => llkv_column_map::with_integer_arrow_type!(
+                            other.clone(),
+                            |ArrowTy| self
+                                .collect_matching_row_ids_fused::<ArrowTy>(filter_lfid, &ops,),
+                            Err(Error::Internal(format!(
+                                "Filtering on type {:?} is not supported",
+                                other
+                            ))),
+                        ),
+                    }?;
+
+                    return Ok(normalize_row_ids(row_ids));
+                }
+
+                // Fallback to existing iterative intersection for mixed expressions.
                 let mut iter = children.iter();
                 let mut acc =
                     self.collect_row_ids_for_expr(iter.next().unwrap(), all_rows_cache)?;
@@ -1125,6 +1182,54 @@ where
             .filter_row_ids::<llkv_column_map::store::scan::filter::Utf8Filter<O>>(
                 field_id, &predicate,
             )
+    }
+
+    fn collect_matching_row_ids_string_fused<O>(
+        &self,
+        field_id: LogicalFieldId,
+        ops: &[Operator<'_>],
+    ) -> LlkvResult<Vec<u64>>
+    where
+        O: OffsetSizeTrait + llkv_column_map::store::scan::filter::StringContainsKernel,
+    {
+        // Build predicates for each operator and call the fused dispatch on Utf8Filter
+        let mut preds: Vec<llkv_expr::typed_predicate::Predicate<String>> =
+            Vec::with_capacity(ops.len());
+        for op in ops {
+            let p = build_var_width_predicate(op).map_err(Error::predicate_build)?;
+            preds.push(p);
+        }
+        // Call the specialized fused runtime on Utf8Filter via the FilterDispatch trait
+        let fused = <llkv_column_map::store::scan::filter::Utf8Filter<O> as llkv_column_map::store::scan::filter::FilterDispatch>::run_fused(
+            self.table.store(),
+            field_id,
+            &preds,
+        )?;
+        Ok(fused)
+    }
+
+    fn collect_matching_row_ids_fused<T>(
+        &self,
+        field_id: LogicalFieldId,
+        ops: &[Operator<'_>],
+    ) -> LlkvResult<Vec<u64>>
+    where
+        T: FilterPrimitive,
+        T::Native: FromLiteral + Copy + PredicateValue,
+    {
+        let mut preds: Vec<llkv_expr::typed_predicate::Predicate<T::Native>> =
+            Vec::with_capacity(ops.len());
+        for op in ops {
+            let p = build_fixed_width_predicate::<T>(op).map_err(Error::predicate_build)?;
+            preds.push(p);
+        }
+        // Call the fused dispatch implemented on FilterDispatch for primitives
+        let fused = <T as llkv_column_map::store::scan::filter::FilterDispatch>::run_fused(
+            self.table.store(),
+            field_id,
+            &preds,
+        )?;
+        Ok(fused)
     }
 }
 
