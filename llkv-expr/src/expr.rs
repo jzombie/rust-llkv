@@ -121,9 +121,44 @@ pub enum Operator<'a> {
     LessThan(Literal),
     LessThanOrEquals(Literal),
     In(&'a [Literal]),
-    StartsWith(&'a str),
-    EndsWith(&'a str),
-    Contains(&'a str),
+    StartsWith {
+        pattern: &'a str,
+        case_sensitive: bool,
+    },
+    EndsWith {
+        pattern: &'a str,
+        case_sensitive: bool,
+    },
+    Contains {
+        pattern: &'a str,
+        case_sensitive: bool,
+    },
+}
+
+impl<'a> Operator<'a> {
+    #[inline]
+    pub fn starts_with(pattern: &'a str, case_sensitive: bool) -> Self {
+        Operator::StartsWith {
+            pattern,
+            case_sensitive,
+        }
+    }
+
+    #[inline]
+    pub fn ends_with(pattern: &'a str, case_sensitive: bool) -> Self {
+        Operator::EndsWith {
+            pattern,
+            case_sensitive,
+        }
+    }
+
+    #[inline]
+    pub fn contains(pattern: &'a str, case_sensitive: bool) -> Self {
+        Operator::Contains {
+            pattern,
+            case_sensitive,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -177,7 +212,7 @@ mod tests {
         };
         let f4 = Filter {
             field_id: 4u32,
-            op: Operator::StartsWith("pre"),
+            op: Operator::starts_with("pre", true),
         };
 
         // ( f1 AND ( f2 OR NOT f3 ) )  OR  ( NOT f1 AND f4 )
@@ -377,27 +412,45 @@ mod tests {
 
         let f_sw = Filter {
             field_id: 10u32,
-            op: Operator::StartsWith("pre"),
+            op: Operator::starts_with("pre", true),
         };
         let f_ew = Filter {
             field_id: 11u32,
-            op: Operator::EndsWith("suf"),
+            op: Operator::ends_with("suf", true),
         };
         let f_ct = Filter {
             field_id: 12u32,
-            op: Operator::Contains("mid"),
+            op: Operator::contains("mid", true),
         };
 
         match f_sw.op {
-            Operator::StartsWith(b) => assert_eq!(b, "pre"),
+            Operator::StartsWith {
+                pattern: b,
+                case_sensitive,
+            } => {
+                assert_eq!(b, "pre");
+                assert!(case_sensitive);
+            }
             _ => panic!(),
         }
         match f_ew.op {
-            Operator::EndsWith(b) => assert_eq!(b, "suf"),
+            Operator::EndsWith {
+                pattern: b,
+                case_sensitive,
+            } => {
+                assert_eq!(b, "suf");
+                assert!(case_sensitive);
+            }
             _ => panic!(),
         }
         match f_ct.op {
-            Operator::Contains(b) => assert_eq!(b, "mid"),
+            Operator::Contains {
+                pattern: b,
+                case_sensitive,
+            } => {
+                assert_eq!(b, "mid");
+                assert!(case_sensitive);
+            }
             _ => panic!(),
         }
     }

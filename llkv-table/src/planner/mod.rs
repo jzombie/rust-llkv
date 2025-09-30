@@ -4,23 +4,27 @@ use std::cmp;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, RecordBatch};
+use arrow::array::{Array, ArrayRef, OffsetSizeTrait, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 
 use llkv_column_map::ScanBuilder;
 use llkv_column_map::llkv_for_each_arrow_numeric;
+use llkv_column_map::parallel;
 use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_expr::literal::{FromLiteral, Literal};
-use llkv_expr::typed_predicate::build_predicate;
+use llkv_expr::typed_predicate::{
+    PredicateValue, build_fixed_width_predicate, build_var_width_predicate,
+};
 use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use llkv_storage::pager::Pager;
+use rayon::prelude::*;
 
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::scalar_eval::{NumericArrayMap, NumericKernels};
@@ -338,6 +342,55 @@ struct PlannedScan<'expr> {
     plan_graph: PlanGraph,
 }
 
+#[derive(Default, Clone, Copy)]
+struct FieldPredicateStats {
+    total: usize,
+    contains: usize,
+}
+
+#[derive(Default)]
+struct PredicateFusionCache {
+    per_field: FxHashMap<FieldId, FieldPredicateStats>,
+}
+
+impl PredicateFusionCache {
+    fn from_expr(expr: &Expr<'_, FieldId>) -> Self {
+        let mut cache = Self::default();
+        cache.record_expr(expr);
+        cache
+    }
+
+    fn record_expr(&mut self, expr: &Expr<'_, FieldId>) {
+        match expr {
+            Expr::Pred(filter) => {
+                let entry = self.per_field.entry(filter.field_id).or_default();
+                entry.total += 1;
+                if matches!(filter.op, Operator::Contains { .. }) {
+                    entry.contains += 1;
+                }
+            }
+            Expr::And(children) | Expr::Or(children) => {
+                for child in children {
+                    self.record_expr(child);
+                }
+            }
+            Expr::Not(inner) => self.record_expr(inner),
+            Expr::Compare { .. } => {}
+        }
+    }
+
+    fn should_fuse(&self, field_id: FieldId, dtype: &DataType) -> bool {
+        let Some(stats) = self.per_field.get(&field_id) else {
+            return false;
+        };
+
+        match dtype {
+            DataType::Utf8 | DataType::LargeUtf8 => stats.contains >= 1 && stats.total >= 2,
+            _ => stats.total >= 2,
+        }
+    }
+}
+
 pub(crate) struct TableExecutor<'a, P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -624,8 +677,10 @@ where
         }
         let out_schema = Arc::new(Schema::new(schema_fields));
 
+        let fusion_cache = PredicateFusionCache::from_expr(&filter_expr);
         let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
-        let row_ids = self.collect_row_ids_for_expr(&filter_expr, &mut all_rows_cache)?;
+        let row_ids =
+            self.collect_row_ids_for_expr(&filter_expr, &fusion_cache, &mut all_rows_cache)?;
         if row_ids.is_empty() {
             return Ok(());
         }
@@ -636,73 +691,104 @@ where
             GatherNullPolicy::DropNulls
         };
 
-        let mut gather_ctx = self.table.store().prepare_gather_context(&unique_lfids)?;
-
         let requires_numeric = projection_evals.iter().enumerate().any(|(idx, eval)| {
             matches!(eval, ProjectionEval::Computed(_)) && passthrough_fields[idx].is_none()
         });
 
-        let mut offset = 0usize;
-        while offset < row_ids.len() {
-            let end = cmp::min(offset + STREAM_BATCH_ROWS, row_ids.len());
-            let window = &row_ids[offset..end];
+        let table_id = self.table.table_id();
+        let store = self.table.store();
+        let unique_lfids = Arc::new(unique_lfids);
+        let projection_evals = Arc::new(projection_evals);
+        let passthrough_fields = Arc::new(passthrough_fields);
+        let unique_index = Arc::new(unique_index);
+        let numeric_fields = Arc::new(numeric_fields);
 
-            let batch = self.table.store().gather_rows_with_reusable_context(
-                &mut gather_ctx,
-                window,
-                null_policy,
-            )?;
+        let chunk_ranges: Vec<(usize, usize)> = (0..row_ids.len())
+            .step_by(STREAM_BATCH_ROWS)
+            .map(|start| {
+                let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
+                (start, end)
+            })
+            .collect();
 
-            if batch.num_rows() == 0 {
-                offset = end;
-                continue;
-            }
-
-            let unique_arrays = batch.columns();
-            let numeric_arrays: Option<NumericArrayMap> = if requires_numeric {
-                Some(NumericKernels::prepare_numeric_arrays(
-                    &unique_lfids,
-                    unique_arrays,
-                    &numeric_fields,
-                )?)
-            } else {
-                None
-            };
-
-            let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
-            for (idx, eval) in projection_evals.iter().enumerate() {
-                match eval {
-                    ProjectionEval::Column(info) => {
-                        let arr_idx = *unique_index
-                            .get(&info.logical_field_id)
-                            .expect("logical field id missing from index");
-                        columns.push(Arc::clone(&unique_arrays[arr_idx]));
-                    }
-                    ProjectionEval::Computed(info) => {
-                        if let Some(fid) = passthrough_fields[idx] {
-                            let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
-                            let arr_idx = *unique_index
-                                .get(&lfid)
-                                .expect("passthrough field missing from index");
-                            columns.push(Arc::clone(&unique_arrays[arr_idx]));
-                        } else {
-                            let numeric_arrays = numeric_arrays
-                                .as_ref()
-                                .expect("numeric arrays should exist for computed projection");
-                            let array = NumericKernels::evaluate_batch(
-                                &info.expr,
-                                batch.num_rows(),
-                                numeric_arrays,
-                            )?;
-                            columns.push(array);
+        let chunk_batches: Vec<LlkvResult<Option<RecordBatch>>> =
+            parallel::with_thread_pool(move || {
+                chunk_ranges
+                    .into_par_iter()
+                    .map(|(start, end)| -> LlkvResult<Option<RecordBatch>> {
+                        let window = &row_ids[start..end];
+                        if window.is_empty() {
+                            return Ok(None);
                         }
-                    }
-                }
-            }
 
-            let output_batch = RecordBatch::try_new(out_schema.clone(), columns)?;
-            on_batch(output_batch);
-            offset = end;
+                        let unique_lfids = Arc::clone(&unique_lfids);
+                        let projection_evals = Arc::clone(&projection_evals);
+                        let passthrough_fields = Arc::clone(&passthrough_fields);
+                        let unique_index = Arc::clone(&unique_index);
+                        let numeric_fields = Arc::clone(&numeric_fields);
+
+                        let mut gather_ctx = store.prepare_gather_context(unique_lfids.as_ref())?;
+                        let batch = store.gather_rows_with_reusable_context(
+                            &mut gather_ctx,
+                            window,
+                            null_policy,
+                        )?;
+                        if batch.num_rows() == 0 {
+                            return Ok(None);
+                        }
+
+                        let unique_arrays = batch.columns();
+                        let numeric_arrays: Option<NumericArrayMap> = if requires_numeric {
+                            Some(NumericKernels::prepare_numeric_arrays(
+                                unique_lfids.as_ref(),
+                                unique_arrays,
+                                numeric_fields.as_ref(),
+                            )?)
+                        } else {
+                            None
+                        };
+
+                        let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
+                        for (idx, eval) in projection_evals.iter().enumerate() {
+                            match eval {
+                                ProjectionEval::Column(info) => {
+                                    let arr_idx = *unique_index
+                                        .get(&info.logical_field_id)
+                                        .expect("logical field id missing from index");
+                                    columns.push(Arc::clone(&unique_arrays[arr_idx]));
+                                }
+                                ProjectionEval::Computed(info) => {
+                                    if let Some(fid) = passthrough_fields[idx] {
+                                        let lfid = LogicalFieldId::for_user(table_id, fid);
+                                        let arr_idx = *unique_index
+                                            .get(&lfid)
+                                            .expect("passthrough field missing from index");
+                                        columns.push(Arc::clone(&unique_arrays[arr_idx]));
+                                    } else {
+                                        let numeric_arrays = numeric_arrays.as_ref().expect(
+                                            "numeric arrays should exist for computed projection",
+                                        );
+                                        let array = NumericKernels::evaluate_batch(
+                                            &info.expr,
+                                            batch.num_rows(),
+                                            numeric_arrays,
+                                        )?;
+                                        columns.push(array);
+                                    }
+                                }
+                            }
+                        }
+
+                        let output_batch = RecordBatch::try_new(Arc::clone(&out_schema), columns)?;
+                        Ok(Some(output_batch))
+                    })
+                    .collect()
+            });
+
+        for batch_result in chunk_batches {
+            if let Some(batch) = batch_result? {
+                on_batch(batch);
+            }
         }
 
         Ok(())
@@ -737,6 +823,9 @@ where
                 }
 
                 let dtype = self.table.store().data_type(p.logical_field_id)?;
+                if matches!(dtype, DataType::Utf8 | DataType::LargeUtf8) {
+                    return Ok(false);
+                }
                 let field_name = p
                     .alias
                     .clone()
@@ -850,6 +939,7 @@ where
     fn collect_row_ids_for_expr(
         &self,
         expr: &Expr<'_, FieldId>,
+        fusion_cache: &PredicateFusionCache,
         all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
     ) -> LlkvResult<Vec<u64>> {
         match expr {
@@ -863,11 +953,74 @@ where
                         "AND expression requires at least one predicate".into(),
                     ));
                 }
+                // Fast-path fusion: if this AND is composed solely of Pred nodes on the
+                // same field, build typed predicates and call the storage fused runtime
+                // entrypoint. This avoids multiple scans over the same column.
+                let mut same_field: Option<FieldId> = None;
+                let mut all_preds_same_field = true;
+                for child in children.iter() {
+                    if let Expr::Pred(f) = child {
+                        if let Some(sf) = same_field {
+                            if f.field_id != sf {
+                                all_preds_same_field = false;
+                                break;
+                            }
+                        } else {
+                            same_field = Some(f.field_id);
+                        }
+                    } else {
+                        all_preds_same_field = false;
+                        break;
+                    }
+                }
+
+                if all_preds_same_field {
+                    let fid = same_field.expect("non-empty children checked");
+                    let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
+                    let dtype = self.table.store().data_type(filter_lfid)?;
+
+                    if fusion_cache.should_fuse(fid, &dtype) {
+                        // Collect operator list
+                        let ops: Vec<Operator<'_>> = children
+                            .iter()
+                            .map(|c| match c {
+                                Expr::Pred(f) => f.op.clone(),
+                                _ => unreachable!(),
+                            })
+                            .collect();
+
+                        let row_ids = match &dtype {
+                            DataType::Utf8 => {
+                                self.collect_matching_row_ids_string_fused::<i32>(filter_lfid, &ops)
+                            }
+                            DataType::LargeUtf8 => {
+                                self.collect_matching_row_ids_string_fused::<i64>(filter_lfid, &ops)
+                            }
+                            other => llkv_column_map::with_integer_arrow_type!(
+                                other.clone(),
+                                |ArrowTy| self
+                                    .collect_matching_row_ids_fused::<ArrowTy>(filter_lfid, &ops,),
+                                Err(Error::Internal(format!(
+                                    "Filtering on type {:?} is not supported",
+                                    other
+                                ))),
+                            ),
+                        }?;
+
+                        return Ok(normalize_row_ids(row_ids));
+                    }
+                }
+
+                // Fallback to existing iterative intersection for mixed expressions.
                 let mut iter = children.iter();
-                let mut acc =
-                    self.collect_row_ids_for_expr(iter.next().unwrap(), all_rows_cache)?;
+                let mut acc = self.collect_row_ids_for_expr(
+                    iter.next().unwrap(),
+                    fusion_cache,
+                    all_rows_cache,
+                )?;
                 for child in iter {
-                    let next_ids = self.collect_row_ids_for_expr(child, all_rows_cache)?;
+                    let next_ids =
+                        self.collect_row_ids_for_expr(child, fusion_cache, all_rows_cache)?;
                     if acc.is_empty() || next_ids.is_empty() {
                         return Ok(Vec::new());
                     }
@@ -886,7 +1039,8 @@ where
                 }
                 let mut acc = Vec::new();
                 for child in children {
-                    let next_ids = self.collect_row_ids_for_expr(child, all_rows_cache)?;
+                    let next_ids =
+                        self.collect_row_ids_for_expr(child, fusion_cache, all_rows_cache)?;
                     if acc.is_empty() {
                         acc = next_ids;
                     } else if !next_ids.is_empty() {
@@ -900,7 +1054,7 @@ where
                 if domain.is_empty() {
                     return Ok(Vec::new());
                 }
-                let matched = self.collect_row_ids_for_expr(inner, all_rows_cache)?;
+                let matched = self.collect_row_ids_for_expr(inner, fusion_cache, all_rows_cache)?;
                 Ok(difference_sorted(domain, matched))
             }
         }
@@ -919,14 +1073,20 @@ where
             return Ok(expand_filter_runs(&runs));
         }
 
-        let row_ids = llkv_column_map::with_integer_arrow_type!(
-            dtype.clone(),
-            |ArrowTy| self.collect_matching_row_ids::<ArrowTy>(filter_lfid, &filter.op),
-            Err(Error::Internal(format!(
-                "Filtering on type {:?} is not supported",
-                dtype
-            ))),
-        )?;
+        let row_ids = match &dtype {
+            DataType::Utf8 => self.collect_matching_row_ids_string::<i32>(filter_lfid, &filter.op),
+            DataType::LargeUtf8 => {
+                self.collect_matching_row_ids_string::<i64>(filter_lfid, &filter.op)
+            }
+            other => llkv_column_map::with_integer_arrow_type!(
+                other.clone(),
+                |ArrowTy| self.collect_matching_row_ids::<ArrowTy>(filter_lfid, &filter.op),
+                Err(Error::Internal(format!(
+                    "Filtering on type {:?} is not supported",
+                    other
+                ))),
+            ),
+        }?;
 
         Ok(normalize_row_ids(row_ids))
     }
@@ -1094,12 +1254,74 @@ where
     ) -> LlkvResult<Vec<u64>>
     where
         T: FilterPrimitive,
-        T::Native: FromLiteral + Copy,
+        T::Native: FromLiteral + Copy + PredicateValue,
     {
-        let predicate = build_predicate::<T>(op).map_err(Error::predicate_build)?;
+        let predicate = build_fixed_width_predicate::<T>(op).map_err(Error::predicate_build)?;
+        self.table.store().filter_row_ids::<T>(field_id, &predicate)
+    }
+
+    fn collect_matching_row_ids_string<O>(
+        &self,
+        field_id: LogicalFieldId,
+        op: &Operator<'_>,
+    ) -> LlkvResult<Vec<u64>>
+    where
+        O: OffsetSizeTrait + llkv_column_map::store::scan::filter::StringContainsKernel,
+    {
+        let predicate = build_var_width_predicate(op).map_err(Error::predicate_build)?;
         self.table
             .store()
-            .filter_row_ids::<T, _>(field_id, move |value| predicate.matches(value))
+            .filter_row_ids::<llkv_column_map::store::scan::filter::Utf8Filter<O>>(
+                field_id, &predicate,
+            )
+    }
+
+    fn collect_matching_row_ids_string_fused<O>(
+        &self,
+        field_id: LogicalFieldId,
+        ops: &[Operator<'_>],
+    ) -> LlkvResult<Vec<u64>>
+    where
+        O: OffsetSizeTrait + llkv_column_map::store::scan::filter::StringContainsKernel,
+    {
+        // Build predicates for each operator and call the fused dispatch on Utf8Filter
+        let mut preds: Vec<llkv_expr::typed_predicate::Predicate<String>> =
+            Vec::with_capacity(ops.len());
+        for op in ops {
+            let p = build_var_width_predicate(op).map_err(Error::predicate_build)?;
+            preds.push(p);
+        }
+        // Call the specialized fused runtime on Utf8Filter via the FilterDispatch trait
+        let fused = <llkv_column_map::store::scan::filter::Utf8Filter<O> as llkv_column_map::store::scan::filter::FilterDispatch>::run_fused(
+            self.table.store(),
+            field_id,
+            &preds,
+        )?;
+        Ok(fused)
+    }
+
+    fn collect_matching_row_ids_fused<T>(
+        &self,
+        field_id: LogicalFieldId,
+        ops: &[Operator<'_>],
+    ) -> LlkvResult<Vec<u64>>
+    where
+        T: FilterPrimitive,
+        T::Native: FromLiteral + Copy + PredicateValue,
+    {
+        let mut preds: Vec<llkv_expr::typed_predicate::Predicate<T::Native>> =
+            Vec::with_capacity(ops.len());
+        for op in ops {
+            let p = build_fixed_width_predicate::<T>(op).map_err(Error::predicate_build)?;
+            preds.push(p);
+        }
+        // Call the fused dispatch implemented on FilterDispatch for primitives
+        let fused = <T as llkv_column_map::store::scan::filter::FilterDispatch>::run_fused(
+            self.table.store(),
+            field_id,
+            &preds,
+        )?;
+        Ok(fused)
     }
 }
 
@@ -1175,10 +1397,27 @@ fn format_operator(op: &Operator<'_>) -> String {
             let rendered: Vec<String> = values.iter().map(format_literal).collect();
             format!("IN {{{}}}", rendered.join(", "))
         }
-        Operator::StartsWith(prefix) => format!("STARTS WITH \"{}\"", escape_string(prefix)),
-        Operator::EndsWith(suffix) => format!("ENDS WITH \"{}\"", escape_string(suffix)),
-        Operator::Contains(fragment) => format!("CONTAINS \"{}\"", escape_string(fragment)),
+        Operator::StartsWith {
+            pattern,
+            case_sensitive,
+        } => format_pattern_op("STARTS WITH", pattern, *case_sensitive),
+        Operator::EndsWith {
+            pattern,
+            case_sensitive,
+        } => format_pattern_op("ENDS WITH", pattern, *case_sensitive),
+        Operator::Contains {
+            pattern,
+            case_sensitive,
+        } => format_pattern_op("CONTAINS", pattern, *case_sensitive),
     }
+}
+
+fn format_pattern_op(op_name: &str, pattern: &str, case_sensitive: bool) -> String {
+    let mut rendered = format!("{} \"{}\"", op_name, escape_string(pattern));
+    if !case_sensitive {
+        rendered.push_str(" (case-insensitive)");
+    }
+    rendered
 }
 
 fn format_range_bound_lower(bound: &Bound<Literal>) -> String {

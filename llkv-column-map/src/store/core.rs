@@ -3,12 +3,14 @@ use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
 };
+use crate::store::scan::filter::FilterDispatch;
 use crate::store::scan::{FilterPrimitive, FilterResult};
 use crate::types::LogicalFieldId;
 use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, UInt64Array};
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use llkv_expr::typed_predicate::Predicate;
 use llkv_result::{Error, Result};
 use llkv_storage::{
     constants::CATALOG_ROOT_PKEY,
@@ -76,10 +78,13 @@ where
     }
 
     /// Collects the row ids whose values satisfy the provided predicate.
-    pub fn filter_row_ids<T, F>(&self, field_id: LogicalFieldId, predicate: F) -> Result<Vec<u64>>
+    pub fn filter_row_ids<T>(
+        &self,
+        field_id: LogicalFieldId,
+        predicate: &Predicate<T::Value>,
+    ) -> Result<Vec<u64>>
     where
-        T: FilterPrimitive,
-        F: FnMut(T::Native) -> bool,
+        T: FilterDispatch,
     {
         T::run_filter(self, field_id, predicate)
     }
@@ -114,6 +119,56 @@ where
 
         let kinds = descriptor.get_indexes()?;
         Ok(kinds)
+    }
+
+    /// Return the total number of rows recorded for the given logical field.
+    ///
+    /// This reads the ColumnDescriptor.total_row_count stored in the catalog and
+    /// descriptor pages and returns it as a u64. The value is updated by append
+    /// / delete code paths and represents the persisted row count for that column.
+    pub fn total_rows_for_field(&self, field_id: LogicalFieldId) -> Result<u64> {
+        let catalog = self.catalog.read().unwrap();
+        let desc_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+        drop(catalog);
+
+        let desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: desc_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
+
+        let desc = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+        Ok(desc.total_row_count)
+    }
+
+    /// Return the total number of rows for a table by inspecting any persisted
+    /// user-data column descriptor belonging to `table_id`.
+    ///
+    /// This method picks the first user-data column found in the in-memory
+    /// catalog for the table and returns its descriptor.total_row_count. If the
+    /// table has no persisted columns, `Ok(0)` is returned.
+    pub fn total_rows_for_table(&self, table_id: crate::types::TableId) -> Result<u64> {
+        use crate::types::Namespace;
+        // Acquire read lock on catalog and find any matching user-data field
+        let catalog = self.catalog.read().unwrap();
+        let mut candidate: Option<LogicalFieldId> = None;
+        for (&lfid, _) in catalog.map.iter() {
+            if lfid.namespace() == Namespace::UserData && lfid.table_id() == table_id {
+                candidate = Some(lfid);
+                break;
+            }
+        }
+        drop(catalog);
+
+        if let Some(field) = candidate {
+            self.total_rows_for_field(field)
+        } else {
+            Ok(0)
+        }
     }
 
     /// Fast presence check using the presence index (row-id permutation) if available.
@@ -211,6 +266,7 @@ where
         Ok(false)
     }
 
+    // TODO: Set up a way to optionally auto-increment a row ID column if not provided.
     #[allow(unused_variables, unused_assignments)] // TODO: Keep `presence_index_created`?
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         // --- PHASE 1: PRE-PROCESSING THE INCOMING BATCH ---

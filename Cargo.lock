@@ -841,10 +841,12 @@ dependencies = [
  "arrow-ord",
  "criterion",
  "line-ending",
+ "llkv-expr",
  "llkv-result",
  "llkv-storage",
  "modular-bitfield",
  "rand",
+ "rayon",
  "roaring",
  "rustc-hash",
  "simd-r-drive-entry-handle",
@@ -857,7 +859,6 @@ version = "0.1.0-alpha"
 dependencies = [
  "arrow",
  "arrow-array",
- "llkv-column-map",
 ]
 
 [[package]]

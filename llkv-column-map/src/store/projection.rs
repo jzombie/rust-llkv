@@ -2,7 +2,8 @@ use super::*;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::types::LogicalFieldId;
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, PrimitiveArray, PrimitiveBuilder, UInt64Array, new_empty_array,
+    Array, ArrayRef, BooleanArray, GenericStringArray, GenericStringBuilder, OffsetSizeTrait,
+    PrimitiveArray, PrimitiveBuilder, UInt64Array, new_empty_array,
 };
 use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
@@ -310,22 +311,38 @@ where
 
         let mut outputs = Vec::with_capacity(ctx.plans().len());
         for plan in ctx.plans() {
-            let array = with_integer_arrow_type!(
-                plan.dtype.clone(),
-                |ArrowTy| {
-                    Self::gather_rows_single_shot::<ArrowTy>(
-                        &row_index,
-                        row_ids.len(),
-                        plan,
-                        &mut chunk_map,
-                        allow_missing,
-                    )
-                },
-                Err(Error::Internal(format!(
-                    "gather_rows_multi: unsupported dtype {:?}",
-                    plan.dtype
-                ))),
-            )?;
+            let array = match &plan.dtype {
+                DataType::Utf8 => Self::gather_rows_single_shot_string::<i32>(
+                    &row_index,
+                    row_ids.len(),
+                    plan,
+                    &mut chunk_map,
+                    allow_missing,
+                ),
+                DataType::LargeUtf8 => Self::gather_rows_single_shot_string::<i64>(
+                    &row_index,
+                    row_ids.len(),
+                    plan,
+                    &mut chunk_map,
+                    allow_missing,
+                ),
+                other => with_integer_arrow_type!(
+                    other.clone(),
+                    |ArrowTy| {
+                        Self::gather_rows_single_shot::<ArrowTy>(
+                            &row_index,
+                            row_ids.len(),
+                            plan,
+                            &mut chunk_map,
+                            allow_missing,
+                        )
+                    },
+                    Err(Error::Internal(format!(
+                        "gather_rows_multi: unsupported dtype {:?}",
+                        other
+                    ))),
+                ),
+            }?;
             outputs.push(array);
         }
 
@@ -539,25 +556,47 @@ where
 
             let mut outputs = Vec::with_capacity(ctx.plans().len());
             for plan in ctx.plans() {
-                let array = with_integer_arrow_type!(
-                    plan.dtype.clone(),
-                    |ArrowTy| {
-                        Self::gather_rows_from_chunks::<ArrowTy>(
-                            row_ids,
-                            row_locator,
-                            len,
-                            &plan.candidate_indices,
-                            plan,
-                            ctx.chunk_cache(),
-                            &mut row_scratch,
-                            allow_missing,
-                        )
-                    },
-                    Err(Error::Internal(format!(
-                        "gather_rows_multi: unsupported dtype {:?}",
-                        plan.dtype
-                    ))),
-                )?;
+                let array = match &plan.dtype {
+                    DataType::Utf8 => Self::gather_rows_from_chunks_string::<i32>(
+                        row_ids,
+                        row_locator,
+                        len,
+                        &plan.candidate_indices,
+                        plan,
+                        ctx.chunk_cache(),
+                        &mut row_scratch,
+                        allow_missing,
+                    ),
+                    DataType::LargeUtf8 => Self::gather_rows_from_chunks_string::<i64>(
+                        row_ids,
+                        row_locator,
+                        len,
+                        &plan.candidate_indices,
+                        plan,
+                        ctx.chunk_cache(),
+                        &mut row_scratch,
+                        allow_missing,
+                    ),
+                    other => with_integer_arrow_type!(
+                        other.clone(),
+                        |ArrowTy| {
+                            Self::gather_rows_from_chunks::<ArrowTy>(
+                                row_ids,
+                                row_locator,
+                                len,
+                                &plan.candidate_indices,
+                                plan,
+                                ctx.chunk_cache(),
+                                &mut row_scratch,
+                                allow_missing,
+                            )
+                        },
+                        Err(Error::Internal(format!(
+                            "gather_rows_multi: unsupported dtype {:?}",
+                            other
+                        ))),
+                    ),
+                }?;
                 outputs.push(array);
             }
 
@@ -626,6 +665,90 @@ where
         idx < sorted_row_ids.len() && sorted_row_ids[idx] <= max
     }
 
+    fn gather_rows_single_shot_string<O>(
+        row_index: &FxHashMap<u64, usize>,
+        len: usize,
+        plan: &FieldPlan,
+        chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
+        allow_missing: bool,
+    ) -> Result<ArrayRef>
+    where
+        O: OffsetSizeTrait,
+    {
+        if len == 0 {
+            let mut builder = GenericStringBuilder::<O>::new();
+            return Ok(Arc::new(builder.finish()) as ArrayRef);
+        }
+
+        let mut values: Vec<Option<String>> = vec![None; len];
+        let mut found: Vec<bool> = vec![false; len];
+
+        for &idx in &plan.candidate_indices {
+            let value_chunk = chunk_blobs
+                .remove(&plan.value_metas[idx].chunk_pk)
+                .ok_or(Error::NotFound)?;
+            let row_chunk = chunk_blobs
+                .remove(&plan.row_metas[idx].chunk_pk)
+                .ok_or(Error::NotFound)?;
+
+            let value_any = deserialize_array(value_chunk)?;
+            let value_arr = value_any
+                .as_any()
+                .downcast_ref::<GenericStringArray<O>>()
+                .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
+            let row_any = deserialize_array(row_chunk)?;
+            let row_arr = row_any
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
+
+            for i in 0..row_arr.len() {
+                if !row_arr.is_valid(i) {
+                    continue;
+                }
+                let row_id = row_arr.value(i);
+                if let Some(&out_idx) = row_index.get(&row_id) {
+                    found[out_idx] = true;
+                    if value_arr.is_null(i) {
+                        values[out_idx] = None;
+                    } else {
+                        values[out_idx] = Some(value_arr.value(i).to_owned());
+                    }
+                }
+            }
+        }
+
+        if !allow_missing {
+            if found.iter().any(|f| !*f) {
+                return Err(Error::Internal(
+                    "gather_rows_multi: one or more requested row IDs were not found".into(),
+                ));
+            }
+        } else {
+            for (idx, was_found) in found.iter().enumerate() {
+                if !*was_found {
+                    values[idx] = None;
+                }
+            }
+        }
+
+        let total_bytes: usize = values
+            .iter()
+            .filter_map(|v| v.as_ref().map(|s| s.len()))
+            .sum();
+
+        let mut builder = GenericStringBuilder::<O>::with_capacity(len, total_bytes);
+        for value in values {
+            match value {
+                Some(s) => builder.append_value(&s),
+                None => builder.append_null(),
+            }
+        }
+
+        Ok(Arc::new(builder.finish()) as ArrayRef)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn gather_rows_single_shot<T>(
         row_index: &FxHashMap<u64, usize>,
         len: usize,
@@ -695,6 +818,138 @@ where
 
         let array = PrimitiveArray::<T>::from_iter(values);
         Ok(Arc::new(array) as ArrayRef)
+    }
+
+    #[allow(clippy::too_many_arguments)] // TODO: Refactor
+    fn gather_rows_from_chunks_string<O>(
+        row_ids: &[u64],
+        row_locator: RowLocator,
+        len: usize,
+        candidate_indices: &[usize],
+        plan: &FieldPlan,
+        chunk_arrays: &FxHashMap<PhysicalKey, ArrayRef>,
+        row_scratch: &mut [Option<(usize, usize)>],
+        allow_missing: bool,
+    ) -> Result<ArrayRef>
+    where
+        O: OffsetSizeTrait,
+    {
+        if len == 0 {
+            let mut builder = GenericStringBuilder::<O>::new();
+            return Ok(Arc::new(builder.finish()) as ArrayRef);
+        }
+
+        if candidate_indices.len() == 1 {
+            let chunk_idx = candidate_indices[0];
+            let value_any = chunk_arrays
+                .get(&plan.value_metas[chunk_idx].chunk_pk)
+                .ok_or(Error::NotFound)?;
+            let row_any = chunk_arrays
+                .get(&plan.row_metas[chunk_idx].chunk_pk)
+                .ok_or(Error::NotFound)?;
+            let _value_arr = value_any
+                .as_any()
+                .downcast_ref::<GenericStringArray<O>>()
+                .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
+            let row_arr = row_any
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
+
+            if row_arr.null_count() == 0 && row_ids.windows(2).all(|w| w[0] <= w[1]) {
+                let values = row_arr.values();
+                if let Ok(start_idx) = values.binary_search(&row_ids[0])
+                    && start_idx + len <= values.len()
+                    && row_ids == &values[start_idx..start_idx + len]
+                {
+                    return Ok(value_any.slice(start_idx, len));
+                }
+            }
+        }
+
+        for slot in row_scratch.iter_mut().take(len) {
+            *slot = None;
+        }
+
+        let mut candidates: Vec<(usize, &GenericStringArray<O>, &UInt64Array)> =
+            Vec::with_capacity(candidate_indices.len());
+        let mut chunk_lookup: FxHashMap<usize, usize> = FxHashMap::default();
+
+        for (slot, &chunk_idx) in candidate_indices.iter().enumerate() {
+            let value_any = chunk_arrays
+                .get(&plan.value_metas[chunk_idx].chunk_pk)
+                .ok_or(Error::NotFound)?;
+            let value_arr = value_any
+                .as_any()
+                .downcast_ref::<GenericStringArray<O>>()
+                .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
+            let row_any = chunk_arrays
+                .get(&plan.row_metas[chunk_idx].chunk_pk)
+                .ok_or(Error::NotFound)?;
+            let row_arr = row_any
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
+
+            candidates.push((chunk_idx, value_arr, row_arr));
+            chunk_lookup.insert(chunk_idx, slot);
+
+            for i in 0..row_arr.len() {
+                if !row_arr.is_valid(i) {
+                    continue;
+                }
+                let row_id = row_arr.value(i);
+                if let Some(out_idx) = row_locator.lookup(row_id, len) {
+                    row_scratch[out_idx] = Some((chunk_idx, i));
+                }
+            }
+        }
+
+        let mut total_bytes = 0usize;
+        for row_scratch_item in row_scratch.iter().take(len) {
+            if let Some((chunk_idx, value_idx)) = row_scratch_item {
+                let slot = *chunk_lookup.get(chunk_idx).ok_or_else(|| {
+                    Error::Internal("gather_rows_multi: chunk lookup missing".into())
+                })?;
+                let (_, value_arr, _) = candidates[slot];
+                if !value_arr.is_null(*value_idx) {
+                    total_bytes += value_arr.value(*value_idx).len();
+                }
+            } else if !allow_missing {
+                return Err(Error::Internal(
+                    "gather_rows_multi: one or more requested row IDs were not found".into(),
+                ));
+            }
+        }
+
+        let mut builder = GenericStringBuilder::<O>::with_capacity(len, total_bytes);
+        for row_scratch_item in row_scratch.iter().take(len) {
+            match row_scratch_item {
+                Some((chunk_idx, value_idx)) => {
+                    let slot = *chunk_lookup.get(chunk_idx).ok_or_else(|| {
+                        Error::Internal("gather_rows_multi: chunk lookup missing".into())
+                    })?;
+                    let (_, value_arr, _) = candidates[slot];
+                    if value_arr.is_null(*value_idx) {
+                        builder.append_null();
+                    } else {
+                        builder.append_value(value_arr.value(*value_idx));
+                    }
+                }
+                None => {
+                    if allow_missing {
+                        builder.append_null();
+                    } else {
+                        return Err(Error::Internal(
+                            "gather_rows_multi: one or more requested row IDs were not found"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(Arc::new(builder.finish()) as ArrayRef)
     }
 
     #[allow(clippy::too_many_arguments)] // TODO: Refactor

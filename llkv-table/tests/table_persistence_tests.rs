@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Float32Array, Float64Array, Int16Array, Int32Array, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Float32Array, Float64Array, Int16Array, Int32Array, StringArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -41,6 +41,7 @@ fn table_persistence_many_columns_simd_r_drive() {
     const F_F64: FieldId = 15;
     const F_F32: FieldId = 16;
     const F_U16: FieldId = 18;
+    const F_STR: FieldId = 19;
 
     // 4 rows
     let rows: Vec<RowId> = vec![1, 2, 3, 4];
@@ -54,6 +55,7 @@ fn table_persistence_many_columns_simd_r_drive() {
     let v_f64 = vec![1.5_f64, 2.5, 3.5, 4.5];
     let v_f32 = vec![1.0_f32, 2.0, 3.0, 4.0];
     let v_u16 = vec![100_u16, 200, 300, 400];
+    let v_str = vec!["alpha", "beta", "gamma", "delta"];
 
     // ---------- Session 1: create pager + table, write a batch ----------
     {
@@ -71,6 +73,7 @@ fn table_persistence_many_columns_simd_r_drive() {
             field_with_fid("f64_col", DataType::Float64, F_F64, false),
             field_with_fid("f32_col", DataType::Float32, F_F32, false),
             field_with_fid("u16_col", DataType::UInt16, F_U16, false),
+            field_with_fid("str_col", DataType::Utf8, F_STR, false),
         ]));
 
         let batch = RecordBatch::try_new(
@@ -85,6 +88,7 @@ fn table_persistence_many_columns_simd_r_drive() {
                 Arc::new(Float64Array::from(v_f64.clone())),
                 Arc::new(Float32Array::from(v_f32.clone())),
                 Arc::new(UInt16Array::from(v_u16.clone())),
+                Arc::new(StringArray::from(v_str.clone())),
             ],
         )
         .unwrap();
@@ -132,5 +136,19 @@ fn table_persistence_many_columns_simd_r_drive() {
         assert_prim_eq!(F_F64, DataType::Float64, Float64Array, v_f64);
         assert_prim_eq!(F_F32, DataType::Float32, Float32Array, v_f32);
         assert_prim_eq!(F_U16, DataType::UInt16, UInt16Array, v_u16);
+
+        assert_eq!(store.data_type(lfid(F_STR)).unwrap(), DataType::Utf8);
+        let batch = store
+            .gather_rows(&[lfid(F_STR)], &rows, GatherNullPolicy::ErrorOnMissing)
+            .unwrap();
+        let arr = batch
+            .column(0)
+            .as_ref()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for (idx, expected) in v_str.iter().enumerate() {
+            assert_eq!(arr.value(idx), *expected);
+        }
     }
 }

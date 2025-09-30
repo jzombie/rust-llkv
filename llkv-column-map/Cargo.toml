@@ -13,9 +13,11 @@ arrow = { workspace = true }
 arrow-ord = { workspace = true }
 llkv-result = { workspace = true }
 llkv-storage = { workspace = true }
+llkv-expr = { workspace = true }
 modular-bitfield = { workspace = true }
 roaring = { workspace = true }
-rustc-hash.workspace = true
+rustc-hash = { workspace = true }
+rayon = { workspace = true }
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
 thiserror = { workspace = true }
 

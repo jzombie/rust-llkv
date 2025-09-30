@@ -194,6 +194,32 @@ where
     pub fn table_id(&self) -> TableId {
         self.table_id
     }
+
+    /// Return the total number of rows for a given user column id in this table.
+    ///
+    /// This delegates to the ColumnStore descriptor for the logical field that
+    /// corresponds to (table_id, col_id) and returns the persisted total_row_count.
+    pub fn total_rows_for_col(&self, col_id: FieldId) -> llkv_result::Result<u64> {
+        let lfid = LogicalFieldId::for_user(self.table_id, col_id);
+        self.store.total_rows_for_field(lfid)
+    }
+
+    /// Return the total number of rows for this table.
+    ///
+    /// Prefer reading the dedicated row-id shadow column if present; otherwise
+    /// fall back to inspecting any persisted user column descriptor.
+    pub fn total_rows(&self) -> llkv_result::Result<u64> {
+        use llkv_column_map::store::rowid_fid;
+        let rid_lfid = rowid_fid(LogicalFieldId::for_user(self.table_id, 0));
+        // Try the row-id shadow column first
+        match self.store.total_rows_for_field(rid_lfid) {
+            Ok(n) => Ok(n),
+            Err(_) => {
+                // Fall back to scanning the catalog for any user-data column
+                self.store.total_rows_for_table(self.table_id)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -204,8 +230,8 @@ mod tests {
     use arrow::array::Array;
     use arrow::array::ArrayRef;
     use arrow::array::{
-        BinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, UInt8Array, UInt32Array,
-        UInt64Array,
+        BinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, StringArray, UInt8Array,
+        UInt32Array, UInt64Array,
     };
     use arrow::compute::{cast, max, min, sum, unary};
     use arrow::datatypes::DataType;
@@ -333,6 +359,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(vals, vec![Some(20), Some(20)]);
+    }
+
+    #[test]
+    fn test_scan_with_string_filter() {
+        let pager = Arc::new(MemPager::default());
+        let table = Table::new(500, Arc::clone(&pager)).unwrap();
+
+        const COL_STR: FieldId = 42;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("name", DataType::Utf8, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                COL_STR.to_string(),
+            )])),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["alice", "bob", "albert", "carol"])),
+            ],
+        )
+        .unwrap();
+        table.append(&batch).unwrap();
+
+        let expr = pred_expr(Filter {
+            field_id: COL_STR,
+            op: Operator::starts_with("al", true),
+        });
+
+        let mut collected: Vec<Option<String>> = Vec::new();
+        table
+            .scan_stream(
+                &[proj(&table, COL_STR)],
+                &expr,
+                ScanStreamOptions::default(),
+                |b| {
+                    let arr = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                    collected.extend(arr.iter().map(|v| v.map(|s| s.to_string())));
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            collected,
+            vec![Some("alice".to_string()), Some("albert".to_string())]
+        );
     }
 
     #[test]

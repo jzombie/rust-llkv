@@ -138,6 +138,9 @@ enum PrimType {
     UInt16 = 9,
     UInt8 = 10,
     Float64 = 11,
+    Utf8 = 12,
+    LargeBinary = 13,
+    LargeUtf8 = 14,
 }
 
 // Re-export convenience helpers from codecs to keep call sites tidy.
@@ -159,6 +162,9 @@ fn prim_from_datatype(dt: &DataType) -> Result<PrimType> {
         Float32 => PrimType::Float32,
         Float64 => PrimType::Float64,
         Binary => PrimType::Binary,
+        Utf8 => PrimType::Utf8,
+        LargeBinary => PrimType::LargeBinary,
+        LargeUtf8 => PrimType::LargeUtf8,
         _ => return Err(Error::Internal("unsupported Arrow type".into())),
     };
     Ok(p)
@@ -180,6 +186,9 @@ fn datatype_from_prim(p: PrimType) -> Result<DataType> {
         PrimType::Float32 => Float32,
         PrimType::Float64 => Float64,
         PrimType::Binary => Binary,
+        PrimType::Utf8 => Utf8,
+        PrimType::LargeBinary => LargeBinary,
+        PrimType::LargeUtf8 => LargeUtf8,
     };
     Ok(dt)
 }
@@ -189,6 +198,9 @@ pub fn serialize_array(arr: &dyn Array) -> Result<Vec<u8>> {
     match arr.data_type() {
         // Var-len path stays explicit to preserve layout.
         &DataType::Binary => serialize_varlen(arr, PrimType::Binary),
+        &DataType::Utf8 => serialize_varlen(arr, PrimType::Utf8),
+        &DataType::LargeBinary => serialize_varlen(arr, PrimType::LargeBinary),
+        &DataType::LargeUtf8 => serialize_varlen(arr, PrimType::LargeUtf8),
 
         // Special-case fixed-size list of f32 as before.
         &DataType::FixedSizeList(ref child, list_size) => {
@@ -389,9 +401,6 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
             let p = PrimType::try_from(type_code)
                 .map_err(|_| Error::Internal("unsupported varlen code".into()))?;
             let data_type = datatype_from_prim(p)?;
-            if data_type != DataType::Binary {
-                return Err(Error::Internal("varlen layout supports Binary only".into()));
-            }
 
             let data = ArrayData::builder(data_type)
                 .len(len)
@@ -423,4 +432,7 @@ const _: () = {
     ["code changed"][!(PrimType::UInt16 as u8 == 9) as usize];
     ["code changed"][!(PrimType::UInt8 as u8 == 10) as usize];
     ["code changed"][!(PrimType::Float64 as u8 == 11) as usize];
+    ["code changed"][!(PrimType::Utf8 as u8 == 12) as usize];
+    ["code changed"][!(PrimType::LargeBinary as u8 == 13) as usize];
+    ["code changed"][!(PrimType::LargeUtf8 as u8 == 14) as usize];
 };
