@@ -895,6 +895,11 @@ name = "llkv-csv"
 version = "0.1.0-alpha"
 dependencies = [
  "arrow",
+ "llkv-column-map",
+ "llkv-result",
+ "llkv-storage",
+ "llkv-table",
+ "simd-r-drive-entry-handle",
  "tempfile",
 ]
 
@@ -948,7 +953,6 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "llkv-column-map",
- "llkv-csv",
  "llkv-expr",
  "llkv-plan",
  "llkv-result",

@@ -7,13 +7,13 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
-use llkv_csv::{CsvReadOptions, open_csv_reader};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::table::Table;
-use crate::types::FieldId;
+use llkv_table::{Table, types::FieldId};
+
+use crate::{CsvReadOptions, open_csv_reader};
 
 fn convert_row_id(array: &ArrayRef) -> LlkvResult<ArrayRef> {
     match array.data_type() {

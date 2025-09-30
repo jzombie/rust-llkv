@@ -6,14 +6,13 @@ use std::sync::Arc;
 use arrow::array::{Float64Array, Int64Array, StringArray};
 use llkv_column_map::store::Projection;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_expr::{Expr, Filter, Operator};
+use llkv_csv::{CsvReadOptions, append_csv_into_table};
 use llkv_storage::pager::MemPager;
-use tempfile::NamedTempFile;
-
-use llkv_csv::CsvReadOptions;
+use llkv_table::Table;
+use llkv_table::expr::{Expr, Filter, Operator};
 use llkv_table::table::ScanStreamOptions;
 use llkv_table::types::FieldId;
-use llkv_table::{Table, append_csv_into_table};
+use tempfile::NamedTempFile;
 
 fn write_sample_csv() -> NamedTempFile {
     let mut tmp = NamedTempFile::new().expect("create tmp csv");
@@ -40,19 +39,19 @@ fn csv_append_roundtrip() {
     append_csv_into_table(&table, csv_file.path(), &field_mapping, &options)
         .expect("append csv into table");
 
-    let all_rows = Expr::Pred(Filter {
+    let projections = vec![
+        Projection::from(LogicalFieldId::for_user(table.table_id(), 1)),
+        Projection::from(LogicalFieldId::for_user(table.table_id(), 2)),
+        Projection::from(LogicalFieldId::for_user(table.table_id(), 3)),
+    ];
+
+    let filter_all_rows = Expr::Pred(Filter {
         field_id: 1,
         op: Operator::Range {
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
         },
     });
-
-    let projections = vec![
-        Projection::from(LogicalFieldId::for_user(table.table_id(), 1)),
-        Projection::from(LogicalFieldId::for_user(table.table_id(), 2)),
-        Projection::from(LogicalFieldId::for_user(table.table_id(), 3)),
-    ];
 
     let mut ints: Vec<i64> = Vec::new();
     let mut floats: Vec<f64> = Vec::new();
@@ -61,7 +60,7 @@ fn csv_append_roundtrip() {
     table
         .scan_stream(
             &projections,
-            &all_rows,
+            &filter_all_rows,
             ScanStreamOptions::default(),
             |batch| {
                 let int_col = batch

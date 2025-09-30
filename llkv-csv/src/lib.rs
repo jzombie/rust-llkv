@@ -9,6 +9,9 @@ use arrow::datatypes::SchemaRef;
 
 pub type CsvResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
+pub mod csv_ingest;
+pub use csv_ingest::append_csv_into_table;
+
 #[derive(Debug, Clone)]
 pub struct CsvReadOptions {
     pub has_header: bool,
