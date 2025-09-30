@@ -176,7 +176,7 @@ def python_substring_scan():
     arr = build_strings(NUM_ROWS)
     found = 0
     for s in arr:
-        if 'needle' in s:
+        if 'needle' in s and s.startswith('row-'):
             found += 1
     assert found == NUM_ROWS // 1000
 
@@ -205,7 +205,15 @@ with tempfile.TemporaryDirectory() as td2:
 
     # --- Polars: Parquet scan (lazy) for substring ---
     def polars_disk_substring():
-        out = pl.scan_parquet(pq_path).filter(pl.col('s').str.contains('needle')).select(pl.col('s').count()).collect()
+        out = (
+            pl.scan_parquet(pq_path)
+            .filter(
+                pl.col('s').str.contains('needle')
+                & pl.col('s').str.starts_with('row-')
+            )
+            .select(pl.col('s').count())
+            .collect()
+        )
         # materialize
         _ = out
 
@@ -213,30 +221,52 @@ with tempfile.TemporaryDirectory() as td2:
     def duckdb_parquet_substring():
         con = duckdb.connect()
         con.execute("PRAGMA threads=4")
-        _ = con.execute(f"SELECT COUNT(*) FROM read_parquet('{pq_path}') WHERE s LIKE '%needle%'").fetchone()
+        _ = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{pq_path}') WHERE s LIKE '%needle%' AND s LIKE 'row-%'"
+        ).fetchone()
         con.close()
 
     # --- DuckDB: db file ---
     def duckdb_dbfile_substring():
         con = duckdb.connect(db_path)
         con.execute("PRAGMA threads=4")
-        _ = con.execute("SELECT COUNT(*) FROM strings WHERE s LIKE '%needle%'").fetchone()
+        _ = con.execute(
+            "SELECT COUNT(*) FROM strings WHERE s LIKE '%needle%' AND s LIKE 'row-%'"
+        ).fetchone()
         con.close()
 
     # --- Pandas: Parquet read + substring filter ---
     def pandas_disk_substring():
         df = pd.read_parquet(pq_path, engine="pyarrow")
-        _ = int(df['s'].str.contains('needle').sum())
+        _ = int(
+            (
+                df['s'].str.contains('needle')
+                & df['s'].str.startswith('row-')
+            ).sum()
+        )
 
     # --- Polars in-memory ---
     polars_str_df = pl.DataFrame({"s": strings})
     def polars_in_memory_substring():
-        out = polars_str_df.lazy().filter(pl.col('s').str.contains('needle')).select(pl.col('s').count()).collect()
+        out = (
+            polars_str_df.lazy()
+            .filter(
+                pl.col('s').str.contains('needle')
+                & pl.col('s').str.starts_with('row-')
+            )
+            .select(pl.col('s').count())
+            .collect()
+        )
         _ = out
 
     # --- Pandas in-memory ---
     def pandas_in_memory_substring():
-        _ = int(pandas_str_df['s'].str.contains('needle').sum())
+        _ = int(
+            (
+                pandas_str_df['s'].str.contains('needle')
+                & pandas_str_df['s'].str.startswith('row-')
+            ).sum()
+        )
 
     # Measure each backend
     print('\n--- String substring scan across backends ---')
