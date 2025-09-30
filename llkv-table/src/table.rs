@@ -194,6 +194,32 @@ where
     pub fn table_id(&self) -> TableId {
         self.table_id
     }
+
+    /// Return the total number of rows for a given user column id in this table.
+    ///
+    /// This delegates to the ColumnStore descriptor for the logical field that
+    /// corresponds to (table_id, col_id) and returns the persisted total_row_count.
+    pub fn total_rows_for_col(&self, col_id: FieldId) -> llkv_result::Result<u64> {
+        let lfid = LogicalFieldId::for_user(self.table_id, col_id);
+        self.store.total_rows_for_field(lfid)
+    }
+
+    /// Return the total number of rows for this table.
+    ///
+    /// Prefer reading the dedicated row-id shadow column if present; otherwise
+    /// fall back to inspecting any persisted user column descriptor.
+    pub fn total_rows(&self) -> llkv_result::Result<u64> {
+        use llkv_column_map::store::rowid_fid;
+        let rid_lfid = rowid_fid(LogicalFieldId::for_user(self.table_id, 0));
+        // Try the row-id shadow column first
+        match self.store.total_rows_for_field(rid_lfid) {
+            Ok(n) => Ok(n),
+            Err(_) => {
+                // Fall back to scanning the catalog for any user-data column
+                self.store.total_rows_for_table(self.table_id)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
