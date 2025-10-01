@@ -317,6 +317,74 @@ where
             }
         }
     }
+
+    /// Join this table with another table based on equality predicates.
+    ///
+    /// This is the primary join API. It streams output batches to the provided
+    /// callback, keeping memory usage bounded. The join is performed according
+    /// to the specified keys and options.
+    ///
+    /// # Arguments
+    ///
+    /// * `right` - The right-hand table to join with
+    /// * `keys` - Join key pairs describing which columns to equate
+    /// * `options` - Join type, algorithm, and performance hints
+    /// * `on_batch` - Callback invoked for each output RecordBatch
+    ///
+    /// # Output Schema
+    ///
+    /// - For Inner/Left/Right/Full joins: all left columns followed by all
+    ///   right columns. Columns with identical names will appear twice.
+    /// - For Semi/Anti joins: only left columns (no right columns).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use llkv_table::join::{JoinType, JoinOptions, JoinKey};
+    ///
+    /// let keys = vec![JoinKey::new(left_field_id, right_field_id)];
+    /// let options = JoinOptions::inner();
+    ///
+    /// left_table.join_stream(&right_table, &keys, &options, |batch| {
+    ///     println!("Joined batch: {} rows", batch.num_rows());
+    /// })?;
+    /// ```
+    pub fn join_stream<F>(
+        &self,
+        right: &Table<P>,
+        keys: &[crate::join::JoinKey],
+        options: &crate::join::JoinOptions,
+        on_batch: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(RecordBatch),
+    {
+        use crate::join::{validate_join_keys, validate_join_options};
+
+        validate_join_keys(keys)?;
+        validate_join_options(options)?;
+
+        match options.algorithm {
+            crate::join::JoinAlgorithm::NestedLoop => {
+                crate::join::nested_loop::nested_loop_join_stream(
+                    self, right, keys, options, on_batch,
+                )
+            }
+            crate::join::JoinAlgorithm::Hash => {
+                // TODO: Implement hash join
+                Err(Error::Internal(
+                    "Hash join not yet implemented; use JoinAlgorithm::NestedLoop".to_string(),
+                ))
+            }
+            crate::join::JoinAlgorithm::SortMerge => {
+                // TODO: Implement sort-merge join
+                Err(Error::Internal(
+                    "Sort-merge join not yet implemented; use JoinAlgorithm::NestedLoop"
+                        .to_string(),
+                ))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
