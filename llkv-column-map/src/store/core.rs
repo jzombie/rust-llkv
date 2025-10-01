@@ -288,6 +288,30 @@ where
     }
 
     // TODO: Set up a way to optionally auto-increment a row ID column if not provided.
+
+    /// NOTE (logical table separation):
+    ///
+    /// The ColumnStore stores data per logical field (a LogicalFieldId) rather
+    /// than per 'table' directly. A LogicalFieldId encodes a namespace and a
+    /// table id together (see [crate::types::LogicalFieldId]). This design lets
+    /// multiple tables share the same underlying storage layer without
+    /// collisions because every persisted column descriptor, chunk chain and
+    /// presence/permutation index is keyed by the full LogicalFieldId.
+    ///
+    /// Concretely:
+    /// - `catalog.map` maps each LogicalFieldId -> descriptor physical key .
+    /// - Each ColumnDescriptor contains chunk metadata and a persisted
+    ///   `total_row_count` for that logical field only.
+    /// - Row-id shadow columns (presence/permutation indices) are created per
+    ///   logical field (they are derived from the LogicalFieldId) and are used
+    ///   for fast existence checks and indexed gathers.
+    ///
+    /// The `append` implementation below expects incoming RecordBatches to be
+    /// namespaced: each field's metadata contains a "field_id" that, when
+    /// combined with the current table id, maps to the LogicalFieldId the
+    /// ColumnStore will append into. This ensures that appends for different
+    /// tables never overwrite each other's descriptors or chunks because the
+    /// LogicalFieldId namespace keeps them separate.
     #[allow(unused_variables, unused_assignments)] // TODO: Keep `presence_index_created`?
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         // --- PHASE 1: PRE-PROCESSING THE INCOMING BATCH ---
