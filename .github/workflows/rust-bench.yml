@@ -57,7 +57,7 @@ jobs:
       THRESHOLD_FLAGS: --threshold-measure latency --threshold-test t_test --threshold-max-sample-size 64 --threshold-upper-boundary 0.99 --thresholds-reset --err
       # Configure sccache to use local disk storage for self-hosted runners.
       # This persists the cache across workflow runs on the same runner.
-      SCCACHE_DIR: ".sccache"
+      SCCACHE_DIR: "./.sccache"
       SCCACHE_CACHE_SIZE: "5G"
     steps:
       - uses: actions/checkout@v4
