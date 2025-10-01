@@ -55,7 +55,7 @@
 //! })?;
 //! ```
 
-pub(crate) mod nested_loop;
+pub(crate) mod hash_join;
 
 use crate::types::FieldId;
 use llkv_result::{Error, Result as LlkvResult};
@@ -126,22 +126,20 @@ impl JoinKey {
 /// Algorithm to use for join execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum JoinAlgorithm {
-    /// Nested-loop join: simple, correct, O(N*M) worst-case.
-    /// Suitable for small inputs or non-equi predicates.
-    #[default]
-    NestedLoop,
     /// Hash join: build hash table on one side, probe with other.
-    /// Good for equality joins; can spill to disk for large inputs.
+    /// O(N+M) complexity - suitable for production workloads.
+    /// Default and recommended for all equality joins.
+    #[default]
     Hash,
     /// Sort-merge join: sort both sides, then merge.
     /// Good for pre-sorted inputs or when memory is constrained.
+    /// Not yet implemented.
     SortMerge,
 }
 
 impl fmt::Display for JoinAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            JoinAlgorithm::NestedLoop => write!(f, "NestedLoop"),
             JoinAlgorithm::Hash => write!(f, "Hash"),
             JoinAlgorithm::SortMerge => write!(f, "SortMerge"),
         }
@@ -168,7 +166,7 @@ impl Default for JoinOptions {
     fn default() -> Self {
         Self {
             join_type: JoinType::Inner,
-            algorithm: JoinAlgorithm::NestedLoop,
+            algorithm: JoinAlgorithm::Hash,
             batch_size: 8192,
             memory_limit_bytes: None,
             concurrency: 1,
@@ -346,7 +344,6 @@ mod tests {
 
     #[test]
     fn test_join_algorithm_display() {
-        assert_eq!(JoinAlgorithm::NestedLoop.to_string(), "NestedLoop");
         assert_eq!(JoinAlgorithm::Hash.to_string(), "Hash");
         assert_eq!(JoinAlgorithm::SortMerge.to_string(), "SortMerge");
     }

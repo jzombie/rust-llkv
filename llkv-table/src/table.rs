@@ -365,21 +365,15 @@ where
         validate_join_options(options)?;
 
         match options.algorithm {
-            crate::join::JoinAlgorithm::NestedLoop => {
-                crate::join::nested_loop::nested_loop_join_stream(
+            crate::join::JoinAlgorithm::Hash => {
+                crate::join::hash_join::hash_join_stream(
                     self, right, keys, options, on_batch,
                 )
-            }
-            crate::join::JoinAlgorithm::Hash => {
-                // TODO: Implement hash join
-                Err(Error::Internal(
-                    "Hash join not yet implemented; use JoinAlgorithm::NestedLoop".to_string(),
-                ))
             }
             crate::join::JoinAlgorithm::SortMerge => {
                 // TODO: Implement sort-merge join
                 Err(Error::Internal(
-                    "Sort-merge join not yet implemented; use JoinAlgorithm::NestedLoop"
+                    "Sort-merge join not yet implemented; use JoinAlgorithm::Hash"
                         .to_string(),
                 ))
             }
