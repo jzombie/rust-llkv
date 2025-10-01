@@ -366,15 +366,12 @@ where
 
         match options.algorithm {
             crate::join::JoinAlgorithm::Hash => {
-                crate::join::hash_join::hash_join_stream(
-                    self, right, keys, options, on_batch,
-                )
+                crate::join::hash_join::hash_join_stream(self, right, keys, options, on_batch)
             }
             crate::join::JoinAlgorithm::SortMerge => {
                 // TODO: Implement sort-merge join
                 Err(Error::Internal(
-                    "Sort-merge join not yet implemented; use JoinAlgorithm::Hash"
-                        .to_string(),
+                    "Sort-merge join not yet implemented; use JoinAlgorithm::Hash".to_string(),
                 ))
             }
         }

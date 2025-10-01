@@ -160,7 +160,7 @@ where
 
     // Probe phase: scan left side and emit matches
     let batch_size = options.batch_size;
-    
+
     if !left_projections.is_empty() {
         let filter_expr = build_all_rows_filter(&left_projections)?;
 
@@ -209,7 +209,10 @@ where
                         &mut on_batch,
                     ),
                     _ => {
-                        eprintln!("Hash join does not yet support {:?}, falling back would cause issues", options.join_type);
+                        eprintln!(
+                            "Hash join does not yet support {:?}, falling back would cause issues",
+                            options.join_type
+                        );
                         Ok(())
                     }
                 };
@@ -256,7 +259,10 @@ where
             // Extract keys for all rows in this batch
             for row_idx in 0..batch.num_rows() {
                 if let Ok(key) = extract_hash_key(&batch, &key_indices, row_idx, join_keys) {
-                    hash_table.entry(key).or_default().push((batch_idx, row_idx));
+                    hash_table
+                        .entry(key)
+                        .or_default()
+                        .push((batch_idx, row_idx));
                 }
             }
 
@@ -278,7 +284,7 @@ fn extract_hash_key(
 
     for (&col_idx, join_key) in key_indices.iter().zip(join_keys) {
         let column = batch.column(col_idx);
-        
+
         // Handle NULL
         if column.is_null(row_idx) {
             if join_key.null_equals_null {
@@ -301,44 +307,94 @@ fn extract_key_value(column: &ArrayRef, row_idx: usize) -> LlkvResult<KeyValue> 
     use arrow::array::*;
 
     let value = match column.data_type() {
-        DataType::Int8 => {
-            KeyValue::Int8(column.as_any().downcast_ref::<Int8Array>().unwrap().value(row_idx))
-        }
-        DataType::Int16 => {
-            KeyValue::Int16(column.as_any().downcast_ref::<Int16Array>().unwrap().value(row_idx))
-        }
-        DataType::Int32 => {
-            KeyValue::Int32(column.as_any().downcast_ref::<Int32Array>().unwrap().value(row_idx))
-        }
-        DataType::Int64 => {
-            KeyValue::Int64(column.as_any().downcast_ref::<Int64Array>().unwrap().value(row_idx))
-        }
-        DataType::UInt8 => {
-            KeyValue::UInt8(column.as_any().downcast_ref::<UInt8Array>().unwrap().value(row_idx))
-        }
-        DataType::UInt16 => {
-            KeyValue::UInt16(column.as_any().downcast_ref::<UInt16Array>().unwrap().value(row_idx))
-        }
-        DataType::UInt32 => {
-            KeyValue::UInt32(column.as_any().downcast_ref::<UInt32Array>().unwrap().value(row_idx))
-        }
-        DataType::UInt64 => {
-            KeyValue::UInt64(column.as_any().downcast_ref::<UInt64Array>().unwrap().value(row_idx))
-        }
+        DataType::Int8 => KeyValue::Int8(
+            column
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .value(row_idx),
+        ),
+        DataType::Int16 => KeyValue::Int16(
+            column
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap()
+                .value(row_idx),
+        ),
+        DataType::Int32 => KeyValue::Int32(
+            column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(row_idx),
+        ),
+        DataType::Int64 => KeyValue::Int64(
+            column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row_idx),
+        ),
+        DataType::UInt8 => KeyValue::UInt8(
+            column
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .value(row_idx),
+        ),
+        DataType::UInt16 => KeyValue::UInt16(
+            column
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .unwrap()
+                .value(row_idx),
+        ),
+        DataType::UInt32 => KeyValue::UInt32(
+            column
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .value(row_idx),
+        ),
+        DataType::UInt64 => KeyValue::UInt64(
+            column
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(row_idx),
+        ),
         DataType::Float32 => {
-            let val = column.as_any().downcast_ref::<Float32Array>().unwrap().value(row_idx);
+            let val = column
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(row_idx);
             KeyValue::Float32(val.to_bits())
         }
         DataType::Float64 => {
-            let val = column.as_any().downcast_ref::<Float64Array>().unwrap().value(row_idx);
+            let val = column
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row_idx);
             KeyValue::Float64(val.to_bits())
         }
-        DataType::Utf8 => {
-            KeyValue::Utf8(column.as_any().downcast_ref::<StringArray>().unwrap().value(row_idx).to_string())
-        }
-        DataType::Binary => {
-            KeyValue::Binary(column.as_any().downcast_ref::<BinaryArray>().unwrap().value(row_idx).to_vec())
-        }
+        DataType::Utf8 => KeyValue::Utf8(
+            column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row_idx)
+                .to_string(),
+        ),
+        DataType::Binary => KeyValue::Binary(
+            column
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(row_idx)
+                .to_vec(),
+        ),
         dt => {
             return Err(Error::Internal(format!(
                 "Unsupported join key type: {:?}",
@@ -370,7 +426,8 @@ where
 
     for probe_row_idx in 0..probe_batch.num_rows() {
         if let Ok(key) = extract_hash_key(probe_batch, probe_key_indices, probe_row_idx, join_keys)
-            && let Some(build_rows) = hash_table.get(&key) {
+            && let Some(build_rows) = hash_table.get(&key)
+        {
             for &(batch_idx, row_idx) in build_rows {
                 probe_indices.push(probe_row_idx);
                 build_indices.push((batch_idx, row_idx));
@@ -427,16 +484,17 @@ where
 
     for probe_row_idx in 0..probe_batch.num_rows() {
         let mut found_match = false;
-        
+
         if let Ok(key) = extract_hash_key(probe_batch, probe_key_indices, probe_row_idx, join_keys)
-            && let Some(build_rows) = hash_table.get(&key) {
+            && let Some(build_rows) = hash_table.get(&key)
+        {
             for &(batch_idx, row_idx) in build_rows {
                 probe_indices.push(probe_row_idx);
                 build_indices.push(Some((batch_idx, row_idx)));
                 found_match = true;
             }
         }
-        
+
         if !found_match {
             // No match - emit probe row with NULLs for build side
             probe_indices.push(probe_row_idx);
@@ -491,7 +549,8 @@ where
 
     for probe_row_idx in 0..probe_batch.num_rows() {
         if let Ok(key) = extract_hash_key(probe_batch, probe_key_indices, probe_row_idx, join_keys)
-            && hash_table.contains_key(&key) {
+            && hash_table.contains_key(&key)
+        {
             probe_indices.push(probe_row_idx);
         }
 
@@ -528,10 +587,11 @@ where
 
     for probe_row_idx in 0..probe_batch.num_rows() {
         let mut found = false;
-        if let Ok(key) = extract_hash_key(probe_batch, probe_key_indices, probe_row_idx, join_keys) {
+        if let Ok(key) = extract_hash_key(probe_batch, probe_key_indices, probe_row_idx, join_keys)
+        {
             found = hash_table.contains_key(&key);
         }
-        
+
         if !found {
             probe_indices.push(probe_row_idx);
         }
@@ -657,10 +717,10 @@ fn build_all_rows_filter(projections: &[ScanProjection]) -> LlkvResult<Expr<'sta
         ScanProjection::Computed { .. } => {
             return Err(Error::InvalidArgumentError(
                 "join projections cannot include computed columns yet".to_string(),
-            ))
+            ));
         }
     };
-    
+
     Ok(Expr::Pred(Filter {
         field_id: first_field,
         op: Operator::Range {
@@ -670,19 +730,13 @@ fn build_all_rows_filter(projections: &[ScanProjection]) -> LlkvResult<Expr<'sta
     }))
 }
 
-fn extract_left_key_indices(
-    keys: &[JoinKey],
-    schema: &Arc<Schema>,
-) -> LlkvResult<Vec<usize>> {
+fn extract_left_key_indices(keys: &[JoinKey], schema: &Arc<Schema>) -> LlkvResult<Vec<usize>> {
     keys.iter()
         .map(|key| find_field_index(schema, key.left_field))
         .collect()
 }
 
-fn extract_right_key_indices(
-    keys: &[JoinKey],
-    schema: &Arc<Schema>,
-) -> LlkvResult<Vec<usize>> {
+fn extract_right_key_indices(keys: &[JoinKey], schema: &Arc<Schema>) -> LlkvResult<Vec<usize>> {
     keys.iter()
         .map(|key| find_field_index(schema, key.right_field))
         .collect()
@@ -749,9 +803,8 @@ fn build_output_schema(
 }
 
 fn gather_indices(batch: &RecordBatch, indices: &[usize]) -> LlkvResult<Vec<ArrayRef>> {
-    let indices_array = arrow::array::UInt32Array::from(
-        indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
-    );
+    let indices_array =
+        arrow::array::UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
 
     let mut result = Vec::new();
     for column in batch.columns() {
@@ -787,7 +840,8 @@ fn gather_indices_from_batches(
             column_data.push(single_row);
         }
 
-        let concatenated = arrow::compute::concat(&column_data.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?;
+        let concatenated =
+            arrow::compute::concat(&column_data.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?;
         result.push(concatenated);
     }
 
@@ -826,7 +880,8 @@ fn gather_optional_indices_from_batches(
             }
         }
 
-        let concatenated = arrow::compute::concat(&column_data.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?;
+        let concatenated =
+            arrow::compute::concat(&column_data.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?;
         result.push(concatenated);
     }
 

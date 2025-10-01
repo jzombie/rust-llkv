@@ -17,11 +17,11 @@
 
 use arrow::array::{Int32Array, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_storage::pager::MemPager;
-use llkv_table::join::{JoinKey, JoinOptions};
 use llkv_table::Table;
+use llkv_table::join::{JoinKey, JoinOptions};
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -38,14 +38,10 @@ fn create_table_with_rows(
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
-        Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-            "field_id".to_string(),
-            "1".to_string(),
-        )])),
-        Field::new("value", DataType::Utf8, false).with_metadata(HashMap::from([(
-            "field_id".to_string(),
-            "2".to_string(),
-        )])),
+        Field::new("id", DataType::Int32, false)
+            .with_metadata(HashMap::from([("field_id".to_string(), "1".to_string())])),
+        Field::new("value", DataType::Utf8, false)
+            .with_metadata(HashMap::from([("field_id".to_string(), "2".to_string())])),
     ]));
 
     // Create data in batches of 10,000 rows
@@ -78,13 +74,13 @@ fn create_table_with_rows(
 }
 
 /// Benchmark nested-loop inner join with small table sizes.
-/// 
+///
 /// NOTE: Nested-loop join is O(N×M), so performance degrades quadratically.
 /// These benchmarks use small sizes because:
 /// - 10K×10K = 100M comparisons (~1.5 seconds)
 /// - 100K×100K = 10B comparisons (~2.5 minutes)
 /// - 1M×1M = 1T comparisons (hours!)
-/// 
+///
 /// Hash join (O(N+M)) enables production workloads.
 fn bench_hash_join_inner_join(c: &mut Criterion) {
     let mut group = c.benchmark_group("hash_join_inner_join");
@@ -97,7 +93,7 @@ fn bench_hash_join_inner_join(c: &mut Criterion) {
         let bench_id = BenchmarkId::from_parameter(size);
         group.bench_with_input(bench_id, &size, |b, &size| {
             let pager = Arc::new(MemPager::default());
-            
+
             // Create two tables with 50% overlap
             // Left:  [0, size)
             // Right: [size/2, size + size/2)
@@ -132,7 +128,7 @@ fn bench_hash_join_left_join(c: &mut Criterion) {
         let bench_id = BenchmarkId::from_parameter(size);
         group.bench_with_input(bench_id, &size, |b, &size| {
             let pager = Arc::new(MemPager::default());
-            
+
             let left = create_table_with_rows(1, &pager, size, 0);
             let right = create_table_with_rows(2, &pager, size / 2, (size / 4) as i32);
 
@@ -164,7 +160,7 @@ fn bench_hash_join_semi_join(c: &mut Criterion) {
         let bench_id = BenchmarkId::from_parameter(size);
         group.bench_with_input(bench_id, &size, |b, &size| {
             let pager = Arc::new(MemPager::default());
-            
+
             let left = create_table_with_rows(1, &pager, size, 0);
             let right = create_table_with_rows(2, &pager, size / 10, 0);
 
@@ -196,7 +192,7 @@ fn bench_hash_join_anti_join(c: &mut Criterion) {
         let bench_id = BenchmarkId::from_parameter(size);
         group.bench_with_input(bench_id, &size, |b, &size| {
             let pager = Arc::new(MemPager::default());
-            
+
             let left = create_table_with_rows(1, &pager, size, 0);
             let right = create_table_with_rows(2, &pager, size / 10, size as i32);
 
@@ -230,7 +226,7 @@ fn bench_hash_join_many_to_many_join(c: &mut Criterion) {
         let bench_id = BenchmarkId::from_parameter(size);
         group.bench_with_input(bench_id, &size, |b, &size| {
             let pager = Arc::new(MemPager::default());
-            
+
             // Create tables where many rows have the same id (high cardinality)
             // Each unique id appears 10 times
             let left = create_table_with_rows(1, &pager, size, 0);
@@ -264,7 +260,7 @@ fn bench_hash_join_no_matches_join(c: &mut Criterion) {
         let bench_id = BenchmarkId::from_parameter(size);
         group.bench_with_input(bench_id, &size, |b, &size| {
             let pager = Arc::new(MemPager::default());
-            
+
             // Non-overlapping ranges
             let left = create_table_with_rows(1, &pager, size, 0);
             let right = create_table_with_rows(2, &pager, size, (size * 2) as i32);

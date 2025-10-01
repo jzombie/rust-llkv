@@ -4,8 +4,8 @@ use arrow::array::{Int32Array, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_storage::pager::MemPager;
-use llkv_table::join::{JoinKey, JoinOptions};
 use llkv_table::Table;
+use llkv_table::join::{JoinKey, JoinOptions};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -19,14 +19,10 @@ fn create_test_table(
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
-        Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-            "field_id".to_string(),
-            "1".to_string(),
-        )])),
-        Field::new("name", DataType::Utf8, false).with_metadata(HashMap::from([(
-            "field_id".to_string(),
-            "2".to_string(),
-        )])),
+        Field::new("id", DataType::Int32, false)
+            .with_metadata(HashMap::from([("field_id".to_string(), "1".to_string())])),
+        Field::new("name", DataType::Utf8, false)
+            .with_metadata(HashMap::from([("field_id".to_string(), "2".to_string())])),
     ]));
 
     let row_ids: Vec<u64> = data.iter().map(|(rid, _, _)| *rid).collect();
@@ -52,10 +48,18 @@ fn test_inner_join_simple() {
     let pager = Arc::new(MemPager::default());
 
     // Left: (1, "Alice"), (2, "Bob"), (3, "Charlie")
-    let left = create_test_table(1, &pager, vec![(0, 1, "Alice"), (1, 2, "Bob"), (2, 3, "Charlie")]);
+    let left = create_test_table(
+        1,
+        &pager,
+        vec![(0, 1, "Alice"), (1, 2, "Bob"), (2, 3, "Charlie")],
+    );
 
     // Right: (2, "Beta"), (3, "Gamma"), (4, "Delta")
-    let right = create_test_table(2, &pager, vec![(0, 2, "Beta"), (1, 3, "Gamma"), (2, 4, "Delta")]);
+    let right = create_test_table(
+        2,
+        &pager,
+        vec![(0, 2, "Beta"), (1, 3, "Gamma"), (2, 4, "Delta")],
+    );
 
     let keys = vec![JoinKey::new(1, 1)]; // Join on id column (field_id=1)
     let options = JoinOptions::inner();
@@ -72,7 +76,11 @@ fn test_inner_join_simple() {
 
     // Verify schema: id, name (left), id, name (right) - row_id excluded
     let schema = &result_batches[0].schema();
-    assert_eq!(schema.fields().len(), 4, "Output should have 4 columns (2 left + 2 right)");
+    assert_eq!(
+        schema.fields().len(),
+        4,
+        "Output should have 4 columns (2 left + 2 right)"
+    );
 }
 
 #[test]
@@ -93,14 +101,21 @@ fn test_left_join() {
 
     // Should have 2 rows: (1, "Alice", NULL) and (2, "Bob", 2, "Beta")
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 2, "Left join should produce 2 rows (all left rows)");
+    assert_eq!(
+        total_rows, 2,
+        "Left join should produce 2 rows (all left rows)"
+    );
 }
 
 #[test]
 fn test_semi_join() {
     let pager = Arc::new(MemPager::default());
 
-    let left = create_test_table(1, &pager, vec![(0, 1, "Alice"), (1, 2, "Bob"), (2, 3, "Charlie")]);
+    let left = create_test_table(
+        1,
+        &pager,
+        vec![(0, 1, "Alice"), (1, 2, "Bob"), (2, 3, "Charlie")],
+    );
     let right = create_test_table(2, &pager, vec![(0, 2, "Beta")]);
 
     let keys = vec![JoinKey::new(1, 1)];
@@ -118,14 +133,22 @@ fn test_semi_join() {
 
     // Verify schema: only left columns (id, name) - row_id excluded
     let schema = &result_batches[0].schema();
-    assert_eq!(schema.fields().len(), 2, "Semi join should only have left columns");
+    assert_eq!(
+        schema.fields().len(),
+        2,
+        "Semi join should only have left columns"
+    );
 }
 
 #[test]
 fn test_anti_join() {
     let pager = Arc::new(MemPager::default());
 
-    let left = create_test_table(1, &pager, vec![(0, 1, "Alice"), (1, 2, "Bob"), (2, 3, "Charlie")]);
+    let left = create_test_table(
+        1,
+        &pager,
+        vec![(0, 1, "Alice"), (1, 2, "Bob"), (2, 3, "Charlie")],
+    );
     let right = create_test_table(2, &pager, vec![(0, 2, "Beta")]);
 
     let keys = vec![JoinKey::new(1, 1)];
@@ -143,7 +166,11 @@ fn test_anti_join() {
 
     // Verify schema: only left columns (id, name) - row_id excluded
     let schema = &result_batches[0].schema();
-    assert_eq!(schema.fields().len(), 2, "Anti join should only have left columns");
+    assert_eq!(
+        schema.fields().len(),
+        2,
+        "Anti join should only have left columns"
+    );
 }
 
 #[test]
@@ -154,7 +181,11 @@ fn test_many_to_many_join() {
     let left = create_test_table(1, &pager, vec![(0, 1, "Alice"), (1, 1, "Alice2")]);
 
     // Right has 3 rows with id=1
-    let right = create_test_table(2, &pager, vec![(0, 1, "Alpha"), (1, 1, "Alpha2"), (2, 1, "Alpha3")]);
+    let right = create_test_table(
+        2,
+        &pager,
+        vec![(0, 1, "Alpha"), (1, 1, "Alpha2"), (2, 1, "Alpha3")],
+    );
 
     let keys = vec![JoinKey::new(1, 1)];
     let options = JoinOptions::inner();
@@ -167,7 +198,10 @@ fn test_many_to_many_join() {
 
     // Should have 2 * 3 = 6 rows (Cartesian product of matching keys)
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 6, "Many-to-many join should produce 6 rows (2 * 3)");
+    assert_eq!(
+        total_rows, 6,
+        "Many-to-many join should produce 6 rows (2 * 3)"
+    );
 }
 
 #[test]
