@@ -312,6 +312,21 @@ where
     /// ColumnStore will append into. This ensures that appends for different
     /// tables never overwrite each other's descriptors or chunks because the
     /// LogicalFieldId namespace keeps them separate.
+    ///
+    /// Constraints and recommended usage:
+    /// - A single `RecordBatch` carries exactly one `ROW_ID` column which is
+    ///   shared by all other columns in that batch. Because of this, a batch
+    ///   is implicitly tied to a single table's row-id space and should not
+    ///   mix columns from different tables.
+    /// - To append data for multiple tables, create separate `RecordBatch`
+    ///   instances (one per table) and call `append` for each. These calls
+    ///   may be executed concurrently for throughput; the ColumnStore persists
+    ///   data per-logical-field so physical writes won't collide.
+    /// - If you need an atomic multi-table append, the current API does not
+    ///   provide that; you'd need a higher-level coordinator that issues the
+    ///   per-table appends within a single transaction boundary (or extend the
+    ///   API to accept per-column row-id arrays). Such a change is more
+    ///   invasive and requires reworking LWW/commit logic.
     #[allow(unused_variables, unused_assignments)] // TODO: Keep `presence_index_created`?
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         // --- PHASE 1: PRE-PROCESSING THE INCOMING BATCH ---
