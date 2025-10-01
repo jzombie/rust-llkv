@@ -83,7 +83,9 @@ where
     let metas = table.catalog().get_cols_meta(table.table_id(), &field_ids);
     let mut mapping = HashMap::with_capacity(metas.len());
     for (fid, meta_opt) in field_ids.into_iter().zip(metas.into_iter()) {
-        if let Some(meta) = meta_opt && let Some(name) = meta.name {
+        if let Some(meta) = meta_opt
+            && let Some(name) = meta.name
+        {
             mapping.insert(name, fid);
         }
     }
@@ -113,7 +115,9 @@ where
         let mut chosen: Option<FieldId> = None;
         let mut should_register_meta = false;
 
-        if let Some(manual) = provided && let Some(&fid) = manual.get(field.name()) {
+        if let Some(manual) = provided
+            && let Some(&fid) = manual.get(field.name())
+        {
             if let Some(&existing_fid) = existing.get(field.name()) {
                 if existing_fid != fid {
                     return Err(Error::InvalidArgumentError(format!(
@@ -129,7 +133,9 @@ where
             chosen = Some(fid);
         }
 
-        if chosen.is_none() && let Some(&fid) = existing.get(field.name()) {
+        if chosen.is_none()
+            && let Some(&fid) = existing.get(field.name())
+        {
             chosen = Some(fid);
         }
 

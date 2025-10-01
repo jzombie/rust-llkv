@@ -273,7 +273,9 @@ where
     }
 
     for projection in projections.iter_mut() {
-        if let ScanProjection::Column(col_proj) = projection && col_proj.alias.is_none() {
+        if let ScanProjection::Column(col_proj) = projection
+            && col_proj.alias.is_none()
+        {
             let field_id = col_proj.logical_field_id.field_id();
             if let Some(name) = alias_map.get(&field_id) {
                 col_proj.alias = Some(name.clone());

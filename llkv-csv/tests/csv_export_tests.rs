@@ -77,7 +77,10 @@ fn export_with_filter_and_custom_options() {
         },
     });
 
-    let options = CsvWriteOptions { delimiter: b'\t', ..Default::default() };
+    let options = CsvWriteOptions {
+        delimiter: b'\t',
+        ..Default::default()
+    };
 
     export_csv_from_table_with_filter(&table, out_file.path(), &columns, &filter_expr, &options)
         .expect("export filtered csv");
