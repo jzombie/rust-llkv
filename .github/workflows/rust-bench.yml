@@ -1,4 +1,4 @@
-name: Continuous Benchmarking with Bencher
+name: rust-bench
 
 on:
   push:

@@ -1,4 +1,4 @@
-name: Rust Lint
+name: rust-lint
 
 on: [push, pull_request]
 
