@@ -11,6 +11,10 @@ jobs:
   test:
     name: Test (OS=${{ matrix.os }}, Features=${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_DIR: "./.sccache"
+      SCCACHE_CACHE_SIZE: "5G"
+      RUSTC_WRAPPER: sccache
     strategy:
       fail-fast: false
       matrix:
@@ -36,9 +40,17 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
+            ${{ env.SCCACHE_DIR }}
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.flags }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
+
+      - name: Ensure sccache directory
+        shell: bash
+        run: mkdir -p "$SCCACHE_DIR"
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Build
         run: cargo build --workspace --all-targets ${{ matrix.flags }}
@@ -47,6 +59,14 @@ jobs:
         # run: cargo test --workspace --all-targets --verbose ${{ matrix.flags }} -- --include-ignored
         # Explicitly ignore benches (workaround for CodSpeed benches running for default)
         run: cargo test --workspace --all-features --verbose --lib --bins --tests --examples -- --include-ignored
+
+      - name: Display sccache stats
+        if: always()
+        shell: bash
+        run: |
+          echo "=== sccache statistics ==="
+          sccache --show-stats
+
 # TODO: Implement
 # Runs the Miri interpreter across all OS targets to detect undefined behavior in unsafe code
 #   miri:
