@@ -3,10 +3,7 @@
 **Work in Progress**
 
 Columnar table using the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
-
-## Design Notes
-
-- `scan_stream` emits column batches without performing row-level filtering. Null handling is delegated to the column-map gatherers so higher layers decide whether to preserve or drop null-only rows.
+This crate is designed to work directly with Arrow `RecordBatch` and does not provide any additional abstraction over the batch data model beyond how batches are queried and streamed. Data is fed into tables and retrieved from tables as batches of `RecordBatch`.
 
 ## License
 
