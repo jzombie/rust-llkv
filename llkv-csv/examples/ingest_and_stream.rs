@@ -9,14 +9,14 @@ use arrow::csv::WriterBuilder;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
-use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME};
+use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME, rowid_fid};
 use llkv_csv::csv_ingest::append_csv_into_table;
 use llkv_csv::{CsvReadOptions, open_csv_reader};
 use llkv_result::{Error as LlkvError, Result as LlkvResult};
 use llkv_storage::pager::MemPager;
+use llkv_table::Table;
 use llkv_table::expr::{Expr, Filter, Operator};
 use llkv_table::table::{ScanProjection, ScanStreamOptions};
-use llkv_table::Table;
 use tempfile::NamedTempFile;
 
 fn main() -> LlkvResult<()> {
@@ -37,12 +37,10 @@ fn run(path: PathBuf) -> LlkvResult<()> {
     let table = Table::new(1, Arc::clone(&pager))?;
 
     let options = CsvReadOptions::default();
-    let augmented_csv = materialize_csv_with_row_ids(path.as_path(), &options)?;
+    let (augmented_csv, _) = materialize_csv_with_row_ids(path.as_path(), &options)?;
     append_csv_into_table(&table, augmented_csv.path(), &options)?;
 
-    let mut logical_fields = table
-        .store()
-        .user_field_ids_for_table(table.table_id());
+    let mut logical_fields = table.store().user_field_ids_for_table(table.table_id());
     if logical_fields.is_empty() {
         println!("The CSV file did not yield any user columns.");
         return Ok(());
@@ -50,20 +48,75 @@ fn run(path: PathBuf) -> LlkvResult<()> {
 
     logical_fields.sort_by_key(|lfid| lfid.field_id());
 
-    let field_ids: Vec<_> = logical_fields.iter().map(|lfid| lfid.field_id()).collect();
-    let column_meta = table.get_cols_meta(&field_ids);
+    // Build a canonical Arrow schema for the table and use it for debug output
+    // and projection construction.
+    let schema = table.schema()?;
 
-    let projections: Vec<ScanProjection> = logical_fields
-        .iter()
-        .enumerate()
-        .map(|(idx, lfid)| {
-            let alias = column_meta
-                .get(idx)
-                .and_then(|meta_opt| meta_opt.as_ref().and_then(|meta| meta.name.clone()))
-                .unwrap_or_else(|| format!("col_{}", lfid.field_id()));
-            ScanProjection::from(Projection::with_alias(*lfid, alias))
-        })
-        .collect();
+    // Debug: show the table schema fields (name, field_id, type)
+    println!("Table schema:");
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if field.name() == ROW_ID_COLUMN_NAME {
+            println!("  [{}] {} (row id)", idx, field.name());
+            continue;
+        }
+        let fid = field
+            .metadata()
+            .get("field_id")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        println!(
+            "  [{}] {} (field_id = {}, type = {:?})",
+            idx,
+            field.name(),
+            fid,
+            field.data_type()
+        );
+    }
+    println!();
+
+    // Build projections from the schema (skip the row_id field)
+    let mut projections: Vec<ScanProjection> = Vec::new();
+    for field in schema.fields().iter() {
+        if field.name() == ROW_ID_COLUMN_NAME {
+            continue;
+        }
+        let fid = field
+            .metadata()
+            .get("field_id")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or_else(|| {
+                // fallback: try to extract numeric suffix from generated col_<id>
+                field
+                    .name()
+                    .strip_prefix("col_")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0)
+            });
+
+        let lfid = llkv_column_map::types::LogicalFieldId::for_user(table.table_id(), fid);
+        let alias = field.name().to_string();
+        projections.push(ScanProjection::from(Projection::with_alias(lfid, alias)));
+    }
+    // Debug: the row-id shadow column is created per user field (presence index),
+    // not as a single table-wide field. Check the first user field's shadow.
+    if let Some(first_lfid) = logical_fields.first() {
+        let rid_lfid = rowid_fid(*first_lfid);
+        match table.store().data_type(rid_lfid) {
+            Ok(dt) => {
+                let total = table.store().total_rows_for_field(rid_lfid).ok();
+                println!(
+                    "Row-id shadow column for first field: logical = {:?}, type = {:?}, total_rows = {:?}",
+                    rid_lfid, dt, total
+                );
+            }
+            Err(_) => println!("Row-id shadow column for first field: not present"),
+        }
+    } else {
+        println!("No user fields to inspect for row-id shadow column");
+    }
+    println!();
+
+    // `projections` was constructed above from the schema; use it directly.
 
     println!("Loaded columns:");
     for (proj_idx, proj) in projections.iter().enumerate() {
@@ -83,7 +136,18 @@ fn run(path: PathBuf) -> LlkvResult<()> {
     }
     println!();
 
-    let first_field = field_ids[0];
+    let first_field = match projections.first() {
+        Some(ScanProjection::Column(p)) => p.logical_field_id.field_id(),
+        Some(ScanProjection::Computed { .. }) => {
+            // If the first projection is computed, fall back to scanning the
+            // first user field id we found earlier.
+            logical_fields[0].field_id()
+        }
+        None => {
+            println!("No projections available");
+            return Ok(());
+        }
+    };
     let filter_expr = Expr::Pred(Filter {
         field_id: first_field,
         op: Operator::Range {
@@ -131,9 +195,20 @@ fn run(path: PathBuf) -> LlkvResult<()> {
     Ok(())
 }
 
-fn materialize_csv_with_row_ids(path: &Path, options: &CsvReadOptions) -> LlkvResult<NamedTempFile> {
+fn materialize_csv_with_row_ids(
+    path: &Path,
+    options: &CsvReadOptions,
+) -> LlkvResult<(NamedTempFile, Vec<String>)> {
     let (schema, mut reader) = open_csv_reader(path, options)
         .map_err(|err| LlkvError::Internal(format!("failed to read CSV: {err}")))?;
+    // Capture the original column names (excluding row_id) so we can use
+    // them as friendly aliases when printing later on.
+    let original_column_names: Vec<String> = schema
+        .fields()
+        .iter()
+        .filter(|f| f.name() != ROW_ID_COLUMN_NAME)
+        .map(|f| f.name().to_string())
+        .collect();
 
     let mut fields: Vec<Field> = Vec::with_capacity(schema.fields().len() + 1);
     fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
@@ -175,5 +250,5 @@ fn materialize_csv_with_row_ids(path: &Path, options: &CsvReadOptions) -> LlkvRe
     let inner = writer.into_inner();
     inner.flush()?;
 
-    Ok(tmp)
+    Ok((tmp, original_column_names))
 }

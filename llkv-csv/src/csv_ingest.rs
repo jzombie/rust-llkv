@@ -258,6 +258,28 @@ where
         table.append(&new_batch)?;
     }
 
+    // Defensive: ensure the catalog contains ColMeta.name for each column we
+    // just inferred. In some code paths the field id metadata can be present
+    // on appended batches without a corresponding ColMeta entry in the
+    // catalog; make sure we persist the CSV header names so `Table::schema()`
+    // returns friendly column names.
+    for (col_name, fid) in inferred_mapping.iter() {
+        let metas = table.get_cols_meta(&[*fid]);
+        let need_put = match metas.get(0) {
+            Some(Some(meta)) => meta.name.is_none(),
+            _ => true,
+        };
+        if need_put {
+            let meta = ColMeta {
+                col_id: *fid,
+                name: Some(col_name.clone()),
+                flags: 0,
+                default: None,
+            };
+            table.put_col_meta(&meta);
+        }
+    }
+
     Ok(())
 }
 

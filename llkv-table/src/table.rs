@@ -4,7 +4,8 @@ use crate::planner::TablePlanner;
 use crate::types::TableId;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
+use std::collections::HashMap;
 
 use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{ColumnStore, types::LogicalFieldId};
@@ -116,6 +117,29 @@ where
                 Field::new(field.name(), field.data_type().clone(), field.is_nullable())
                     .with_metadata(new_metadata);
             new_fields.push(new_field);
+
+            // Ensure the catalog remembers the human-friendly column name for
+            // this field so callers of `Table::schema()` (and other metadata
+            // consumers) can recover it later. The CSV ingest path (and other
+            // writers) may only supply the `field_id` metadata on the batch,
+            // so defensively persist the column name when absent.
+            let need_meta = match self
+                .catalog()
+                .get_cols_meta(self.table_id, &[user_field_id])
+            {
+                metas if metas.is_empty() => true,
+                metas => matches!(metas[0].as_ref().and_then(|m| m.name.as_ref()), None),
+            };
+
+            if need_meta {
+                let meta = ColMeta {
+                    col_id: user_field_id,
+                    name: Some(field.name().to_string()),
+                    flags: 0,
+                    default: None,
+                };
+                self.put_col_meta(&meta);
+            }
         }
 
         let new_schema = Arc::new(Schema::new(new_fields));
@@ -184,6 +208,41 @@ where
     #[inline]
     pub fn get_cols_meta(&self, col_ids: &[FieldId]) -> Vec<Option<ColMeta>> {
         self.catalog().get_cols_meta(self.table_id, col_ids)
+    }
+
+    /// Build and return an Arrow `Schema` that describes this table.
+    ///
+    /// The returned schema includes the `row_id` field first, followed by
+    /// user fields. Each user field has its `field_id` stored in the field
+    /// metadata (under the "field_id" key) and the name is taken from the
+    /// catalog when available or falls back to `col_<id>`.
+    pub fn schema(&self) -> LlkvResult<Arc<Schema>> {
+        // Collect logical fields for this table and sort by field id.
+        let mut logical_fields = self.store.user_field_ids_for_table(self.table_id);
+        logical_fields.sort_by_key(|lfid| lfid.field_id());
+
+        let field_ids: Vec<FieldId> = logical_fields.iter().map(|lfid| lfid.field_id()).collect();
+        let metas = self.get_cols_meta(&field_ids);
+
+        let mut fields: Vec<Field> = Vec::with_capacity(1 + field_ids.len());
+        // Add row_id first
+        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+
+        for (idx, lfid) in logical_fields.into_iter().enumerate() {
+            let fid = lfid.field_id();
+            let dtype = self.store.data_type(lfid)?;
+            let name = metas
+                .get(idx)
+                .and_then(|m| m.as_ref().and_then(|meta| meta.name.clone()))
+                .unwrap_or_else(|| format!("col_{}", fid));
+
+            let mut metadata: HashMap<String, String> = HashMap::new();
+            metadata.insert("field_id".to_string(), fid.to_string());
+
+            fields.push(Field::new(&name, dtype.clone(), true).with_metadata(metadata));
+        }
+
+        Ok(Arc::new(Schema::new(fields)))
     }
 
     pub fn store(&self) -> &ColumnStore<P> {

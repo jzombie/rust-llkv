@@ -34,6 +34,7 @@ const F_COL_META: u32 = 10; // bytes: bitcode(ColMeta)
 
 // ----- Namespacing helpers -----
 
+// TODO: Dedupe with llkv_column_map::types::lfid()
 #[inline]
 fn lfid(table_id: TableId, col_id: u32) -> LogicalFieldId {
     LogicalFieldId::new()
@@ -42,6 +43,7 @@ fn lfid(table_id: TableId, col_id: u32) -> LogicalFieldId {
         .with_field_id(col_id)
 }
 
+// TODO: Migrate to llkv_column_map::types::rid_table()
 #[inline]
 fn rid_table(table_id: TableId) -> u64 {
     let fid = LogicalFieldId::new()
@@ -51,6 +53,7 @@ fn rid_table(table_id: TableId) -> u64 {
     fid.into()
 }
 
+// TODO: Migrate to llkv_column_map::types::rid_col()
 #[inline]
 fn rid_col(table_id: TableId, col_id: u32) -> u64 {
     lfid(table_id, col_id).into()
@@ -164,7 +167,8 @@ where
             )])),
         ]));
 
-        let row_id = Arc::new(UInt64Array::from(vec![rid_col(table_id, meta.col_id)]));
+        let rid_value = rid_col(table_id, meta.col_id);
+        let row_id = Arc::new(UInt64Array::from(vec![rid_value]));
         let meta_encoded = bitcode::encode(meta);
         let meta_bytes = Arc::new(BinaryArray::from(vec![meta_encoded.as_slice()]));
 
