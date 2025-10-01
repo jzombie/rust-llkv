@@ -167,8 +167,7 @@ where
         if let (Ok(left_dtype), Ok(right_dtype)) = (
             get_key_datatype(&left_schema, keys[0].left_field),
             get_key_datatype(&right_schema, keys[0].right_field),
-        )
-            && left_dtype == right_dtype
+        ) && left_dtype == right_dtype
         {
             match left_dtype {
                 DataType::Int32 => {
@@ -967,13 +966,12 @@ fn gather_optional_indices_from_batches(
     Ok(result)
 }
 
-
 // ============================================================================
 // Macro to generate fast-path implementations for integer types
 // ============================================================================
 
 /// Generates fast-path hash join implementations for integer types.
-/// 
+///
 /// This macro creates specialized functions that avoid HashKey/KeyValue allocations
 /// by using primitive types directly as hash map keys.
 macro_rules! impl_integer_fast_path {
@@ -989,7 +987,7 @@ macro_rules! impl_integer_fast_path {
         null_sentinel: $null_sentinel:expr
     ) => {
         /// Fast-path hash join for integer join keys.
-        /// 
+        ///
         /// This optimized path avoids HashKey/KeyValue allocations by using
         /// FxHashMap directly, resulting in 1.2-3.6× speedup.
         #[allow(clippy::too_many_arguments)]
@@ -1010,7 +1008,8 @@ macro_rules! impl_integer_fast_path {
             let left_projections = build_user_projections(left, &left_schema)?;
             let right_projections = build_user_projections(right, &right_schema)?;
 
-            let output_schema = build_output_schema(&left_schema, &right_schema, options.join_type)?;
+            let output_schema =
+                build_output_schema(&left_schema, &right_schema, options.join_type)?;
 
             let (hash_table, build_batches) = if right_projections.is_empty() {
                 (FxHashMap::default(), Vec::new())
@@ -1134,11 +1133,17 @@ macro_rules! impl_integer_fast_path {
                     for row_idx in 0..batch.num_rows() {
                         if key_array.is_null(row_idx) {
                             if null_equals_null {
-                                hash_table.entry($null_sentinel).or_default().push((batch_idx, row_idx));
+                                hash_table
+                                    .entry($null_sentinel)
+                                    .or_default()
+                                    .push((batch_idx, row_idx));
                             }
                         } else {
                             let key = key_array.value(row_idx);
-                            hash_table.entry(key).or_default().push((batch_idx, row_idx));
+                            hash_table
+                                .entry(key)
+                                .or_default()
+                                .push((batch_idx, row_idx));
                         }
                     }
 
@@ -1164,7 +1169,11 @@ macro_rules! impl_integer_fast_path {
         where
             F: FnMut(RecordBatch),
         {
-            let probe_keys = match probe_batch.column(probe_key_idx).as_any().downcast_ref::<$arrow_array>() {
+            let probe_keys = match probe_batch
+                .column(probe_key_idx)
+                .as_any()
+                .downcast_ref::<$arrow_array>()
+            {
                 Some(arr) => arr,
                 None => {
                     return Err(Error::Internal(format!(
@@ -1238,7 +1247,11 @@ macro_rules! impl_integer_fast_path {
         where
             F: FnMut(RecordBatch),
         {
-            let probe_keys = match probe_batch.column(probe_key_idx).as_any().downcast_ref::<$arrow_array>() {
+            let probe_keys = match probe_batch
+                .column(probe_key_idx)
+                .as_any()
+                .downcast_ref::<$arrow_array>()
+            {
                 Some(arr) => arr,
                 None => {
                     return Err(Error::Internal(format!(
@@ -1316,7 +1329,11 @@ macro_rules! impl_integer_fast_path {
         where
             F: FnMut(RecordBatch),
         {
-            let probe_keys = match probe_batch.column(probe_key_idx).as_any().downcast_ref::<$arrow_array>() {
+            let probe_keys = match probe_batch
+                .column(probe_key_idx)
+                .as_any()
+                .downcast_ref::<$arrow_array>()
+            {
                 Some(arr) => arr,
                 None => {
                     return Err(Error::Internal(format!(
@@ -1370,7 +1387,11 @@ macro_rules! impl_integer_fast_path {
         where
             F: FnMut(RecordBatch),
         {
-            let probe_keys = match probe_batch.column(probe_key_idx).as_any().downcast_ref::<$arrow_array>() {
+            let probe_keys = match probe_batch
+                .column(probe_key_idx)
+                .as_any()
+                .downcast_ref::<$arrow_array>()
+            {
                 Some(arr) => arr,
                 None => {
                     return Err(Error::Internal(format!(
