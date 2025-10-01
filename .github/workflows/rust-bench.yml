@@ -59,9 +59,21 @@ jobs:
       # This persists the cache across workflow runs on the same runner.
       SCCACHE_DIR: "${{ github.workspace }}/.sccache"
       SCCACHE_CACHE_SIZE: "5G"
-      RUSTC_WRAPPER: "sccache"
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache Cargo registry and build target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.cargo/registry
+            ${{ github.workspace }}/.cargo/git
+            ${{ github.workspace }}/.cargo/bin
+            target
+            ./.sccache
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -86,6 +98,8 @@ jobs:
       - uses: bencherdev/bencher@main
 
       - name: Run benches via Bencher (in-repo PRs)
+        env:
+          RUSTC_WRAPPER: sccache
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false }}
         # Note: The `--github-actions` flag will allow Bencher to create a PR
         # comment/check using the provided GITHUB_TOKEN. This step passes the
@@ -101,6 +115,8 @@ jobs:
             "cargo bench"
 
       - name: Run benches via Bencher (pushes / forked PRs)
+        env:
+          RUSTC_WRAPPER: sccache
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == true }}
         # For forked PRs secrets are not available — this runs Bencher locally
         # (no GitHub comment). It still accepts the same branch/testbed and
