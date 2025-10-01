@@ -78,6 +78,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Add cargo bin to PATH
+        run: |
+          mkdir -p "${CARGO_HOME}/bin"
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+
       # Install sccache binary if not already present on the self-hosted runner
       - name: Install sccache
         run: |
