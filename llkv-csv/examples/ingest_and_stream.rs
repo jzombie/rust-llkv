@@ -3,6 +3,7 @@ use std::io::Write;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::array::{ArrayRef, UInt64Builder};
 use arrow::csv::WriterBuilder;
@@ -37,8 +38,17 @@ fn run(path: PathBuf) -> LlkvResult<()> {
     let table = Table::new(1, Arc::clone(&pager))?;
 
     let options = CsvReadOptions::default();
+    // Materialize CSV with injected row ids and time the operation.
+    let mat_start = Instant::now();
     let (augmented_csv, _) = materialize_csv_with_row_ids(path.as_path(), &options)?;
+    let mat_elapsed = mat_start.elapsed();
+    println!("CSV materialization completed in {:.3?}", mat_elapsed);
+
+    // Ingest the augmented CSV into the table and time ingestion.
+    let ingest_start = Instant::now();
     append_csv_into_table(&table, augmented_csv.path(), &options)?;
+    let ingest_elapsed = ingest_start.elapsed();
+    println!("CSV ingest completed in {:.3?}", ingest_elapsed);
 
     let mut logical_fields = table.store().user_field_ids_for_table(table.table_id());
     if logical_fields.is_empty() {
@@ -160,6 +170,7 @@ fn run(path: PathBuf) -> LlkvResult<()> {
     let mut total_rows = 0usize;
     let mut print_result: LlkvResult<()> = Ok(());
 
+    let scan_start = Instant::now();
     table.scan_stream(
         &projections,
         &filter_expr,
@@ -173,13 +184,18 @@ fn run(path: PathBuf) -> LlkvResult<()> {
             total_rows += batch.num_rows();
 
             println!("--- Batch {} ({} rows) ---", batch_index, batch.num_rows());
+            // Time batch materialization / printing.
+            let mat_batch_start = Instant::now();
             let batches = vec![batch];
             if let Err(err) = print_batches(&batches) {
                 print_result = Err(err.into());
             }
-            println!();
+            let mat_batch_elapsed = mat_batch_start.elapsed();
+            println!("Batch {} materialized in {:.3?}\n", batch_index, mat_batch_elapsed);
         },
     )?;
+    let scan_elapsed = scan_start.elapsed();
+    println!("Scan completed in {:.3?}", scan_elapsed);
 
     print_result?;
 
