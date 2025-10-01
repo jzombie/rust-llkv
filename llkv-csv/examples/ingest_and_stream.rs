@@ -122,27 +122,11 @@ fn run(
     // Build a canonical Arrow schema for the table and use it for debug output
     // and projection construction.
     let schema = table.schema()?;
-
-    // Debug: show the table schema fields (name, field_id, type)
+    // Pretty-print the table schema as a RecordBatch for clearer output.
     println!("Table schema:");
-    for (idx, field) in schema.fields().iter().enumerate() {
-        if field.name() == ROW_ID_COLUMN_NAME {
-            println!("  [{}] {} (row id)", idx, field.name());
-            continue;
-        }
-        let fid = field
-            .metadata()
-            .get("field_id")
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
-        println!(
-            "  [{}] {} (field_id = {}, type = {:?})",
-            idx,
-            field.name(),
-            fid,
-            field.data_type()
-        );
-    }
+    let schema_batch = table.schema_recordbatch()?;
+    // print_batches takes &[RecordBatch]
+    print_batches(&[schema_batch])?;
     println!();
 
     // Build projections from the schema (skip the row_id field)

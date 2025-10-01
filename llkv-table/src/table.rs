@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::planner::TablePlanner;
 use crate::types::TableId;
 
-use arrow::array::RecordBatch;
+use arrow::array::{RecordBatch, StringArray, UInt32Array, ArrayRef};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 
@@ -244,6 +244,43 @@ where
         }
 
         Ok(Arc::new(Schema::new(fields)))
+    }
+
+    /// Return the table schema formatted as an Arrow RecordBatch suitable
+    /// for pretty printing. The batch has three columns: `name` (Utf8),
+    /// `field_id` (UInt32) and `data_type` (Utf8).
+    pub fn schema_recordbatch(&self) -> LlkvResult<RecordBatch> {
+        let schema = self.schema()?;
+        let fields = schema.fields();
+
+        let mut names: Vec<String> = Vec::with_capacity(fields.len());
+        let mut fids: Vec<u32> = Vec::with_capacity(fields.len());
+        let mut dtypes: Vec<String> = Vec::with_capacity(fields.len());
+
+        for field in fields.iter() {
+            names.push(field.name().to_string());
+            let fid = field
+                .metadata()
+                .get("field_id")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0u32);
+            fids.push(fid);
+            dtypes.push(format!("{:?}", field.data_type()));
+        }
+
+        // Build Arrow arrays
+        let name_array: ArrayRef = Arc::new(StringArray::from(names));
+        let fid_array: ArrayRef = Arc::new(UInt32Array::from(fids));
+        let dtype_array: ArrayRef = Arc::new(StringArray::from(dtypes));
+
+        let rb_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("field_id", DataType::UInt32, false),
+            Field::new("data_type", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(rb_schema, vec![name_array, fid_array, dtype_array])?;
+        Ok(batch)
     }
 
     pub fn store(&self) -> &ColumnStore<P> {
