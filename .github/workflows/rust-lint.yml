@@ -6,7 +6,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     env:
-      SCCACHE_DIR: "./.sccache"
+      SCCACHE_DIR: "${{ github.workspace }}/.sccache"
       SCCACHE_CACHE_SIZE: "5G"
       RUSTC_WRAPPER: sccache
 
