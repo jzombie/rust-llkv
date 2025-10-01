@@ -365,7 +365,7 @@ fn csv_append_preserves_nulls() {
     let csv_file = write_sample_csv_with_nulls();
     let options = CsvReadOptions::default();
 
-    let (schema, _) = llkv_csv::open_csv_reader(csv_file.path(), &options).expect("open reader");
+    let (schema, _, _) = llkv_csv::open_csv_reader(csv_file.path(), &options).expect("open reader");
     use arrow::datatypes::DataType;
     assert_eq!(schema.field(1).data_type(), &DataType::Int64);
     assert_eq!(schema.field(2).data_type(), &DataType::Float64);

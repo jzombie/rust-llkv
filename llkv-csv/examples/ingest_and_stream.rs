@@ -21,7 +21,7 @@ use llkv_table::table::{ScanProjection, ScanStreamOptions};
 use tempfile::NamedTempFile;
 
 fn main() -> LlkvResult<()> {
-    // Usage: ingest_and_stream <path-to-csv> [--no-print]
+    // Usage: ingest_and_stream <path-to-csv> [--no-print] [--null-token TOKEN] [--sample N] [--batch-size N]
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: ingest_and_stream <path-to-csv> [--no-print]");
@@ -31,13 +31,39 @@ fn main() -> LlkvResult<()> {
     // First non-flag argument is the CSV path
     let mut path_arg: Option<String> = None;
     let mut no_print = false;
-    for a in args.iter().skip(1) {
-        if a == "--no-print" {
-            no_print = true;
-            continue;
-        }
-        if path_arg.is_none() {
-            path_arg = Some(a.clone());
+    let mut sample: Option<usize> = None;
+    let mut batch_size: Option<usize> = None;
+    let mut null_token: Option<String> = None;
+    let mut iter = args.iter().skip(1);
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--no-print" => {
+                no_print = true;
+            }
+            "--sample" => {
+                if let Some(v) = iter.next() {
+                    if let Ok(n) = v.parse::<usize>() {
+                        sample = Some(n);
+                    }
+                }
+            }
+            "--batch-size" => {
+                if let Some(v) = iter.next() {
+                    if let Ok(n) = v.parse::<usize>() {
+                        batch_size = Some(n);
+                    }
+                }
+            }
+            "--null-token" => {
+                if let Some(v) = iter.next() {
+                    null_token = Some(v.to_string());
+                }
+            }
+            other => {
+                if path_arg.is_none() {
+                    path_arg = Some(other.to_string());
+                }
+            }
         }
     }
 
@@ -49,15 +75,30 @@ fn main() -> LlkvResult<()> {
         }
     };
 
-    run(path, no_print)
+    run(path, no_print, sample, batch_size, null_token)
 }
 
-fn run(path: PathBuf, no_print: bool) -> LlkvResult<()> {
+fn run(
+    path: PathBuf,
+    no_print: bool,
+    sample: Option<usize>,
+    batch_size: Option<usize>,
+    null_token: Option<String>,
+) -> LlkvResult<()> {
     let pager = Arc::new(MemPager::default());
     // Use a simple table identifier for the in-memory table.
     let table = Table::new(1, Arc::clone(&pager))?;
 
-    let options = CsvReadOptions::default();
+    let mut options = CsvReadOptions::default();
+    if let Some(s) = sample {
+        options.max_read_records = Some(s);
+    }
+    if let Some(b) = batch_size {
+        options.batch_size = Some(b);
+    }
+    if let Some(t) = null_token {
+        options.null_token = Some(t);
+    }
     // Materialize CSV with injected row ids and time the operation.
     let mat_start = Instant::now();
     let (augmented_csv, _) = materialize_csv_with_row_ids(path.as_path(), &options)?;
@@ -304,7 +345,7 @@ fn materialize_csv_with_row_ids(
     path: &Path,
     options: &CsvReadOptions,
 ) -> LlkvResult<(NamedTempFile, Vec<String>)> {
-    let (schema, reader) = open_csv_reader(path, options)
+    let (schema, reader, _) = open_csv_reader(path, options)
         .map_err(|err| LlkvError::Internal(format!("failed to read CSV: {err}")))?;
     // Capture the original column names (excluding row_id) so we can use
     // them as friendly aliases when printing later on.
@@ -315,9 +356,15 @@ fn materialize_csv_with_row_ids(
         .map(|f| f.name().to_string())
         .collect();
 
-    let mut fields: Vec<Field> = Vec::with_capacity(schema.fields().len() + 1);
+    let reader_schema = reader.schema();
+    let mut fields: Vec<Field> = Vec::with_capacity(reader_schema.fields().len() + 1);
     fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
-    fields.extend(schema.fields().iter().map(|field| field.as_ref().clone()));
+    fields.extend(
+        reader_schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone()),
+    );
     let augmented_schema = Arc::new(Schema::new(fields));
 
     let mut tmp = NamedTempFile::new()?;

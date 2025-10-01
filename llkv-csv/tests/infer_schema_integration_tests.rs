@@ -19,7 +19,7 @@ fn integration_infer_schema_with_boolean_and_date_types() {
     assert_eq!(schema.field(2).data_type(), &DataType::Boolean);
     assert_eq!(schema.field(3).data_type(), &DataType::Date32);
 
-    let (_, mut reader) = open_csv_reader(tmp.path(), &options).expect("open reader");
+    let (_, mut reader, _) = open_csv_reader(tmp.path(), &options).expect("open reader");
     let batch = reader.next().expect("first batch").expect("batch ok");
     assert_eq!(batch.column(0).data_type(), &DataType::Int64);
     assert_eq!(batch.column(1).data_type(), &DataType::Float64);

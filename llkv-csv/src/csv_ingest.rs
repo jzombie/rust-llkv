@@ -2,7 +2,16 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int64Array, UInt64Builder};
+use arrow::array::{
+    Array,
+    ArrayRef,
+    Float64Builder,
+    Int64Array,
+    Int64Builder,
+    StringArray,
+    StringBuilder,
+    UInt64Builder,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -13,7 +22,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 use llkv_table::{ColMeta, Table, types::FieldId};
 
-use crate::{CsvReadOptions, open_csv_reader};
+use crate::{CsvReadOptions, open_csv_reader, normalize_numeric_like};
 
 // TODO: Migrate to common type utils
 fn convert_row_id(array: &ArrayRef) -> LlkvResult<ArrayRef> {
@@ -238,12 +247,13 @@ where
     C: AsRef<Path>,
 {
     let csv_path_ref = csv_path.as_ref();
-    let (schema, reader) = open_csv_reader(csv_path_ref, csv_options)
+    let (target_schema, reader, type_overrides) = open_csv_reader(csv_path_ref, csv_options)
         .map_err(|err| Error::Internal(format!("failed to open CSV: {err}")))?;
 
-    let inferred_mapping = infer_field_mapping(table, schema.as_ref(), field_mapping_override)?;
+    let inferred_mapping =
+        infer_field_mapping(table, target_schema.as_ref(), field_mapping_override)?;
     let (schema_with_metadata, row_id_index) =
-        build_schema_with_metadata(&schema, &inferred_mapping)?;
+        build_schema_with_metadata(&target_schema, &inferred_mapping)?;
 
     for batch_result in reader {
         let batch = batch_result
@@ -253,7 +263,147 @@ where
             continue;
         }
 
+        // If a null_token is configured, normalize occurrences of that token
+        // in Utf8 columns to actual nulls so downstream processing (and
+        // storage) treats them as missing values.
         let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+        for col in columns.iter_mut() {
+            if matches!(col.data_type(), DataType::LargeUtf8) {
+                let casted = arrow::compute::cast(col.as_ref(), &DataType::Utf8)
+                    .map_err(|err| Error::Internal(format!(
+                        "failed to cast LargeUtf8 column to Utf8: {err}"
+                    )))?;
+                *col = casted;
+            }
+        }
+        if let Some(token) = &csv_options.null_token {
+            let token_lower = token.to_lowercase();
+            for col in columns.iter_mut() {
+                match col.data_type() {
+                    DataType::Utf8 => {
+                        // Downcast to StringArray and rebuild with nulls where
+                        // the trimmed, lowercased value equals the token.
+                        let sarr = col
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .expect("expected StringArray");
+                        let mut builder = StringBuilder::with_capacity(sarr.len(), sarr.len() * 8);
+                        for idx in 0..sarr.len() {
+                            if sarr.is_null(idx) {
+                                builder.append_null();
+                                continue;
+                            }
+                            let v = sarr.value(idx);
+                            if v.trim().to_lowercase() == token_lower {
+                                builder.append_null();
+                            } else {
+                                builder.append_value(v);
+                            }
+                        }
+                        *col = Arc::new(builder.finish());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for (idx, target_type_opt) in type_overrides.iter().enumerate() {
+            if idx == row_id_index {
+                continue;
+            }
+            let Some(target_type) = target_type_opt else { continue; };
+
+            if columns[idx].data_type() == target_type {
+                continue;
+            }
+
+            match (columns[idx].data_type(), target_type) {
+                (DataType::Utf8, DataType::Float64) => {
+                    let sarr = columns[idx]
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| Error::Internal(format!(
+                            "expected StringArray for column '{}' during Float64 conversion",
+                            target_schema.field(idx).name()
+                        )))?;
+
+                    let mut builder = Float64Builder::with_capacity(sarr.len());
+                    for row_idx in 0..sarr.len() {
+                        if sarr.is_null(row_idx) {
+                            builder.append_null();
+                            continue;
+                        }
+                        let v = sarr.value(row_idx);
+                        if let Some((cleaned, _)) = normalize_numeric_like(v) {
+                            match cleaned.parse::<f64>() {
+                                Ok(parsed) => builder.append_value(parsed),
+                                Err(_) => {
+                                    return Err(Error::InvalidArgumentError(format!(
+                                        "failed to parse '{}' as Float64 in column '{}'",
+                                        v,
+                                        target_schema.field(idx).name()
+                                    )));
+                                }
+                            }
+                        } else {
+                            builder.append_null();
+                        }
+                    }
+                    columns[idx] = Arc::new(builder.finish());
+                }
+                (DataType::Utf8, DataType::Int64) => {
+                    let sarr = columns[idx]
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| Error::Internal(format!(
+                            "expected StringArray for column '{}' during Int64 conversion",
+                            target_schema.field(idx).name()
+                        )))?;
+
+                    let mut builder = Int64Builder::with_capacity(sarr.len());
+                    for row_idx in 0..sarr.len() {
+                        if sarr.is_null(row_idx) {
+                            builder.append_null();
+                            continue;
+                        }
+                        let v = sarr.value(row_idx);
+                        if let Some((cleaned, has_decimal)) = normalize_numeric_like(v) {
+                            if has_decimal {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "value '{}' in column '{}' contains decimals but column inferred as Int64",
+                                    v,
+                                    target_schema.field(idx).name()
+                                )));
+                            }
+                            match cleaned.parse::<i64>() {
+                                Ok(parsed) => builder.append_value(parsed),
+                                Err(_) => {
+                                    return Err(Error::InvalidArgumentError(format!(
+                                        "failed to parse '{}' as Int64 in column '{}'",
+                                        v,
+                                        target_schema.field(idx).name()
+                                    )));
+                                }
+                            }
+                        } else {
+                            builder.append_null();
+                        }
+                    }
+                    columns[idx] = Arc::new(builder.finish());
+                }
+                _ => {
+                    // For other type combinations, fall back to Arrow's cast.
+                    let casted = arrow::compute::cast(columns[idx].as_ref(), target_type)
+                        .map_err(|err| Error::Internal(format!(
+                            "failed to cast column '{}' to {:?}: {err}",
+                            target_schema.field(idx).name(),
+                            target_type
+                        )))?;
+                    columns[idx] = casted;
+                }
+            }
+        }
+
         let row_id_array = convert_row_id(&columns[row_id_index])?;
         columns[row_id_index] = row_id_array;
 

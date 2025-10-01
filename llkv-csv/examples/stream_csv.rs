@@ -15,7 +15,7 @@ fn main() -> CsvResult<()> {
     };
 
     let options = CsvReadOptions::default();
-    let (schema, reader) = open_csv_reader(path.as_path(), &options)?;
+    let (schema, reader, _) = open_csv_reader(path.as_path(), &options)?;
 
     println!("Inferred schema:\n{schema:#?}");
 
