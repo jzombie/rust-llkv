@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::planner::TablePlanner;
 use crate::types::TableId;
 
-use arrow::array::{RecordBatch, StringArray, UInt32Array, ArrayRef};
+use arrow::array::{ArrayRef, RecordBatch, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 
