@@ -21,18 +21,38 @@ use llkv_table::table::{ScanProjection, ScanStreamOptions};
 use tempfile::NamedTempFile;
 
 fn main() -> LlkvResult<()> {
-    let path = match env::args().nth(1) {
-        Some(arg) => PathBuf::from(arg),
+    // Usage: ingest_and_stream <path-to-csv> [--no-print]
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: ingest_and_stream <path-to-csv> [--no-print]");
+        std::process::exit(2);
+    }
+
+    // First non-flag argument is the CSV path
+    let mut path_arg: Option<String> = None;
+    let mut no_print = false;
+    for a in args.iter().skip(1) {
+        if a == "--no-print" {
+            no_print = true;
+            continue;
+        }
+        if path_arg.is_none() {
+            path_arg = Some(a.clone());
+        }
+    }
+
+    let path = match path_arg {
+        Some(p) => PathBuf::from(p),
         None => {
-            eprintln!("Usage: ingest_and_stream <path-to-csv>");
+            eprintln!("Usage: ingest_and_stream <path-to-csv> [--no-print]");
             std::process::exit(2);
         }
     };
 
-    run(path)
+    run(path, no_print)
 }
 
-fn run(path: PathBuf) -> LlkvResult<()> {
+fn run(path: PathBuf, no_print: bool) -> LlkvResult<()> {
     let pager = Arc::new(MemPager::default());
     // Use a simple table identifier for the in-memory table.
     let table = Table::new(1, Arc::clone(&pager))?;
@@ -170,7 +190,19 @@ fn run(path: PathBuf) -> LlkvResult<()> {
     let mut total_rows = 0usize;
     let mut print_result: LlkvResult<()> = Ok(());
 
+    // Metrics aggregation
+    use std::time::Duration;
+    let mut total_materialization = Duration::from_secs(0);
+    let mut total_print_time = Duration::from_secs(0);
+    let mut min_materialization: Option<Duration> = None;
+    let mut max_materialization: Option<Duration> = None;
+    let mut min_print: Option<Duration> = None;
+    let mut max_print: Option<Duration> = None;
+
     let scan_start = Instant::now();
+    // Track the end-time of the previous callback (start equals scan_start)
+    let mut prev_callback_end = scan_start;
+
     table.scan_stream(
         &projections,
         &filter_expr,
@@ -180,18 +212,38 @@ fn run(path: PathBuf) -> LlkvResult<()> {
                 return;
             }
 
+            // Arrival time = when the batch materialization finished and the
+            // callback was invoked. The time since prev_callback_end is the
+            // materialization duration for this batch (excludes printing).
+            let arrival = Instant::now();
+            let mat_dur = arrival.duration_since(prev_callback_end);
+            total_materialization += mat_dur;
+            min_materialization = Some(min_materialization.map_or(mat_dur, |m| m.min(mat_dur)));
+            max_materialization = Some(max_materialization.map_or(mat_dur, |m| m.max(mat_dur)));
+
             batch_index += 1;
             total_rows += batch.num_rows();
 
             println!("--- Batch {} ({} rows) ---", batch_index, batch.num_rows());
-            // Time batch materialization / printing.
-            let mat_batch_start = Instant::now();
-            let batches = vec![batch];
-            if let Err(err) = print_batches(&batches) {
-                print_result = Err(err.into());
+
+            if !no_print {
+                // Printing/pretty formatting time only
+                let print_start = Instant::now();
+                let batches = vec![batch];
+                if let Err(err) = print_batches(&batches) {
+                    print_result = Err(err.into());
+                }
+                let print_elapsed = print_start.elapsed();
+                total_print_time += print_elapsed;
+                min_print = Some(min_print.map_or(print_elapsed, |p| p.min(print_elapsed)));
+                max_print = Some(max_print.map_or(print_elapsed, |p| p.max(print_elapsed)));
+            } else {
+                // When printing is disabled, we don't call print_batches and
+                // leave printing metrics as zero.
             }
-            let mat_batch_elapsed = mat_batch_start.elapsed();
-            println!("Batch {} materialized in {:.3?}\n", batch_index, mat_batch_elapsed);
+
+            // Mark end of callback (used to compute next batch's materialization)
+            prev_callback_end = Instant::now();
         },
     )?;
     let scan_elapsed = scan_start.elapsed();
@@ -205,6 +257,46 @@ fn run(path: PathBuf) -> LlkvResult<()> {
         println!(
             "Stream completed: {} batches, {} total rows.",
             batch_index, total_rows
+        );
+
+        // Also print total projected columns and total cells (rows x columns)
+        let projected_columns = projections.len();
+        let total_cells: usize = projected_columns.saturating_mul(total_rows);
+        println!("Projected columns: {}", projected_columns);
+        println!("Total cells (rows x cols): {}", total_cells);
+
+        // Final metrics report
+        let avg_mat = if batch_index > 0 {
+            total_materialization / (batch_index as u32)
+        } else {
+            Duration::from_secs(0)
+        };
+        let avg_print = if batch_index > 0 {
+            total_print_time / (batch_index as u32)
+        } else {
+            Duration::from_secs(0)
+        };
+
+        println!("\n=== Metrics Summary ===");
+        println!("CSV materialization: {:.3?}", mat_elapsed);
+        println!("CSV ingest: {:.3?}", ingest_elapsed);
+        println!(
+            "Batches: {}, total rows: {}",
+            batch_index, total_rows
+        );
+        println!(
+            "Materialization (excluding printing): total = {:.3?}, avg = {:.3?}, min = {:.3?}, max = {:.3?}",
+            total_materialization,
+            avg_mat,
+            min_materialization.unwrap_or_else(|| Duration::from_secs(0)),
+            max_materialization.unwrap_or_else(|| Duration::from_secs(0))
+        );
+        println!(
+            "Printing time: total = {:.3?}, avg = {:.3?}, min = {:.3?}, max = {:.3?}",
+            total_print_time,
+            avg_print,
+            min_print.unwrap_or_else(|| Duration::from_secs(0)),
+            max_print.unwrap_or_else(|| Duration::from_secs(0))
         );
     }
 
