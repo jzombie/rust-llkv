@@ -102,7 +102,10 @@ where
 {
     let mut mapping = HashMap::new();
     let mut existing = existing_column_mapping(table);
-    let mut used_ids: HashSet<FieldId> = existing.values().copied().collect();
+    // Track ids assigned during this inference pass. Start empty so re-using
+    // existing column ids for the same column name does not trigger a false
+    // duplicate-detection when we later insert them into `used_ids`.
+    let mut used_ids: HashSet<FieldId> = HashSet::default();
     let mut next_field_id: FieldId = existing.values().copied().max().unwrap_or(0);
 
     for field in schema.fields() {

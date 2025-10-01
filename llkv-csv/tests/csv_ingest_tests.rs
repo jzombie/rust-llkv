@@ -13,6 +13,8 @@ use llkv_table::table::ScanStreamOptions;
 use llkv_table::{Table, types::FieldId};
 use tempfile::NamedTempFile;
 
+use rand::{seq::SliceRandom, rngs::StdRng, SeedableRng};
+
 fn write_sample_csv() -> NamedTempFile {
     let mut tmp = NamedTempFile::new().expect("create tmp csv");
     writeln!(tmp, "row_id,int_col,float_col,text_col,bool_col,date_col").unwrap();
@@ -41,6 +43,67 @@ fn write_additional_csv_rows() -> NamedTempFile {
     writeln!(tmp, "3,40,4.5,again,false,2024-01-04").unwrap();
     writeln!(tmp, "4,50,5.5,more,true,2024-01-05").unwrap();
     tmp
+}
+
+#[test]
+fn csv_persists_colmeta_names() {
+    let pager = Arc::new(MemPager::default());
+    let table = Table::new(2001, Arc::clone(&pager)).expect("create table");
+
+    let options = CsvReadOptions::default();
+    let csv = write_sample_csv();
+    append_csv_into_table(&table, csv.path(), &options).expect("append csv");
+
+    // Query the catalog for the first two user column metas
+    let metas = table.get_cols_meta(&[1, 2]);
+    assert!(metas.len() == 2);
+    assert!(metas[0].as_ref().and_then(|m| m.name.clone()).is_some());
+    assert!(metas[1].as_ref().and_then(|m| m.name.clone()).is_some());
+    assert_eq!(metas[0].as_ref().unwrap().name.as_ref().unwrap(), "int_col");
+}
+
+#[test]
+fn csv_infer_fuzz_permutations() {
+    // Deterministic-ish permutation test: shuffle column order a few times and
+    // make sure inference succeeds and produces unique mappings.
+    let mut rng = StdRng::seed_from_u64(42);
+    let base_cols = vec!["row_id", "int_col", "float_col", "text_col", "bool_col", "date_col"];
+
+    // Increase seeds and write multiple rows for broader coverage.
+    for seed in 0..50 {
+        let mut cols = base_cols.clone();
+        cols[1..].shuffle(&mut rng);
+
+        // Build a temporary CSV with this column order, using the same values.
+        let mut tmp = NamedTempFile::new().expect("tmp csv");
+        writeln!(tmp, "{}", cols.join(",")).unwrap();
+        // write two rows of data to exercise multiple rows handling
+        let row_vals1 = vec!["0","10","1.5","hello","true","2024-01-01"];
+        let row_vals2 = vec!["1","20","2.5","world","false","2024-01-02"];
+        let mut ordered1: Vec<&str> = Vec::new();
+        let mut ordered2: Vec<&str> = Vec::new();
+        for c in &cols {
+            let idx = base_cols.iter().position(|b| b == c).unwrap();
+            ordered1.push(row_vals1[idx]);
+            ordered2.push(row_vals2[idx]);
+        }
+        writeln!(tmp, "{}", ordered1.join(",")).unwrap();
+        writeln!(tmp, "{}", ordered2.join(",")).unwrap();
+
+    let pager = Arc::new(MemPager::default());
+    let table = Table::new(3000 + seed as u16, Arc::clone(&pager)).expect("create table");
+        let options = CsvReadOptions::default();
+        append_csv_into_table(&table, tmp.path(), &options).expect("append permuted csv");
+
+        // Ensure metas exist and mapping is unique
+        let logicals = table.store().user_field_ids_for_table(table.table_id());
+        let mut seen = std::collections::HashSet::new();
+        for l in logicals {
+            let fid = l.field_id();
+            assert!(fid != 0);
+            assert!(seen.insert(fid), "duplicate fid seen");
+        }
+    }
 }
 
 #[test]
@@ -121,6 +184,26 @@ fn csv_append_roundtrip() {
     assert_eq!(texts, vec!["hello", "world", "test"]);
     assert_eq!(bools, vec![true, false, true]);
     assert_eq!(dates, vec![19723, 19724, 19725]);
+}
+
+#[test]
+fn csv_infer_reuse_regression() {
+    // Regression test for schema inference reuse: ensure appending a CSV and
+    // then appending additional rows reuses field ids instead of erroring.
+    let pager = Arc::new(MemPager::default());
+    let table = Table::new(1001, Arc::clone(&pager)).expect("create table");
+
+    let options = CsvReadOptions::default();
+    let first = write_sample_csv();
+    append_csv_into_table(&table, first.path(), &options).expect("append first csv");
+
+    let second = write_additional_csv_rows();
+    append_csv_into_table(&table, second.path(), &options).expect("append second csv");
+
+    // Confirm the mapping exists by asking for schema and checking column names
+    let schema = table.schema().expect("schema");
+    assert_eq!(schema.fields().len(), 6); // row_id + 5 user columns
+    assert_eq!(schema.field(1).name(), "int_col");
 }
 
 #[test]

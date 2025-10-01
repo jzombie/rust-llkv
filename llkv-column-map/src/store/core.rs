@@ -155,20 +155,28 @@ where
         use crate::types::Namespace;
         // Acquire read lock on catalog and find any matching user-data field
         let catalog = self.catalog.read().unwrap();
-        let mut candidate: Option<LogicalFieldId> = None;
-        for (&lfid, _) in catalog.map.iter() {
-            if lfid.namespace() == Namespace::UserData && lfid.table_id() == table_id {
-                candidate = Some(lfid);
-                break;
-            }
-        }
+        // Collect all user-data logical field ids for this table.
+        let candidates: Vec<LogicalFieldId> = catalog
+            .map
+            .keys()
+            .filter(|fid| fid.namespace() == Namespace::UserData && fid.table_id() == table_id)
+            .copied()
+            .collect();
         drop(catalog);
 
-        if let Some(field) = candidate {
-            self.total_rows_for_field(field)
-        } else {
-            Ok(0)
+        if candidates.is_empty() {
+            return Ok(0);
         }
+
+        // Return the maximum total_row_count across all user columns for the table.
+        let mut max_rows: u64 = 0;
+        for field in candidates {
+            let rows = self.total_rows_for_field(field)?;
+            if rows > max_rows {
+                max_rows = rows;
+            }
+        }
+        Ok(max_rows)
     }
 
     /// Return the logical field identifiers for all user columns in `table_id`.

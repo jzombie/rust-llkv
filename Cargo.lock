@@ -899,6 +899,7 @@ dependencies = [
  "llkv-result",
  "llkv-storage",
  "llkv-table",
+ "rand",
  "simd-r-drive-entry-handle",
  "tempfile",
 ]

@@ -16,4 +16,5 @@ llkv-storage.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
 
 [dev-dependencies]
-tempfile = "3.21.0"
+tempfile.workspace = true
+rand.workspace = true
