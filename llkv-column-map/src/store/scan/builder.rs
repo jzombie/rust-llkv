@@ -216,6 +216,33 @@ macro_rules! declare_sorted_range_filter_for_type {
             |array: &$array_ty, idx| F32Key::new(array.value(idx))
         );
     };
+    (bool, $chunk_fn:ident, $chunk_with_rids_fn:ident, $run_fn:ident, $run_with_rids_fn:ident, $array_ty:ty, $physical_ty:ty, $dtype_expr:expr, $native_ty:ty, $cast_expr:expr) => {
+        impl_sorted_range_filter!(
+            $run_fn,
+            $array_ty,
+            bool_r,
+            |x| x,
+            |array: &$array_ty, idx| array.value(idx)
+        );
+    };
+    (date64, $chunk_fn:ident, $chunk_with_rids_fn:ident, $run_fn:ident, $run_with_rids_fn:ident, $array_ty:ty, $physical_ty:ty, $dtype_expr:expr, $native_ty:ty, $cast_expr:expr) => {
+        impl_sorted_range_filter!(
+            $run_fn,
+            $array_ty,
+            i64_r,
+            |x| x,
+            |array: &$array_ty, idx| array.value(idx)
+        );
+    };
+    (date32, $chunk_fn:ident, $chunk_with_rids_fn:ident, $run_fn:ident, $run_with_rids_fn:ident, $array_ty:ty, $physical_ty:ty, $dtype_expr:expr, $native_ty:ty, $cast_expr:expr) => {
+        impl_sorted_range_filter!(
+            $run_fn,
+            $array_ty,
+            i32_r,
+            |x| x,
+            |array: &$array_ty, idx| array.value(idx)
+        );
+    };
 }
 
 macro_rules! declare_sorted_with_rids_range_filter_for_type {
@@ -309,6 +336,33 @@ macro_rules! declare_sorted_with_rids_range_filter_for_type {
             |array: &$array_ty, idx| F32Key::new(array.value(idx))
         );
     };
+    (bool, $chunk_fn:ident, $chunk_with_rids_fn:ident, $run_fn:ident, $run_with_rids_fn:ident, $array_ty:ty, $physical_ty:ty, $dtype_expr:expr, $native_ty:ty, $cast_expr:expr) => {
+        impl_sorted_with_rids_range_filter!(
+            $run_with_rids_fn,
+            $array_ty,
+            bool_r,
+            |x| x,
+            |array: &$array_ty, idx| array.value(idx)
+        );
+    };
+    (date64, $chunk_fn:ident, $chunk_with_rids_fn:ident, $run_fn:ident, $run_with_rids_fn:ident, $array_ty:ty, $physical_ty:ty, $dtype_expr:expr, $native_ty:ty, $cast_expr:expr) => {
+        impl_sorted_with_rids_range_filter!(
+            $run_with_rids_fn,
+            $array_ty,
+            i64_r,
+            |x| x,
+            |array: &$array_ty, idx| array.value(idx)
+        );
+    };
+    (date32, $chunk_fn:ident, $chunk_with_rids_fn:ident, $run_fn:ident, $run_with_rids_fn:ident, $array_ty:ty, $physical_ty:ty, $dtype_expr:expr, $native_ty:ty, $cast_expr:expr) => {
+        impl_sorted_with_rids_range_filter!(
+            $run_with_rids_fn,
+            $array_ty,
+            i32_r,
+            |x| x,
+            |array: &$array_ty, idx| array.value(idx)
+        );
+    };
 }
 
 pub struct ScanBuilder<'a, P: Pager<Blob = EntryHandle>> {
@@ -388,7 +442,8 @@ where
             || self.ir.i16_r.is_some()
             || self.ir.i8_r.is_some()
             || self.ir.f64_r.is_some()
-            || self.ir.f32_r.is_some();
+            || self.ir.f32_r.is_some()
+            || self.ir.bool_r.is_some();
         if !has_ranges {
             return self.store.scan(self.field_id, self.opts, visitor);
         }
@@ -438,6 +493,15 @@ where
             fn f32_chunk(&mut self, a: &Float32Array) {
                 self.inner.f32_chunk(a)
             }
+            fn bool_chunk(&mut self, a: &BooleanArray) {
+                self.inner.bool_chunk(a)
+            }
+            fn date64_chunk(&mut self, a: &Date64Array) {
+                self.inner.date64_chunk(a)
+            }
+            fn date32_chunk(&mut self, a: &Date32Array) {
+                self.inner.date32_chunk(a)
+            }
         }
         impl<'v, V> crate::store::scan::PrimitiveWithRowIdsVisitor for RangeAdapter<'v, V>
         where
@@ -473,18 +537,29 @@ where
             fn f32_chunk_with_rids(&mut self, v: &Float32Array, r: &UInt64Array) {
                 self.inner.f32_chunk_with_rids(v, r)
             }
+            fn bool_chunk_with_rids(&mut self, v: &BooleanArray, r: &UInt64Array) {
+                self.inner.bool_chunk_with_rids(v, r)
+            }
+            fn date64_chunk_with_rids(&mut self, v: &Date64Array, r: &UInt64Array) {
+                self.inner.date64_chunk_with_rids(v, r)
+            }
+            fn date32_chunk_with_rids(&mut self, v: &Date32Array, r: &UInt64Array) {
+                self.inner.date32_chunk_with_rids(v, r)
+            }
         }
         impl<'v, V> crate::store::scan::PrimitiveSortedVisitor for RangeAdapter<'v, V>
         where
             V: crate::store::scan::PrimitiveSortedVisitor,
         {
             llkv_for_each_arrow_numeric!(declare_sorted_range_filter_for_type);
+            llkv_for_each_arrow_boolean!(declare_sorted_range_filter_for_type);
         }
         impl<'v, V> crate::store::scan::PrimitiveSortedWithRowIdsVisitor for RangeAdapter<'v, V>
         where
             V: crate::store::scan::PrimitiveSortedWithRowIdsVisitor,
         {
             llkv_for_each_arrow_numeric!(declare_sorted_with_rids_range_filter_for_type);
+            llkv_for_each_arrow_boolean!(declare_sorted_with_rids_range_filter_for_type);
         }
 
         let mut adapter = RangeAdapter {

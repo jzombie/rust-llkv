@@ -155,20 +155,41 @@ where
         use crate::types::Namespace;
         // Acquire read lock on catalog and find any matching user-data field
         let catalog = self.catalog.read().unwrap();
-        let mut candidate: Option<LogicalFieldId> = None;
-        for (&lfid, _) in catalog.map.iter() {
-            if lfid.namespace() == Namespace::UserData && lfid.table_id() == table_id {
-                candidate = Some(lfid);
-                break;
-            }
-        }
+        // Collect all user-data logical field ids for this table.
+        let candidates: Vec<LogicalFieldId> = catalog
+            .map
+            .keys()
+            .filter(|fid| fid.namespace() == Namespace::UserData && fid.table_id() == table_id)
+            .copied()
+            .collect();
         drop(catalog);
 
-        if let Some(field) = candidate {
-            self.total_rows_for_field(field)
-        } else {
-            Ok(0)
+        if candidates.is_empty() {
+            return Ok(0);
         }
+
+        // Return the maximum total_row_count across all user columns for the table.
+        let mut max_rows: u64 = 0;
+        for field in candidates {
+            let rows = self.total_rows_for_field(field)?;
+            if rows > max_rows {
+                max_rows = rows;
+            }
+        }
+        Ok(max_rows)
+    }
+
+    /// Return the logical field identifiers for all user columns in `table_id`.
+    pub fn user_field_ids_for_table(&self, table_id: crate::types::TableId) -> Vec<LogicalFieldId> {
+        use crate::types::Namespace;
+
+        let catalog = self.catalog.read().unwrap();
+        catalog
+            .map
+            .keys()
+            .filter(|fid| fid.namespace() == Namespace::UserData && fid.table_id() == table_id)
+            .copied()
+            .collect()
     }
 
     /// Fast presence check using the presence index (row-id permutation) if available.
@@ -267,6 +288,45 @@ where
     }
 
     // TODO: Set up a way to optionally auto-increment a row ID column if not provided.
+
+    /// NOTE (logical table separation):
+    ///
+    /// The ColumnStore stores data per logical field (a LogicalFieldId) rather
+    /// than per 'table' directly. A LogicalFieldId encodes a namespace and a
+    /// table id together (see [crate::types::LogicalFieldId]). This design lets
+    /// multiple tables share the same underlying storage layer without
+    /// collisions because every persisted column descriptor, chunk chain and
+    /// presence/permutation index is keyed by the full LogicalFieldId.
+    ///
+    /// Concretely:
+    /// - `catalog.map` maps each LogicalFieldId -> descriptor physical key .
+    /// - Each ColumnDescriptor contains chunk metadata and a persisted
+    ///   `total_row_count` for that logical field only.
+    /// - Row-id shadow columns (presence/permutation indices) are created per
+    ///   logical field (they are derived from the LogicalFieldId) and are used
+    ///   for fast existence checks and indexed gathers.
+    ///
+    /// The `append` implementation below expects incoming RecordBatches to be
+    /// namespaced: each field's metadata contains a "field_id" that, when
+    /// combined with the current table id, maps to the LogicalFieldId the
+    /// ColumnStore will append into. This ensures that appends for different
+    /// tables never overwrite each other's descriptors or chunks because the
+    /// LogicalFieldId namespace keeps them separate.
+    ///
+    /// Constraints and recommended usage:
+    /// - A single `RecordBatch` carries exactly one `ROW_ID` column which is
+    ///   shared by all other columns in that batch. Because of this, a batch
+    ///   is implicitly tied to a single table's row-id space and should not
+    ///   mix columns from different tables.
+    /// - To append data for multiple tables, create separate `RecordBatch`
+    ///   instances (one per table) and call `append` for each. These calls
+    ///   may be executed concurrently for throughput; the ColumnStore persists
+    ///   data per-logical-field so physical writes won't collide.
+    /// - If you need an atomic multi-table append, the current API does not
+    ///   provide that; you'd need a higher-level coordinator that issues the
+    ///   per-table appends within a single transaction boundary (or extend the
+    ///   API to accept per-column row-id arrays). Such a change is more
+    ///   invasive and requires reworking LWW/commit logic.
     #[allow(unused_variables, unused_assignments)] // TODO: Keep `presence_index_created`?
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         // --- PHASE 1: PRE-PROCESSING THE INCOMING BATCH ---

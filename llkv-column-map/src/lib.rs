@@ -168,7 +168,130 @@ macro_rules! llkv_for_each_arrow_numeric {
             f32,
             |v: f32| v as f64
         );
+        $macro!(
+            date64,
+            date64_chunk,
+            date64_chunk_with_rids,
+            date64_run,
+            date64_run_with_rids,
+            arrow::array::Date64Array,
+            arrow::datatypes::Date64Type,
+            arrow::datatypes::DataType::Date64,
+            i64,
+            |v: i64| v as f64
+        );
+        $macro!(
+            date32,
+            date32_chunk,
+            date32_chunk_with_rids,
+            date32_run,
+            date32_run_with_rids,
+            arrow::array::Date32Array,
+            arrow::datatypes::Date32Type,
+            arrow::datatypes::DataType::Date32,
+            i32,
+            |v: i32| v as f64
+        );
     };
+}
+
+#[macro_export]
+#[rustfmt::skip]
+macro_rules! llkv_for_each_arrow_boolean {
+    ($macro:ident) => {
+        $macro!(
+            bool,
+            bool_chunk,
+            bool_chunk_with_rids,
+            bool_run,
+            bool_run_with_rids,
+            arrow::array::BooleanArray,
+            arrow::datatypes::BooleanType,
+            arrow::datatypes::DataType::Boolean,
+            bool,
+            |v: bool| if v { 1.0 } else { 0.0 }
+        );
+    };
+}
+
+pub fn is_supported_arrow_type(dtype: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType;
+
+    if matches!(dtype, DataType::Utf8 | DataType::LargeUtf8) {
+        return true;
+    }
+
+    let mut matched = false;
+
+    macro_rules! __llkv_match_dtype {
+        (
+            $base:ident,
+            $chunk_fn:ident,
+            $chunk_with_rids_fn:ident,
+            $run_fn:ident,
+            $run_with_rids_fn:ident,
+            $array_ty:ty,
+            $physical_ty:ty,
+            $dtype_expr:expr,
+            $native_ty:ty,
+            $cast_expr:expr
+        ) => {
+            if dtype == &$dtype_expr {
+                matched = true;
+            }
+        };
+    }
+
+    llkv_for_each_arrow_numeric!(__llkv_match_dtype);
+    llkv_for_each_arrow_boolean!(__llkv_match_dtype);
+
+    matched
+}
+
+pub fn supported_arrow_types() -> Vec<arrow::datatypes::DataType> {
+    use arrow::datatypes::DataType;
+
+    let mut types = vec![DataType::Utf8, DataType::LargeUtf8];
+
+    macro_rules! __llkv_push_dtype {
+        (
+            $base:ident,
+            $chunk_fn:ident,
+            $chunk_with_rids_fn:ident,
+            $run_fn:ident,
+            $run_with_rids_fn:ident,
+            $array_ty:ty,
+            $physical_ty:ty,
+            $dtype_expr:expr,
+            $native_ty:ty,
+            $cast_expr:expr
+        ) => {
+            types.push($dtype_expr.clone());
+        };
+    }
+
+    llkv_for_each_arrow_numeric!(__llkv_push_dtype);
+    llkv_for_each_arrow_boolean!(__llkv_push_dtype);
+
+    types
+}
+
+pub fn ensure_supported_arrow_type(dtype: &arrow::datatypes::DataType) -> Result<()> {
+    if is_supported_arrow_type(dtype) {
+        return Ok(());
+    }
+
+    let mut supported = supported_arrow_types()
+        .into_iter()
+        .map(|dtype| format!("{dtype:?}"))
+        .collect::<Vec<_>>();
+    supported.sort();
+    supported.dedup();
+
+    Err(Error::InvalidArgumentError(format!(
+        "unsupported Arrow type {dtype:?}; supported types are {}",
+        supported.join(", ")
+    )))
 }
 
 pub mod parallel;

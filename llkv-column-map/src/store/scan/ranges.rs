@@ -13,6 +13,7 @@ pub struct IntRanges {
     pub i8_r: Option<(Bound<i8>, Bound<i8>)>,
     pub f64_r: Option<(Bound<f64>, Bound<f64>)>,
     pub f32_r: Option<(Bound<f32>, Bound<f32>)>,
+    pub bool_r: Option<(Bound<bool>, Bound<bool>)>,
 }
 
 // Internal helper trait mapping a scalar type to the appropriate IntRanges slot.
@@ -67,6 +68,11 @@ impl RangeKey for f64 {
 impl RangeKey for f32 {
     fn store(ir: &mut IntRanges, lb: Bound<f32>, ub: Bound<f32>) {
         ir.f32_r = Some((lb, ub));
+    }
+}
+impl RangeKey for bool {
+    fn store(ir: &mut IntRanges, lb: Bound<bool>, ub: Bound<bool>) {
+        ir.bool_r = Some((lb, ub));
     }
 }
 

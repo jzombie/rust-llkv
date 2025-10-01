@@ -122,6 +122,36 @@ impl FromLiteral for f32 {
     }
 }
 
+impl FromLiteral for bool {
+    fn from_literal(lit: &Literal) -> Result<Self, LiteralCastError> {
+        match lit {
+            Literal::Integer(i) => match *i {
+                0 => Ok(false),
+                1 => Ok(true),
+                value => Err(LiteralCastError::OutOfRange {
+                    target: "bool",
+                    value,
+                }),
+            },
+            Literal::Float(_) => Err(LiteralCastError::TypeMismatch {
+                expected: "bool",
+                got: "float",
+            }),
+            Literal::String(s) => {
+                let normalized = s.trim().to_ascii_lowercase();
+                match normalized.as_str() {
+                    "true" | "t" | "1" => Ok(true),
+                    "false" | "f" | "0" => Ok(false),
+                    _ => Err(LiteralCastError::TypeMismatch {
+                        expected: "bool",
+                        got: "string",
+                    }),
+                }
+            }
+        }
+    }
+}
+
 impl FromLiteral for f64 {
     fn from_literal(lit: &Literal) -> Result<Self, LiteralCastError> {
         match lit {

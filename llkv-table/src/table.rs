@@ -3,8 +3,9 @@ use std::sync::Arc;
 use crate::planner::TablePlanner;
 use crate::types::TableId;
 
-use arrow::array::RecordBatch;
-use arrow::datatypes::{Field, Schema};
+use arrow::array::{ArrayRef, RecordBatch, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use std::collections::HashMap;
 
 use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{ColumnStore, types::LogicalFieldId};
@@ -116,6 +117,29 @@ where
                 Field::new(field.name(), field.data_type().clone(), field.is_nullable())
                     .with_metadata(new_metadata);
             new_fields.push(new_field);
+
+            // Ensure the catalog remembers the human-friendly column name for
+            // this field so callers of `Table::schema()` (and other metadata
+            // consumers) can recover it later. The CSV ingest path (and other
+            // writers) may only supply the `field_id` metadata on the batch,
+            // so defensively persist the column name when absent.
+            let need_meta = match self
+                .catalog()
+                .get_cols_meta(self.table_id, &[user_field_id])
+            {
+                metas if metas.is_empty() => true,
+                metas => metas[0].as_ref().and_then(|m| m.name.as_ref()).is_none(),
+            };
+
+            if need_meta {
+                let meta = ColMeta {
+                    col_id: user_field_id,
+                    name: Some(field.name().to_string()),
+                    flags: 0,
+                    default: None,
+                };
+                self.put_col_meta(&meta);
+            }
         }
 
         let new_schema = Arc::new(Schema::new(new_fields));
@@ -147,6 +171,7 @@ where
         self.scan_stream_with_exprs(&stream_projections, filter_expr, options, on_batch)
     }
 
+    // TODO: Document difference between this and `scan_stream`
     pub fn scan_stream_with_exprs<'a, F>(
         &self,
         projections: &[ScanProjection],
@@ -184,6 +209,78 @@ where
     #[inline]
     pub fn get_cols_meta(&self, col_ids: &[FieldId]) -> Vec<Option<ColMeta>> {
         self.catalog().get_cols_meta(self.table_id, col_ids)
+    }
+
+    /// Build and return an Arrow `Schema` that describes this table.
+    ///
+    /// The returned schema includes the `row_id` field first, followed by
+    /// user fields. Each user field has its `field_id` stored in the field
+    /// metadata (under the "field_id" key) and the name is taken from the
+    /// catalog when available or falls back to `col_<id>`.
+    pub fn schema(&self) -> LlkvResult<Arc<Schema>> {
+        // Collect logical fields for this table and sort by field id.
+        let mut logical_fields = self.store.user_field_ids_for_table(self.table_id);
+        logical_fields.sort_by_key(|lfid| lfid.field_id());
+
+        let field_ids: Vec<FieldId> = logical_fields.iter().map(|lfid| lfid.field_id()).collect();
+        let metas = self.get_cols_meta(&field_ids);
+
+        let mut fields: Vec<Field> = Vec::with_capacity(1 + field_ids.len());
+        // Add row_id first
+        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+
+        for (idx, lfid) in logical_fields.into_iter().enumerate() {
+            let fid = lfid.field_id();
+            let dtype = self.store.data_type(lfid)?;
+            let name = metas
+                .get(idx)
+                .and_then(|m| m.as_ref().and_then(|meta| meta.name.clone()))
+                .unwrap_or_else(|| format!("col_{}", fid));
+
+            let mut metadata: HashMap<String, String> = HashMap::new();
+            metadata.insert("field_id".to_string(), fid.to_string());
+
+            fields.push(Field::new(&name, dtype.clone(), true).with_metadata(metadata));
+        }
+
+        Ok(Arc::new(Schema::new(fields)))
+    }
+
+    /// Return the table schema formatted as an Arrow RecordBatch suitable
+    /// for pretty printing. The batch has three columns: `name` (Utf8),
+    /// `field_id` (UInt32) and `data_type` (Utf8).
+    pub fn schema_recordbatch(&self) -> LlkvResult<RecordBatch> {
+        let schema = self.schema()?;
+        let fields = schema.fields();
+
+        let mut names: Vec<String> = Vec::with_capacity(fields.len());
+        let mut fids: Vec<u32> = Vec::with_capacity(fields.len());
+        let mut dtypes: Vec<String> = Vec::with_capacity(fields.len());
+
+        for field in fields.iter() {
+            names.push(field.name().to_string());
+            let fid = field
+                .metadata()
+                .get("field_id")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0u32);
+            fids.push(fid);
+            dtypes.push(format!("{:?}", field.data_type()));
+        }
+
+        // Build Arrow arrays
+        let name_array: ArrayRef = Arc::new(StringArray::from(names));
+        let fid_array: ArrayRef = Arc::new(UInt32Array::from(fids));
+        let dtype_array: ArrayRef = Arc::new(StringArray::from(dtypes));
+
+        let rb_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("field_id", DataType::UInt32, false),
+            Field::new("data_type", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(rb_schema, vec![name_array, fid_array, dtype_array])?;
+        Ok(batch)
     }
 
     pub fn store(&self) -> &ColumnStore<P> {
