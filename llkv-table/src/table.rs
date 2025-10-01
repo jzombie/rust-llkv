@@ -128,7 +128,7 @@ where
                 .get_cols_meta(self.table_id, &[user_field_id])
             {
                 metas if metas.is_empty() => true,
-                metas => matches!(metas[0].as_ref().and_then(|m| m.name.as_ref()), None),
+                metas => metas[0].as_ref().and_then(|m| m.name.as_ref()).is_none(),
             };
 
             if need_meta {

@@ -268,7 +268,7 @@ where
     // returns friendly column names.
     for (col_name, fid) in inferred_mapping.iter() {
         let metas = table.get_cols_meta(&[*fid]);
-        let need_put = match metas.get(0) {
+        let need_put = match metas.first() {
             Some(Some(meta)) => meta.name.is_none(),
             _ => true,
         };

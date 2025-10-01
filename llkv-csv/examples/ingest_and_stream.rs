@@ -280,10 +280,7 @@ fn run(path: PathBuf, no_print: bool) -> LlkvResult<()> {
         println!("\n=== Metrics Summary ===");
         println!("CSV materialization: {:.3?}", mat_elapsed);
         println!("CSV ingest: {:.3?}", ingest_elapsed);
-        println!(
-            "Batches: {}, total rows: {}",
-            batch_index, total_rows
-        );
+        println!("Batches: {}, total rows: {}", batch_index, total_rows);
         println!(
             "Materialization (excluding printing): total = {:.3?}, avg = {:.3?}, min = {:.3?}, max = {:.3?}",
             total_materialization,
@@ -307,7 +304,7 @@ fn materialize_csv_with_row_ids(
     path: &Path,
     options: &CsvReadOptions,
 ) -> LlkvResult<(NamedTempFile, Vec<String>)> {
-    let (schema, mut reader) = open_csv_reader(path, options)
+    let (schema, reader) = open_csv_reader(path, options)
         .map_err(|err| LlkvError::Internal(format!("failed to read CSV: {err}")))?;
     // Capture the original column names (excluding row_id) so we can use
     // them as friendly aliases when printing later on.
@@ -331,7 +328,7 @@ fn materialize_csv_with_row_ids(
 
     let mut next_row_id: u64 = 0;
 
-    while let Some(batch) = reader.next() {
+    for batch in reader {
         let batch = batch?;
         let len = batch.num_rows();
         if len == 0 {

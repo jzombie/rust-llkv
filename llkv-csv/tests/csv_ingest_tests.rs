@@ -13,7 +13,7 @@ use llkv_table::table::ScanStreamOptions;
 use llkv_table::{Table, types::FieldId};
 use tempfile::NamedTempFile;
 
-use rand::{seq::SliceRandom, rngs::StdRng, SeedableRng};
+use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
 
 fn write_sample_csv() -> NamedTempFile {
     let mut tmp = NamedTempFile::new().expect("create tmp csv");
@@ -67,7 +67,14 @@ fn csv_infer_fuzz_permutations() {
     // Deterministic-ish permutation test: shuffle column order a few times and
     // make sure inference succeeds and produces unique mappings.
     let mut rng = StdRng::seed_from_u64(42);
-    let base_cols = vec!["row_id", "int_col", "float_col", "text_col", "bool_col", "date_col"];
+    let base_cols = vec![
+        "row_id",
+        "int_col",
+        "float_col",
+        "text_col",
+        "bool_col",
+        "date_col",
+    ];
 
     // Increase seeds and write multiple rows for broader coverage.
     for seed in 0..50 {
@@ -78,8 +85,8 @@ fn csv_infer_fuzz_permutations() {
         let mut tmp = NamedTempFile::new().expect("tmp csv");
         writeln!(tmp, "{}", cols.join(",")).unwrap();
         // write two rows of data to exercise multiple rows handling
-        let row_vals1 = vec!["0","10","1.5","hello","true","2024-01-01"];
-        let row_vals2 = vec!["1","20","2.5","world","false","2024-01-02"];
+        let row_vals1 = ["0", "10", "1.5", "hello", "true", "2024-01-01"];
+        let row_vals2 = ["1", "20", "2.5", "world", "false", "2024-01-02"];
         let mut ordered1: Vec<&str> = Vec::new();
         let mut ordered2: Vec<&str> = Vec::new();
         for c in &cols {
@@ -90,8 +97,8 @@ fn csv_infer_fuzz_permutations() {
         writeln!(tmp, "{}", ordered1.join(",")).unwrap();
         writeln!(tmp, "{}", ordered2.join(",")).unwrap();
 
-    let pager = Arc::new(MemPager::default());
-    let table = Table::new(3000 + seed as u16, Arc::clone(&pager)).expect("create table");
+        let pager = Arc::new(MemPager::default());
+        let table = Table::new(3000 + seed as u16, Arc::clone(&pager)).expect("create table");
         let options = CsvReadOptions::default();
         append_csv_into_table(&table, tmp.path(), &options).expect("append permuted csv");
 
