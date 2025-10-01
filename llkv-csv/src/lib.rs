@@ -15,7 +15,8 @@ pub use csv_ingest::{append_csv_into_table, append_csv_into_table_with_mapping};
 pub mod csv_export;
 pub use csv_export::{
     CsvExportColumn, CsvWriteOptions, export_csv_from_table, export_csv_from_table_with_filter,
-    export_csv_to_writer_with_filter,
+    export_csv_from_table_with_projections, export_csv_to_writer_with_filter,
+    export_csv_to_writer_with_projections,
 };
 
 #[derive(Debug, Clone)]
