@@ -70,7 +70,7 @@ jobs:
             ${{ github.workspace }}/.cargo/git
             ${{ github.workspace }}/.cargo/bin
             target
-            ./.sccache
+            ${{ env.SCCACHE_DIR }}
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
