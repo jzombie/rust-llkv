@@ -86,9 +86,7 @@ jobs:
         run: mkdir -p "$SCCACHE_DIR"
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.1.27
-        with:
-          cache-key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - uses: bencherdev/bencher@main
 
