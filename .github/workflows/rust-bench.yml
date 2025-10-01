@@ -70,7 +70,6 @@ jobs:
             ${{ github.workspace }}/.cargo/git
             ${{ github.workspace }}/.cargo/bin
             target
-            ./.sccache
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
@@ -83,22 +82,13 @@ jobs:
           mkdir -p "${CARGO_HOME}/bin"
           echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
 
-      # Install sccache binary if not already present on the self-hosted runner
-      - name: Install sccache
-        run: |
-          if ! command -v sccache &> /dev/null; then
-            echo "Installing sccache..."
-            cargo install sccache --locked
-          else
-            echo "sccache already installed: $(sccache --version)"
-          fi
+      - name: Ensure sccache directory
+        run: mkdir -p "$SCCACHE_DIR"
 
-      # Create sccache directory and start sccache server
-      - name: Configure sccache
-        run: |
-          mkdir -p "$SCCACHE_DIR"
-          sccache --start-server || true
-          sccache --show-stats
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.1.27
+        with:
+          cache-key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
 
       - uses: bencherdev/bencher@main
 
