@@ -12,7 +12,7 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
 use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME, rowid_fid};
 use llkv_csv::csv_ingest::append_csv_into_table;
-use llkv_csv::{CsvReadOptions, open_csv_reader};
+use llkv_csv::{CsvReadOptions, CsvReader};
 use llkv_result::{Error as LlkvError, Result as LlkvResult};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
@@ -345,8 +345,11 @@ fn materialize_csv_with_row_ids(
     path: &Path,
     options: &CsvReadOptions,
 ) -> LlkvResult<(NamedTempFile, Vec<String>)> {
-    let (schema, reader, _) = open_csv_reader(path, options)
+    let reader = CsvReader::with_options(options.clone());
+    let mut session = reader
+        .open(path)
         .map_err(|err| LlkvError::Internal(format!("failed to read CSV: {err}")))?;
+    let schema = session.schema();
     // Capture the original column names (excluding row_id) so we can use
     // them as friendly aliases when printing later on.
     let original_column_names: Vec<String> = schema
@@ -356,7 +359,7 @@ fn materialize_csv_with_row_ids(
         .map(|f| f.name().to_string())
         .collect();
 
-    let reader_schema = reader.schema();
+    let reader_schema = session.reader().schema();
     let mut fields: Vec<Field> = Vec::with_capacity(reader_schema.fields().len() + 1);
     fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
     fields.extend(
@@ -375,7 +378,7 @@ fn materialize_csv_with_row_ids(
 
     let mut next_row_id: u64 = 0;
 
-    for batch in reader {
+    for batch in session {
         let batch = batch?;
         let len = batch.num_rows();
         if len == 0 {

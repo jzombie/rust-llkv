@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 use arrow::util::pretty::print_batches;
-use llkv_csv::{CsvReadOptions, CsvResult, open_csv_reader};
+use llkv_csv::{CsvReadOptions, CsvReader, CsvResult};
 
 fn main() -> CsvResult<()> {
     let mut args = env::args().skip(1);
@@ -15,11 +15,13 @@ fn main() -> CsvResult<()> {
     };
 
     let options = CsvReadOptions::default();
-    let (schema, reader, _) = open_csv_reader(path.as_path(), &options)?;
+    let reader = CsvReader::with_options(options.clone());
+    let session = reader.open(path.as_path())?;
+    let schema = session.schema();
 
     println!("Inferred schema:\n{schema:#?}");
 
-    for maybe_batch in reader {
+    for maybe_batch in session {
         let batch = maybe_batch?;
         print_batches(&[batch])?;
     }

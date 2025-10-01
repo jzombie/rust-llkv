@@ -22,7 +22,8 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 use llkv_table::{ColMeta, Table, types::FieldId};
 
-use crate::{CsvReadOptions, open_csv_reader, normalize_numeric_like};
+use crate::inference::normalize_numeric_like;
+use crate::{CsvReadOptions, CsvReader};
 
 // TODO: Migrate to common type utils
 fn convert_row_id(array: &ArrayRef) -> LlkvResult<ArrayRef> {
@@ -247,15 +248,19 @@ where
     C: AsRef<Path>,
 {
     let csv_path_ref = csv_path.as_ref();
-    let (target_schema, reader, type_overrides) = open_csv_reader(csv_path_ref, csv_options)
+    let reader_builder = CsvReader::with_options(csv_options.clone());
+    let session = reader_builder
+        .open(csv_path_ref)
         .map_err(|err| Error::Internal(format!("failed to open CSV: {err}")))?;
+    let target_schema = session.schema();
+    let type_overrides = session.type_overrides().to_vec();
 
     let inferred_mapping =
         infer_field_mapping(table, target_schema.as_ref(), field_mapping_override)?;
     let (schema_with_metadata, row_id_index) =
         build_schema_with_metadata(&target_schema, &inferred_mapping)?;
 
-    for batch_result in reader {
+    for batch_result in session {
         let batch = batch_result
             .map_err(|err| Error::Internal(format!("failed to read CSV batch: {err}")))?;
 
