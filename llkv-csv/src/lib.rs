@@ -2,9 +2,9 @@ use std::error::Error;
 
 pub type CsvResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-pub(crate) mod inference;
-pub mod csv_ingest;
 pub mod csv_export;
+pub mod csv_ingest;
+pub(crate) mod inference;
 
 mod reader;
 mod writer;

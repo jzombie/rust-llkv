@@ -6,8 +6,8 @@ use arrow::csv::reader::{Format, Reader, ReaderBuilder};
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use crate::inference;
 use crate::CsvResult;
+use crate::inference;
 
 #[derive(Debug, Clone)]
 pub struct CsvReadOptions {
@@ -40,7 +40,7 @@ impl CsvReadOptions {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CsvReader {
     options: CsvReadOptions,
 }
@@ -87,14 +87,6 @@ impl CsvReader {
             type_overrides: outcome.type_overrides,
             reader,
         })
-    }
-}
-
-impl Default for CsvReader {
-    fn default() -> Self {
-        Self {
-            options: CsvReadOptions::default(),
-        }
     }
 }
 
@@ -164,8 +156,10 @@ mod tests {
     #[test]
     fn reader_streams_batches() {
         let tmp = write_sample_csv();
-        let mut options = CsvReadOptions::default();
-        options.batch_size = Some(1);
+        let options = CsvReadOptions {
+            batch_size: Some(1),
+            ..Default::default()
+        };
         let reader = CsvReader::new(options);
 
         let mut session = reader.open(tmp.path()).expect("open reader");

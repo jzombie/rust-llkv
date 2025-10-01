@@ -206,9 +206,8 @@ where
                     return;
                 }
                 if let Err(err) = csv_writer.write(&batch) {
-                    write_error = Some(Error::Internal(format!(
-                        "failed to write CSV batch: {err}"
-                    )));
+                    write_error =
+                        Some(Error::Internal(format!("failed to write CSV batch: {err}")));
                 }
             })?;
 

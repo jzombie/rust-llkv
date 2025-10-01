@@ -159,7 +159,7 @@ pub(crate) fn infer(path: &Path, options: &CsvReadOptions) -> CsvResult<Inferenc
     })
 }
 
-pub(crate) fn split_csv_line<'a>(line: &'a str, delim: char) -> Vec<&'a str> {
+pub(crate) fn split_csv_line(line: &str, delim: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut in_quotes = false;
     let mut start = 0usize;
@@ -228,4 +228,4 @@ pub(crate) fn normalize_numeric_like(s: &str) -> Option<(String, bool)> {
     }
 
     Some((cleaned, has_decimal))
-    }
+}

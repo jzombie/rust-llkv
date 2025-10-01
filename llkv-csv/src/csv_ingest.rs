@@ -3,13 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array,
-    ArrayRef,
-    Float64Builder,
-    Int64Array,
-    Int64Builder,
-    StringArray,
-    StringBuilder,
+    Array, ArrayRef, Float64Builder, Int64Array, Int64Builder, StringArray, StringBuilder,
     UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
@@ -274,40 +268,37 @@ where
         let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
         for col in columns.iter_mut() {
             if matches!(col.data_type(), DataType::LargeUtf8) {
-                let casted = arrow::compute::cast(col.as_ref(), &DataType::Utf8)
-                    .map_err(|err| Error::Internal(format!(
-                        "failed to cast LargeUtf8 column to Utf8: {err}"
-                    )))?;
+                let casted =
+                    arrow::compute::cast(col.as_ref(), &DataType::Utf8).map_err(|err| {
+                        Error::Internal(format!("failed to cast LargeUtf8 column to Utf8: {err}"))
+                    })?;
                 *col = casted;
             }
         }
         if let Some(token) = &csv_options.null_token {
             let token_lower = token.to_lowercase();
             for col in columns.iter_mut() {
-                match col.data_type() {
-                    DataType::Utf8 => {
-                        // Downcast to StringArray and rebuild with nulls where
-                        // the trimmed, lowercased value equals the token.
-                        let sarr = col
-                            .as_any()
-                            .downcast_ref::<StringArray>()
-                            .expect("expected StringArray");
-                        let mut builder = StringBuilder::with_capacity(sarr.len(), sarr.len() * 8);
-                        for idx in 0..sarr.len() {
-                            if sarr.is_null(idx) {
-                                builder.append_null();
-                                continue;
-                            }
-                            let v = sarr.value(idx);
-                            if v.trim().to_lowercase() == token_lower {
-                                builder.append_null();
-                            } else {
-                                builder.append_value(v);
-                            }
+                if col.data_type() == &DataType::Utf8 {
+                    // Downcast to StringArray and rebuild with nulls where
+                    // the trimmed, lowercased value equals the token.
+                    let sarr = col
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("expected StringArray");
+                    let mut builder = StringBuilder::with_capacity(sarr.len(), sarr.len() * 8);
+                    for idx in 0..sarr.len() {
+                        if sarr.is_null(idx) {
+                            builder.append_null();
+                            continue;
                         }
-                        *col = Arc::new(builder.finish());
+                        let v = sarr.value(idx);
+                        if v.trim().to_lowercase() == token_lower {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(v);
+                        }
                     }
-                    _ => {}
+                    *col = Arc::new(builder.finish());
                 }
             }
         }
@@ -316,7 +307,9 @@ where
             if idx == row_id_index {
                 continue;
             }
-            let Some(target_type) = target_type_opt else { continue; };
+            let Some(target_type) = target_type_opt else {
+                continue;
+            };
 
             if columns[idx].data_type() == target_type {
                 continue;
@@ -327,10 +320,12 @@ where
                     let sarr = columns[idx]
                         .as_any()
                         .downcast_ref::<StringArray>()
-                        .ok_or_else(|| Error::Internal(format!(
-                            "expected StringArray for column '{}' during Float64 conversion",
-                            target_schema.field(idx).name()
-                        )))?;
+                        .ok_or_else(|| {
+                            Error::Internal(format!(
+                                "expected StringArray for column '{}' during Float64 conversion",
+                                target_schema.field(idx).name()
+                            ))
+                        })?;
 
                     let mut builder = Float64Builder::with_capacity(sarr.len());
                     for row_idx in 0..sarr.len() {
@@ -360,10 +355,12 @@ where
                     let sarr = columns[idx]
                         .as_any()
                         .downcast_ref::<StringArray>()
-                        .ok_or_else(|| Error::Internal(format!(
-                            "expected StringArray for column '{}' during Int64 conversion",
-                            target_schema.field(idx).name()
-                        )))?;
+                        .ok_or_else(|| {
+                            Error::Internal(format!(
+                                "expected StringArray for column '{}' during Int64 conversion",
+                                target_schema.field(idx).name()
+                            ))
+                        })?;
 
                     let mut builder = Int64Builder::with_capacity(sarr.len());
                     for row_idx in 0..sarr.len() {
@@ -398,12 +395,15 @@ where
                 }
                 _ => {
                     // For other type combinations, fall back to Arrow's cast.
-                    let casted = arrow::compute::cast(columns[idx].as_ref(), target_type)
-                        .map_err(|err| Error::Internal(format!(
-                            "failed to cast column '{}' to {:?}: {err}",
-                            target_schema.field(idx).name(),
-                            target_type
-                        )))?;
+                    let casted = arrow::compute::cast(columns[idx].as_ref(), target_type).map_err(
+                        |err| {
+                            Error::Internal(format!(
+                                "failed to cast column '{}' to {:?}: {err}",
+                                target_schema.field(idx).name(),
+                                target_type
+                            ))
+                        },
+                    )?;
                     columns[idx] = casted;
                 }
             }

@@ -41,17 +41,17 @@ fn main() -> LlkvResult<()> {
                 no_print = true;
             }
             "--sample" => {
-                if let Some(v) = iter.next() {
-                    if let Ok(n) = v.parse::<usize>() {
-                        sample = Some(n);
-                    }
+                if let Some(v) = iter.next()
+                    && let Ok(n) = v.parse::<usize>()
+                {
+                    sample = Some(n);
                 }
             }
             "--batch-size" => {
-                if let Some(v) = iter.next() {
-                    if let Ok(n) = v.parse::<usize>() {
-                        batch_size = Some(n);
-                    }
+                if let Some(v) = iter.next()
+                    && let Ok(n) = v.parse::<usize>()
+                {
+                    batch_size = Some(n);
                 }
             }
             "--null-token" => {
