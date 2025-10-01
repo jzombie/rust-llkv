@@ -105,13 +105,7 @@ where
         ))
     })?;
     let writer = BufWriter::new(file);
-    export_csv_to_writer_with_projections(
-        table,
-        writer,
-        projections,
-        filter_expr,
-        options,
-    )
+    export_csv_to_writer_with_projections(table, writer, projections, filter_expr, options)
 }
 
 pub fn export_csv_to_writer_with_filter<P, W>(
@@ -165,8 +159,7 @@ where
     I: IntoIterator<Item = SP>,
     SP: Into<ScanProjection>,
 {
-    let mut projections: Vec<ScanProjection> =
-        projections.into_iter().map(|p| p.into()).collect();
+    let mut projections: Vec<ScanProjection> = projections.into_iter().map(|p| p.into()).collect();
 
     if projections.is_empty() {
         return Err(Error::InvalidArgumentError(
@@ -191,9 +184,7 @@ where
             return;
         }
         if let Err(err) = csv_writer.write(&batch) {
-            write_error = Some(Error::Internal(format!(
-                "failed to write CSV batch: {err}"
-            )));
+            write_error = Some(Error::Internal(format!("failed to write CSV batch: {err}")));
         }
     })?;
 
@@ -228,7 +219,7 @@ where
     let mut projections: Vec<ScanProjection> = Vec::with_capacity(columns.len());
     for (idx, column) in columns.iter().enumerate() {
         let lfid = LogicalFieldId::for_user(table.table_id(), column.field_id);
-    table.store().data_type(lfid)?;
+        table.store().data_type(lfid)?;
 
         let resolved_name = column
             .alias
@@ -247,7 +238,7 @@ where
     Ok(projections)
 }
 
-fn ensure_column_aliases<P>(table: &Table<P>, projections: &mut [ScanProjection]) -> LlkvResult<()> 
+fn ensure_column_aliases<P>(table: &Table<P>, projections: &mut [ScanProjection]) -> LlkvResult<()>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -282,14 +273,12 @@ where
     }
 
     for projection in projections.iter_mut() {
-        if let ScanProjection::Column(col_proj) = projection {
-            if col_proj.alias.is_none() {
-                let field_id = col_proj.logical_field_id.field_id();
-                if let Some(name) = alias_map.get(&field_id) {
-                    col_proj.alias = Some(name.clone());
-                } else {
-                    col_proj.alias = Some(format!("col_{}", field_id));
-                }
+        if let ScanProjection::Column(col_proj) = projection && col_proj.alias.is_none() {
+            let field_id = col_proj.logical_field_id.field_id();
+            if let Some(name) = alias_map.get(&field_id) {
+                col_proj.alias = Some(name.clone());
+            } else {
+                col_proj.alias = Some(format!("col_{}", field_id));
             }
         }
     }

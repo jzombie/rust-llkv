@@ -83,10 +83,8 @@ where
     let metas = table.catalog().get_cols_meta(table.table_id(), &field_ids);
     let mut mapping = HashMap::with_capacity(metas.len());
     for (fid, meta_opt) in field_ids.into_iter().zip(metas.into_iter()) {
-        if let Some(meta) = meta_opt {
-            if let Some(name) = meta.name {
-                mapping.insert(name, fid);
-            }
+        if let Some(meta) = meta_opt && let Some(name) = meta.name {
+            mapping.insert(name, fid);
         }
     }
     mapping
@@ -115,28 +113,24 @@ where
         let mut chosen: Option<FieldId> = None;
         let mut should_register_meta = false;
 
-        if let Some(manual) = provided {
-            if let Some(&fid) = manual.get(field.name()) {
-                if let Some(&existing_fid) = existing.get(field.name()) {
-                    if existing_fid != fid {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "column '{}' mapped to field_id {} but existing schema expects {}",
-                            field.name(),
-                            fid,
-                            existing_fid
-                        )));
-                    }
-                } else {
-                    should_register_meta = true;
+        if let Some(manual) = provided && let Some(&fid) = manual.get(field.name()) {
+            if let Some(&existing_fid) = existing.get(field.name()) {
+                if existing_fid != fid {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "column '{}' mapped to field_id {} but existing schema expects {}",
+                        field.name(),
+                        fid,
+                        existing_fid
+                    )));
                 }
-                chosen = Some(fid);
+            } else {
+                should_register_meta = true;
             }
+            chosen = Some(fid);
         }
 
-        if chosen.is_none() {
-            if let Some(&fid) = existing.get(field.name()) {
-                chosen = Some(fid);
-            }
+        if chosen.is_none() && let Some(&fid) = existing.get(field.name()) {
+            chosen = Some(fid);
         }
 
         if chosen.is_none() {

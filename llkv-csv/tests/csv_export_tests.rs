@@ -2,15 +2,15 @@ use std::io::Write;
 use std::ops::Bound;
 use std::sync::Arc;
 
+use llkv_column_map::store::Projection;
+use llkv_column_map::types::LogicalFieldId;
+use llkv_csv::CsvReadOptions;
 use llkv_csv::csv_export::{
     CsvExportColumn, CsvWriteOptions, export_csv_from_table, export_csv_from_table_with_filter,
     export_csv_from_table_with_projections, export_csv_to_writer_with_filter,
     export_csv_to_writer_with_projections,
 };
-use llkv_csv::CsvReadOptions;
 use llkv_csv::csv_ingest::append_csv_into_table;
-use llkv_column_map::store::Projection;
-use llkv_column_map::types::LogicalFieldId;
 use llkv_result::Result as LlkvResult;
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
@@ -77,8 +77,7 @@ fn export_with_filter_and_custom_options() {
         },
     });
 
-    let mut options = CsvWriteOptions::default();
-    options.delimiter = b'\t';
+    let options = CsvWriteOptions { delimiter: b'\t', ..Default::default() };
 
     export_csv_from_table_with_filter(&table, out_file.path(), &columns, &filter_expr, &options)
         .expect("export filtered csv");
