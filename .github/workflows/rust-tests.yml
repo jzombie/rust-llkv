@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   test_self_hosted:
-    name: test (self-hosted)
+    name: test
     runs-on: [self-hosted, macOS, ARM64]
 
     env:
@@ -35,21 +35,6 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-features --verbose --lib --bins --tests --examples -- --include-ignored
-
-  # test:
-  #   name: test
-  #   runs-on: ubuntu-latest
-  #   needs: test_matrix
-  #   if: ${{ always() }}
-  #   steps:
-  #     - name: Evaluate matrix results
-  #       run: |
-  #         result="${{ needs.test_matrix.result }}"
-  #         echo "Matrix job concluded with: ${result}"
-  #         if [ "${result}" != "success" ]; then
-  #           exit 1
-  #         fi
-  #         echo "All platform combinations succeeded."
 # TODO: Implement
 # Runs the Miri interpreter across all OS targets to detect undefined behavior in unsafe code
 #   miri:
