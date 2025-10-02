@@ -57,23 +57,24 @@ jobs:
       THRESHOLD_FLAGS: --threshold-measure latency --threshold-test t_test --threshold-max-sample-size 64 --threshold-upper-boundary 0.99 --thresholds-reset --err
       # Configure sccache to use local disk storage for self-hosted runners.
       # This persists the cache across workflow runs on the same runner.
-      SCCACHE_DIR: "./.sccache"
+      SCCACHE_DIR: "${{ github.workspace }}/.sccache"
       SCCACHE_CACHE_SIZE: "5G"
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Cargo registry and build target
+      - name: Cache Cargo dependencies
         uses: actions/cache@v4
         with:
           path: |
-            ${{ github.workspace }}/.cargo/registry
-            ${{ github.workspace }}/.cargo/git
-            ${{ github.workspace }}/.cargo/bin
-            target
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
             ${{ env.SCCACHE_DIR }}
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.flags }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
