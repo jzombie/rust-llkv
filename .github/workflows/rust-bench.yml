@@ -134,9 +134,7 @@ jobs:
           echo "detected packages: $PACKAGES"
           echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
 
-      - uses: bencherdev/bencher@main
-
-      - name: Run benches via Bencher
+      - name: Run benches directly
         id: run-benches
         env:
           RUSTC_WRAPPER: sccache
@@ -149,43 +147,10 @@ jobs:
             exit 0
           fi
 
-          # Build the bencher command safely into an array to avoid eval/quoting issues.
-          # Split threshold flags into an array so each flag is preserved as a token.
-          read -r -a THRESHOLD_ARR <<<"${THRESHOLD_FLAGS}"
-
-          BENCHER_CMD=(
-            bencher
-            run
-            --adapter "${BENCHER_ADAPTER}"
-            --project "${BENCHER_PROJECT}"
-            --branch "${BENCHER_BRANCH}"
-            --testbed "${BENCHER_TESTBED}"
-          )
-
-          if [ "${#THRESHOLD_ARR[@]}" -ne 0 ]; then
-            BENCHER_CMD+=("${THRESHOLD_ARR[@]}")
-          fi
-
-          # If this is an in-repo PR (secrets available) append the GitHub
-          # actions flag so Bencher can post a PR comment/check. This flag is
-          # strictly about creating a GitHub PR comment, not uploading to
-          # bencher.dev (that's controlled by BENCHER_API_TOKEN).
-          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.pull_request.head.repo.fork }}" = "false" ]; then
-            BENCHER_CMD+=(--github-actions "${{ secrets.GITHUB_TOKEN }}")
-          fi
-
-          # We'll run Bencher separately for each changed package using
-          # `--manifest-path <pkg>/Cargo.toml`. This runs `cargo bench` in
-          # the context of that package's manifest which avoids building
-          # unrelated workspace members. Note: this assumes the package
-          # directory name matches the package name (common layout).
           for p in $PACKAGES; do
-            echo "Running bencher for package: $p"
-            # Call the helper script under bencher. The script will
-            # run `cargo bench --manifest-path <pkg>/Cargo.toml`.
-            CMD=("${BENCHER_CMD[@]}" "bash" "${GITHUB_WORKSPACE:-.}/scripts/bench-package.sh" "$p")
-            echo "+ ${CMD[@]}"
-            "${CMD[@]}"
+            echo "Running cargo benches for package: $p"
+            echo "+ bash ${GITHUB_WORKSPACE:-.}/scripts/bench-package.sh $p"
+            bash "${GITHUB_WORKSPACE:-.}/scripts/bench-package.sh" "$p"
           done
 
       # Show final sccache statistics after benchmark completion
