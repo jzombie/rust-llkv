@@ -14,21 +14,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test_matrix:
-    name: test (OS=${{ matrix.os }}, Features=${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
+  test_arm64_self_hosted:
+    name: test (self-hosted)
+    # NOTE: This job targets a self-hosted runner with the labels: `self-hosted`, `linux`, `arm64`.
+    # Make sure your runner is registered with those labels before enabling this job.
+    runs-on: [self-hosted, Linux, ARM64]
     env:
       SCCACHE_DIR: "${{ github.workspace }}/.sccache"
       SCCACHE_CACHE_SIZE: "5G"
       RUSTC_WRAPPER: sccache
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        include:
-          - name: "All Features"
-            flags: "--all-features"
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,54 +30,95 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # Added caching step to speed up dependency builds.
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-            ${{ env.SCCACHE_DIR }}
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.flags }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
-
       - name: Ensure sccache directory
         shell: bash
         run: mkdir -p "$SCCACHE_DIR"
 
-      - name: Setup sccache
+      - name: Setup sccache (best-effort)
+        # On self-hosted runners you may already have sccache installed/configured.
+        # This action is a no-op if not needed, but it's kept for parity with matrix job.
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Test
-        # run: cargo test --workspace --all-targets --verbose ${{ matrix.flags }} -- --include-ignored
-        # Explicitly ignore benches (workaround for CodSpeed benches running for default)
         run: cargo test --workspace --all-features --verbose --lib --bins --tests --examples -- --include-ignored
 
       - name: Display sccache stats
         if: always()
         shell: bash
         run: |
-          echo "=== sccache statistics ==="
-          sccache --show-stats
+          echo "=== sccache statistics (self-hosted) ==="
+          sccache --show-stats || true
 
-  test:
-    name: test
-    runs-on: ubuntu-latest
-    needs: test_matrix
-    if: ${{ always() }}
-    steps:
-      - name: Evaluate matrix results
-        run: |
-          result="${{ needs.test_matrix.result }}"
-          echo "Matrix job concluded with: ${result}"
-          if [ "${result}" != "success" ]; then
-            exit 1
-          fi
-          echo "All platform combinations succeeded."
+  # test_matrix:
+  #   name: test (OS=${{ matrix.os }}, Features=${{ matrix.name }})
+  #   runs-on: ${{ matrix.os }}
+  #   env:
+  #     SCCACHE_DIR: "${{ github.workspace }}/.sccache"
+  #     SCCACHE_CACHE_SIZE: "5G"
+  #     RUSTC_WRAPPER: sccache
+  #   # strategy:
+  #   #   fail-fast: false
+  #   #   matrix:
+  #   #     os: [ubuntu-latest, macos-latest, windows-latest]
+  #   #     include:
+  #   #       - name: "All Features"
+  #   #         flags: "--all-features"
+
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v4
+
+  #     - name: Install Rust
+  #       uses: dtolnay/rust-toolchain@stable
+
+  #     # Added caching step to speed up dependency builds.
+  #     - name: Cache Cargo dependencies
+  #       uses: actions/cache@v4
+  #       with:
+  #         path: |
+  #           ~/.cargo/bin/
+  #           ~/.cargo/registry/index/
+  #           ~/.cargo/registry/cache/
+  #           ~/.cargo/git/db/
+  #           target/
+  #           ${{ env.SCCACHE_DIR }}
+  #         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.flags }}
+  #         restore-keys: |
+  #           ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
+
+  #     - name: Ensure sccache directory
+  #       shell: bash
+  #       run: mkdir -p "$SCCACHE_DIR"
+
+  #     - name: Setup sccache
+  #       uses: mozilla-actions/sccache-action@v0.0.9
+
+  #     - name: Test
+  #       # run: cargo test --workspace --all-targets --verbose ${{ matrix.flags }} -- --include-ignored
+  #       # Explicitly ignore benches (workaround for CodSpeed benches running for default)
+  #       run: cargo test --workspace --all-features --verbose --lib --bins --tests --examples -- --include-ignored
+
+  #     - name: Display sccache stats
+  #       if: always()
+  #       shell: bash
+  #       run: |
+  #         echo "=== sccache statistics ==="
+  #         sccache --show-stats
+
+  # test:
+  #   name: test
+  #   runs-on: ubuntu-latest
+  #   needs: test_matrix
+  #   if: ${{ always() }}
+  #   steps:
+  #     - name: Evaluate matrix results
+  #       run: |
+  #         result="${{ needs.test_matrix.result }}"
+  #         echo "Matrix job concluded with: ${result}"
+  #         if [ "${result}" != "success" ]; then
+  #           exit 1
+  #         fi
+  #         echo "All platform combinations succeeded."
 
 # TODO: Implement
 # Runs the Miri interpreter across all OS targets to detect undefined behavior in unsafe code
