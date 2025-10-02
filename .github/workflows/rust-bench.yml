@@ -42,7 +42,7 @@ jobs:
       # The Bencher adapter to use for the benchmark run.
       # https://bencher.dev/docs/explanation/adapters
       BENCHER_ADAPTER: rust_criterion
-      # BENCHER_API_TOKEN removed (not used anymore)
+      BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
       # Use a workspace-local CARGO_HOME to avoid writing into the runner's
       # $HOME/.cargo. This keeps installs and registry/git cache inside the
       # repository workspace (useful for self-hosted runners).
