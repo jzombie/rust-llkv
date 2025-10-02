@@ -6,6 +6,8 @@ on:
       - main
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  # Manual trigger so you can run the workflow from the Actions tab
+  workflow_dispatch: {}
 
 # Grant the minimum permissions required for the action to create PR comments.
 # By default GITHUB_TOKEN is read-only for many scopes; explicitly allow write
