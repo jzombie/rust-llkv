@@ -138,6 +138,8 @@ jobs:
           echo "detected packages: $PACKAGES"
           echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
 
+      - uses: bencherdev/bencher@main
+
       - name: Run benches directly
         id: run-benches
         env:
