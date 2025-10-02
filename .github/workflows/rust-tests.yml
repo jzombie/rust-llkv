@@ -14,11 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test_arm64_self_hosted:
+  test_self_hosted:
     name: test (self-hosted)
-    # NOTE: This job targets a self-hosted runner with the labels: `self-hosted`, `linux`, `arm64`.
-    # Make sure your runner is registered with those labels before enabling this job.
-    runs-on: [self-hosted, Linux, ARM64]
+    runs-on: [self-hosted, macOS, ARM64]
     env:
       SCCACHE_DIR: "${{ github.workspace }}/.sccache"
       SCCACHE_CACHE_SIZE: "5G"
