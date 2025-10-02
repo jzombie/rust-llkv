@@ -42,13 +42,6 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Install cargo-binstall
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! command -v cargo-binstall >/dev/null 2>&1; then
-            curl -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-          fi
 
       # Note: This is a workaround for an issue that just started appearing in lint checks
       # and I'm not yet sure if it's due to GitHub Actions having updated something behind
@@ -57,19 +50,20 @@ jobs:
       - name: Install rustfmt
         run: rustup component add rustfmt clippy
 
+      - name: Install cargo-binstall
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-binstall >/dev/null 2>&1; then
+            curl -sSfL https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          fi
+
       - name: Install tools
         shell: bash
         run: |
           set -euo pipefail
-          install_with_fallback() {
-            local crate="$1"
-            if ! cargo binstall --no-confirm --no-symlinks "$crate"; then
-              echo "cargo-binstall failed for $crate, falling back to cargo install"
-              cargo install --locked "$crate"
-            fi
-          }
-          install_with_fallback cargo-deny
-          install_with_fallback cargo-audit
+          cargo binstall --no-confirm --no-symlinks --force cargo-deny cargo-audit \
+            || cargo install --locked --force cargo-deny cargo-audit
 
       # Check formatting across the entire workspace
       - name: Check formatting
