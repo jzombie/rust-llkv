@@ -150,23 +150,24 @@ jobs:
             exit 0
           fi
 
-          # Populate sccache by doing a no-run bench build for each package
-          # using the same profile as the actual bench. This helps ensure
-          # the cache contains entries for the exact rustc invocations we
-          # will run in the real bench step.
+          # Build a single cargo bench invocation with -p flags for all
+          # detected packages. Running one cargo process avoids duplicate
+          # dependency resolution and compilation across multiple cargo
+          # invocations and helps sccache reuse.
+          PACKAGE_FLAGS=()
           for p in $PACKAGES; do
-            echo "Populating sccache for package: $p"
-            manifest="${GITHUB_WORKSPACE:-.}/$p/Cargo.toml"
-            echo "+ cargo bench --manifest-path $manifest --no-run"
-            cargo bench --manifest-path "$manifest" --no-run || true
+            PACKAGE_FLAGS+=("-p" "$p")
           done
 
-          for p in $PACKAGES; do
-            echo "Running cargo benches for package: $p"
-            manifest="${GITHUB_WORKSPACE:-.}/$p/Cargo.toml"
-            echo "+ cargo bench --manifest-path $manifest"
-            cargo bench --manifest-path "$manifest"
-          done
+          # Populate (no-run) using a single cargo invocation
+          echo "Populating sccache for packages: $PACKAGES"
+          echo "+ cargo bench ${PACKAGE_FLAGS[@]} --no-run"
+          cargo bench "${PACKAGE_FLAGS[@]}" --no-run || true
+
+          # Run benches for the same set of packages
+          echo "Running benches for packages: $PACKAGES"
+          echo "+ cargo bench ${PACKAGE_FLAGS[@]}"
+          cargo bench "${PACKAGE_FLAGS[@]}"
 
       - name: Debug sccache & compile one package (diagnostic)
         if: always()
