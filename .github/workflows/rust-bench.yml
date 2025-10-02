@@ -68,24 +68,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ env.CARGO_HOME }}/bin/
-            ${{ env.CARGO_HOME }}/registry/index/
-            ${{ env.CARGO_HOME }}/registry/cache/
-            ${{ env.CARGO_HOME }}/git/db/
-            ${{ env.SCCACHE_DIR }}
-            target/
-          # Cache scoped to OS + ARCH and invalidated when Cargo.lock or
-          # rust-toolchain files change. We intentionally do NOT cache
-          # `target/` here because sccache provides compiled-object caching
-          # and caching `target/` can lead to incompatible incremental files.
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock','**/rust-toolchain*') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock','**/rust-toolchain*') }}-
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -144,8 +126,35 @@ jobs:
           echo "detected packages: $PACKAGES"
           echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
 
+      - name: Hash detected packages
+        id: pkghash
+        run: |
+          # Create a short SHA-1 hash of the space-separated package list
+          # This keeps the cache key compact and deterministic.
+          echo -n "${{ steps.detect.outputs.packages }}" | shasum -a 1 | cut -c1-12 > /tmp/pkg-hash
+          echo "pkg_hash=$(cat /tmp/pkg-hash)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.CARGO_HOME }}/bin/
+            ${{ env.CARGO_HOME }}/registry/index/
+            ${{ env.CARGO_HOME }}/registry/cache/
+            ${{ env.CARGO_HOME }}/git/db/
+            target/
+            ${{ env.SCCACHE_DIR }}
+          # Cache scoped to OS + ARCH and invalidated when Cargo.lock,
+          # Cargo.toml, or rust-toolchain files change. Also include the
+          # list of changed packages so crate-level changes influence the
+          # cache key. `steps.detect.outputs.packages` is a space-separated
+          # list; it works as a simple discriminator here.
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock','**/Cargo.toml','**/rust-toolchain*') }}-${{ steps.pkghash.outputs.pkg_hash }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock','**/Cargo.toml','**/rust-toolchain*') }}-
+
       - uses: bencherdev/bencher@main
-      - name: Run benches directly
+      - name: Run benches
         id: run-benches
         env:
           PACKAGES: ${{ steps.detect.outputs.packages }}
