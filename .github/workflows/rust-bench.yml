@@ -180,25 +180,10 @@ jobs:
           # unrelated workspace members. Note: this assumes the package
           # directory name matches the package name (common layout).
           for p in $PACKAGES; do
-            # Compute a manifest path for the package. If your workspace
-            # layout differs, adjust this accordingly.
-            MANIFEST_PATH="${GITHUB_WORKSPACE}/${p}/Cargo.toml"
-
-            # If the manifest path doesn't exist, fall back to running
-            # with -p (best-effort). This keeps behavior safe for odd
-            # repository layouts.
-            if [ -f "$MANIFEST_PATH" ]; then
-              CARGO_CMD=(cargo bench --manifest-path "$MANIFEST_PATH")
-            else
-              echo "Warning: manifest not found at $MANIFEST_PATH, falling back to -p $p"
-              CARGO_CMD=(cargo bench -p "$p")
-            fi
-
-            # Build the final bencher command for this package.
-            CMD=("${BENCHER_CMD[@]}")
-            CMD+=("${CARGO_CMD[@]}")
-
             echo "Running bencher for package: $p"
+            # Call the helper script under bencher. The script will
+            # run `cargo bench --manifest-path <pkg>/Cargo.toml`.
+            CMD=("${BENCHER_CMD[@]}" "bash" "${GITHUB_WORKSPACE:-.}/scripts/bench-package.sh" "$p")
             echo "+ ${CMD[@]}"
             "${CMD[@]}"
           done
