@@ -33,19 +33,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Ensure sccache directory
-        shell: bash
-        run: mkdir -p "$SCCACHE_DIR"
-
       - name: Test
         run: cargo test --workspace --all-features --verbose --lib --bins --tests --examples -- --include-ignored
-
-      - name: Display sccache stats
-        if: always()
-        shell: bash
-        run: |
-          echo "=== sccache statistics (self-hosted) ==="
-          sccache --show-stats || true
 
   # test:
   #   name: test
@@ -61,7 +50,6 @@ jobs:
   #           exit 1
   #         fi
   #         echo "All platform combinations succeeded."
-
 # TODO: Implement
 # Runs the Miri interpreter across all OS targets to detect undefined behavior in unsafe code
 #   miri:
