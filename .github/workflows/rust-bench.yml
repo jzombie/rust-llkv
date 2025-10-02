@@ -154,7 +154,13 @@ jobs:
 
           # Run detection with verbose error output
           echo "Running: cargo workspaces changed --since $SINCE"
-          PACKAGES=$(cargo workspaces changed --since "$SINCE" 2>&1 | tee /tmp/cargo-ws-output.txt | paste -sd ' ' - || true)
+
+          # Capture both stdout and stderr for debugging, then filter to get just package names
+          cargo workspaces changed --since "$SINCE" 2>&1 | tee /tmp/cargo-ws-output.txt
+
+          # Filter out info/log lines (start with "info") and keep only package names
+          # Package names are simple tokens without spaces or special prefixes
+          PACKAGES=$(grep -v "^info " /tmp/cargo-ws-output.txt | grep -v "^warn " | tr '\n' ' ' | xargs || true)
 
           # If detection failed or returned nothing, show debug info
           if [ -z "$PACKAGES" ]; then
