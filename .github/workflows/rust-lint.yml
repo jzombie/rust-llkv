@@ -1,14 +1,48 @@
-name: Rust Lint
+name: rust-lint
 
 on: [push, pull_request]
 
+# Ensure only one run per branch/PR at a time. If new commits are pushed,
+# older jobs will be automatically canceled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
+    name: lint
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_DIR: "${{ github.workspace }}/.sccache"
+      SCCACHE_CACHE_SIZE: "5G"
+      RUSTC_WRAPPER: sccache
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            ${{ env.SCCACHE_DIR }}
+          key: ${{ runner.os }}-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-lint-
+
+      - name: Ensure sccache directory
+        shell: bash
+        run: mkdir -p "$SCCACHE_DIR"
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
 
       # Note: This is a workaround for an issue that just started appearing in lint checks
       # and I'm not yet sure if it's due to GitHub Actions having updated something behind
@@ -17,11 +51,20 @@ jobs:
       - name: Install rustfmt
         run: rustup component add rustfmt clippy
 
-      - name: Install tools
-        # TODO: Use `cargo-binstall`? (https://github.com/cargo-bins/cargo-binstall)
+      - name: Install cargo-binstall
+        shell: bash
         run: |
-          cargo install cargo-deny
-          cargo install cargo-audit
+          set -euo pipefail
+          if ! command -v cargo-binstall >/dev/null 2>&1; then
+            curl -sSfL https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          fi
+
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo binstall --no-confirm --no-symlinks --force cargo-deny cargo-audit \
+            || cargo install --locked --force cargo-deny cargo-audit
 
       # Check formatting across the entire workspace
       - name: Check formatting
@@ -42,3 +85,10 @@ jobs:
       # Security: cargo-audit on root Cargo.lock
       - name: Run cargo-audit
         run: cargo audit
+
+      - name: Display sccache stats
+        if: always()
+        shell: bash
+        run: |
+          echo "=== sccache statistics ==="
+          sccache --show-stats

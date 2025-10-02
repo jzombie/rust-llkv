@@ -5,6 +5,9 @@ out.txt
 # Local Cargo overrides
 .cargo/config.toml
 
+# sccache directory (used by CI for build caching)
+.sccache/
+
 # Depending on how the fastembed example is run, this cache could
 # wind up in multiple places
 **/.fastembed_cache/*

@@ -1,4 +1,4 @@
-name: Continuous Benchmarking with Bencher
+name: rust-bench
 
 on:
   push:
@@ -19,19 +19,19 @@ permissions:
   checks: write
 
 # Ensure only one run per branch/PR at a time. If new commits are pushed,
-# older benchmark jobs will be automatically canceled.
+# older jobs will be automatically canceled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  benchmark_with_bencher:
+  bench:
+    name: bench
     # Only run this job for non-draft pull requests. We still want the job to run
     # for pushes and manual `workflow_dispatch` events. GitHub exposes
     # `github.event.pull_request.draft` (true for draft PRs), so require it to
     # be false when the event is a pull_request.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
-    name: Run Rust workspace benchmarks
 
     # runs-on: ubuntu-latest
     runs-on: [self-hosted, macOS, ARM64]
@@ -55,35 +55,46 @@ jobs:
       # bench run executes. Leave empty to skip creating/updating Thresholds.
       # https://bencher.dev/docs/explanation/thresholds/
       THRESHOLD_FLAGS: --threshold-measure latency --threshold-test t_test --threshold-max-sample-size 64 --threshold-upper-boundary 0.99 --thresholds-reset --err
-      # Enable sccache integration for the job. If the sccache action runs it
-      # will configure the wrapper; setting these here is harmless and makes
-      # sccache behavior explicit for all steps.
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
+      # Configure sccache to use local disk storage for self-hosted runners.
+      # This persists the cache across workflow runs on the same runner.
+      SCCACHE_DIR: "${{ github.workspace }}/.sccache"
+      SCCACHE_CACHE_SIZE: "5G"
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Cargo registry and build target
+      - name: Cache Cargo dependencies
         uses: actions/cache@v4
         with:
           path: |
-            ${{ github.workspace }}/.cargo/registry
-            ${{ github.workspace }}/.cargo/git
-            ${{ github.workspace }}/.cargo/bin
-            target
-            ./.sccache
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            ${{ env.SCCACHE_DIR }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.flags }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run sccache setup
+      - name: Add cargo bin to PATH
+        run: |
+          mkdir -p "${CARGO_HOME}/bin"
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+
+      - name: Ensure sccache directory
+        run: mkdir -p "$SCCACHE_DIR"
+
+      - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - uses: bencherdev/bencher@main
+
       - name: Run benches via Bencher (in-repo PRs)
+        env:
+          RUSTC_WRAPPER: sccache
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false }}
         # Note: The `--github-actions` flag will allow Bencher to create a PR
         # comment/check using the provided GITHUB_TOKEN. This step passes the
@@ -99,6 +110,8 @@ jobs:
             "cargo bench"
 
       - name: Run benches via Bencher (pushes / forked PRs)
+        env:
+          RUSTC_WRAPPER: sccache
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == true }}
         # For forked PRs secrets are not available — this runs Bencher locally
         # (no GitHub comment). It still accepts the same branch/testbed and
@@ -111,3 +124,18 @@ jobs:
             --testbed "${BENCHER_TESTBED}" \
             ${THRESHOLD_FLAGS} \
             "cargo bench"
+
+      # Show final sccache statistics after benchmark completion
+      - name: Display sccache stats
+        if: always()
+        run: |
+          echo "=== Final sccache statistics ==="
+          sccache --show-stats
+          echo ""
+          echo "=== sccache cache directory size ==="
+          du -sh "$SCCACHE_DIR" 2>/dev/null || echo "Cache directory not found"
+
+      # Stop sccache server to clean up
+      - name: Stop sccache
+        if: always()
+        run: sccache --stop-server || true
