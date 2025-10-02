@@ -1,4 +1,4 @@
-// TODO: Remove this comment
+// TODO: Remove this comment!
 
 // NOTE: rustfmt appears to repeatedly re-indent portions of some macros in
 // this file when running `cargo fmt` (likely a rustfmt bug). To avoid noisy
