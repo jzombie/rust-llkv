@@ -149,16 +149,6 @@ jobs:
             exit 0
           fi
 
-          # Build package flags for `cargo bench` as separate args
-          # so they are preserved when passed into the bencher command
-          # (avoid embedding all args into a single string token).
-          # Example result: ("cargo" "bench" "-p" "foo" "-p" "bar")
-          declare -a CARGO_ARGS
-          CARGO_ARGS+=("cargo" "bench")
-          for p in $PACKAGES; do
-            CARGO_ARGS+=("-p" "$p")
-          done
-
           # Build the bencher command safely into an array to avoid eval/quoting issues.
           # Split threshold flags into an array so each flag is preserved as a token.
           read -r -a THRESHOLD_ARR <<<"${THRESHOLD_FLAGS}"
@@ -184,12 +174,34 @@ jobs:
             BENCHER_CMD+=(--github-actions "${{ secrets.GITHUB_TOKEN }}")
           fi
 
-          # The final arguments to bencher are the command tokens to run.
-          # Append the cargo command array to the bencher command array.
-          BENCHER_CMD+=("${CARGO_ARGS[@]}")
+          # We'll run Bencher separately for each changed package using
+          # `--manifest-path <pkg>/Cargo.toml`. This runs `cargo bench` in
+          # the context of that package's manifest which avoids building
+          # unrelated workspace members. Note: this assumes the package
+          # directory name matches the package name (common layout).
+          for p in $PACKAGES; do
+            # Compute a manifest path for the package. If your workspace
+            # layout differs, adjust this accordingly.
+            MANIFEST_PATH="${GITHUB_WORKSPACE}/${p}/Cargo.toml"
 
-          # Execute the command array safely without eval.
-          "${BENCHER_CMD[@]}"
+            # If the manifest path doesn't exist, fall back to running
+            # with -p (best-effort). This keeps behavior safe for odd
+            # repository layouts.
+            if [ -f "$MANIFEST_PATH" ]; then
+              CARGO_CMD=(cargo bench --manifest-path "$MANIFEST_PATH")
+            else
+              echo "Warning: manifest not found at $MANIFEST_PATH, falling back to -p $p"
+              CARGO_CMD=(cargo bench -p "$p")
+            fi
+
+            # Build the final bencher command for this package.
+            CMD=("${BENCHER_CMD[@]}")
+            CMD+=("${CARGO_CMD[@]}")
+
+            echo "Running bencher for package: $p"
+            echo "+ ${CMD[@]}"
+            "${CMD[@]}"
+          done
 
       # Show final sccache statistics after benchmark completion
       - name: Display sccache stats
