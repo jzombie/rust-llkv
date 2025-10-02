@@ -79,19 +79,7 @@ jobs:
       - name: Ensure sccache directory
         run: mkdir -p "$SCCACHE_DIR"
 
-      - name: Restore registry and sccache cache
-        uses: actions/cache@v4
-        id: restore-sccache
-        with:
-          path: |
-            ${{ env.CARGO_HOME }}/bin/
-            ${{ env.CARGO_HOME }}/registry/index/
-            ${{ env.CARGO_HOME }}/registry/cache/
-            ${{ env.CARGO_HOME }}/git/db/
-            ${{ env.SCCACHE_DIR }}
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock','**/rust-toolchain*') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock','**/rust-toolchain*') }}-
+      # NOTE: Removed "Restore registry and sccache cache" (actions/cache).
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -148,29 +136,10 @@ jobs:
           echo -n "${{ steps.detect.outputs.packages }}" | shasum -a 1 | cut -c1-12 > /tmp/pkg-hash
           echo "pkg_hash=$(cat /tmp/pkg-hash)" >> "$GITHUB_OUTPUT"
 
-      - name: Cache Cargo dependencies
-        id: cache-deps
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ env.CARGO_HOME }}/bin/
-            ${{ env.CARGO_HOME }}/registry/index/
-            ${{ env.CARGO_HOME }}/registry/cache/
-            ${{ env.CARGO_HOME }}/git/db/
-            target/
-          # Cache scoped to OS + ARCH and invalidated when Cargo.lock,
-          # Cargo.toml, or rust-toolchain files change. Also include the
-          # list of changed packages so crate-level changes influence the
-          # cache key. `steps.detect.outputs.packages` is a space-separated
-          # list; it works as a simple discriminator here.
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock','**/Cargo.toml','**/rust-toolchain*') }}-${{ steps.pkghash.outputs.pkg_hash }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock','**/Cargo.toml','**/rust-toolchain*') }}-
-
       - name: Debug sccache after start
         run: |
-          echo "restore-sccache.cache-hit=${{ steps.restore-sccache.outputs.cache-hit }}"
-          echo "cache-deps.cache-hit=${{ steps.cache-deps.outputs.cache-hit }}"
+          echo "restore-sccache.cache-hit=removed"
+          echo "cache-deps.cache-hit=removed"
           sccache --version || true
           sccache --show-stats || true
 
@@ -231,8 +200,7 @@ jobs:
           done
 
           # Print the exact command (quoting preserved) for debugging
-          printf '+ %q ' "${BENCHER_CMD[@]}"
-          printf '\n'
+          printf '+ %q ' "${BENCHER_CMD[@]}"; printf '\n'
 
           # Execute the assembled command
           "${BENCHER_CMD[@]}"
