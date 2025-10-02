@@ -128,11 +128,24 @@ jobs:
             SINCE="origin/main"
           fi
 
+          # Debugging aids: print SINCE and whether cargo-workspaces is present
+          echo "SINCE=$SINCE"
+          if command -v cargo-workspaces >/dev/null 2>&1; then
+            echo "cargo-workspaces: $(command -v cargo-workspaces)"
+          else
+            echo "cargo-workspaces: not found"
+          fi
+
           # Run detection, produce a JSON array (fallback to empty array on error)
           PACKAGES_JSON=$(cargo workspaces changed --json --since "$SINCE" 2>/dev/null || echo '[]')
 
           # Convert JSON array to a simple space-separated list of crate names
           # Use the default (plain-text) output of `cargo workspaces changed`.
+          # It lists one crate name per line; convert to a space-separated list.
+          PACKAGES=$(cargo workspaces changed --since "$SINCE" 2>/dev/null | paste -sd ' ' - || true)
+
+          echo "detected packages: $PACKAGES"
+          echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
           # It lists one crate name per line; convert to a space-separated list.
           PACKAGES=$(cargo workspaces changed --since "$SINCE" 2>/dev/null | paste -sd ' ' - || true)
 
