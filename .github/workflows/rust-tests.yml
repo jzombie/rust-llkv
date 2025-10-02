@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   test_self_hosted:
-    name: test (self-hosted)
+    name: test
     runs-on: [self-hosted, macOS, ARM64]
     env:
       SCCACHE_DIR: "${{ github.workspace }}/.sccache"
