@@ -66,14 +66,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ${{ env.CARGO_HOME }}/bin/
-            ${{ env.CARGO_HOME }}/registry/index/
-            ${{ env.CARGO_HOME }}/registry/cache/
-            ${{ env.CARGO_HOME }}/git/db/
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
             target/
             ${{ env.SCCACHE_DIR }}
-          # Use Cargo.lock (and optionally toolchain) as the primary cache key.
-          # Avoid relying on undefined matrix variables which can change cache behavior.
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
