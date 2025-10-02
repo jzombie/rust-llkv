@@ -60,12 +60,12 @@ jobs:
 
       # Configure sccache to use a persistent location OUTSIDE the workspace.
       # This keeps the cache across runs even if the repo checkout is wiped.
-      SCCACHE_DIR: /tmp/sccache
+      SCCACHE_DIR: /tmp/llkv-bench-sccache
       SCCACHE_CACHE_SIZE: "20G"
       # Ensure every cargo invocation in the job goes through sccache
       RUSTC_WRAPPER: sccache
-      # Use a consistent target directory so artifacts are shared across steps
-      CARGO_TARGET_DIR: "${{ github.workspace }}/target"
+      # Use a persistent target directory OUTSIDE the workspace to survive runner cleanup
+      CARGO_TARGET_DIR: /tmp/llkv-bench-target
 
       # Use nightly toolchain to support edition2024
       # (Required for cargo-workspaces to parse workspace manifests)
