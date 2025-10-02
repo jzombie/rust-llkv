@@ -12,16 +12,16 @@
 //!
 //! **TODO: Implement hash join** (O(N+M)) for production workloads:
 //! - 1M×1M would become ~2M operations (seconds instead of hours)
-//! - See `/Users/administrator/Projects/rust-llkv/llkv-table/src/join/hash_join.rs` (WIP)
+//! - See `/Users/administrator/Projects/rust-llkv/llkv-join/src/hash_join.rs`
 //! - Once implemented, add `bench_hash_join_*` functions here for 100K, 1M, 10M row tests
 
 use arrow::array::{Int32Array, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
+use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
-use llkv_table::join::{JoinKey, JoinOptions};
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;

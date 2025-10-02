@@ -1,65 +1,16 @@
-//! Table join operations.
-//!
-//! This module provides join primitives for combining two tables based on
-//! equality predicates over one or more columns. The implementation is
-//! designed to support both immediate execution and integration with query
-//! planners and SQL frontends.
-//!
-//! ## Design Philosophy
-//!
-//! - **Streaming-first**: Joins yield batches incrementally rather than
-//!   materializing entire results, keeping memory usage bounded.
-//! - **Frontend-agnostic**: Types and APIs are independent of SQL/DDL syntax;
-//!   planners can map logical join nodes to these physical operators.
-//! - **Extensible algorithms**: The `JoinAlgorithm` enum allows choosing
-//!   between nested-loop (correctness-focused) and hash join (performance)
-//!   without changing the call site.
-//!
-//! ## Join Types
-//!
-//! - **Inner**: Emit only matching row pairs.
-//! - **Left**: Emit all left rows; unmatched left rows have NULL right columns.
-//! - **Right**: Emit all right rows; unmatched right rows have NULL left columns.
-//! - **Full**: Emit all rows from both sides, NULLs for unmatched.
-//! - **Semi**: Emit left rows that have at least one match (no right columns).
-//! - **Anti**: Emit left rows that have no match (no right columns).
-//!
-//! ## Null Semantics
-//!
-//! By default, NULL != NULL for join equality (Arrow semantics). Set
-//! `JoinKey::null_equals_null` to true for SQL-style NULL-safe equality.
-//!
-//! ## Example
-//!
-//! ```ignore
-//! use llkv_table::join::{JoinType, JoinOptions, JoinKey};
-//! use llkv_table::Table;
-//!
-//! let left = Table::new(1, pager.clone())?;
-//! let right = Table::new(2, pager.clone())?;
-//!
-//! let keys = vec![JoinKey {
-//!     left_field: 10,
-//!     right_field: 20,
-//!     null_equals_null: false,
-//! }];
-//!
-//! let options = JoinOptions {
-//!     join_type: JoinType::Inner,
-//!     ..Default::default()
-//! };
-//!
-//! left.join_stream(&right, &keys, &options, |batch| {
-//!     // Process each output batch
-//!     println!("Batch: {} rows", batch.num_rows());
-//! })?;
-//! ```
+#![forbid(unsafe_code)]
 
-pub(crate) mod hash_join;
+mod hash_join;
 
-use crate::types::FieldId;
+use arrow::array::RecordBatch;
 use llkv_result::{Error, Result as LlkvResult};
+use llkv_storage::pager::Pager;
+use llkv_table::table::Table;
+use llkv_table::types::FieldId;
+use simd_r_drive_entry_handle::EntryHandle;
 use std::fmt;
+
+pub use hash_join::hash_join_stream;
 
 /// Type of join to perform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -249,7 +200,7 @@ impl JoinOptions {
 }
 
 /// Validate join keys before execution.
-pub(crate) fn validate_join_keys(keys: &[JoinKey]) -> LlkvResult<()> {
+pub fn validate_join_keys(keys: &[JoinKey]) -> LlkvResult<()> {
     if keys.is_empty() {
         return Err(Error::InvalidArgumentError(
             "join requires at least one key pair".to_string(),
@@ -259,7 +210,7 @@ pub(crate) fn validate_join_keys(keys: &[JoinKey]) -> LlkvResult<()> {
 }
 
 /// Validate join options before execution.
-pub(crate) fn validate_join_options(options: &JoinOptions) -> LlkvResult<()> {
+pub fn validate_join_options(options: &JoinOptions) -> LlkvResult<()> {
     if options.batch_size == 0 {
         return Err(Error::InvalidArgumentError(
             "join batch_size must be > 0".to_string(),
@@ -271,6 +222,51 @@ pub(crate) fn validate_join_options(options: &JoinOptions) -> LlkvResult<()> {
         ));
     }
     Ok(())
+}
+
+/// Extension trait adding join operations to `Table`.
+pub trait TableJoinExt<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    /// Join this table with another table based on equality predicates.
+    fn join_stream<F>(
+        &self,
+        right: &Table<P>,
+        keys: &[JoinKey],
+        options: &JoinOptions,
+        on_batch: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(RecordBatch);
+}
+
+impl<P> TableJoinExt<P> for Table<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn join_stream<F>(
+        &self,
+        right: &Table<P>,
+        keys: &[JoinKey],
+        options: &JoinOptions,
+        on_batch: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(RecordBatch),
+    {
+        validate_join_keys(keys)?;
+        validate_join_options(options)?;
+
+        match options.algorithm {
+            JoinAlgorithm::Hash => {
+                hash_join::hash_join_stream(self, right, keys, options, on_batch)
+            }
+            JoinAlgorithm::SortMerge => Err(Error::Internal(
+                "Sort-merge join not yet implemented; use JoinAlgorithm::Hash".to_string(),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

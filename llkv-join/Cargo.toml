@@ -1,6 +1,6 @@
 [package]
-name = "llkv-table"
-description = "Columnar table using the LLKV toolkit."
+name = "llkv-join"
+description = "Join operators for LLKV tables."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -10,16 +10,11 @@ publish.workspace = true
 
 [dependencies]
 arrow.workspace = true
-arrow-array.workspace = true
-arrow-schema.workspace = true
-bitcode.workspace = true
-crossbeam-channel.workspace = true
 llkv-column-map.workspace = true
 llkv-expr.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true
-llkv-plan.workspace = true
-rayon.workspace = true
+llkv-table.workspace = true
 rustc-hash.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
 
@@ -29,23 +24,5 @@ tempfile.workspace = true
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
 
 [[bench]]
-name = "string_substring_bench"
+name = "join_bench"
 harness = false
-
-[[bench]]
-name = "string_substring_fused_vs_sequential"
-harness = false
-
-[[bench]]
-name = "table_math_bench"
-harness = false
-
-[[bench]]
-name = "table_layer_overhead_bench"
-harness = false
-
-# [profile.bench]
-# opt-level = 3
-# lto = "thin"
-# codegen-units = 1
-# debug = false

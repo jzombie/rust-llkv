@@ -36,9 +36,7 @@
 //! - Type mismatches between left/right use generic path
 //! - Empty tables safely fall back to generic path
 
-use crate::join::{JoinKey, JoinOptions, JoinType};
-use crate::table::{ScanProjection, ScanStreamOptions, Table};
-use crate::types::FieldId;
+use crate::{JoinKey, JoinOptions, JoinType};
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Schema};
@@ -47,6 +45,8 @@ use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::{Expr, Filter, Operator};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
+use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
+use llkv_table::types::FieldId;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::hash::{Hash, Hasher};
@@ -144,7 +144,7 @@ type RowRef = (usize, usize);
 type HashTable = FxHashMap<HashKey, Vec<RowRef>>;
 
 /// Entry point for hash join algorithm.
-pub(crate) fn hash_join_stream<P, F>(
+pub fn hash_join_stream<P, F>(
     left: &Table<P>,
     right: &Table<P>,
     keys: &[JoinKey],

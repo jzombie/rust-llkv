@@ -3,9 +3,9 @@
 use arrow::array::{Int32Array, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
+use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
-use llkv_table::join::{JoinKey, JoinOptions};
 use std::collections::HashMap;
 use std::sync::Arc;
 
