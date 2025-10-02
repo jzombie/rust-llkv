@@ -67,8 +67,9 @@ jobs:
       # Use a consistent target directory so artifacts are shared across steps
       CARGO_TARGET_DIR: "${{ github.workspace }}/target"
 
-      # Pin the toolchain to keep cache keys stable across runs.
-      RUSTUP_TOOLCHAIN: 1.80.1
+      # Use nightly toolchain to support edition2024
+      # (Required for cargo-workspaces to parse workspace manifests)
+      RUSTUP_TOOLCHAIN: nightly
 
       # Lightweight logging to inspect why an item was (not) cached.
       SCCACHE_LOG: info
@@ -80,7 +81,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
 
       - name: Add cargo bin to PATH
         run: |
@@ -169,10 +170,12 @@ jobs:
 
       - name: Hash detected packages
         id: pkghash
+        env:
+          PACKAGES: ${{ steps.detect.outputs.packages }}
         run: |
-          # Create a short SHA-1 hash of the space-separated package list
+          # Create a short SHA-1 hash of the space-separated package list.
           # This keeps the cache key compact and deterministic.
-          echo -n "${{ steps.detect.outputs.packages }}" | shasum -a 1 | cut -c1-12 > /tmp/pkg-hash
+          echo -n "$PACKAGES" | shasum -a 1 | cut -c1-12 > /tmp/pkg-hash
           echo "pkg_hash=$(cat /tmp/pkg-hash)" >> "$GITHUB_OUTPUT"
 
       - name: Debug sccache after start
