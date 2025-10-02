@@ -149,10 +149,14 @@ jobs:
             exit 0
           fi
 
-          # Build package flags for `cargo bench` (eg: -p foo -p bar)
-          PACKAGE_FLAGS=""
+          # Build package flags for `cargo bench` as separate args
+          # so they are preserved when passed into the bencher command
+          # (avoid embedding all args into a single string token).
+          # Example result: ("cargo" "bench" "-p" "foo" "-p" "bar")
+          declare -a CARGO_ARGS
+          CARGO_ARGS+=("cargo" "bench")
           for p in $PACKAGES; do
-            PACKAGE_FLAGS="$PACKAGE_FLAGS -p $p"
+            CARGO_ARGS+=("-p" "$p")
           done
 
           # Build the bencher command safely into an array to avoid eval/quoting issues.
@@ -180,8 +184,9 @@ jobs:
             BENCHER_CMD+=(--github-actions "${{ secrets.GITHUB_TOKEN }}")
           fi
 
-          # The final argument to bencher is the command to run (cargo bench ...)
-          BENCHER_CMD+=("cargo bench ${PACKAGE_FLAGS}")
+          # The final arguments to bencher are the command tokens to run.
+          # Append the cargo command array to the bencher command array.
+          BENCHER_CMD+=("${CARGO_ARGS[@]}")
 
           # Execute the command array safely without eval.
           "${BENCHER_CMD[@]}"
