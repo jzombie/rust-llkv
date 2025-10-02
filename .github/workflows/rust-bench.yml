@@ -104,8 +104,15 @@ jobs:
             # Ensure the base branch is fetched
             git fetch --no-tags origin "${{ github.event.pull_request.base.ref }}"
             
-            # Use merge-base to find the actual divergence point
-            SINCE=$(git merge-base HEAD "$BASE_REF")
+            # Use merge-base to find the actual divergence point. git merge-base
+            # can return non-zero (no common ancestor) which would abort the
+            # step under `set -e`. Run it safely and fall back to a sensible
+            # reference (the fetched ref or FETCH_HEAD) when it doesn't work.
+            SINCE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || true)
+            if [ -z "$SINCE" ]; then
+              # Try to use the ref directly, or FETCH_HEAD as a last resort.
+              SINCE=$(git rev-parse --verify "$BASE_REF" 2>/dev/null || git rev-parse --verify FETCH_HEAD 2>/dev/null || true)
+            fi
             echo "Using merge-base: $SINCE"
           else
             # For pushes, compare against origin/main
