@@ -166,10 +166,41 @@ jobs:
           echo "+ cargo bench ${PACKAGE_FLAGS[@]} --no-run"
           cargo bench "${PACKAGE_FLAGS[@]}" --no-run || true
 
-          # Run benches for the same set of packages
+          # Run benches for the same set of packages via Bencher (forward cargo command)
           echo "Running benches for packages: $PACKAGES"
-          echo "+ cargo bench ${PACKAGE_FLAGS[@]}"
-          cargo bench "${PACKAGE_FLAGS[@]}"
+
+          # Build the bencher command as an array so we preserve quoting and
+          # can easily print/inspect the exact argv that will be executed.
+          BENCHER_CMD=(
+            bencher run
+            --adapter "${BENCHER_ADAPTER}"
+            --project "${BENCHER_PROJECT}"
+            --branch "${BENCHER_BRANCH}"
+            --testbed "${BENCHER_TESTBED}"
+          )
+
+          # If THRESHOLD_FLAGS is set, split into words and append them.
+          if [ -n "${THRESHOLD_FLAGS:-}" ]; then
+            read -r -a THRESHOLD_ARR <<< "${THRESHOLD_FLAGS}"
+            for t in "${THRESHOLD_ARR[@]}"; do
+              BENCHER_CMD+=("$t")
+            done
+          fi
+
+          # Separator and cargo bench invocation
+          BENCHER_CMD+=(-- cargo bench)
+
+          # Append package flags (eg: -p crate) to the command
+          for pf in "${PACKAGE_FLAGS[@]}"; do
+            BENCHER_CMD+=("$pf")
+          done
+
+          # Print the exact command (quoting preserved) for debugging
+          printf '+ %q ' "${BENCHER_CMD[@]}"
+          printf '\n'
+
+          # Execute the assembled command
+          "${BENCHER_CMD[@]}"
 
       # Show final sccache statistics after benchmark completion
       - name: Display sccache stats
