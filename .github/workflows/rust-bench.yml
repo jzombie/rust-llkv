@@ -88,14 +88,7 @@ jobs:
       - name: Prepare persistent sccache directory
         env:
           SCCACHE_DIR: ${{ env.SCCACHE_DIR }}
-        run: |
-          set -euo pipefail
-          dir="${SCCACHE_DIR:?SCCACHE_DIR must be set}"
-          # Create the directory; use sudo only if required.
-          mkdir -p "$dir" 2>/dev/null || sudo mkdir -p "$dir"
-          # Ensure writable by the current user (no-op if already owned).
-          sudo chown -R "$USER" "$dir" 2>/dev/null || true
-          echo "SCCACHE_DIR=$dir"
+        run: mkdir -p "$SCCACHE_DIR"
 
       # NOTE: Removed "Restore registry and sccache cache" (actions/cache).
 
