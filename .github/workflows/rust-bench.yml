@@ -90,6 +90,21 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
+      - name: Install cargo-binstall
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-binstall >/dev/null 2>&1; then
+            curl -sSfL https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          fi
+
+      - name: Install cargo-workspaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo binstall --no-confirm --no-symlinks --force cargo-workspaces \
+            || cargo install --locked --force cargo-workspaces
+
       - name: Detect changed crates
         id: detect
         # This uses `cargo-workspaces` to find crates changed since the base
@@ -106,11 +121,6 @@ jobs:
             SINCE="${{ github.event.pull_request.base.sha }}"
           else
             SINCE="origin/main"
-          fi
-
-          # Install cargo-workspaces if missing (cached installs are faster on runners)
-          if ! command -v cargo-workspaces >/dev/null 2>&1; then
-            cargo install cargo-workspaces || true
           fi
 
           # Run detection, produce a JSON array (fallback to empty array on error)
