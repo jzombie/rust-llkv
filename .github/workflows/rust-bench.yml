@@ -76,11 +76,14 @@ jobs:
             ${{ env.CARGO_HOME }}/registry/index/
             ${{ env.CARGO_HOME }}/registry/cache/
             ${{ env.CARGO_HOME }}/git/db/
-            target/
             ${{ env.SCCACHE_DIR }}
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # Cache scoped to OS + ARCH and invalidated when Cargo.lock or
+          # rust-toolchain files change. We intentionally do NOT cache
+          # `target/` here because sccache provides compiled-object caching
+          # and caching `target/` can lead to incompatible incremental files.
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock','**/rust-toolchain*') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock','**/rust-toolchain*') }}-
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
