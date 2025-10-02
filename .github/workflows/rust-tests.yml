@@ -18,7 +18,7 @@ jobs:
     name: Test (OS=${{ matrix.os }}, Features=${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     env:
-      SCCACHE_DIR: "${{ github.workspace }}/.sccache"
+      SCCACHE_DIR: "./.sccache"
       SCCACHE_CACHE_SIZE: "5G"
       RUSTC_WRAPPER: sccache
     strategy:
