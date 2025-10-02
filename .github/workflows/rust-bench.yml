@@ -163,8 +163,9 @@ jobs:
 
           for p in $PACKAGES; do
             echo "Running cargo benches for package: $p"
-            echo "+ bash ${GITHUB_WORKSPACE:-.}/scripts/bench-package.sh $p"
-            bash "${GITHUB_WORKSPACE:-.}/scripts/bench-package.sh" "$p"
+            manifest="${GITHUB_WORKSPACE:-.}/$p/Cargo.toml"
+            echo "+ cargo bench --manifest-path $manifest"
+            cargo bench --manifest-path "$manifest"
           done
 
       - name: Debug sccache & compile one package (diagnostic)
