@@ -32,17 +32,18 @@ llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
 name = "string_substring_bench"
 harness = false
 
-[[bench]]
-name = "string_substring_fused_vs_sequential"
-harness = false
+# TODO: Re-enable
+# [[bench]]
+# name = "string_substring_fused_vs_sequential"
+# harness = false
 
-[[bench]]
-name = "table_math_bench"
-harness = false
+# [[bench]]
+# name = "table_math_bench"
+# harness = false
 
-[[bench]]
-name = "table_layer_overhead_bench"
-harness = false
+# [[bench]]
+# name = "table_layer_overhead_bench"
+# harness = false
 
 # [profile.bench]
 # opt-level = 3
