@@ -88,19 +88,26 @@ jobs:
           mkdir -p "${CARGO_HOME}/bin"
           echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
 
-      - name: Prepare persistent sccache directory
+      - name: Start sccache (stop/restart with env)
         run: |
-          mkdir -p "$SCCACHE_DIR"
-          echo "SCCACHE_DIR is: $SCCACHE_DIR"
+          # Ensure any existing server is stopped (so old config won't be used)
+          sccache --stop-server || true
 
-      - name: Start sccache
-        run: |
-          # Start sccache server (if not already running)
-          sccache --start-server || true
+          # Export vars (they're already in job env, but export them explicitly in the shell)
+          export SCCACHE_DIR="${SCCACHE_DIR}"
+          export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE}"
+
+          # Create dir and set permissions if needed
+          mkdir -p "$SCCACHE_DIR"
+          chmod 700 "$SCCACHE_DIR" || true
+
+          # Start server (server picks up env vars from this shell)
+          sccache --start-server
+
+          # Verify sccache is running and shows the expected configuration
           echo "sccache version: $(sccache --version)"
-          echo "sccache config:"
-          echo "  SCCACHE_DIR=$SCCACHE_DIR"
-          echo "  SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE"
+          echo "=== sccache --show-stats (initial) ==="
+          sccache --show-stats || true
 
       - name: Install cargo-binstall
         shell: bash
