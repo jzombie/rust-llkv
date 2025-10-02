@@ -89,14 +89,18 @@ jobs:
           echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
 
       - name: Prepare persistent sccache directory
-        env:
-          SCCACHE_DIR: ${{ env.SCCACHE_DIR }}
-        run: mkdir -p "$SCCACHE_DIR"
+        run: |
+          mkdir -p "$SCCACHE_DIR"
+          echo "SCCACHE_DIR is: $SCCACHE_DIR"
 
-      # NOTE: Removed "Restore registry and sccache cache" (actions/cache).
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Start sccache
+        run: |
+          # Start sccache server (if not already running)
+          sccache --start-server || true
+          echo "sccache version: $(sccache --version)"
+          echo "sccache config:"
+          echo "  SCCACHE_DIR=$SCCACHE_DIR"
+          echo "  SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE"
 
       - name: Install cargo-binstall
         shell: bash
@@ -257,6 +261,10 @@ jobs:
         run: |
           echo "post-run sccache stats:"
           sccache --show-stats || true
+
+      - name: Stop sccache
+        if: always()
+        run: sccache --stop-server || true
 
     #   # Show final sccache statistics after benchmark completion
     #   - name: Display sccache stats
