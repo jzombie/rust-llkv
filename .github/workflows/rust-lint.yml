@@ -12,10 +12,6 @@ jobs:
   lint:
     name: lint
     runs-on: ubuntu-latest
-    env:
-      SCCACHE_DIR: "${{ github.workspace }}/.sccache"
-      SCCACHE_CACHE_SIZE: "5G"
-      RUSTC_WRAPPER: sccache
 
     steps:
       - uses: actions/checkout@v4
@@ -31,18 +27,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-            ${{ env.SCCACHE_DIR }}
           key: ${{ runner.os }}-lint-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-lint-
-
-      - name: Ensure sccache directory
-        shell: bash
-        run: mkdir -p "$SCCACHE_DIR"
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
 
       # Note: This is a workaround for an issue that just started appearing in lint checks
       # and I'm not yet sure if it's due to GitHub Actions having updated something behind
@@ -85,10 +72,3 @@ jobs:
       # Security: cargo-audit on root Cargo.lock
       - name: Run cargo-audit
         run: cargo audit
-
-      - name: Display sccache stats
-        if: always()
-        shell: bash
-        run: |
-          echo "=== sccache statistics ==="
-          sccache --show-stats

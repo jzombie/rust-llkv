@@ -6,6 +6,8 @@ on:
       - main
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  # Manual trigger so you can run the workflow from the Actions tab
+  workflow_dispatch: {}
 
 # Grant the minimum permissions required for the action to create PR comments.
 # By default GITHUB_TOKEN is read-only for many scopes; explicitly allow write
@@ -41,10 +43,6 @@ jobs:
       # https://bencher.dev/docs/explanation/adapters
       BENCHER_ADAPTER: rust_criterion
       BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
-      # Use a workspace-local CARGO_HOME to avoid writing into the runner's
-      # $HOME/.cargo. This keeps installs and registry/git cache inside the
-      # repository workspace (useful for self-hosted runners).
-      CARGO_HOME: "${{ github.workspace }}/.cargo"
       # The branch name to report to Bencher. For pull_request events use the
       # head ref, otherwise use the ref name (branch on push).
       BENCHER_BRANCH: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
@@ -54,27 +52,16 @@ jobs:
       # Optional: set threshold flags here to create Thresholds/Models when the
       # bench run executes. Leave empty to skip creating/updating Thresholds.
       # https://bencher.dev/docs/explanation/thresholds/
-      THRESHOLD_FLAGS: --threshold-measure latency --threshold-test t_test --threshold-max-sample-size 64 --threshold-upper-boundary 0.99 --thresholds-reset --err
-      # Configure sccache to use local disk storage for self-hosted runners.
-      # This persists the cache across workflow runs on the same runner.
-      SCCACHE_DIR: "${{ github.workspace }}/.sccache"
-      SCCACHE_CACHE_SIZE: "5G"
+      BENCHER_THRESHOLD_FLAGS: --threshold-measure latency --threshold-test t_test --threshold-max-sample-size 64 --threshold-upper-boundary 0.99 --thresholds-reset --err
+      # Use a workspace-local CARGO_HOME to avoid writing into the runner's
+      # $HOME/.cargo. This keeps installs and registry/git cache inside the
+      # repository workspace (useful for self-hosted runners).
+      CARGO_HOME: "${{ github.workspace }}/.cargo"
+      # Use a persistent target directory OUTSIDE the workspace to survive runner cleanup
+      CARGO_TARGET_DIR: /tmp/llkv-bench-target
+
     steps:
       - uses: actions/checkout@v4
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-            ${{ env.SCCACHE_DIR }}
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.flags }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -84,58 +71,158 @@ jobs:
           mkdir -p "${CARGO_HOME}/bin"
           echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
 
-      - name: Ensure sccache directory
-        run: mkdir -p "$SCCACHE_DIR"
+      - name: Install cargo-binstall
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-binstall >/dev/null 2>&1; then
+            curl -sSfL https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          fi
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install cargo-workspaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo binstall --no-confirm --no-symlinks --force cargo-workspaces \
+            || cargo install --locked --force cargo-workspaces
+
+      - name: Detect changed crates
+        id: detect
+        # This uses `cargo-workspaces` to find crates changed since the base
+        # ref of the current PR (or `origin/main` for pushes). It writes a
+        # space-separated list of crate names to the `packages` output. If no
+        # crates changed the output will be empty.
+        run: |
+          set -euo pipefail
+
+          # Determine the comparison base
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # For PRs, compare against the merge base (common ancestor)
+            BASE_REF="origin/${{ github.event.pull_request.base.ref }}"
+            echo "Event: pull_request, base ref: $BASE_REF"
+            
+            # Ensure the base branch is fetched
+            git fetch --no-tags origin "${{ github.event.pull_request.base.ref }}"
+            
+            # Use merge-base to find the actual divergence point. git merge-base
+            # can return non-zero (no common ancestor) which would abort the
+            # step under `set -e`. Run it safely and fall back to a sensible
+            # reference (the fetched ref or FETCH_HEAD) when it doesn't work.
+            SINCE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || true)
+            if [ -z "$SINCE" ]; then
+              # Try to use the ref directly, or FETCH_HEAD as a last resort.
+              SINCE=$(git rev-parse --verify "$BASE_REF" 2>/dev/null || git rev-parse --verify FETCH_HEAD 2>/dev/null || true)
+            fi
+            echo "Using merge-base: $SINCE"
+          else
+            # For pushes, compare against origin/main
+            SINCE="origin/main"
+            echo "Event: push, comparing against: $SINCE"
+            git fetch --no-tags origin main
+          fi
+
+          # Debugging: show current HEAD and SINCE
+          echo "Current HEAD: $(git rev-parse HEAD)"
+          echo "Comparing since: $SINCE ($(git rev-parse "$SINCE" 2>/dev/null || echo 'unresolved'))"
+
+          # Verify cargo-workspaces is available
+          if ! command -v cargo-workspaces >/dev/null 2>&1; then
+            echo "ERROR: cargo-workspaces not found"
+            exit 1
+          fi
+          echo "cargo-workspaces: $(command -v cargo-workspaces)"
+
+          # Run detection with verbose error output
+          echo "Running: cargo workspaces changed --since $SINCE"
+
+          # Capture both stdout and stderr for debugging, then filter to get just package names
+          cargo workspaces changed --since "$SINCE" 2>&1 | tee /tmp/cargo-ws-output.txt
+
+          # Filter out info/log lines (start with "info") and keep only package names
+          # Package names are simple tokens without spaces or special prefixes
+          PACKAGES=$(grep -v "^info " /tmp/cargo-ws-output.txt | grep -v "^warn " | tr '\n' ' ' | xargs || true)
+
+          # If detection failed or returned nothing, show debug info
+          if [ -z "$PACKAGES" ]; then
+            echo "WARNING: No packages detected. Debug info:"
+            echo "--- cargo workspaces output ---"
+            cat /tmp/cargo-ws-output.txt || true
+            echo "--- git diff --name-only $SINCE..HEAD ---"
+            git diff --name-only "$SINCE"..HEAD | head -20 || true
+          fi
+
+          echo "detected packages: $PACKAGES"
+          echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
+
+      - name: Hash detected packages
+        id: pkghash
+        env:
+          PACKAGES: ${{ steps.detect.outputs.packages }}
+        run: |
+          # Create a short SHA-1 hash of the space-separated package list.
+          # This keeps the cache key compact and deterministic.
+          echo -n "$PACKAGES" | shasum -a 1 | cut -c1-12 > /tmp/pkg-hash
+          echo "pkg_hash=$(cat /tmp/pkg-hash)" >> "$GITHUB_OUTPUT"
 
       - uses: bencherdev/bencher@main
 
-      - name: Run benches via Bencher (in-repo PRs)
+      - name: Run benches
+        id: run-benches
         env:
-          RUSTC_WRAPPER: sccache
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false }}
-        # Note: The `--github-actions` flag will allow Bencher to create a PR
-        # comment/check using the provided GITHUB_TOKEN. This step passes the
-        # branch/testbed and any optional threshold flags.
+          PACKAGES: ${{ steps.detect.outputs.packages }}
         run: |
-          bencher run \
-            --adapter ${BENCHER_ADAPTER} \
-            --project "${BENCHER_PROJECT}" \
-            --branch "${BENCHER_BRANCH}" \
-            --testbed "${BENCHER_TESTBED}" \
-            ${THRESHOLD_FLAGS} \
-            --github-actions "${{ secrets.GITHUB_TOKEN }}" \
-            "cargo bench"
+          set -euo pipefail
 
-      - name: Run benches via Bencher (pushes / forked PRs)
-        env:
-          RUSTC_WRAPPER: sccache
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == true }}
-        # For forked PRs secrets are not available — this runs Bencher locally
-        # (no GitHub comment). It still accepts the same branch/testbed and
-        # threshold flags, but without uploading results if no API token is set.
-        run: |
-          bencher run \
-            --adapter ${BENCHER_ADAPTER} \
-            --project "${BENCHER_PROJECT}" \
-            --branch "${BENCHER_BRANCH}" \
-            --testbed "${BENCHER_TESTBED}" \
-            ${THRESHOLD_FLAGS} \
-            "cargo bench"
+          if [ -z "${PACKAGES}" ]; then
+            echo "No changed crates detected; skipping bench run."
+            exit 0
+          fi
 
-      # Show final sccache statistics after benchmark completion
-      - name: Display sccache stats
-        if: always()
-        run: |
-          echo "=== Final sccache statistics ==="
-          sccache --show-stats
-          echo ""
-          echo "=== sccache cache directory size ==="
-          du -sh "$SCCACHE_DIR" 2>/dev/null || echo "Cache directory not found"
+          # Build a single cargo bench invocation with -p flags for all
+          # detected packages. Running one cargo process avoids duplicate
+          # dependency resolution and compilation across multiple cargo
+          # invocations and potentially helps cache reuse (if enabled).
+          PACKAGE_FLAGS=()
+          for p in $PACKAGES; do
+            PACKAGE_FLAGS+=("-p" "$p")
+          done
 
-      # Stop sccache server to clean up
-      - name: Stop sccache
-        if: always()
-        run: sccache --stop-server || true
+          # Populate (no-run) using a single cargo invocation
+          echo "Populating cache for packages: $PACKAGES"
+          echo "+ cargo bench ${PACKAGE_FLAGS[@]} --no-run"
+          cargo bench "${PACKAGE_FLAGS[@]}" --no-run || true
+
+          # Run benches for the same set of packages via Bencher (forward cargo command)
+          echo "Running benches for packages: $PACKAGES"
+
+          # Build the bencher command as an array so we preserve quoting and
+          # can easily print/inspect the exact argv that will be executed.
+          BENCHER_CMD=(
+            bencher run
+            --adapter "${BENCHER_ADAPTER}"
+            --project "${BENCHER_PROJECT}"
+            --branch "${BENCHER_BRANCH}"
+            --testbed "${BENCHER_TESTBED}"
+          )
+
+          # If BENCHER_THRESHOLD_FLAGS is set, split into words and append them.
+          if [ -n "${BENCHER_THRESHOLD_FLAGS:-}" ]; then
+            read -r -a THRESHOLD_ARR <<< "${BENCHER_THRESHOLD_FLAGS}"
+            for t in "${THRESHOLD_ARR[@]}"; do
+              BENCHER_CMD+=("$t")
+            done
+          fi
+
+          # Separator and cargo bench invocation
+          BENCHER_CMD+=(-- cargo bench)
+
+          # Append package flags (eg: -p crate) to the command
+          for pf in "${PACKAGE_FLAGS[@]}"; do
+            BENCHER_CMD+=("$pf")
+          done
+
+          # Print the exact command (quoting preserved) for debugging
+          printf '+ %q ' "${BENCHER_CMD[@]}"; printf '\n'
+
+          # Execute the assembled command
+          "${BENCHER_CMD[@]}"
