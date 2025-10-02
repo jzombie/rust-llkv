@@ -57,23 +57,12 @@ jobs:
       # bench run executes. Leave empty to skip creating/updating Thresholds.
       # https://bencher.dev/docs/explanation/thresholds/
       THRESHOLD_FLAGS: --threshold-measure latency --threshold-test t_test --threshold-max-sample-size 64 --threshold-upper-boundary 0.99 --thresholds-reset --err
-
-      # Configure sccache to use a persistent location OUTSIDE the workspace.
-      # This keeps the cache across runs even if the repo checkout is wiped.
-      SCCACHE_DIR: /tmp/llkv-bench-sccache
-      SCCACHE_CACHE_SIZE: "20G"
-      # Ensure every cargo invocation in the job goes through sccache
-      RUSTC_WRAPPER: sccache
       # Use a persistent target directory OUTSIDE the workspace to survive runner cleanup
       CARGO_TARGET_DIR: /tmp/llkv-bench-target
 
       # Use nightly toolchain to support edition2024
       # (Required for cargo-workspaces to parse workspace manifests)
       RUSTUP_TOOLCHAIN: nightly
-
-      # Lightweight logging to inspect why an item was (not) cached.
-      SCCACHE_LOG: info
-      SCCACHE_ERROR_LOG: ${{ github.workspace }}/sccache.log
 
     steps:
       - uses: actions/checkout@v4
@@ -87,27 +76,6 @@ jobs:
         run: |
           mkdir -p "${CARGO_HOME}/bin"
           echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
-
-      - name: Start sccache (stop/restart with env)
-        run: |
-          # Ensure any existing server is stopped (so old config won't be used)
-          sccache --stop-server || true
-
-          # Export vars (they're already in job env, but export them explicitly in the shell)
-          export SCCACHE_DIR="${SCCACHE_DIR}"
-          export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE}"
-
-          # Create dir and set permissions if needed
-          mkdir -p "$SCCACHE_DIR"
-          chmod 700 "$SCCACHE_DIR" || true
-
-          # Start server (server picks up env vars from this shell)
-          sccache --start-server
-
-          # Verify sccache is running and shows the expected configuration
-          echo "sccache version: $(sccache --version)"
-          echo "=== sccache --show-stats (initial) ==="
-          sccache --show-stats || true
 
       - name: Install cargo-binstall
         shell: bash
@@ -195,11 +163,6 @@ jobs:
           echo -n "$PACKAGES" | shasum -a 1 | cut -c1-12 > /tmp/pkg-hash
           echo "pkg_hash=$(cat /tmp/pkg-hash)" >> "$GITHUB_OUTPUT"
 
-      - name: Debug sccache after start
-        run: |
-          sccache --version || true
-          sccache --show-stats || true
-
       - uses: bencherdev/bencher@main
 
       - name: Run benches
@@ -217,14 +180,14 @@ jobs:
           # Build a single cargo bench invocation with -p flags for all
           # detected packages. Running one cargo process avoids duplicate
           # dependency resolution and compilation across multiple cargo
-          # invocations and helps sccache reuse.
+          # invocations and potentially helps cache reuse (if enabled).
           PACKAGE_FLAGS=()
           for p in $PACKAGES; do
             PACKAGE_FLAGS+=("-p" "$p")
           done
 
           # Populate (no-run) using a single cargo invocation
-          echo "Populating sccache for packages: $PACKAGES"
+          echo "Populating cache for packages: $PACKAGES"
           echo "+ cargo bench ${PACKAGE_FLAGS[@]} --no-run"
           cargo bench "${PACKAGE_FLAGS[@]}" --no-run || true
 
@@ -262,28 +225,3 @@ jobs:
 
           # Execute the assembled command
           "${BENCHER_CMD[@]}"
-
-      - name: Debug sccache after run
-        if: always()
-        run: |
-          echo "post-run sccache stats:"
-          sccache --show-stats || true
-
-      - name: Stop sccache
-        if: always()
-        run: sccache --stop-server || true
-
-    #   # Show final sccache statistics after benchmark completion
-    #   - name: Display sccache stats
-    #     if: always()
-    #     run: |
-    #       echo "=== Final sccache statistics ==="
-    #       sccache --show-stats
-    #       echo ""
-    #       echo "=== sccache cache directory size ==="
-    #       du -sh "$SCCACHE_DIR" 2>/dev/null || echo "Cache directory not found"
-
-    #   # Stop sccache server to clean up
-    #   - name: Stop sccache
-    #     if: always()
-    #     run: sccache --stop-server || true
