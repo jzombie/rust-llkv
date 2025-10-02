@@ -121,33 +121,48 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Ensure we can compare against origin/main or the PR base
-          git fetch --no-tags --prune origin "+refs/heads/*:refs/remotes/origin/*"
-
+          # Determine the comparison base
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            SINCE="${{ github.event.pull_request.base.sha }}"
+            # For PRs, compare against the merge base (common ancestor)
+            BASE_REF="origin/${{ github.event.pull_request.base.ref }}"
+            echo "Event: pull_request, base ref: $BASE_REF"
+            
+            # Ensure the base branch is fetched
+            git fetch --no-tags origin "${{ github.event.pull_request.base.ref }}"
+            
+            # Use merge-base to find the actual divergence point
+            SINCE=$(git merge-base HEAD "$BASE_REF")
+            echo "Using merge-base: $SINCE"
           else
+            # For pushes, compare against origin/main
             SINCE="origin/main"
+            echo "Event: push, comparing against: $SINCE"
+            git fetch --no-tags origin main
           fi
 
-          # Debugging aids: print SINCE and whether cargo-workspaces is present
-          echo "SINCE=$SINCE"
-          if command -v cargo-workspaces >/dev/null 2>&1; then
-            echo "cargo-workspaces: $(command -v cargo-workspaces)"
-          else
-            echo "cargo-workspaces: not found"
+          # Debugging: show current HEAD and SINCE
+          echo "Current HEAD: $(git rev-parse HEAD)"
+          echo "Comparing since: $SINCE ($(git rev-parse "$SINCE" 2>/dev/null || echo 'unresolved'))"
+
+          # Verify cargo-workspaces is available
+          if ! command -v cargo-workspaces >/dev/null 2>&1; then
+            echo "ERROR: cargo-workspaces not found"
             exit 1
           fi
+          echo "cargo-workspaces: $(command -v cargo-workspaces)"
 
-          # Run detection, produce a JSON array (fallback to empty array on error)
-          PACKAGES_JSON=$(cargo workspaces changed --json --since "$SINCE" 2>/dev/null || echo '[]')
+          # Run detection with verbose error output
+          echo "Running: cargo workspaces changed --since $SINCE"
+          PACKAGES=$(cargo workspaces changed --since "$SINCE" 2>&1 | tee /tmp/cargo-ws-output.txt | paste -sd ' ' - || true)
 
-          # Convert JSON array to a space-separated list of unique crate names.
-          PACKAGES=$(echo "$PACKAGES_JSON" \
-            | tr -d "\n" \
-            | sed "s/},{/}\n{/g" \
-            | sed -n "s/.*\"name\":\"\([^\"]*\)\".*/\1/p" \
-            | paste -sd ' ' - || true)
+          # If detection failed or returned nothing, show debug info
+          if [ -z "$PACKAGES" ]; then
+            echo "WARNING: No packages detected. Debug info:"
+            echo "--- cargo workspaces output ---"
+            cat /tmp/cargo-ws-output.txt || true
+            echo "--- git diff --name-only $SINCE..HEAD ---"
+            git diff --name-only "$SINCE"..HEAD | head -20 || true
+          fi
 
           echo "detected packages: $PACKAGES"
           echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
