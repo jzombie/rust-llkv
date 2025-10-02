@@ -142,12 +142,12 @@ jobs:
           # Run detection, produce a JSON array (fallback to empty array on error)
           PACKAGES_JSON=$(cargo workspaces changed --json --since "$SINCE" 2>/dev/null || echo '[]')
 
-          # Convert JSON array to a simple space-separated list of crate names
-          # Use the default (plain-text) output of `cargo workspaces changed`.
-          # It lists one crate name per line; convert to a space-separated list.
-          PACKAGES=$(cargo workspaces changed --since "$SINCE" 2>/dev/null | paste -sd ' ' - || true)
-
-
+          # Convert JSON array to a space-separated list of unique crate names.
+          PACKAGES=$(echo "$PACKAGES_JSON" \
+            | tr -d "\n" \
+            | sed "s/},{/}\n{/g" \
+            | sed -n "s/.*\"name\":\"\([^\"]*\)\".*/\1/p" \
+            | paste -sd ' ' - || true)
 
           echo "detected packages: $PACKAGES"
           echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
