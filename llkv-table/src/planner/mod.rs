@@ -36,6 +36,8 @@ use self::plan_graph::{
     PlanNodeId, PlanOperator,
 };
 
+// TODO: Refactor into executor and potentially migrate any remnants to `llkv-plan`
+
 macro_rules! impl_single_column_emit_chunk {
     (
         $_base:ident,

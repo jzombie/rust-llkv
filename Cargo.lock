@@ -913,6 +913,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-join"
+version = "0.1.0-alpha"
+dependencies = [
+ "arrow",
+ "criterion",
+ "llkv-column-map",
+ "llkv-expr",
+ "llkv-result",
+ "llkv-storage",
+ "llkv-table",
+ "rustc-hash",
+ "simd-r-drive-entry-handle",
+ "tempfile",
+]
+
+[[package]]
 name = "llkv-plan"
 version = "0.1.0-alpha"
 dependencies = [
