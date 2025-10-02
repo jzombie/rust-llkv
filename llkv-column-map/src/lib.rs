@@ -1,3 +1,5 @@
+// TODO: Remove
+
 // NOTE: rustfmt appears to repeatedly re-indent portions of some macros in
 // this file when running `cargo fmt` (likely a rustfmt bug). To avoid noisy
 // diffs and churn, skip automatic formatting on the affected macro_rules!
