@@ -77,6 +77,7 @@ jobs:
             ${{ env.CARGO_HOME }}/registry/cache/
             ${{ env.CARGO_HOME }}/git/db/
             ${{ env.SCCACHE_DIR }}
+            target/
           # Cache scoped to OS + ARCH and invalidated when Cargo.lock or
           # rust-toolchain files change. We intentionally do NOT cache
           # `target/` here because sccache provides compiled-object caching
