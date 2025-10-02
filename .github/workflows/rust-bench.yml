@@ -72,7 +72,7 @@ jobs:
             ~/.cargo/git/db/
             target/
             ${{ env.SCCACHE_DIR }}
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.flags }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
 
@@ -90,40 +90,91 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
+      - name: Detect changed crates
+        id: detect
+        # This uses `cargo-workspaces` to find crates changed since the base
+        # ref of the current PR (or `origin/main` for pushes). It writes a
+        # space-separated list of crate names to the `packages` output. If no
+        # crates changed the output will be empty.
+        run: |
+          set -euo pipefail
+
+          # Ensure we can compare against origin/main or the PR base
+          git fetch --no-tags --prune origin "+refs/heads/*:refs/remotes/origin/*"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            SINCE="${{ github.event.pull_request.base.sha }}"
+          else
+            SINCE="origin/main"
+          fi
+
+          # Install cargo-workspaces if missing (cached installs are faster on runners)
+          if ! command -v cargo-workspaces >/dev/null 2>&1; then
+            cargo install cargo-workspaces || true
+          fi
+
+          # Run detection, produce a JSON array (fallback to empty array on error)
+          PACKAGES_JSON=$(cargo workspaces changed --json --since "$SINCE" 2>/dev/null || echo '[]')
+
+          # Convert JSON array to a simple space-separated list of crate names
+          # Use the default (plain-text) output of `cargo workspaces changed`.
+          # It lists one crate name per line; convert to a space-separated list.
+          PACKAGES=$(cargo workspaces changed --since "$SINCE" 2>/dev/null | paste -sd ' ' - || true)
+
+          echo "detected packages: $PACKAGES"
+          echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
+
       - uses: bencherdev/bencher@main
 
-      - name: Run benches via Bencher (in-repo PRs)
+      - name: Run benches via Bencher
+        id: run-benches
         env:
           RUSTC_WRAPPER: sccache
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false }}
-        # Note: The `--github-actions` flag will allow Bencher to create a PR
-        # comment/check using the provided GITHUB_TOKEN. This step passes the
-        # branch/testbed and any optional threshold flags.
+          PACKAGES: ${{ steps.detect.outputs.packages }}
         run: |
-          bencher run \
-            --adapter ${BENCHER_ADAPTER} \
-            --project "${BENCHER_PROJECT}" \
-            --branch "${BENCHER_BRANCH}" \
-            --testbed "${BENCHER_TESTBED}" \
-            ${THRESHOLD_FLAGS} \
-            --github-actions "${{ secrets.GITHUB_TOKEN }}" \
-            "cargo bench"
+          set -euo pipefail
 
-      - name: Run benches via Bencher (pushes / forked PRs)
-        env:
-          RUSTC_WRAPPER: sccache
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == true }}
-        # For forked PRs secrets are not available — this runs Bencher locally
-        # (no GitHub comment). It still accepts the same branch/testbed and
-        # threshold flags, but without uploading results if no API token is set.
-        run: |
-          bencher run \
-            --adapter ${BENCHER_ADAPTER} \
-            --project "${BENCHER_PROJECT}" \
-            --branch "${BENCHER_BRANCH}" \
-            --testbed "${BENCHER_TESTBED}" \
-            ${THRESHOLD_FLAGS} \
-            "cargo bench"
+          if [ -z "${PACKAGES}" ]; then
+            echo "No changed crates detected; skipping bench run."
+            exit 0
+          fi
+
+          # Build package flags for `cargo bench` (eg: -p foo -p bar)
+          PACKAGE_FLAGS=""
+          for p in $PACKAGES; do
+            PACKAGE_FLAGS="$PACKAGE_FLAGS -p $p"
+          done
+
+          # Build the bencher command safely into an array to avoid eval/quoting issues.
+          # Split threshold flags into an array so each flag is preserved as a token.
+          read -r -a THRESHOLD_ARR <<<"${THRESHOLD_FLAGS}"
+
+          BENCHER_CMD=(
+            bencher
+            run
+            --adapter "${BENCHER_ADAPTER}"
+            --project "${BENCHER_PROJECT}"
+            --branch "${BENCHER_BRANCH}"
+            --testbed "${BENCHER_TESTBED}"
+          )
+
+          if [ "${#THRESHOLD_ARR[@]}" -ne 0 ]; then
+            BENCHER_CMD+=("${THRESHOLD_ARR[@]}")
+          fi
+
+          # If this is an in-repo PR (secrets available) append the GitHub
+          # actions flag so Bencher can post a PR comment/check. This flag is
+          # strictly about creating a GitHub PR comment, not uploading to
+          # bencher.dev (that's controlled by BENCHER_API_TOKEN).
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.pull_request.head.repo.fork }}" = "false" ]; then
+            BENCHER_CMD+=(--github-actions "${{ secrets.GITHUB_TOKEN }}")
+          fi
+
+          # The final argument to bencher is the command to run (cargo bench ...)
+          BENCHER_CMD+=("cargo bench ${PACKAGE_FLAGS}")
+
+          # Execute the command array safely without eval.
+          "${BENCHER_CMD[@]}"
 
       # Show final sccache statistics after benchmark completion
       - name: Display sccache stats
