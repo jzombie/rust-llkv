@@ -171,41 +171,6 @@ jobs:
           echo "+ cargo bench ${PACKAGE_FLAGS[@]}"
           cargo bench "${PACKAGE_FLAGS[@]}"
 
-      - name: Debug sccache & compile one package (diagnostic)
-        if: always()
-        env:
-          RUSTC_WRAPPER: sccache
-          PACKAGES: ${{ steps.detect.outputs.packages }}
-        run: |
-          set -euo pipefail
-
-          echo "=== Environment check ==="
-          echo "RUSTC_WRAPPER=$RUSTC_WRAPPER"
-          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE:-.}"
-          echo "PACKAGES=$PACKAGES"
-
-          first_pkg=$(echo "$PACKAGES" | awk '{print $1}')
-          if [ -z "$first_pkg" ]; then
-            echo "No packages detected, skipping debug step."
-            exit 0
-          fi
-
-          manifest="${GITHUB_WORKSPACE:-.}/$first_pkg/Cargo.toml"
-          echo "Using manifest: $manifest"
-
-          echo "=== sccache stats (before) ==="
-          sccache --show-stats || true
-
-          echo "=== sccache dir listing (top) ==="
-          du -sh "${SCCACHE_DIR:-.}/" || true
-          ls -la "${SCCACHE_DIR:-.}" | head -n 50 || true
-
-          echo "=== Running cargo bench --no-run for $first_pkg ==="
-          cargo bench --manifest-path "$manifest" --no-run || true
-
-          echo "=== sccache stats (after) ==="
-          sccache --show-stats || true
-
       # Show final sccache statistics after benchmark completion
       - name: Display sccache stats
         if: always()
