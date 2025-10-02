@@ -25,7 +25,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  benchmark_with_bencher:
+  bench:
     # Only run this job for non-draft pull requests. We still want the job to run
     # for pushes and manual `workflow_dispatch` events. GitHub exposes
     # `github.event.pull_request.draft` (true for draft PRs), so require it to
