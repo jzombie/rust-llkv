@@ -60,17 +60,11 @@ jobs:
       # Use a persistent target directory OUTSIDE the workspace to survive runner cleanup
       CARGO_TARGET_DIR: /tmp/llkv-bench-target
 
-      # Use nightly toolchain to support edition2024
-      # (Required for cargo-workspaces to parse workspace manifests)
-      RUSTUP_TOOLCHAIN: nightly
-
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Add cargo bin to PATH
         run: |
