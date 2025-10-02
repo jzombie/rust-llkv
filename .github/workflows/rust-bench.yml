@@ -40,7 +40,7 @@ jobs:
       # The Bencher adapter to use for the benchmark run.
       # https://bencher.dev/docs/explanation/adapters
       BENCHER_ADAPTER: rust_criterion
-      BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+      # BENCHER_API_TOKEN removed (not used anymore)
       # Use a workspace-local CARGO_HOME to avoid writing into the runner's
       # $HOME/.cargo. This keeps installs and registry/git cache inside the
       # repository workspace (useful for self-hosted runners).
@@ -59,6 +59,10 @@ jobs:
       # This persists the cache across workflow runs on the same runner.
       SCCACHE_DIR: "${{ github.workspace }}/.sccache"
       SCCACHE_CACHE_SIZE: "5G"
+      # Ensure every cargo invocation in the job goes through sccache
+      RUSTC_WRAPPER: sccache
+      # Use a consistent target directory so artifacts are shared across steps
+      CARGO_TARGET_DIR: "${{ github.workspace }}/target"
     steps:
       - uses: actions/checkout@v4
 
@@ -137,7 +141,6 @@ jobs:
       - name: Run benches directly
         id: run-benches
         env:
-          RUSTC_WRAPPER: sccache
           PACKAGES: ${{ steps.detect.outputs.packages }}
         run: |
           set -euo pipefail
@@ -146,6 +149,17 @@ jobs:
             echo "No changed crates detected; skipping bench run."
             exit 0
           fi
+
+          # Populate sccache by doing a no-run bench build for each package
+          # using the same profile as the actual bench. This helps ensure
+          # the cache contains entries for the exact rustc invocations we
+          # will run in the real bench step.
+          for p in $PACKAGES; do
+            echo "Populating sccache for package: $p"
+            manifest="${GITHUB_WORKSPACE:-.}/$p/Cargo.toml"
+            echo "+ cargo bench --manifest-path $manifest --no-run"
+            cargo bench --manifest-path "$manifest" --no-run || true
+          done
 
           for p in $PACKAGES; do
             echo "Running cargo benches for package: $p"
