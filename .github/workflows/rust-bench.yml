@@ -62,7 +62,7 @@ jobs:
       SCCACHE_DIR: "${{ github.workspace }}/.sccache"
       SCCACHE_CACHE_SIZE: "5G"
       # Ensure every cargo invocation in the job goes through sccache
-      RUSTC_WRAPPER: sccache
+      # RUSTC_WRAPPER: sccache
       # Use a consistent target directory so artifacts are shared across steps
       CARGO_TARGET_DIR: "${{ github.workspace }}/target"
     steps:
@@ -79,8 +79,8 @@ jobs:
       - name: Ensure sccache directory
         run: mkdir -p "$SCCACHE_DIR"
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      #   - name: Setup sccache
+      #     uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install cargo-binstall
         shell: bash
@@ -216,17 +216,17 @@ jobs:
           # Execute the assembled command
           "${BENCHER_CMD[@]}"
 
-      # Show final sccache statistics after benchmark completion
-      - name: Display sccache stats
-        if: always()
-        run: |
-          echo "=== Final sccache statistics ==="
-          sccache --show-stats
-          echo ""
-          echo "=== sccache cache directory size ==="
-          du -sh "$SCCACHE_DIR" 2>/dev/null || echo "Cache directory not found"
+    #   # Show final sccache statistics after benchmark completion
+    #   - name: Display sccache stats
+    #     if: always()
+    #     run: |
+    #       echo "=== Final sccache statistics ==="
+    #       sccache --show-stats
+    #       echo ""
+    #       echo "=== sccache cache directory size ==="
+    #       du -sh "$SCCACHE_DIR" 2>/dev/null || echo "Cache directory not found"
 
-      # Stop sccache server to clean up
-      - name: Stop sccache
-        if: always()
-        run: sccache --stop-server || true
+    #   # Stop sccache server to clean up
+    #   - name: Stop sccache
+    #     if: always()
+    #     run: sccache --stop-server || true
