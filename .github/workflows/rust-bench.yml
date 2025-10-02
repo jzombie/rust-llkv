@@ -57,14 +57,23 @@ jobs:
       # bench run executes. Leave empty to skip creating/updating Thresholds.
       # https://bencher.dev/docs/explanation/thresholds/
       THRESHOLD_FLAGS: --threshold-measure latency --threshold-test t_test --threshold-max-sample-size 64 --threshold-upper-boundary 0.99 --thresholds-reset --err
-      # Configure sccache to use local disk storage for self-hosted runners.
-      # This persists the cache across workflow runs on the same runner.
-      SCCACHE_DIR: "${{ github.workspace }}/.sccache"
-      SCCACHE_CACHE_SIZE: "5G"
+
+      # Configure sccache to use a persistent location OUTSIDE the workspace.
+      # This keeps the cache across runs even if the repo checkout is wiped.
+      SCCACHE_DIR: /tmp/sccache
+      SCCACHE_CACHE_SIZE: "20G"
       # Ensure every cargo invocation in the job goes through sccache
       RUSTC_WRAPPER: sccache
       # Use a consistent target directory so artifacts are shared across steps
       CARGO_TARGET_DIR: "${{ github.workspace }}/target"
+
+      # Pin the toolchain to keep cache keys stable across runs.
+      RUSTUP_TOOLCHAIN: 1.80.1
+
+      # Lightweight logging to inspect why an item was (not) cached.
+      SCCACHE_LOG: info
+      SCCACHE_ERROR_LOG: ${{ runner.temp }}/sccache.log
+
     steps:
       - uses: actions/checkout@v4
 
@@ -76,8 +85,17 @@ jobs:
           mkdir -p "${CARGO_HOME}/bin"
           echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
 
-      - name: Ensure sccache directory
-        run: mkdir -p "$SCCACHE_DIR"
+      - name: Prepare persistent sccache directory
+        env:
+          SCCACHE_DIR: ${{ env.SCCACHE_DIR }}
+        run: |
+          set -euo pipefail
+          dir="${SCCACHE_DIR:?SCCACHE_DIR must be set}"
+          # Create the directory; use sudo only if required.
+          mkdir -p "$dir" 2>/dev/null || sudo mkdir -p "$dir"
+          # Ensure writable by the current user (no-op if already owned).
+          sudo chown -R "$USER" "$dir" 2>/dev/null || true
+          echo "SCCACHE_DIR=$dir"
 
       # NOTE: Removed "Restore registry and sccache cache" (actions/cache).
 
@@ -138,12 +156,11 @@ jobs:
 
       - name: Debug sccache after start
         run: |
-          echo "restore-sccache.cache-hit=removed"
-          echo "cache-deps.cache-hit=removed"
           sccache --version || true
           sccache --show-stats || true
 
       - uses: bencherdev/bencher@main
+
       - name: Run benches
         id: run-benches
         env:
