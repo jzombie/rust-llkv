@@ -21,3 +21,11 @@ Then run `flamegraph` / `summarize` on the prefix in `prof/`.
 
 Make a minimal `benches/manual_bench.rs` that just calls your join functions and prints elapsed time.
 Build that with `cargo build --release --benches`. If it compiles fast, Criterion is the main culprit.
+
+**llvm-lines**
+
+https://github.com/dtolnay/cargo-llvm-lines
+
+```sh
+cargo llvm-lines --example reimplement_benches --release
+```
