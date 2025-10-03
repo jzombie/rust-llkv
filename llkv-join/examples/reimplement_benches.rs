@@ -6,7 +6,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Int32Array, UInt64Array, StringArray};
+use arrow::array::{Int32Array, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -188,7 +188,10 @@ fn main() {
     }
 
     for &size in &[100usize, 1_000usize, 10_000usize] {
-        print_result(&format!("many_to_many size={}", size), run_many_to_many(size));
+        print_result(
+            &format!("many_to_many size={}", size),
+            run_many_to_many(size),
+        );
     }
 
     for &size in &[1_000usize, 10_000usize, 100_000usize] {

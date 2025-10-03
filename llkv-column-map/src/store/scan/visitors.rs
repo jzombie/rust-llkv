@@ -112,17 +112,36 @@ pub trait PrimitiveSortedWithRowIdsVisitor {
 }
 
 /// Combined trait for functions needing both with-rids and sorted-with-rids visitors
-pub trait PrimitiveWithRowIdsAndNullsVisitor: PrimitiveWithRowIdsVisitor + PrimitiveSortedWithRowIdsVisitor {}
+pub trait PrimitiveWithRowIdsAndNullsVisitor:
+    PrimitiveWithRowIdsVisitor + PrimitiveSortedWithRowIdsVisitor
+{
+}
 
 // Blanket impl for any type implementing both required traits
-impl<T> PrimitiveWithRowIdsAndNullsVisitor for T where T: PrimitiveWithRowIdsVisitor + PrimitiveSortedWithRowIdsVisitor {}
+impl<T> PrimitiveWithRowIdsAndNullsVisitor for T where
+    T: PrimitiveWithRowIdsVisitor + PrimitiveSortedWithRowIdsVisitor
+{
+}
 
 /// Combined trait for scan function needing all 4 visitor types.
 /// This is a supertrait of PrimitiveWithRowIdsAndNullsVisitor.
-pub trait PrimitiveFullVisitor: PrimitiveVisitor + PrimitiveSortedVisitor + PrimitiveWithRowIdsVisitor + PrimitiveSortedWithRowIdsVisitor + PrimitiveWithRowIdsAndNullsVisitor {}
+pub trait PrimitiveFullVisitor:
+    PrimitiveVisitor
+    + PrimitiveSortedVisitor
+    + PrimitiveWithRowIdsVisitor
+    + PrimitiveSortedWithRowIdsVisitor
+    + PrimitiveWithRowIdsAndNullsVisitor
+{
+}
 
 // Blanket impl for any type implementing all required traits
-impl<T> PrimitiveFullVisitor for T where T: PrimitiveVisitor + PrimitiveSortedVisitor + PrimitiveWithRowIdsVisitor + PrimitiveSortedWithRowIdsVisitor {}
+impl<T> PrimitiveFullVisitor for T where
+    T: PrimitiveVisitor
+        + PrimitiveSortedVisitor
+        + PrimitiveWithRowIdsVisitor
+        + PrimitiveSortedWithRowIdsVisitor
+{
+}
 
 // Pagination adapter: enforces offset/limit across chunks (unsorted)
 // and across coalesced runs (sorted). It wraps an inner visitor that
