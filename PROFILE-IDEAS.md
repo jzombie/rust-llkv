@@ -30,6 +30,12 @@ https://github.com/dtolnay/cargo-llvm-lines
 cargo llvm-lines --example reimplement_benches --release
 ```
 
+Current debug for https://github.com/jzombie/rust-llkv/issues/63:
+
+```sh
+CARGO_PROFILE_RELEASE_LTO=fat cargo llvm-lines -p llkv-join --example reimplement_benches --release > debug-lines2.txt
+```
+
 **Related**
 
 https://github.com/apache/datafusion/issues/13814

@@ -111,6 +111,12 @@ pub trait PrimitiveSortedWithRowIdsVisitor {
     fn null_run(&mut self, _r: &UInt64Array, _start: usize, _len: usize) {}
 }
 
+/// Combined trait for functions needing both with-rids and sorted-with-rids visitors
+pub trait PrimitiveWithRowIdsAndNullsVisitor: PrimitiveWithRowIdsVisitor + PrimitiveSortedWithRowIdsVisitor {}
+
+// Blanket impl for any type implementing both required traits
+impl<T> PrimitiveWithRowIdsAndNullsVisitor for T where T: PrimitiveWithRowIdsVisitor + PrimitiveSortedWithRowIdsVisitor {}
+
 // Pagination adapter: enforces offset/limit across chunks (unsorted)
 // and across coalesced runs (sorted). It wraps an inner visitor that
 // implements the same traits and forwards appropriately.
