@@ -67,10 +67,10 @@ where
 
     /// Convenience: sorted scan with closures over coalesced runs.
     /// Sorted scan with typed visitor callbacks over coalesced runs.
-    fn scan_sorted_visit<V: crate::store::scan::PrimitiveSortedVisitor>(
+    fn scan_sorted_visit(
         &self,
         field_id: LogicalFieldId,
-        visitor: &mut V,
+        visitor: &mut dyn crate::store::scan::PrimitiveSortedVisitor,
     ) -> Result<()> {
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
@@ -121,10 +121,10 @@ where
     }
 
     /// Sorted scan in reverse (descending) with typed visitor callbacks.
-    fn scan_sorted_visit_reverse<V: crate::store::scan::PrimitiveSortedVisitor>(
+    fn scan_sorted_visit_reverse(
         &self,
         field_id: LogicalFieldId,
-        visitor: &mut V,
+        visitor: &mut dyn crate::store::scan::PrimitiveSortedVisitor,
     ) -> Result<()> {
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;

@@ -309,11 +309,11 @@ macro_rules! sorted_visit_impl {
             );
             Ok(())
         }
-        pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
+        pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas: &[ChunkMetadata],
             buffers: &SortedChunkBuffers,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedVisitor,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for idx in 0..metas.len() {
@@ -745,70 +745,64 @@ sorted_with_rids_float_impl!(
 );
 
 pub(crate) trait SortedDispatch {
-    fn visit<P, V>(
+    fn visit<P>(
         pager: &P,
         metas: &[ChunkMetadata],
         buffers: &SortedChunkBuffers,
-        visitor: &mut V,
+        visitor: &mut dyn PrimitiveSortedVisitor,
     ) -> Result<()>
     where
-        P: Pager<Blob = EntryHandle>,
-        V: PrimitiveSortedVisitor;
+        P: Pager<Blob = EntryHandle>;
 
-    fn visit_rev<P, V>(
+    fn visit_rev<P>(
         pager: &P,
         metas: &[ChunkMetadata],
         buffers: &SortedChunkBuffers,
-        visitor: &mut V,
+        visitor: &mut dyn PrimitiveSortedVisitor,
     ) -> Result<()>
     where
-        P: Pager<Blob = EntryHandle>,
-        V: PrimitiveSortedVisitor;
+        P: Pager<Blob = EntryHandle>;
 
-    fn visit_with_rids<P, V>(
+    fn visit_with_rids<P>(
         pager: &P,
         metas_val: &[ChunkMetadata],
         metas_rid: &[ChunkMetadata],
         buffers: &SortedChunkBuffersWithRids,
-        visitor: &mut V,
+        visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
     ) -> Result<()>
     where
-        P: Pager<Blob = EntryHandle>,
-        V: PrimitiveSortedWithRowIdsVisitor;
+        P: Pager<Blob = EntryHandle>;
 
-    fn visit_with_rids_rev<P, V>(
+    fn visit_with_rids_rev<P>(
         pager: &P,
         metas_val: &[ChunkMetadata],
         metas_rid: &[ChunkMetadata],
         buffers: &SortedChunkBuffersWithRids,
-        visitor: &mut V,
+        visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
     ) -> Result<()>
     where
-        P: Pager<Blob = EntryHandle>,
-        V: PrimitiveSortedWithRowIdsVisitor;
+        P: Pager<Blob = EntryHandle>;
 
-    fn visit_bounds<P, V>(
+    fn visit_bounds<P>(
         pager: &P,
         metas: &[ChunkMetadata],
         buffers: &SortedChunkBuffers,
         ir: &IntRanges,
-        visitor: &mut V,
+        visitor: &mut dyn PrimitiveSortedVisitor,
     ) -> Result<()>
     where
-        P: Pager<Blob = EntryHandle>,
-        V: PrimitiveSortedVisitor;
+        P: Pager<Blob = EntryHandle>;
 
-    fn visit_with_rids_bounds<P, V>(
+    fn visit_with_rids_bounds<P>(
         pager: &P,
         metas_val: &[ChunkMetadata],
         metas_rid: &[ChunkMetadata],
         buffers: &SortedChunkBuffersWithRids,
         ir: &IntRanges,
-        visitor: &mut V,
+        visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
     ) -> Result<()>
     where
-        P: Pager<Blob = EntryHandle>,
-        V: PrimitiveSortedWithRowIdsVisitor;
+        P: Pager<Blob = EntryHandle>;
 }
 
 macro_rules! impl_sorted_dispatch {
@@ -824,74 +818,69 @@ macro_rules! impl_sorted_dispatch {
     ) => {
         impl SortedDispatch for $ty {
             #[inline]
-            fn visit<P, V>(
+            fn visit<P>(
                 pager: &P,
                 metas: &[ChunkMetadata],
                 buffers: &SortedChunkBuffers,
-                visitor: &mut V,
+                visitor: &mut dyn PrimitiveSortedVisitor,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
-                V: PrimitiveSortedVisitor,
             {
                 $visit(pager, metas, buffers, visitor)
             }
 
             #[inline]
-            fn visit_rev<P, V>(
+            fn visit_rev<P>(
                 pager: &P,
                 metas: &[ChunkMetadata],
                 buffers: &SortedChunkBuffers,
-                visitor: &mut V,
+                visitor: &mut dyn PrimitiveSortedVisitor,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
-                V: PrimitiveSortedVisitor,
             {
                 $visit_rev(pager, metas, buffers, visitor)
             }
 
             #[inline]
-            fn visit_with_rids<P, V>(
+            fn visit_with_rids<P>(
                 pager: &P,
                 metas_val: &[ChunkMetadata],
                 metas_rid: &[ChunkMetadata],
                 buffers: &SortedChunkBuffersWithRids,
-                visitor: &mut V,
+                visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
-                V: PrimitiveSortedWithRowIdsVisitor,
             {
                 $with_rids(pager, metas_val, metas_rid, buffers, visitor)
             }
 
             #[inline]
-            fn visit_with_rids_rev<P, V>(
+            fn visit_with_rids_rev<P>(
                 pager: &P,
                 metas_val: &[ChunkMetadata],
                 metas_rid: &[ChunkMetadata],
                 buffers: &SortedChunkBuffersWithRids,
-                visitor: &mut V,
+                visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
-                V: PrimitiveSortedWithRowIdsVisitor,
             {
                 $with_rids_rev(pager, metas_val, metas_rid, buffers, visitor)
             }
 
             #[inline]
-            fn visit_bounds<P, V>(
+            fn visit_bounds<P>(
                 pager: &P,
                 metas: &[ChunkMetadata],
                 buffers: &SortedChunkBuffers,
                 ir: &IntRanges,
-                visitor: &mut V,
+                visitor: &mut dyn PrimitiveSortedVisitor,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
-                V: PrimitiveSortedVisitor,
             {
                 let bounds = ir
                     .$range_field
@@ -900,17 +889,16 @@ macro_rules! impl_sorted_dispatch {
             }
 
             #[inline]
-            fn visit_with_rids_bounds<P, V>(
+            fn visit_with_rids_bounds<P>(
                 pager: &P,
                 metas_val: &[ChunkMetadata],
                 metas_rid: &[ChunkMetadata],
                 buffers: &SortedChunkBuffersWithRids,
                 ir: &IntRanges,
-                visitor: &mut V,
+                visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
-                V: PrimitiveSortedWithRowIdsVisitor,
             {
                 let bounds = ir
                     .$range_field
