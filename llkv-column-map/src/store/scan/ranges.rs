@@ -77,11 +77,11 @@ impl RangeKey for bool {
 }
 
 #[inline]
-pub(crate) fn lower_idx_by<T: Ord, F: Fn(usize) -> T>(
+pub(crate) fn lower_idx_by<T: Ord>(
     mut lo: usize,
     mut hi: usize,
     pred: &T,
-    get: F,
+    get: &dyn Fn(usize) -> T,
 ) -> usize {
     while lo < hi {
         let mid = (lo + hi) >> 1;
@@ -94,11 +94,11 @@ pub(crate) fn lower_idx_by<T: Ord, F: Fn(usize) -> T>(
     lo
 }
 #[inline]
-pub(crate) fn upper_idx_by<T: Ord, F: Fn(usize) -> T>(
+pub(crate) fn upper_idx_by<T: Ord>(
     mut lo: usize,
     mut hi: usize,
     pred: &T,
-    get: F,
+    get: &dyn Fn(usize) -> T,
 ) -> usize {
     while lo < hi {
         let mid = (lo + hi) >> 1;
