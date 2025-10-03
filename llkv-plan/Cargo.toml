@@ -1,6 +1,6 @@
 [package]
 name = "llkv-plan"
-description = "Planner IR and related utilities for the LLKV toolkit."
+description = "Query planner for the LLKV toolkit."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true

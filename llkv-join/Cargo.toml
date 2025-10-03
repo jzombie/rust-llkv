@@ -1,6 +1,6 @@
 [package]
 name = "llkv-join"
-description = "Join operators for LLKV tables."
+description = "Table join operators for the LLKV toolkit."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true

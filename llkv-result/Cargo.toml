@@ -1,5 +1,6 @@
 [package]
 name = "llkv-result"
+description = "Result and error types for the LLKV toolkit."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
