@@ -301,11 +301,11 @@ macro_rules! sorted_visit_impl {
             if arrays.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<_, _, _, _, _>(
+            kmerge_coalesced::<_, _>(
                 &arrays,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| a.value(i),
-                |c, s, l| visitor.$visit(&arrays[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| a.value(i),
+                &mut |c, s, l| visitor.$visit(&arrays[c], s, l),
             );
             Ok(())
         }
@@ -334,11 +334,11 @@ macro_rules! sorted_visit_impl {
             if arrays.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced_rev::<_, _, _, _, _>(
+            kmerge_coalesced_rev::<_, _>(
                 &arrays,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| a.value(i),
-                |c, s, l| visitor.$visit(&arrays[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| a.value(i),
+                &mut |c, s, l| visitor.$visit(&arrays[c], s, l),
             );
             Ok(())
         }
@@ -381,11 +381,11 @@ macro_rules! sorted_visit_float_impl {
             if arrays.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<$key, _, _, _, _>(
+            kmerge_coalesced::<$key, _>(
                 &arrays,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
-                |c, s, l| visitor.$visit(&arrays[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
+                &mut |c, s, l| visitor.$visit(&arrays[c], s, l),
             );
             Ok(())
         }
@@ -414,11 +414,11 @@ macro_rules! sorted_visit_float_impl {
             if arrays.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced_rev::<$key, _, _, _, _>(
+            kmerge_coalesced_rev::<$key, _>(
                 &arrays,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
-                |c, s, l| visitor.$visit(&arrays[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
+                &mut |c, s, l| visitor.$visit(&arrays[c], s, l),
             );
             Ok(())
         }
@@ -502,11 +502,11 @@ macro_rules! sorted_with_rids_impl {
             if vals.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<_, _, _, _, _>(
+            kmerge_coalesced::<_, _>(
                 &vals,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| a.value(i),
-                |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| a.value(i),
+                &mut |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
             );
             Ok(())
         }
@@ -553,11 +553,11 @@ macro_rules! sorted_with_rids_impl {
             if vals.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced_rev::<_, _, _, _, _>(
+            kmerge_coalesced_rev::<_, _>(
                 &vals,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| a.value(i),
-                |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| a.value(i),
+                &mut |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
             );
             Ok(())
         }
@@ -673,11 +673,11 @@ macro_rules! sorted_with_rids_float_impl {
             if vals.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<$key, _, _, _, _>(
+            kmerge_coalesced::<$key, _>(
                 &vals,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
-                |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
+                &mut |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
             );
             Ok(())
         }
@@ -724,11 +724,11 @@ macro_rules! sorted_with_rids_float_impl {
             if vals.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced_rev::<$key, _, _, _, _>(
+            kmerge_coalesced_rev::<$key, _>(
                 &vals,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
-                |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
+                &mut |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
             );
             Ok(())
         }
@@ -1123,11 +1123,11 @@ macro_rules! sorted_visit_bounds_impl {
             if arrays.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<_, _, _, _, _>(
+            kmerge_coalesced::<_, _>(
                 &arrays,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| a.value(i),
-                |c, s, l| visitor.$visit(&arrays[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| a.value(i),
+                &mut |c, s, l| visitor.$visit(&arrays[c], s, l),
             );
             Ok(())
         }
@@ -1199,11 +1199,11 @@ macro_rules! sorted_visit_float_bounds_impl {
             if arrays.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<$key, _, _, _, _>(
+            kmerge_coalesced::<$key, _>(
                 &arrays,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
-                |c, s, l| visitor.$visit(&arrays[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
+                &mut |c, s, l| visitor.$visit(&arrays[c], s, l),
             );
             Ok(())
         }
@@ -1297,11 +1297,11 @@ macro_rules! sorted_with_rids_bounds_impl {
             if vals.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<_, _, _, _, _>(
+            kmerge_coalesced::<_, _>(
                 &vals,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| a.value(i),
-                |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| a.value(i),
+                &mut |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
             );
             Ok(())
         }
@@ -1395,11 +1395,11 @@ macro_rules! sorted_with_rids_float_bounds_impl {
             if vals.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<$key, _, _, _, _>(
+            kmerge_coalesced::<$key, _>(
                 &vals,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
-                |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
+                &mut |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
             );
             Ok(())
         }
