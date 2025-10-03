@@ -275,11 +275,11 @@ impl Ord for FloatOrd32 {
 
 macro_rules! sorted_visit_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident) => {
-        pub(crate) fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
+        pub(crate) fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas: &[ChunkMetadata],
             buffers: &SortedChunkBuffers,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedVisitor,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for idx in 0..metas.len() {
@@ -356,11 +356,11 @@ sorted_visit_impl!(sorted_visit_i8, sorted_visit_i8_rev, Int8Array, i8_run);
 
 macro_rules! sorted_visit_float_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident, $key:ty) => {
-        pub(crate) fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
+        pub(crate) fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas: &[ChunkMetadata],
             buffers: &SortedChunkBuffers,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedVisitor,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for idx in 0..metas.len() {
@@ -389,11 +389,11 @@ macro_rules! sorted_visit_float_impl {
             );
             Ok(())
         }
-        pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
+        pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas: &[ChunkMetadata],
             buffers: &SortedChunkBuffers,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedVisitor,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for idx in 0..metas.len() {
@@ -462,12 +462,12 @@ sorted_visit_impl!(
 
 macro_rules! sorted_with_rids_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident) => {
-        pub(crate) fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedWithRowIdsVisitor>(
+        pub(crate) fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             buffers: &SortedChunkBuffersWithRids,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
                 return Err(Error::Internal(
@@ -510,15 +510,12 @@ macro_rules! sorted_with_rids_impl {
             );
             Ok(())
         }
-        pub(crate) fn $name_rev<
-            P: Pager<Blob = EntryHandle>,
-            V: PrimitiveSortedWithRowIdsVisitor,
-        >(
+        pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             buffers: &SortedChunkBuffersWithRids,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
                 return Err(Error::Internal(
@@ -633,12 +630,12 @@ sorted_with_rids_impl!(
 
 macro_rules! sorted_with_rids_float_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident, $key:ty) => {
-        pub(crate) fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedWithRowIdsVisitor>(
+        pub(crate) fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             buffers: &SortedChunkBuffersWithRids,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
                 return Err(Error::Internal(
@@ -681,15 +678,12 @@ macro_rules! sorted_with_rids_float_impl {
             );
             Ok(())
         }
-        pub(crate) fn $name_rev<
-            P: Pager<Blob = EntryHandle>,
-            V: PrimitiveSortedWithRowIdsVisitor,
-        >(
+        pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             buffers: &SortedChunkBuffersWithRids,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
                 return Err(Error::Internal(
@@ -1060,12 +1054,12 @@ impl_sorted_dispatch!(
 
 macro_rules! sorted_visit_bounds_impl {
     ($name:ident, $ArrTy:ty, $ty:ty, $visit:ident) => {
-        fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
+        fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas: &[ChunkMetadata],
             buffers: &SortedChunkBuffers,
             bounds: (Bound<$ty>, Bound<$ty>),
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedVisitor,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for m in metas {
@@ -1136,12 +1130,12 @@ macro_rules! sorted_visit_bounds_impl {
 
 macro_rules! sorted_visit_float_bounds_impl {
     ($name:ident, $ArrTy:ty, $scalar:ty, $key:ty, $visit:ident) => {
-        fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
+        fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas: &[ChunkMetadata],
             buffers: &SortedChunkBuffers,
             bounds: (Bound<$scalar>, Bound<$scalar>),
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedVisitor,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for m in metas {
@@ -1212,13 +1206,13 @@ macro_rules! sorted_visit_float_bounds_impl {
 
 macro_rules! sorted_with_rids_bounds_impl {
     ($name:ident, $ArrTy:ty, $ty:ty, $visit:ident) => {
-        fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedWithRowIdsVisitor>(
+        fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             buffers: &SortedChunkBuffersWithRids,
             bounds: (Bound<$ty>, Bound<$ty>),
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
                 return Err(Error::Internal(
@@ -1310,13 +1304,13 @@ macro_rules! sorted_with_rids_bounds_impl {
 
 macro_rules! sorted_with_rids_float_bounds_impl {
     ($name:ident, $ArrTy:ty, $scalar:ty, $key:ty, $visit:ident) => {
-        fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedWithRowIdsVisitor>(
+        fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             buffers: &SortedChunkBuffersWithRids,
             bounds: (Bound<$scalar>, Bound<$scalar>),
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
                 return Err(Error::Internal(
