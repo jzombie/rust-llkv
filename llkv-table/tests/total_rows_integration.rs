@@ -58,9 +58,7 @@ fn test_total_rows_before_after_append_and_delete() {
     // Delete row with global position 2 (third row) from column 1 only
     let store = table.store();
     let lfid1 = LogicalFieldId::for_user(table.table_id(), 1);
-    store
-        .delete_rows(&[lfid1], &[2u64])
-        .expect("delete col1");
+    store.delete_rows(&[lfid1], &[2u64]).expect("delete col1");
 
     // col1 should be 4, col2 still 5
     let col1_after = table.total_rows_for_col(1).expect("col1 after");
