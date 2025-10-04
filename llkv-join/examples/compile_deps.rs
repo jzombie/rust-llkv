@@ -1,7 +1,6 @@
 // Small example whose purpose is to exercise public APIs so that dependencies are compiled.
 // Run with: cargo build --example compile_deps -p llkv-join
 
-use std::sync::Arc;
 use arrow::array::{Int32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -10,8 +9,13 @@ use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-fn create_table_with_rows(table_id: u16, pager: &Arc<MemPager>, num_rows: usize) -> Table<MemPager> {
+fn create_table_with_rows(
+    table_id: u16,
+    pager: &Arc<MemPager>,
+    num_rows: usize,
+) -> Table<MemPager> {
     let table = Table::new(table_id, Arc::clone(pager)).unwrap();
 
     let schema = Arc::new(Schema::new(vec![
@@ -23,8 +27,12 @@ fn create_table_with_rows(table_id: u16, pager: &Arc<MemPager>, num_rows: usize)
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(UInt64Array::from((0..num_rows).map(|i| i as u64).collect::<Vec<_>>())),
-            Arc::new(Int32Array::from((0..num_rows).map(|i| i as i32).collect::<Vec<_>>())),
+            Arc::new(UInt64Array::from(
+                (0..num_rows).map(|i| i as u64).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(
+                (0..num_rows).map(|i| i as i32).collect::<Vec<_>>(),
+            )),
         ],
     )
     .unwrap();
