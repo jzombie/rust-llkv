@@ -52,6 +52,7 @@ jobs:
       # Optional: set threshold flags here to create Thresholds/Models when the
       # bench run executes. Leave empty to skip creating/updating Thresholds.
       # https://bencher.dev/docs/explanation/thresholds/
+      # TODO: Evaluate multiple thresholds https://bencher.dev/docs/explanation/thresholds/#multiple-thresholds
       BENCHER_THRESHOLD_FLAGS: --threshold-measure latency --threshold-test t_test --threshold-max-sample-size 64 --threshold-upper-boundary 0.99 --thresholds-reset --err
       # Use a workspace-local CARGO_HOME to avoid writing into the runner's
       # $HOME/.cargo. This keeps installs and registry/git cache inside the
