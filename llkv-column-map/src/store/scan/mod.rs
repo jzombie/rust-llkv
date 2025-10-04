@@ -56,10 +56,10 @@ where
     P: Pager<Blob = EntryHandle>,
 {
     /// Unsorted scan with typed visitor callbacks per chunk.
-    fn scan_visit<V: crate::store::scan::PrimitiveVisitor>(
+    fn scan_visit(
         &self,
         field_id: LogicalFieldId,
-        visitor: &mut V,
+        visitor: &mut dyn crate::store::scan::PrimitiveVisitor,
     ) -> Result<()> {
         let catalog = self.catalog.read().unwrap();
         crate::store::scan::unsorted_visit(self.pager.as_ref(), &catalog.map, field_id, visitor)
@@ -67,10 +67,10 @@ where
 
     /// Convenience: sorted scan with closures over coalesced runs.
     /// Sorted scan with typed visitor callbacks over coalesced runs.
-    fn scan_sorted_visit<V: crate::store::scan::PrimitiveSortedVisitor>(
+    fn scan_sorted_visit(
         &self,
         field_id: LogicalFieldId,
-        visitor: &mut V,
+        visitor: &mut dyn crate::store::scan::PrimitiveSortedVisitor,
     ) -> Result<()> {
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
@@ -121,10 +121,10 @@ where
     }
 
     /// Sorted scan in reverse (descending) with typed visitor callbacks.
-    fn scan_sorted_visit_reverse<V: crate::store::scan::PrimitiveSortedVisitor>(
+    fn scan_sorted_visit_reverse(
         &self,
         field_id: LogicalFieldId,
-        visitor: &mut V,
+        visitor: &mut dyn crate::store::scan::PrimitiveSortedVisitor,
     ) -> Result<()> {
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
@@ -183,18 +183,12 @@ where
 
     /// Unified scan entrypoint configured by ScanOptions.
     /// Requires `V` to implement both unsorted and sorted visitor traits; methods are no-ops by default.
-    pub fn scan<V>(
+    pub fn scan(
         &self,
         field_id: LogicalFieldId,
         opts: ScanOptions,
-        visitor: &mut V,
-    ) -> Result<()>
-    where
-        V: crate::store::scan::PrimitiveVisitor
-            + crate::store::scan::PrimitiveSortedVisitor
-            + crate::store::scan::PrimitiveWithRowIdsVisitor
-            + crate::store::scan::PrimitiveSortedWithRowIdsVisitor,
-    {
+        visitor: &mut dyn crate::store::scan::PrimitiveFullVisitor,
+    ) -> Result<()> {
         let paginate = opts.offset > 0 || opts.limit.is_some();
         if !opts.sorted {
             if opts.with_row_ids {

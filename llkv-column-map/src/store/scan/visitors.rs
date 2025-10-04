@@ -111,10 +111,42 @@ pub trait PrimitiveSortedWithRowIdsVisitor {
     fn null_run(&mut self, _r: &UInt64Array, _start: usize, _len: usize) {}
 }
 
+/// Combined trait for functions needing both with-rids and sorted-with-rids visitors
+pub trait PrimitiveWithRowIdsAndNullsVisitor:
+    PrimitiveWithRowIdsVisitor + PrimitiveSortedWithRowIdsVisitor
+{
+}
+
+// Blanket impl for any type implementing both required traits
+impl<T> PrimitiveWithRowIdsAndNullsVisitor for T where
+    T: PrimitiveWithRowIdsVisitor + PrimitiveSortedWithRowIdsVisitor
+{
+}
+
+/// Combined trait for scan function needing all 4 visitor types.
+/// This is a supertrait of PrimitiveWithRowIdsAndNullsVisitor.
+pub trait PrimitiveFullVisitor:
+    PrimitiveVisitor
+    + PrimitiveSortedVisitor
+    + PrimitiveWithRowIdsVisitor
+    + PrimitiveSortedWithRowIdsVisitor
+    + PrimitiveWithRowIdsAndNullsVisitor
+{
+}
+
+// Blanket impl for any type implementing all required traits
+impl<T> PrimitiveFullVisitor for T where
+    T: PrimitiveVisitor
+        + PrimitiveSortedVisitor
+        + PrimitiveWithRowIdsVisitor
+        + PrimitiveSortedWithRowIdsVisitor
+{
+}
+
 // Pagination adapter: enforces offset/limit across chunks (unsorted)
 // and across coalesced runs (sorted). It wraps an inner visitor that
 // implements the same traits and forwards appropriately.
-pub struct PaginateVisitor<'a, V> {
+pub struct PaginateVisitor<'a, V: ?Sized> {
     pub inner: &'a mut V,
     // items to skip before emitting
     skip: usize,
@@ -124,7 +156,7 @@ pub struct PaginateVisitor<'a, V> {
     reverse: bool,
 }
 
-impl<'a, V> PaginateVisitor<'a, V> {
+impl<'a, V: ?Sized> PaginateVisitor<'a, V> {
     pub fn new(inner: &'a mut V, offset: usize, limit: Option<usize>) -> Self {
         Self {
             inner,
@@ -214,7 +246,7 @@ macro_rules! expand_unsorted_paginate {
     };
 }
 
-impl<'a, V> PrimitiveVisitor for PaginateVisitor<'a, V>
+impl<'a, V: ?Sized> PrimitiveVisitor for PaginateVisitor<'a, V>
 where
     V: PrimitiveVisitor,
 {
@@ -258,7 +290,7 @@ macro_rules! expand_unsorted_with_rids_paginate {
     };
 }
 
-impl<'a, V> PrimitiveWithRowIdsVisitor for PaginateVisitor<'a, V>
+impl<'a, V: ?Sized> PrimitiveWithRowIdsVisitor for PaginateVisitor<'a, V>
 where
     V: PrimitiveWithRowIdsVisitor,
 {
@@ -305,7 +337,7 @@ macro_rules! expand_sorted_paginate {
     };
 }
 
-impl<'a, V> PrimitiveSortedVisitor for PaginateVisitor<'a, V>
+impl<'a, V: ?Sized> PrimitiveSortedVisitor for PaginateVisitor<'a, V>
 where
     V: PrimitiveSortedVisitor,
 {
@@ -350,7 +382,7 @@ macro_rules! expand_sorted_with_rids_paginate {
     };
 }
 
-impl<'a, V> PrimitiveSortedWithRowIdsVisitor for PaginateVisitor<'a, V>
+impl<'a, V: ?Sized> PrimitiveSortedWithRowIdsVisitor for PaginateVisitor<'a, V>
 where
     V: PrimitiveSortedWithRowIdsVisitor,
 {

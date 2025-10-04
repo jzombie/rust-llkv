@@ -69,22 +69,22 @@ macro_rules! impl_sorted_range_filter {
                     Bound::Unbounded => s,
                     Bound::Included(x) => {
                         let key = ($bound_to_key)(x);
-                        crate::store::scan::lower_idx_by(s, s + l, &key, |i| ($value_to_key)(a, i))
+                        crate::store::scan::lower_idx_by(s, s + l, &key, &|i| ($value_to_key)(a, i))
                     }
                     Bound::Excluded(x) => {
                         let key = ($bound_to_key)(x);
-                        crate::store::scan::upper_idx_by(s, s + l, &key, |i| ($value_to_key)(a, i))
+                        crate::store::scan::upper_idx_by(s, s + l, &key, &|i| ($value_to_key)(a, i))
                     }
                 };
                 let end = match ub {
                     Bound::Unbounded => s + l,
                     Bound::Included(x) => {
                         let key = ($bound_to_key)(x);
-                        crate::store::scan::upper_idx_by(s, s + l, &key, |i| ($value_to_key)(a, i))
+                        crate::store::scan::upper_idx_by(s, s + l, &key, &|i| ($value_to_key)(a, i))
                     }
                     Bound::Excluded(x) => {
                         let key = ($bound_to_key)(x);
-                        crate::store::scan::lower_idx_by(s, s + l, &key, |i| ($value_to_key)(a, i))
+                        crate::store::scan::lower_idx_by(s, s + l, &key, &|i| ($value_to_key)(a, i))
                     }
                 };
                 if start < end {
@@ -105,22 +105,22 @@ macro_rules! impl_sorted_with_rids_range_filter {
                     Bound::Unbounded => s,
                     Bound::Included(x) => {
                         let key = ($bound_to_key)(x);
-                        crate::store::scan::lower_idx_by(s, s + l, &key, |i| ($value_to_key)(v, i))
+                        crate::store::scan::lower_idx_by(s, s + l, &key, &|i| ($value_to_key)(v, i))
                     }
                     Bound::Excluded(x) => {
                         let key = ($bound_to_key)(x);
-                        crate::store::scan::upper_idx_by(s, s + l, &key, |i| ($value_to_key)(v, i))
+                        crate::store::scan::upper_idx_by(s, s + l, &key, &|i| ($value_to_key)(v, i))
                     }
                 };
                 let end = match ub {
                     Bound::Unbounded => s + l,
                     Bound::Included(x) => {
                         let key = ($bound_to_key)(x);
-                        crate::store::scan::upper_idx_by(s, s + l, &key, |i| ($value_to_key)(v, i))
+                        crate::store::scan::upper_idx_by(s, s + l, &key, &|i| ($value_to_key)(v, i))
                     }
                     Bound::Excluded(x) => {
                         let key = ($bound_to_key)(x);
-                        crate::store::scan::lower_idx_by(s, s + l, &key, |i| ($value_to_key)(v, i))
+                        crate::store::scan::lower_idx_by(s, s + l, &key, &|i| ($value_to_key)(v, i))
                     }
                 };
                 if start < end {

@@ -275,11 +275,11 @@ impl Ord for FloatOrd32 {
 
 macro_rules! sorted_visit_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident) => {
-        pub(crate) fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
+        pub(crate) fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas: &[ChunkMetadata],
             buffers: &SortedChunkBuffers,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedVisitor,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for idx in 0..metas.len() {
@@ -301,19 +301,19 @@ macro_rules! sorted_visit_impl {
             if arrays.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<_, _, _, _, _>(
+            kmerge_coalesced::<_, _>(
                 &arrays,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| a.value(i),
-                |c, s, l| visitor.$visit(&arrays[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| a.value(i),
+                &mut |c, s, l| visitor.$visit(&arrays[c], s, l),
             );
             Ok(())
         }
-        pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
+        pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas: &[ChunkMetadata],
             buffers: &SortedChunkBuffers,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedVisitor,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for idx in 0..metas.len() {
@@ -334,11 +334,11 @@ macro_rules! sorted_visit_impl {
             if arrays.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced_rev::<_, _, _, _, _>(
+            kmerge_coalesced_rev::<_, _>(
                 &arrays,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| a.value(i),
-                |c, s, l| visitor.$visit(&arrays[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| a.value(i),
+                &mut |c, s, l| visitor.$visit(&arrays[c], s, l),
             );
             Ok(())
         }
@@ -356,11 +356,11 @@ sorted_visit_impl!(sorted_visit_i8, sorted_visit_i8_rev, Int8Array, i8_run);
 
 macro_rules! sorted_visit_float_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident, $key:ty) => {
-        pub(crate) fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
+        pub(crate) fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas: &[ChunkMetadata],
             buffers: &SortedChunkBuffers,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedVisitor,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for idx in 0..metas.len() {
@@ -381,19 +381,19 @@ macro_rules! sorted_visit_float_impl {
             if arrays.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<$key, _, _, _, _>(
+            kmerge_coalesced::<$key, _>(
                 &arrays,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
-                |c, s, l| visitor.$visit(&arrays[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
+                &mut |c, s, l| visitor.$visit(&arrays[c], s, l),
             );
             Ok(())
         }
-        pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
+        pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas: &[ChunkMetadata],
             buffers: &SortedChunkBuffers,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedVisitor,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for idx in 0..metas.len() {
@@ -414,11 +414,11 @@ macro_rules! sorted_visit_float_impl {
             if arrays.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced_rev::<$key, _, _, _, _>(
+            kmerge_coalesced_rev::<$key, _>(
                 &arrays,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
-                |c, s, l| visitor.$visit(&arrays[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
+                &mut |c, s, l| visitor.$visit(&arrays[c], s, l),
             );
             Ok(())
         }
@@ -462,12 +462,12 @@ sorted_visit_impl!(
 
 macro_rules! sorted_with_rids_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident) => {
-        pub(crate) fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedWithRowIdsVisitor>(
+        pub(crate) fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             buffers: &SortedChunkBuffersWithRids,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
                 return Err(Error::Internal(
@@ -502,23 +502,20 @@ macro_rules! sorted_with_rids_impl {
             if vals.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<_, _, _, _, _>(
+            kmerge_coalesced::<_, _>(
                 &vals,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| a.value(i),
-                |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| a.value(i),
+                &mut |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
             );
             Ok(())
         }
-        pub(crate) fn $name_rev<
-            P: Pager<Blob = EntryHandle>,
-            V: PrimitiveSortedWithRowIdsVisitor,
-        >(
+        pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             buffers: &SortedChunkBuffersWithRids,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
                 return Err(Error::Internal(
@@ -553,11 +550,11 @@ macro_rules! sorted_with_rids_impl {
             if vals.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced_rev::<_, _, _, _, _>(
+            kmerge_coalesced_rev::<_, _>(
                 &vals,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| a.value(i),
-                |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| a.value(i),
+                &mut |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
             );
             Ok(())
         }
@@ -633,12 +630,12 @@ sorted_with_rids_impl!(
 
 macro_rules! sorted_with_rids_float_impl {
     ($name:ident, $name_rev:ident, $ArrTy:ty, $visit:ident, $key:ty) => {
-        pub(crate) fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedWithRowIdsVisitor>(
+        pub(crate) fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             buffers: &SortedChunkBuffersWithRids,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
                 return Err(Error::Internal(
@@ -673,23 +670,20 @@ macro_rules! sorted_with_rids_float_impl {
             if vals.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<$key, _, _, _, _>(
+            kmerge_coalesced::<$key, _>(
                 &vals,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
-                |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
+                &mut |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
             );
             Ok(())
         }
-        pub(crate) fn $name_rev<
-            P: Pager<Blob = EntryHandle>,
-            V: PrimitiveSortedWithRowIdsVisitor,
-        >(
+        pub(crate) fn $name_rev<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             buffers: &SortedChunkBuffersWithRids,
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
                 return Err(Error::Internal(
@@ -724,11 +718,11 @@ macro_rules! sorted_with_rids_float_impl {
             if vals.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced_rev::<$key, _, _, _, _>(
+            kmerge_coalesced_rev::<$key, _>(
                 &vals,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
-                |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
+                &mut |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
             );
             Ok(())
         }
@@ -751,70 +745,64 @@ sorted_with_rids_float_impl!(
 );
 
 pub(crate) trait SortedDispatch {
-    fn visit<P, V>(
+    fn visit<P>(
         pager: &P,
         metas: &[ChunkMetadata],
         buffers: &SortedChunkBuffers,
-        visitor: &mut V,
+        visitor: &mut dyn PrimitiveSortedVisitor,
     ) -> Result<()>
     where
-        P: Pager<Blob = EntryHandle>,
-        V: PrimitiveSortedVisitor;
+        P: Pager<Blob = EntryHandle>;
 
-    fn visit_rev<P, V>(
+    fn visit_rev<P>(
         pager: &P,
         metas: &[ChunkMetadata],
         buffers: &SortedChunkBuffers,
-        visitor: &mut V,
+        visitor: &mut dyn PrimitiveSortedVisitor,
     ) -> Result<()>
     where
-        P: Pager<Blob = EntryHandle>,
-        V: PrimitiveSortedVisitor;
+        P: Pager<Blob = EntryHandle>;
 
-    fn visit_with_rids<P, V>(
+    fn visit_with_rids<P>(
         pager: &P,
         metas_val: &[ChunkMetadata],
         metas_rid: &[ChunkMetadata],
         buffers: &SortedChunkBuffersWithRids,
-        visitor: &mut V,
+        visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
     ) -> Result<()>
     where
-        P: Pager<Blob = EntryHandle>,
-        V: PrimitiveSortedWithRowIdsVisitor;
+        P: Pager<Blob = EntryHandle>;
 
-    fn visit_with_rids_rev<P, V>(
+    fn visit_with_rids_rev<P>(
         pager: &P,
         metas_val: &[ChunkMetadata],
         metas_rid: &[ChunkMetadata],
         buffers: &SortedChunkBuffersWithRids,
-        visitor: &mut V,
+        visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
     ) -> Result<()>
     where
-        P: Pager<Blob = EntryHandle>,
-        V: PrimitiveSortedWithRowIdsVisitor;
+        P: Pager<Blob = EntryHandle>;
 
-    fn visit_bounds<P, V>(
+    fn visit_bounds<P>(
         pager: &P,
         metas: &[ChunkMetadata],
         buffers: &SortedChunkBuffers,
         ir: &IntRanges,
-        visitor: &mut V,
+        visitor: &mut dyn PrimitiveSortedVisitor,
     ) -> Result<()>
     where
-        P: Pager<Blob = EntryHandle>,
-        V: PrimitiveSortedVisitor;
+        P: Pager<Blob = EntryHandle>;
 
-    fn visit_with_rids_bounds<P, V>(
+    fn visit_with_rids_bounds<P>(
         pager: &P,
         metas_val: &[ChunkMetadata],
         metas_rid: &[ChunkMetadata],
         buffers: &SortedChunkBuffersWithRids,
         ir: &IntRanges,
-        visitor: &mut V,
+        visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
     ) -> Result<()>
     where
-        P: Pager<Blob = EntryHandle>,
-        V: PrimitiveSortedWithRowIdsVisitor;
+        P: Pager<Blob = EntryHandle>;
 }
 
 macro_rules! impl_sorted_dispatch {
@@ -830,74 +818,69 @@ macro_rules! impl_sorted_dispatch {
     ) => {
         impl SortedDispatch for $ty {
             #[inline]
-            fn visit<P, V>(
+            fn visit<P>(
                 pager: &P,
                 metas: &[ChunkMetadata],
                 buffers: &SortedChunkBuffers,
-                visitor: &mut V,
+                visitor: &mut dyn PrimitiveSortedVisitor,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
-                V: PrimitiveSortedVisitor,
             {
                 $visit(pager, metas, buffers, visitor)
             }
 
             #[inline]
-            fn visit_rev<P, V>(
+            fn visit_rev<P>(
                 pager: &P,
                 metas: &[ChunkMetadata],
                 buffers: &SortedChunkBuffers,
-                visitor: &mut V,
+                visitor: &mut dyn PrimitiveSortedVisitor,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
-                V: PrimitiveSortedVisitor,
             {
                 $visit_rev(pager, metas, buffers, visitor)
             }
 
             #[inline]
-            fn visit_with_rids<P, V>(
+            fn visit_with_rids<P>(
                 pager: &P,
                 metas_val: &[ChunkMetadata],
                 metas_rid: &[ChunkMetadata],
                 buffers: &SortedChunkBuffersWithRids,
-                visitor: &mut V,
+                visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
-                V: PrimitiveSortedWithRowIdsVisitor,
             {
                 $with_rids(pager, metas_val, metas_rid, buffers, visitor)
             }
 
             #[inline]
-            fn visit_with_rids_rev<P, V>(
+            fn visit_with_rids_rev<P>(
                 pager: &P,
                 metas_val: &[ChunkMetadata],
                 metas_rid: &[ChunkMetadata],
                 buffers: &SortedChunkBuffersWithRids,
-                visitor: &mut V,
+                visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
-                V: PrimitiveSortedWithRowIdsVisitor,
             {
                 $with_rids_rev(pager, metas_val, metas_rid, buffers, visitor)
             }
 
             #[inline]
-            fn visit_bounds<P, V>(
+            fn visit_bounds<P>(
                 pager: &P,
                 metas: &[ChunkMetadata],
                 buffers: &SortedChunkBuffers,
                 ir: &IntRanges,
-                visitor: &mut V,
+                visitor: &mut dyn PrimitiveSortedVisitor,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
-                V: PrimitiveSortedVisitor,
             {
                 let bounds = ir
                     .$range_field
@@ -906,17 +889,16 @@ macro_rules! impl_sorted_dispatch {
             }
 
             #[inline]
-            fn visit_with_rids_bounds<P, V>(
+            fn visit_with_rids_bounds<P>(
                 pager: &P,
                 metas_val: &[ChunkMetadata],
                 metas_rid: &[ChunkMetadata],
                 buffers: &SortedChunkBuffersWithRids,
                 ir: &IntRanges,
-                visitor: &mut V,
+                visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
             ) -> Result<()>
             where
                 P: Pager<Blob = EntryHandle>,
-                V: PrimitiveSortedWithRowIdsVisitor,
             {
                 let bounds = ir
                     .$range_field
@@ -1060,12 +1042,12 @@ impl_sorted_dispatch!(
 
 macro_rules! sorted_visit_bounds_impl {
     ($name:ident, $ArrTy:ty, $ty:ty, $visit:ident) => {
-        fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
+        fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas: &[ChunkMetadata],
             buffers: &SortedChunkBuffers,
             bounds: (Bound<$ty>, Bound<$ty>),
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedVisitor,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for m in metas {
@@ -1123,11 +1105,11 @@ macro_rules! sorted_visit_bounds_impl {
             if arrays.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<_, _, _, _, _>(
+            kmerge_coalesced::<_, _>(
                 &arrays,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| a.value(i),
-                |c, s, l| visitor.$visit(&arrays[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| a.value(i),
+                &mut |c, s, l| visitor.$visit(&arrays[c], s, l),
             );
             Ok(())
         }
@@ -1136,12 +1118,12 @@ macro_rules! sorted_visit_bounds_impl {
 
 macro_rules! sorted_visit_float_bounds_impl {
     ($name:ident, $ArrTy:ty, $scalar:ty, $key:ty, $visit:ident) => {
-        fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedVisitor>(
+        fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas: &[ChunkMetadata],
             buffers: &SortedChunkBuffers,
             bounds: (Bound<$scalar>, Bound<$scalar>),
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedVisitor,
         ) -> Result<()> {
             let mut arrays: Vec<$ArrTy> = Vec::with_capacity(metas.len());
             for m in metas {
@@ -1199,11 +1181,11 @@ macro_rules! sorted_visit_float_bounds_impl {
             if arrays.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<$key, _, _, _, _>(
+            kmerge_coalesced::<$key, _>(
                 &arrays,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
-                |c, s, l| visitor.$visit(&arrays[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
+                &mut |c, s, l| visitor.$visit(&arrays[c], s, l),
             );
             Ok(())
         }
@@ -1212,13 +1194,13 @@ macro_rules! sorted_visit_float_bounds_impl {
 
 macro_rules! sorted_with_rids_bounds_impl {
     ($name:ident, $ArrTy:ty, $ty:ty, $visit:ident) => {
-        fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedWithRowIdsVisitor>(
+        fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             buffers: &SortedChunkBuffersWithRids,
             bounds: (Bound<$ty>, Bound<$ty>),
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
                 return Err(Error::Internal(
@@ -1297,11 +1279,11 @@ macro_rules! sorted_with_rids_bounds_impl {
             if vals.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<_, _, _, _, _>(
+            kmerge_coalesced::<_, _>(
                 &vals,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| a.value(i),
-                |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| a.value(i),
+                &mut |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
             );
             Ok(())
         }
@@ -1310,13 +1292,13 @@ macro_rules! sorted_with_rids_bounds_impl {
 
 macro_rules! sorted_with_rids_float_bounds_impl {
     ($name:ident, $ArrTy:ty, $scalar:ty, $key:ty, $visit:ident) => {
-        fn $name<P: Pager<Blob = EntryHandle>, V: PrimitiveSortedWithRowIdsVisitor>(
+        fn $name<P: Pager<Blob = EntryHandle>>(
             _pager: &P,
             metas_val: &[ChunkMetadata],
             metas_rid: &[ChunkMetadata],
             buffers: &SortedChunkBuffersWithRids,
             bounds: (Bound<$scalar>, Bound<$scalar>),
-            visitor: &mut V,
+            visitor: &mut dyn PrimitiveSortedWithRowIdsVisitor,
         ) -> Result<()> {
             if metas_val.len() != metas_rid.len() {
                 return Err(Error::Internal(
@@ -1395,11 +1377,11 @@ macro_rules! sorted_with_rids_float_bounds_impl {
             if vals.is_empty() {
                 return Ok(());
             }
-            kmerge_coalesced::<$key, _, _, _, _>(
+            kmerge_coalesced::<$key, _>(
                 &vals,
-                |a: &$ArrTy| a.len(),
-                |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
-                |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
+                &mut |a: &$ArrTy| a.len(),
+                &mut |a: &$ArrTy, i: usize| <$key>::new(a.value(i)),
+                &mut |c, s, l| visitor.$visit(&vals[c], &rids[c], s, l),
             );
             Ok(())
         }

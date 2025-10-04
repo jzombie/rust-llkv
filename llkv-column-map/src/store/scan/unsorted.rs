@@ -179,11 +179,11 @@ macro_rules! dispatch_unsorted_nulls {
     }};
 }
 
-pub fn unsorted_visit<P: Pager<Blob = EntryHandle>, V: PrimitiveVisitor>(
+pub fn unsorted_visit<P: Pager<Blob = EntryHandle>>(
     pager: &P,
     catalog: &FxHashMap<LogicalFieldId, PhysicalKey>,
     field_id: LogicalFieldId,
-    visitor: &mut V,
+    visitor: &mut dyn PrimitiveVisitor,
 ) -> Result<()> {
     let descriptor_pk = *catalog.get(&field_id).ok_or(Error::NotFound)?;
     let desc_blob = pager
@@ -229,12 +229,12 @@ pub fn unsorted_visit<P: Pager<Blob = EntryHandle>, V: PrimitiveVisitor>(
     dispatch_unsorted_visit!(first_any.data_type(), metas, blobs, visitor)
 }
 
-pub fn unsorted_with_row_ids_visit<P: Pager<Blob = EntryHandle>, V: PrimitiveWithRowIdsVisitor>(
+pub fn unsorted_with_row_ids_visit<P: Pager<Blob = EntryHandle>>(
     pager: &P,
     catalog: &FxHashMap<LogicalFieldId, PhysicalKey>,
     value_fid: LogicalFieldId,
     rowid_fid: LogicalFieldId,
-    visitor: &mut V,
+    visitor: &mut dyn PrimitiveWithRowIdsVisitor,
 ) -> Result<()> {
     let v_pk = *catalog.get(&value_fid).ok_or(Error::NotFound)?;
     let r_pk = *catalog.get(&rowid_fid).ok_or(Error::NotFound)?;
@@ -325,17 +325,14 @@ pub fn unsorted_with_row_ids_visit<P: Pager<Blob = EntryHandle>, V: PrimitiveWit
     )
 }
 
-pub fn unsorted_with_row_ids_and_nulls_visit<
-    P: Pager<Blob = EntryHandle>,
-    V: PrimitiveWithRowIdsVisitor + PrimitiveSortedWithRowIdsVisitor,
->(
+pub fn unsorted_with_row_ids_and_nulls_visit<P: Pager<Blob = EntryHandle>>(
     pager: &P,
     catalog: &FxHashMap<LogicalFieldId, PhysicalKey>,
     value_fid: LogicalFieldId,
     rowid_fid: LogicalFieldId,
     anchor_rowid_fid: LogicalFieldId,
     _nulls_first: bool, // Anchor order interleave; nulls_first ignored for unsorted
-    visitor: &mut V,
+    visitor: &mut dyn PrimitiveWithRowIdsAndNullsVisitor,
 ) -> Result<()> {
     let v_pk = *catalog.get(&value_fid).ok_or(Error::NotFound)?;
     let r_pk = *catalog.get(&rowid_fid).ok_or(Error::NotFound)?;

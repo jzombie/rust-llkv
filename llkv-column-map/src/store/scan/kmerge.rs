@@ -2,16 +2,13 @@ use super::*;
 
 /// Generic k-way merge over sorted per-chunk arrays, coalescing runs.
 /// `get` fetches the T value at index for an array, and `emit` sends runs.
-pub fn kmerge_coalesced<T, A, FLen, FGet, FEmit>(
+pub fn kmerge_coalesced<T, A>(
     arrays: &[A],
-    mut len_of: FLen,
-    mut get: FGet,
-    mut emit: FEmit,
+    len_of: &mut dyn FnMut(&A) -> usize,
+    get: &mut dyn FnMut(&A, usize) -> T,
+    emit: &mut dyn FnMut(usize, usize, usize), // (chunk_idx, start, len)
 ) where
     T: Ord + Copy,
-    FLen: FnMut(&A) -> usize,
-    FGet: FnMut(&A, usize) -> T,
-    FEmit: FnMut(usize, usize, usize), // (chunk_idx, start, len)
 {
     #[derive(Clone, Copy, Debug)]
     struct H<T> {
@@ -76,16 +73,13 @@ pub fn kmerge_coalesced<T, A, FLen, FGet, FEmit>(
 }
 
 /// Reverse (descending) k-way merge over sorted per-chunk arrays, coalescing runs.
-pub fn kmerge_coalesced_rev<T, A, FLen, FGet, FEmit>(
+pub fn kmerge_coalesced_rev<T, A>(
     arrays: &[A],
-    mut len_of: FLen,
-    mut get: FGet,
-    mut emit: FEmit,
+    len_of: &mut dyn FnMut(&A) -> usize,
+    get: &mut dyn FnMut(&A, usize) -> T,
+    emit: &mut dyn FnMut(usize, usize, usize), // (chunk_idx, start, len) but start..start+len iterates descending via get
 ) where
     T: Ord + Copy,
-    FLen: FnMut(&A) -> usize,
-    FGet: FnMut(&A, usize) -> T,
-    FEmit: FnMut(usize, usize, usize), // (chunk_idx, start, len) but start..start+len iterates descending via get
 {
     #[derive(Clone, Copy, Debug)]
     struct H<T> {
