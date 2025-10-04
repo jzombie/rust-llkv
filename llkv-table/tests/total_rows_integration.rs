@@ -4,7 +4,7 @@ use arrow::array::{StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use llkv_column_map::store::ROW_ID_COLUMN_NAME;
+use llkv_column_map::store::{ROW_ID_COLUMN_NAME, table_rowid_fid};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
@@ -48,10 +48,19 @@ fn test_total_rows_before_after_append_and_delete() {
     assert_eq!(col2_total, 5);
     assert_eq!(table_total, 5);
 
+    let store = table.store();
+    let table_rid = table_rowid_fid(table.table_id());
+    let rid_count = store
+        .total_rows_for_field(table_rid)
+        .expect("table rid count");
+    assert_eq!(rid_count, 5);
+
     // Delete row with global position 2 (third row) from column 1 only
     let store = table.store();
     let lfid1 = LogicalFieldId::for_user(table.table_id(), 1);
-    store.delete_rows(lfid1, vec![2u64]).expect("delete col1");
+    store
+        .delete_rows(&[(lfid1, vec![2u64])])
+        .expect("delete col1");
 
     // col1 should be 4, col2 still 5
     let col1_after = table.total_rows_for_col(1).expect("col1 after");
@@ -61,9 +70,16 @@ fn test_total_rows_before_after_append_and_delete() {
     assert_eq!(col2_after, 5);
     assert_eq!(table_total, 5);
 
-    // Delete global position 3 from column 2 only
+    // Delete global position 3 from column 2 and mirror it on the table-level
+    // row-id descriptor atomically.
     let lfid2 = LogicalFieldId::for_user(table.table_id(), 2);
-    store.delete_rows(lfid2, vec![3u64]).expect("delete col2");
+    assert_eq!(store.total_rows_for_field(table_rid).unwrap(), 5);
+    store
+        .delete_rows(&[(lfid2, vec![3u64])])
+        .expect("delete col2 only");
+    store
+        .delete_table_row_ids(table.table_id(), vec![3u64])
+        .expect("delete table rid");
 
     // col1 still 4, col2 should now be 4
     let col1_after2 = table.total_rows_for_col(1).expect("col1 after2");

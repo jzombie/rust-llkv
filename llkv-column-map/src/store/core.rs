@@ -5,7 +5,7 @@ use crate::store::descriptor::{
 };
 use crate::store::scan::filter::FilterDispatch;
 use crate::store::scan::{FilterPrimitive, FilterResult};
-use crate::types::LogicalFieldId;
+use crate::types::{LogicalFieldId, Namespace, RowId, TableId};
 use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, UInt64Array};
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;
@@ -30,6 +30,9 @@ pub struct ColumnStore<P: Pager> {
     dtype_cache: DTypeCache<P>,
     index_manager: IndexManager<P>,
 }
+
+/// Convenience alias for describing batched delete operations.
+pub type DeleteRowsSpec = (LogicalFieldId, Vec<RowId>);
 
 impl<P> ColumnStore<P>
 where
@@ -153,9 +156,28 @@ where
     /// table has no persisted columns, `Ok(0)` is returned.
     pub fn total_rows_for_table(&self, table_id: crate::types::TableId) -> Result<u64> {
         use crate::types::Namespace;
-        // Acquire read lock on catalog and find any matching user-data field
+
+        // Prefer the dedicated table-level row-id shadow column if present.
+        let rid_fid = table_rowid_fid(table_id);
+        {
+            let catalog = self.catalog.read().unwrap();
+            if let Some(desc_pk) = catalog.map.get(&rid_fid) {
+                let desc_blob = self
+                    .pager
+                    .batch_get(&[BatchGet::Raw { key: *desc_pk }])?
+                    .pop()
+                    .and_then(|r| match r {
+                        GetResult::Raw { bytes, .. } => Some(bytes),
+                        _ => None,
+                    })
+                    .ok_or(Error::NotFound)?;
+                let desc = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+                return Ok(desc.total_row_count);
+            }
+        }
+
+        // Fall back to scanning any user-data column descriptors.
         let catalog = self.catalog.read().unwrap();
-        // Collect all user-data logical field ids for this table.
         let candidates: Vec<LogicalFieldId> = catalog
             .map
             .keys()
@@ -168,7 +190,6 @@ where
             return Ok(0);
         }
 
-        // Return the maximum total_row_count across all user columns for the table.
         let mut max_rows: u64 = 0;
         for field in candidates {
             let rows = self.total_rows_for_field(field)?;
@@ -469,6 +490,10 @@ where
         let append_row_id_any: ArrayRef = Arc::clone(batch_to_append.column(append_row_id_idx));
         let mut puts_appends: Vec<BatchPut> = Vec::new();
 
+        // Track the logical table id for the batch so we can update the
+        // table-level row-id shadow column once per append.
+        let mut table_id_for_batch: Option<TableId> = None;
+
         // Loop through each column of the filtered batch to append its data.
         for (i, array) in batch_to_append.columns().iter().enumerate() {
             if i == append_row_id_idx {
@@ -483,6 +508,11 @@ where
                 .parse::<u64>()
                 .map(LogicalFieldId::from)
                 .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
+
+            match table_id_for_batch {
+                Some(existing) => debug_assert_eq!(existing, field_id.table_id()),
+                None => table_id_for_batch = Some(field_id.table_id()),
+            }
 
             // Populate the data type cache for this column. This is a performance optimization
             // to avoid reading a chunk from storage later just to determine its type.
@@ -651,6 +681,96 @@ where
             puts_appends.push(BatchPut::Raw {
                 key: rid_descriptor_pk,
                 bytes: rid_descriptor.to_le_bytes(),
+            });
+        }
+
+        // After processing user-data columns, append the row ids to the
+        // table-level shadow column so table-level metadata stays in sync.
+        if let Some(table_id) = table_id_for_batch {
+            let table_rid_fid = table_rowid_fid(table_id);
+            let table_rid_descriptor_pk = {
+                let mut catalog = self.catalog.write().unwrap();
+                *catalog.map.entry(table_rid_fid).or_insert_with(|| {
+                    catalog_dirty = true;
+                    self.pager.alloc_many(1).unwrap()[0]
+                })
+            };
+
+            let (mut table_rid_descriptor, mut table_rid_tail_page) =
+                ColumnDescriptor::load_or_create(
+                    Arc::clone(&self.pager),
+                    table_rid_descriptor_pk,
+                    table_rid_fid,
+                )?;
+
+            let rid_slices = split_to_target_bytes(
+                &append_row_id_any,
+                TARGET_CHUNK_BYTES,
+                self.cfg.varwidth_fallback_rows_per_slice,
+            );
+
+            for rid_slice in rid_slices {
+                let rows = rid_slice.len();
+                if rows == 0 {
+                    continue;
+                }
+
+                let rid_norm = zero_offset(&rid_slice);
+                let rid_pk = self.pager.alloc_many(1)?[0];
+                let rid_bytes = serialize_array(rid_norm.as_ref())?;
+                puts_appends.push(BatchPut::Raw {
+                    key: rid_pk,
+                    bytes: rid_bytes,
+                });
+
+                let rids_for_meta = rid_norm
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::Internal("row_id downcast failed".into()))?;
+
+                let (min, max) = if !rids_for_meta.is_empty() {
+                    let mut min_val = rids_for_meta.value(0);
+                    let mut max_val = rids_for_meta.value(0);
+                    for i in 1..rids_for_meta.len() {
+                        let v = rids_for_meta.value(i);
+                        if v < min_val {
+                            min_val = v;
+                        }
+                        if v > max_val {
+                            max_val = v;
+                        }
+                    }
+                    (min_val, max_val)
+                } else {
+                    (0, 0)
+                };
+
+                let table_rid_meta = ChunkMetadata {
+                    chunk_pk: rid_pk,
+                    row_count: rows as u64,
+                    serialized_bytes: rid_norm.get_array_memory_size() as u64,
+                    min_val_u64: min,
+                    max_val_u64: max,
+                    ..Default::default()
+                };
+
+                // The table-level row-id column currently has no secondary
+                // indexes, so skip stage_updates_for_new_chunk.
+                self.append_meta_in_loop(
+                    &mut table_rid_descriptor,
+                    &mut table_rid_tail_page,
+                    table_rid_meta,
+                    &mut puts_appends,
+                )?;
+            }
+
+            puts_appends.push(BatchPut::Raw {
+                key: table_rid_descriptor.tail_page_pk,
+                bytes: table_rid_tail_page,
+            });
+            puts_appends.push(BatchPut::Raw {
+                key: table_rid_descriptor_pk,
+                bytes: table_rid_descriptor.to_le_bytes(),
             });
         }
 
@@ -889,33 +1009,35 @@ where
         Ok(rewritten_ids)
     }
 
-    // TODO: Remove pre-condition; accept vector of row ids instead
-    /// Explicit delete by global row **positions** (0-based, ascending,
-    /// unique) -> in-place chunk rewrite.
-    ///
-    /// Precondition: `rows_to_delete` yields strictly increasing positions.
-    /// Explicit delete by global row **positions** (0-based, ascending,
-    /// unique) -> in-place chunk rewrite.
-    pub fn delete_rows<I>(&self, field_id: LogicalFieldId, rows_to_delete: I) -> Result<()>
-    where
-        I: IntoIterator<Item = u64>,
-    {
+    fn stage_delete_rows_for_field(
+        &self,
+        field_id: LogicalFieldId,
+        rows_to_delete: &[RowId],
+        staged_puts: &mut Vec<BatchPut>,
+    ) -> Result<bool> {
         use crate::store::descriptor::DescriptorIterator;
         use crate::store::ingest::ChunkEdit;
 
-        // Stream and validate ascending, unique positions.
-        let mut del_iter = rows_to_delete.into_iter();
-        let mut cur_del = del_iter.next();
-        let mut last_seen: Option<u64> = None;
-        if let Some(v) = cur_del {
-            last_seen = Some(v);
+        if rows_to_delete.is_empty() {
+            return Ok(false);
         }
+
+        // Stream and validate ascending, unique positions.
+        let mut del_iter = rows_to_delete.iter().copied();
+        let mut cur_del = del_iter.next();
+        let mut last_seen: Option<u64> = cur_del;
 
         // Lookup descriptors (data and optional row_id).
         let catalog = self.catalog.read().unwrap();
         let desc_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
-        let rid_fid = rowid_fid(field_id);
-        let desc_pk_rid = catalog.map.get(&rid_fid).copied();
+        let is_table_rowid = field_id.namespace() == Namespace::RowIdShadow
+            && field_id.field_id() == TABLE_ROW_ID_FIELD_ID;
+        let desc_pk_rid = if is_table_rowid {
+            None
+        } else {
+            let rid_fid = rowid_fid(field_id);
+            catalog.map.get(&rid_fid).copied()
+        };
 
         // Batch fetch descriptor blobs up front.
         let mut gets = vec![BatchGet::Raw { key: desc_pk }];
@@ -930,7 +1052,12 @@ where
             }
         }
 
-        let desc_blob = blobs_by_pk.remove(&desc_pk).ok_or(Error::NotFound)?;
+        let desc_blob = blobs_by_pk.remove(&desc_pk).ok_or_else(|| {
+            Error::Internal(format!(
+                "descriptor pk={} missing during delete_rows for field {:?}",
+                desc_pk, field_id
+            ))
+        })?;
         let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
         // Build metas for data column.
@@ -940,8 +1067,7 @@ where
         }
         if metas.is_empty() {
             drop(catalog);
-            self.compact_field_bounded(field_id)?;
-            return Ok(());
+            return Ok(false);
         }
 
         // Optionally mirror metas for row_id column.
@@ -957,8 +1083,8 @@ where
             descriptor_rid = Some(d_rid);
         }
 
-        let mut puts = Vec::new();
         let mut cum_rows = 0u64;
+        let mut any_changed = false;
 
         for (i, meta) in metas.iter_mut().enumerate() {
             let start_u64 = cum_rows;
@@ -1031,7 +1157,7 @@ where
 
             // Write back data.
             let data_bytes = serialize_array(&new_data_arr)?;
-            puts.push(BatchPut::Raw {
+            staged_puts.push(BatchPut::Raw {
                 key: meta.chunk_pk,
                 bytes: data_bytes,
             });
@@ -1042,7 +1168,7 @@ where
             if let (Some(_), Some(rids)) = (metas_rid.get_mut(i), new_rid_arr) {
                 let rm = metas_rid.get_mut(i).unwrap();
                 let rid_bytes = serialize_array(&rids)?;
-                puts.push(BatchPut::Raw {
+                staged_puts.push(BatchPut::Raw {
                     key: rm.chunk_pk,
                     bytes: rid_bytes,
                 });
@@ -1058,26 +1184,211 @@ where
                 };
                 let indices = lexsort_to_indices(&[sort_column], None)?;
                 let perm_bytes = serialize_array(&indices)?;
-                puts.push(BatchPut::Raw {
+                staged_puts.push(BatchPut::Raw {
                     key: meta.value_order_perm_pk,
                     bytes: perm_bytes,
                 });
             }
 
             cum_rows = end_u64;
+            any_changed = true;
         }
 
         // Rewrite descriptor chains/totals and commit.
-        descriptor.rewrite_pages(Arc::clone(&self.pager), desc_pk, &mut metas, &mut puts)?;
+        descriptor.rewrite_pages(Arc::clone(&self.pager), desc_pk, &mut metas, staged_puts)?;
         if let (Some(rid_pk), Some(mut rid_desc)) = (desc_pk_rid, descriptor_rid) {
-            rid_desc.rewrite_pages(Arc::clone(&self.pager), rid_pk, &mut metas_rid, &mut puts)?;
+            rid_desc.rewrite_pages(Arc::clone(&self.pager), rid_pk, &mut metas_rid, staged_puts)?;
         }
-        if !puts.is_empty() {
-            self.pager.batch_put(&puts)?;
+        drop(catalog);
+        Ok(any_changed)
+    }
+
+    /// Delete row positions for one or more logical fields in a single atomic batch.
+    ///
+    /// Each entry contains a field id and the global row positions to delete
+    /// for that field. All staged metadata and chunk updates are committed in a
+    /// single pager batch.
+    pub fn delete_rows(&self, deletes: &[DeleteRowsSpec]) -> Result<()> {
+        if deletes.is_empty() {
+            return Ok(());
         }
 
+        let mut puts = Vec::new();
+        let mut touched: FxHashSet<LogicalFieldId> = FxHashSet::default();
+        let mut table_id: Option<TableId> = None;
+
+        for (field_id, rows) in deletes {
+            if rows.is_empty() {
+                continue;
+            }
+            if let Some(expected) = table_id {
+                if field_id.table_id() != expected {
+                    return Err(Error::InvalidArgumentError(
+                        "delete_rows requires fields from the same table".into(),
+                    ));
+                }
+            } else {
+                table_id = Some(field_id.table_id());
+            }
+
+            if self.stage_delete_rows_for_field(*field_id, rows, &mut puts)? {
+                touched.insert(*field_id);
+            }
+        }
+
+        if puts.is_empty() {
+            return Ok(());
+        }
+
+        self.pager.batch_put(&puts)?;
+
+        for field_id in touched {
+            self.compact_field_bounded(field_id)?;
+        }
+        Ok(())
+    }
+
+    fn stage_table_row_id_deletes(
+        &self,
+        table_id: TableId,
+        to_remove: &FxHashSet<RowId>,
+        puts: &mut Vec<BatchPut>,
+    ) -> Result<bool> {
+        use crate::store::descriptor::DescriptorIterator;
+
+        if to_remove.is_empty() {
+            return Ok(false);
+        }
+
+        let field_id = table_rowid_fid(table_id);
+        let catalog = self.catalog.read().unwrap();
+        let Some(desc_pk) = catalog.map.get(&field_id).copied() else {
+            return Ok(false);
+        };
         drop(catalog);
-        self.compact_field_bounded(field_id)
+
+        let desc_blob = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: desc_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .ok_or(Error::NotFound)?;
+        let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
+
+        let mut metas: Vec<ChunkMetadata> =
+            DescriptorIterator::new(self.pager.as_ref(), descriptor.head_page_pk)
+                .collect::<Result<_>>()?;
+        if metas.is_empty() {
+            return Ok(false);
+        }
+
+        let mut any_changed = false;
+
+        for meta in metas.iter_mut() {
+            if meta.row_count == 0 {
+                continue;
+            }
+
+            let chunk_blob = self
+                .pager
+                .batch_get(&[BatchGet::Raw { key: meta.chunk_pk }])?
+                .pop()
+                .and_then(|r| match r {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
+                .ok_or(Error::NotFound)?;
+            let arr_any = deserialize_array(chunk_blob)?;
+            let arr = arr_any
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("row_id downcast failed".into()))?;
+
+            if arr.is_empty() {
+                continue;
+            }
+
+            let mut keep_mask = Vec::with_capacity(arr.len());
+            let mut removed = false;
+            for idx in 0..arr.len() {
+                let rid = arr.value(idx);
+                if to_remove.contains(&rid) {
+                    keep_mask.push(false);
+                    removed = true;
+                } else {
+                    keep_mask.push(true);
+                }
+            }
+
+            if !removed {
+                continue;
+            }
+
+            let keep_array = BooleanArray::from(keep_mask);
+            let filtered_any = compute::filter(arr_any.as_ref(), &keep_array)?;
+            let filtered = zero_offset(&filtered_any);
+            let bytes = serialize_array(filtered.as_ref())?;
+            puts.push(BatchPut::Raw {
+                key: meta.chunk_pk,
+                bytes,
+            });
+
+            let filtered_rids = filtered
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("row_id downcast failed".into()))?;
+            meta.row_count = filtered_rids.len() as u64;
+            meta.serialized_bytes = filtered.get_array_memory_size() as u64;
+            if filtered_rids.is_empty() {
+                meta.min_val_u64 = 0;
+                meta.max_val_u64 = 0;
+            } else {
+                let mut min_val = filtered_rids.value(0);
+                let mut max_val = filtered_rids.value(0);
+                for i in 1..filtered_rids.len() {
+                    let v = filtered_rids.value(i);
+                    if v < min_val {
+                        min_val = v;
+                    }
+                    if v > max_val {
+                        max_val = v;
+                    }
+                }
+                meta.min_val_u64 = min_val;
+                meta.max_val_u64 = max_val;
+            }
+
+            any_changed = true;
+        }
+
+        if !any_changed {
+            return Ok(false);
+        }
+
+        descriptor.rewrite_pages(Arc::clone(&self.pager), desc_pk, &mut metas, puts)?;
+        Ok(true)
+    }
+
+    /// Delete specific row ids from the table-level row-id shadow column.
+    pub fn delete_table_row_ids<I>(&self, table_id: TableId, row_ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        use rustc_hash::FxHashSet;
+
+        let to_remove: FxHashSet<RowId> = row_ids.into_iter().collect();
+        if to_remove.is_empty() {
+            return Ok(());
+        }
+
+        let mut puts = Vec::new();
+        if self.stage_table_row_id_deletes(table_id, &to_remove, &mut puts)? && !puts.is_empty() {
+            self.pager.batch_put(&puts)?;
+        }
+        Ok(())
     }
 
     // TODO: Move to descriptor module?
