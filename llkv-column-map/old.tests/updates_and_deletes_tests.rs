@@ -226,7 +226,7 @@ fn test_deletes_and_updates() {
     let mut bm = RoaringTreemap::new();
     bm.insert(idx_40);
     let deletes: Vec<RowId> = bm.iter().collect();
-    store.delete_rows(&[(field_id, deletes)]).unwrap();
+    store.delete_rows(&[field_id], &deletes).unwrap();
 
     // Collect and verify: we should have 9 rows now.
     let got = scan_u64(&store, field_id);

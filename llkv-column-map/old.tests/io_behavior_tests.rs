@@ -106,7 +106,7 @@ fn test_instrumented_paging_io_behavior() {
     let mut to_delete = RoaringTreemap::new();
     to_delete.insert(0); // Delete the row with global index 0 (value 10)
     let deletes: Vec<RowId> = to_delete.iter().collect();
-    store.delete_rows(&[(field_id, deletes)]).unwrap();
+    store.delete_rows(&[field_id], &deletes).unwrap();
 
     let puts_after_delete = stats.physical_puts.load(Ordering::Relaxed);
     let gets_after_delete = stats.physical_gets.load(Ordering::Relaxed);
@@ -221,7 +221,7 @@ fn test_large_scale_churn_io() {
         }
     }
     let deletes: Vec<RowId> = to_delete.iter().collect();
-    store.delete_rows(&[(field_id, deletes)]).unwrap();
+    store.delete_rows(&[field_id], &deletes).unwrap();
 
     let gets_after_delete = stats.get_batches.load(Ordering::Relaxed);
     let puts_after_delete = stats.put_batches.load(Ordering::Relaxed);

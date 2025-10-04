@@ -31,9 +31,6 @@ pub struct ColumnStore<P: Pager> {
     index_manager: IndexManager<P>,
 }
 
-/// Convenience alias for describing batched delete operations.
-pub type DeleteRowsSpec = (LogicalFieldId, Vec<RowId>);
-
 impl<P> ColumnStore<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -792,6 +789,7 @@ where
         }
         Ok(())
     }
+
     fn lww_rewrite_for_field(
         &self,
         catalog: &mut ColumnCatalog,
@@ -1205,11 +1203,11 @@ where
 
     /// Delete row positions for one or more logical fields in a single atomic batch.
     ///
-    /// Each entry contains a field id and the global row positions to delete
-    /// for that field. All staged metadata and chunk updates are committed in a
+    /// The same set of global row positions is applied to every field in
+    /// `fields`. All staged metadata and chunk updates are committed in a
     /// single pager batch.
-    pub fn delete_rows(&self, deletes: &[DeleteRowsSpec]) -> Result<()> {
-        if deletes.is_empty() {
+    pub fn delete_rows(&self, fields: &[LogicalFieldId], rows_to_delete: &[RowId]) -> Result<()> {
+        if fields.is_empty() || rows_to_delete.is_empty() {
             return Ok(());
         }
 
@@ -1217,10 +1215,7 @@ where
         let mut touched: FxHashSet<LogicalFieldId> = FxHashSet::default();
         let mut table_id: Option<TableId> = None;
 
-        for (field_id, rows) in deletes {
-            if rows.is_empty() {
-                continue;
-            }
+        for field_id in fields {
             if let Some(expected) = table_id {
                 if field_id.table_id() != expected {
                     return Err(Error::InvalidArgumentError(
@@ -1231,7 +1226,7 @@ where
                 table_id = Some(field_id.table_id());
             }
 
-            if self.stage_delete_rows_for_field(*field_id, rows, &mut puts)? {
+            if self.stage_delete_rows_for_field(*field_id, rows_to_delete, &mut puts)? {
                 touched.insert(*field_id);
             }
         }

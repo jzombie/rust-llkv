@@ -59,7 +59,7 @@ fn test_total_rows_before_after_append_and_delete() {
     let store = table.store();
     let lfid1 = LogicalFieldId::for_user(table.table_id(), 1);
     store
-        .delete_rows(&[(lfid1, vec![2u64])])
+        .delete_rows(&[lfid1], &[2u64])
         .expect("delete col1");
 
     // col1 should be 4, col2 still 5
@@ -75,7 +75,7 @@ fn test_total_rows_before_after_append_and_delete() {
     let lfid2 = LogicalFieldId::for_user(table.table_id(), 2);
     assert_eq!(store.total_rows_for_field(table_rid).unwrap(), 5);
     store
-        .delete_rows(&[(lfid2, vec![3u64])])
+        .delete_rows(&[lfid2], &[3u64])
         .expect("delete col2 only");
     store
         .delete_table_row_ids(table.table_id(), vec![3u64])

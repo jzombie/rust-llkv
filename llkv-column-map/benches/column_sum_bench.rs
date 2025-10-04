@@ -205,7 +205,7 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
     let rows_to_delete: RoaringTreemap = (0..NUM_ROWS_FRAGMENTED).step_by(10).collect();
     let delete_vec: Vec<RowId> = rows_to_delete.iter().collect();
     store
-        .delete_rows(&[(field_id, delete_vec)])
+        .delete_rows(&[field_id], &delete_vec)
         .expect("delete rows in bench");
 
     // 3) Append one more chunk after deletions.

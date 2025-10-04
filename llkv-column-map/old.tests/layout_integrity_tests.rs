@@ -94,7 +94,7 @@ fn test_layout_integrity_under_churn() {
     to_delete.insert(5000);
     to_delete.insert(50000);
     let deletes: Vec<RowId> = to_delete.iter().collect();
-    store.delete_rows(&[(field_id, deletes)]).unwrap();
+    store.delete_rows(&[field_id], &deletes).unwrap();
 
     println!("\n--- After Deletes ---");
     // VERIFY 3: The store must be consistent after deletes.
