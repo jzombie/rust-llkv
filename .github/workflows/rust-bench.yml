@@ -26,6 +26,11 @@ jobs:
     # runs-on: ubuntu-latest
     runs-on: [self-hosted, macOS, ARM64]
 
+    env:
+      # Use a persistent target directory OUTSIDE the workspace to survive
+      # runner cleanup
+      CARGO_TARGET_DIR: /tmp/llkv-bench-target
+
     steps:
       - uses: actions/checkout@v4
 
@@ -49,8 +54,6 @@ jobs:
           codspeed --version || true
 
       - name: Build the benchmark target(s)
-        env:
-          CARGO_TARGET_DIR: "${{ github.workspace }}/target"
         run: |
           set -euo pipefail
           cargo clean
@@ -60,9 +63,8 @@ jobs:
         env:
           CODSPEED_TOKEN: ${{ secrets.CODSPEED_TOKEN }}
           CODSPEED_LOG: debug
-          CARGO_TARGET_DIR: "${{ github.workspace }}/target"
           # Disable perf/system-level instrumentation to avoid sudo prompts
-          CODSPEED_PERF_ENABLED: "false"
+          # CODSPEED_PERF_ENABLED: "false"
         run: |
           set -euo pipefail
           codspeed run --mode=walltime --token "${CODSPEED_TOKEN:-}" -- 'cargo codspeed run --workspace'
