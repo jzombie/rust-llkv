@@ -44,12 +44,44 @@ jobs:
       - name: Build the benchmark target(s)
         run: cargo codspeed build
 
+      # Install the CodSpeed runner and add it to PATH (self-hosted friendly)
+      - name: Install CodSpeed runner CLI
+        run: |
+          set -Eeuo pipefail
+          # Pick a version or keep 'latest'
+          RUNNER_VERSION="${CODSPEED_RUNNER_VERSION:-latest}"
+          if [ "$RUNNER_VERSION" = "latest" ]; then
+            curl -fsSL \
+              https://github.com/CodSpeedHQ/runner/releases/latest/download/codspeed-runner-installer.sh \
+              | bash -s -- --quiet
+          else
+            RUNNER_VERSION="${RUNNER_VERSION#v}"
+            curl -fsSL \
+              "https://github.com/CodSpeedHQ/runner/releases/download/v${RUNNER_VERSION}/codspeed-runner-installer.sh" \
+              | bash -s -- --quiet
+          fi
+          echo "$HOME/.codspeed/bin" >> "$GITHUB_PATH"
+
       # Ensure codspeed is on PATH and enable debug logs
-      - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v4
+      - name: Run the benchmarks (inline, no action)
         env:
           CODSPEED_LOG: debug
-        with:
-          mode: instrumentation
-          run: cargo codspeed run
-          token: ${{ secrets.CODSPEED_TOKEN }}
+          # Optional: set to 'instrumentation' or 'walltime'
+          CODSPEED_MODE: instrumentation
+          # Optional: token for private repos
+          CODSPEED_TOKEN: ${{ secrets.CODSPEED_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          which codspeed
+          codspeed --version
+          ARGS=()
+          if [ -n "${CODSPEED_TOKEN:-}" ]; then
+            ARGS+=("--token" "$CODSPEED_TOKEN")
+          fi
+          ARGS+=("--mode=${CODSPEED_MODE:-instrumentation}")
+          # If you later add defaults.run.working-directory, either:
+          #  - keep this step's working-directory, OR
+          #  - pass --working-directory here.
+          # Example:
+          # ARGS+=("--working-directory=.")
+          codspeed run "${ARGS[@]}" -- 'cargo codspeed run'
