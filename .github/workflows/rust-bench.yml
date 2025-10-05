@@ -37,10 +37,12 @@ jobs:
           codspeed --version || true
 
       - name: Build the benchmark target(s)
+        env:
+          CARGO_TARGET_DIR: "${{ github.workspace }}/target"
         run: |
           set -euo pipefail
           cargo clean
-          CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target" cargo codspeed build --workspace
+          cargo codspeed build --workspace --measurement-mode walltime
 
       - name: Run the benchmarks
         env:
