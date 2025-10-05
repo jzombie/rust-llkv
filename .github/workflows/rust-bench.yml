@@ -10,7 +10,9 @@ on:
 jobs:
   codspeed:
     name: Run benchmarks
-    runs-on: ubuntu-latest
+
+    # runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64]
 
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +42,9 @@ jobs:
       - name: Run the benchmarks
         env:
           CODSPEED_TOKEN: ${{ secrets.CODSPEED_TOKEN }}
+          CODSPEED_LOG: debug
+          # Disable perf/system-level instrumentation to avoid sudo prompts
+          CODSPEED_PERF_ENABLED: "false"
         run: |
           set -euo pipefail
           codspeed run --mode=instrumentation --token "${CODSPEED_TOKEN:-}" -- 'cargo codspeed run'
