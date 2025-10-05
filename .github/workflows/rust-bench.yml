@@ -49,7 +49,6 @@ jobs:
         uses: CodSpeedHQ/action@v4
         env:
           CODSPEED_LOG: debug
-          PATH: ${{ env.HOME }}/.codspeed/bin:${{ env.PATH }}
         with:
           mode: instrumentation
           run: cargo codspeed run
