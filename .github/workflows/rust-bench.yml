@@ -48,22 +48,29 @@ jobs:
           bins: cargo-codspeed
 
       # Clone codspeed-runner over HTTPS (specific branch)
-      - name: Clone codspeed-runner (branch or fallback)
+      - name: Fetch codspeed-runner source (tarball fallback)
         run: |
           set -euo pipefail
-          REPO_URL="https://github.com/jzombie/codspeed-runner.git"
+          REPO_BASE="https://github.com/jzombie/codspeed-runner"
           BRANCH="feature/prototype-macos-support"
           DEST_DIR="codspeed-runner-src"
 
-          # Try cloning the requested branch first; if it fails (branch missing),
-          # fall back to a shallow clone of the default branch.
-          if git ls-remote --heads "${REPO_URL}" "refs/heads/${BRANCH}" | grep -q "refs/heads/${BRANCH}"; then
-            echo "Cloning ${BRANCH} from ${REPO_URL}"
-            git clone --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${DEST_DIR}"
+          # Prefer downloading the branch tarball; if it doesn't exist fall back
+          # to the main branch tarball. Using tarballs avoids git shallow-clone
+          # edge cases in CI.
+          TAR_URL="${REPO_BASE}/archive/refs/heads/${BRANCH}.tar.gz"
+          TEMP_TAR="/tmp/codspeed-runner.tar.gz"
+
+          if curl -sfL --head "${TAR_URL}" >/dev/null 2>&1; then
+            echo "Downloading ${BRANCH} tarball from ${TAR_URL}"
           else
-            echo "Branch ${BRANCH} not found; cloning default branch from ${REPO_URL}"
-            git clone --depth 1 "${REPO_URL}" "${DEST_DIR}"
+            echo "Branch ${BRANCH} tarball not found; falling back to main branch"
+            TAR_URL="${REPO_BASE}/archive/refs/heads/main.tar.gz"
           fi
+
+          curl -fsSL "${TAR_URL}" -o "${TEMP_TAR}"
+          rm -rf "${DEST_DIR}" && mkdir -p "${DEST_DIR}"
+          tar -xzf "${TEMP_TAR}" -C "${DEST_DIR}" --strip-components=1
 
           test -f "${DEST_DIR}/scripts/simple-installer.sh"
 
