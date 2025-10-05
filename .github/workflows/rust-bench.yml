@@ -41,9 +41,6 @@ jobs:
           xcrun xctrace version || true
           /usr/sbin/DevToolsSecurity -status || true
 
-      - name: Build the benchmark target(s)
-        run: cargo codspeed build
-
       # Install the CodSpeed runner and add it to PATH (self-hosted friendly)
       - name: Install CodSpeed runner CLI
         run: |
@@ -91,6 +88,9 @@ jobs:
           ls -la "$HOME/.codspeed/bin" || true
           which codspeed || true
           codspeed --version
+
+      - name: Build the benchmark target(s)
+        run: cargo codspeed build
 
       # Ensure codspeed is on PATH and enable debug logs
       # Modified from: https://github.com/CodSpeedHQ/action/blob/main/action.yml
