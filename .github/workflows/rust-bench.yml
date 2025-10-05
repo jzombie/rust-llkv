@@ -14,7 +14,7 @@ jobs:
     name: Run benchmarks
 
     # runs-on: ubuntu-latest
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: [self-hosted, Linux, ARM64]
 
     steps:
       - uses: actions/checkout@v4
@@ -26,128 +26,12 @@ jobs:
           cache-target: release
           bins: cargo-codspeed
 
-      # Surface env issues on self-hosted macOS
-      - name: Verify prerequisites (macOS)
-        run: |
-          set -x
-          which cargo || true
-          cargo --version
-          which cargo-codspeed || true
-          cargo codspeed --version || true
-          which codspeed || true
-          codspeed --version || true
-          xcode-select -p || true
-          xcrun xcodebuild -version || true
-          xcrun xctrace version || true
-          /usr/sbin/DevToolsSecurity -status || true
-
-      # Install the CodSpeed runner and add it to PATH (self-hosted friendly)
-      - name: Install CodSpeed runner CLI (debug)
-        run: |
-          set -Eeuo pipefail
-          set -x
-
-          # OS / env fingerprint
-          echo "==== OS INFO ===="
-          uname -a || true
-          command -v sw_vers >/dev/null 2>&1 && sw_vers || true
-          command -v arch >/dev/null 2>&1 && arch || true
-          echo "SHELL=$SHELL HOME=$HOME USER=$USER"
-          echo "PATH=$PATH"
-          echo "================="
-
-          : "${CODSPEED_RUNNER_VERSION:=latest}"
-
-          # Build URL for the installer script
-          if [ "$CODSPEED_RUNNER_VERSION" = "latest" ]; then
-            INSTALL_URL="https://github.com/CodSpeedHQ/runner/releases/latest/download/codspeed-runner-installer.sh"
-          else
-            v="${CODSPEED_RUNNER_VERSION#v}"
-            INSTALL_URL="https://github.com/CodSpeedHQ/runner/releases/download/v${v}/codspeed-runner-installer.sh"
-          fi
-
-          # Download to a stable temp path
-          TMP_DIR="${RUNNER_TEMP:-/tmp}"
-          INSTALL_SH="${TMP_DIR}/codspeed-runner-installer.sh"
-          curl -fSL "$INSTALL_URL" -o "$INSTALL_SH"
-
-          echo "==== Head of installer (first 200 lines) ===="
-          nl -ba "$INSTALL_SH" | sed -n '1,200p' || true
-          echo "============================================"
-
-          # Run with bash -x to trace exactly where it fails
-          set +e
-          bash -x "$INSTALL_SH" --quiet 2> "${TMP_DIR}/codspeed-install.trace"
-          CODE=$?
-          set -e
-
-          echo "==== Installer exit code: $CODE ===="
-
-          echo "==== Tail of bash -x trace (last 200 lines) ===="
-          tail -n 200 "${TMP_DIR}/codspeed-install.trace" || true
-          echo "==============================================="
-
-          # Print any CodSpeed directories/logs the script may have created
-          echo "==== List ~/.codspeed ===="
-          ls -la "$HOME/.codspeed" || true
-          echo "==== List ~/.codspeed/bin ===="
-          ls -la "$HOME/.codspeed/bin" || true
-          echo "==== Dump common installer logs if present ===="
-          for f in "$HOME/.codspeed/install.log" \
-                  "$HOME/.codspeed/installer.log" \
-                  "${TMP_DIR}/codspeed*.log"; do
-            [ -f "$f" ] && { echo "---- $f ----"; tail -n +1 "$f"; }
-          done
-
-          echo "==== Grep for failure patterns in trace ===="
-          grep -nE 'exit [0-9]+|Unsupported|Darwin|macOS|not supported|fatal|error' \
-            "${TMP_DIR}/codspeed-install.trace" || true
-          echo "==========================================="
-
-          # If it actually installed, put it on PATH for this job
-          if [ -x "$HOME/.codspeed/bin/codspeed" ]; then
-            echo "$HOME/.codspeed/bin" >> "$GITHUB_PATH"
-            which codspeed || true
-            codspeed --version || true
-          fi
-
-          # Propagate the original exit code so the job fails where the script did
-          exit "$CODE"
-
-      # Verify runner CLI actually installed and is usable
-      - name: Verify codspeed runner CLI
-        run: |
-          set -Eeuo pipefail
-          set -x
-          ls -la "$HOME/.codspeed" || true
-          ls -la "$HOME/.codspeed/bin" || true
-          which codspeed || true
-          codspeed --version
-
       - name: Build the benchmark target(s)
         run: cargo codspeed build
 
-      # Ensure codspeed is on PATH and enable debug logs
-      # Modified from: https://github.com/CodSpeedHQ/action/blob/main/action.yml
-      - name: Run the benchmarks (inline, no action)
-        env:
-          CODSPEED_LOG: debug
-          # Optional: set to 'instrumentation' or 'walltime'
-          CODSPEED_MODE: instrumentation
-          # Optional: token for private repos
-          CODSPEED_TOKEN: ${{ secrets.CODSPEED_TOKEN }}
-        run: |
-          set -Eeuo pipefail
-          which codspeed
-          codspeed --version
-          ARGS=()
-          if [ -n "${CODSPEED_TOKEN:-}" ]; then
-            ARGS+=("--token" "$CODSPEED_TOKEN")
-          fi
-          ARGS+=("--mode=${CODSPEED_MODE:-instrumentation}")
-          # If you later add defaults.run.working-directory, either:
-          #  - keep this step's working-directory, OR
-          #  - pass --working-directory here.
-          # Example:
-          # ARGS+=("--working-directory=.")
-          codspeed run "${ARGS[@]}" -- 'cargo codspeed run'
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v4
+        with:
+          mode: instrumentation
+          run: cargo codspeed run
+          token: ${{ secrets.CODSPEED_TOKEN }}
