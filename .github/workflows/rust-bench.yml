@@ -52,4 +52,4 @@ jobs:
           CARGO_TARGET_DIR: "${{ github.workspace }}/target"
         run: |
           set -euo pipefail
-          codspeed run --mode=instrumentation --token "${CODSPEED_TOKEN:-}" -- 'cargo codspeed run --workspace'
+          codspeed run --mode=walltime --token "${CODSPEED_TOKEN:-}" -- 'cargo codspeed run --workspace'
