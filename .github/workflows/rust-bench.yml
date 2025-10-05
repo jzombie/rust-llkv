@@ -130,16 +130,36 @@ jobs:
       - name: Build the benchmark target(s)
         run: cargo codspeed build
 
-      - name: Run the benchmarks
+      - name: Run the benchmarks (diagnostics + instrumentation)
         env:
           CODSPEED_TOKEN: ${{ secrets.CODSPEED_TOKEN }}
           CODSPEED_LOG: debug
-          # Woraround to prevent sudo calls
+          # Disable perf/system-level instrumentation to avoid sudo prompts
           CODSPEED_PERF_ENABLED: "false"
         run: |
           set -euo pipefail
+
+          echo "=== Preflight diagnostics ==="
+          echo "uname:"; uname -a
+          echo "arch:"; arch || true
+          echo "which sh:"; which sh || true
+          echo "file /bin/sh:"; file /bin/sh || true
+
+          echo "--- Rust/cargo versions ---"
+          rustc --version || true
+          cargo --version || true
+
+          echo "--- Workspace target/ listings ---"
+          if [ -d target ]; then
+            find target -maxdepth 3 -type f -executable -print -exec file {} \; || true
+          else
+            echo "No target dir yet"
+          fi
+
+          echo "=== Running codspeed (instrumentation mode) ==="
+          # Force instrumentation mode (no systemd-run, no polkit prompt)
           codspeed run \
-            --mode=walltime \
+            --mode=instrumentation \
             --token "${CODSPEED_TOKEN:-}" \
             --working-directory "${GITHUB_WORKSPACE}" \
             -- 'cargo codspeed run'
