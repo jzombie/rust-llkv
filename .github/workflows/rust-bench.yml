@@ -19,6 +19,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Ensure rustup/cargo are available for the runner user and on PATH
+      - name: Ensure rustup and cargo
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup --version
+          cargo --version
+
+      # OS build deps required by the codspeed crate (bindgen + C toolchain)
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang libclang-dev pkg-config
+
+      # (Optional) Verify perf permissions for instrumentation; non-fatal
+      - name: Verify perf settings (non-fatal)
+        run: |
+          set -euo pipefail
+          uname -a || true
+          getconf LONG_BIT || true
+          cat /proc/sys/kernel/perf_event_paranoid || true
+          sysctl kernel.perf_event_paranoid || true
+
       - name: Setup rust toolchain, cache and cargo-codspeed binary
         uses: moonrepo/setup-rust@v0
         with:
