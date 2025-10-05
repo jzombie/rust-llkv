@@ -1,6 +1,8 @@
 name: rust-bench
 
 on:
+  push:
+    branches: [main]
   # Only run benches for pull requests
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -19,7 +21,7 @@ jobs:
     # for pushes and manual `workflow_dispatch` events. GitHub exposes
     # `github.event.pull_request.draft` (true for draft PRs), so require it to
     # be false when the event is a pull_request.
-    if: ${{ github.event.pull_request.draft == false }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
 
     # runs-on: ubuntu-latest
     runs-on: [self-hosted, macOS, ARM64]
