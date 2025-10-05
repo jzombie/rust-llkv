@@ -50,6 +50,10 @@ jobs:
       # We pass these on PRs so the cloned Thresholds' models are present and
       # `--err` can fail on breach. We intentionally DO NOT use --thresholds-reset
       # here to avoid wiping cloned models.
+      #
+      # Note: There's currently an open issue with bencher.dev to measure
+      # throughput with Criterion: https://github.com/bencherdev/bencher/issues/376
+      # (related PR: https://github.com/bencherdev/bencher/pull/377)
       BENCHER_THRESHOLD_FLAGS: >
         --threshold-measure latency
         --threshold-test t_test
