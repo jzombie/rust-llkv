@@ -157,6 +157,9 @@ jobs:
           fi
 
           echo "=== Running codspeed (instrumentation mode) ==="
+          echo "PWD: $(pwd)"
+          echo "Listing current directory:"; ls -la
+          echo "Listing target directory (if present):"; ls -la target || true
           # Force instrumentation mode (no systemd-run, no polkit prompt)
           codspeed run \
             --mode=instrumentation \
