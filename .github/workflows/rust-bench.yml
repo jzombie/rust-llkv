@@ -26,11 +26,30 @@ jobs:
           cache-target: release
           bins: cargo-codspeed
 
+      # Surface env issues on self-hosted macOS
+      - name: Verify prerequisites (macOS)
+        run: |
+          set -x
+          which cargo || true
+          cargo --version
+          which cargo-codspeed || true
+          cargo codspeed --version || true
+          which codspeed || true
+          codspeed --version || true
+          xcode-select -p || true
+          xcrun xcodebuild -version || true
+          xcrun xctrace version || true
+          /usr/sbin/DevToolsSecurity -status || true
+
       - name: Build the benchmark target(s)
         run: cargo codspeed build
 
+      # Ensure codspeed is on PATH and enable debug logs
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v4
+        env:
+          CODSPEED_LOG: debug
+          PATH: ${{ env.HOME }}/.codspeed/bin:${{ env.PATH }}
         with:
           mode: instrumentation
           run: cargo codspeed run
