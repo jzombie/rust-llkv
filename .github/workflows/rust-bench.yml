@@ -14,7 +14,7 @@ jobs:
     name: Run benchmarks
 
     # runs-on: ubuntu-latest
-    runs-on: [self-hosted, Linux, ARM64]
+    runs-on: [self-hosted, macOS, ARM64]
 
     steps:
       - uses: actions/checkout@v4
@@ -29,14 +29,6 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustup --version
           cargo --version
-
-      # OS build deps required by the codspeed crate (bindgen + C toolchain)
-      - name: Install build dependencies
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential clang libclang-dev pkg-config
 
       # (Optional) Verify perf permissions for instrumentation; non-fatal
       - name: Verify perf settings (non-fatal)
@@ -57,10 +49,35 @@ jobs:
       - name: Build the benchmark target(s)
         run: cargo codspeed build
 
-      - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v4
+      # Clone codspeed-runner over HTTPS (no SSH key required)
+      - name: Checkout codspeed-runner (HTTPS)
+        uses: actions/checkout@v4
         with:
-          mode: instrumentation
-          run: cargo codspeed run
-          working-directory: ${{ github.workspace }}
-          token: ${{ secrets.CODSPEED_TOKEN }}
+          repository: jzombie/codspeed-runner
+          ref: feature/prototype-macos-support
+          path: codspeed-runner-src
+
+      # Replace CodSpeedHQ/action installer with the custom simple installer from the cloned repo
+      - name: Install codspeed runner (custom)
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          bash codspeed-runner-src/scripts/simple-installer.sh \
+            --ref feature/prototype-macos-support \
+            --install-dir "$HOME/.local/bin" \
+            --quiet
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          which codspeed
+          codspeed --version
+
+      - name: Run the benchmarks
+        env:
+          CODSPEED_TOKEN: ${{ secrets.CODSPEED_TOKEN }}
+          CODSPEED_LOG: debug
+        run: |
+          set -euo pipefail
+          codspeed run \
+            --mode=instrumentation \
+            --token "${CODSPEED_TOKEN:-}" \
+            --working-directory "${GITHUB_WORKSPACE}" \
+            -- 'cargo codspeed run'
