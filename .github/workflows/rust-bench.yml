@@ -127,8 +127,27 @@ jobs:
           which codspeed
           codspeed --version
 
-      - name: Build the benchmark target(s)
-        run: cargo codspeed build
+      - name: Build the benchmark target(s) (single build, shared target dir)
+        run: |
+          set -euo pipefail
+          echo "Build step PWD: $(pwd)"
+          echo "GITHUB_WORKSPACE: ${GITHUB_WORKSPACE:-<unset>}"
+          # Ensure cargo and codspeed place artifacts in the same target dir
+          export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target"
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+
+          # Prefer a single codspeed-aware build. This should produce bench artifacts
+          # without running the benchmarks and avoids duplicate builds.
+          if command -v codspeed >/dev/null 2>&1; then
+            echo "Running: cargo codspeed build --release --workspace"
+            cargo codspeed build --release --workspace
+          else
+            echo "codspeed not present; running cargo build --release --workspace"
+            cargo build --release --workspace
+          fi
+
+          echo "Listing target directory after build:"
+          ls -la "$CARGO_TARGET_DIR" || true
 
       - name: Run the benchmarks (diagnostics + instrumentation)
         env:
