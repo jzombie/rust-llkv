@@ -1,118 +1,37 @@
-name: rust-bench
+name: CodSpeed
 
 on:
-  # Only run benches for pull requests
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-
-# Grant the minimum permissions required for the action to create PR comments.
-# By default GITHUB_TOKEN is read-only for many scopes; explicitly allow write
-# access to issues/pull-requests so Bencher can post comments on PRs.
-# Note: For runs triggered by forks, secrets (including GITHUB_TOKEN) are not
-# available and commenting will fail — this is a GitHub security restriction.
-#
-# https://bencher.dev/docs/explanation/bencher-run/#--github-actions-github_token
-permissions:
-  pull-requests: write
-  checks: write
-
-# Ensure only one run per branch/PR at a time. If new commits are pushed,
-# older jobs will be automatically canceled.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  push:
+    branches:
+      - "main" # or "master"
+  pull_request: # required to have reports on PRs
+  # `workflow_dispatch` allows CodSpeed to trigger backtest
+  # performance analysis in order to generate initial data.
+  workflow_dispatch:
 
 jobs:
-  bench:
-    name: bench
-    # Only run this job for non-draft pull requests. We still want the job to run
-    # for pushes and manual `workflow_dispatch` events. GitHub exposes
-    # `github.event.pull_request.draft` (true for draft PRs), so require it to
-    # be false when the event is a pull_request.
-    if: ${{ github.event.pull_request.draft == false }}
+  codspeed:
+    name: Run benchmarks
 
     # runs-on: ubuntu-latest
     runs-on: [self-hosted, macOS, ARM64]
-    env:
-      BENCHER_PROJECT: llkv
-      # The Bencher adapter to use for the benchmark run.
-      # https://bencher.dev/docs/explanation/adapters
-      BENCHER_ADAPTER: rust_criterion
-      BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
-      # Report all PR results under a shared virtual branch to avoid per-PR
-      # Threshold proliferation. Thresholds live on `main` and are cloned into
-      # this branch for alerts to work pre-merge.
-      BENCHER_BRANCH: premerge
-      # A simple testbed identifier. You can change this to better describe the
-      # runner (eg: self-hosted-mac-arm64, github-ubuntu-latest, etc.).
-      BENCHER_TESTBED: ci
-      # Two Threshold models to evaluate (latency upper, throughput lower).
-      # We pass these on PRs so the cloned Thresholds' models are present and
-      # `--err` can fail on breach. We intentionally DO NOT use --thresholds-reset
-      # here to avoid wiping cloned models.
-      #
-      # Note: There's currently an open issue with bencher.dev to measure
-      # throughput with Criterion: https://github.com/bencherdev/bencher/issues/376
-      # (related PR: https://github.com/bencherdev/bencher/pull/377)
-      BENCHER_THRESHOLD_FLAGS: >
-        --threshold-measure latency
-        --threshold-test t_test
-        --threshold-max-sample-size 64
-        --threshold-lower-boundary _
-        --threshold-upper-boundary 0.99
-        --threshold-measure throughput
-        --threshold-test t_test
-        --threshold-max-sample-size 64
-        --threshold-lower-boundary 0.99
-        --threshold-upper-boundary _
-        --err
-      # Use a workspace-local CARGO_HOME to avoid writing into the runner's
-      # $HOME/.cargo. This keeps installs and registry/git cache inside the
-      # repository workspace (useful for self-hosted runners).
-      CARGO_HOME: "${{ github.workspace }}/.cargo"
-      # Use a persistent target directory OUTSIDE the workspace to survive
-      # runner cleanup
-      CARGO_TARGET_DIR: /tmp/llkv-bench-target
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup rust toolchain, cache and cargo-codspeed binary
+        uses: moonrepo/setup-rust@v0
+        with:
+          channel: stable
+          cache-target: release
+          bins: cargo-codspeed
 
-      - name: Add cargo bin to PATH
-        run: |
-          mkdir -p "${CARGO_HOME}/bin"
-          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+      - name: Build the benchmark target(s)
+        run: cargo codspeed build
 
-      - uses: bencherdev/bencher@main
-
-      - name: Run benches (entire workspace)
-        id: run-benches
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Populate (no-run) for the whole workspace to warm caches/artifacts
-          echo "Populating cache for entire workspace"
-          echo "+ cargo bench --workspace --no-run"
-          cargo bench --workspace --no-run || true
-
-          # Compare against the base branch of the PR and clone its thresholds
-          # into the shared 'premerge' branch so alerts can fire.
-          EXTRA_FLAGS="--start-point '${{ github.event.pull_request.base.ref }}' \
-            --start-point-clone-thresholds ${BENCHER_THRESHOLD_FLAGS}"
-
-          echo "+ bencher run --adapter '${BENCHER_ADAPTER}' \
-            --project '${BENCHER_PROJECT}' \
-            --branch '${BENCHER_BRANCH}' \
-            --testbed '${BENCHER_TESTBED}' \
-            ${EXTRA_FLAGS} -- cargo bench --workspace"
-
-          bencher run \
-            --adapter "${BENCHER_ADAPTER}" \
-            --project "${BENCHER_PROJECT}" \
-            --branch "${BENCHER_BRANCH}" \
-            --testbed "${BENCHER_TESTBED}" \
-            ${EXTRA_FLAGS} -- \
-            cargo bench --workspace
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v4
+        with:
+          mode: instrumentation
+          run: cargo codspeed run
+          token: ${{ secrets.CODSPEED_TOKEN }}
