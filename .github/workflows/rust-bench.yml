@@ -111,14 +111,18 @@ jobs:
             exit 1
           fi
 
-      # Replace CodSpeedHQ/action installer with the custom simple installer from the cloned repo
-      - name: Install codspeed runner (custom)
+      # Build and install codspeed from the cloned fork (no installer, no fallback)
+      - name: Build and install codspeed from source
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.local/bin"
-          bash codspeed-runner-src/scripts/simple-installer.sh \
-            --install-dir "$HOME/.local/bin" \
-            --quiet
+
+          # Build and install the codspeed binary from the cloned fork. This
+          # ensures we use the fork's code directly and avoids running any
+          # installer scripts.
+          export CARGO_TERM_COLOR=always
+          cargo install --path codspeed-runner-src --root "$HOME/.local" --force
+
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           which codspeed
           codspeed --version
