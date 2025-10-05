@@ -95,12 +95,21 @@ jobs:
 
           if [ ${success} -ne 1 ]; then
             echo "Failed to clone ${BRANCH} after ${max_attempts} attempts"
-            # Exit non-zero so the job fails loudly (branch missing or persistent error)
             exit 1
           fi
 
-          # Verify installer present
-          test -f "${DEST_DIR}/scripts/simple-installer.sh"
+          # Diagnostics: list cloned files and verify installer presence explicitly
+          echo "--- Contents of ${DEST_DIR} ---"
+          ls -la "${DEST_DIR}" || true
+          echo "--- Checking for installer script ---"
+          if [ -f "${DEST_DIR}/scripts/simple-installer.sh" ]; then
+            echo "Installer found: ${DEST_DIR}/scripts/simple-installer.sh"
+          else
+            echo "ERROR: installer script missing at ${DEST_DIR}/scripts/simple-installer.sh"
+            echo "Listing ${DEST_DIR}/scripts:" || true
+            ls -la "${DEST_DIR}/scripts" || true
+            exit 1
+          fi
 
       # Replace CodSpeedHQ/action installer with the custom simple installer from the cloned repo
       - name: Install codspeed runner (custom)
