@@ -1,87 +1,49 @@
 name: CodSpeed
+name: CodSpeed
 
 on:
   push:
     branches:
       - "main" # or "master"
   pull_request: # required to have reports on PRs
-  # `workflow_dispatch` allows CodSpeed to trigger backtest
-  # performance analysis in order to generate initial data.
   workflow_dispatch:
 
 jobs:
   codspeed:
     name: Run benchmarks
-
-    # runs-on: ubuntu-latest
-    runs-on: [self-hosted, macOS, ARM64]
-    env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      # Ensure rustup/cargo are available for the runner user and on PATH
-      - name: Ensure rustup and cargo
-        run: |
-          set -euo pipefail
-          if ! command -v rustup >/dev/null 2>&1; then
-            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
-          fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          rustup --version
-          cargo --version
-
-      # (Optional) Verify perf permissions for instrumentation; non-fatal
-      - name: Verify perf settings (non-fatal)
-        run: |
-          set -euo pipefail
-          uname -a || true
-          xcode-select -p || true
-          xcrun xcodebuild -version || true
-          xcrun xctrace version || true
-          /usr/sbin/DevToolsSecurity -status || true
-
-      - name: Setup rust toolchain, cache and cargo-codspeed binary
+      - name: Setup rust toolchain, cache and cargo-codspeed
         uses: moonrepo/setup-rust@v0
         with:
           channel: stable
           cache-target: release
           bins: cargo-codspeed
 
-      # Clone codspeed-runner over HTTPS (specific branch)
-      - name: Clone codspeed-runner (simple, verbose)
+      - name: Clone and build custom codspeed-runner
         run: |
           set -euo pipefail
           REPO_URL="https://github.com/jzombie/codspeed-runner.git"
           BRANCH="feature/prototype-macos-support"
           DEST_DIR="codspeed-runner-src"
-
-          echo "Git version: $(git --version)"
-          echo "Attempting simple clone of ${BRANCH} from ${REPO_URL} into ${DEST_DIR}"
           rm -rf "${DEST_DIR}" || true
+          git clone --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${DEST_DIR}"
+          cargo install --path "${DEST_DIR}" --root "$HOME/.local" --force
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          codspeed --version || true
 
-          # Enable verbose git tracing for diagnostics (prints to job logs)
-          export GIT_TRACE=1
-          export GIT_TRACE_PACKET=1
-          export GIT_CURL_VERBOSE=1
+      - name: Build the benchmark target(s)
+        run: cargo codspeed build
 
-          attempts=0
-          max_attempts=3
-          success=0
-          while [ $attempts -lt $max_attempts ]; do
-            attempts=$((attempts + 1))
-            echo "Clone attempt ${attempts}/${max_attempts} (shallow first)"
-            if git clone --verbose --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${DEST_DIR}"; then
-              success=1
-              echo "Shallow clone succeeded on attempt ${attempts}"
-              break
-            else
-              echo "Shallow clone failed on attempt ${attempts}"
-              rm -rf "${DEST_DIR}" || true
-              # On first failure, try a full clone once before continuing retries
-              if [ ${attempts} -eq 1 ]; then
-                echo "Retrying with a full clone (no --depth)"
+      - name: Run the benchmarks
+        env:
+          CODSPEED_TOKEN: ${{ secrets.CODSPEED_TOKEN }}
+        run: |
+          set -euo pipefail
+          codspeed run --mode=instrumentation --token "${CODSPEED_TOKEN:-}" -- 'cargo codspeed run'
                 if git clone --verbose --branch "${BRANCH}" "${REPO_URL}" "${DEST_DIR}"; then
                   success=1
                   echo "Full clone succeeded"
