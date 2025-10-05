@@ -42,42 +42,77 @@ jobs:
           /usr/sbin/DevToolsSecurity -status || true
 
       # Install the CodSpeed runner and add it to PATH (self-hosted friendly)
-      - name: Install CodSpeed runner CLI
+      - name: Install CodSpeed runner CLI (debug)
         run: |
           set -Eeuo pipefail
           set -x
 
+          # OS / env fingerprint
+          echo "==== OS INFO ===="
+          uname -a || true
+          command -v sw_vers >/dev/null 2>&1 && sw_vers || true
+          command -v arch >/dev/null 2>&1 && arch || true
+          echo "SHELL=$SHELL HOME=$HOME USER=$USER"
+          echo "PATH=$PATH"
+          echo "================="
+
           : "${CODSPEED_RUNNER_VERSION:=latest}"
 
-          # Quick connectivity/TLS sanity checks
-          curl -I -fsSL https://github.com/ || (echo "GH reachability failed"; exit 2)
-          curl -I -fsSL https://github.com/CodSpeedHQ/runner/releases/ || \
-            (echo "Runner releases not reachable"; exit 3)
-
-          install_script_url=""
+          # Build URL for the installer script
           if [ "$CODSPEED_RUNNER_VERSION" = "latest" ]; then
-            install_script_url="https://github.com/CodSpeedHQ/runner/releases/latest/download/codspeed-runner-installer.sh"
+            INSTALL_URL="https://github.com/CodSpeedHQ/runner/releases/latest/download/codspeed-runner-installer.sh"
           else
-            # Strip an optional leading 'v'
             v="${CODSPEED_RUNNER_VERSION#v}"
-            install_script_url="https://github.com/CodSpeedHQ/runner/releases/download/v${v}/codspeed-runner-installer.sh"
-            # Preflight to catch 404s explicitly
-            curl -I -fsSL "https://github.com/CodSpeedHQ/runner/releases/download/v${v}/" >/dev/null
+            INSTALL_URL="https://github.com/CodSpeedHQ/runner/releases/download/v${v}/codspeed-runner-installer.sh"
           fi
 
-          # Download to a file so we can show verbose errors if it fails
-          tmp="${RUNNER_TEMP:-/tmp}/codspeed-runner-installer.sh"
-          curl -fSL "$install_script_url" -o "$tmp" || {
-            echo "Download failed for: $install_script_url"
-            echo "Retrying with verbose curl..."
-            curl -vSL "$install_script_url" -o "$tmp"
-            exit 4
-          }
+          # Download to a stable temp path
+          TMP_DIR="${RUNNER_TEMP:-/tmp}"
+          INSTALL_SH="${TMP_DIR}/codspeed-runner-installer.sh"
+          curl -fSL "$INSTALL_URL" -o "$INSTALL_SH"
 
-          bash "$tmp" --quiet
+          echo "==== Head of installer (first 200 lines) ===="
+          nl -ba "$INSTALL_SH" | sed -n '1,200p' || true
+          echo "============================================"
 
-          # Put codspeed on PATH for the rest of the job
-          echo "$HOME/.codspeed/bin" >> "$GITHUB_PATH"
+          # Run with bash -x to trace exactly where it fails
+          set +e
+          bash -x "$INSTALL_SH" --quiet 2> "${TMP_DIR}/codspeed-install.trace"
+          CODE=$?
+          set -e
+
+          echo "==== Installer exit code: $CODE ===="
+
+          echo "==== Tail of bash -x trace (last 200 lines) ===="
+          tail -n 200 "${TMP_DIR}/codspeed-install.trace" || true
+          echo "==============================================="
+
+          # Print any CodSpeed directories/logs the script may have created
+          echo "==== List ~/.codspeed ===="
+          ls -la "$HOME/.codspeed" || true
+          echo "==== List ~/.codspeed/bin ===="
+          ls -la "$HOME/.codspeed/bin" || true
+          echo "==== Dump common installer logs if present ===="
+          for f in "$HOME/.codspeed/install.log" \
+                  "$HOME/.codspeed/installer.log" \
+                  "${TMP_DIR}/codspeed*.log"; do
+            [ -f "$f" ] && { echo "---- $f ----"; tail -n +1 "$f"; }
+          done
+
+          echo "==== Grep for failure patterns in trace ===="
+          grep -nE 'exit [0-9]+|Unsupported|Darwin|macOS|not supported|fatal|error' \
+            "${TMP_DIR}/codspeed-install.trace" || true
+          echo "==========================================="
+
+          # If it actually installed, put it on PATH for this job
+          if [ -x "$HOME/.codspeed/bin/codspeed" ]; then
+            echo "$HOME/.codspeed/bin" >> "$GITHUB_PATH"
+            which codspeed || true
+            codspeed --version || true
+          fi
+
+          # Propagate the original exit code so the job fails where the script did
+          exit "$CODE"
 
       # Verify runner CLI actually installed and is usable
       - name: Verify codspeed runner CLI
