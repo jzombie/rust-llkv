@@ -1,11 +1,9 @@
 name: rust-bench
 
 on:
-  push:
-    branches:
-      - "main" # or "master"
-  pull_request: # required to have reports on PRs
-  workflow_dispatch:
+  # Only run benches for pull requests
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 # Ensure only one run per branch/PR at a time. If new commits are pushed,
 # older jobs will be automatically canceled.
@@ -16,6 +14,12 @@ concurrency:
 jobs:
   codspeed:
     name: bench
+
+    # Only run this job for non-draft pull requests. We still want the job to run
+    # for pushes and manual `workflow_dispatch` events. GitHub exposes
+    # `github.event.pull_request.draft` (true for draft PRs), so require it to
+    # be false when the event is a pull_request.
+    if: ${{ github.event.pull_request.draft == false }}
 
     # runs-on: ubuntu-latest
     runs-on: [self-hosted, macOS, ARM64]
