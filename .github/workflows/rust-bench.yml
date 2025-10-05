@@ -48,14 +48,24 @@ jobs:
           bins: cargo-codspeed
 
       # Clone codspeed-runner over HTTPS (specific branch)
-      - name: Clone codspeed-runner (branch)
+      - name: Clone codspeed-runner (branch or fallback)
         run: |
           set -euo pipefail
-          git clone --depth 1 \
-            --branch feature/prototype-macos-support \
-            https://github.com/jzombie/codspeed-runner.git \
-            codspeed-runner-src
-          test -f codspeed-runner-src/scripts/simple-installer.sh
+          REPO_URL="https://github.com/jzombie/codspeed-runner.git"
+          BRANCH="feature/prototype-macos-support"
+          DEST_DIR="codspeed-runner-src"
+
+          # Try cloning the requested branch first; if it fails (branch missing),
+          # fall back to a shallow clone of the default branch.
+          if git ls-remote --heads "${REPO_URL}" "refs/heads/${BRANCH}" | grep -q "refs/heads/${BRANCH}"; then
+            echo "Cloning ${BRANCH} from ${REPO_URL}"
+            git clone --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${DEST_DIR}"
+          else
+            echo "Branch ${BRANCH} not found; cloning default branch from ${REPO_URL}"
+            git clone --depth 1 "${REPO_URL}" "${DEST_DIR}"
+          fi
+
+          test -f "${DEST_DIR}/scripts/simple-installer.sh"
 
       # Replace CodSpeedHQ/action installer with the custom simple installer from the cloned repo
       - name: Install codspeed runner (custom)
