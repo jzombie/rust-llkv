@@ -48,21 +48,52 @@ jobs:
       - name: Install CodSpeed runner CLI
         run: |
           set -Eeuo pipefail
-          # Pick a version or keep 'latest'
-          RUNNER_VERSION="${CODSPEED_RUNNER_VERSION:-latest}"
-          if [ "$RUNNER_VERSION" = "latest" ]; then
-            curl -fsSL \
-              https://github.com/CodSpeedHQ/runner/releases/latest/download/codspeed-runner-installer.sh \
-              | bash -s -- --quiet
+          set -x
+
+          : "${CODSPEED_RUNNER_VERSION:=latest}"
+
+          # Quick connectivity/TLS sanity checks
+          curl -I -fsSL https://github.com/ || (echo "GH reachability failed"; exit 2)
+          curl -I -fsSL https://github.com/CodSpeedHQ/runner/releases/ || \
+            (echo "Runner releases not reachable"; exit 3)
+
+          install_script_url=""
+          if [ "$CODSPEED_RUNNER_VERSION" = "latest" ]; then
+            install_script_url="https://github.com/CodSpeedHQ/runner/releases/latest/download/codspeed-runner-installer.sh"
           else
-            RUNNER_VERSION="${RUNNER_VERSION#v}"
-            curl -fsSL \
-              "https://github.com/CodSpeedHQ/runner/releases/download/v${RUNNER_VERSION}/codspeed-runner-installer.sh" \
-              | bash -s -- --quiet
+            # Strip an optional leading 'v'
+            v="${CODSPEED_RUNNER_VERSION#v}"
+            install_script_url="https://github.com/CodSpeedHQ/runner/releases/download/v${v}/codspeed-runner-installer.sh"
+            # Preflight to catch 404s explicitly
+            curl -I -fsSL "https://github.com/CodSpeedHQ/runner/releases/download/v${v}/" >/dev/null
           fi
+
+          # Download to a file so we can show verbose errors if it fails
+          tmp="${RUNNER_TEMP:-/tmp}/codspeed-runner-installer.sh"
+          curl -fSL "$install_script_url" -o "$tmp" || {
+            echo "Download failed for: $install_script_url"
+            echo "Retrying with verbose curl..."
+            curl -vSL "$install_script_url" -o "$tmp"
+            exit 4
+          }
+
+          bash "$tmp" --quiet
+
+          # Put codspeed on PATH for the rest of the job
           echo "$HOME/.codspeed/bin" >> "$GITHUB_PATH"
 
+      # Verify runner CLI actually installed and is usable
+      - name: Verify codspeed runner CLI
+        run: |
+          set -Eeuo pipefail
+          set -x
+          ls -la "$HOME/.codspeed" || true
+          ls -la "$HOME/.codspeed/bin" || true
+          which codspeed || true
+          codspeed --version
+
       # Ensure codspeed is on PATH and enable debug logs
+      # Modified from: https://github.com/CodSpeedHQ/action/blob/main/action.yml
       - name: Run the benchmarks (inline, no action)
         env:
           CODSPEED_LOG: debug
