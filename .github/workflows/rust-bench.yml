@@ -48,30 +48,19 @@ jobs:
           bins: cargo-codspeed
 
       # Clone codspeed-runner over HTTPS (specific branch)
-      - name: Fetch codspeed-runner source (tarball fallback)
+      - name: Clone codspeed-runner (simple, verbose)
         run: |
           set -euo pipefail
-          REPO_BASE="https://github.com/jzombie/codspeed-runner"
+          REPO_URL="https://github.com/jzombie/codspeed-runner.git"
           BRANCH="feature/prototype-macos-support"
           DEST_DIR="codspeed-runner-src"
 
-          # Prefer downloading the branch tarball; if it doesn't exist fall back
-          # to the main branch tarball. Using tarballs avoids git shallow-clone
-          # edge cases in CI.
-          TAR_URL="${REPO_BASE}/archive/refs/heads/${BRANCH}.tar.gz"
-          TEMP_TAR="/tmp/codspeed-runner.tar.gz"
+          echo "Git version: $(git --version)"
+          echo "Attempting simple clone of ${BRANCH} from ${REPO_URL} into ${DEST_DIR}"
+          rm -rf "${DEST_DIR}" || true
+          git clone --verbose --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${DEST_DIR}"
 
-          if curl -sfL --head "${TAR_URL}" >/dev/null 2>&1; then
-            echo "Downloading ${BRANCH} tarball from ${TAR_URL}"
-          else
-            echo "Branch ${BRANCH} tarball not found; falling back to main branch"
-            TAR_URL="${REPO_BASE}/archive/refs/heads/main.tar.gz"
-          fi
-
-          curl -fsSL "${TAR_URL}" -o "${TEMP_TAR}"
-          rm -rf "${DEST_DIR}" && mkdir -p "${DEST_DIR}"
-          tar -xzf "${TEMP_TAR}" -C "${DEST_DIR}" --strip-components=1
-
+          # Verify installer present
           test -f "${DEST_DIR}/scripts/simple-installer.sh"
 
       # Replace CodSpeedHQ/action installer with the custom simple installer from the cloned repo
