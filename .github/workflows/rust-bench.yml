@@ -62,4 +62,5 @@ jobs:
         with:
           mode: instrumentation
           run: cargo codspeed run
+          working-directory: ${{ github.workspace }}
           token: ${{ secrets.CODSPEED_TOKEN }}
