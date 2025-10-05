@@ -37,14 +37,19 @@ jobs:
           codspeed --version || true
 
       - name: Build the benchmark target(s)
-        run: cargo codspeed build
+        run: |
+          set -euo pipefail
+          cargo clean
+          CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target" cargo codspeed build --workspace
 
       - name: Run the benchmarks
         env:
           CODSPEED_TOKEN: ${{ secrets.CODSPEED_TOKEN }}
           CODSPEED_LOG: debug
           # Disable perf/system-level instrumentation to avoid sudo prompts
+
           CODSPEED_PERF_ENABLED: "false"
+          CARGO_TARGET_DIR: "${{ github.workspace }}/target"
         run: |
           set -euo pipefail
-          codspeed run --mode=instrumentation --token "${CODSPEED_TOKEN:-}" -- 'cargo codspeed run'
+          codspeed run --mode=instrumentation --token "${CODSPEED_TOKEN:-}" -- 'cargo codspeed run --workspace'
