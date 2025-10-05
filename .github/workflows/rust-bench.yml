@@ -58,7 +58,46 @@ jobs:
           echo "Git version: $(git --version)"
           echo "Attempting simple clone of ${BRANCH} from ${REPO_URL} into ${DEST_DIR}"
           rm -rf "${DEST_DIR}" || true
-          git clone --verbose --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${DEST_DIR}"
+
+          # Enable verbose git tracing for diagnostics (prints to job logs)
+          export GIT_TRACE=1
+          export GIT_TRACE_PACKET=1
+          export GIT_CURL_VERBOSE=1
+
+          attempts=0
+          max_attempts=3
+          success=0
+          while [ $attempts -lt $max_attempts ]; do
+            attempts=$((attempts + 1))
+            echo "Clone attempt ${attempts}/${max_attempts} (shallow first)"
+            if git clone --verbose --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${DEST_DIR}"; then
+              success=1
+              echo "Shallow clone succeeded on attempt ${attempts}"
+              break
+            else
+              echo "Shallow clone failed on attempt ${attempts}"
+              rm -rf "${DEST_DIR}" || true
+              # On first failure, try a full clone once before continuing retries
+              if [ ${attempts} -eq 1 ]; then
+                echo "Retrying with a full clone (no --depth)"
+                if git clone --verbose --branch "${BRANCH}" "${REPO_URL}" "${DEST_DIR}"; then
+                  success=1
+                  echo "Full clone succeeded"
+                  break
+                else
+                  echo "Full clone failed"
+                  rm -rf "${DEST_DIR}" || true
+                fi
+              fi
+            fi
+            sleep 2
+          done
+
+          if [ ${success} -ne 1 ]; then
+            echo "Failed to clone ${BRANCH} after ${max_attempts} attempts"
+            # Exit non-zero so the job fails loudly (branch missing or persistent error)
+            exit 1
+          fi
 
           # Verify installer present
           test -f "${DEST_DIR}/scripts/simple-installer.sh"
