@@ -15,6 +15,8 @@ jobs:
 
     # runs-on: ubuntu-latest
     runs-on: [self-hosted, macOS, ARM64]
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
       - uses: actions/checkout@v4
@@ -180,6 +182,7 @@ jobs:
           echo "PWD: $(pwd)"
           echo "Listing current directory:"; ls -la
           echo "Listing target directory (if present):"; ls -la target || true
+          echo "Listing expected bench artifacts (release/deps):"; ls -la "$CARGO_TARGET_DIR/release/deps" || true
           # Force instrumentation mode (no systemd-run, no polkit prompt)
           codspeed run \
             --mode=instrumentation \
