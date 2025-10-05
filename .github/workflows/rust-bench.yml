@@ -134,6 +134,8 @@ jobs:
         env:
           CODSPEED_TOKEN: ${{ secrets.CODSPEED_TOKEN }}
           CODSPEED_LOG: debug
+          # Woraround to prevent sudo calls
+          CODSPEED_PERF_ENABLED: "false"
         run: |
           set -euo pipefail
           codspeed run \
