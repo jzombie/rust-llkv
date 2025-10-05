@@ -188,4 +188,4 @@ jobs:
             --mode=instrumentation \
             --token "${CODSPEED_TOKEN:-}" \
             --working-directory "${GITHUB_WORKSPACE}" \
-            -- 'cargo codspeed run'
+            -- 'cargo codspeed run --profile bench'
