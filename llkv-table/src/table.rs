@@ -306,8 +306,8 @@ where
     /// Prefer reading the dedicated row-id shadow column if present; otherwise
     /// fall back to inspecting any persisted user column descriptor.
     pub fn total_rows(&self) -> llkv_result::Result<u64> {
-        use llkv_column_map::store::table_rowid_fid;
-        let rid_lfid = table_rowid_fid(self.table_id);
+        use llkv_column_map::store::rowid_fid;
+        let rid_lfid = rowid_fid(LogicalFieldId::for_user(self.table_id, 0));
         // Try the row-id shadow column first
         match self.store.total_rows_for_field(rid_lfid) {
             Ok(n) => Ok(n),

@@ -1,53 +1,41 @@
-+---------------+------------------------------------------------------------------------------+-------------+----------------------------+
-| ObjectType    | LogicalID                                                                    | PhysicalKey | Details                    |
-+---------------+------------------------------------------------------------------------------+-------------+----------------------------+
-| Catalog       |                                                                              | 0           | 15 entries                 |
-|   L Field     | LogicalFieldId { field_id: 20, table_id: 0, namespace: UserData }            | 10          | Rows: 50, Chunks: 1        |
-|     L Page    |                                                                              | 12          | Entries: 1                 |
-|       L Chunk |                                                                              | 14          | Rows: 50, Est. Bytes: 296  |
-|   L Field     | LogicalFieldId { field_id: 4294967295, table_id: 2, namespace: RowIdShadow } | 46          | Rows: 10, Chunks: 1        |
-|     L Page    |                                                                              | 47          | Entries: 1                 |
-|       L Chunk |                                                                              | 48          | Rows: 10, Est. Bytes: 176  |
-|   L Field     | LogicalFieldId { field_id: 1, table_id: 2, namespace: UserData }             | 40          | Rows: 10, Chunks: 1        |
-|     L Page    |                                                                              | 42          | Entries: 1                 |
-|       L Chunk |                                                                              | 44          | Rows: 10, Est. Bytes: 176  |
-|   L Field     | LogicalFieldId { field_id: 10, table_id: 0, namespace: UserData }            | 1           | Rows: 100, Chunks: 1       |
-|     L Page    |                                                                              | 3           | Entries: 1                 |
-|       L Chunk |                                                                              | 5           | Rows: 100, Est. Bytes: 896 |
-|   L Field     | LogicalFieldId { field_id: 10, table_id: 0, namespace: RowIdShadow }         | 2           | Rows: 100, Chunks: 1       |
-|     L Page    |                                                                              | 4           | Entries: 1                 |
-|       L Chunk |                                                                              | 6           | Rows: 100, Est. Bytes: 896 |
-|   L Field     | LogicalFieldId { field_id: 10, table_id: 1, namespace: UserData }            | 24          | Rows: 30, Chunks: 1        |
-|     L Page    |                                                                              | 26          | Entries: 1                 |
-|       L Chunk |                                                                              | 28          | Rows: 30, Est. Bytes: 336  |
-|   L Field     | LogicalFieldId { field_id: 10, table_id: 1, namespace: RowIdShadow }         | 25          | Rows: 30, Chunks: 1        |
-|     L Page    |                                                                              | 27          | Entries: 1                 |
-|       L Chunk |                                                                              | 29          | Rows: 30, Est. Bytes: 336  |
-|   L Field     | LogicalFieldId { field_id: 20, table_id: 0, namespace: RowIdShadow }         | 11          | Rows: 50, Chunks: 1        |
-|     L Page    |                                                                              | 13          | Entries: 1                 |
-|       L Chunk |                                                                              | 15          | Rows: 50, Est. Bytes: 496  |
-|   L Field     | LogicalFieldId { field_id: 4294967295, table_id: 1, namespace: RowIdShadow } | 30          | Rows: 45, Chunks: 2        |
-|     L Page    |                                                                              | 31          | Entries: 2                 |
-|       L Chunk |                                                                              | 32          | Rows: 30, Est. Bytes: 336  |
-|       L Chunk |                                                                              | 39          | Rows: 15, Est. Bytes: 216  |
-|   L Field     | LogicalFieldId { field_id: 1, table_id: 2, namespace: RowIdShadow }          | 41          | Rows: 10, Chunks: 1        |
-|     L Page    |                                                                              | 43          | Entries: 1                 |
-|       L Chunk |                                                                              | 45          | Rows: 10, Est. Bytes: 176  |
-|   L Field     | LogicalFieldId { field_id: 20, table_id: 1, namespace: UserData }            | 33          | Rows: 15, Chunks: 1        |
-|     L Page    |                                                                              | 35          | Entries: 1                 |
-|       L Chunk |                                                                              | 37          | Rows: 15, Est. Bytes: 156  |
-|   L Field     | LogicalFieldId { field_id: 4294967295, table_id: 0, namespace: RowIdShadow } | 7           | Rows: 175, Chunks: 3       |
-|     L Page    |                                                                              | 8           | Entries: 3                 |
-|       L Chunk |                                                                              | 9           | Rows: 100, Est. Bytes: 896 |
-|       L Chunk |                                                                              | 16          | Rows: 50, Est. Bytes: 496  |
-|       L Chunk |                                                                              | 23          | Rows: 25, Est. Bytes: 296  |
-|   L Field     | LogicalFieldId { field_id: 30, table_id: 0, namespace: RowIdShadow }         | 18          | Rows: 25, Chunks: 1        |
-|     L Page    |                                                                              | 20          | Entries: 1                 |
-|       L Chunk |                                                                              | 22          | Rows: 25, Est. Bytes: 296  |
-|   L Field     | LogicalFieldId { field_id: 20, table_id: 1, namespace: RowIdShadow }         | 34          | Rows: 15, Chunks: 1        |
-|     L Page    |                                                                              | 36          | Entries: 1                 |
-|       L Chunk |                                                                              | 38          | Rows: 15, Est. Bytes: 216  |
-|   L Field     | LogicalFieldId { field_id: 30, table_id: 0, namespace: UserData }            | 17          | Rows: 25, Chunks: 1        |
-|     L Page    |                                                                              | 19          | Entries: 1                 |
-|       L Chunk |                                                                              | 21          | Rows: 25, Est. Bytes: 5244 |
-+---------------+------------------------------------------------------------------------------+-------------+----------------------------+
++---------------+----------------------------------------------------------------------+-------------+----------------------------+
+| ObjectType    | LogicalID                                                            | PhysicalKey | Details                    |
++---------------+----------------------------------------------------------------------+-------------+----------------------------+
+| Catalog       |                                                                      | 0           | 12 entries                 |
+|   L Field     | LogicalFieldId { field_id: 20, table_id: 1, namespace: RowIdShadow } | 26          | Rows: 15, Chunks: 1        |
+|     L Page    |                                                                      | 28          | Entries: 1                 |
+|       L Chunk |                                                                      | 30          | Rows: 15, Est. Bytes: 216  |
+|   L Field     | LogicalFieldId { field_id: 20, table_id: 0, namespace: UserData }    | 7           | Rows: 50, Chunks: 1        |
+|     L Page    |                                                                      | 9           | Entries: 1                 |
+|       L Chunk |                                                                      | 11          | Rows: 50, Est. Bytes: 296  |
+|   L Field     | LogicalFieldId { field_id: 1, table_id: 2, namespace: UserData }     | 31          | Rows: 10, Chunks: 1        |
+|     L Page    |                                                                      | 33          | Entries: 1                 |
+|       L Chunk |                                                                      | 35          | Rows: 10, Est. Bytes: 176  |
+|   L Field     | LogicalFieldId { field_id: 20, table_id: 0, namespace: RowIdShadow } | 8           | Rows: 50, Chunks: 1        |
+|     L Page    |                                                                      | 10          | Entries: 1                 |
+|       L Chunk |                                                                      | 12          | Rows: 50, Est. Bytes: 496  |
+|   L Field     | LogicalFieldId { field_id: 1, table_id: 2, namespace: RowIdShadow }  | 32          | Rows: 10, Chunks: 1        |
+|     L Page    |                                                                      | 34          | Entries: 1                 |
+|       L Chunk |                                                                      | 36          | Rows: 10, Est. Bytes: 176  |
+|   L Field     | LogicalFieldId { field_id: 10, table_id: 0, namespace: UserData }    | 1           | Rows: 100, Chunks: 1       |
+|     L Page    |                                                                      | 3           | Entries: 1                 |
+|       L Chunk |                                                                      | 5           | Rows: 100, Est. Bytes: 896 |
+|   L Field     | LogicalFieldId { field_id: 10, table_id: 0, namespace: RowIdShadow } | 2           | Rows: 100, Chunks: 1       |
+|     L Page    |                                                                      | 4           | Entries: 1                 |
+|       L Chunk |                                                                      | 6           | Rows: 100, Est. Bytes: 896 |
+|   L Field     | LogicalFieldId { field_id: 10, table_id: 1, namespace: UserData }    | 19          | Rows: 30, Chunks: 1        |
+|     L Page    |                                                                      | 21          | Entries: 1                 |
+|       L Chunk |                                                                      | 23          | Rows: 30, Est. Bytes: 336  |
+|   L Field     | LogicalFieldId { field_id: 20, table_id: 1, namespace: UserData }    | 25          | Rows: 15, Chunks: 1        |
+|     L Page    |                                                                      | 27          | Entries: 1                 |
+|       L Chunk |                                                                      | 29          | Rows: 15, Est. Bytes: 156  |
+|   L Field     | LogicalFieldId { field_id: 30, table_id: 0, namespace: RowIdShadow } | 14          | Rows: 25, Chunks: 1        |
+|     L Page    |                                                                      | 16          | Entries: 1                 |
+|       L Chunk |                                                                      | 18          | Rows: 25, Est. Bytes: 296  |
+|   L Field     | LogicalFieldId { field_id: 30, table_id: 0, namespace: UserData }    | 13          | Rows: 25, Chunks: 1        |
+|     L Page    |                                                                      | 15          | Entries: 1                 |
+|       L Chunk |                                                                      | 17          | Rows: 25, Est. Bytes: 5244 |
+|   L Field     | LogicalFieldId { field_id: 10, table_id: 1, namespace: RowIdShadow } | 20          | Rows: 30, Chunks: 1        |
+|     L Page    |                                                                      | 22          | Entries: 1                 |
+|       L Chunk |                                                                      | 24          | Rows: 30, Est. Bytes: 336  |
++---------------+----------------------------------------------------------------------+-------------+----------------------------+
