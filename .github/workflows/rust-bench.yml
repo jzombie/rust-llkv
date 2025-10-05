@@ -136,15 +136,16 @@ jobs:
           export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target"
           echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 
-          # Prefer a single codspeed-aware build. This should produce bench artifacts
-          # without running the benchmarks and avoids duplicate builds.
-          if command -v codspeed >/dev/null 2>&1; then
-            echo "Running: cargo codspeed build --release --workspace"
-            cargo codspeed build --release --workspace
-          else
-            echo "codspeed not present; running cargo build --release --workspace"
-            cargo build --release --workspace
+          # Require codspeed to be present. We install it earlier in the job from
+          # the cloned fork; if it's missing, fail early to avoid flaky fallbacks.
+          if ! command -v codspeed >/dev/null 2>&1; then
+            echo "ERROR: codspeed binary not found in PATH. Expected it to be installed at $HOME/.local/bin by earlier step."
+            echo "Please check the Build and install codspeed from source step output above for failures."
+            exit 1
           fi
+
+          echo "Running: cargo codspeed build --workspace --profile bench"
+          cargo codspeed build --workspace --profile bench
 
           echo "Listing target directory after build:"
           ls -la "$CARGO_TARGET_DIR" || true
