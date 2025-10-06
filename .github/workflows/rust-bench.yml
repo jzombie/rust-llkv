@@ -56,11 +56,11 @@ jobs:
       # - name: Ensure clean build targets
       #   run: cargo clean
 
-      # - name: Run Criterion benchmarks
+      - name: Run Criterion benchmarks
         # Only run benches for the llkv-column-map crate here to keep the job
         # fast and focused. TODO: add separate jobs or a matrix to run benches
         # for other crates (llkv-csv, llkv-table, llkv-join, etc.).
-      #  run: cargo bench -p llkv-column-map
+        run: cargo bench -p llkv-column-map
 
       - name: Ingest Criterion outputs and upload to CodSpeed
         id: ingest
