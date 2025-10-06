@@ -517,8 +517,7 @@ checksum = "b94f61472cee1439c0b966b47e3aca9ae07e45d070759512cd390ea2bebc6675"
 [[package]]
 name = "codspeed"
 version = "4.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877928176a982bb1f893bc34134ac9f8ee846d9588c92e63ba6bfd8d58f9a9c4"
+source = "git+https://github.com/jzombie/codspeed-rust?branch=debug-mac-perf-swings#ddcf3c1e8c396d5b3185c2d4365fa739449eb5a7"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -536,8 +535,7 @@ dependencies = [
 [[package]]
 name = "codspeed-criterion-compat"
 version = "4.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ba430e4426b7cdf72c69e153fa5679a9981000199faa8ac9eda34c9f92fbd41"
+source = "git+https://github.com/jzombie/codspeed-rust?branch=debug-mac-perf-swings#ddcf3c1e8c396d5b3185c2d4365fa739449eb5a7"
 dependencies = [
  "clap",
  "codspeed",
@@ -549,8 +547,7 @@ dependencies = [
 [[package]]
 name = "codspeed-criterion-compat-walltime"
 version = "4.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4789a891747658766c37631f88ce16b3aa42739535b5637a1428ac108e2a11db"
+source = "git+https://github.com/jzombie/codspeed-rust?branch=debug-mac-perf-swings#ddcf3c1e8c396d5b3185c2d4365fa739449eb5a7"
 dependencies = [
  "anes",
  "cast",
