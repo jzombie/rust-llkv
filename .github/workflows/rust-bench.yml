@@ -66,8 +66,8 @@ jobs:
           codspeed --version || true
 
       # TODO: Temporary while debugging unstable dependencies
-      - name: Ensure clean build targets
-        run: cargo clean
+      # - name: Ensure clean build targets
+      #  run: cargo clean
 
       - name: Build the benchmark target(s)
         run: cargo codspeed build --workspace --measurement-mode walltime
