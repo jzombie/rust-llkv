@@ -31,25 +31,25 @@ rand = { workspace = true }
 name = "column_sum_bench"
 harness = false
 
-# [[bench]]
-# name = "gather_rows_bench"
-# harness = false
+[[bench]]
+name = "gather_rows_bench"
+harness = false
 
-# [[bench]]
-# name = "ingest_bench"
-# harness = false
+[[bench]]
+name = "ingest_bench"
+harness = false
 
-# [[bench]]
-# name = "random_probe_bench"
-# harness = false
+[[bench]]
+name = "random_probe_bench"
+harness = false
 
-# [[bench]]
-# name = "scan_builder_bench"
-# harness = false
+[[bench]]
+name = "scan_builder_bench"
+harness = false
 
-# [[bench]]
-# name = "sort_index_bench"
-# harness = false
+[[bench]]
+name = "sort_index_bench"
+harness = false
 
 # [profile.bench]
 # opt-level = 3
