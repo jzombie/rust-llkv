@@ -1,6 +1,8 @@
 name: rust-bench
 
 on:
+  push:
+    branches: [main]
   # Only run benches for pull requests
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -19,10 +21,15 @@ jobs:
     # for pushes and manual `workflow_dispatch` events. GitHub exposes
     # `github.event.pull_request.draft` (true for draft PRs), so require it to
     # be false when the event is a pull_request.
-    if: ${{ github.event.pull_request.draft == false }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
 
     # runs-on: ubuntu-latest
     runs-on: [self-hosted, macOS, ARM64]
+
+    env:
+      # Use a persistent target directory OUTSIDE the workspace to survive
+      # runner cleanup
+      CARGO_TARGET_DIR: /tmp/llkv-bench-target
 
     steps:
       - uses: actions/checkout@v4
@@ -47,8 +54,6 @@ jobs:
           codspeed --version || true
 
       - name: Build the benchmark target(s)
-        env:
-          CARGO_TARGET_DIR: "${{ github.workspace }}/target"
         run: |
           set -euo pipefail
           cargo clean
@@ -58,9 +63,8 @@ jobs:
         env:
           CODSPEED_TOKEN: ${{ secrets.CODSPEED_TOKEN }}
           CODSPEED_LOG: debug
-          CARGO_TARGET_DIR: "${{ github.workspace }}/target"
           # Disable perf/system-level instrumentation to avoid sudo prompts
-          CODSPEED_PERF_ENABLED: "false"
+          # CODSPEED_PERF_ENABLED: "false"
         run: |
           set -euo pipefail
           codspeed run --mode=walltime --token "${CODSPEED_TOKEN:-}" -- 'cargo codspeed run --workspace'

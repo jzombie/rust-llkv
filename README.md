@@ -1,5 +1,7 @@
 # LLKV: A Columnar Storage Layer for Key-Value Stores
 
+[![CodSpeed Badge](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/jzombie/rust-llkv)
+
 **Work in Progress**
 
 `LLKV` is a lightweight toolkit for building logical, columnar layouts and query primitives on top of generic key–value stores.
