@@ -34,12 +34,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup rust toolchain, cache and cargo-codspeed
+      - name: Setup rust toolchain and cache
         uses: moonrepo/setup-rust@v0
         with:
           channel: stable
           cache-target: release
-          bins: cargo-codspeed
+
+      # TODO: Temporary while debugging
+      - name: Install cargo-codspeed from git branch
+        run: |
+          set -euo pipefail
+          cargo install --git https://github.com/jzombie/codspeed-rust --branch debug-mac-perf-swings cargo-codspeed --force --locked
 
       - name: Clone and build custom codspeed-runner
         run: |
