@@ -26,13 +26,17 @@ jobs:
     # runs-on: ubuntu-latest
     runs-on: [self-hosted, macOS, ARM64]
 
-    env:
-      # Use a persistent target directory OUTSIDE the workspace to survive
-      # runner cleanup
-      CARGO_TARGET_DIR: /tmp/llkv-bench-target
-
     steps:
       - uses: actions/checkout@v4
+
+      # Workaround for `CARGO_TARGET_DIR` not being set consistently across steps
+      - name: Export canonical CARGO_TARGET_DIR
+        run: |
+          set -euo pipefail
+          echo "CARGO_TARGET_DIR=/tmp/llkv-bench-target" >> "$GITHUB_ENV"
+          mkdir -p /tmp/llkv-bench-target
+          echo "Exported CARGO_TARGET_DIR=$(cat $GITHUB_ENV | sed -n 's/^CARGO_TARGET_DIR=//p')"
+          ls -ld /tmp/llkv-bench-target || true
 
       - name: Setup rust toolchain, cache and cargo-codspeed
         uses: moonrepo/setup-rust@v0
