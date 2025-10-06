@@ -19,7 +19,6 @@ llkv-plan = { path = "./llkv-plan", version = "0.2.0-alpha" }
 simd-r-drive = "0.15.0-alpha"
 simd-r-drive-entry-handle = "0.15.0-alpha"
 
-
 # Vendor crates
 arrow = { version = "56.2.0", default-features = false, features = ["prettyprint"] }
 arrow-array = { version = "56.2.0", default-features = false }
