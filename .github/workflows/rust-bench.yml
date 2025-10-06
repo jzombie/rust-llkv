@@ -38,6 +38,24 @@ jobs:
           echo "Exported CARGO_TARGET_DIR=$(cat $GITHUB_ENV | sed -n 's/^CARGO_TARGET_DIR=//p')"
           ls -ld /tmp/llkv-bench-target || true
 
+      # DEBUG: show environment and relevant paths early so we can confirm the
+      # runner sees the CARGO_TARGET_DIR we just exported.
+      - name: Debug environment (early)
+        run: |
+          set -euo pipefail
+          echo "GITHUB_ENV file path: ${GITHUB_ENV:-<not-set>}"
+          echo "Contents of GITHUB_ENV (grep CARGO_TARGET_DIR):"
+          grep -E '^CARGO_TARGET_DIR=' "$GITHUB_ENV" || true
+          echo "CARGO_TARGET_DIR in this shell: '${CARGO_TARGET_DIR:-<not-set>}'"
+          echo "Listing /tmp/llkv-bench-target:"
+          ls -la /tmp/llkv-bench-target || true
+          echo "Which cargo: $(which cargo || true)"
+          cargo --version || true
+          echo "Which rustc: $(which rustc || true)"
+          rustc --version || true
+          echo "Which codspeed: $(which codspeed || true)"
+          codspeed --version || true
+
       - name: Setup rust toolchain, cache and cargo-codspeed
         uses: moonrepo/setup-rust@v0
         with:
@@ -55,13 +73,31 @@ jobs:
           git clone --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${DEST_DIR}"
           cargo install --path "${DEST_DIR}" --root "$HOME/.local" --force
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "After install: PATH=$PATH"
+          ls -la "$HOME/.local/bin" || true
+          which codspeed || true
           codspeed --version || true
+
+      # DEBUG: confirm runner still has CARGO_TARGET_DIR available before build
+      - name: Debug environment (before build)
+        run: |
+          set -euo pipefail
+          echo "CARGO_TARGET_DIR from env: '${CARGO_TARGET_DIR:-<not-set>}'"
+          echo "GITHUB_ENV file contents (grep CARGO_TARGET_DIR):"
+          grep -E '^CARGO_TARGET_DIR=' "$GITHUB_ENV" || true
+          echo "ls -la /tmp/llkv-bench-target:"; ls -la /tmp/llkv-bench-target || true
+          echo "pwd: $(pwd)"
+          echo "env | grep CARGO_TARGET_DIR: "; env | grep -E '^CARGO_TARGET_DIR=' || true
 
       - name: Build the benchmark target(s)
         run: |
           set -euo pipefail
+          echo "DEBUG: CARGO_TARGET_DIR='${CARGO_TARGET_DIR:-}'"
+          echo "DEBUG: contents of /tmp/llkv-bench-target:"; ls -la /tmp/llkv-bench-target || true
+          env | sort | grep -E 'CARGO_TARGET_DIR|GITHUB_ENV' || true
           cargo clean
-          cargo codspeed build --workspace --measurement-mode walltime
+          # Run with verbose output so we can see target selection and any paths used
+          CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/tmp/llkv-bench-target} cargo codspeed build --workspace --measurement-mode walltime -v
 
       - name: Run the benchmarks
         env:
