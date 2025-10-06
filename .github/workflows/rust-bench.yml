@@ -34,12 +34,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup rust toolchain, cache and cargo-codspeed
+      - name: Setup rust toolchain and cache
         uses: moonrepo/setup-rust@v0
         with:
           channel: stable
           cache-target: release
-          bins: cargo-codspeed
+
+      # TODO: Temporary until upstream releases a new cargo-codspeed.
+      - name: Install cargo-codspeed from git branch
+        run: |
+          set -euo pipefail
+          CARGO_INSTALL_ROOT="$RUNNER_TEMP/cargo-root"
+          rm -rf "$CARGO_INSTALL_ROOT" || true
+          mkdir -p "$CARGO_INSTALL_ROOT"
+          cargo install \
+            --git https://github.com/jzombie/codspeed-rust \
+            --branch debug-mac-perf-swings \
+            cargo-codspeed \
+            --root "$CARGO_INSTALL_ROOT" \
+            --force \
+            --locked
+          echo "$CARGO_INSTALL_ROOT/bin" >> "$GITHUB_PATH"
 
       - name: Clone and build custom codspeed-runner
         run: |
@@ -52,6 +67,10 @@ jobs:
           cargo install --path "${DEST_DIR}" --root "$HOME/.local" --force
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           codspeed --version || true
+
+      # TODO: Temporary while debugging unstable dependencies
+      - name: Ensure clean build targets
+        run: cargo clean
 
       - name: Build the benchmark target(s)
         run: cargo codspeed build --workspace --measurement-mode walltime
