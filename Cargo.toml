@@ -9,7 +9,7 @@ publish = true
 [workspace.dependencies]
 llkv-column-map = { path = "./llkv-column-map", version = "0.2.0-alpha" }
 # llkv-csv = { path = "./llkv-csv", version = "0.2.0-alpha" }
-# llkv-expr = { path = "./llkv-expr", version = "0.2.0-alpha" }
+llkv-expr = { path = "./llkv-expr", version = "0.2.0-alpha" }
 # llkv-join = { path = "./llkv-join", version = "0.2.0-alpha" }
 llkv-result = { path = "./llkv-result", version = "0.2.0-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.2.0-alpha" }
@@ -43,7 +43,7 @@ serde_json = "1.0.145"
 members = [
     "llkv-column-map",
     # "llkv-csv",
-    # "llkv-expr",
+    "llkv-expr",
     # "llkv-join",
     # "llkv-plan",
     "llkv-result",
