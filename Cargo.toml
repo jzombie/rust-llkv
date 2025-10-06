@@ -24,7 +24,7 @@ arrow-array = { version = "56.2.0", default-features = false }
 arrow-ord = { version = "56.2.0", default-features = false }
 arrow-schema = { version = "56.2.0", default-features = false }
 bitcode = "0.6.7"
-criterion = { package = "codspeed-criterion-compat", version = "4.0.1" }
+criterion = "0.7.0"
 crossbeam-channel = "0.5.15"
 csv = "1.3.1"
 line-ending = "1.5.1"
@@ -51,9 +51,3 @@ members = [
     "llkv-table"
 ]
 resolver = "2"
-
-# TODO: Temporary while debugging warmup trimming changes in CodSpeed
-[patch.crates-io]
-codspeed = { git = "https://github.com/jzombie/codspeed-rust", branch = "debug-mac-perf-swings" }
-codspeed-criterion-compat = { git = "https://github.com/jzombie/codspeed-rust", branch = "debug-mac-perf-swings" }
-codspeed-criterion-compat-walltime = { git = "https://github.com/jzombie/codspeed-rust", branch = "debug-mac-perf-swings" }
