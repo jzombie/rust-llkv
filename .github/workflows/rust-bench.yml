@@ -54,10 +54,7 @@ jobs:
           codspeed --version || true
 
       - name: Build the benchmark target(s)
-        run: |
-          set -euo pipefail
-          cargo clean
-          cargo codspeed build --workspace --measurement-mode walltime
+        run: cargo codspeed build --workspace --measurement-mode walltime
 
       - name: Run the benchmarks
         env:
@@ -65,6 +62,4 @@ jobs:
           CODSPEED_LOG: debug
           # Disable perf/system-level instrumentation to avoid sudo prompts
           # CODSPEED_PERF_ENABLED: "false"
-        run: |
-          set -euo pipefail
-          codspeed run --mode=walltime --token "${CODSPEED_TOKEN:-}" -- 'cargo codspeed run --workspace'
+        run: codspeed run --mode=walltime --token "${CODSPEED_TOKEN:-}" -- 'cargo codspeed run --workspace'
