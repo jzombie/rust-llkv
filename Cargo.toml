@@ -51,9 +51,3 @@ members = [
     "llkv-table"
 ]
 resolver = "2"
-
-# TODO: Temporary while debugging
-[patch.crates-io]
-codspeed = { git = "https://github.com/jzombie/codspeed-rust", branch = "debug-mac-perf-swings" }
-codspeed-criterion-compat = { git = "https://github.com/jzombie/codspeed-rust", branch = "debug-mac-perf-swings" }
-codspeed-criterion-compat-walltime = { git = "https://github.com/jzombie/codspeed-rust", branch = "debug-mac-perf-swings" }
