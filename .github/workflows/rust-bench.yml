@@ -40,11 +40,18 @@ jobs:
           channel: stable
           cache-target: release
 
-      # TODO: Temporary while debugging
-      - name: Install cargo-codspeed from git branch
+      # TODO: Temporary while debugging unstable dependencies
+      - name: Install cargo-codspeed from git branch into ephemeral root
         run: |
           set -euo pipefail
-          cargo install --git https://github.com/jzombie/codspeed-rust --branch debug-mac-perf-swings cargo-codspeed --force --locked
+          # Use a single ephemeral install root under $RUNNER_TEMP (no run-id)
+          # to avoid creating lots of per-run directories. We'll remove it at
+          # the end of the job to avoid accumulating storage.
+          CARGO_INSTALL_ROOT="$RUNNER_TEMP/cargo-root"
+          rm -rf "$CARGO_INSTALL_ROOT" || true
+          mkdir -p "$CARGO_INSTALL_ROOT"
+          cargo install --git https://github.com/jzombie/codspeed-rust --branch debug-mac-perf-swings cargo-codspeed --root "$CARGO_INSTALL_ROOT" --force --locked
+          echo "$CARGO_INSTALL_ROOT/bin" >> "$GITHUB_PATH"
 
       - name: Clone and build custom codspeed-runner
         run: |
@@ -57,6 +64,10 @@ jobs:
           cargo install --path "${DEST_DIR}" --root "$HOME/.local" --force
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           codspeed --version || true
+
+      # TODO: Temporary while debugging unstable dependencies
+      - name: Ensure clean build targets
+        run: cargo clean
 
       - name: Build the benchmark target(s)
         run: cargo codspeed build --workspace --measurement-mode walltime
