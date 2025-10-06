@@ -61,5 +61,5 @@ jobs:
           CODSPEED_TOKEN: ${{ secrets.CODSPEED_TOKEN }}
           CODSPEED_LOG: debug
           # Disable perf/system-level instrumentation to avoid sudo prompts
-          # CODSPEED_PERF_ENABLED: "false"
+          CODSPEED_PERF_ENABLED: "false"
         run: codspeed run --mode=walltime --token "${CODSPEED_TOKEN:-}" -- 'cargo codspeed run --workspace'
