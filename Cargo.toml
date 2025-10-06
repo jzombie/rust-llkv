@@ -9,6 +9,7 @@ publish = true
 [workspace.dependencies]
 llkv-column-map = { path = "./llkv-column-map", version = "0.2.0-alpha" }
 llkv-csv = { path = "./llkv-csv", version = "0.2.0-alpha" }
+llkv-bench-utils = { path = "./llkv-dev-tools/bench-utils", version = "0.2.0-alpha" }
 llkv-expr = { path = "./llkv-expr", version = "0.2.0-alpha" }
 llkv-join = { path = "./llkv-join", version = "0.2.0-alpha" }
 llkv-result = { path = "./llkv-result", version = "0.2.0-alpha" }
@@ -17,6 +18,7 @@ llkv-table = { path = "./llkv-table", version = "0.2.0-alpha" }
 llkv-plan = { path = "./llkv-plan", version = "0.2.0-alpha" }
 simd-r-drive = "0.15.0-alpha"
 simd-r-drive-entry-handle = "0.15.0-alpha"
+
 
 # Vendor crates
 arrow = { version = "56.2.0", default-features = false, features = ["prettyprint"] }
@@ -43,6 +45,7 @@ serde_json = "1.0.145"
 members = [
     "llkv-column-map",
     "llkv-csv",
+    "llkv-dev-tools/bench-utils",
     "llkv-expr",
     "llkv-join",
     "llkv-plan",

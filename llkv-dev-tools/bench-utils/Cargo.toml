@@ -1,0 +1,12 @@
+[package]
+name = "llkv-bench-utils"
+description = "Development tools for the LLKV toolkit."
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+criterion.workspace = true

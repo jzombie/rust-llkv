@@ -22,6 +22,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use llkv_bench_utils::configure_group;
 
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::debug::ColumnStoreDebug;
@@ -147,7 +148,8 @@ fn bench_ingest_mixed_columns(c: &mut Criterion) {
     let total_cells = (N_ROWS as u64) * (num_cols as u64);
 
     let mut group = c.benchmark_group("ingest_mixed_1M");
-    group.sample_size(10);
+    // apply standardized timings from workspace helper, then override throughput
+    configure_group(&mut group);
     group.throughput(Throughput::Elements(total_cells));
 
     for &batches in &[1usize, 4, 16, 64] {
