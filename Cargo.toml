@@ -52,7 +52,7 @@ members = [
 ]
 resolver = "2"
 
-# TODO: Temporary while debugging warmup trimming changes in CodSpeed.
+# TODO: Temporary while debugging warmup trimming changes in CodSpeed
 [patch.crates-io]
 codspeed = { git = "https://github.com/jzombie/codspeed-rust", branch = "debug-mac-perf-swings" }
 codspeed-criterion-compat = { git = "https://github.com/jzombie/codspeed-rust", branch = "debug-mac-perf-swings" }
