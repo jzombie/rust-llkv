@@ -1,6 +1,6 @@
 [package]
 name = "llkv-bench-utils"
-description = "Development tools for the LLKV toolkit."
+description = "Benchmark utilities for the LLKV toolkit."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
