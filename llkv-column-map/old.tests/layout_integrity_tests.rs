@@ -3,7 +3,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::LogicalFieldId;
+use llkv_column_map::types::{LogicalFieldId, RowId};
+use llkv_column_map::ROW_ID_COLUMN_NAME;
 use roaring::RoaringTreemap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -92,7 +93,8 @@ fn test_layout_integrity_under_churn() {
     to_delete.insert(500);
     to_delete.insert(5000);
     to_delete.insert(50000);
-    store.delete_rows(field_id, &to_delete).unwrap();
+    let deletes: Vec<RowId> = to_delete.iter().collect();
+    store.delete_rows(&[field_id], &deletes).unwrap();
 
     println!("\n--- After Deletes ---");
     // VERIFY 3: The store must be consistent after deletes.

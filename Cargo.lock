@@ -2143,3 +2143,11 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[patch.unused]]
+name = "simd-r-drive"
+version = "0.14.0-alpha"
+
+[[patch.unused]]
+name = "simd-r-drive-entry-handle"
+version = "0.14.0-alpha"
