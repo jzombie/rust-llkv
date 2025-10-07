@@ -40,7 +40,7 @@ use crate::{JoinKey, JoinOptions, JoinType};
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Schema};
-use llkv_column_map::store::Projection;
+use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::{Expr, Filter, Operator};
 use llkv_result::{Error, Result as LlkvResult};
@@ -736,7 +736,7 @@ where
     let mut projections = Vec::new();
 
     for field in schema.fields() {
-        if field.name() == "row_id" {
+        if field.name() == ROW_ID_COLUMN_NAME {
             continue;
         }
 
@@ -800,7 +800,7 @@ fn find_field_index(schema: &Schema, target_field_id: FieldId) -> LlkvResult<usi
     let mut user_col_idx = 0;
 
     for field in schema.fields() {
-        if field.name() == "row_id" {
+        if field.name() == ROW_ID_COLUMN_NAME {
             continue;
         }
 
@@ -826,7 +826,7 @@ fn find_field_index(schema: &Schema, target_field_id: FieldId) -> LlkvResult<usi
 /// Get the DataType of a join key field from schema.
 fn get_key_datatype(schema: &Schema, field_id: FieldId) -> LlkvResult<DataType> {
     for field in schema.fields() {
-        if field.name() == "row_id" {
+        if field.name() == ROW_ID_COLUMN_NAME {
             continue;
         }
 
@@ -857,7 +857,7 @@ fn build_output_schema(
     // For semi/anti joins, only include left side
     if matches!(join_type, JoinType::Semi | JoinType::Anti) {
         for field in left_schema.fields() {
-            if field.name() != "row_id" {
+            if field.name() != ROW_ID_COLUMN_NAME {
                 fields.push(field.clone());
             }
         }
@@ -866,13 +866,13 @@ fn build_output_schema(
 
     // For other joins, include both sides
     for field in left_schema.fields() {
-        if field.name() != "row_id" {
+        if field.name() != ROW_ID_COLUMN_NAME {
             fields.push(field.clone());
         }
     }
 
     for field in right_schema.fields() {
-        if field.name() != "row_id" {
+        if field.name() != ROW_ID_COLUMN_NAME {
             fields.push(field.clone());
         }
     }
