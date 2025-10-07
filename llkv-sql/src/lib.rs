@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,6 +9,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::LogicalFieldId;
+use llkv_column_map::ColumnStore;
 use llkv_expr::expr::{CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_expr::literal::Literal;
 use llkv_result::{Error, Result as LlkvResult};
@@ -16,6 +17,7 @@ use llkv_storage::pager::Pager;
 use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, TableId};
 use llkv_table::{ColMeta, TableMeta};
+use llkv_table::{SysCatalog, CATALOG_TABLE_ID};
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     BinaryOperator, ColumnDef, ColumnOption, ColumnOptionDef, DataType as SqlDataType,
@@ -36,7 +38,6 @@ where
 {
     pager: Arc<P>,
     tables: RwLock<HashMap<String, Arc<SqlTable<P>>>>,
-    next_table_id: AtomicU32,
 }
 
 impl<P> SqlEngine<P>
@@ -48,7 +49,6 @@ where
         Self {
             pager,
             tables: RwLock::new(HashMap::new()),
-            next_table_id: AtomicU32::new(1),
         }
     }
 
@@ -110,16 +110,11 @@ where
             columns.push(column);
         }
 
-        let table_id = self.next_table_id.fetch_add(1, Ordering::SeqCst);
-        if table_id > TableId::MAX as u32 {
-            return Err(Error::InvalidArgumentError(
-                "exhausted available table ids".into(),
-            ));
-        }
+        let table_id = self.reserve_table_id()?;
 
-        let table = Table::new(table_id as TableId, Arc::clone(&self.pager))?;
+        let table = Table::new(table_id, Arc::clone(&self.pager))?;
         table.put_table_meta(&TableMeta {
-            table_id: table_id as TableId,
+            table_id,
             name: Some(display_name.clone()),
             created_at_micros: current_time_micros(),
             flags: 0,
@@ -389,6 +384,40 @@ where
             .get(canonical_name)
             .cloned()
             .ok_or_else(|| Error::InvalidArgumentError(format!("unknown table '{canonical_name}'")))
+    }
+
+    fn reserve_table_id(&self) -> SqlResult<TableId> {
+        let store = ColumnStore::open(Arc::clone(&self.pager))?;
+        let catalog = SysCatalog::new(&store);
+
+        let mut next = match catalog.get_next_table_id()? {
+            Some(value) => value,
+            None => {
+                let seed = catalog.max_table_id()?.unwrap_or(CATALOG_TABLE_ID);
+                let initial = seed.checked_add(1).ok_or_else(|| {
+                    Error::InvalidArgumentError("exhausted available table ids".into())
+                })?;
+                catalog.put_next_table_id(initial)?;
+                initial
+            }
+        };
+
+        if next == CATALOG_TABLE_ID {
+            next = next.checked_add(1).ok_or_else(|| {
+                Error::InvalidArgumentError("exhausted available table ids".into())
+            })?;
+        }
+
+        let mut following = next
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidArgumentError("exhausted available table ids".into()))?;
+        if following == CATALOG_TABLE_ID {
+            following = following.checked_add(1).ok_or_else(|| {
+                Error::InvalidArgumentError("exhausted available table ids".into())
+            })?;
+        }
+        catalog.put_next_table_id(following)?;
+        Ok(next)
     }
 }
 
@@ -995,5 +1024,38 @@ mod tests {
         };
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_columns(), 2);
+    }
+
+    #[test]
+    fn table_id_allocation_persists_across_engines() {
+        let pager = Arc::new(MemPager::default());
+        {
+            let engine = SqlEngine::new(Arc::clone(&pager));
+            engine
+                .execute("CREATE TABLE alpha (id INT NOT NULL)")
+                .expect("create table alpha");
+        }
+        {
+            let engine = SqlEngine::new(Arc::clone(&pager));
+            engine
+                .execute("CREATE TABLE beta (id INT NOT NULL)")
+                .expect("create table beta");
+        }
+
+        let store = ColumnStore::open(Arc::clone(&pager)).expect("open store");
+        let catalog = SysCatalog::new(&store);
+        let max_id = catalog
+            .max_table_id()
+            .expect("max table id")
+            .expect("some table id");
+        assert!(
+            max_id > CATALOG_TABLE_ID,
+            "expected user tables to be registered in catalog"
+        );
+        let next = catalog
+            .get_next_table_id()
+            .expect("read next table id")
+            .expect("next table id value");
+        assert!(next > max_id, "next id should advance past existing tables");
     }
 }
