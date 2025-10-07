@@ -56,6 +56,7 @@ jobs:
       # - name: Ensure clean build targets
       #   run: cargo clean
 
+      # TODO: Re-enable all benches
       - name: Run Criterion benchmarks
         # Only run benches for the llkv-column-map crate here to keep the job
         # fast and focused. TODO: add separate jobs or a matrix to run benches
