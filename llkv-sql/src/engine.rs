@@ -1,12 +1,15 @@
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::SqlResult;
 use crate::value::SqlValue;
-use arrow::array::{ArrayRef, Float64Builder, Int64Builder, StringBuilder, UInt64Builder};
+use arrow::array::{
+    Array, ArrayRef, Float64Builder, Int64Array, Int64Builder, StringBuilder, UInt64Builder,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
@@ -22,10 +25,11 @@ use llkv_table::{CATALOG_TABLE_ID, SysCatalog};
 use llkv_table::{ColMeta, TableMeta};
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
-    BinaryOperator, ColumnDef, ColumnOption, ColumnOptionDef, DataType as SqlDataType,
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, Ident, ObjectName, ObjectNamePart,
-    Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor,
-    TableObject, TableWithJoins, UnaryOperator, Value, ValueWithSpan,
+    BeginTransactionKind, BinaryOperator, ColumnDef, ColumnOption, ColumnOptionDef,
+    DataType as SqlDataType, ExceptionWhen, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, Ident, ObjectName, ObjectNamePart, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
+    TransactionMode, TransactionModifier, UnaryOperator, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -37,6 +41,7 @@ where
 {
     pager: Arc<P>,
     tables: RwLock<HashMap<String, Arc<SqlTable<P>>>>,
+    transaction_active: Mutex<bool>,
 }
 
 impl<P> SqlEngine<P>
@@ -48,6 +53,7 @@ where
         Self {
             pager,
             tables: RwLock::new(HashMap::new()),
+            transaction_active: Mutex::new(false),
         }
     }
 
@@ -55,7 +61,7 @@ where
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<SqlStatementResult>> {
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, sql)
-            .map_err(|err| Error::InvalidArgumentError(err.to_string()))?;
+            .map_err(|err| Error::InvalidArgumentError(format!("failed to parse SQL: {err}")))?;
 
         let mut results = Vec::with_capacity(statements.len());
         for stmt in statements {
@@ -69,10 +75,74 @@ where
             Statement::CreateTable(stmt) => self.handle_create_table(stmt),
             Statement::Insert(stmt) => self.handle_insert(stmt),
             Statement::Query(query) => self.handle_query(*query),
+            Statement::StartTransaction {
+                modes,
+                begin,
+                transaction,
+                modifier,
+                statements,
+                exception,
+                has_end_keyword,
+            } => self.handle_start_transaction(
+                modes,
+                begin,
+                transaction,
+                modifier,
+                statements,
+                exception,
+                has_end_keyword,
+            ),
+            Statement::Commit {
+                chain,
+                end,
+                modifier,
+            } => self.handle_commit(chain, end, modifier),
+            Statement::Rollback { chain, savepoint } => self.handle_rollback(chain, savepoint),
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported SQL statement: {other:?}"
             ))),
         }
+    }
+
+    fn parse_count_nulls_case(
+        &self,
+        table: &SqlTable<P>,
+        expr: &SqlExpr,
+    ) -> SqlResult<Option<FieldId>> {
+        let SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } = expr
+        else {
+            return Ok(None);
+        };
+
+        if operand.is_some() || conditions.len() != 1 {
+            return Ok(None);
+        }
+
+        let case_when = &conditions[0];
+        if !is_integer_literal(&case_when.result, 1) {
+            return Ok(None);
+        }
+
+        let else_expr = match else_result {
+            Some(expr) => expr.as_ref(),
+            None => return Ok(None),
+        };
+        if !is_integer_literal(else_expr, 0) {
+            return Ok(None);
+        }
+
+        let inner = match &case_when.condition {
+            SqlExpr::IsNull(inner) => inner.as_ref(),
+            _ => return Ok(None),
+        };
+
+        let column = self.resolve_aggregate_column(table, inner)?;
+        Ok(Some(column.field_id))
     }
 
     fn handle_create_table(
@@ -142,6 +212,7 @@ where
             table: Arc::new(table),
             schema,
             next_row_id: AtomicU64::new(0),
+            total_rows: AtomicU64::new(0),
         };
 
         tables.insert(canonical_name, Arc::new(sql_table));
@@ -318,6 +389,9 @@ where
 
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
         table.table.append(&batch)?;
+        table
+            .total_rows
+            .fetch_add(row_count as u64, Ordering::SeqCst);
 
         Ok(SqlStatementResult::Insert {
             table_name: display_name,
@@ -336,6 +410,508 @@ where
             }
         };
         self.execute_select(select)
+    }
+
+    fn try_parse_simple_aggregates(
+        &self,
+        table: &SqlTable<P>,
+        projection_items: &[SelectItem],
+    ) -> SqlResult<Option<Vec<AggregateSpec>>> {
+        if projection_items.is_empty() {
+            return Ok(None);
+        }
+
+        let mut specs: Vec<AggregateSpec> = Vec::with_capacity(projection_items.len());
+        for (idx, item) in projection_items.iter().enumerate() {
+            let (expr, alias_opt) = match item {
+                SelectItem::UnnamedExpr(expr) => (expr, None),
+                SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+                _ => return Ok(None),
+            };
+
+            let alias = alias_opt.unwrap_or_else(|| format!("col{}", idx + 1));
+            let SqlExpr::Function(func) = expr else {
+                return Ok(None);
+            };
+
+            if func.uses_odbc_syntax {
+                return Err(Error::InvalidArgumentError(
+                    "ODBC function syntax is not supported in aggregate queries".into(),
+                ));
+            }
+            if !matches!(func.parameters, FunctionArguments::None) {
+                return Err(Error::InvalidArgumentError(
+                    "parameterized aggregate functions are not supported".into(),
+                ));
+            }
+            if func.filter.is_some()
+                || func.null_treatment.is_some()
+                || func.over.is_some()
+                || !func.within_group.is_empty()
+            {
+                return Err(Error::InvalidArgumentError(
+                    "advanced aggregate clauses are not supported".into(),
+                ));
+            }
+
+            let args_slice: &[FunctionArg] = match &func.args {
+                FunctionArguments::List(list) => {
+                    if list.duplicate_treatment.is_some() {
+                        return Err(Error::InvalidArgumentError(
+                            "DISTINCT aggregates are not supported".into(),
+                        ));
+                    }
+                    if !list.clauses.is_empty() {
+                        return Err(Error::InvalidArgumentError(
+                            "aggregate argument clauses are not supported".into(),
+                        ));
+                    }
+                    &list.args
+                }
+                FunctionArguments::None => &[],
+                FunctionArguments::Subquery(_) => {
+                    return Err(Error::InvalidArgumentError(
+                        "aggregate subquery arguments are not supported".into(),
+                    ));
+                }
+            };
+
+            let func_name = if func.name.0.len() == 1 {
+                match &func.name.0[0] {
+                    ObjectNamePart::Identifier(ident) => ident.value.to_ascii_lowercase(),
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "unsupported aggregate function name".into(),
+                        ));
+                    }
+                }
+            } else {
+                return Err(Error::InvalidArgumentError(
+                    "qualified aggregate function names are not supported".into(),
+                ));
+            };
+
+            let kind = match func_name.as_str() {
+                "count" => {
+                    if args_slice.len() != 1 {
+                        return Err(Error::InvalidArgumentError(
+                            "COUNT accepts exactly one argument".into(),
+                        ));
+                    }
+                    match &args_slice[0] {
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => AggregateKind::CountStar,
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) => {
+                            let column = self.resolve_aggregate_column(table, arg_expr)?;
+                            AggregateKind::CountField {
+                                field_id: column.field_id,
+                            }
+                        }
+                        FunctionArg::Named { .. } | FunctionArg::ExprNamed { .. } => {
+                            return Err(Error::InvalidArgumentError(
+                                "named COUNT arguments are not supported".into(),
+                            ));
+                        }
+                        FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => {
+                            return Err(Error::InvalidArgumentError(
+                                "COUNT does not support qualified wildcards".into(),
+                            ));
+                        }
+                    }
+                }
+                "sum" | "min" | "max" => {
+                    if args_slice.len() != 1 {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "{} accepts exactly one argument",
+                            func_name.to_uppercase()
+                        )));
+                    }
+                    let arg_expr = match &args_slice[0] {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) => arg_expr,
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                        | FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "{} does not support wildcard arguments",
+                                func_name.to_uppercase()
+                            )));
+                        }
+                        FunctionArg::Named { .. } | FunctionArg::ExprNamed { .. } => {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "{} arguments must be column references",
+                                func_name.to_uppercase()
+                            )));
+                        }
+                    };
+
+                    if func_name == "sum" {
+                        if let Some(field_id) = self.parse_count_nulls_case(table, arg_expr)? {
+                            AggregateKind::CountNulls { field_id }
+                        } else {
+                            let column = self.resolve_aggregate_column(table, arg_expr)?;
+                            if column.data_type != DataType::Int64 {
+                                return Err(Error::InvalidArgumentError(
+                                    "SUM currently supports only INTEGER columns".into(),
+                                ));
+                            }
+                            AggregateKind::SumInt64 {
+                                field_id: column.field_id,
+                            }
+                        }
+                    } else {
+                        let column = self.resolve_aggregate_column(table, arg_expr)?;
+                        if column.data_type != DataType::Int64 {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "{} currently supports only INTEGER columns",
+                                func_name.to_uppercase()
+                            )));
+                        }
+                        if func_name == "min" {
+                            AggregateKind::MinInt64 {
+                                field_id: column.field_id,
+                            }
+                        } else {
+                            AggregateKind::MaxInt64 {
+                                field_id: column.field_id,
+                            }
+                        }
+                    }
+                }
+                _ => return Ok(None),
+            };
+
+            specs.push(AggregateSpec { alias, kind });
+        }
+
+        if specs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(specs))
+    }
+
+    fn execute_simple_aggregates(
+        &self,
+        table: &SqlTable<P>,
+        select: &Select,
+        table_name: &str,
+        aggregates: Vec<AggregateSpec>,
+    ) -> SqlResult<SqlStatementResult> {
+        let filter_expr = if let Some(expr) = &select.selection {
+            translate_condition(expr, table.schema.as_ref())?
+        } else {
+            let field_id = table.schema.first_field_id().ok_or_else(|| {
+                Error::InvalidArgumentError("table has no selectable columns".into())
+            })?;
+            full_table_scan_filter(field_id)
+        };
+
+        let mut required_fields: Vec<FieldId> = Vec::new();
+        for spec in &aggregates {
+            if let Some(field_id) = spec.kind.field_id()
+                && !required_fields.contains(&field_id)
+            {
+                required_fields.push(field_id);
+            }
+        }
+
+        let mut projection_specs: Vec<(FieldId, Projection)> = Vec::new();
+        for field_id in &required_fields {
+            let column = table
+                .schema
+                .column_by_field_id(*field_id)
+                .ok_or_else(|| Error::InvalidArgumentError("unknown column in aggregate".into()))?;
+            let projection = Projection::with_alias(
+                LogicalFieldId::for_user(table.table.table_id(), column.field_id),
+                column.name.clone(),
+            );
+            projection_specs.push((*field_id, projection));
+        }
+
+        if projection_specs.is_empty()
+            && let Some(first_column) = table.schema.columns.first()
+        {
+            let projection = Projection::with_alias(
+                LogicalFieldId::for_user(table.table.table_id(), first_column.field_id),
+                first_column.name.clone(),
+            );
+            projection_specs.push((first_column.field_id, projection));
+        }
+
+        if projection_specs.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "aggregate queries require at least one column".into(),
+            ));
+        }
+
+        let mut column_index: HashMap<FieldId, usize> = HashMap::new();
+        for (idx, (field_id, _)) in projection_specs.iter().enumerate() {
+            column_index.insert(*field_id, idx);
+        }
+
+        let scan_projections: Vec<ScanProjection> = projection_specs
+            .iter()
+            .map(|(_, proj)| ScanProjection::from(proj.clone()))
+            .collect();
+
+        let mut states: Vec<AggregateState> = Vec::with_capacity(aggregates.len());
+        let count_star_override = if select.selection.is_none() {
+            let total_rows = table.total_rows.load(Ordering::SeqCst);
+            Some(i64::try_from(total_rows).map_err(|_| {
+                Error::InvalidArgumentError("table row count exceeds i64 range".into())
+            })?)
+        } else {
+            None
+        };
+        for spec in aggregates {
+            let accumulator = match spec.kind {
+                AggregateKind::CountStar => AggregateAccumulator::CountStar { value: 0 },
+                AggregateKind::CountField { field_id } => {
+                    let idx = *column_index.get(&field_id).ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "internal aggregate error: missing column projection".into(),
+                        )
+                    })?;
+                    AggregateAccumulator::CountColumn {
+                        column_index: idx,
+                        value: 0,
+                    }
+                }
+                AggregateKind::SumInt64 { field_id } => {
+                    let idx = *column_index.get(&field_id).ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "internal aggregate error: missing column projection".into(),
+                        )
+                    })?;
+                    AggregateAccumulator::SumInt64 {
+                        column_index: idx,
+                        value: 0,
+                        saw_value: false,
+                    }
+                }
+                AggregateKind::MinInt64 { field_id } => {
+                    let idx = *column_index.get(&field_id).ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "internal aggregate error: missing column projection".into(),
+                        )
+                    })?;
+                    AggregateAccumulator::MinInt64 {
+                        column_index: idx,
+                        value: None,
+                    }
+                }
+                AggregateKind::MaxInt64 { field_id } => {
+                    let idx = *column_index.get(&field_id).ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "internal aggregate error: missing column projection".into(),
+                        )
+                    })?;
+                    AggregateAccumulator::MaxInt64 {
+                        column_index: idx,
+                        value: None,
+                    }
+                }
+                AggregateKind::CountNulls { field_id: _ } => {
+                    let total_rows = count_star_override.ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "SUM(CASE WHEN ... IS NULL ...) with WHERE clauses is not supported yet"
+                                .into(),
+                        )
+                    })?;
+                    AggregateAccumulator::CountNulls {
+                        non_null_rows: 0,
+                        total_rows,
+                    }
+                }
+            };
+            states.push(AggregateState {
+                alias: spec.alias,
+                accumulator,
+                override_value: match spec.kind {
+                    AggregateKind::CountStar => count_star_override,
+                    _ => None,
+                },
+            });
+        }
+
+        let options = ScanStreamOptions {
+            include_nulls: true,
+        };
+
+        let mut error: Option<Error> = None;
+        table
+            .table
+            .scan_stream(scan_projections, &filter_expr, options, |batch| {
+                if error.is_some() {
+                    return;
+                }
+                for state in &mut states {
+                    if let Err(err) = state.update(&batch) {
+                        error = Some(err);
+                        return;
+                    }
+                }
+            })?;
+
+        if let Some(err) = error {
+            return Err(err);
+        }
+
+        let mut fields = Vec::with_capacity(states.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(states.len());
+        for state in states {
+            let (field, array) = state.finalize()?;
+            fields.push(field);
+            arrays.push(array);
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, arrays)?;
+        Ok(SqlStatementResult::Select {
+            table_name: table_name.to_string(),
+            batches: vec![batch],
+        })
+    }
+
+    fn resolve_aggregate_column<'a>(
+        &self,
+        table: &'a SqlTable<P>,
+        expr: &SqlExpr,
+    ) -> SqlResult<&'a SqlColumn> {
+        let column_name = match expr {
+            SqlExpr::Identifier(ident) => ident.value.clone(),
+            SqlExpr::CompoundIdentifier(parts) => {
+                if let Some(last) = parts.last() {
+                    last.value.clone()
+                } else {
+                    return Err(Error::InvalidArgumentError(
+                        "empty column identifier".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::InvalidArgumentError(
+                    "aggregate arguments must be plain column identifiers".into(),
+                ));
+            }
+        };
+
+        table.schema.resolve(&column_name).ok_or_else(|| {
+            Error::InvalidArgumentError(format!(
+                "unknown column '{}' in aggregate expression",
+                column_name
+            ))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_start_transaction(
+        &self,
+        modes: Vec<TransactionMode>,
+        begin: bool,
+        transaction: Option<BeginTransactionKind>,
+        modifier: Option<TransactionModifier>,
+        statements: Vec<Statement>,
+        exception: Option<Vec<ExceptionWhen>>,
+        has_end_keyword: bool,
+    ) -> SqlResult<SqlStatementResult> {
+        if !modes.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "transaction modes are not supported".into(),
+            ));
+        }
+        if modifier.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "transaction modifiers are not supported".into(),
+            ));
+        }
+        if !statements.is_empty() || exception.is_some() || has_end_keyword {
+            return Err(Error::InvalidArgumentError(
+                "BEGIN blocks with inline statements or exceptions are not supported".into(),
+            ));
+        }
+        if let Some(kind) = transaction {
+            match kind {
+                BeginTransactionKind::Transaction | BeginTransactionKind::Work => {}
+            }
+        }
+        if !begin {
+            // We currently treat START TRANSACTION the same as BEGIN, but keep
+            // a guard in case dialects set `begin` to false for unsupported forms.
+        }
+
+        let mut active = self.transaction_active.lock().unwrap();
+        if *active {
+            return Err(Error::InvalidArgumentError(
+                "a transaction is already in progress".into(),
+            ));
+        }
+        *active = true;
+        Ok(SqlStatementResult::Transaction {
+            kind: TransactionKind::Begin,
+        })
+    }
+
+    fn handle_commit(
+        &self,
+        chain: bool,
+        end: bool,
+        modifier: Option<TransactionModifier>,
+    ) -> SqlResult<SqlStatementResult> {
+        if chain {
+            return Err(Error::InvalidArgumentError(
+                "COMMIT AND [NO] CHAIN is not supported".into(),
+            ));
+        }
+        if end {
+            return Err(Error::InvalidArgumentError(
+                "END blocks are not supported".into(),
+            ));
+        }
+        if modifier.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "transaction modifiers are not supported".into(),
+            ));
+        }
+
+        let mut active = self.transaction_active.lock().unwrap();
+        if !*active {
+            return Err(Error::InvalidArgumentError(
+                "no transaction is currently in progress".into(),
+            ));
+        }
+        *active = false;
+        Ok(SqlStatementResult::Transaction {
+            kind: TransactionKind::Commit,
+        })
+    }
+
+    fn handle_rollback(
+        &self,
+        chain: bool,
+        savepoint: Option<Ident>,
+    ) -> SqlResult<SqlStatementResult> {
+        if chain {
+            return Err(Error::InvalidArgumentError(
+                "ROLLBACK AND [NO] CHAIN is not supported".into(),
+            ));
+        }
+        if savepoint.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "ROLLBACK TO SAVEPOINT is not supported".into(),
+            ));
+        }
+
+        let mut active = self.transaction_active.lock().unwrap();
+        if !*active {
+            return Err(Error::InvalidArgumentError(
+                "no transaction is currently in progress".into(),
+            ));
+        }
+        *active = false;
+        // NOTE: The current engine does not implement MVCC/undo. Rolling back will
+        // not revert previously applied changes, but we accept the statement to keep
+        // sqllogictest scripts moving forward.
+        Ok(SqlStatementResult::Transaction {
+            kind: TransactionKind::Rollback,
+        })
     }
 
     fn execute_select(&self, select: &Select) -> SqlResult<SqlStatementResult> {
@@ -394,6 +970,17 @@ where
 
         let (display_name, canonical_name) = extract_single_table(&select.from)?;
         let table = self.lookup_table(&canonical_name)?;
+
+        if let Some(aggregates) =
+            self.try_parse_simple_aggregates(table.as_ref(), &select.projection)?
+        {
+            return self.execute_simple_aggregates(
+                table.as_ref(),
+                select,
+                &display_name,
+                aggregates,
+            );
+        }
 
         let projections = build_projections(&select.projection, table.as_ref())?;
         let filter_expr = if let Some(expr) = &select.selection {
@@ -481,6 +1068,247 @@ pub enum SqlStatementResult {
         table_name: String,
         batches: Vec<RecordBatch>,
     },
+    Transaction {
+        kind: TransactionKind,
+    },
+}
+
+pub enum TransactionKind {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+#[derive(Clone)]
+enum AggregateKind {
+    CountStar,
+    CountField { field_id: FieldId },
+    SumInt64 { field_id: FieldId },
+    MinInt64 { field_id: FieldId },
+    MaxInt64 { field_id: FieldId },
+    CountNulls { field_id: FieldId },
+}
+
+impl AggregateKind {
+    fn field_id(&self) -> Option<FieldId> {
+        match self {
+            AggregateKind::CountStar => None,
+            AggregateKind::CountField { field_id }
+            | AggregateKind::SumInt64 { field_id }
+            | AggregateKind::MinInt64 { field_id }
+            | AggregateKind::MaxInt64 { field_id }
+            | AggregateKind::CountNulls { field_id } => Some(*field_id),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AggregateSpec {
+    alias: String,
+    kind: AggregateKind,
+}
+
+enum AggregateAccumulator {
+    CountStar {
+        value: i64,
+    },
+    CountColumn {
+        column_index: usize,
+        value: i64,
+    },
+    SumInt64 {
+        column_index: usize,
+        value: i64,
+        saw_value: bool,
+    },
+    MinInt64 {
+        column_index: usize,
+        value: Option<i64>,
+    },
+    MaxInt64 {
+        column_index: usize,
+        value: Option<i64>,
+    },
+    CountNulls {
+        non_null_rows: i64,
+        total_rows: i64,
+    },
+}
+
+struct AggregateState {
+    alias: String,
+    accumulator: AggregateAccumulator,
+    override_value: Option<i64>,
+}
+
+impl AggregateState {
+    fn update(&mut self, batch: &RecordBatch) -> SqlResult<()> {
+        match &mut self.accumulator {
+            AggregateAccumulator::CountStar { value } => {
+                let rows = i64::try_from(batch.num_rows()).map_err(|_| {
+                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
+                })?;
+                *value = value.checked_add(rows).ok_or_else(|| {
+                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
+                })?;
+            }
+            AggregateAccumulator::CountColumn {
+                column_index,
+                value,
+            } => {
+                let array = batch.column(*column_index).as_ref();
+                let non_null = array.len() - array.null_count();
+                let increment = i64::try_from(non_null).map_err(|_| {
+                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
+                })?;
+                *value = value.checked_add(increment).ok_or_else(|| {
+                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
+                })?;
+            }
+            AggregateAccumulator::SumInt64 {
+                column_index,
+                value,
+                saw_value,
+            } => {
+                let array = batch.column(*column_index);
+                let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "SUM aggregate expected an INT column in execution".into(),
+                    )
+                })?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        let v = array.value(i);
+                        *value = value.checked_add(v).ok_or_else(|| {
+                            Error::InvalidArgumentError(
+                                "SUM aggregate result exceeds i64 range".into(),
+                            )
+                        })?;
+                        *saw_value = true;
+                    }
+                }
+            }
+            AggregateAccumulator::MinInt64 {
+                column_index,
+                value,
+            } => {
+                let array = batch.column(*column_index);
+                let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "MIN aggregate expected an INT column in execution".into(),
+                    )
+                })?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        let v = array.value(i);
+                        *value = Some(match *value {
+                            Some(current) => current.min(v),
+                            None => v,
+                        });
+                    }
+                }
+            }
+            AggregateAccumulator::MaxInt64 {
+                column_index,
+                value,
+            } => {
+                let array = batch.column(*column_index);
+                let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "MAX aggregate expected an INT column in execution".into(),
+                    )
+                })?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        let v = array.value(i);
+                        *value = Some(match *value {
+                            Some(current) => current.max(v),
+                            None => v,
+                        });
+                    }
+                }
+            }
+            AggregateAccumulator::CountNulls { non_null_rows, .. } => {
+                let rows = i64::try_from(batch.num_rows()).map_err(|_| {
+                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
+                })?;
+                *non_null_rows = non_null_rows.checked_add(rows).ok_or_else(|| {
+                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(self) -> SqlResult<(Field, ArrayRef)> {
+        let AggregateState {
+            alias,
+            accumulator,
+            override_value,
+        } = self;
+        match accumulator {
+            AggregateAccumulator::CountStar { value } => {
+                let mut builder = Int64Builder::with_capacity(1);
+                let result = override_value.unwrap_or(value);
+                builder.append_value(result);
+                let array = Arc::new(builder.finish()) as ArrayRef;
+                Ok((Field::new(&alias, DataType::Int64, false), array))
+            }
+            AggregateAccumulator::CountColumn { value, .. } => {
+                let mut builder = Int64Builder::with_capacity(1);
+                builder.append_value(value);
+                let array = Arc::new(builder.finish()) as ArrayRef;
+                Ok((Field::new(&alias, DataType::Int64, false), array))
+            }
+            AggregateAccumulator::SumInt64 {
+                value, saw_value, ..
+            } => {
+                let mut builder = Int64Builder::with_capacity(1);
+                if saw_value {
+                    builder.append_value(value);
+                } else {
+                    builder.append_null();
+                }
+                let array = Arc::new(builder.finish()) as ArrayRef;
+                Ok((Field::new(&alias, DataType::Int64, true), array))
+            }
+            AggregateAccumulator::MinInt64 { value, .. } => {
+                let mut builder = Int64Builder::with_capacity(1);
+                if let Some(v) = value {
+                    builder.append_value(v);
+                } else {
+                    builder.append_null();
+                }
+                let array = Arc::new(builder.finish()) as ArrayRef;
+                Ok((Field::new(&alias, DataType::Int64, true), array))
+            }
+            AggregateAccumulator::MaxInt64 { value, .. } => {
+                let mut builder = Int64Builder::with_capacity(1);
+                if let Some(v) = value {
+                    builder.append_value(v);
+                } else {
+                    builder.append_null();
+                }
+                let array = Arc::new(builder.finish()) as ArrayRef;
+                Ok((Field::new(&alias, DataType::Int64, true), array))
+            }
+            AggregateAccumulator::CountNulls {
+                non_null_rows,
+                total_rows,
+                ..
+            } => {
+                let nulls = total_rows.checked_sub(non_null_rows).ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "NULL-count aggregate observed more non-null rows than total rows".into(),
+                    )
+                })?;
+                let mut builder = Int64Builder::with_capacity(1);
+                builder.append_value(nulls);
+                let array = Arc::new(builder.finish()) as ArrayRef;
+                Ok((Field::new(&alias, DataType::Int64, false), array))
+            }
+        }
+    }
 }
 
 struct SqlTable<P>
@@ -490,6 +1318,7 @@ where
     table: Arc<Table<P>>,
     schema: Arc<SqlSchema>,
     next_row_id: AtomicU64,
+    total_rows: AtomicU64,
 }
 
 struct SqlSchema {
@@ -507,6 +1336,10 @@ impl SqlSchema {
 
     fn first_field_id(&self) -> Option<FieldId> {
         self.columns.first().map(|col| col.field_id)
+    }
+
+    fn column_by_field_id(&self, field_id: FieldId) -> Option<&SqlColumn> {
+        self.columns.iter().find(|col| col.field_id == field_id)
     }
 }
 
@@ -772,7 +1605,7 @@ fn extract_rows_from_range(select: &Select) -> SqlResult<Option<RangeSelectRows>
         || select.top.is_some()
         || select.into.is_some()
         || select.prewhere.is_some()
-        || select.lateral_views.len() > 0
+        || !select.lateral_views.is_empty()
         || select.value_table_mode.is_some()
         || !group_by_is_empty(&select.group_by)
     {
@@ -1207,6 +2040,16 @@ fn literal_from_value(value: &ValueWithSpan) -> SqlResult<ScalarExpr<FieldId>> {
                 )))
             }
         }
+    }
+}
+
+fn is_integer_literal(expr: &SqlExpr, expected: i64) -> bool {
+    match expr {
+        SqlExpr::Value(ValueWithSpan {
+            value: Value::Number(text, _),
+            ..
+        }) => text.parse::<i64>() == Ok(expected),
+        _ => false,
     }
 }
 

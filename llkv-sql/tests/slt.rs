@@ -20,6 +20,12 @@ impl EngineHarness {
     }
 }
 
+impl Default for EngineHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait::async_trait]
 impl AsyncDB for EngineHarness {
     type Error = LlkvError;
@@ -120,6 +126,7 @@ impl AsyncDB for EngineHarness {
                         Ok(DBOutput::StatementComplete(*rows_inserted as u64))
                     }
                     SqlStatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
+                    SqlStatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
                 }
             }
             Err(e) => Err(e),
@@ -144,4 +151,17 @@ async fn run_slt_basic() {
         .run_file_async(&path)
         .await
         .expect("slt runner failed");
+}
+
+#[test]
+fn validator_space_vs_tab() {
+    use sqllogictest::runner::{default_normalizer, default_validator};
+
+    let actual = vec![
+        vec!["1".to_string(), "3.14".to_string()],
+        vec!["2".to_string(), "2.71".to_string()],
+    ];
+    let expected = vec!["1 3.14".to_string(), "2 2.71".to_string()];
+
+    assert!(default_validator(default_normalizer, &actual, &expected));
 }

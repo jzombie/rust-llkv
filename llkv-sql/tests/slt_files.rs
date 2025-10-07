@@ -172,11 +172,20 @@ async fn run_all_slt_files() {
                     ),
                 };
 
-                // normalize both sides to tab-separated strings for comparison
-                let got_lines: Vec<String> = got.into_iter().map(|r| r.join("\t")).collect();
-                // trim expected rows and compare
-                let exp_lines: Vec<String> =
-                    expected.into_iter().map(|s| s.trim().to_string()).collect();
+                let normalize = sqllogictest::runner::default_normalizer;
+                let got_lines: Vec<String> = got
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|cell| normalize(&cell))
+                            .collect::<Vec<String>>()
+                            .join(" ")
+                    })
+                    .collect();
+                let exp_lines: Vec<String> = expected
+                    .into_iter()
+                    .map(|s| normalize(&s.trim().to_string()))
+                    .collect();
                 if got_lines != exp_lines {
                     panic!(
                         "  FAIL: {}: query mismatch\n[SQL] {}\nexpected: {:?}\ngot: {:?}",
