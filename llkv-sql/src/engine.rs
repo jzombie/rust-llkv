@@ -4,20 +4,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::SqlResult;
+use crate::value::SqlValue;
 use arrow::array::{ArrayRef, Float64Builder, Int64Builder, StringBuilder, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::LogicalFieldId;
-use llkv_column_map::ColumnStore;
 use llkv_expr::expr::{CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
 use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, TableId};
+use llkv_table::{CATALOG_TABLE_ID, SysCatalog};
 use llkv_table::{ColMeta, TableMeta};
-use llkv_table::{SysCatalog, CATALOG_TABLE_ID};
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     BinaryOperator, ColumnDef, ColumnOption, ColumnOptionDef, DataType as SqlDataType,
@@ -27,8 +29,6 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use crate::value::SqlValue;
-use crate::SqlResult;
 
 /// Executes SQL statements against `llkv-table`.
 pub struct SqlEngine<P>
@@ -188,7 +188,7 @@ where
             _ => {
                 return Err(Error::InvalidArgumentError(
                     "INSERT requires a plain table name".into(),
-                ))
+                ));
             }
         };
 
@@ -204,7 +204,7 @@ where
             _ => {
                 return Err(Error::InvalidArgumentError(
                     "INSERT currently supports only VALUES lists".into(),
-                ))
+                ));
             }
         };
         if values.rows.is_empty() {
@@ -237,7 +237,7 @@ where
                 column_values[target_index].push(value);
             }
             for (idx, column) in table.schema.columns.iter().enumerate() {
-                if column_order.iter().any(|&c| c == idx) {
+                if column_order.contains(&idx) {
                     continue;
                 }
                 if !column.nullable {
@@ -290,7 +290,7 @@ where
             _ => {
                 return Err(Error::InvalidArgumentError(
                     "only simple SELECT statements are supported".into(),
-                ))
+                ));
             }
         };
         self.execute_select(select)
@@ -364,12 +364,18 @@ where
         };
 
         let mut batches: Vec<RecordBatch> = Vec::new();
-        table.table.scan_stream(
-            &projections,
-            &filter_expr,
-            ScanStreamOptions::default(),
-            |batch| batches.push(batch),
-        ).map_err(|err| { eprintln!("scan_stream failed: {err:?}"); err })?;
+        table
+            .table
+            .scan_stream(
+                &projections,
+                &filter_expr,
+                ScanStreamOptions::default(),
+                |batch| batches.push(batch),
+            )
+            .map_err(|err| {
+                eprintln!("scan_stream failed: {err:?}");
+                err
+            })?;
 
         Ok(SqlStatementResult::Select {
             table_name: display_name,
@@ -482,13 +488,13 @@ impl SqlColumn {
                     return Err(Error::InvalidArgumentError(format!(
                         "DEFAULT values are not supported for column '{}'",
                         def.name
-                    )))
+                    )));
                 }
                 other => {
                     return Err(Error::InvalidArgumentError(format!(
                         "unsupported column option {:?} on '{}'",
                         other, def.name
-                    )))
+                    )));
                 }
             }
         }
@@ -555,7 +561,7 @@ fn canonical_object_name(name: &ObjectName) -> SqlResult<(String, String)> {
             _ => {
                 return Err(Error::InvalidArgumentError(
                     "object names using functions are not supported".into(),
-                ))
+                ));
             }
         };
         parts.push(ident.value.clone());
@@ -625,7 +631,7 @@ fn build_array_for_column(dtype: &DataType, values: &[SqlValue]) -> SqlResult<Ar
                     SqlValue::String(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert string into INT column".into(),
-                        ))
+                        ));
                     }
                 }
             }
@@ -641,7 +647,7 @@ fn build_array_for_column(dtype: &DataType, values: &[SqlValue]) -> SqlResult<Ar
                     SqlValue::String(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert string into DOUBLE column".into(),
-                        ))
+                        ));
                     }
                 }
             }
@@ -733,7 +739,7 @@ where
             other => {
                 return Err(Error::InvalidArgumentError(format!(
                     "unsupported SELECT item: {other:?}"
-                )))
+                )));
             }
         }
     }
@@ -808,7 +814,7 @@ fn translate_comparison(
         other => {
             return Err(Error::InvalidArgumentError(format!(
                 "unsupported comparison operator: {other:?}"
-            )))
+            )));
         }
     };
     Ok(LlkvExpr::Compare {

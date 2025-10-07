@@ -8,10 +8,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 
 use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME};
-use llkv_column_map::{
-    ColumnStore,
-    types::{LogicalFieldId, Namespace},
-};
+use llkv_column_map::{ColumnStore, types::LogicalFieldId};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -116,24 +113,17 @@ where
                     ))
                 })?;
 
-            // TODO: Require usage of primitive `FieldId` type here?
-            // The SQL layer (and other writers) pass plain user FieldIds (u32). Other
-            // internal paths may already provide fully-qualified LogicalFieldIds.
-            let (user_field_id, logical_field_id) = if raw_field_id <= u32::MAX as u64 {
-                let fid = raw_field_id as FieldId;
-                (fid, LogicalFieldId::for_user(self.table_id, fid))
-            } else {
-                let parsed = LogicalFieldId::from(raw_field_id);
-                if parsed.namespace() != Namespace::UserData {
-                    return Err(llkv_result::Error::Internal(format!(
-                        "Field '{}' carries non-user-data namespace {:?}",
-                        field.name(),
-                        parsed
-                    )));
-                }
-                let fid = parsed.field_id();
-                (fid, LogicalFieldId::for_user(self.table_id, fid))
-            };
+            if raw_field_id > FieldId::MAX as u64 {
+                return Err(llkv_result::Error::Internal(format!(
+                    "Field '{}' expected user FieldId (<= {}) but got logical id '{}'",
+                    field.name(),
+                    FieldId::MAX,
+                    raw_field_id
+                )));
+            }
+
+            let user_field_id = raw_field_id as FieldId;
+            let logical_field_id = LogicalFieldId::for_user(self.table_id, user_field_id);
 
             // Store the fully-qualified logical field id in the metadata we hand to the
             // column store so descriptors are registered under the correct table id.
@@ -457,6 +447,39 @@ mod tests {
             result,
             Err(Error::ReservedTableId(id)) if id == CATALOG_TABLE_ID
         ));
+    }
+
+    #[test]
+    fn test_append_rejects_logical_field_id_in_metadata() {
+        // Create a table and build a schema where the column's metadata
+        // contains a fully-qualified LogicalFieldId (u64). Append should
+        // reject this and require a plain user FieldId instead.
+        let table = Table::new(7, Arc::new(MemPager::default())).unwrap();
+
+        const USER_FID: FieldId = 42;
+        // Build a logical id (namespaced) and put its numeric value into metadata
+        let logical: LogicalFieldId = LogicalFieldId::for_user(table.table_id(), USER_FID);
+        let logical_val: u64 = logical.into();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("bad", DataType::UInt64, false).with_metadata(HashMap::from([(
+                "field_id".to_string(),
+                logical_val.to_string(),
+            )])),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![1u64, 2u64])),
+                Arc::new(UInt64Array::from(vec![10u64, 20u64])),
+            ],
+        )
+        .unwrap();
+
+        let res = table.append(&batch);
+        assert!(matches!(res, Err(Error::Internal(_))));
     }
 
     #[test]
