@@ -1,9 +1,10 @@
 use arrow::array::{Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::storage::pager::{InstrumentedPager, MemPager, Pager};
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::LogicalFieldId;
+use llkv_column_map::types::{LogicalFieldId, RowId};
 use roaring::RoaringTreemap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::collections::HashMap;
@@ -13,7 +14,10 @@ use std::sync::atomic::Ordering;
 /// Helper to build a simple schema with "row_id" and one UInt64 data field.
 fn u64_schema_with_fid(fid: LogicalFieldId) -> Arc<Schema> {
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(fid).to_string());
+    md.insert(
+        crate::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid).to_string(),
+    );
     let data_field = Field::new("data", DataType::UInt64, false).with_metadata(md);
     let row_id_field = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     Arc::new(Schema::new(vec![row_id_field, data_field]))
@@ -104,7 +108,8 @@ fn test_instrumented_paging_io_behavior() {
     // which *will* free the old, now-obsolete data pages.
     let mut to_delete = RoaringTreemap::new();
     to_delete.insert(0); // Delete the row with global index 0 (value 10)
-    store.delete_rows(field_id, &to_delete).unwrap();
+    let deletes: Vec<RowId> = to_delete.iter().collect();
+    store.delete_rows(&[field_id], &deletes).unwrap();
 
     let puts_after_delete = stats.physical_puts.load(Ordering::Relaxed);
     let gets_after_delete = stats.physical_gets.load(Ordering::Relaxed);
@@ -218,7 +223,8 @@ fn test_large_scale_churn_io() {
             to_delete.insert(i);
         }
     }
-    store.delete_rows(field_id, &to_delete).unwrap();
+    let deletes: Vec<RowId> = to_delete.iter().collect();
+    store.delete_rows(&[field_id], &deletes).unwrap();
 
     let gets_after_delete = stats.get_batches.load(Ordering::Relaxed);
     let puts_after_delete = stats.put_batches.load(Ordering::Relaxed);

@@ -40,7 +40,10 @@ fn setup_table() -> Table {
     let table = Table::new(TABLE_ID, Arc::clone(&pager)).expect("table creation");
 
     let mut metadata = HashMap::new();
-    metadata.insert("field_id".to_string(), FIELD_ID.to_string());
+    metadata.insert(
+        llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+        FIELD_ID.to_string(),
+    );
     let data_field = Field::new("data", DataType::UInt64, false).with_metadata(metadata);
     let schema = schema_with_row_id(data_field);
 

@@ -11,26 +11,33 @@ use bitcode::{Decode, Encode};
 use crate::types::TableId;
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
-    PrimitiveWithRowIdsVisitor,
+    PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
 
 use llkv_column_map::types::LogicalFieldId;
 use llkv_column_map::{
     ColumnStore,
-    store::{GatherNullPolicy, ROW_ID_COLUMN_NAME},
+    store::{GatherNullPolicy, ROW_ID_COLUMN_NAME, rowid_fid},
     types::Namespace,
 };
+use llkv_result::{self, Result as LlkvResult};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
 // ----- Catalog constants -----
 
-/// Reserved catalog table id.
-pub const CATALOG_TID: TableId = 0;
+/// Reserved table id used for the system catalog itself.
+pub const CATALOG_TABLE_ID: TableId = 0;
 
-/// Catalog column ids (within table id 0).
-const F_TABLE_META: u32 = 1; // bytes: bitcode(TableMeta)
-const F_COL_META: u32 = 10; // bytes: bitcode(ColMeta)
+/// Column id storing serialized `TableMeta` entries (bitcode-encoded).
+/// Field id for serialized `TableMeta` entries (bitcode-encoded).
+const CATALOG_FIELD_TABLE_META_ID: u32 = 1;
+/// Field id for serialized `ColMeta` entries (bitcode-encoded).
+const CATALOG_FIELD_COL_META_ID: u32 = 10;
+/// Field id for the next available user table id (the cell value is persisted as `UInt64`).
+const CATALOG_FIELD_NEXT_TABLE_ID: u32 = 100;
+/// Row id reserved for the singleton next-table-id value.
+const CATALOG_NEXT_TABLE_ROW_ID: u64 = 0;
 
 // ----- Namespacing helpers -----
 
@@ -97,11 +104,11 @@ where
 
     /// Upsert table metadata.
     pub fn put_table_meta(&self, meta: &TableMeta) {
-        let lfid_val: u64 = lfid(CATALOG_TID, F_TABLE_META).into();
+        let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_TABLE_META_ID).into();
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("meta", DataType::Binary, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 lfid_val.to_string(),
             )])),
         ]));
@@ -150,19 +157,21 @@ where
             ..Default::default()
         };
 
-        let _ = self
-            .store
-            .scan(lfid(CATALOG_TID, F_TABLE_META), scan_opts, &mut visitor);
+        let _ = self.store.scan(
+            lfid(CATALOG_TABLE_ID, CATALOG_FIELD_TABLE_META_ID),
+            scan_opts,
+            &mut visitor,
+        );
         visitor.meta
     }
 
     /// Upsert a single column’s metadata.
     pub fn put_col_meta(&self, table_id: TableId, meta: &ColMeta) {
-        let lfid_val: u64 = lfid(CATALOG_TID, F_COL_META).into();
+        let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_COL_META_ID).into();
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("meta", DataType::Binary, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 lfid_val.to_string(),
             )])),
         ]));
@@ -183,7 +192,7 @@ where
         }
 
         let row_ids: Vec<u64> = col_ids.iter().map(|&cid| rid_col(table_id, cid)).collect();
-        let catalog_field = lfid(CATALOG_TID, F_COL_META);
+        let catalog_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_COL_META_ID);
 
         let batch =
             match self
@@ -212,4 +221,103 @@ where
             })
             .collect()
     }
+
+    pub fn put_next_table_id(&self, next_id: TableId) -> LlkvResult<()> {
+        let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_NEXT_TABLE_ID).into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("next_table_id", DataType::UInt64, false).with_metadata(HashMap::from([(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            )])),
+        ]));
+
+        let row_id = Arc::new(UInt64Array::from(vec![CATALOG_NEXT_TABLE_ROW_ID]));
+        let value_array = Arc::new(UInt64Array::from(vec![next_id as u64]));
+        let batch = RecordBatch::try_new(schema, vec![row_id, value_array])?;
+        self.store.append(&batch)?;
+        Ok(())
+    }
+
+    pub fn get_next_table_id(&self) -> LlkvResult<Option<TableId>> {
+        let lfid = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_NEXT_TABLE_ID);
+        let batch = match self.store.gather_rows(
+            &[lfid],
+            &[CATALOG_NEXT_TABLE_ROW_ID],
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(batch) => batch,
+            Err(llkv_result::Error::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        if batch.num_columns() == 0 || batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal(
+                    "catalog next_table_id column stored unexpected type".into(),
+                )
+            })?;
+        if array.is_empty() || array.is_null(0) {
+            return Ok(None);
+        }
+
+        let value = array.value(0);
+        if value > TableId::MAX as u64 {
+            return Err(llkv_result::Error::InvalidArgumentError(
+                "persisted next_table_id exceeds TableId range".into(),
+            ));
+        }
+
+        Ok(Some(value as TableId))
+    }
+
+    pub fn max_table_id(&self) -> LlkvResult<Option<TableId>> {
+        let meta_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_TABLE_META_ID);
+        let row_field = rowid_fid(meta_field);
+
+        let mut collector = MaxRowIdCollector { max: None };
+        match ScanBuilder::new(self.store, row_field)
+            .options(ScanOptions::default())
+            .run(&mut collector)
+        {
+            Ok(()) => {}
+            Err(llkv_result::Error::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        }
+
+        let max_value = match collector.max {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+
+        let logical: LogicalFieldId = max_value.into();
+        Ok(Some(logical.table_id()))
+    }
 }
+
+struct MaxRowIdCollector {
+    max: Option<u64>,
+}
+
+impl PrimitiveVisitor for MaxRowIdCollector {
+    fn u64_chunk(&mut self, values: &UInt64Array) {
+        for i in 0..values.len() {
+            let value = values.value(i);
+            self.max = match self.max {
+                Some(curr) if curr >= value => Some(curr),
+                _ => Some(value),
+            };
+        }
+    }
+}
+
+impl PrimitiveWithRowIdsVisitor for MaxRowIdCollector {}
+impl PrimitiveSortedVisitor for MaxRowIdCollector {}
+impl PrimitiveSortedWithRowIdsVisitor for MaxRowIdCollector {}

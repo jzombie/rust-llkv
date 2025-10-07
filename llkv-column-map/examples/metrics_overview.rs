@@ -58,7 +58,10 @@ fn batch_from_columns(cols: &[(LogicalFieldId, ArrayRef)]) -> RecordBatch {
         .enumerate()
         .map(|(i, (fid, arr))| {
             let mut md = std::collections::HashMap::new();
-            md.insert("field_id".to_string(), u64::from(*fid).to_string());
+            md.insert(
+                llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+                u64::from(*fid).to_string(),
+            );
             Field::new(format!("c{i}"), arr.data_type().clone(), false).with_metadata(md)
         })
         .collect();

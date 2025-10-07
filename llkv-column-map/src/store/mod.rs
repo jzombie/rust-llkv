@@ -4,6 +4,7 @@ mod config;
 use config::*;
 
 mod constants;
+pub use constants::FIELD_ID_META_KEY;
 pub use constants::ROW_ID_COLUMN_NAME;
 use constants::*;
 

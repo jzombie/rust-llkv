@@ -17,7 +17,10 @@ fn presence_index_cross_column_queries() {
     // Column A schema
     let fid_a = LogicalFieldId::for_user_table_0(101);
     let mut md_a = HashMap::new();
-    md_a.insert("field_id".to_string(), u64::from(fid_a).to_string());
+    md_a.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid_a).to_string(),
+    );
     let schema_a = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md_a),
@@ -26,7 +29,10 @@ fn presence_index_cross_column_queries() {
     // Column B schema
     let fid_b = LogicalFieldId::for_user_table_0(102);
     let mut md_b = HashMap::new();
-    md_b.insert("field_id".to_string(), u64::from(fid_b).to_string());
+    md_b.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid_b).to_string(),
+    );
     let schema_b = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md_b),

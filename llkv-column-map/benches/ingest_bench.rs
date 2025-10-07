@@ -68,7 +68,7 @@ fn schema_for(cols: &[ColKind]) -> Arc<Schema> {
         };
         let mut md = HashMap::new();
         md.insert(
-            "field_id".to_string(),
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
             u64::from(LogicalFieldId::for_user_table_0(fid_raw)).to_string(),
         );
         fields.push(Field::new("data", dt, false).with_metadata(md));

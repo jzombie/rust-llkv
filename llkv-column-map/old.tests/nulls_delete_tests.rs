@@ -26,7 +26,10 @@ fn nulls_are_lww_deletes_u64_large() {
 
     // Schema: row_id u64 (non-null) + data u64 (nullable) with field_id tag.
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    md.insert(
+        crate::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
     let row_id_f = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     let data_f = Field::new("data", DataType::UInt64, true).with_metadata(md);
     let schema = Arc::new(Schema::new(vec![row_id_f, data_f]));

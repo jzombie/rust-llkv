@@ -30,9 +30,15 @@ fn ingest_two_cols(
     let store = ColumnStore::open(pager).unwrap();
 
     let mut md_u64 = HashMap::new();
-    md_u64.insert("field_id".to_string(), u64::from(fid_u64).to_string());
+    md_u64.insert(
+        crate::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid_u64).to_string(),
+    );
     let mut md_i32 = HashMap::new();
-    md_i32.insert("field_id".to_string(), u64::from(fid_i32).to_string());
+    md_i32.insert(
+        crate::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid_i32).to_string(),
+    );
 
     let row_f = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     let data_u64_f = Field::new("data_u64", DataType::UInt64, false).with_metadata(md_u64);
@@ -88,7 +94,9 @@ fn collect_u64_in_bounds(
     while let Some((arr_dyn, start, len)) = m.next_run() {
         let arr = arr_dyn.as_any().downcast_ref::<UInt64Array>().unwrap();
         let end = start + len;
-        for i in start..end { out.push(arr.value(i)); }
+        for i in start..end {
+            out.push(arr.value(i));
+        }
     }
     out
 }
@@ -108,7 +116,9 @@ fn collect_i32_in_bounds(
     while let Some((arr_dyn, start, len)) = m.next_run() {
         let arr = arr_dyn.as_any().downcast_ref::<Int32Array>().unwrap();
         let end = start + len;
-        for i in start..end { out.push(arr.value(i)); }
+        for i in start..end {
+            out.push(arr.value(i));
+        }
     }
     out
 }

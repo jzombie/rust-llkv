@@ -23,7 +23,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::ScanOptions;
-use llkv_column_map::types::LogicalFieldId;
+use llkv_column_map::types::{LogicalFieldId, RowId};
 use llkv_storage::pager::MemPager;
 
 use roaring::RoaringTreemap;
@@ -50,7 +50,10 @@ fn bench_column_store_sum(c: &mut Criterion) {
     let u64_field_id = LogicalFieldId::for_user_table_0(7777);
 
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(u64_field_id).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(u64_field_id).to_string(),
+    );
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);
     let schema = schema_with_row_id(data_f);
 
@@ -112,7 +115,10 @@ fn bench_column_store_sum(c: &mut Criterion) {
     let i32_field_id = LogicalFieldId::for_user_table_0(8888);
 
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(i32_field_id).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(i32_field_id).to_string(),
+    );
     let data_f = Field::new("data", DataType::Int32, false).with_metadata(md);
     let schema = schema_with_row_id(data_f);
 
@@ -182,7 +188,10 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
     let store = ColumnStore::open(pager).unwrap();
 
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);
     let schema = schema_with_row_id(data_f);
 
@@ -203,7 +212,10 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
 
     // 2) Delete every 10th row (absolute row index).
     let rows_to_delete: RoaringTreemap = (0..NUM_ROWS_FRAGMENTED).step_by(10).collect();
-    store.delete_rows(field_id, &rows_to_delete).unwrap();
+    let delete_vec: Vec<RowId> = rows_to_delete.iter().collect();
+    store
+        .delete_rows(&[field_id], &delete_vec)
+        .expect("delete rows in bench");
 
     // 3) Append one more chunk after deletions.
     let start = NUM_ROWS_FRAGMENTED;

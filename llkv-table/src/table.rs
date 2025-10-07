@@ -12,7 +12,7 @@ use llkv_column_map::{ColumnStore, types::LogicalFieldId};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::sys_catalog::{CATALOG_TID, ColMeta, SysCatalog, TableMeta};
+use crate::sys_catalog::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
 use llkv_expr::{Expr, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
@@ -80,7 +80,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub fn new(table_id: TableId, pager: Arc<P>) -> LlkvResult<Self> {
-        if table_id == CATALOG_TID {
+        if table_id == CATALOG_TABLE_ID {
             return Err(Error::reserved_table_id(table_id));
         }
 
@@ -91,27 +91,51 @@ where
     pub fn append(&self, batch: &RecordBatch) -> LlkvResult<()> {
         let mut new_fields = Vec::with_capacity(batch.schema().fields().len());
         for field in batch.schema().fields() {
-            if field.name() == ROW_ID_COLUMN_NAME {
+            let maybe_field_id = field.metadata().get(crate::constants::FIELD_ID_META_KEY);
+            if maybe_field_id.is_none() && field.name() == ROW_ID_COLUMN_NAME {
                 new_fields.push(field.as_ref().clone());
                 continue;
             }
 
-            let user_field_id: FieldId = field
-                .metadata()
-                .get("field_id")
-                .and_then(|s| s.parse().ok())
+            let raw_field_id = maybe_field_id
                 .ok_or_else(|| {
                     llkv_result::Error::Internal(format!(
-                        "Field '{}' is missing a valid 'field_id' in its \
-                         metadata.",
-                        field.name()
+                        "Field '{}' is missing a valid '{}' in its metadata.",
+                        field.name(),
+                        crate::constants::FIELD_ID_META_KEY
+                    ))
+                })?
+                .parse::<u64>()
+                .map_err(|err| {
+                    llkv_result::Error::Internal(format!(
+                        "Field '{}' contains an invalid '{}': {}",
+                        field.name(),
+                        crate::constants::FIELD_ID_META_KEY,
+                        err
                     ))
                 })?;
 
-            let lfid = LogicalFieldId::for_user(self.table_id, user_field_id);
+            if raw_field_id > FieldId::MAX as u64 {
+                return Err(llkv_result::Error::Internal(format!(
+                    "Field '{}' expected user FieldId (<= {}) but got logical id '{}'",
+                    field.name(),
+                    FieldId::MAX,
+                    raw_field_id
+                )));
+            }
+
+            let user_field_id = raw_field_id as FieldId;
+            let logical_field_id = LogicalFieldId::for_user(self.table_id, user_field_id);
+
+            // Store the fully-qualified logical field id in the metadata we hand to the
+            // column store so descriptors are registered under the correct table id.
+            let lfid = logical_field_id;
             let mut new_metadata = field.metadata().clone();
             let lfid_val: u64 = lfid.into();
-            new_metadata.insert("field_id".to_string(), lfid_val.to_string());
+            new_metadata.insert(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            );
 
             let new_field =
                 Field::new(field.name(), field.data_type().clone(), field.is_nullable())
@@ -238,7 +262,10 @@ where
                 .unwrap_or_else(|| format!("col_{}", fid));
 
             let mut metadata: HashMap<String, String> = HashMap::new();
-            metadata.insert("field_id".to_string(), fid.to_string());
+            metadata.insert(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                fid.to_string(),
+            );
 
             fields.push(Field::new(&name, dtype.clone(), true).with_metadata(metadata));
         }
@@ -261,7 +288,7 @@ where
             names.push(field.name().to_string());
             let fid = field
                 .metadata()
-                .get("field_id")
+                .get(crate::constants::FIELD_ID_META_KEY)
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(0u32);
             fids.push(fid);
@@ -275,7 +302,7 @@ where
 
         let rb_schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, false),
-            Field::new("field_id", DataType::UInt32, false),
+            Field::new(crate::constants::FIELD_ID_META_KEY, DataType::UInt32, false),
             Field::new("data_type", DataType::Utf8, false),
         ]));
 
@@ -322,7 +349,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sys_catalog::CATALOG_TID;
+    use crate::sys_catalog::CATALOG_TABLE_ID;
     use crate::types::RowId;
     use arrow::array::Array;
     use arrow::array::ArrayRef;
@@ -354,23 +381,23 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_A_U64.to_string(),
             )])),
             Field::new("b_bin", DataType::Binary, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_B_BIN.to_string(),
             )])),
             Field::new("c_i32", DataType::Int32, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_C_I32.to_string(),
             )])),
             Field::new("d_f64", DataType::Float64, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_D_F64.to_string(),
             )])),
             Field::new("e_f32", DataType::Float32, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_E_F32.to_string(),
             )])),
         ]));
@@ -423,11 +450,44 @@ mod tests {
 
     #[test]
     fn table_new_rejects_reserved_table_id() {
-        let result = Table::new(CATALOG_TID, Arc::new(MemPager::default()));
+        let result = Table::new(CATALOG_TABLE_ID, Arc::new(MemPager::default()));
         assert!(matches!(
             result,
-            Err(Error::ReservedTableId(id)) if id == CATALOG_TID
+            Err(Error::ReservedTableId(id)) if id == CATALOG_TABLE_ID
         ));
+    }
+
+    #[test]
+    fn test_append_rejects_logical_field_id_in_metadata() {
+        // Create a table and build a schema where the column's metadata
+        // contains a fully-qualified LogicalFieldId (u64). Append should
+        // reject this and require a plain user FieldId instead.
+        let table = Table::new(7, Arc::new(MemPager::default())).unwrap();
+
+        const USER_FID: FieldId = 42;
+        // Build a logical id (namespaced) and put its numeric value into metadata
+        let logical: LogicalFieldId = LogicalFieldId::for_user(table.table_id(), USER_FID);
+        let logical_val: u64 = logical.into();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("bad", DataType::UInt64, false).with_metadata(HashMap::from([(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                logical_val.to_string(),
+            )])),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![1u64, 2u64])),
+                Arc::new(UInt64Array::from(vec![10u64, 20u64])),
+            ],
+        )
+        .unwrap();
+
+        let res = table.append(&batch);
+        assert!(matches!(res, Err(Error::Internal(_))));
     }
 
     #[test]
@@ -467,7 +527,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("name", DataType::Utf8, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_STR.to_string(),
             )])),
         ]));
@@ -537,22 +597,25 @@ mod tests {
         // First session: create tables and write data.
         {
             let table = Table::new(TABLE_ALPHA, Arc::clone(&pager)).unwrap();
-            let schema =
-                Arc::new(Schema::new(vec![
-                    Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
-                    Field::new("alpha_u64", DataType::UInt64, false).with_metadata(HashMap::from(
-                        [("field_id".to_string(), COL_ALPHA_U64.to_string())],
-                    )),
-                    Field::new("alpha_i32", DataType::Int32, false).with_metadata(HashMap::from([
-                        ("field_id".to_string(), COL_ALPHA_I32.to_string()),
-                    ])),
-                    Field::new("alpha_u32", DataType::UInt32, false).with_metadata(HashMap::from(
-                        [("field_id".to_string(), COL_ALPHA_U32.to_string())],
-                    )),
-                    Field::new("alpha_i16", DataType::Int16, false).with_metadata(HashMap::from([
-                        ("field_id".to_string(), COL_ALPHA_I16.to_string()),
-                    ])),
-                ]));
+            let schema = Arc::new(Schema::new(vec![
+                Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+                Field::new("alpha_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
+                    crate::constants::FIELD_ID_META_KEY.to_string(),
+                    COL_ALPHA_U64.to_string(),
+                )])),
+                Field::new("alpha_i32", DataType::Int32, false).with_metadata(HashMap::from([(
+                    crate::constants::FIELD_ID_META_KEY.to_string(),
+                    COL_ALPHA_I32.to_string(),
+                )])),
+                Field::new("alpha_u32", DataType::UInt32, false).with_metadata(HashMap::from([(
+                    crate::constants::FIELD_ID_META_KEY.to_string(),
+                    COL_ALPHA_U32.to_string(),
+                )])),
+                Field::new("alpha_i16", DataType::Int16, false).with_metadata(HashMap::from([(
+                    crate::constants::FIELD_ID_META_KEY.to_string(),
+                    COL_ALPHA_I16.to_string(),
+                )])),
+            ]));
             let batch = RecordBatch::try_new(
                 schema,
                 vec![
@@ -572,11 +635,11 @@ mod tests {
             let schema = Arc::new(Schema::new(vec![
                 Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
                 Field::new("beta_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
-                    "field_id".to_string(),
+                    crate::constants::FIELD_ID_META_KEY.to_string(),
                     COL_BETA_U64.to_string(),
                 )])),
                 Field::new("beta_u8", DataType::UInt8, false).with_metadata(HashMap::from([(
-                    "field_id".to_string(),
+                    crate::constants::FIELD_ID_META_KEY.to_string(),
                     COL_BETA_U8.to_string(),
                 )])),
             ]));
@@ -597,7 +660,7 @@ mod tests {
             let schema = Arc::new(Schema::new(vec![
                 Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
                 Field::new("gamma_i16", DataType::Int16, false).with_metadata(HashMap::from([(
-                    "field_id".to_string(),
+                    crate::constants::FIELD_ID_META_KEY.to_string(),
                     COL_GAMMA_I16.to_string(),
                 )])),
             ]));
@@ -1099,23 +1162,23 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_A_U64.to_string(),
             )])),
             Field::new("b_bin", DataType::Binary, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_B_BIN.to_string(),
             )])),
             Field::new("c_i32", DataType::Int32, true).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_C_I32.to_string(),
             )])),
             Field::new("d_f64", DataType::Float64, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_D_F64.to_string(),
             )])),
             Field::new("e_f32", DataType::Float32, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_E_F32.to_string(),
             )])),
         ]));
@@ -1279,23 +1342,23 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("a_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_A_U64.to_string(),
             )])),
             Field::new("d_u32", DataType::UInt32, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_D_U32.to_string(),
             )])),
             Field::new("e_i16", DataType::Int16, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_E_I16.to_string(),
             )])),
             Field::new("f_u8", DataType::UInt8, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_F_U8.to_string(),
             )])),
             Field::new("c_i32", DataType::Int32, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 COL_C_I32.to_string(),
             )])),
         ]));

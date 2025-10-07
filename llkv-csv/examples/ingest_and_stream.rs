@@ -137,7 +137,7 @@ fn run(
         }
         let fid = field
             .metadata()
-            .get("field_id")
+            .get(llkv_table::constants::FIELD_ID_META_KEY)
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or_else(|| {
                 // fallback: try to extract numeric suffix from generated col_<id>

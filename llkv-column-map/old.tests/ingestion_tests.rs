@@ -18,14 +18,20 @@ fn ingest_and_scan_multiple_columns() {
     // the column. We now construct a full LogicalFieldId for it.
     let field_id_1 = LogicalFieldId::for_user_table_0(101);
     let mut metadata1 = HashMap::new();
-    metadata1.insert("field_id".to_string(), u64::from(field_id_1).to_string());
+    metadata1.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id_1).to_string(),
+    );
     let field1 = Field::new("user_id", DataType::UInt64, false).with_metadata(metadata1);
     let array1 = Arc::new(UInt64Array::from(vec![1001, 1002, 1003]));
 
     // 3. Define the second column (2D f32 vectors) and its metadata.
     let field_id_2 = LogicalFieldId::for_user_table_0(102);
     let mut metadata2 = HashMap::new();
-    metadata2.insert("field_id".to_string(), u64::from(field_id_2).to_string());
+    metadata2.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id_2).to_string(),
+    );
     let list_value_field = Arc::new(Field::new("item", DataType::Float32, true));
     let field2_type = DataType::FixedSizeList(list_value_field.clone(), 2);
     let field2 = Field::new("embedding", field2_type, true).with_metadata(metadata2);

@@ -13,6 +13,7 @@ llkv-csv = { path = "./llkv-csv", version = "0.2.0-alpha" }
 llkv-expr = { path = "./llkv-expr", version = "0.2.0-alpha" }
 llkv-join = { path = "./llkv-join", version = "0.2.0-alpha" }
 llkv-result = { path = "./llkv-result", version = "0.2.0-alpha" }
+llkv-sql = { path = "./llkv-sql", version = "0.2.0-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.2.0-alpha" }
 llkv-table = { path = "./llkv-table", version = "0.2.0-alpha" }
 llkv-plan = { path = "./llkv-plan", version = "0.2.0-alpha" }
@@ -24,6 +25,7 @@ arrow = { version = "56.2.0", default-features = false, features = ["prettyprint
 arrow-array = { version = "56.2.0", default-features = false }
 arrow-ord = { version = "56.2.0", default-features = false }
 arrow-schema = { version = "56.2.0", default-features = false }
+async-trait = "0.1.89"
 bitcode = "0.6.7"
 criterion = "0.7.0"
 crossbeam-channel = "0.5.15"
@@ -34,11 +36,15 @@ num_enum = "0.7.4"
 rand = "0.9.1"
 rayon = "1.10.0"
 roaring = "0.11.2"
+sqlparser = "0.59.0"
 tempfile = "3.21.0"
 thiserror = "2.0.16"
 rustc-hash = "2.1.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+sqllogictest = "0.28.4"
+time = { version = "0.3.44", features = ["parsing"] }
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
 
 [workspace]
 members = [
@@ -49,6 +55,7 @@ members = [
     "llkv-join",
     "llkv-plan",
     "llkv-result",
+    "llkv-sql",
     "llkv-storage",
     "llkv-table"
 ]

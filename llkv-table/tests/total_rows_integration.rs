@@ -17,11 +17,17 @@ fn test_total_rows_before_after_append_and_delete() {
 
     // Build schema: row_id + name (field_id 1) + age (field_id 2)
     let mut md1 = std::collections::HashMap::new();
-    md1.insert("field_id".to_string(), "1".to_string());
+    md1.insert(
+        llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+        "1".to_string(),
+    );
     let name_field = Field::new("name", DataType::Utf8, false).with_metadata(md1);
 
     let mut md2 = std::collections::HashMap::new();
-    md2.insert("field_id".to_string(), "2".to_string());
+    md2.insert(
+        llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+        "2".to_string(),
+    );
     let age_field = Field::new("age", DataType::UInt64, false).with_metadata(md2);
 
     let schema = {
@@ -51,7 +57,7 @@ fn test_total_rows_before_after_append_and_delete() {
     // Delete row with global position 2 (third row) from column 1 only
     let store = table.store();
     let lfid1 = LogicalFieldId::for_user(table.table_id(), 1);
-    store.delete_rows(lfid1, vec![2u64]).expect("delete col1");
+    store.delete_rows(&[lfid1], &[2u64]).expect("delete col1");
 
     // col1 should be 4, col2 still 5
     let col1_after = table.total_rows_for_col(1).expect("col1 after");
@@ -63,7 +69,7 @@ fn test_total_rows_before_after_append_and_delete() {
 
     // Delete global position 3 from column 2 only
     let lfid2 = LogicalFieldId::for_user(table.table_id(), 2);
-    store.delete_rows(lfid2, vec![3u64]).expect("delete col2");
+    store.delete_rows(&[lfid2], &[3u64]).expect("delete col2");
 
     // col1 still 4, col2 should now be 4
     let col1_after2 = table.total_rows_for_col(1).expect("col1 after2");

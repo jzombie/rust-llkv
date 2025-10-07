@@ -19,7 +19,10 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     // Table 0: two small columns, deterministic values
     let fid_u64 = LogicalFieldId::for_user(0, 10);
     let mut md1 = HashMap::new();
-    md1.insert("field_id".to_string(), u64::from(fid_u64).to_string());
+    md1.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid_u64).to_string(),
+    );
     let schema1 = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md1),
@@ -38,7 +41,10 @@ fn seed_small_store() -> ColumnStore<MemPager> {
 
     let fid_i32 = LogicalFieldId::for_user(0, 20);
     let mut md2 = HashMap::new();
-    md2.insert("field_id".to_string(), u64::from(fid_i32).to_string());
+    md2.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid_i32).to_string(),
+    );
     let schema2 = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::Int32, false).with_metadata(md2),
@@ -58,7 +64,10 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     // Also add a small Binary column to table 0
     let fid_bin = LogicalFieldId::for_user(0, 30);
     let mut md3 = HashMap::new();
-    md3.insert("field_id".to_string(), u64::from(fid_bin).to_string());
+    md3.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid_bin).to_string(),
+    );
     let schema3 = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::Binary, false).with_metadata(md3),
@@ -80,7 +89,10 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     // Table 1: one u64 and one i32 column (smaller)
     let fid1_u64 = LogicalFieldId::for_user(1, 10);
     let mut md4 = HashMap::new();
-    md4.insert("field_id".to_string(), u64::from(fid1_u64).to_string());
+    md4.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid1_u64).to_string(),
+    );
     let schema4 = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md4),
@@ -99,7 +111,10 @@ fn seed_small_store() -> ColumnStore<MemPager> {
 
     let fid1_i32 = LogicalFieldId::for_user(1, 20);
     let mut md5 = HashMap::new();
-    md5.insert("field_id".to_string(), u64::from(fid1_i32).to_string());
+    md5.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid1_i32).to_string(),
+    );
     let schema5 = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::Int32, false).with_metadata(md5),
@@ -119,7 +134,10 @@ fn seed_small_store() -> ColumnStore<MemPager> {
     // Table 2: tiny single-column table
     let fid2_u64 = LogicalFieldId::for_user(2, 1);
     let mut md6 = HashMap::new();
-    md6.insert("field_id".to_string(), u64::from(fid2_u64).to_string());
+    md6.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid2_u64).to_string(),
+    );
     let schema6 = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md6),
