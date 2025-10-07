@@ -7,6 +7,7 @@ repository = "https://github.com/jzombie/rust-llkv"
 publish = true
 
 [workspace.dependencies]
+llkv-bench-utils = { path = "./llkv-dev-tools/bench-utils", version = "0.2.0-alpha" }
 llkv-column-map = { path = "./llkv-column-map", version = "0.2.0-alpha" }
 llkv-csv = { path = "./llkv-csv", version = "0.2.0-alpha" }
 llkv-expr = { path = "./llkv-expr", version = "0.2.0-alpha" }
@@ -49,6 +50,7 @@ tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
 members = [
     "llkv-column-map",
     "llkv-csv",
+    "llkv-dev-tools/bench-utils",
     "llkv-expr",
     "llkv-join",
     "llkv-plan",

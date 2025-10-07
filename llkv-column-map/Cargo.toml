@@ -25,6 +25,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 line-ending = { workspace = true }
+llkv-bench-utils = { workspace = true }
 rand = { workspace = true }
 
 [[bench]]
