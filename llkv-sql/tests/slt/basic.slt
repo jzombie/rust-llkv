@@ -1,0 +1,14 @@
+statement ok
+CREATE TABLE users (id INT NOT NULL, name TEXT);
+
+statement ok
+INSERT INTO users (id, name) VALUES (1, 'alice');
+
+statement ok
+INSERT INTO users (id, name) VALUES (2, 'bob');
+
+query T rowsort
+SELECT name FROM users;
+----
+alice
+bob

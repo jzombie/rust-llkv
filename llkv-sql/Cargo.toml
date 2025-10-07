@@ -16,3 +16,8 @@ llkv-expr.workspace = true
 llkv-table.workspace = true
 simd-r-drive-entry-handle.workspace = true
 sqlparser.workspace = true
+
+[dev-dependencies]
+sqllogictest = "0.28.4"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
+async-trait = "0.1.89"

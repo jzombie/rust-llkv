@@ -1,0 +1,14 @@
+statement ok
+CREATE TABLE numbers (i INT NOT NULL, v FLOAT);
+
+statement ok
+INSERT INTO numbers (i, v) VALUES (1, 3.14);
+
+statement ok
+INSERT INTO numbers (i, v) VALUES (2, 2.71);
+
+query IR rowsort
+SELECT i, v FROM numbers;
+----
+1 3.14
+2 2.71
