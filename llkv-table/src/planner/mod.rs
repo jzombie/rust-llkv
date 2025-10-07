@@ -729,7 +729,17 @@ where
                         let unique_index = Arc::clone(&unique_index);
                         let numeric_fields = Arc::clone(&numeric_fields);
 
-                        let mut gather_ctx = store.prepare_gather_context(unique_lfids.as_ref())?;
+                        let mut gather_ctx =
+                            match store.prepare_gather_context(unique_lfids.as_ref()) {
+                                Ok(ctx) => ctx,
+                                Err(e) => {
+                                    eprintln!(
+                                        "prepare_gather_context failed for lfids={:?}: {e:?}",
+                                        unique_lfids
+                                    );
+                                    return Err(e);
+                                }
+                            };
                         let batch = store.gather_rows_with_reusable_context(
                             &mut gather_ctx,
                             window,

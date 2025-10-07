@@ -8,7 +8,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 
 use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME};
-use llkv_column_map::{ColumnStore, types::LogicalFieldId};
+use llkv_column_map::{
+    ColumnStore,
+    types::{LogicalFieldId, Namespace},
+};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -91,24 +94,50 @@ where
     pub fn append(&self, batch: &RecordBatch) -> LlkvResult<()> {
         let mut new_fields = Vec::with_capacity(batch.schema().fields().len());
         for field in batch.schema().fields() {
-            if field.name() == ROW_ID_COLUMN_NAME {
+            let maybe_field_id = field.metadata().get("field_id");
+            if maybe_field_id.is_none() && field.name() == ROW_ID_COLUMN_NAME {
                 new_fields.push(field.as_ref().clone());
                 continue;
             }
 
-            let user_field_id: FieldId = field
-                .metadata()
-                .get("field_id")
-                .and_then(|s| s.parse().ok())
+            let raw_field_id = maybe_field_id
                 .ok_or_else(|| {
                     llkv_result::Error::Internal(format!(
-                        "Field '{}' is missing a valid 'field_id' in its \
-                         metadata.",
+                        "Field '{}' is missing a valid 'field_id' in its metadata.",
                         field.name()
+                    ))
+                })?
+                .parse::<u64>()
+                .map_err(|err| {
+                    llkv_result::Error::Internal(format!(
+                        "Field '{}' contains an invalid 'field_id': {}",
+                        field.name(),
+                        err
                     ))
                 })?;
 
-            let lfid = LogicalFieldId::for_user(self.table_id, user_field_id);
+            // TODO: Require usage of primitive `FieldId` type here?
+            // The SQL layer (and other writers) pass plain user FieldIds (u32). Other
+            // internal paths may already provide fully-qualified LogicalFieldIds.
+            let (user_field_id, logical_field_id) = if raw_field_id <= u32::MAX as u64 {
+                let fid = raw_field_id as FieldId;
+                (fid, LogicalFieldId::for_user(self.table_id, fid))
+            } else {
+                let parsed = LogicalFieldId::from(raw_field_id);
+                if parsed.namespace() != Namespace::UserData {
+                    return Err(llkv_result::Error::Internal(format!(
+                        "Field '{}' carries non-user-data namespace {:?}",
+                        field.name(),
+                        parsed
+                    )));
+                }
+                let fid = parsed.field_id();
+                (fid, LogicalFieldId::for_user(self.table_id, fid))
+            };
+
+            // Store the fully-qualified logical field id in the metadata we hand to the
+            // column store so descriptors are registered under the correct table id.
+            let lfid = logical_field_id;
             let mut new_metadata = field.metadata().clone();
             let lfid_val: u64 = lfid.into();
             new_metadata.insert("field_id".to_string(), lfid_val.to_string());
