@@ -40,27 +40,11 @@ jobs:
           channel: stable
           cache-target: release
 
-      # TODO: Temporary until upstream releases a new cargo-codspeed.
-      - name: Install cargo-codspeed from git branch
-        run: |
-          set -euo pipefail
-          CARGO_INSTALL_ROOT="$RUNNER_TEMP/cargo-root"
-          rm -rf "$CARGO_INSTALL_ROOT" || true
-          mkdir -p "$CARGO_INSTALL_ROOT"
-          cargo install \
-            --git https://github.com/jzombie/codspeed-rust \
-            --branch debug-mac-perf-swings \
-            cargo-codspeed \
-            --root "$CARGO_INSTALL_ROOT" \
-            --force \
-            --locked
-          echo "$CARGO_INSTALL_ROOT/bin" >> "$GITHUB_PATH"
-
       - name: Clone and build custom codspeed-runner
         run: |
           set -euo pipefail
           REPO_URL="https://github.com/jzombie/codspeed-runner.git"
-          BRANCH="feature/prototype-macos-support"
+          BRANCH="feature/criterion-log-ingestion"
           DEST_DIR="codspeed-runner-src"
           rm -rf "${DEST_DIR}" || true
           git clone --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${DEST_DIR}"
@@ -68,17 +52,26 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           codspeed --version || true
 
-      # TODO: Temporary while debugging unstable dependencies
-      - name: Ensure clean build targets
-        run: cargo clean
+      - name: Run Criterion benchmarks
+        run: cargo bench --workspace
 
-      - name: Build the benchmark target(s)
-        run: cargo codspeed build --workspace --measurement-mode walltime
+      - name: Ingest Criterion outputs and upload to CodSpeed
+        id: ingest
+        run: |
+          set -euo pipefail
+          TIMESTAMP=$(date +%s)
+          PROFILE_DIR="codspeed-profile-${TIMESTAMP}"
+          mkdir -p "${PROFILE_DIR}"
 
-      - name: Run the benchmarks
-        env:
-          CODSPEED_TOKEN: ${{ secrets.CODSPEED_TOKEN }}
-          CODSPEED_LOG: debug
-          # Disable perf/system-level instrumentation to avoid sudo prompts
-          CODSPEED_PERF_ENABLED: "false"
-        run: codspeed run --mode=walltime --token "${CODSPEED_TOKEN:-}" -- 'cargo codspeed run --workspace'
+          codspeed ingest-criterion \
+            --criterion-dir "${CARGO_TARGET_DIR}/criterion" \
+            --profile-folder "${PROFILE_DIR}" \
+            --upload
+
+          echo "profile_dir=${PROFILE_DIR}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload CodSpeed profile folder as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codspeed-profile
+          path: ${{ steps.ingest.outputs.profile_dir }}
