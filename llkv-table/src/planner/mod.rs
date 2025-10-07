@@ -1,10 +1,14 @@
 pub mod plan_graph;
 
 use std::cmp;
+use std::convert::TryFrom;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, OffsetSizeTrait, RecordBatch};
+use arrow::array::{
+    Array, ArrayRef, Float64Array, Int64Array, OffsetSizeTrait, RecordBatch, StringArray,
+    new_null_array,
+};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
 use llkv_column_map::ScanBuilder;
@@ -615,12 +619,6 @@ where
                     let simplified = NumericKernels::simplify(expr);
                     let mut fields_set: FxHashSet<FieldId> = FxHashSet::default();
                     NumericKernels::collect_fields(&simplified, &mut fields_set);
-                    if fields_set.is_empty() {
-                        return Err(Error::InvalidArgumentError(
-                            "Computed projection must reference at least one column".into(),
-                        ));
-                    }
-
                     for field_id in fields_set.iter().copied() {
                         numeric_fields.insert(field_id);
                         let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
@@ -672,7 +670,19 @@ where
                         })?;
                         schema_fields.push(Field::new(info.alias.clone(), dtype, true));
                     } else {
-                        schema_fields.push(Field::new(info.alias.clone(), DataType::Float64, true));
+                        let dtype = match &info.expr {
+                            ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
+                            ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
+                            ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
+                            ScalarExpr::Binary { .. } => DataType::Float64,
+                            ScalarExpr::Column(fid) => {
+                                let lfid = LogicalFieldId::for_user(self.table.table_id(), *fid);
+                                lfid_dtypes.get(&lfid).cloned().ok_or_else(|| {
+                                    Error::Internal("missing dtype for computed column".into())
+                                })?
+                            }
+                        };
+                        schema_fields.push(Field::new(info.alias.clone(), dtype, true));
                     }
                 }
             }
@@ -684,6 +694,31 @@ where
         let row_ids =
             self.collect_row_ids_for_expr(&filter_expr, &fusion_cache, &mut all_rows_cache)?;
         if row_ids.is_empty() {
+            if is_trivial_filter(&filter_expr) {
+                let total_rows = self.table.total_rows()?;
+                let row_count = usize::try_from(total_rows).map_err(|_| {
+                    Error::InvalidArgumentError("table row count exceeds supported range".into())
+                })?;
+                if row_count == 0 {
+                    return Ok(());
+                }
+
+                let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
+                for (idx, eval) in projection_evals.iter().enumerate() {
+                    let array = match eval {
+                        ProjectionEval::Column(info) => new_null_array(&info.data_type, row_count),
+                        ProjectionEval::Computed(info) => synthesize_computed_literal_array(
+                            info,
+                            out_schema.field(idx).data_type(),
+                            row_count,
+                        )?,
+                    };
+                    columns.push(array);
+                }
+
+                let batch = RecordBatch::try_new(Arc::clone(&out_schema), columns)?;
+                on_batch(batch);
+            }
             return Ok(());
         }
 
@@ -694,7 +729,9 @@ where
         };
 
         let requires_numeric = projection_evals.iter().enumerate().any(|(idx, eval)| {
-            matches!(eval, ProjectionEval::Computed(_)) && passthrough_fields[idx].is_none()
+            matches!(eval, ProjectionEval::Computed(info)
+                if passthrough_fields[idx].is_none()
+                    && computed_expr_requires_numeric(&info.expr))
         });
 
         let table_id = self.table.table_id();
@@ -713,8 +750,8 @@ where
             })
             .collect();
 
-        let chunk_batches: Vec<LlkvResult<Option<RecordBatch>>> =
-            parallel::with_thread_pool(move || {
+        let chunk_batches: Vec<LlkvResult<Option<RecordBatch>>> = parallel::with_thread_pool(
+            move || {
                 chunk_ranges
                     .into_par_iter()
                     .map(|(start, end)| -> LlkvResult<Option<RecordBatch>> {
@@ -729,36 +766,55 @@ where
                         let unique_index = Arc::clone(&unique_index);
                         let numeric_fields = Arc::clone(&numeric_fields);
 
-                        let mut gather_ctx =
-                            match store.prepare_gather_context(unique_lfids.as_ref()) {
-                                Ok(ctx) => ctx,
-                                Err(e) => {
-                                    eprintln!(
-                                        "prepare_gather_context failed for lfids={:?}: {e:?}",
-                                        unique_lfids
-                                    );
-                                    return Err(e);
-                                }
+                        let (batch_len, unique_arrays_owned, numeric_arrays): (
+                            usize,
+                            Vec<ArrayRef>,
+                            Option<NumericArrayMap>,
+                        ) = if unique_lfids.is_empty() {
+                            let numeric_arrays = if requires_numeric {
+                                Some(Default::default())
+                            } else {
+                                None
                             };
-                        let batch = store.gather_rows_with_reusable_context(
-                            &mut gather_ctx,
-                            window,
-                            null_policy,
-                        )?;
-                        if batch.num_rows() == 0 {
+                            (window.len(), Vec::new(), numeric_arrays)
+                        } else {
+                            let mut gather_ctx =
+                                match store.prepare_gather_context(unique_lfids.as_ref()) {
+                                    Ok(ctx) => ctx,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "prepare_gather_context failed for lfids={:?}: {e:?}",
+                                            unique_lfids
+                                        );
+                                        return Err(e);
+                                    }
+                                };
+                            let batch = store.gather_rows_with_reusable_context(
+                                &mut gather_ctx,
+                                window,
+                                null_policy,
+                            )?;
+                            if batch.num_rows() == 0 {
+                                return Ok(None);
+                            }
+
+                            let unique_arrays_owned: Vec<ArrayRef> =
+                                batch.columns().iter().map(Arc::clone).collect();
+                            let numeric_arrays = if requires_numeric {
+                                Some(NumericKernels::prepare_numeric_arrays(
+                                    unique_lfids.as_ref(),
+                                    unique_arrays_owned.as_slice(),
+                                    numeric_fields.as_ref(),
+                                )?)
+                            } else {
+                                None
+                            };
+                            (batch.num_rows(), unique_arrays_owned, numeric_arrays)
+                        };
+
+                        if batch_len == 0 {
                             return Ok(None);
                         }
-
-                        let unique_arrays = batch.columns();
-                        let numeric_arrays: Option<NumericArrayMap> = if requires_numeric {
-                            Some(NumericKernels::prepare_numeric_arrays(
-                                unique_lfids.as_ref(),
-                                unique_arrays,
-                                numeric_fields.as_ref(),
-                            )?)
-                        } else {
-                            None
-                        };
 
                         let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
                         for (idx, eval) in projection_evals.iter().enumerate() {
@@ -767,7 +823,7 @@ where
                                     let arr_idx = *unique_index
                                         .get(&info.logical_field_id)
                                         .expect("logical field id missing from index");
-                                    columns.push(Arc::clone(&unique_arrays[arr_idx]));
+                                    columns.push(Arc::clone(&unique_arrays_owned[arr_idx]));
                                 }
                                 ProjectionEval::Computed(info) => {
                                     if let Some(fid) = passthrough_fields[idx] {
@@ -775,16 +831,42 @@ where
                                         let arr_idx = *unique_index
                                             .get(&lfid)
                                             .expect("passthrough field missing from index");
-                                        columns.push(Arc::clone(&unique_arrays[arr_idx]));
+                                        columns.push(Arc::clone(&unique_arrays_owned[arr_idx]));
                                     } else {
-                                        let numeric_arrays = numeric_arrays.as_ref().expect(
-                                            "numeric arrays should exist for computed projection",
-                                        );
-                                        let array = NumericKernels::evaluate_batch(
-                                            &info.expr,
-                                            batch.num_rows(),
-                                            numeric_arrays,
-                                        )?;
+                                        let array: ArrayRef = match &info.expr {
+                                            ScalarExpr::Literal(Literal::Integer(value)) => {
+                                                let cast = i64::try_from(*value).map_err(|_| {
+                                                    Error::InvalidArgumentError(
+                                                        "integer literal exceeds 64-bit range"
+                                                            .into(),
+                                                    )
+                                                })?;
+                                                Arc::new(Int64Array::from(vec![cast; batch_len]))
+                                                    as ArrayRef
+                                            }
+                                            ScalarExpr::Literal(Literal::Float(value)) => {
+                                                Arc::new(Float64Array::from(vec![
+                                                    *value;
+                                                    batch_len
+                                                ])) as ArrayRef
+                                            }
+                                            ScalarExpr::Literal(Literal::String(value)) => {
+                                                Arc::new(StringArray::from(vec![
+                                                    value.clone();
+                                                    batch_len
+                                                ])) as ArrayRef
+                                            }
+                                            _ => {
+                                                let numeric_arrays = numeric_arrays.as_ref().expect(
+                                                    "numeric arrays should exist for computed projection",
+                                                );
+                                                NumericKernels::evaluate_batch(
+                                                    &info.expr,
+                                                    batch_len,
+                                                    numeric_arrays,
+                                                )?
+                                            }
+                                        };
                                         columns.push(array);
                                     }
                                 }
@@ -795,10 +877,16 @@ where
                         Ok(Some(output_batch))
                     })
                     .collect()
-            });
+            },
+        );
 
         for batch_result in chunk_batches {
             if let Some(batch) = batch_result? {
+                eprintln!(
+                    "TableExecutor produced batch with {} rows and {} columns",
+                    batch.num_rows(),
+                    batch.num_columns()
+                );
                 on_batch(batch);
             }
         }
@@ -1085,7 +1173,13 @@ where
         } = &filter.op
             && let Some(runs) = dense_row_runs(self.table.store(), filter_lfid)?
         {
-            return Ok(expand_filter_runs(&runs));
+            let rows = expand_filter_runs(&runs);
+            eprintln!(
+                "collect_row_ids_for_filter dense runs field {:?} -> {} rows",
+                filter_lfid,
+                rows.len()
+            );
+            return Ok(rows);
         }
 
         let row_ids = match &dtype {
@@ -1103,6 +1197,11 @@ where
                 ))),
             ),
         }?;
+        eprintln!(
+            "collect_row_ids_for_filter general field {:?} -> {} rows",
+            filter_lfid,
+            row_ids.len()
+        );
 
         Ok(normalize_row_ids(row_ids))
     }
@@ -1372,6 +1471,44 @@ where
     }
 }
 
+fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
+    match expr {
+        ScalarExpr::Literal(_) => false,
+        ScalarExpr::Column(_) => true,
+        ScalarExpr::Binary { .. } => true,
+    }
+}
+
+fn synthesize_computed_literal_array(
+    info: &ComputedProjectionInfo,
+    data_type: &DataType,
+    row_count: usize,
+) -> LlkvResult<ArrayRef> {
+    if row_count == 0 {
+        return Ok(new_null_array(data_type, 0));
+    }
+
+    match &info.expr {
+        ScalarExpr::Literal(Literal::Integer(value)) => {
+            let v = i64::try_from(*value).map_err(|_| {
+                Error::InvalidArgumentError(
+                    "integer literal exceeds supported range for INT64 column".into(),
+                )
+            })?;
+            Ok(Arc::new(Int64Array::from(vec![v; row_count])) as ArrayRef)
+        }
+        ScalarExpr::Literal(Literal::Float(value)) => {
+            Ok(Arc::new(Float64Array::from(vec![*value; row_count])) as ArrayRef)
+        }
+        ScalarExpr::Literal(Literal::String(value)) => {
+            Ok(Arc::new(StringArray::from(vec![value.clone(); row_count])) as ArrayRef)
+        }
+        ScalarExpr::Column(_) | ScalarExpr::Binary { .. } => {
+            Ok(new_null_array(data_type, row_count))
+        }
+    }
+}
+
 fn plan_graph_err(err: PlanGraphError) -> Error {
     Error::Internal(format!("plan graph construction failed: {err}"))
 }
@@ -1502,6 +1639,7 @@ fn format_binary_op(op: BinaryOp) -> &'static str {
         BinaryOp::Subtract => "-",
         BinaryOp::Multiply => "*",
         BinaryOp::Divide => "/",
+        BinaryOp::Modulo => "%",
     }
 }
 

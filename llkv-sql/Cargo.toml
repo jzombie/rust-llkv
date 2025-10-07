@@ -16,6 +16,8 @@ llkv-expr.workspace = true
 llkv-table.workspace = true
 simd-r-drive-entry-handle.workspace = true
 sqlparser.workspace = true
+# TODO: Use chrono instead?
+time = { version = "0.3", features = ["parsing"] }
 
 [dev-dependencies]
 sqllogictest = "0.28.4"

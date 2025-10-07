@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,14 +8,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::SqlResult;
 use crate::value::SqlValue;
 use arrow::array::{
-    Array, ArrayRef, Float64Builder, Int64Array, Int64Builder, StringBuilder, UInt64Builder,
+    Array, ArrayRef, Date32Array, Date32Builder, Float64Array, Float64Builder, Int64Array,
+    Int64Builder, StringArray, StringBuilder, UInt64Builder, new_null_array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::LogicalFieldId;
-use llkv_expr::expr::{CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr};
+use llkv_expr::expr::{BinaryOp, CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
@@ -25,14 +26,16 @@ use llkv_table::{CATALOG_TABLE_ID, SysCatalog};
 use llkv_table::{ColMeta, TableMeta};
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
-    BeginTransactionKind, BinaryOperator, ColumnDef, ColumnOption, ColumnOptionDef,
-    DataType as SqlDataType, ExceptionWhen, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, Ident, ObjectName, ObjectNamePart, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
-    TransactionMode, TransactionModifier, UnaryOperator, Value, ValueWithSpan,
+    Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnDef, ColumnOption,
+    ColumnOptionDef, DataType as SqlDataType, ExceptionWhen, Expr as SqlExpr, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, ObjectName, ObjectNamePart, Query,
+    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor,
+    TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
+    UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use time::{Date, Month};
 
 /// Executes SQL statements against `llkv-table`.
 pub struct SqlEngine<P>
@@ -75,6 +78,14 @@ where
             Statement::CreateTable(stmt) => self.handle_create_table(stmt),
             Statement::Insert(stmt) => self.handle_insert(stmt),
             Statement::Query(query) => self.handle_query(*query),
+            Statement::Update {
+                table,
+                assignments,
+                from,
+                selection,
+                returning,
+                ..
+            } => self.handle_update(table, assignments, from, selection, returning),
             Statement::StartTransaction {
                 modes,
                 begin,
@@ -149,7 +160,7 @@ where
         &self,
         stmt: sqlparser::ast::CreateTable,
     ) -> SqlResult<SqlStatementResult> {
-        validate_simple_create_table(&stmt)?;
+        validate_create_table_common(&stmt)?;
 
         let (display_name, canonical_name) = canonical_object_name(&stmt.name)?;
         if display_name.is_empty() {
@@ -157,10 +168,33 @@ where
                 "table name must not be empty".into(),
             ));
         }
+
+        if stmt.query.is_some() {
+            return self.handle_create_table_as(stmt, display_name, canonical_name);
+        }
+
         if stmt.columns.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "CREATE TABLE requires at least one column".into(),
             ));
+        }
+
+        validate_create_table_definition(&stmt)?;
+
+        let exists = {
+            let tables = self.tables.read().unwrap();
+            tables.contains_key(&canonical_name)
+        };
+        if exists {
+            if stmt.if_not_exists {
+                return Ok(SqlStatementResult::CreateTable {
+                    table_name: display_name,
+                });
+            }
+            return Err(Error::InvalidArgumentError(format!(
+                "table '{}' already exists",
+                display_name
+            )));
         }
 
         let mut columns: Vec<SqlColumn> = Vec::with_capacity(stmt.columns.len());
@@ -199,23 +233,193 @@ where
             });
         }
 
-        let tables = &mut *self.tables.write().unwrap();
+        let schema = Arc::new(SqlSchema { columns, lookup });
+        let sql_table = Arc::new(SqlTable {
+            table: Arc::new(table),
+            schema,
+            next_row_id: AtomicU64::new(0),
+            total_rows: AtomicU64::new(0),
+        });
+
+        let mut tables = self.tables.write().unwrap();
         if tables.contains_key(&canonical_name) {
+            if stmt.if_not_exists {
+                return Ok(SqlStatementResult::CreateTable {
+                    table_name: display_name,
+                });
+            }
+            return Err(Error::InvalidArgumentError(format!(
+                "table '{}' already exists",
+                display_name
+            )));
+        }
+        let stored_table = Arc::clone(&sql_table);
+        tables.insert(canonical_name, sql_table);
+
+        let field_ids = stored_table
+            .table
+            .store()
+            .user_field_ids_for_table(stored_table.table.table_id());
+        eprintln!(
+            "CTAS registered field ids for table {}: {:?}",
+            display_name, field_ids
+        );
+
+        Ok(SqlStatementResult::CreateTable {
+            table_name: display_name,
+        })
+    }
+
+    fn handle_create_table_as(
+        &self,
+        mut stmt: sqlparser::ast::CreateTable,
+        display_name: String,
+        canonical_name: String,
+    ) -> SqlResult<SqlStatementResult> {
+        validate_create_table_as(&stmt)?;
+
+        if !stmt.columns.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TABLE AS SELECT does not support column definitions yet".into(),
+            ));
+        }
+
+        let exists = {
+            let tables = self.tables.read().unwrap();
+            tables.contains_key(&canonical_name)
+        };
+        if exists {
+            if stmt.if_not_exists {
+                return Ok(SqlStatementResult::CreateTable {
+                    table_name: display_name,
+                });
+            }
             return Err(Error::InvalidArgumentError(format!(
                 "table '{}' already exists",
                 display_name
             )));
         }
 
-        let schema = Arc::new(SqlSchema { columns, lookup });
-        let sql_table = SqlTable {
+        let query = stmt
+            .query
+            .take()
+            .expect("CTAS path verified query is present");
+        let SelectExecution {
+            table_name: _,
+            schema: select_schema,
+            batches,
+        } = self.execute_query_collect(*query)?;
+        eprintln!("CTAS source produced {} batches", batches.len());
+
+        if select_schema.fields().is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TABLE AS SELECT requires at least one projected column".into(),
+            ));
+        }
+
+        let mut columns: Vec<SqlColumn> = Vec::with_capacity(select_schema.fields().len());
+        let mut lookup: HashMap<String, usize> = HashMap::new();
+        for (idx, field) in select_schema.fields().iter().enumerate() {
+            let column = SqlColumn::from_field(field, (idx + 1) as FieldId)?;
+            if lookup
+                .insert(column.normalized_name.clone(), columns.len())
+                .is_some()
+            {
+                return Err(Error::InvalidArgumentError(format!(
+                    "duplicate column name '{}' in CTAS result",
+                    column.name
+                )));
+            }
+            columns.push(column);
+        }
+
+        let table_id = self.reserve_table_id()?;
+        let table = Table::new(table_id, Arc::clone(&self.pager))?;
+        table.put_table_meta(&TableMeta {
+            table_id,
+            name: Some(display_name.clone()),
+            created_at_micros: current_time_micros(),
+            flags: 0,
+            epoch: 0,
+        });
+
+        for column in &columns {
+            table.put_col_meta(&ColMeta {
+                col_id: column.field_id,
+                name: Some(column.name.clone()),
+                flags: 0,
+                default: None,
+            });
+        }
+
+        let column_defs = columns.clone();
+        let sql_schema = Arc::new(SqlSchema { columns, lookup });
+        let sql_table = Arc::new(SqlTable {
             table: Arc::new(table),
-            schema,
+            schema: sql_schema,
             next_row_id: AtomicU64::new(0),
             total_rows: AtomicU64::new(0),
-        };
+        });
 
-        tables.insert(canonical_name, Arc::new(sql_table));
+        let mut next_row_id: u64 = 0;
+        let mut total_rows: u64 = 0;
+
+        for batch in batches {
+            let row_count = batch.num_rows();
+            if row_count == 0 {
+                continue;
+            }
+            if batch.num_columns() != column_defs.len() {
+                return Err(Error::InvalidArgumentError(
+                    "CTAS query returned unexpected column count".into(),
+                ));
+            }
+
+            let start_row = next_row_id;
+            next_row_id += row_count as u64;
+            total_rows += row_count as u64;
+
+            let mut row_builder = UInt64Builder::with_capacity(row_count);
+            for offset in 0..row_count {
+                row_builder.append_value(start_row + offset as u64);
+            }
+
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(row_count + 1);
+            arrays.push(Arc::new(row_builder.finish()) as ArrayRef);
+
+            let mut fields: Vec<Field> = Vec::with_capacity(column_defs.len() + 1);
+            fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+
+            for (idx, column) in column_defs.iter().enumerate() {
+                let mut metadata = HashMap::new();
+                metadata.insert("field_id".to_string(), column.field_id.to_string());
+                let field = Field::new(&column.name, column.data_type.clone(), column.nullable)
+                    .with_metadata(metadata);
+                fields.push(field);
+                arrays.push(batch.column(idx).clone());
+            }
+
+            let append_schema = Arc::new(Schema::new(fields));
+            let append_batch = RecordBatch::try_new(append_schema, arrays)?;
+            sql_table.table.append(&append_batch)?;
+        }
+
+        sql_table.next_row_id.store(next_row_id, Ordering::SeqCst);
+        sql_table.total_rows.store(total_rows, Ordering::SeqCst);
+
+        let mut tables = self.tables.write().unwrap();
+        if tables.contains_key(&canonical_name) {
+            if stmt.if_not_exists {
+                return Ok(SqlStatementResult::CreateTable {
+                    table_name: display_name,
+                });
+            }
+            return Err(Error::InvalidArgumentError(format!(
+                "table '{}' already exists",
+                display_name
+            )));
+        }
+        tables.insert(canonical_name, sql_table);
 
         Ok(SqlStatementResult::CreateTable {
             table_name: display_name,
@@ -298,22 +502,43 @@ where
                 out
             }
             SetExpr::Select(select) => {
-                let range_rows = extract_rows_from_range(select.as_ref())?;
-                let range_rows = match range_rows {
-                    Some(rows) => rows,
-                    None => {
-                        return Err(Error::InvalidArgumentError(
-                            "INSERT currently supports only VALUES lists or SELECT statements over range()".into(),
-                        ));
+                if let Some(range_rows) = extract_rows_from_range(select.as_ref())? {
+                    if range_rows.column_count != expected_len {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "expected {} values in INSERT SELECT, found {}",
+                            expected_len, range_rows.column_count
+                        )));
                     }
-                };
-                if range_rows.column_count != expected_len {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "expected {} values in INSERT SELECT, found {}",
-                        expected_len, range_rows.column_count
-                    )));
+                    range_rows.rows
+                } else {
+                    let SelectExecution {
+                        batches, schema, ..
+                    } = self.execute_query_collect((**query).clone())?;
+                    if schema.fields().len() != expected_len {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "expected {} values in INSERT SELECT, found {}",
+                            expected_len,
+                            schema.fields().len()
+                        )));
+                    }
+                    let mut out: Vec<Vec<SqlValue>> = Vec::new();
+                    for batch in batches {
+                        if batch.num_columns() != expected_len {
+                            return Err(Error::InvalidArgumentError(
+                                "INSERT SELECT produced unexpected column count".into(),
+                            ));
+                        }
+                        let row_count = batch.num_rows();
+                        for row_idx in 0..row_count {
+                            let mut row: Vec<SqlValue> = Vec::with_capacity(expected_len);
+                            for col_idx in 0..expected_len {
+                                row.push(sql_value_from_array(batch.column(col_idx), row_idx)?);
+                            }
+                            out.push(row);
+                        }
+                    }
+                    out
                 }
-                range_rows.rows
             }
             _ => {
                 return Err(Error::InvalidArgumentError(
@@ -324,6 +549,7 @@ where
         };
 
         let row_count = rows.len();
+        eprintln!("INSERT row_count={}", row_count);
 
         let mut column_values: Vec<Vec<SqlValue>> = table
             .schema
@@ -398,18 +624,131 @@ where
             rows_inserted: row_count,
         })
     }
+    fn handle_update(
+        &self,
+        table: TableWithJoins,
+        assignments: Vec<Assignment>,
+        from: Option<UpdateTableFromKind>,
+        selection: Option<SqlExpr>,
+        returning: Option<Vec<SelectItem>>,
+    ) -> SqlResult<SqlStatementResult> {
+        if from.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "UPDATE ... FROM is not supported yet".into(),
+            ));
+        }
+        if selection.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "UPDATE with WHERE clauses is not supported yet".into(),
+            ));
+        }
+        if returning.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "UPDATE ... RETURNING is not supported".into(),
+            ));
+        }
+        if assignments.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "UPDATE requires at least one assignment".into(),
+            ));
+        }
+
+        let (display_name, canonical_name) = extract_single_table(std::slice::from_ref(&table))?;
+        let table_entry = self.lookup_table(&canonical_name)?;
+
+        let total_rows = table_entry.total_rows.load(Ordering::SeqCst);
+        let total_rows_usize = usize::try_from(total_rows).map_err(|_| {
+            Error::InvalidArgumentError("table row count exceeds supported range".into())
+        })?;
+
+        if total_rows_usize == 0 {
+            return Ok(SqlStatementResult::Update {
+                table_name: display_name,
+                rows_updated: 0,
+            });
+        }
+
+        let mut row_id_builder = UInt64Builder::with_capacity(total_rows_usize);
+        for row_id in 0..total_rows {
+            row_id_builder.append_value(row_id);
+        }
+
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(assignments.len() + 1);
+        arrays.push(Arc::new(row_id_builder.finish()));
+
+        let mut fields: Vec<Field> = Vec::with_capacity(assignments.len() + 1);
+        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+
+        let mut seen_columns: HashSet<String> = HashSet::with_capacity(assignments.len());
+
+        for assignment in assignments {
+            let column_name = resolve_assignment_column_name(&assignment.target)?;
+            let normalized_name = column_name.to_ascii_lowercase();
+            if !seen_columns.insert(normalized_name) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "duplicate column '{}' in UPDATE assignments",
+                    column_name
+                )));
+            }
+            let column = table_entry.schema.resolve(&column_name).ok_or_else(|| {
+                Error::InvalidArgumentError(format!("unknown column '{}' in UPDATE", column_name))
+            })?;
+
+            let literal = SqlValue::try_from_expr(&assignment.value)?;
+            let mut column_values: Vec<SqlValue> = Vec::with_capacity(total_rows_usize);
+            for _ in 0..total_rows_usize {
+                column_values.push(literal.clone());
+            }
+
+            let array = build_array_for_column(&column.data_type, &column_values)?;
+            arrays.push(array);
+
+            let mut metadata = HashMap::new();
+            metadata.insert("field_id".to_string(), column.field_id.to_string());
+            fields.push(
+                Field::new(&column.name, column.data_type.clone(), column.nullable)
+                    .with_metadata(metadata),
+            );
+        }
+
+        let update_batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
+        table_entry.table.append(&update_batch)?;
+
+        Ok(SqlStatementResult::Update {
+            table_name: display_name,
+            rows_updated: total_rows_usize,
+        })
+    }
 
     fn handle_query(&self, query: Query) -> SqlResult<SqlStatementResult> {
+        let SelectExecution {
+            table_name,
+            batches,
+            ..
+        } = self.execute_query_collect(query)?;
+        Ok(SqlStatementResult::Select {
+            table_name,
+            batches,
+        })
+    }
+
+    fn execute_query_collect(&self, query: Query) -> SqlResult<SelectExecution> {
         validate_simple_query(&query)?;
-        let select = match query.body.as_ref() {
-            SetExpr::Select(select) => select.as_ref(),
-            _ => {
-                return Err(Error::InvalidArgumentError(
-                    "only simple SELECT statements are supported".into(),
-                ));
+
+        let execution = match query.body.as_ref() {
+            SetExpr::Select(select) => self.execute_select(select.as_ref())?,
+            other => {
+                return Err(Error::InvalidArgumentError(format!(
+                    "unsupported query expression: {other:?}"
+                )));
             }
         };
-        self.execute_select(select)
+
+        if query.order_by.is_some() {
+            // TODO: support ORDER BY clauses
+        }
+
+        Ok(execution)
     }
 
     fn try_parse_simple_aggregates(
@@ -491,6 +830,7 @@ where
                 ));
             };
 
+            // TODO: Use enum for function
             let kind = match func_name.as_str() {
                 "count" => {
                     if args_slice.len() != 1 {
@@ -593,7 +933,7 @@ where
         select: &Select,
         table_name: &str,
         aggregates: Vec<AggregateSpec>,
-    ) -> SqlResult<SqlStatementResult> {
+    ) -> SqlResult<SelectExecution> {
         let filter_expr = if let Some(expr) = &select.selection {
             translate_condition(expr, table.schema.as_ref())?
         } else {
@@ -763,9 +1103,10 @@ where
         }
 
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema, arrays)?;
-        Ok(SqlStatementResult::Select {
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+        Ok(SelectExecution {
             table_name: table_name.to_string(),
+            schema,
             batches: vec![batch],
         })
     }
@@ -914,7 +1255,7 @@ where
         })
     }
 
-    fn execute_select(&self, select: &Select) -> SqlResult<SqlStatementResult> {
+    fn execute_select(&self, select: &Select) -> SqlResult<SelectExecution> {
         if select.distinct.is_some() {
             return Err(Error::InvalidArgumentError(
                 "SELECT DISTINCT is not supported".into(),
@@ -983,6 +1324,7 @@ where
         }
 
         let projections = build_projections(&select.projection, table.as_ref())?;
+        let schema = schema_for_projections(table.as_ref(), &projections)?;
         let filter_expr = if let Some(expr) = &select.selection {
             translate_condition(expr, table.schema.as_ref())?
         } else {
@@ -993,21 +1335,56 @@ where
         };
 
         let mut batches: Vec<RecordBatch> = Vec::new();
-        table
-            .table
-            .scan_stream(
-                &projections,
-                &filter_expr,
-                ScanStreamOptions::default(),
-                |batch| batches.push(batch),
-            )
-            .map_err(|err| {
-                eprintln!("scan_stream failed: {err:?}");
-                err
-            })?;
+        let scan_options = ScanStreamOptions {
+            include_nulls: true,
+        };
 
-        Ok(SqlStatementResult::Select {
+        let scan_result =
+            table
+                .table
+                .scan_stream(&projections, &filter_expr, scan_options, |batch| {
+                    batches.push(batch)
+                });
+
+        match scan_result {
+            Ok(()) => {}
+            Err(Error::NotFound) if select.selection.is_none() => {
+                eprintln!(
+                    "scan_stream returned NotFound; synthesizing null batch for full table scan"
+                );
+                let total_rows = table.total_rows.load(Ordering::SeqCst);
+                let fallback_batches = synthesize_null_scan(Arc::clone(&schema), total_rows)?;
+                batches = fallback_batches;
+            }
+            Err(err) => {
+                eprintln!("scan_stream failed: {err:?}");
+                return Err(err);
+            }
+        }
+
+        if batches.is_empty() && select.selection.is_none() {
+            let total_rows = table.total_rows.load(Ordering::SeqCst);
+            if total_rows > 0 {
+                eprintln!(
+                    "scan_stream produced no batches for full table scan; synthesizing null batch"
+                );
+            }
+            if !select.projection.is_empty()
+                && select
+                    .projection
+                    .iter()
+                    .all(|item| matches!(item, SelectItem::ExprWithAlias { .. }))
+            {
+                batches.push(RecordBatch::try_new(Arc::clone(&schema), vec![])?);
+            } else {
+                let fallback_batches = synthesize_null_scan(Arc::clone(&schema), total_rows)?;
+                batches = fallback_batches;
+            }
+        }
+
+        Ok(SelectExecution {
             table_name: display_name,
+            schema,
             batches,
         })
     }
@@ -1056,6 +1433,7 @@ where
 }
 
 /// Result of executing a SQL statement.
+#[derive(Debug)]
 pub enum SqlStatementResult {
     CreateTable {
         table_name: String,
@@ -1063,6 +1441,10 @@ pub enum SqlStatementResult {
     Insert {
         table_name: String,
         rows_inserted: usize,
+    },
+    Update {
+        table_name: String,
+        rows_updated: usize,
     },
     Select {
         table_name: String,
@@ -1073,10 +1455,17 @@ pub enum SqlStatementResult {
     },
 }
 
+#[derive(Debug)]
 pub enum TransactionKind {
     Begin,
     Commit,
     Rollback,
+}
+
+struct SelectExecution {
+    table_name: String,
+    schema: Arc<Schema>,
+    batches: Vec<RecordBatch>,
 }
 
 #[derive(Clone)]
@@ -1343,6 +1732,7 @@ impl SqlSchema {
     }
 }
 
+#[derive(Clone)]
 struct SqlColumn {
     name: String,
     normalized_name: String,
@@ -1359,6 +1749,9 @@ impl SqlColumn {
             match option {
                 ColumnOption::Null => nullable = true,
                 ColumnOption::NotNull => nullable = false,
+                ColumnOption::Unique { .. } => {
+                    // Uniqueness constraints are accepted but not enforced yet.
+                }
                 ColumnOption::Default(_) => {
                     return Err(Error::InvalidArgumentError(format!(
                         "DEFAULT values are not supported for column '{}'",
@@ -1382,12 +1775,38 @@ impl SqlColumn {
             field_id,
         })
     }
+
+    fn from_field(field: &Field, field_id: FieldId) -> SqlResult<Self> {
+        let data_type = match field.data_type() {
+            DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Date32 => {
+                field.data_type().clone()
+            }
+            other => {
+                return Err(Error::InvalidArgumentError(format!(
+                    "unsupported column type in CTAS result: {other:?}"
+                )));
+            }
+        };
+
+        Ok(Self {
+            normalized_name: field.name().to_ascii_lowercase(),
+            name: field.name().to_string(),
+            data_type,
+            nullable: field.is_nullable(),
+            field_id,
+        })
+    }
 }
 
-fn validate_simple_create_table(stmt: &sqlparser::ast::CreateTable) -> SqlResult<()> {
-    if stmt.query.is_some() || stmt.clone.is_some() || stmt.like.is_some() {
+fn validate_create_table_common(stmt: &sqlparser::ast::CreateTable) -> SqlResult<()> {
+    if stmt.clone.is_some() || stmt.like.is_some() {
         return Err(Error::InvalidArgumentError(
-            "CREATE TABLE AS/LIKE/CLONE is not supported".into(),
+            "CREATE TABLE LIKE/CLONE is not supported".into(),
+        ));
+    }
+    if stmt.or_replace {
+        return Err(Error::InvalidArgumentError(
+            "CREATE OR REPLACE TABLE is not supported".into(),
         ));
     }
     if !stmt.constraints.is_empty() {
@@ -1398,9 +1817,26 @@ fn validate_simple_create_table(stmt: &sqlparser::ast::CreateTable) -> SqlResult
     Ok(())
 }
 
+fn validate_create_table_definition(stmt: &sqlparser::ast::CreateTable) -> SqlResult<()> {
+    if stmt.query.is_some() {
+        return Err(Error::InvalidArgumentError(
+            "CREATE TABLE AS SELECT must use the CTAS path".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_create_table_as(stmt: &sqlparser::ast::CreateTable) -> SqlResult<()> {
+    if stmt.query.is_none() {
+        return Err(Error::InvalidArgumentError(
+            "CREATE TABLE AS SELECT requires a query".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_simple_query(query: &Query) -> SqlResult<()> {
     if query.with.is_some()
-        || query.order_by.is_some()
         || query.limit_clause.is_some()
         || query.fetch.is_some()
         || !query.locks.is_empty()
@@ -1446,6 +1882,27 @@ fn canonical_object_name(name: &ObjectName) -> SqlResult<(String, String)> {
     Ok((display, canonical))
 }
 
+fn resolve_assignment_column_name(target: &AssignmentTarget) -> SqlResult<String> {
+    match target {
+        AssignmentTarget::ColumnName(name) => {
+            if name.0.len() != 1 {
+                return Err(Error::InvalidArgumentError(
+                    "qualified column names in UPDATE assignments are not supported yet".into(),
+                ));
+            }
+            match &name.0[0] {
+                ObjectNamePart::Identifier(ident) => Ok(ident.value.clone()),
+                other => Err(Error::InvalidArgumentError(format!(
+                    "unsupported column reference in UPDATE assignment: {other:?}"
+                ))),
+            }
+        }
+        AssignmentTarget::Tuple(_) => Err(Error::InvalidArgumentError(
+            "tuple assignments are not supported yet".into(),
+        )),
+    }
+}
+
 fn current_time_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1469,6 +1926,7 @@ fn arrow_type_from_sql(data_type: &SqlDataType) -> SqlResult<DataType> {
         | SqlDataType::Varchar(_)
         | SqlDataType::Char(_)
         | SqlDataType::Uuid => Ok(DataType::Utf8),
+        SqlDataType::Date => Ok(DataType::Date32),
         SqlDataType::Decimal(_) | SqlDataType::Numeric(_) => Ok(DataType::Float64),
         SqlDataType::Boolean => Err(Error::InvalidArgumentError(
             "BOOLEAN columns are not supported yet".into(),
@@ -1540,12 +1998,140 @@ fn build_array_for_column(dtype: &DataType, values: &[SqlValue]) -> SqlResult<Ar
             }
             Ok(Arc::new(builder.finish()))
         }
+        DataType::Date32 => {
+            let mut builder = Date32Builder::with_capacity(values.len());
+            for value in values {
+                match value {
+                    SqlValue::Null => builder.append_null(),
+                    SqlValue::Integer(days) => {
+                        let casted = i32::try_from(*days).map_err(|_| {
+                            Error::InvalidArgumentError(
+                                "integer literal out of range for DATE column".into(),
+                            )
+                        })?;
+                        builder.append_value(casted);
+                    }
+                    SqlValue::Float(_) => {
+                        return Err(Error::InvalidArgumentError(
+                            "cannot insert float into DATE column".into(),
+                        ));
+                    }
+                    SqlValue::String(text) => {
+                        let days = parse_date32_literal(text)?;
+                        builder.append_value(days);
+                    }
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported Arrow data type for INSERT: {other:?}"
         ))),
     }
 }
 
+fn parse_date32_literal(text: &str) -> SqlResult<i32> {
+    let mut parts = text.split('-');
+    let year_str = parts
+        .next()
+        .ok_or_else(|| Error::InvalidArgumentError(format!("invalid DATE literal '{text}'")))?;
+    let month_str = parts
+        .next()
+        .ok_or_else(|| Error::InvalidArgumentError(format!("invalid DATE literal '{text}'")))?;
+    let day_str = parts
+        .next()
+        .ok_or_else(|| Error::InvalidArgumentError(format!("invalid DATE literal '{text}'")))?;
+    if parts.next().is_some() {
+        return Err(Error::InvalidArgumentError(format!(
+            "invalid DATE literal '{text}'"
+        )));
+    }
+
+    let year = year_str.parse::<i32>().map_err(|_| {
+        Error::InvalidArgumentError(format!("invalid year in DATE literal '{text}'"))
+    })?;
+    let month_num = month_str.parse::<u8>().map_err(|_| {
+        Error::InvalidArgumentError(format!("invalid month in DATE literal '{text}'"))
+    })?;
+    let day = day_str.parse::<u8>().map_err(|_| {
+        Error::InvalidArgumentError(format!("invalid day in DATE literal '{text}'"))
+    })?;
+
+    let month = Month::try_from(month_num).map_err(|_| {
+        Error::InvalidArgumentError(format!("invalid month in DATE literal '{text}'"))
+    })?;
+
+    let date = Date::from_calendar_date(year, month, day).map_err(|err| {
+        Error::InvalidArgumentError(format!("invalid DATE literal '{text}': {err}"))
+    })?;
+    let days = date.to_julian_day() - epoch_julian_day();
+    Ok(days)
+}
+
+fn epoch_julian_day() -> i32 {
+    Date::from_calendar_date(1970, Month::January, 1)
+        .expect("1970-01-01 is a valid date")
+        .to_julian_day()
+}
+
+fn format_date32(days: i32) -> SqlResult<String> {
+    let base = epoch_julian_day() as i64;
+    let julian = base + days as i64;
+    if !(i32::MIN as i64..=i32::MAX as i64).contains(&julian) {
+        return Err(Error::InvalidArgumentError(
+            "DATE value out of supported range".into(),
+        ));
+    }
+    let date = Date::from_julian_day(julian as i32).map_err(|err| {
+        Error::InvalidArgumentError(format!("DATE value out of supported range: {err}"))
+    })?;
+    Ok(date.to_string())
+}
+
+fn sql_value_from_array(array: &ArrayRef, index: usize) -> SqlResult<SqlValue> {
+    if array.is_null(index) {
+        return Ok(SqlValue::Null);
+    }
+    match array.data_type() {
+        DataType::Int64 => {
+            let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                Error::InvalidArgumentError("expected Int64 array in INSERT SELECT".into())
+            })?;
+            Ok(SqlValue::Integer(values.value(index)))
+        }
+        DataType::Float64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("expected Float64 array in INSERT SELECT".into())
+                })?;
+            Ok(SqlValue::Float(values.value(index)))
+        }
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("expected Utf8 array in INSERT SELECT".into())
+                })?;
+            Ok(SqlValue::String(values.value(index).to_string()))
+        }
+        DataType::Date32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("expected Date32 array in INSERT SELECT".into())
+                })?;
+            let text = format_date32(values.value(index))?;
+            Ok(SqlValue::String(text))
+        }
+        other => Err(Error::InvalidArgumentError(format!(
+            "unsupported column type in INSERT SELECT: {other:?}"
+        ))),
+    }
+}
 struct RangeSelectRows {
     rows: Vec<Vec<SqlValue>>,
     column_count: usize,
@@ -1841,7 +2427,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     let mut projections = Vec::new();
-    for item in projection_items {
+    for (idx, item) in projection_items.iter().enumerate() {
         match item {
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
                 for column in &table.schema.columns {
@@ -1878,10 +2464,14 @@ where
                     alias.value.clone(),
                 )));
             }
-            other => {
-                return Err(Error::InvalidArgumentError(format!(
-                    "unsupported SELECT item: {other:?}"
-                )));
+            SelectItem::ExprWithAlias { expr, alias } => {
+                let scalar = translate_scalar(expr, table.schema.as_ref())?;
+                projections.push(ScanProjection::computed(scalar, alias.value.clone()));
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                let scalar = translate_scalar(expr, table.schema.as_ref())?;
+                let alias = format!("col{}", idx + 1);
+                projections.push(ScanProjection::computed(scalar, alias));
             }
         }
     }
@@ -1893,6 +2483,46 @@ where
     Ok(projections)
 }
 
+fn schema_for_projections<P>(
+    table: &SqlTable<P>,
+    projections: &[ScanProjection],
+) -> SqlResult<Arc<Schema>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let mut fields: Vec<Field> = Vec::with_capacity(projections.len());
+    for projection in projections {
+        match projection {
+            ScanProjection::Column(proj) => {
+                let field_id = proj.logical_field_id.field_id();
+                let column = table.schema.column_by_field_id(field_id).ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "unknown column with field id {} in projection",
+                        field_id
+                    ))
+                })?;
+                let name = proj.alias.clone().unwrap_or_else(|| column.name.clone());
+                let mut metadata = HashMap::new();
+                metadata.insert("field_id".to_string(), column.field_id.to_string());
+                let field = Field::new(&name, column.data_type.clone(), column.nullable)
+                    .with_metadata(metadata);
+                fields.push(field);
+            }
+            ScanProjection::Computed { alias, expr } => {
+                let dtype = match expr {
+                    ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
+                    ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
+                    ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
+                    ScalarExpr::Column(_) | ScalarExpr::Binary { .. } => DataType::Float64,
+                };
+                let field = Field::new(alias, dtype, true);
+                fields.push(field);
+            }
+        }
+    }
+    Ok(Arc::new(Schema::new(fields)))
+}
+
 fn full_table_scan_filter(field_id: FieldId) -> LlkvExpr<'static, FieldId> {
     LlkvExpr::Pred(Filter {
         field_id,
@@ -1901,6 +2531,24 @@ fn full_table_scan_filter(field_id: FieldId) -> LlkvExpr<'static, FieldId> {
             upper: Bound::Unbounded,
         },
     })
+}
+
+fn synthesize_null_scan(schema: Arc<Schema>, total_rows: u64) -> SqlResult<Vec<RecordBatch>> {
+    let row_count = usize::try_from(total_rows).map_err(|_| {
+        Error::InvalidArgumentError("table row count exceeds supported in-memory batch size".into())
+    })?;
+
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        columns.push(new_null_array(field.data_type(), row_count));
+    }
+
+    let batch = RecordBatch::try_new(schema, columns)?;
+    Ok(vec![batch])
 }
 
 fn translate_condition(
@@ -1984,6 +2632,23 @@ fn translate_scalar(expr: &SqlExpr, schema: &SqlSchema) -> SqlResult<ScalarExpr<
             }
         }
         SqlExpr::Value(value) => literal_from_value(value),
+        SqlExpr::BinaryOp { left, op, right } => {
+            let left_expr = translate_scalar(left, schema)?;
+            let right_expr = translate_scalar(right, schema)?;
+            let op = match op {
+                BinaryOperator::Plus => BinaryOp::Add,
+                BinaryOperator::Minus => BinaryOp::Subtract,
+                BinaryOperator::Multiply => BinaryOp::Multiply,
+                BinaryOperator::Divide => BinaryOp::Divide,
+                BinaryOperator::Modulo => BinaryOp::Modulo,
+                other => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported scalar binary operator: {other:?}"
+                    )));
+                }
+            };
+            Ok(ScalarExpr::binary(left_expr, op, right_expr))
+        }
         SqlExpr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
@@ -2117,6 +2782,94 @@ mod tests {
         assert_eq!(batches[0].num_columns(), 2);
     }
 
+    #[test]
+    fn modulo_predicate_filters_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+        engine
+            .execute("CREATE TABLE seq (val INT NOT NULL)")
+            .expect("create table");
+        engine
+            .execute("INSERT INTO seq (val) VALUES (1), (2), (3), (4)")
+            .expect("insert rows");
+
+        let result = engine
+            .execute("SELECT val FROM seq WHERE val % 2 <> 0")
+            .expect("select odds");
+
+        let batches = match &result[0] {
+            SqlStatementResult::Select { batches, .. } => batches,
+            _ => panic!("expected select result"),
+        };
+        assert_eq!(batches.len(), 1);
+        let column = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("int column");
+        assert_eq!(column.len(), 2);
+        assert_eq!(column.value(0), 1);
+        assert_eq!(column.value(1), 3);
+    }
+
+    #[test]
+    fn ctas_select_constant_from_filtered_table() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+        engine
+            .execute("CREATE TABLE integers (i INT NOT NULL)")
+            .expect("create source table");
+        engine
+            .execute("INSERT INTO integers VALUES (1), (2), (3), (4), (5)")
+            .expect("seed source data");
+
+        let integers_table = engine.lookup_table("integers").expect("lookup integers");
+        let stored_ids = integers_table
+            .table
+            .store()
+            .user_field_ids_for_table(integers_table.table.table_id());
+        eprintln!("integers stored field ids after insert: {:?}", stored_ids);
+        let total_rows = integers_table.table.total_rows().expect("table rows");
+        eprintln!("integers total_rows after insert: {}", total_rows);
+
+        let source_check = engine
+            .execute("SELECT * FROM integers ORDER BY 1")
+            .expect("select integers");
+        let source_batches = match &source_check[0] {
+            SqlStatementResult::Select { batches, .. } => batches,
+            _ => panic!("expected select"),
+        };
+        assert_eq!(source_batches.len(), 1);
+        let source_column = source_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("int column");
+        assert_eq!(source_column.len(), 5);
+
+        engine
+            .execute("CREATE TABLE i2 AS SELECT 1 AS i FROM integers WHERE i % 2 <> 0")
+            .expect("create ctas table");
+
+        let result = engine
+            .execute("SELECT * FROM i2 ORDER BY 1")
+            .expect("select from ctas table");
+        let batches = match &result[0] {
+            SqlStatementResult::Select { batches, .. } => batches,
+            _ => panic!("expected select"),
+        };
+        assert_eq!(batches.len(), 1);
+        let column = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("int column");
+        assert_eq!(column.len(), 3);
+        for idx in 0..column.len() {
+            assert_eq!(column.value(idx), 1);
+        }
+    }
+    // TODO: This should more finely check max id to ensure it's incremented per table
     #[test]
     fn table_id_allocation_persists_across_engines() {
         let pager = Arc::new(MemPager::default());

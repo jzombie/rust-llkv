@@ -55,7 +55,7 @@ impl AsyncDB for EngineHarness {
                                                 .downcast_ref::<Int64Array>()
                                                 .unwrap();
                                             if a.is_null(row_idx) {
-                                                "".to_string()
+                                                "NULL".to_string()
                                             } else {
                                                 a.value(row_idx).to_string()
                                             }
@@ -66,7 +66,7 @@ impl AsyncDB for EngineHarness {
                                                 .downcast_ref::<UInt64Array>()
                                                 .unwrap();
                                             if a.is_null(row_idx) {
-                                                "".to_string()
+                                                "NULL".to_string()
                                             } else {
                                                 a.value(row_idx).to_string()
                                             }
@@ -77,7 +77,7 @@ impl AsyncDB for EngineHarness {
                                                 .downcast_ref::<Float64Array>()
                                                 .unwrap();
                                             if a.is_null(row_idx) {
-                                                "".to_string()
+                                                "NULL".to_string()
                                             } else {
                                                 a.value(row_idx).to_string()
                                             }
@@ -88,7 +88,7 @@ impl AsyncDB for EngineHarness {
                                                 .downcast_ref::<StringArray>()
                                                 .unwrap();
                                             if a.is_null(row_idx) {
-                                                "".to_string()
+                                                "NULL".to_string()
                                             } else {
                                                 a.value(row_idx).to_string()
                                             }
@@ -124,6 +124,9 @@ impl AsyncDB for EngineHarness {
                     }
                     SqlStatementResult::Insert { rows_inserted, .. } => {
                         Ok(DBOutput::StatementComplete(*rows_inserted as u64))
+                    }
+                    SqlStatementResult::Update { rows_updated, .. } => {
+                        Ok(DBOutput::StatementComplete(*rows_updated as u64))
                     }
                     SqlStatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
                     SqlStatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
