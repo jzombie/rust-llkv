@@ -1,7 +1,6 @@
 pub type SqlResult<T> = llkv_result::Result<T>;
 
-mod engine;
+mod sql_engine;
 mod value;
 
-// TODO: Rename to `sql_engine`
-pub use engine::{SqlEngine, SqlStatementResult, TransactionKind};
+pub use sql_engine::{SqlEngine, SqlStatementResult, TransactionKind};
