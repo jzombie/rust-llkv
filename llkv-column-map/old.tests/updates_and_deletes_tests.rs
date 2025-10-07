@@ -17,10 +17,10 @@ use arrow::array::{Array, Int32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
 use llkv_column_map::types::{LogicalFieldId, RowId};
-use llkv_column_map::ROW_ID_COLUMN_NAME;
 
 use roaring::RoaringTreemap;
 use std::collections::{BTreeMap, HashMap};
@@ -100,7 +100,10 @@ fn test_lww_updates_single_field_u64() {
 
     let field_id = LogicalFieldId::for_user_table_0(700);
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    md.insert(
+        crate::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);
 
     let schema = schema_with_row_id(vec![data_f]);
@@ -147,11 +150,17 @@ fn test_lww_per_field_isolation() {
     let fidb = LogicalFieldId::for_user_table_0(801);
 
     let mut mda = HashMap::new();
-    mda.insert("field_id".to_string(), u64::from(fida).to_string());
+    mda.insert(
+        crate::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fida).to_string(),
+    );
     let fa = Field::new("a_data", DataType::UInt64, false).with_metadata(mda);
 
     let mut mdb = HashMap::new();
-    mdb.insert("field_id".to_string(), u64::from(fidb).to_string());
+    mdb.insert(
+        crate::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fidb).to_string(),
+    );
     let fb = Field::new("b_data", DataType::Int32, false).with_metadata(mdb);
 
     let schema_ab = schema_with_row_id(vec![fa.clone(), fb.clone()]);
@@ -166,7 +175,10 @@ fn test_lww_per_field_isolation() {
     // Use a schema that includes only row_id and field A, so the number
     // of arrays matches the number of fields.
     let mut mda2 = HashMap::new();
-    mda2.insert("field_id".to_string(), u64::from(fida).to_string());
+    mda2.insert(
+        crate::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fida).to_string(),
+    );
     let fa2 = Field::new("a_data", DataType::UInt64, false).with_metadata(mda2);
     let schema_a_only = schema_with_row_id(vec![fa2]);
 
@@ -200,7 +212,10 @@ fn test_deletes_and_updates() {
 
     let field_id = LogicalFieldId::for_user_table_0(820);
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    md.insert(
+        crate::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);
 
     let schema = schema_with_row_id(vec![data_f]);

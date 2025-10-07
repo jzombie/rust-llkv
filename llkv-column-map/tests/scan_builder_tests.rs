@@ -21,7 +21,10 @@ fn scan_builder_sorted_range_u64() {
 
     // Build schema and ingest 0..10000 (shuffled via reverse values)
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md),
@@ -75,7 +78,10 @@ fn scan_builder_sorted_with_row_ids() {
     let field_id = LogicalFieldId::for_user_table_0(77);
 
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md),

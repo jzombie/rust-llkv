@@ -20,8 +20,10 @@ fn create_table_with_rows(
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
-        Field::new("id", DataType::Int32, false)
-            .with_metadata(HashMap::from([("field_id".to_string(), "1".to_string())])),
+        Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )])),
     ]));
 
     let batch = RecordBatch::try_new(

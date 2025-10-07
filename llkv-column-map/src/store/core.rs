@@ -417,7 +417,7 @@ where
                 continue;
             }
             let field = schema.field(i);
-            if let Some(field_id_str) = field.metadata().get("field_id") {
+            if let Some(field_id_str) = field.metadata().get(crate::store::FIELD_ID_META_KEY) {
                 let field_id = field_id_str
                     .parse::<u64>()
                     .map(LogicalFieldId::from)
@@ -478,7 +478,7 @@ where
             let field = append_schema.field(i);
             let field_id = field
                 .metadata()
-                .get("field_id")
+                .get(crate::store::FIELD_ID_META_KEY)
                 .ok_or_else(|| Error::Internal("Missing field_id".into()))?
                 .parse::<u64>()
                 .map(LogicalFieldId::from)

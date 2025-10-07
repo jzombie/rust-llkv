@@ -24,7 +24,10 @@ fn test_large_sort_u64() {
     let store = ColumnStore::open(pager).unwrap();
 
     let mut metadata = HashMap::new();
-    metadata.insert("field_id".to_string(), u64::from(field_id).to_string());
+    metadata.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
 
     let data_field = Field::new("data", DataType::UInt64, false).with_metadata(metadata);
     let row_id_field = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
@@ -64,7 +67,9 @@ fn test_large_sort_u64() {
     while let Some((arr_dyn, start, len)) = merge.next_run() {
         let a = arr_dyn.as_any().downcast_ref::<UInt64Array>().unwrap();
         let end = start + len;
-        for i in start..end { collected_results.push(a.value(i)); }
+        for i in start..end {
+            collected_results.push(a.value(i));
+        }
     }
     println!("Scan complete.");
 
@@ -87,7 +92,10 @@ fn test_large_sort_i32() {
     let store = ColumnStore::open(pager).unwrap();
 
     let mut metadata = HashMap::new();
-    metadata.insert("field_id".to_string(), u64::from(field_id).to_string());
+    metadata.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
 
     let data_field = Field::new("data", DataType::Int32, false).with_metadata(metadata);
     let row_id_field = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
@@ -129,7 +137,9 @@ fn test_large_sort_i32() {
     while let Some((arr_dyn, start, len)) = merge.next_run() {
         let a = arr_dyn.as_any().downcast_ref::<Int32Array>().unwrap();
         let end = start + len;
-        for i in start..end { collected_results.push(a.value(i)); }
+        for i in start..end {
+            collected_results.push(a.value(i));
+        }
     }
     println!("Scan complete.");
 

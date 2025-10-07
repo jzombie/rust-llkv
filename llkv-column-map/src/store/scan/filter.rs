@@ -1145,15 +1145,17 @@ where
         return Ok(None);
     };
 
-    let desc_blob = store
+    let desc_blob = match store
         .pager
         .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
         .pop()
         .and_then(|res| match res {
             GetResult::Raw { bytes, .. } => Some(bytes),
             _ => None,
-        })
-        .ok_or(Error::NotFound)?;
+        }) {
+        Some(bytes) => bytes,
+        None => return Ok(None),
+    };
     let descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
     drop(catalog);
 

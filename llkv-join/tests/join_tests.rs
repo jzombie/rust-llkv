@@ -23,10 +23,14 @@ fn create_test_table(
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
-        Field::new("user_id", DataType::Int32, false)
-            .with_metadata(HashMap::from([("field_id".to_string(), "1".to_string())])),
-        Field::new("name", DataType::Utf8, false)
-            .with_metadata(HashMap::from([("field_id".to_string(), "2".to_string())])),
+        Field::new("user_id", DataType::Int32, false).with_metadata(HashMap::from([(
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )])),
+        Field::new("name", DataType::Utf8, false).with_metadata(HashMap::from([(
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+            "2".to_string(),
+        )])),
     ]));
 
     let row_ids: Vec<u64> = data.iter().map(|(rid, _, _)| *rid).collect();
@@ -312,19 +316,19 @@ fn test_join_with_expression_filters() {
     let customer_schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("customer_id", DataType::Int32, false).with_metadata(HashMap::from([(
-            "field_id".to_string(),
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
             LEFT_CUSTOMER_ID.to_string(),
         )])),
         Field::new("segment", DataType::Utf8, false).with_metadata(HashMap::from([(
-            "field_id".to_string(),
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
             LEFT_SEGMENT.to_string(),
         )])),
         Field::new("annual_revenue", DataType::Int64, false).with_metadata(HashMap::from([(
-            "field_id".to_string(),
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
             LEFT_ANNUAL_REVENUE.to_string(),
         )])),
         Field::new("loyalty_score", DataType::Int32, false).with_metadata(HashMap::from([(
-            "field_id".to_string(),
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
             LEFT_LOYALTY.to_string(),
         )])),
     ]));
@@ -359,19 +363,19 @@ fn test_join_with_expression_filters() {
     let orders_schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("order_id", DataType::Int32, false).with_metadata(HashMap::from([(
-            "field_id".to_string(),
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
             RIGHT_ORDER_ID.to_string(),
         )])),
         Field::new("customer_id", DataType::Int32, false).with_metadata(HashMap::from([(
-            "field_id".to_string(),
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
             RIGHT_CUSTOMER_ID.to_string(),
         )])),
         Field::new("avg_order_value", DataType::Int64, false).with_metadata(HashMap::from([(
-            "field_id".to_string(),
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
             RIGHT_AVG_ORDER_VALUE.to_string(),
         )])),
         Field::new("trailing_spend", DataType::Int64, false).with_metadata(HashMap::from([(
-            "field_id".to_string(),
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
             RIGHT_TRAILING_SPEND.to_string(),
         )])),
     ]));

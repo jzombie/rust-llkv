@@ -32,7 +32,10 @@ fn seed_u64_perm(
 
     // Schema: row_id (u64), data (u64)
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md),

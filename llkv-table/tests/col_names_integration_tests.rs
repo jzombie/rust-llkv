@@ -26,11 +26,11 @@ fn col_names_persist_across_reopen() {
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("name", DataType::Utf8, true).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                llkv_table::constants::FIELD_ID_META_KEY.to_string(),
                 COL_NAME_FID.to_string(),
             )])),
             Field::new("age", DataType::UInt64, true).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                llkv_table::constants::FIELD_ID_META_KEY.to_string(),
                 COL_AGE_FID.to_string(),
             )])),
         ]));

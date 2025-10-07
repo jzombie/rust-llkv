@@ -106,7 +106,10 @@ fn run_float64_case(mut values: Vec<f64>, low: f64, high: f64) {
     let field_id = LogicalFieldId::for_user(2, 500);
 
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::Float64, false).with_metadata(md),
@@ -184,7 +187,10 @@ fn run_float32_case(mut values: Vec<f32>, low: f32, high: f32) {
     let field_id = LogicalFieldId::for_user(2, 600);
 
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::Float32, false).with_metadata(md),

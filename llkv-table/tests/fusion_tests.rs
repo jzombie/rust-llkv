@@ -18,7 +18,10 @@ fn make_string_table(table_id: llkv_table::types::TableId) -> Table {
         Field::new(llkv_column_map::ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("s", DataType::Utf8, false).with_metadata({
             let mut m = std::collections::HashMap::new();
-            m.insert("field_id".to_string(), FIELD.to_string());
+            m.insert(
+                llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+                FIELD.to_string(),
+            );
             m
         }),
     ]));
@@ -59,7 +62,10 @@ fn make_table_from_values(
         Field::new(llkv_column_map::ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("s", DataType::Utf8, false).with_metadata({
             let mut m = std::collections::HashMap::new();
-            m.insert("field_id".to_string(), field_id.to_string());
+            m.insert(
+                llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+                field_id.to_string(),
+            );
             m
         }),
     ]));

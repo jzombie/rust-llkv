@@ -271,7 +271,8 @@ impl NumericKernels {
         }
         let scalar_value = scalar.expect("checked above");
 
-        if array_is_left && matches!(op, BinaryOp::Divide) && scalar_value == 0.0 {
+        if array_is_left && matches!(op, BinaryOp::Divide | BinaryOp::Modulo) && scalar_value == 0.0
+        {
             return Ok(VectorizedExpr::Scalar(None));
         }
 
@@ -365,6 +366,7 @@ impl NumericKernels {
                             return left_s;
                         }
                     }
+                    BinaryOp::Modulo => {}
                 }
 
                 ScalarExpr::binary(left_s, *op, right_s)
@@ -414,6 +416,7 @@ impl NumericKernels {
                     BinaryOp::Subtract => Self::affine_sub(left_state, right_state),
                     BinaryOp::Multiply => Self::affine_mul(left_state, right_state),
                     BinaryOp::Divide => Self::affine_div(left_state, right_state),
+                    BinaryOp::Modulo => None,
                 }
             }
         }
@@ -484,6 +487,13 @@ impl NumericKernels {
                     Some(Self::literal_from_f64(lhs / rhs))
                 }
             }
+            BinaryOp::Modulo => {
+                if rhs == 0.0 {
+                    None
+                } else {
+                    Some(Self::literal_from_f64(lhs % rhs))
+                }
+            }
         }
     }
 
@@ -509,6 +519,13 @@ impl NumericKernels {
                         Some(lv / rv)
                     }
                 }
+                BinaryOp::Modulo => {
+                    if rv == 0.0 {
+                        None
+                    } else {
+                        Some(lv % rv)
+                    }
+                }
             },
             (Some(_), None) | (None, Some(_)) => None,
             (None, None) => None,
@@ -532,6 +549,7 @@ impl NumericKernels {
 mod tests {
     use super::*;
     use arrow::array::Float64Array;
+    use llkv_expr::Literal;
 
     fn array(values: &[Option<f64>]) -> Arc<Float64Array> {
         Arc::new(Float64Array::from(values.to_vec()))
@@ -692,6 +710,49 @@ mod tests {
         assert!(result.is_null(0));
         assert!(result.is_null(1));
         assert!(result.is_null(2));
+    }
+
+    #[test]
+    fn vectorized_modulo_literals() {
+        let expr = ScalarExpr::binary(
+            ScalarExpr::literal(13),
+            BinaryOp::Modulo,
+            ScalarExpr::literal(5),
+        );
+
+        let simplified = NumericKernels::simplify(&expr);
+        let ScalarExpr::Literal(Literal::Integer(value)) = simplified else {
+            panic!("expected literal result");
+        };
+        assert_eq!(value, 3);
+    }
+
+    #[test]
+    fn vectorized_modulo_column_rhs_zero_yields_null() {
+        const NUM: FieldId = 23;
+        const DEN: FieldId = 24;
+        let mut arrays: NumericArrayMap = NumericArrayMap::default();
+        arrays.insert(NUM, array(&[Some(4.0), Some(7.0), None, Some(-6.0)]));
+        arrays.insert(DEN, array(&[Some(2.0), Some(0.0), Some(3.0), Some(-4.0)]));
+
+        let expr = ScalarExpr::binary(
+            ScalarExpr::column(NUM),
+            BinaryOp::Modulo,
+            ScalarExpr::column(DEN),
+        );
+
+        let result = NumericKernels::evaluate_batch(&expr, 4, &arrays).unwrap();
+        let result = result
+            .as_ref()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        assert_eq!(result.len(), 4);
+        assert_eq!(result.value(0), 0.0);
+        assert!(result.is_null(1));
+        assert!(result.is_null(2));
+        assert_eq!(result.value(3), -6.0 % -4.0);
     }
 
     #[test]

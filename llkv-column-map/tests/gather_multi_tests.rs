@@ -16,7 +16,10 @@ use rand::seq::SliceRandom;
 fn schema_for_field(field_id: LogicalFieldId, name: &str, dtype: DataType) -> Arc<Schema> {
     let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
     let data = Field::new(name, dtype, false).with_metadata(md);
     Arc::new(Schema::new(vec![rid, data]))
 }
@@ -24,7 +27,10 @@ fn schema_for_field(field_id: LogicalFieldId, name: &str, dtype: DataType) -> Ar
 fn schema_for_nullable_field(field_id: LogicalFieldId, name: &str, dtype: DataType) -> Arc<Schema> {
     let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
     let data = Field::new(name, dtype, true).with_metadata(md);
     Arc::new(Schema::new(vec![rid, data]))
 }

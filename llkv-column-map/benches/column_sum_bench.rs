@@ -50,7 +50,10 @@ fn bench_column_store_sum(c: &mut Criterion) {
     let u64_field_id = LogicalFieldId::for_user_table_0(7777);
 
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(u64_field_id).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(u64_field_id).to_string(),
+    );
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);
     let schema = schema_with_row_id(data_f);
 
@@ -112,7 +115,10 @@ fn bench_column_store_sum(c: &mut Criterion) {
     let i32_field_id = LogicalFieldId::for_user_table_0(8888);
 
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(i32_field_id).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(i32_field_id).to_string(),
+    );
     let data_f = Field::new("data", DataType::Int32, false).with_metadata(md);
     let schema = schema_with_row_id(data_f);
 
@@ -182,7 +188,10 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
     let store = ColumnStore::open(pager).unwrap();
 
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
     let data_f = Field::new("data", DataType::UInt64, false).with_metadata(md);
     let schema = schema_with_row_id(data_f);
 

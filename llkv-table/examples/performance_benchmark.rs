@@ -17,8 +17,10 @@ use std::ops::Bound;
 
 /// Attach required `field_id` metadata to a data column field.
 fn field_with_fid(name: &str, dt: DataType, fid: FieldId, nullable: bool) -> Field {
-    Field::new(name, dt, nullable)
-        .with_metadata(HashMap::from([("field_id".to_string(), fid.to_string())]))
+    Field::new(name, dt, nullable).with_metadata(HashMap::from([(
+        llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+        fid.to_string(),
+    )]))
 }
 
 fn benchmark_scenario(

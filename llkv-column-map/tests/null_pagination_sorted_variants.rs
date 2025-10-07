@@ -19,7 +19,10 @@ fn seed_anchor_and_target() -> (ColumnStore<MemPager>, LogicalFieldId, LogicalFi
     // Anchor rid 0..100
     let anchor_fid = LogicalFieldId::for_user_table_0(11);
     let mut md_a = HashMap::new();
-    md_a.insert("field_id".to_string(), u64::from(anchor_fid).to_string());
+    md_a.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(anchor_fid).to_string(),
+    );
     let schema_a = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md_a),
@@ -37,7 +40,10 @@ fn seed_anchor_and_target() -> (ColumnStore<MemPager>, LogicalFieldId, LogicalFi
     // Target: values only on multiples of 3
     let target_fid = LogicalFieldId::for_user_table_0(12);
     let mut md_t = HashMap::new();
-    md_t.insert("field_id".to_string(), u64::from(target_fid).to_string());
+    md_t.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(target_fid).to_string(),
+    );
     let schema_t = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md_t),

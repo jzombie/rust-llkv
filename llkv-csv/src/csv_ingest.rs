@@ -220,7 +220,10 @@ fn build_schema_with_metadata(
         })?;
 
         let mut metadata = std::collections::HashMap::new();
-        metadata.insert("field_id".to_string(), field_id.to_string());
+        metadata.insert(
+            llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+            field_id.to_string(),
+        );
 
         fields_with_metadata.push(
             Field::new(field.name(), field.data_type().clone(), field.is_nullable())
