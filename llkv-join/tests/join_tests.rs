@@ -13,7 +13,7 @@ use llkv_table::table::{ScanProjection, ScanStreamOptions};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Helper to create a test table with row_id, id, and name columns.
+/// Helper to create a test table with row-id, user_id, and name columns.
 fn create_test_table(
     table_id: u16,
     pager: &Arc<MemPager>,
@@ -23,7 +23,7 @@ fn create_test_table(
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
-        Field::new("id", DataType::Int32, false)
+        Field::new("user_id", DataType::Int32, false)
             .with_metadata(HashMap::from([("field_id".to_string(), "1".to_string())])),
         Field::new("name", DataType::Utf8, false)
             .with_metadata(HashMap::from([("field_id".to_string(), "2".to_string())])),
