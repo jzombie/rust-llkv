@@ -4,6 +4,7 @@ use std::sync::Arc;
 use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 
+use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
 use llkv_table::types::{FieldId, TableId};
@@ -23,7 +24,7 @@ fn col_names_persist_across_reopen() {
         let table = Table::new(TID, Arc::clone(&pager)).expect("create table");
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("row_id", DataType::UInt64, false),
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("name", DataType::Utf8, true).with_metadata(HashMap::from([(
                 "field_id".to_string(),
                 COL_NAME_FID.to_string(),

@@ -19,7 +19,8 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::storage::pager::MemPager;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::LogicalFieldId;
+use llkv_column_map::types::{LogicalFieldId, RowId};
+use llkv_column_map::ROW_ID_COLUMN_NAME;
 
 use roaring::RoaringTreemap;
 use std::collections::{BTreeMap, HashMap};
@@ -224,7 +225,8 @@ fn test_deletes_and_updates() {
 
     let mut bm = RoaringTreemap::new();
     bm.insert(idx_40);
-    store.delete_rows(field_id, &bm).unwrap();
+    let deletes: Vec<RowId> = bm.iter().collect();
+    store.delete_rows(&[field_id], &deletes).unwrap();
 
     // Collect and verify: we should have 9 rows now.
     let got = scan_u64(&store, field_id);

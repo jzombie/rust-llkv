@@ -5,7 +5,7 @@ use crate::store::descriptor::{
 };
 use crate::store::scan::filter::FilterDispatch;
 use crate::store::scan::{FilterPrimitive, FilterResult};
-use crate::types::LogicalFieldId;
+use crate::types::{LogicalFieldId, RowId, TableId};
 use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, UInt64Array};
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;
@@ -672,6 +672,7 @@ where
         }
         Ok(())
     }
+
     fn lww_rewrite_for_field(
         &self,
         catalog: &mut ColumnCatalog,
@@ -889,27 +890,23 @@ where
         Ok(rewritten_ids)
     }
 
-    // TODO: Remove pre-condition; accept vector of row ids instead
-    /// Explicit delete by global row **positions** (0-based, ascending,
-    /// unique) -> in-place chunk rewrite.
-    ///
-    /// Precondition: `rows_to_delete` yields strictly increasing positions.
-    /// Explicit delete by global row **positions** (0-based, ascending,
-    /// unique) -> in-place chunk rewrite.
-    pub fn delete_rows<I>(&self, field_id: LogicalFieldId, rows_to_delete: I) -> Result<()>
-    where
-        I: IntoIterator<Item = u64>,
-    {
+    fn stage_delete_rows_for_field(
+        &self,
+        field_id: LogicalFieldId,
+        rows_to_delete: &[RowId],
+        staged_puts: &mut Vec<BatchPut>,
+    ) -> Result<bool> {
         use crate::store::descriptor::DescriptorIterator;
         use crate::store::ingest::ChunkEdit;
 
-        // Stream and validate ascending, unique positions.
-        let mut del_iter = rows_to_delete.into_iter();
-        let mut cur_del = del_iter.next();
-        let mut last_seen: Option<u64> = None;
-        if let Some(v) = cur_del {
-            last_seen = Some(v);
+        if rows_to_delete.is_empty() {
+            return Ok(false);
         }
+
+        // Stream and validate ascending, unique positions.
+        let mut del_iter = rows_to_delete.iter().copied();
+        let mut cur_del = del_iter.next();
+        let mut last_seen: Option<u64> = cur_del;
 
         // Lookup descriptors (data and optional row_id).
         let catalog = self.catalog.read().unwrap();
@@ -930,7 +927,12 @@ where
             }
         }
 
-        let desc_blob = blobs_by_pk.remove(&desc_pk).ok_or(Error::NotFound)?;
+        let desc_blob = blobs_by_pk.remove(&desc_pk).ok_or_else(|| {
+            Error::Internal(format!(
+                "descriptor pk={} missing during delete_rows for field {:?}",
+                desc_pk, field_id
+            ))
+        })?;
         let mut descriptor = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
 
         // Build metas for data column.
@@ -940,8 +942,7 @@ where
         }
         if metas.is_empty() {
             drop(catalog);
-            self.compact_field_bounded(field_id)?;
-            return Ok(());
+            return Ok(false);
         }
 
         // Optionally mirror metas for row_id column.
@@ -957,8 +958,8 @@ where
             descriptor_rid = Some(d_rid);
         }
 
-        let mut puts = Vec::new();
         let mut cum_rows = 0u64;
+        let mut any_changed = false;
 
         for (i, meta) in metas.iter_mut().enumerate() {
             let start_u64 = cum_rows;
@@ -1031,7 +1032,7 @@ where
 
             // Write back data.
             let data_bytes = serialize_array(&new_data_arr)?;
-            puts.push(BatchPut::Raw {
+            staged_puts.push(BatchPut::Raw {
                 key: meta.chunk_pk,
                 bytes: data_bytes,
             });
@@ -1042,7 +1043,7 @@ where
             if let (Some(_), Some(rids)) = (metas_rid.get_mut(i), new_rid_arr) {
                 let rm = metas_rid.get_mut(i).unwrap();
                 let rid_bytes = serialize_array(&rids)?;
-                puts.push(BatchPut::Raw {
+                staged_puts.push(BatchPut::Raw {
                     key: rm.chunk_pk,
                     bytes: rid_bytes,
                 });
@@ -1058,26 +1059,65 @@ where
                 };
                 let indices = lexsort_to_indices(&[sort_column], None)?;
                 let perm_bytes = serialize_array(&indices)?;
-                puts.push(BatchPut::Raw {
+                staged_puts.push(BatchPut::Raw {
                     key: meta.value_order_perm_pk,
                     bytes: perm_bytes,
                 });
             }
 
             cum_rows = end_u64;
+            any_changed = true;
         }
 
         // Rewrite descriptor chains/totals and commit.
-        descriptor.rewrite_pages(Arc::clone(&self.pager), desc_pk, &mut metas, &mut puts)?;
+        descriptor.rewrite_pages(Arc::clone(&self.pager), desc_pk, &mut metas, staged_puts)?;
         if let (Some(rid_pk), Some(mut rid_desc)) = (desc_pk_rid, descriptor_rid) {
-            rid_desc.rewrite_pages(Arc::clone(&self.pager), rid_pk, &mut metas_rid, &mut puts)?;
+            rid_desc.rewrite_pages(Arc::clone(&self.pager), rid_pk, &mut metas_rid, staged_puts)?;
         }
-        if !puts.is_empty() {
-            self.pager.batch_put(&puts)?;
+        drop(catalog);
+        Ok(any_changed)
+    }
+
+    /// Delete row positions for one or more logical fields in a single atomic batch.
+    ///
+    /// The same set of global row positions is applied to every field in
+    /// `fields`. All staged metadata and chunk updates are committed in a
+    /// single pager batch.
+    pub fn delete_rows(&self, fields: &[LogicalFieldId], rows_to_delete: &[RowId]) -> Result<()> {
+        if fields.is_empty() || rows_to_delete.is_empty() {
+            return Ok(());
         }
 
-        drop(catalog);
-        self.compact_field_bounded(field_id)
+        let mut puts = Vec::new();
+        let mut touched: FxHashSet<LogicalFieldId> = FxHashSet::default();
+        let mut table_id: Option<TableId> = None;
+
+        for field_id in fields {
+            if let Some(expected) = table_id {
+                if field_id.table_id() != expected {
+                    return Err(Error::InvalidArgumentError(
+                        "delete_rows requires fields from the same table".into(),
+                    ));
+                }
+            } else {
+                table_id = Some(field_id.table_id());
+            }
+
+            if self.stage_delete_rows_for_field(*field_id, rows_to_delete, &mut puts)? {
+                touched.insert(*field_id);
+            }
+        }
+
+        if puts.is_empty() {
+            return Ok(());
+        }
+
+        self.pager.batch_put(&puts)?;
+
+        for field_id in touched {
+            self.compact_field_bounded(field_id)?;
+        }
+        Ok(())
     }
 
     // TODO: Move to descriptor module?
