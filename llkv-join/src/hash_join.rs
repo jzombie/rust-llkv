@@ -736,8 +736,10 @@ where
     let mut projections = Vec::new();
 
     for field in schema.fields() {
-        // TODO: Use common constant for `field_id`
-        let Some(field_id_str) = field.metadata().get("field_id") else {
+        let Some(field_id_str) = field
+            .metadata()
+            .get(llkv_column_map::store::FIELD_ID_META_KEY)
+        else {
             continue;
         };
 
@@ -799,7 +801,10 @@ fn find_field_index(schema: &Schema, target_field_id: FieldId) -> LlkvResult<usi
     let mut user_col_idx = 0;
 
     for field in schema.fields() {
-        let Some(field_id_str) = field.metadata().get("field_id") else {
+        let Some(field_id_str) = field
+            .metadata()
+            .get(llkv_column_map::store::FIELD_ID_META_KEY)
+        else {
             continue;
         };
 
@@ -823,7 +828,10 @@ fn find_field_index(schema: &Schema, target_field_id: FieldId) -> LlkvResult<usi
 /// Get the DataType of a join key field from schema.
 fn get_key_datatype(schema: &Schema, field_id: FieldId) -> LlkvResult<DataType> {
     for field in schema.fields() {
-        let Some(field_id_str) = field.metadata().get("field_id") else {
+        let Some(field_id_str) = field
+            .metadata()
+            .get(llkv_column_map::store::FIELD_ID_META_KEY)
+        else {
             continue;
         };
 
@@ -852,7 +860,11 @@ fn build_output_schema(
     // For semi/anti joins, only include left side
     if matches!(join_type, JoinType::Semi | JoinType::Anti) {
         for field in left_schema.fields() {
-            if field.metadata().get("field_id").is_some() {
+            if field
+                .metadata()
+                .get(llkv_column_map::store::FIELD_ID_META_KEY)
+                .is_some()
+            {
                 fields.push(field.clone());
             }
         }
@@ -861,13 +873,21 @@ fn build_output_schema(
 
     // For other joins, include both sides
     for field in left_schema.fields() {
-        if field.metadata().get("field_id").is_some() {
+        if field
+            .metadata()
+            .get(llkv_column_map::store::FIELD_ID_META_KEY)
+            .is_some()
+        {
             fields.push(field.clone());
         }
     }
 
     for field in right_schema.fields() {
-        if field.metadata().get("field_id").is_some() {
+        if field
+            .metadata()
+            .get(llkv_column_map::store::FIELD_ID_META_KEY)
+            .is_some()
+        {
             fields.push(field.clone());
         }
     }

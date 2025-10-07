@@ -20,7 +20,10 @@ fn unsorted_scan_works_without_index_u64() {
 
     let fid = LogicalFieldId::for_user_table_0(11);
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(fid).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid).to_string(),
+    );
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md),
@@ -80,7 +83,10 @@ fn unsorted_with_row_ids_works_without_index() {
 
     let fid = LogicalFieldId::for_user_table_0(12);
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(fid).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid).to_string(),
+    );
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::Int32, false).with_metadata(md),
@@ -134,7 +140,10 @@ fn sorted_scan_without_index_returns_error() {
     let store = ColumnStore::open(pager).unwrap();
     let fid = LogicalFieldId::for_user_table_0(13);
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(fid).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid).to_string(),
+    );
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md),

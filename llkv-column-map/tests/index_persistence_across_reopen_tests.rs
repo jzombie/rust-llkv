@@ -43,7 +43,10 @@ fn indices_persist_after_drop_and_reopen() {
 
         // Anchor column: values for all row_ids 0..100
         let mut md_a = HashMap::new();
-        md_a.insert("field_id".to_string(), u64::from(anchor_fid).to_string());
+        md_a.insert(
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+            u64::from(anchor_fid).to_string(),
+        );
         let schema_a = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("data", DataType::UInt64, false).with_metadata(md_a),
@@ -61,7 +64,10 @@ fn indices_persist_after_drop_and_reopen() {
 
         // Target column: values only on multiples of 3
         let mut md_t = HashMap::new();
-        md_t.insert("field_id".to_string(), u64::from(target_fid).to_string());
+        md_t.insert(
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+            u64::from(target_fid).to_string(),
+        );
         let schema_t = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("data", DataType::UInt64, false).with_metadata(md_t),
@@ -136,7 +142,10 @@ fn index_can_be_removed_and_persists() {
 
         // Seed some data for the target column
         let mut md_t = HashMap::new();
-        md_t.insert("field_id".to_string(), u64::from(target_fid).to_string());
+        md_t.insert(
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+            u64::from(target_fid).to_string(),
+        );
         let schema_t = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("data", DataType::UInt64, false).with_metadata(md_t),

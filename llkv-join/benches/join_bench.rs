@@ -38,10 +38,14 @@ fn create_table_with_rows(
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
-        Field::new("id", DataType::Int32, false)
-            .with_metadata(HashMap::from([("field_id".to_string(), "1".to_string())])),
-        Field::new("value", DataType::Utf8, false)
-            .with_metadata(HashMap::from([("field_id".to_string(), "2".to_string())])),
+        Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )])),
+        Field::new("value", DataType::Utf8, false).with_metadata(HashMap::from([(
+            llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+            "2".to_string(),
+        )])),
     ]));
 
     // Create data in batches of 10,000 rows

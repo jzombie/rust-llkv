@@ -17,11 +17,17 @@ fn test_total_rows_before_after_append_and_delete() {
 
     // Build schema: row_id + name (field_id 1) + age (field_id 2)
     let mut md1 = std::collections::HashMap::new();
-    md1.insert("field_id".to_string(), "1".to_string());
+    md1.insert(
+        llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+        "1".to_string(),
+    );
     let name_field = Field::new("name", DataType::Utf8, false).with_metadata(md1);
 
     let mut md2 = std::collections::HashMap::new();
-    md2.insert("field_id".to_string(), "2".to_string());
+    md2.insert(
+        llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+        "2".to_string(),
+    );
     let age_field = Field::new("age", DataType::UInt64, false).with_metadata(md2);
 
     let schema = {

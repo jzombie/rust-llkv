@@ -21,7 +21,10 @@ fn sorted_with_nulls_last_pagination() {
     // Anchor row_id column (dense 0..100)
     let anchor_fid = LogicalFieldId::for_user_table_0(1);
     let mut md_anchor = HashMap::new();
-    md_anchor.insert("field_id".to_string(), u64::from(anchor_fid).to_string());
+    md_anchor.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(anchor_fid).to_string(),
+    );
     let schema_anchor = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md_anchor),
@@ -40,7 +43,10 @@ fn sorted_with_nulls_last_pagination() {
     // Target column: only even row_ids present
     let target_fid = LogicalFieldId::for_user_table_0(2);
     let mut md_t = HashMap::new();
-    md_t.insert("field_id".to_string(), u64::from(target_fid).to_string());
+    md_t.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(target_fid).to_string(),
+    );
     let schema_t = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("data", DataType::UInt64, false).with_metadata(md_t),

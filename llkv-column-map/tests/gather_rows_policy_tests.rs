@@ -16,7 +16,10 @@ fn drop_nulls_policy_removes_null_rows() {
 
     let fid = LogicalFieldId::for_user(42, 7);
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(fid).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(fid).to_string(),
+    );
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),

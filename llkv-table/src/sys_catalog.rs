@@ -108,7 +108,7 @@ where
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("meta", DataType::Binary, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 lfid_val.to_string(),
             )])),
         ]));
@@ -171,7 +171,7 @@ where
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("meta", DataType::Binary, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 lfid_val.to_string(),
             )])),
         ]));
@@ -227,7 +227,7 @@ where
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new("next_table_id", DataType::UInt64, false).with_metadata(HashMap::from([(
-                "field_id".to_string(),
+                crate::constants::FIELD_ID_META_KEY.to_string(),
                 lfid_val.to_string(),
             )])),
         ]));

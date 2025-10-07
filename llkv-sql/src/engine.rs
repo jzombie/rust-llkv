@@ -392,7 +392,10 @@ where
 
             for (idx, column) in column_defs.iter().enumerate() {
                 let mut metadata = HashMap::new();
-                metadata.insert("field_id".to_string(), column.field_id.to_string());
+                metadata.insert(
+                    llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+                    column.field_id.to_string(),
+                );
                 let field = Field::new(&column.name, column.data_type.clone(), column.nullable)
                     .with_metadata(metadata);
                 fields.push(field);
@@ -606,7 +609,10 @@ where
         for (column, values) in table.schema.columns.iter().zip(column_values.into_iter()) {
             let array = build_array_for_column(&column.data_type, &values)?;
             let mut metadata = HashMap::new();
-            metadata.insert("field_id".to_string(), column.field_id.to_string());
+            metadata.insert(
+                llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+                column.field_id.to_string(),
+            );
             let field = Field::new(&column.name, column.data_type.clone(), column.nullable)
                 .with_metadata(metadata);
             arrays.push(array);
@@ -704,7 +710,10 @@ where
             arrays.push(array);
 
             let mut metadata = HashMap::new();
-            metadata.insert("field_id".to_string(), column.field_id.to_string());
+            metadata.insert(
+                llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+                column.field_id.to_string(),
+            );
             fields.push(
                 Field::new(&column.name, column.data_type.clone(), column.nullable)
                     .with_metadata(metadata),
@@ -2503,7 +2512,10 @@ where
                 })?;
                 let name = proj.alias.clone().unwrap_or_else(|| column.name.clone());
                 let mut metadata = HashMap::new();
-                metadata.insert("field_id".to_string(), column.field_id.to_string());
+                metadata.insert(
+                    llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+                    column.field_id.to_string(),
+                );
                 let field = Field::new(&name, column.data_type.clone(), column.nullable)
                     .with_metadata(metadata);
                 fields.push(field);

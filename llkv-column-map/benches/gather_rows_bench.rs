@@ -27,7 +27,10 @@ const SEED: u64 = 0x9E37_79B9_F701_3CAB;
 fn schema_with_row_id(field_id: LogicalFieldId, name: &str) -> Arc<Schema> {
     let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);
     let mut md = HashMap::new();
-    md.insert("field_id".to_string(), u64::from(field_id).to_string());
+    md.insert(
+        llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
+        u64::from(field_id).to_string(),
+    );
     let data = Field::new(name, DataType::UInt64, false).with_metadata(md);
     Arc::new(Schema::new(vec![rid, data]))
 }
