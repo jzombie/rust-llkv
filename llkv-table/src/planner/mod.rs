@@ -782,10 +782,10 @@ where
                                 match store.prepare_gather_context(unique_lfids.as_ref()) {
                                     Ok(ctx) => ctx,
                                     Err(e) => {
-                                        eprintln!(
-                                            "prepare_gather_context failed for lfids={:?}: {e:?}",
-                                            unique_lfids
-                                        );
+                                        // eprintln!(
+                                        //     "prepare_gather_context failed for lfids={:?}: {e:?}",
+                                        //     unique_lfids
+                                        // );
                                         return Err(e);
                                     }
                                 };
@@ -882,11 +882,11 @@ where
 
         for batch_result in chunk_batches {
             if let Some(batch) = batch_result? {
-                eprintln!(
-                    "TableExecutor produced batch with {} rows and {} columns",
-                    batch.num_rows(),
-                    batch.num_columns()
-                );
+                // eprintln!(
+                //     "TableExecutor produced batch with {} rows and {} columns",
+                //     batch.num_rows(),
+                //     batch.num_columns()
+                // );
                 on_batch(batch);
             }
         }
@@ -1174,11 +1174,11 @@ where
             && let Some(runs) = dense_row_runs(self.table.store(), filter_lfid)?
         {
             let rows = expand_filter_runs(&runs);
-            eprintln!(
-                "collect_row_ids_for_filter dense runs field {:?} -> {} rows",
-                filter_lfid,
-                rows.len()
-            );
+            // eprintln!(
+            //     "collect_row_ids_for_filter dense runs field {:?} -> {} rows",
+            //     filter_lfid,
+            //     rows.len()
+            // );
             return Ok(rows);
         }
 
@@ -1197,11 +1197,11 @@ where
                 ))),
             ),
         }?;
-        eprintln!(
-            "collect_row_ids_for_filter general field {:?} -> {} rows",
-            filter_lfid,
-            row_ids.len()
-        );
+        // eprintln!(
+        //     "collect_row_ids_for_filter general field {:?} -> {} rows",
+        //     filter_lfid,
+        //     row_ids.len()
+        // );
 
         Ok(normalize_row_ids(row_ids))
     }

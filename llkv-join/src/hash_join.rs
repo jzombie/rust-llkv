@@ -40,7 +40,7 @@ use crate::{JoinKey, JoinOptions, JoinType};
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Schema};
-use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME};
+use llkv_column_map::store::Projection;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::{Expr, Filter, Operator};
 use llkv_result::{Error, Result as LlkvResult};
@@ -263,16 +263,16 @@ where
                         &mut on_batch,
                     ),
                     _ => {
-                        eprintln!(
-                            "Hash join does not yet support {:?}, falling back would cause issues",
-                            options.join_type
-                        );
+                        // eprintln!(
+                        //     "Hash join does not yet support {:?}, falling back would cause issues",
+                        //     options.join_type
+                        // );
                         Ok(())
                     }
                 };
 
-                if let Err(e) = result {
-                    eprintln!("Join error: {}", e);
+                if let Err(_e) = result {
+                    // TODO: re-enable logging once tracing is wired up
                 }
             },
         )?;
@@ -736,20 +736,19 @@ where
     let mut projections = Vec::new();
 
     for field in schema.fields() {
-        if field.name() == ROW_ID_COLUMN_NAME {
+        // TODO: Use common constant for `field_id`
+        let Some(field_id_str) = field.metadata().get("field_id") else {
             continue;
-        }
+        };
 
-        if let Some(field_id_str) = field.metadata().get("field_id") {
-            let field_id: u32 = field_id_str.parse().map_err(|_| {
-                Error::Internal(format!("Invalid field_id in schema: {}", field_id_str))
-            })?;
-            let lfid = LogicalFieldId::for_user(table.table_id(), field_id);
-            projections.push(ScanProjection::Column(Projection::with_alias(
-                lfid,
-                field.name().to_string(),
-            )));
-        }
+        let field_id: u32 = field_id_str.parse().map_err(|_| {
+            Error::Internal(format!("Invalid field_id in schema: {}", field_id_str))
+        })?;
+        let lfid = LogicalFieldId::for_user(table.table_id(), field_id);
+        projections.push(ScanProjection::Column(Projection::with_alias(
+            lfid,
+            field.name().to_string(),
+        )));
     }
 
     Ok(projections)
@@ -800,18 +799,16 @@ fn find_field_index(schema: &Schema, target_field_id: FieldId) -> LlkvResult<usi
     let mut user_col_idx = 0;
 
     for field in schema.fields() {
-        if field.name() == ROW_ID_COLUMN_NAME {
+        let Some(field_id_str) = field.metadata().get("field_id") else {
             continue;
-        }
+        };
 
-        if let Some(field_id_str) = field.metadata().get("field_id") {
-            let field_id: u32 = field_id_str.parse().map_err(|_| {
-                Error::Internal(format!("Invalid field_id in schema: {}", field_id_str))
-            })?;
+        let field_id: u32 = field_id_str.parse().map_err(|_| {
+            Error::Internal(format!("Invalid field_id in schema: {}", field_id_str))
+        })?;
 
-            if field_id == target_field_id {
-                return Ok(user_col_idx);
-            }
+        if field_id == target_field_id {
+            return Ok(user_col_idx);
         }
 
         user_col_idx += 1;
@@ -826,18 +823,16 @@ fn find_field_index(schema: &Schema, target_field_id: FieldId) -> LlkvResult<usi
 /// Get the DataType of a join key field from schema.
 fn get_key_datatype(schema: &Schema, field_id: FieldId) -> LlkvResult<DataType> {
     for field in schema.fields() {
-        if field.name() == ROW_ID_COLUMN_NAME {
+        let Some(field_id_str) = field.metadata().get("field_id") else {
             continue;
-        }
+        };
 
-        if let Some(field_id_str) = field.metadata().get("field_id") {
-            let fid: u32 = field_id_str.parse().map_err(|_| {
-                Error::Internal(format!("Invalid field_id in schema: {}", field_id_str))
-            })?;
+        let fid: u32 = field_id_str.parse().map_err(|_| {
+            Error::Internal(format!("Invalid field_id in schema: {}", field_id_str))
+        })?;
 
-            if fid == field_id {
-                return Ok(field.data_type().clone());
-            }
+        if fid == field_id {
+            return Ok(field.data_type().clone());
         }
     }
 
@@ -857,7 +852,7 @@ fn build_output_schema(
     // For semi/anti joins, only include left side
     if matches!(join_type, JoinType::Semi | JoinType::Anti) {
         for field in left_schema.fields() {
-            if field.name() != ROW_ID_COLUMN_NAME {
+            if field.metadata().get("field_id").is_some() {
                 fields.push(field.clone());
             }
         }
@@ -866,13 +861,13 @@ fn build_output_schema(
 
     // For other joins, include both sides
     for field in left_schema.fields() {
-        if field.name() != ROW_ID_COLUMN_NAME {
+        if field.metadata().get("field_id").is_some() {
             fields.push(field.clone());
         }
     }
 
     for field in right_schema.fields() {
-        if field.name() != ROW_ID_COLUMN_NAME {
+        if field.metadata().get("field_id").is_some() {
             fields.push(field.clone());
         }
     }
@@ -1074,13 +1069,13 @@ macro_rules! impl_integer_fast_path {
                                 &mut on_batch,
                             ),
                             _ => {
-                                eprintln!("Hash join does not yet support {:?}", options.join_type);
+                                // eprintln!("Hash join does not yet support {:?}", options.join_type);
                                 Ok(())
                             }
                         };
 
-                        if let Err(e) = result {
-                            eprintln!("Join error: {}", e);
+                        if let Err(_e) = result {
+                            // TODO: re-enable logging once tracing is wired up
                         }
                     },
                 )?;
@@ -1121,10 +1116,10 @@ macro_rules! impl_integer_fast_path {
                     let key_array = match key_column.as_any().downcast_ref::<$arrow_array>() {
                         Some(arr) => arr,
                         None => {
-                            eprintln!(
-                                "Fast-path: Expected array type but got {:?}",
-                                key_column.data_type()
-                            );
+                            // eprintln!(
+                            //     "Fast-path: Expected array type but got {:?}",
+                            //     key_column.data_type()
+                            // );
                             batches.push(batch.clone());
                             return;
                         }
