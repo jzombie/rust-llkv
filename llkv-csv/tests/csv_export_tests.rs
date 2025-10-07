@@ -20,7 +20,7 @@ use tempfile::NamedTempFile;
 
 fn write_sample_csv() -> NamedTempFile {
     let mut tmp = NamedTempFile::new().expect("create tmp csv");
-    writeln!(tmp, "row_id,int_col,float_col,text_col,bool_col,date_col").unwrap();
+    writeln!(tmp, "id,int_col,float_col,text_col,bool_col,date_col").unwrap();
     writeln!(tmp, "0,10,1.5,hello,true,2024-01-01").unwrap();
     writeln!(tmp, "1,20,2.5,world,false,2024-01-02").unwrap();
     writeln!(tmp, "2,30,3.5,test,true,2024-01-03").unwrap();
