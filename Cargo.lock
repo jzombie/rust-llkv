@@ -1195,6 +1195,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-dsl"
+version = "0.2.0-alpha"
+dependencies = [
+ "arrow",
+ "llkv-column-map",
+ "llkv-expr",
+ "llkv-result",
+ "llkv-storage",
+ "llkv-table",
+ "simd-r-drive-entry-handle",
+ "time",
+ "tracing",
+]
+
+[[package]]
 name = "llkv-expr"
 version = "0.2.0-alpha"
 dependencies = [
@@ -1247,6 +1262,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "llkv-column-map",
+ "llkv-dsl",
  "llkv-expr",
  "llkv-result",
  "llkv-storage",

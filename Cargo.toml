@@ -9,6 +9,7 @@ publish = true
 [workspace.dependencies]
 llkv-column-map = { path = "./llkv-column-map", version = "0.2.0-alpha" }
 llkv-csv = { path = "./llkv-csv", version = "0.2.0-alpha" }
+llkv-dsl = { path = "./llkv-dsl", version = "0.2.0-alpha" }
 llkv-expr = { path = "./llkv-expr", version = "0.2.0-alpha" }
 llkv-join = { path = "./llkv-join", version = "0.2.0-alpha" }
 llkv-plan = { path = "./llkv-plan", version = "0.2.0-alpha" }
@@ -52,6 +53,7 @@ tracing-subscriber = { version = "0.3.2", features = ["env-filter"] }
 members = [
     "llkv-column-map",
     "llkv-csv",
+    "llkv-dsl",
     "llkv-expr",
     "llkv-join",
     "llkv-plan",

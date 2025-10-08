@@ -1,4 +1,5 @@
 use crate::SqlResult;
+use llkv_dsl::DslValue;
 use llkv_result::Error;
 use sqlparser::ast::{Expr as SqlExpr, UnaryOperator, Value, ValueWithSpan};
 
@@ -66,5 +67,16 @@ fn parse_number_literal(text: &str) -> SqlResult<SqlValue> {
             Error::InvalidArgumentError(format!("invalid integer literal: {err}"))
         })?;
         Ok(SqlValue::Integer(value))
+    }
+}
+
+impl From<SqlValue> for DslValue {
+    fn from(value: SqlValue) -> Self {
+        match value {
+            SqlValue::Null => DslValue::Null,
+            SqlValue::Integer(v) => DslValue::Integer(v),
+            SqlValue::Float(v) => DslValue::Float(v),
+            SqlValue::String(s) => DslValue::String(s),
+        }
     }
 }
