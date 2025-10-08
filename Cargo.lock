@@ -1181,6 +1181,7 @@ dependencies = [
  "rustc-hash",
  "simd-r-drive-entry-handle",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -1251,6 +1252,7 @@ dependencies = [
  "rustc-hash",
  "simd-r-drive-entry-handle",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

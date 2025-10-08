@@ -263,16 +263,16 @@ where
                         &mut on_batch,
                     ),
                     _ => {
-                        // eprintln!(
-                        //     "Hash join does not yet support {:?}, falling back would cause issues",
-                        //     options.join_type
-                        // );
+                        tracing::debug!(
+                            join_type = ?options.join_type,
+                            "Hash join does not yet support this join type; skipping batch processing"
+                        );
                         Ok(())
                     }
                 };
 
-                if let Err(_e) = result {
-                    // TODO: re-enable logging once tracing is wired up
+                if let Err(err) = result {
+                    tracing::debug!(error = %err, "Hash join batch processing failed");
                 }
             },
         )?;
@@ -1089,13 +1089,16 @@ macro_rules! impl_integer_fast_path {
                                 &mut on_batch,
                             ),
                             _ => {
-                                // eprintln!("Hash join does not yet support {:?}", options.join_type);
+                                tracing::debug!(
+                                    join_type = ?options.join_type,
+                                    "Hash join does not yet support this join type; skipping batch processing"
+                                );
                                 Ok(())
                             }
                         };
 
-                        if let Err(_e) = result {
-                            // TODO: re-enable logging once tracing is wired up
+                        if let Err(err) = result {
+                            tracing::debug!(error = %err, "Hash join batch processing failed");
                         }
                     },
                 )?;
@@ -1136,10 +1139,11 @@ macro_rules! impl_integer_fast_path {
                     let key_array = match key_column.as_any().downcast_ref::<$arrow_array>() {
                         Some(arr) => arr,
                         None => {
-                            // eprintln!(
-                            //     "Fast-path: Expected array type but got {:?}",
-                            //     key_column.data_type()
-                            // );
+                            tracing::debug!(
+                                expected_array = stringify!($arrow_array),
+                                actual_type = ?key_column.data_type(),
+                                "Fast-path expected array type mismatch; falling back to generic path"
+                            );
                             batches.push(batch.clone());
                             return;
                         }
