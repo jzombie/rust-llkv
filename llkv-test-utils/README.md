@@ -81,4 +81,4 @@ Because the auto-init attaches a subscriber early for the whole test binary, the
 
 ## License
 
-Licensed under the [Apache-2.0 License](./LICENSE).
+Licensed under the [Apache-2.0 License](../LICENSE).
