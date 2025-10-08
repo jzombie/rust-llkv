@@ -153,7 +153,7 @@ where
             columns,
             source: None,
         };
-        self.context.create_table(plan)
+        self.context.create_table_plan(plan)
     }
 
     fn handle_create_table_as(
@@ -179,7 +179,7 @@ where
             columns: Vec::new(),
             source: Some(CreateTableSource::Batches { schema, batches }),
         };
-        self.context.create_table(plan)
+        self.context.create_table_plan(plan)
     }
 
     fn handle_insert(&self, stmt: sqlparser::ast::Insert) -> SqlResult<StatementResult<P>> {
@@ -259,8 +259,7 @@ where
                 if let Some(range_rows) = extract_rows_from_range(select.as_ref())? {
                     InsertSource::Rows(range_rows.into_rows())
                 } else {
-                    let execution =
-                        self.execute_query_collect((**source_expr).clone())?;
+                    let execution = self.execute_query_collect((**source_expr).clone())?;
                     let rows = execution.into_rows()?;
                     InsertSource::Rows(rows)
                 }
@@ -1152,9 +1151,9 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            StatementResult::Select {
-                execution, ..
-            } => execution.collect().expect("collect batches"),
+            StatementResult::Select { execution, .. } => {
+                execution.collect().expect("collect batches")
+            }
             _ => panic!("expected select result"),
         };
         assert_eq!(batches.len(), 1);

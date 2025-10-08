@@ -22,14 +22,14 @@ use llkv_result::Error;
 use llkv_storage::pager::Pager;
 use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, TableId};
-use llkv_table::{ColMeta, SysCatalog, TableMeta, CATALOG_TABLE_ID};
+use llkv_table::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
 use simd_r_drive_entry_handle::EntryHandle;
-use time::{Date, Month};
 use sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName, ObjectNamePart,
-    Select, SelectItem, SelectItemQualifiedWildcardKind, TableAlias, TableFactor,
-    UnaryOperator, Value, ValueWithSpan,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName, ObjectNamePart, Select,
+    SelectItem, SelectItemQualifiedWildcardKind, TableAlias, TableFactor, UnaryOperator, Value,
+    ValueWithSpan,
 };
+use time::{Date, Month};
 
 pub type DslResult<T> = llkv_result::Result<T>;
 
@@ -60,7 +60,6 @@ where
     },
 }
 
-
 impl<P> fmt::Debug for StatementResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -88,18 +87,15 @@ where
                 .field("rows_updated", rows_updated)
                 .finish(),
             StatementResult::Select {
-                table_name,
-                schema,
-                ..
+                table_name, schema, ..
             } => f
                 .debug_struct("Select")
                 .field("table_name", table_name)
                 .field("schema", schema)
                 .finish(),
-            StatementResult::Transaction { kind } => f
-                .debug_struct("Transaction")
-                .field("kind", kind)
-                .finish(),
+            StatementResult::Transaction { kind } => {
+                f.debug_struct("Transaction").field("kind", kind).finish()
+            }
         }
     }
 }
@@ -144,6 +140,16 @@ impl From<f64> for DslValue {
     }
 }
 
+impl From<bool> for DslValue {
+    fn from(value: bool) -> Self {
+        if value {
+            Self::Integer(1)
+        } else {
+            Self::Integer(0)
+        }
+    }
+}
+
 /// Specification for creating a table.
 #[derive(Clone, Debug)]
 pub struct CreateTablePlan {
@@ -178,6 +184,61 @@ impl ColumnSpec {
             data_type,
             nullable,
         }
+    }
+}
+
+pub trait IntoColumnSpec {
+    fn into_column_spec(self) -> ColumnSpec;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnNullability {
+    Nullable,
+    NotNull,
+}
+
+impl ColumnNullability {
+    fn is_nullable(self) -> bool {
+        matches!(self, ColumnNullability::Nullable)
+    }
+}
+
+#[allow(non_upper_case_globals)]
+pub const Nullable: ColumnNullability = ColumnNullability::Nullable;
+
+#[allow(non_upper_case_globals)]
+pub const NotNull: ColumnNullability = ColumnNullability::NotNull;
+
+impl IntoColumnSpec for ColumnSpec {
+    fn into_column_spec(self) -> ColumnSpec {
+        self
+    }
+}
+
+impl<'a, T> IntoColumnSpec for &'a T
+where
+    T: Clone + IntoColumnSpec,
+{
+    fn into_column_spec(self) -> ColumnSpec {
+        self.clone().into_column_spec()
+    }
+}
+
+impl<'a> IntoColumnSpec for (&'a str, DataType) {
+    fn into_column_spec(self) -> ColumnSpec {
+        ColumnSpec::new(self.0, self.1, true)
+    }
+}
+
+impl<'a> IntoColumnSpec for (&'a str, DataType, bool) {
+    fn into_column_spec(self) -> ColumnSpec {
+        ColumnSpec::new(self.0, self.1, self.2)
+    }
+}
+
+impl<'a> IntoColumnSpec for (&'a str, DataType, ColumnNullability) {
+    fn into_column_spec(self) -> ColumnSpec {
+        ColumnSpec::new(self.0, self.1, self.2.is_nullable())
     }
 }
 
@@ -355,7 +416,27 @@ where
         }
     }
 
-    pub fn create_table(&self, plan: CreateTablePlan) -> DslResult<StatementResult<P>> {
+    pub fn create_table<C, I>(self: &Arc<Self>, name: &str, columns: I) -> DslResult<TableHandle<P>>
+    where
+        C: IntoColumnSpec,
+        I: IntoIterator<Item = C>,
+    {
+        self.create_table_with_options(name, columns, false)
+    }
+
+    pub fn create_table_if_not_exists<C, I>(
+        self: &Arc<Self>,
+        name: &str,
+        columns: I,
+    ) -> DslResult<TableHandle<P>>
+    where
+        C: IntoColumnSpec,
+        I: IntoIterator<Item = C>,
+    {
+        self.create_table_with_options(name, columns, true)
+    }
+
+    pub fn create_table_plan(&self, plan: CreateTablePlan) -> DslResult<StatementResult<P>> {
         if plan.columns.is_empty() && plan.source.is_none() {
             return Err(Error::InvalidArgumentError(
                 "CREATE TABLE requires explicit columns or a source".into(),
@@ -380,15 +461,13 @@ where
         }
 
         match plan.source {
-            Some(CreateTableSource::Batches { schema, batches }) => {
-                self.create_table_from_batches(
-                    display_name,
-                    canonical_name,
-                    schema,
-                    batches,
-                    plan.if_not_exists,
-                )
-            }
+            Some(CreateTableSource::Batches { schema, batches }) => self.create_table_from_batches(
+                display_name,
+                canonical_name,
+                schema,
+                batches,
+                plan.if_not_exists,
+            ),
             None => self.create_table_from_columns(
                 display_name,
                 canonical_name,
@@ -398,11 +477,49 @@ where
         }
     }
 
+    pub fn create_table_builder(&self, name: &str) -> CreateTableBuilder<'_, P> {
+        CreateTableBuilder {
+            ctx: self,
+            plan: CreateTablePlan::new(name),
+        }
+    }
+
+    fn execute_create_table(&self, plan: CreateTablePlan) -> DslResult<StatementResult<P>> {
+        self.create_table_plan(plan)
+    }
+
+    fn create_table_with_options<C, I>(
+        self: &Arc<Self>,
+        name: &str,
+        columns: I,
+        if_not_exists: bool,
+    ) -> DslResult<TableHandle<P>>
+    where
+        C: IntoColumnSpec,
+        I: IntoIterator<Item = C>,
+    {
+        let mut plan = CreateTablePlan::new(name);
+        plan.if_not_exists = if_not_exists;
+        plan.columns = columns
+            .into_iter()
+            .map(|column| column.into_column_spec())
+            .collect();
+        let result = self.create_table_plan(plan)?;
+        match result {
+            StatementResult::CreateTable { .. } => TableHandle::new(Arc::clone(self), name),
+            other => Err(Error::InvalidArgumentError(format!(
+                "unexpected statement result {other:?} when creating table"
+            ))),
+        }
+    }
+
     pub fn insert(&self, plan: InsertPlan) -> DslResult<StatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
         match plan.source {
-            InsertSource::Rows(rows) => self.insert_rows(table.as_ref(), display_name, rows, plan.columns),
+            InsertSource::Rows(rows) => {
+                self.insert_rows(table.as_ref(), display_name, rows, plan.columns)
+            }
             InsertSource::Batches(batches) => {
                 self.insert_batches(table.as_ref(), display_name, batches, plan.columns)
             }
@@ -413,6 +530,10 @@ where
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
         self.update_all_rows(table.as_ref(), display_name, plan.assignments)
+    }
+
+    pub fn table_handle(self: &Arc<Self>, name: &str) -> DslResult<TableHandle<P>> {
+        TableHandle::new(Arc::clone(self), name)
     }
 
     pub fn begin_transaction(&self) -> DslResult<StatementResult<P>> {
@@ -658,12 +779,8 @@ where
             table_entry.table.append(&append_batch)?;
         }
 
-        table_entry
-            .next_row_id
-            .store(next_row_id, Ordering::SeqCst);
-        table_entry
-            .total_rows
-            .store(total_rows, Ordering::SeqCst);
+        table_entry.next_row_id.store(next_row_id, Ordering::SeqCst);
+        table_entry.total_rows.store(total_rows, Ordering::SeqCst);
 
         let mut tables = self.tables.write().unwrap();
         if tables.contains_key(&canonical_name) {
@@ -709,7 +826,8 @@ where
         }
 
         let row_count = rows.len();
-        let mut column_values: Vec<Vec<DslValue>> = vec![Vec::with_capacity(row_count); table.schema.columns.len()];
+        let mut column_values: Vec<Vec<DslValue>> =
+            vec![Vec::with_capacity(row_count); table.schema.columns.len()];
         for row in rows {
             for (idx, value) in row.into_iter().enumerate() {
                 let dest_index = column_order[idx];
@@ -800,12 +918,7 @@ where
                 rows.push(row);
             }
 
-            match self.insert_rows(
-                table,
-                display_name.clone(),
-                rows,
-                columns.clone(),
-            )? {
+            match self.insert_rows(table, display_name.clone(), rows, columns.clone())? {
                 StatementResult::Insert { rows_inserted, .. } => {
                     total_rows_inserted += rows_inserted;
                 }
@@ -862,15 +975,12 @@ where
                     assignment.column
                 )));
             }
-            let column = table
-                .schema
-                .resolve(&assignment.column)
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError(format!(
-                        "unknown column '{}' in UPDATE",
-                        assignment.column
-                    ))
-                })?;
+            let column = table.schema.resolve(&assignment.column).ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "unknown column '{}' in UPDATE",
+                    assignment.column
+                ))
+            })?;
 
             let values = vec![assignment.value.clone(); total_rows_usize];
             let array = build_array_for_column(&column.data_type, &values)?;
@@ -1203,6 +1313,11 @@ where
     pub fn collect(self) -> DslResult<SelectExecution<P>> {
         self.context.execute_select(self.plan)
     }
+
+    pub fn collect_rows(self) -> DslResult<RowBatch> {
+        let execution = self.context.execute_select(self.plan)?;
+        execution.collect_rows()
+    }
 }
 
 /// Streaming execution handle for SELECT queries.
@@ -1256,11 +1371,7 @@ where
         }
     }
 
-    fn new_single_batch(
-        table_name: String,
-        schema: Arc<Schema>,
-        batch: RecordBatch,
-    ) -> Self {
+    fn new_single_batch(table_name: String, schema: Arc<Schema>, batch: RecordBatch) -> Self {
         Self {
             table_name,
             schema,
@@ -1276,10 +1387,7 @@ where
         Arc::clone(&self.schema)
     }
 
-    pub fn stream(
-        self,
-        mut on_batch: impl FnMut(RecordBatch) -> DslResult<()>,
-    ) -> DslResult<()> {
+    pub fn stream(self, mut on_batch: impl FnMut(RecordBatch) -> DslResult<()>) -> DslResult<()> {
         let schema = Arc::clone(&self.schema);
         match self.stream {
             SelectStream::Projection {
@@ -1327,7 +1435,8 @@ where
         Ok(batches)
     }
 
-    pub fn into_rows(self) -> DslResult<Vec<Vec<DslValue>>> {
+    pub fn collect_rows(self) -> DslResult<RowBatch> {
+        let schema = self.schema();
         let mut rows: Vec<Vec<DslValue>> = Vec::new();
         self.stream(|batch| {
             for row_idx in 0..batch.num_rows() {
@@ -1340,7 +1449,16 @@ where
             }
             Ok(())
         })?;
-        Ok(rows)
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect();
+        Ok(RowBatch { columns, rows })
+    }
+
+    pub fn into_rows(self) -> DslResult<Vec<Vec<DslValue>>> {
+        Ok(self.collect_rows()?.rows)
     }
 }
 
@@ -1432,8 +1550,13 @@ struct AggregateState {
 }
 
 enum AggregateAccumulator {
-    CountStar { value: i64 },
-    CountColumn { column_index: usize, value: i64 },
+    CountStar {
+        value: i64,
+    },
+    CountColumn {
+        column_index: usize,
+        value: i64,
+    },
     SumInt64 {
         column_index: usize,
         value: i64,
@@ -1564,12 +1687,9 @@ impl AggregateAccumulator {
             } => {
                 let array = batch.column(*column_index);
                 let non_null = (0..array.len()).filter(|idx| array.is_valid(*idx)).count();
-                let non_null =
-                    i64::try_from(non_null).map_err(|_| {
-                        Error::InvalidArgumentError(
-                            "COUNT result exceeds i64 range".into(),
-                        )
-                    })?;
+                let non_null = i64::try_from(non_null).map_err(|_| {
+                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
+                })?;
                 *value = value.checked_add(non_null).ok_or_else(|| {
                     Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
                 })?;
@@ -1644,12 +1764,9 @@ impl AggregateAccumulator {
             } => {
                 let array = batch.column(*column_index);
                 let non_null = (0..array.len()).filter(|idx| array.is_valid(*idx)).count();
-                let non_null =
-                    i64::try_from(non_null).map_err(|_| {
-                        Error::InvalidArgumentError(
-                            "COUNT result exceeds i64 range".into(),
-                        )
-                    })?;
+                let non_null = i64::try_from(non_null).map_err(|_| {
+                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
+                })?;
                 *non_null_rows = non_null_rows.checked_add(non_null).ok_or_else(|| {
                     Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
                 })?;
@@ -1759,19 +1876,17 @@ fn current_time_micros() -> u64 {
         .as_micros() as u64
 }
 
-fn resolve_insert_columns(
-    columns: &[String],
-    schema: &DslSchema,
-) -> DslResult<Vec<usize>> {
+fn resolve_insert_columns(columns: &[String], schema: &DslSchema) -> DslResult<Vec<usize>> {
     if columns.is_empty() {
         return Ok((0..schema.columns.len()).collect());
     }
     let mut resolved = Vec::with_capacity(columns.len());
     for column in columns {
         let normalized = column.to_ascii_lowercase();
-        let index = schema.lookup.get(&normalized).ok_or_else(|| {
-            Error::InvalidArgumentError(format!("unknown column '{}'", column))
-        })?;
+        let index = schema
+            .lookup
+            .get(&normalized)
+            .ok_or_else(|| Error::InvalidArgumentError(format!("unknown column '{}'", column)))?;
         resolved.push(*index);
     }
     Ok(resolved)
@@ -1911,9 +2026,12 @@ fn dsl_value_from_array(array: &ArrayRef, index: usize) -> DslResult<DslValue> {
             Ok(DslValue::Integer(values.value(index)))
         }
         DataType::Float64 => {
-            let values = array.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
-                Error::InvalidArgumentError("expected Float64 array in INSERT SELECT".into())
-            })?;
+            let values = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("expected Float64 array in INSERT SELECT".into())
+                })?;
             Ok(DslValue::Float(values.value(index)))
         }
         DataType::Utf8 => {
@@ -1972,10 +2090,7 @@ where
             }
             SelectProjection::Column { name, alias } => {
                 let column = table.schema.resolve(name).ok_or_else(|| {
-                    Error::InvalidArgumentError(format!(
-                        "unknown column '{}' in projection",
-                        name
-                    ))
+                    Error::InvalidArgumentError(format!("unknown column '{}' in projection", name))
                 })?;
                 let alias = alias.clone().unwrap_or_else(|| column.name.clone());
                 result.push(ScanProjection::from(StoreProjection::with_alias(
@@ -2031,12 +2146,13 @@ where
                     ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
                     ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
                     ScalarExpr::Column(field_id) => {
-                        let column = table.schema.column_by_field_id(*field_id).ok_or_else(|| {
-                            Error::InvalidArgumentError(format!(
-                                "unknown column with field id {} in computed projection",
-                                field_id
-                            ))
-                        })?;
+                        let column =
+                            table.schema.column_by_field_id(*field_id).ok_or_else(|| {
+                                Error::InvalidArgumentError(format!(
+                                    "unknown column with field id {} in computed projection",
+                                    field_id
+                                ))
+                            })?;
                         column.data_type.clone()
                     }
                     ScalarExpr::Binary { .. } => DataType::Float64,
@@ -2096,7 +2212,9 @@ fn translate_predicate(
             }
             Ok(LlkvExpr::Or(converted))
         }
-        LlkvExpr::Not(inner) => Ok(LlkvExpr::Not(Box::new(translate_predicate(*inner, schema)?))),
+        LlkvExpr::Not(inner) => Ok(LlkvExpr::Not(Box::new(translate_predicate(
+            *inner, schema,
+        )?))),
         LlkvExpr::Pred(Filter { field_id, op }) => {
             let column = schema.resolve(&field_id).ok_or_else(|| {
                 Error::InvalidArgumentError(format!("unknown column '{field_id}' in filter"))
@@ -2114,7 +2232,10 @@ fn translate_predicate(
     }
 }
 
-fn translate_scalar(expr: &ScalarExpr<String>, schema: &DslSchema) -> DslResult<ScalarExpr<FieldId>> {
+fn translate_scalar(
+    expr: &ScalarExpr<String>,
+    schema: &DslSchema,
+) -> DslResult<ScalarExpr<FieldId>> {
     match expr {
         ScalarExpr::Column(name) => {
             let column = schema.resolve(name).ok_or_else(|| {
@@ -2164,14 +2285,14 @@ fn dsl_value_from_sql_value(value: &ValueWithSpan) -> DslResult<DslValue> {
         Value::Null => Ok(DslValue::Null),
         Value::Number(text, _) => {
             if text.contains(['.', 'e', 'E']) {
-                let parsed = text
-                    .parse::<f64>()
-                    .map_err(|err| Error::InvalidArgumentError(format!("invalid float literal: {err}")))?;
+                let parsed = text.parse::<f64>().map_err(|err| {
+                    Error::InvalidArgumentError(format!("invalid float literal: {err}"))
+                })?;
                 Ok(DslValue::Float(parsed))
             } else {
-                let parsed = text
-                    .parse::<i64>()
-                    .map_err(|err| Error::InvalidArgumentError(format!("invalid integer literal: {err}")))?;
+                let parsed = text.parse::<i64>().map_err(|err| {
+                    Error::InvalidArgumentError(format!("invalid integer literal: {err}"))
+                })?;
                 Ok(DslValue::Integer(parsed))
             }
         }
@@ -2467,53 +2588,414 @@ fn parse_range_spec_from_args(
     }))
 }
 
+#[derive(Clone, Debug)]
+pub struct RowBatch {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<DslValue>>,
+}
+
+pub struct CreateTableBuilder<'ctx, P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    ctx: &'ctx DslContext<P>,
+    plan: CreateTablePlan,
+}
+
+impl<'ctx, P> CreateTableBuilder<'ctx, P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    pub fn if_not_exists(mut self) -> Self {
+        self.plan.if_not_exists = true;
+        self
+    }
+
+    pub fn with_column(mut self, name: impl Into<String>, data_type: DataType) -> Self {
+        self.plan
+            .columns
+            .push(ColumnSpec::new(name.into(), data_type, true));
+        self
+    }
+
+    pub fn with_not_null_column(mut self, name: impl Into<String>, data_type: DataType) -> Self {
+        self.plan
+            .columns
+            .push(ColumnSpec::new(name.into(), data_type, false));
+        self
+    }
+
+    pub fn with_column_spec(mut self, spec: ColumnSpec) -> Self {
+        self.plan.columns.push(spec);
+        self
+    }
+
+    pub fn finish(self) -> DslResult<StatementResult<P>> {
+        self.ctx.execute_create_table(self.plan)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Row {
+    values: Vec<(String, DslValue)>,
+}
+
+impl Row {
+    pub fn new() -> Self {
+        Self { values: Vec::new() }
+    }
+
+    pub fn with(mut self, name: impl Into<String>, value: impl Into<DslValue>) -> Self {
+        self.set(name, value);
+        self
+    }
+
+    pub fn set(&mut self, name: impl Into<String>, value: impl Into<DslValue>) -> &mut Self {
+        let name = name.into();
+        let value = value.into();
+        if let Some((_, existing)) = self.values.iter_mut().find(|(n, _)| *n == name) {
+            *existing = value;
+        } else {
+            self.values.push((name, value));
+        }
+        self
+    }
+
+    fn columns(&self) -> Vec<String> {
+        self.values.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    fn values_for_columns(&self, columns: &[String]) -> DslResult<Vec<DslValue>> {
+        let mut out = Vec::with_capacity(columns.len());
+        for column in columns {
+            let value = self
+                .values
+                .iter()
+                .find(|(name, _)| name == column)
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "insert row missing value for column '{}'",
+                        column
+                    ))
+                })?;
+            out.push(value.1.clone());
+        }
+        Ok(out)
+    }
+}
+
+pub fn row() -> Row {
+    Row::new()
+}
+
+#[doc(hidden)]
+pub enum InsertRowKind {
+    Named {
+        columns: Vec<String>,
+        values: Vec<DslValue>,
+    },
+    Positional(Vec<DslValue>),
+}
+
+pub trait IntoInsertRow {
+    fn into_insert_row(self) -> DslResult<InsertRowKind>;
+}
+
+impl IntoInsertRow for Row {
+    fn into_insert_row(self) -> DslResult<InsertRowKind> {
+        let row = self;
+        if row.values.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "insert requires at least one column".into(),
+            ));
+        }
+        let columns = row.columns();
+        let values = row.values_for_columns(&columns)?;
+        Ok(InsertRowKind::Named { columns, values })
+    }
+}
+
+impl<'a, T> IntoInsertRow for &'a T
+where
+    T: Clone + IntoInsertRow,
+{
+    fn into_insert_row(self) -> DslResult<InsertRowKind> {
+        self.clone().into_insert_row()
+    }
+}
+
+impl<T> IntoInsertRow for Vec<T>
+where
+    T: Into<DslValue>,
+{
+    fn into_insert_row(self) -> DslResult<InsertRowKind> {
+        if self.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "insert requires at least one column".into(),
+            ));
+        }
+        Ok(InsertRowKind::Positional(
+            self.into_iter().map(Into::into).collect(),
+        ))
+    }
+}
+
+impl<T, const N: usize> IntoInsertRow for [T; N]
+where
+    T: Into<DslValue>,
+{
+    fn into_insert_row(self) -> DslResult<InsertRowKind> {
+        if N == 0 {
+            return Err(Error::InvalidArgumentError(
+                "insert requires at least one column".into(),
+            ));
+        }
+        Ok(InsertRowKind::Positional(
+            self.into_iter().map(Into::into).collect(),
+        ))
+    }
+}
+
+macro_rules! impl_into_insert_row_tuple {
+    ($($type:ident => $value:ident),+) => {
+        impl<$($type,)+> IntoInsertRow for ($($type,)+)
+        where
+            $($type: Into<DslValue>,)+
+        {
+            fn into_insert_row(self) -> DslResult<InsertRowKind> {
+                let ($($value,)+) = self;
+                Ok(InsertRowKind::Positional(vec![$($value.into(),)+]))
+            }
+        }
+    };
+}
+
+impl_into_insert_row_tuple!(T1 => v1);
+impl_into_insert_row_tuple!(T1 => v1, T2 => v2);
+impl_into_insert_row_tuple!(T1 => v1, T2 => v2, T3 => v3);
+impl_into_insert_row_tuple!(T1 => v1, T2 => v2, T3 => v3, T4 => v4);
+impl_into_insert_row_tuple!(T1 => v1, T2 => v2, T3 => v3, T4 => v4, T5 => v5);
+impl_into_insert_row_tuple!(T1 => v1, T2 => v2, T3 => v3, T4 => v4, T5 => v5, T6 => v6);
+impl_into_insert_row_tuple!(
+    T1 => v1,
+    T2 => v2,
+    T3 => v3,
+    T4 => v4,
+    T5 => v5,
+    T6 => v6,
+    T7 => v7
+);
+impl_into_insert_row_tuple!(
+    T1 => v1,
+    T2 => v2,
+    T3 => v3,
+    T4 => v4,
+    T5 => v5,
+    T6 => v6,
+    T7 => v7,
+    T8 => v8
+);
+
+pub struct TableHandle<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    context: Arc<DslContext<P>>,
+    display_name: String,
+    _canonical_name: String,
+}
+
+impl<P> TableHandle<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    pub fn new(context: Arc<DslContext<P>>, name: &str) -> DslResult<Self> {
+        let (display_name, canonical_name) = canonical_table_name(name)?;
+        context.lookup_table(&canonical_name)?;
+        Ok(Self {
+            context,
+            display_name,
+            _canonical_name: canonical_name,
+        })
+    }
+
+    pub fn lazy(&self) -> DslResult<LazyFrame<P>> {
+        LazyFrame::scan(Arc::clone(&self.context), &self.display_name)
+    }
+
+    pub fn insert_rows<R>(&self, rows: impl IntoIterator<Item = R>) -> DslResult<StatementResult<P>>
+    where
+        R: IntoInsertRow,
+    {
+        enum InsertMode {
+            Named,
+            Positional,
+        }
+
+        let table = self.context.lookup_table(&self._canonical_name)?;
+        let schema = table.schema.as_ref();
+        let schema_column_names: Vec<String> =
+            schema.columns.iter().map(|col| col.name.clone()).collect();
+        let mut normalized_rows: Vec<Vec<DslValue>> = Vec::new();
+        let mut mode: Option<InsertMode> = None;
+        let mut column_names: Option<Vec<String>> = None;
+        let mut row_count = 0usize;
+
+        for row in rows.into_iter() {
+            row_count += 1;
+            match row.into_insert_row()? {
+                InsertRowKind::Named { columns, values } => {
+                    if let Some(existing) = &mode {
+                        if !matches!(existing, InsertMode::Named) {
+                            return Err(Error::InvalidArgumentError(
+                                "cannot mix positional and named insert rows".into(),
+                            ));
+                        }
+                    } else {
+                        mode = Some(InsertMode::Named);
+                        let mut seen = HashSet::new();
+                        for column in &columns {
+                            if !seen.insert(column.clone()) {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "duplicate column '{}' in insert row",
+                                    column
+                                )));
+                            }
+                        }
+                        column_names = Some(columns.clone());
+                    }
+
+                    let expected = column_names
+                        .as_ref()
+                        .expect("column names must be initialized for named insert");
+                    if columns != *expected {
+                        return Err(Error::InvalidArgumentError(
+                            "insert rows must specify the same columns".into(),
+                        ));
+                    }
+                    if values.len() != expected.len() {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "insert row expected {} values, found {}",
+                            expected.len(),
+                            values.len()
+                        )));
+                    }
+                    normalized_rows.push(values);
+                }
+                InsertRowKind::Positional(values) => {
+                    if let Some(existing) = &mode {
+                        if !matches!(existing, InsertMode::Positional) {
+                            return Err(Error::InvalidArgumentError(
+                                "cannot mix positional and named insert rows".into(),
+                            ));
+                        }
+                    } else {
+                        mode = Some(InsertMode::Positional);
+                        column_names = Some(schema_column_names.clone());
+                    }
+
+                    if values.len() != schema.columns.len() {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "insert row expected {} values, found {}",
+                            schema.columns.len(),
+                            values.len()
+                        )));
+                    }
+                    normalized_rows.push(values);
+                }
+            }
+        }
+
+        if row_count == 0 {
+            return Err(Error::InvalidArgumentError(
+                "insert requires at least one row".into(),
+            ));
+        }
+
+        let columns = column_names.unwrap_or_else(|| schema_column_names.clone());
+        self.insert_row_batch(RowBatch {
+            columns,
+            rows: normalized_rows,
+        })
+    }
+
+    pub fn insert_row_batch(&self, batch: RowBatch) -> DslResult<StatementResult<P>> {
+        if batch.rows.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "insert requires at least one row".into(),
+            ));
+        }
+        if batch.columns.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "insert requires at least one column".into(),
+            ));
+        }
+        for row in &batch.rows {
+            if row.len() != batch.columns.len() {
+                return Err(Error::InvalidArgumentError(
+                    "insert rows must have values for every column".into(),
+                ));
+            }
+        }
+
+        let plan = InsertPlan {
+            table: self.display_name.clone(),
+            columns: batch.columns,
+            source: InsertSource::Rows(batch.rows),
+        };
+        self.context.insert(plan)
+    }
+
+    pub fn insert_batches(&self, batches: Vec<RecordBatch>) -> DslResult<StatementResult<P>> {
+        let plan = InsertPlan {
+            table: self.display_name.clone(),
+            columns: Vec::new(),
+            source: InsertSource::Batches(batches),
+        };
+        self.context.insert(plan)
+    }
+
+    pub fn insert_lazy(&self, frame: LazyFrame<P>) -> DslResult<StatementResult<P>> {
+        let RowBatch { columns, rows } = frame.collect_rows()?;
+        self.insert_row_batch(RowBatch { columns, rows })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.display_name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::{Array, Int64Array, StringArray};
     use llkv_storage::pager::MemPager;
+    use std::sync::Arc;
 
     #[test]
     fn create_insert_select_roundtrip() {
         let pager = Arc::new(MemPager::default());
-        let context = DslContext::new(pager);
+        let context = Arc::new(DslContext::new(pager));
 
-        let plan = CreateTablePlan {
-            name: "people".into(),
-            if_not_exists: false,
-            columns: vec![
-                ColumnSpec::new("id", DataType::Int64, false),
-                ColumnSpec::new("name", DataType::Utf8, false),
-            ],
-            source: None,
-        };
-        let result = context.create_table(plan).expect("create table");
-        matches!(result, StatementResult::CreateTable { .. });
+        let table = context
+            .create_table(
+                "people",
+                [
+                    ("id", DataType::Int64, NotNull),
+                    ("name", DataType::Utf8, Nullable),
+                ],
+            )
+            .expect("create table");
+        table
+            .insert_rows([(1_i64, "alice"), (2_i64, "bob")])
+            .expect("insert rows");
 
-        let insert = InsertPlan {
-            table: "people".into(),
-            columns: vec!["id".into(), "name".into()],
-            source: InsertSource::Rows(vec![
-                vec![DslValue::Integer(1), DslValue::from("alice")],
-                vec![DslValue::Integer(2), DslValue::from("bob")],
-            ]),
-        };
-        let result = context.insert(insert).expect("insert rows");
-        match result {
-            StatementResult::Insert { rows_inserted, .. } => assert_eq!(rows_inserted, 2),
-            other => panic!("expected insert result, got {other:?}"),
-        }
-
-        let select_plan =
-            SelectPlan::new("people").with_projections(vec![SelectProjection::Column {
-                name: "name".into(),
-                alias: None,
-            }]);
-        let execution = context.execute_select(select_plan).expect("select rows");
-        let batches = execution.collect().expect("collect batches");
+        let execution = table.lazy().expect("lazy scan");
+        let select = execution.collect().expect("build select execution");
+        let batches = select.collect().expect("collect batches");
         assert_eq!(batches.len(), 1);
         let column = batches[0]
-            .column(0)
+            .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("string column");
@@ -2523,33 +3005,21 @@ mod tests {
     #[test]
     fn aggregate_count_nulls() {
         let pager = Arc::new(MemPager::default());
-        let context = DslContext::new(pager);
+        let context = Arc::new(DslContext::new(pager));
 
-        context
-            .create_table(CreateTablePlan {
-                name: "ints".into(),
-                if_not_exists: false,
-                columns: vec![ColumnSpec::new("i", DataType::Int64, true)],
-                source: None,
-            })
+        let table = context
+            .create_table("ints", [("i", DataType::Int64)])
             .expect("create table");
-
-        context
-            .insert(InsertPlan {
-                table: "ints".into(),
-                columns: vec!["i".into()],
-                source: InsertSource::Rows(vec![
-                    vec![DslValue::Null],
-                    vec![DslValue::Integer(1)],
-                    vec![DslValue::Null],
-                ]),
-            })
+        table
+            .insert_rows([
+                (DslValue::Null,),
+                (DslValue::Integer(1),),
+                (DslValue::Null,),
+            ])
             .expect("insert rows");
 
-        let plan = SelectPlan::new("ints").with_aggregates(vec![AggregateExpr::count_nulls(
-            "i",
-            "nulls",
-        )]);
+        let plan =
+            SelectPlan::new("ints").with_aggregates(vec![AggregateExpr::count_nulls("i", "nulls")]);
         let execution = context.execute_select(plan).expect("select");
         let batches = execution.collect().expect("collect batches");
         let column = batches[0]
