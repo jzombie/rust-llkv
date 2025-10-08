@@ -11,11 +11,12 @@ llkv-column-map = { path = "./llkv-column-map", version = "0.2.0-alpha" }
 llkv-csv = { path = "./llkv-csv", version = "0.2.0-alpha" }
 llkv-expr = { path = "./llkv-expr", version = "0.2.0-alpha" }
 llkv-join = { path = "./llkv-join", version = "0.2.0-alpha" }
+llkv-plan = { path = "./llkv-plan", version = "0.2.0-alpha" }
 llkv-result = { path = "./llkv-result", version = "0.2.0-alpha" }
 llkv-sql = { path = "./llkv-sql", version = "0.2.0-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.2.0-alpha" }
 llkv-table = { path = "./llkv-table", version = "0.2.0-alpha" }
-llkv-plan = { path = "./llkv-plan", version = "0.2.0-alpha" }
+llkv-test-utils = { path = "./llkv-test-utils", version = "0.2.0-alpha" }
 simd-r-drive = "0.15.0-alpha"
 simd-r-drive-entry-handle = "0.15.0-alpha"
 
@@ -44,6 +45,8 @@ serde_json = "1.0.145"
 sqllogictest = "0.28.4"
 time = { version = "0.3.44", features = ["parsing"] }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.2", features = ["env-filter"] }
 
 [workspace]
 members = [
@@ -55,6 +58,7 @@ members = [
     "llkv-result",
     "llkv-sql",
     "llkv-storage",
-    "llkv-table"
+    "llkv-table",
+    "llkv-test-utils"
 ]
 resolver = "2"

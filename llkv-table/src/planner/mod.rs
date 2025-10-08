@@ -782,10 +782,11 @@ where
                                 match store.prepare_gather_context(unique_lfids.as_ref()) {
                                     Ok(ctx) => ctx,
                                     Err(e) => {
-                                        // eprintln!(
-                                        //     "prepare_gather_context failed for lfids={:?}: {e:?}",
-                                        //     unique_lfids
-                                        // );
+                                        tracing::debug!(
+                                            ?unique_lfids,
+                                            error = %e,
+                                            "prepare_gather_context failed"
+                                        );
                                         return Err(e);
                                     }
                                 };
@@ -882,11 +883,11 @@ where
 
         for batch_result in chunk_batches {
             if let Some(batch) = batch_result? {
-                // eprintln!(
-                //     "TableExecutor produced batch with {} rows and {} columns",
-                //     batch.num_rows(),
-                //     batch.num_columns()
-                // );
+                tracing::debug!(
+                    rows = batch.num_rows(),
+                    columns = batch.num_columns(),
+                    "TableExecutor produced batch"
+                );
                 on_batch(batch);
             }
         }
@@ -1174,11 +1175,11 @@ where
             && let Some(runs) = dense_row_runs(self.table.store(), filter_lfid)?
         {
             let rows = expand_filter_runs(&runs);
-            // eprintln!(
-            //     "collect_row_ids_for_filter dense runs field {:?} -> {} rows",
-            //     filter_lfid,
-            //     rows.len()
-            // );
+            tracing::debug!(
+                field = ?filter_lfid,
+                row_count = rows.len(),
+                "collect_row_ids_for_filter using dense runs"
+            );
             return Ok(rows);
         }
 
@@ -1197,11 +1198,11 @@ where
                 ))),
             ),
         }?;
-        // eprintln!(
-        //     "collect_row_ids_for_filter general field {:?} -> {} rows",
-        //     filter_lfid,
-        //     row_ids.len()
-        // );
+        tracing::debug!(
+            field = ?filter_lfid,
+            row_count = row_ids.len(),
+            "collect_row_ids_for_filter general path"
+        );
 
         Ok(normalize_row_ids(row_ids))
     }

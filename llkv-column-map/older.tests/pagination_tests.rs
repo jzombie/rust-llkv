@@ -102,7 +102,7 @@ fn seed_strings_as_keys(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n: u
     items.shuffle(&mut rng);
     let shuffle_ms = t_shuffle.elapsed().as_secs_f64() * 1e3;
 
-    println!(
+    tracing::info!(
         "[seed keys] built all items: {:.3} ms, shuffle: {:.3} ms, n={}",
         build_all_ms, shuffle_ms, n
     );
@@ -137,7 +137,7 @@ fn seed_strings_as_keys(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n: u
         );
         let ingest_ms = t_ingest.elapsed().as_secs_f64() * 1e3;
 
-        println!(
+        tracing::info!(
             "[seed keys] batch {}/{}: make={:.3} ms, ingest={:.3} ms, \
 items={}",
             bi + 1,
@@ -161,7 +161,7 @@ items={}",
     }
 
     let seed_ms = t_seed.elapsed().as_secs_f64() * 1e3;
-    println!(
+    tracing::info!(
         "[seed keys] totals: batches={}, make_sum={:.3} ms, \
 ingest_sum={:.3} ms, make_max={:.3} ms, ingest_max={:.3} ms, \
 slow_ingests_gt8ms={}, seed_end_to_end={:.3} ms",
@@ -201,7 +201,7 @@ fn seed_strings_as_values(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n:
     items.shuffle(&mut rng);
     let shuffle_ms = t_shuffle.elapsed().as_secs_f64() * 1e3;
 
-    println!(
+    tracing::info!(
         "[seed vals] built all items: {:.3} ms, shuffle: {:.3} ms, n={}",
         build_all_ms, shuffle_ms, n
     );
@@ -236,7 +236,7 @@ fn seed_strings_as_values(store: &ColumnStore<MemPager>, fid: LogicalFieldId, n:
         );
         let ingest_ms = t_ingest.elapsed().as_secs_f64() * 1e3;
 
-        println!(
+        tracing::info!(
             "[seed vals] batch {}/{}: make={:.3} ms, ingest={:.3} ms, \
 items={}",
             bi + 1,
@@ -260,7 +260,7 @@ items={}",
     }
 
     let seed_ms = t_seed.elapsed().as_secs_f64() * 1e3;
-    println!(
+    tracing::info!(
         "[seed vals] totals: batches={}, make_sum={:.3} ms, \
 ingest_sum={:.3} ms, make_max={:.3} ms, ingest_max={:.3} ms, \
 slow_ingests_gt8ms={}, seed_end_to_end={:.3} ms",
@@ -308,7 +308,7 @@ fn seed_keys_varlen_max_total(
     items.shuffle(&mut rng);
     let shuffle_ms = t_shuffle.elapsed().as_secs_f64() * 1e3;
 
-    println!(
+    tracing::info!(
         "[seed keys 1kb] built all: {:.3} ms, shuffle: {:.3} ms, n={}, \
 max_total={}",
         build_all_ms, shuffle_ms, n, max_total
@@ -343,7 +343,7 @@ max_total={}",
         );
         let ingest_ms = t_ingest.elapsed().as_secs_f64() * 1e3;
 
-        println!(
+        tracing::info!(
             "[seed keys 1kb] batch {}/{}: make={:.3} ms, ingest={:.3} ms, \
 items={}",
             bi + 1,
@@ -367,7 +367,7 @@ items={}",
     }
 
     let seed_ms = t_seed.elapsed().as_secs_f64() * 1e3;
-    println!(
+    tracing::info!(
         "[seed keys 1kb] totals: batches={}, make_sum={:.3} ms, \
 ingest_sum={:.3} ms, make_max={:.3} ms, ingest_max={:.3} ms, \
 slow_ingests_gt8ms={}, seed_end_to_end={:.3} ms",
@@ -413,7 +413,7 @@ fn seed_vals_varlen_max_total(
     items.shuffle(&mut rng);
     let shuffle_ms = t_shuffle.elapsed().as_secs_f64() * 1e3;
 
-    println!(
+    tracing::info!(
         "[seed vals 1kb] built all: {:.3} ms, shuffle: {:.3} ms, n={}, \
 max_total={}",
         build_all_ms, shuffle_ms, n, max_total
@@ -448,7 +448,7 @@ max_total={}",
         );
         let ingest_ms = t_ingest.elapsed().as_secs_f64() * 1e3;
 
-        println!(
+        tracing::info!(
             "[seed vals 1kb] batch {}/{}: make={:.3} ms, ingest={:.3} ms, \
 items={}",
             bi + 1,
@@ -472,7 +472,7 @@ items={}",
     }
 
     let seed_ms = t_seed.elapsed().as_secs_f64() * 1e3;
-    println!(
+    tracing::info!(
         "[seed vals 1kb] totals: batches={}, make_sum={:.3} ms, \
 ingest_sum={:.3} ms, make_max={:.3} ms, ingest_max={:.3} ms, \
 slow_ingests_gt8ms={}, seed_end_to_end={:.3} ms",
@@ -533,7 +533,7 @@ fn paginate_strings_as_keys_smoke() {
     }
 
     let scan_ms = t_scan.elapsed().as_secs_f64() * 1e3;
-    println!(
+    tracing::info!(
         "[scan keys fwd] pagesize={}, items={}, total={:.3} ms",
         page_size, seen, scan_ms
     );
@@ -587,7 +587,7 @@ fn paginate_strings_as_values_smoke() {
     }
 
     let scan_ms = t_scan.elapsed().as_secs_f64() * 1e3;
-    println!(
+    tracing::info!(
         "[scan vals fwd] pagesize={}, items={}, total={:.3} ms",
         page_size, seen, scan_ms
     );
@@ -640,7 +640,7 @@ fn paginate_strings_reverse_smoke() {
         }
     }
     let scan_k_ms = t_scan_k.elapsed().as_secs_f64() * 1e3;
-    println!(
+    tracing::info!(
         "[scan keys rev] pagesize={}, items={}, total={:.3} ms",
         page_size, seen_k, scan_k_ms
     );
@@ -679,7 +679,7 @@ fn paginate_strings_reverse_smoke() {
         }
     }
     let scan_v_ms = t_scan_v.elapsed().as_secs_f64() * 1e3;
-    println!(
+    tracing::info!(
         "[scan vals rev] pagesize={}, items={}, total={:.3} ms",
         page_size, seen_v, scan_v_ms
     );
@@ -743,7 +743,7 @@ fn paginate_strings_heavy_keys_1kb_ignored() {
         }
     }
     let scan_k_ms = t_scan_k.elapsed().as_secs_f64() * 1e3;
-    println!(
+    tracing::info!(
         "[scan keys fwd 1kb] pagesize={}, items={}, total={:.3} ms",
         page_size, seen_k, scan_k_ms
     );
@@ -806,7 +806,7 @@ fn paginate_strings_heavy_vals_1kb_ignored() {
         }
     }
     let scan_v_ms = t_scan_v.elapsed().as_secs_f64() * 1e3;
-    println!(
+    tracing::info!(
         "[scan vals rev 1kb] pagesize={}, items={}, total={:.3} ms",
         page_size, seen_v, scan_v_ms
     );
@@ -846,7 +846,7 @@ fn seed_ints_as_keys_fixed(
     items.shuffle(&mut rng);
     let shuffle_ms = t_shuffle.elapsed().as_secs_f64() * 1e3;
 
-    println!(
+    tracing::info!(
         "[seed int-keys] built all: {:.3} ms, shuffle: {:.3} ms, n={}",
         build_all_ms, shuffle_ms, n
     );
@@ -880,7 +880,7 @@ fn seed_ints_as_keys_fixed(
         );
         let ingest_ms = t_ingest.elapsed().as_secs_f64() * 1e3;
 
-        println!(
+        tracing::info!(
             "[seed int-keys] batch {}/{}: make={:.3} ms, ingest={:.3} ms, \
 items={}",
             bi + 1,
@@ -904,7 +904,7 @@ items={}",
     }
 
     let seed_ms = t_seed.elapsed().as_secs_f64() * 1e3;
-    println!(
+    tracing::info!(
         "[seed int-keys] totals: batches={}, make_sum={:.3} ms, \
 ingest_sum={:.3} ms, make_max={:.3} ms, ingest_max={:.3} ms, \
 slow_ingests_gt8ms={}, seed_end_to_end={:.3} ms",
@@ -949,7 +949,7 @@ fn seed_ints_as_values_fixed(
     items.shuffle(&mut rng);
     let shuffle_ms = t_shuffle.elapsed().as_secs_f64() * 1e3;
 
-    println!(
+    tracing::info!(
         "[seed int-vals] built all: {:.3} ms, shuffle: {:.3} ms, n={}",
         build_all_ms, shuffle_ms, n
     );
@@ -983,7 +983,7 @@ fn seed_ints_as_values_fixed(
         );
         let ingest_ms = t_ingest.elapsed().as_secs_f64() * 1e3;
 
-        println!(
+        tracing::info!(
             "[seed int-vals] batch {}/{}: make={:.3} ms, ingest={:.3} ms, \
 items={}",
             bi + 1,
@@ -1007,7 +1007,7 @@ items={}",
     }
 
     let seed_ms = t_seed.elapsed().as_secs_f64() * 1e3;
-    println!(
+    tracing::info!(
         "[seed int-vals] totals: batches={}, make_sum={:.3} ms, \
 ingest_sum={:.3} ms, make_max={:.3} ms, ingest_max={:.3} ms, \
 slow_ingests_gt8ms={}, seed_end_to_end={:.3} ms",
@@ -1074,7 +1074,7 @@ fn paginate_ints_heavy_keys_fixed_ignored() {
         }
     }
     let scan_ms = t_scan.elapsed().as_secs_f64() * 1e3;
-    println!(
+    tracing::info!(
         "[scan int-keys fwd FIXED] pagesize={}, items={}, total={:.3} ms",
         page_size, seen, scan_ms
     );
@@ -1133,7 +1133,7 @@ fn paginate_ints_heavy_vals_fixed_ignored() {
         }
     }
     let scan_ms = t_scan.elapsed().as_secs_f64() * 1e3;
-    println!(
+    tracing::info!(
         "[scan int-vals fwd FIXED] pagesize={}, items={}, total={:.3} ms",
         page_size, seen, scan_ms
     );

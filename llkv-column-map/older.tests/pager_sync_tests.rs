@@ -159,5 +159,5 @@ fn test_pager_persistence_on_reopen_column_map() {
         // store drops here
     }
 
-    eprintln!("NOTE: delete sync is NOT exercised in this test.");
+    etracing::info!("NOTE: delete sync is NOT exercised in this test.");
 }

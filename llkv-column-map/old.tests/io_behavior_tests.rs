@@ -61,9 +61,10 @@ fn test_instrumented_paging_io_behavior() {
     // Check I/O stats after the first append.
     let puts_after_append = stats.physical_puts.load(Ordering::Relaxed);
     let gets_after_append = stats.physical_gets.load(Ordering::Relaxed);
-    println!(
+    tracing::info!(
         "Stats after initial append: gets={}, puts={}",
-        gets_after_append, puts_after_append
+        gets_after_append,
+        puts_after_append
     );
     assert!(
         puts_after_append > 0,
@@ -85,9 +86,10 @@ fn test_instrumented_paging_io_behavior() {
 
     let puts_after_lww = stats.physical_puts.load(Ordering::Relaxed);
     let gets_after_lww = stats.physical_gets.load(Ordering::Relaxed);
-    println!(
+    tracing::info!(
         "Stats after LWW update: gets={}, puts={}",
-        gets_after_lww, puts_after_lww
+        gets_after_lww,
+        puts_after_lww
     );
     assert!(
         puts_after_lww > puts_after_append,
@@ -114,9 +116,11 @@ fn test_instrumented_paging_io_behavior() {
     let puts_after_delete = stats.physical_puts.load(Ordering::Relaxed);
     let gets_after_delete = stats.physical_gets.load(Ordering::Relaxed);
     let frees_after_delete = stats.physical_frees.load(Ordering::Relaxed);
-    println!(
+    tracing::info!(
         "Stats after delete+compact: gets={}, puts={}, frees={}",
-        gets_after_delete, puts_after_delete, frees_after_delete
+        gets_after_delete,
+        puts_after_delete,
+        frees_after_delete
     );
     // Assert that the delete/compaction process involved reads, writes (for new chunks), and frees (for old chunks).
     assert!(puts_after_delete > puts_after_lww);
@@ -125,7 +129,7 @@ fn test_instrumented_paging_io_behavior() {
         frees_after_delete > 0,
         "Compaction after delete should free obsolete pages"
     );
-    println!("\nFinal IO Stats: {:?}", stats);
+    tracing::info!("\nFinal IO Stats: {:?}", stats);
 }
 
 #[test]
@@ -190,7 +194,7 @@ fn test_large_scale_churn_io() {
     let schema = u64_schema_with_fid(field_id);
 
     // --- 2. Phase 1: Bulk Upsert (Insert) of 1M Entries in Batches ---
-    println!(
+    tracing::info!(
         "\n--- Phase 1: Appending 1,000,000 rows in {} batches ---",
         NUM_INITIAL_BATCHES
     );
@@ -208,14 +212,16 @@ fn test_large_scale_churn_io() {
     let gets_after_insert = stats.get_batches.load(Ordering::Relaxed);
     let puts_after_insert = stats.put_batches.load(Ordering::Relaxed);
     let allocs_after_insert = stats.alloc_batches.load(Ordering::Relaxed);
-    println!(
+    tracing::info!(
         "Stats after 1M insert: {} get batches, {} put batches, {} alloc batches",
-        gets_after_insert, puts_after_insert, allocs_after_insert
+        gets_after_insert,
+        puts_after_insert,
+        allocs_after_insert
     );
     assert_eq!(stats.free_batches.load(Ordering::Relaxed), 0);
 
     // --- 3. Phase 2: Delete 10,000 Entries ---
-    println!("\n--- Phase 2: Deleting 10,000 rows ---");
+    tracing::info!("\n--- Phase 2: Deleting 10,000 rows ---");
     let mut to_delete = RoaringTreemap::new();
     // Delete the first 10,000 even-numbered global row indexes.
     for i in 0..(NUM_DELETES * 2) {
@@ -230,9 +236,12 @@ fn test_large_scale_churn_io() {
     let puts_after_delete = stats.put_batches.load(Ordering::Relaxed);
     let allocs_after_delete = stats.alloc_batches.load(Ordering::Relaxed);
     let frees_after_delete = stats.free_batches.load(Ordering::Relaxed);
-    println!(
+    tracing::info!(
         "Stats after 10k delete: {} get batches, {} put batches, {} alloc batches, {} free batches",
-        gets_after_delete, puts_after_delete, allocs_after_delete, frees_after_delete
+        gets_after_delete,
+        puts_after_delete,
+        allocs_after_delete,
+        frees_after_delete
     );
     assert!(gets_after_delete > gets_after_insert);
     assert!(puts_after_delete > puts_after_insert);
@@ -246,7 +255,7 @@ fn test_large_scale_churn_io() {
     );
 
     // --- 4. Phase 3: Bulk Upsert (Update) of 100,000 Entries ---
-    println!("\n--- Phase 3: Updating 100,000 rows ---");
+    tracing::info!("\n--- Phase 3: Updating 100,000 rows ---");
     // Update row_ids in a range that was not deleted
     let update_start_row_id = (NUM_DELETES * 2) as u64; // Start updates after the deleted range
     let rids_update = Arc::new(UInt64Array::from(
@@ -264,9 +273,12 @@ fn test_large_scale_churn_io() {
     let puts_after_update = stats.put_batches.load(Ordering::Relaxed);
     let allocs_after_update = stats.alloc_batches.load(Ordering::Relaxed);
     let frees_after_update = stats.free_batches.load(Ordering::Relaxed);
-    println!(
+    tracing::info!(
         "Stats after 100k update: {} get batches, {} put batches, {} alloc batches, {} free batches",
-        gets_after_update, puts_after_update, allocs_after_update, frees_after_update
+        gets_after_update,
+        puts_after_update,
+        allocs_after_update,
+        frees_after_update
     );
     assert!(gets_after_update > gets_after_delete);
     assert!(puts_after_update > puts_after_delete);
@@ -277,5 +289,5 @@ fn test_large_scale_churn_io() {
         scan_u64(&store, field_id).len(),
         (NUM_ROWS - NUM_DELETES as u64) as usize
     );
-    println!("\nTest Complete. Final IO Stats: {:?}", stats);
+    tracing::info!("\nTest Complete. Final IO Stats: {:?}", stats);
 }

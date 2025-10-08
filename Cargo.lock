@@ -649,6 +649,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctor"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67773048316103656a637612c4a62477603b777d91d9c62ff2290f9cde178fdb"
+dependencies = [
+ "ctor-proc-macro",
+ "dtor",
+]
+
+[[package]]
+name = "ctor-proc-macro"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2931af7e13dc045d8e9d26afccc6fa115d64e115c9c84b1166288b46f6782c2"
+
+[[package]]
 name = "dashmap"
 version = "6.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -680,6 +696,21 @@ dependencies = [
  "block-buffer",
  "crypto-common",
 ]
+
+[[package]]
+name = "dtor"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e58a0764cddb55ab28955347b45be00ade43d4d6f3ba4bf3dc354e4ec9432934"
+dependencies = [
+ "dtor-proc-macro",
+]
+
+[[package]]
+name = "dtor-proc-macro"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f678cf4a922c215c63e0de95eb1ff08a958a81d47e485cf9da1e27bf6305cfa5"
 
 [[package]]
 name = "educe"
@@ -1136,6 +1167,7 @@ dependencies = [
  "llkv-expr",
  "llkv-result",
  "llkv-storage",
+ "llkv-test-utils",
  "modular-bitfield",
  "rand 0.9.2",
  "rayon",
@@ -1143,6 +1175,7 @@ dependencies = [
  "rustc-hash",
  "simd-r-drive-entry-handle",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -1154,9 +1187,11 @@ dependencies = [
  "llkv-result",
  "llkv-storage",
  "llkv-table",
+ "llkv-test-utils",
  "rand 0.9.2",
  "simd-r-drive-entry-handle",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -1165,6 +1200,7 @@ version = "0.2.0-alpha"
 dependencies = [
  "arrow",
  "arrow-array",
+ "llkv-test-utils",
 ]
 
 [[package]]
@@ -1178,15 +1214,18 @@ dependencies = [
  "llkv-result",
  "llkv-storage",
  "llkv-table",
+ "llkv-test-utils",
  "rustc-hash",
  "simd-r-drive-entry-handle",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
 name = "llkv-plan"
 version = "0.2.0-alpha"
 dependencies = [
+ "llkv-test-utils",
  "serde",
  "serde_json",
  "thiserror",
@@ -1197,6 +1236,7 @@ name = "llkv-result"
 version = "0.2.0-alpha"
 dependencies = [
  "arrow",
+ "llkv-test-utils",
  "thiserror",
 ]
 
@@ -1211,11 +1251,13 @@ dependencies = [
  "llkv-result",
  "llkv-storage",
  "llkv-table",
+ "llkv-test-utils",
  "simd-r-drive-entry-handle",
  "sqllogictest",
  "sqlparser",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1225,6 +1267,7 @@ dependencies = [
  "arrow",
  "llkv-result",
  "llkv-storage",
+ "llkv-test-utils",
  "num_enum",
  "rustc-hash",
  "simd-r-drive",
@@ -1247,10 +1290,21 @@ dependencies = [
  "llkv-plan",
  "llkv-result",
  "llkv-storage",
+ "llkv-test-utils",
  "rayon",
  "rustc-hash",
  "simd-r-drive-entry-handle",
  "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "llkv-test-utils"
+version = "0.2.0-alpha"
+dependencies = [
+ "ctor",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

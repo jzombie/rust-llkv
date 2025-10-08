@@ -10,12 +10,14 @@ publish.workspace = true
 
 [dependencies]
 arrow = { workspace = true, default-features = false, features = ["csv", "prettyprint"] }
-llkv-table.workspace = true
 llkv-column-map.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true
+llkv-table.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
+tracing.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
 rand.workspace = true
+tempfile.workspace = true

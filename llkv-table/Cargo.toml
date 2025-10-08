@@ -22,11 +22,13 @@ llkv-plan.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
+tracing.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-tempfile.workspace = true
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
+llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
+tempfile.workspace = true
 
 [[bench]]
 name = "string_substring_bench"
