@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int64Array, StringArray, UInt64Array};
 use llkv_result::Error as LlkvError;
-use llkv_sql::{SqlEngine, SqlStatementResult};
+use llkv_sql::{SqlEngine, StatementResult};
 use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType, Runner};
 
@@ -39,7 +39,7 @@ impl AsyncDB for EngineHarness {
                 }
                 let result = results.remove(0);
                 match result {
-                    SqlStatementResult::Select {
+                    StatementResult::Select {
                         execution,
                         ..
                     } => {
@@ -123,14 +123,14 @@ impl AsyncDB for EngineHarness {
 
                         Ok(DBOutput::Rows { types, rows })
                     }
-                    SqlStatementResult::Insert { rows_inserted, .. } => {
+                    StatementResult::Insert { rows_inserted, .. } => {
                         Ok(DBOutput::StatementComplete(rows_inserted as u64))
                     }
-                    SqlStatementResult::Update { rows_updated, .. } => {
+                    StatementResult::Update { rows_updated, .. } => {
                         Ok(DBOutput::StatementComplete(rows_updated as u64))
                     }
-                    SqlStatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
-                    SqlStatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
+                    StatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
+                    StatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
                 }
             }
             Err(e) => Err(e),

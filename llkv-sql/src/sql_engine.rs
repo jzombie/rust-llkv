@@ -7,7 +7,7 @@ use crate::value::SqlValue;
 use llkv_dsl::{
     AggregateExpr, ColumnAssignment, ColumnSpec, CreateTablePlan, CreateTableSource, DslContext,
     DslValue, InsertPlan, InsertSource, SelectExecution, SelectPlan, SelectProjection,
-    StatementResult, UpdatePlan,
+    StatementResult, UpdatePlan, extract_rows_from_range,
 };
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
@@ -18,8 +18,8 @@ use sqlparser::ast::{
     ColumnOptionDef, DataType as SqlDataType, ExceptionWhen, Expr as SqlExpr, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName,
     ObjectNamePart, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
-    TableAlias, TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier,
-    UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
+    TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
+    UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -257,18 +257,12 @@ where
             }
             SetExpr::Select(select) => {
                 if let Some(range_rows) = extract_rows_from_range(select.as_ref())? {
-                    InsertSource::Rows(
-                        range_rows
-                            .rows
-                            .into_iter()
-                            .map(|row| row.into_iter().map(DslValue::from).collect())
-                            .collect(),
-                    )
+                    InsertSource::Rows(range_rows.into_rows())
                 } else {
                     let execution =
                         self.execute_query_collect((**source_expr).clone())?;
-                    let batches = execution.collect()?;
-                    InsertSource::Batches(batches)
+                    let rows = execution.into_rows()?;
+                    InsertSource::Rows(rows)
                 }
             }
             _ => {
@@ -885,6 +879,16 @@ fn parse_count_nulls_case(expr: &SqlExpr) -> SqlResult<Option<String>> {
     resolve_column_name(inner).map(Some)
 }
 
+fn is_integer_literal(expr: &SqlExpr, expected: i64) -> bool {
+    match expr {
+        SqlExpr::Value(ValueWithSpan {
+            value: Value::Number(text, _),
+            ..
+        }) => text.parse::<i64>() == Ok(expected),
+        _ => false,
+    }
+}
+
 fn translate_condition(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     match expr {
         SqlExpr::BinaryOp { left, op, right } => match op {
@@ -1114,282 +1118,6 @@ fn group_by_is_empty(expr: &GroupByExpr) -> bool {
         GroupByExpr::Expressions(exprs, modifiers)
             if exprs.is_empty() && modifiers.is_empty()
     )
-}
-
-fn is_integer_literal(expr: &SqlExpr, expected: i64) -> bool {
-    match expr {
-        SqlExpr::Value(ValueWithSpan {
-            value: Value::Number(text, _),
-            ..
-        }) => text.parse::<i64>() == Ok(expected),
-        _ => false,
-    }
-}
-
-#[derive(Clone)]
-struct RangeSelectRows {
-    rows: Vec<Vec<SqlValue>>,
-}
-
-fn extract_rows_from_range(select: &Select) -> SqlResult<Option<RangeSelectRows>> {
-    let spec = match parse_range_spec(select)? {
-        Some(spec) => spec,
-        None => return Ok(None),
-    };
-
-    if select.selection.is_some() {
-        return Err(Error::InvalidArgumentError(
-            "WHERE clauses are not supported for range() SELECT statements".into(),
-        ));
-    }
-    if select.having.is_some()
-        || !select.named_window.is_empty()
-        || select.qualify.is_some()
-        || select.distinct.is_some()
-        || select.top.is_some()
-        || select.into.is_some()
-        || select.prewhere.is_some()
-        || !select.lateral_views.is_empty()
-        || select.value_table_mode.is_some()
-        || !group_by_is_empty(&select.group_by)
-    {
-        return Err(Error::InvalidArgumentError(
-            "advanced SELECT clauses are not supported for range() SELECT statements".into(),
-        ));
-    }
-
-    let mut projections: Vec<RangeProjection> = Vec::with_capacity(select.projection.len());
-    for item in &select.projection {
-        let projection = match item {
-            SelectItem::Wildcard(_) => RangeProjection::Column,
-            SelectItem::QualifiedWildcard(kind, _) => match kind {
-                SelectItemQualifiedWildcardKind::ObjectName(object_name) => {
-                    if spec.matches_object_name(object_name) {
-                        RangeProjection::Column
-                    } else {
-                        return Err(Error::InvalidArgumentError(
-                            "qualified wildcard must reference the range() source".into(),
-                        ));
-                    }
-                }
-                SelectItemQualifiedWildcardKind::Expr(_) => {
-                    return Err(Error::InvalidArgumentError(
-                        "expression-qualified wildcards are not supported for range() SELECT statements".into(),
-                    ));
-                }
-            },
-            SelectItem::UnnamedExpr(expr) => build_range_projection_expr(expr, &spec)?,
-            SelectItem::ExprWithAlias { expr, .. } => build_range_projection_expr(expr, &spec)?,
-        };
-        projections.push(projection);
-    }
-
-    if projections.is_empty() {
-        return Err(Error::InvalidArgumentError(
-            "SELECT projection must include at least one column".into(),
-        ));
-    }
-
-    let mut rows: Vec<Vec<SqlValue>> = Vec::with_capacity(spec.row_count);
-    for idx in 0..spec.row_count {
-        let mut row: Vec<SqlValue> = Vec::with_capacity(projections.len());
-        for projection in &projections {
-            match projection {
-                RangeProjection::Column => row.push(SqlValue::Integer(idx as i64)),
-                RangeProjection::Literal(value) => row.push(value.clone()),
-            }
-        }
-        rows.push(row);
-    }
-
-    Ok(Some(RangeSelectRows { rows }))
-}
-
-fn build_range_projection_expr(expr: &SqlExpr, spec: &RangeSpec) -> SqlResult<RangeProjection> {
-    match expr {
-        SqlExpr::Identifier(ident) => {
-            if spec.matches_identifier(&ident.value) {
-                Ok(RangeProjection::Column)
-            } else {
-                Err(Error::InvalidArgumentError(format!(
-                    "unknown column '{}' in range() SELECT",
-                    ident.value
-                )))
-            }
-        }
-        SqlExpr::CompoundIdentifier(parts) => {
-            if parts.len() == 2
-                && spec.matches_table_alias(&parts[0].value)
-                && spec.matches_identifier(&parts[1].value)
-            {
-                Ok(RangeProjection::Column)
-            } else {
-                Err(Error::InvalidArgumentError(
-                    "compound identifiers must reference the range() source".into(),
-                ))
-            }
-        }
-        SqlExpr::Wildcard(_) | SqlExpr::QualifiedWildcard(_, _) => unreachable!(),
-        other => {
-            let value = SqlValue::try_from_expr(other)?;
-            Ok(RangeProjection::Literal(value))
-        }
-    }
-}
-
-#[derive(Clone)]
-enum RangeProjection {
-    Column,
-    Literal(SqlValue),
-}
-
-fn parse_range_spec(select: &Select) -> SqlResult<Option<RangeSpec>> {
-    if select.from.len() != 1 {
-        return Ok(None);
-    }
-    let item = &select.from[0];
-    if !item.joins.is_empty() {
-        return Err(Error::InvalidArgumentError(
-            "JOIN clauses are not supported for range() SELECT statements".into(),
-        ));
-    }
-
-    match &item.relation {
-        TableFactor::Function {
-            lateral,
-            name,
-            args,
-            alias,
-        } => {
-            if *lateral {
-                return Err(Error::InvalidArgumentError(
-                    "LATERAL range() is not supported".into(),
-                ));
-            }
-            parse_range_spec_from_args(name, args, alias)
-        }
-        TableFactor::Table {
-            name,
-            alias,
-            args: Some(table_args),
-            with_ordinality,
-            ..
-        } => {
-            if *with_ordinality {
-                return Err(Error::InvalidArgumentError(
-                    "WITH ORDINALITY is not supported for range()".into(),
-                ));
-            }
-            if table_args.settings.is_some() {
-                return Err(Error::InvalidArgumentError(
-                    "range() SETTINGS clause is not supported".into(),
-                ));
-            }
-            parse_range_spec_from_args(name, &table_args.args, alias)
-        }
-        _ => Ok(None),
-    }
-}
-
-fn parse_range_spec_from_args(
-    name: &ObjectName,
-    args: &[FunctionArg],
-    alias: &Option<TableAlias>,
-) -> SqlResult<Option<RangeSpec>> {
-    if name.0.len() != 1 {
-        return Ok(None);
-    }
-    let func_name = match &name.0[0] {
-        ObjectNamePart::Identifier(ident) => ident.value.to_ascii_lowercase(),
-        _ => return Ok(None),
-    };
-    if func_name != "range" {
-        return Ok(None);
-    }
-
-    if args.len() != 1 {
-        return Err(Error::InvalidArgumentError(
-            "range() requires exactly one argument".into(),
-        ));
-    }
-
-    let arg_expr = match &args[0] {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
-        FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_))
-        | FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
-            return Err(Error::InvalidArgumentError(
-                "range() argument must be an integer literal".into(),
-            ));
-        }
-        FunctionArg::Named { .. } | FunctionArg::ExprNamed { .. } => {
-            return Err(Error::InvalidArgumentError(
-                "named arguments are not supported for range()".into(),
-            ));
-        }
-    };
-
-    let value = SqlValue::try_from_expr(arg_expr)?;
-    let row_count = match value {
-        SqlValue::Integer(v) if v >= 0 => v as usize,
-        SqlValue::Integer(_) => {
-            return Err(Error::InvalidArgumentError(
-                "range() argument must be non-negative".into(),
-            ));
-        }
-        _ => {
-            return Err(Error::InvalidArgumentError(
-                "range() argument must be an integer literal".into(),
-            ));
-        }
-    };
-
-    let column_name_lower = alias
-        .as_ref()
-        .and_then(|a| {
-            a.columns
-                .first()
-                .map(|col| col.name.value.to_ascii_lowercase())
-        })
-        .unwrap_or_else(|| "range".to_string());
-    let table_alias_lower = alias.as_ref().map(|a| a.name.value.to_ascii_lowercase());
-
-    Ok(Some(RangeSpec {
-        row_count,
-        column_name_lower,
-        table_alias_lower,
-    }))
-}
-
-// TODO: Move to DSL?
-struct RangeSpec {
-    row_count: usize,
-    column_name_lower: String,
-    table_alias_lower: Option<String>,
-}
-
-impl RangeSpec {
-    fn matches_identifier(&self, ident: &str) -> bool {
-        let lower = ident.to_ascii_lowercase();
-        lower == self.column_name_lower || lower == "range"
-    }
-
-    fn matches_table_alias(&self, ident: &str) -> bool {
-        let lower = ident.to_ascii_lowercase();
-        match &self.table_alias_lower {
-            Some(alias) => lower == *alias,
-            None => lower == "range",
-        }
-    }
-
-    fn matches_object_name(&self, name: &ObjectName) -> bool {
-        if name.0.len() != 1 {
-            return false;
-        }
-        match &name.0[0] {
-            ObjectNamePart::Identifier(ident) => self.matches_table_alias(&ident.value),
-            _ => false,
-        }
-    }
 }
 
 #[cfg(test)]
