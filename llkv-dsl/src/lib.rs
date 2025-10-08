@@ -215,7 +215,7 @@ impl IntoColumnSpec for ColumnSpec {
     }
 }
 
-impl<'a, T> IntoColumnSpec for &'a T
+impl<T> IntoColumnSpec for &T
 where
     T: Clone + IntoColumnSpec,
 {
@@ -224,19 +224,19 @@ where
     }
 }
 
-impl<'a> IntoColumnSpec for (&'a str, DataType) {
+impl IntoColumnSpec for (&str, DataType) {
     fn into_column_spec(self) -> ColumnSpec {
         ColumnSpec::new(self.0, self.1, true)
     }
 }
 
-impl<'a> IntoColumnSpec for (&'a str, DataType, bool) {
+impl IntoColumnSpec for (&str, DataType, bool) {
     fn into_column_spec(self) -> ColumnSpec {
         ColumnSpec::new(self.0, self.1, self.2)
     }
 }
 
-impl<'a> IntoColumnSpec for (&'a str, DataType, ColumnNullability) {
+impl IntoColumnSpec for (&str, DataType, ColumnNullability) {
     fn into_column_spec(self) -> ColumnSpec {
         ColumnSpec::new(self.0, self.1, self.2.is_nullable())
     }
@@ -2731,7 +2731,7 @@ impl IntoInsertRow for Row {
     }
 }
 
-impl<'a, T> IntoInsertRow for &'a T
+impl<T> IntoInsertRow for &T
 where
     T: Clone + IntoInsertRow,
 {

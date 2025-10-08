@@ -39,10 +39,7 @@ impl AsyncDB for EngineHarness {
                 }
                 let result = results.remove(0);
                 match result {
-                    StatementResult::Select {
-                        execution,
-                        ..
-                    } => {
+                    StatementResult::Select { execution, .. } => {
                         let batches = execution.collect()?;
                         let mut rows: Vec<Vec<String>> = Vec::new();
                         for batch in &batches {

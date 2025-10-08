@@ -641,6 +641,7 @@ where
         Ok(projections)
     }
 
+    #[allow(clippy::too_many_arguments)] // TODO: Refactor using struct for arg
     fn handle_start_transaction(
         &self,
         modes: Vec<TransactionMode>,
