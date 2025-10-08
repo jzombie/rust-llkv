@@ -29,6 +29,12 @@ impl SqlValue {
                 op: UnaryOperator::Plus,
                 expr,
             } => SqlValue::try_from_expr(expr),
+            SqlExpr::Cast { expr, .. } => match SqlValue::try_from_expr(expr)? {
+                SqlValue::Null => Ok(SqlValue::Null),
+                other => Err(Error::InvalidArgumentError(format!(
+                    "unsupported literal CAST expression: {other:?}"
+                ))),
+            },
             SqlExpr::Nested(inner) => SqlValue::try_from_expr(inner),
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported literal expression: {other:?}"

@@ -1019,15 +1019,15 @@ where
         };
         let schema = schema_for_projections(table_ref, &projections)?;
 
-        let filter_expr = match plan.filter {
-            Some(expr) => translate_predicate(expr, table_ref.schema.as_ref())?,
+        let (filter_expr, full_table_scan) = match plan.filter {
+            Some(expr) => (translate_predicate(expr, table_ref.schema.as_ref())?, false),
             None => {
                 let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "table has no columns; cannot perform wildcard scan".into(),
                     )
                 })?;
-                full_table_scan_filter(field_id)
+                (full_table_scan_filter(field_id), true)
             }
         };
 
@@ -1042,6 +1042,7 @@ where
             projections,
             filter_expr,
             options,
+            full_table_scan,
         ))
     }
 
@@ -1341,6 +1342,7 @@ where
         projections: Vec<ScanProjection>,
         filter_expr: LlkvExpr<'static, FieldId>,
         options: ScanStreamOptions,
+        full_table_scan: bool,
     },
     Aggregation {
         batch: RecordBatch,
@@ -1358,6 +1360,7 @@ where
         projections: Vec<ScanProjection>,
         filter_expr: LlkvExpr<'static, FieldId>,
         options: ScanStreamOptions,
+        full_table_scan: bool,
     ) -> Self {
         Self {
             table_name,
@@ -1367,6 +1370,7 @@ where
                 projections,
                 filter_expr,
                 options,
+                full_table_scan,
             },
         }
     }
@@ -1395,9 +1399,11 @@ where
                 projections,
                 filter_expr,
                 options,
+                full_table_scan,
             } => {
                 let mut error: Option<Error> = None;
                 let mut produced = false;
+                let mut produced_rows: u64 = 0;
                 table
                     .table
                     .scan_stream(projections, &filter_expr, options, |batch| {
@@ -1405,6 +1411,7 @@ where
                             return;
                         }
                         produced = true;
+                        produced_rows = produced_rows.saturating_add(batch.num_rows() as u64);
                         if let Err(err) = on_batch(batch) {
                             error = Some(err);
                         }
@@ -1412,10 +1419,19 @@ where
                 if let Some(err) = error {
                     return Err(err);
                 }
+                let total_rows = table.total_rows.load(Ordering::SeqCst);
                 if !produced {
-                    let total_rows = table.total_rows.load(Ordering::SeqCst);
                     if total_rows > 0 {
                         for batch in synthesize_null_scan(Arc::clone(&schema), total_rows)? {
+                            on_batch(batch)?;
+                        }
+                    }
+                    return Ok(());
+                }
+                if options.include_nulls && full_table_scan && produced_rows < total_rows {
+                    let missing = total_rows - produced_rows;
+                    if missing > 0 {
+                        for batch in synthesize_null_scan(Arc::clone(&schema), missing)? {
                             on_batch(batch)?;
                         }
                     }

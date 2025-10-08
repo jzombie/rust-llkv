@@ -256,7 +256,9 @@ where
                 )
             }
             SetExpr::Select(select) => {
-                if let Some(range_rows) = extract_rows_from_range(select.as_ref())? {
+                if let Some(rows) = extract_constant_select_rows(select.as_ref())? {
+                    InsertSource::Rows(rows)
+                } else if let Some(range_rows) = extract_rows_from_range(select.as_ref())? {
                     InsertSource::Rows(range_rows.into_rows())
                 } else {
                     let execution = self.execute_query_collect((**source_expr).clone())?;
@@ -671,6 +673,7 @@ where
         }
         if !begin {
             // Currently treat START TRANSACTION same as BEGIN
+            tracing::warn!("Currently treat `START TRANSACTION` same as `BEGIN`")
         }
         self.context.begin_transaction()
     }
@@ -1091,6 +1094,53 @@ fn arrow_type_from_sql(data_type: &SqlDataType) -> SqlResult<arrow::datatypes::D
     }
 }
 
+fn extract_constant_select_rows(select: &Select) -> SqlResult<Option<Vec<Vec<DslValue>>>> {
+    if !select.from.is_empty() {
+        return Ok(None);
+    }
+
+    if select.selection.is_some()
+        || select.having.is_some()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.distinct.is_some()
+        || select.top.is_some()
+        || select.into.is_some()
+        || select.prewhere.is_some()
+        || !select.lateral_views.is_empty()
+        || select.value_table_mode.is_some()
+        || !group_by_is_empty(&select.group_by)
+    {
+        return Err(Error::InvalidArgumentError(
+            "constant SELECT statements do not support advanced clauses".into(),
+        ));
+    }
+
+    if select.projection.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "constant SELECT requires at least one projection".into(),
+        ));
+    }
+
+    let mut row: Vec<DslValue> = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) => expr,
+            SelectItem::ExprWithAlias { expr, .. } => expr,
+            other => {
+                return Err(Error::InvalidArgumentError(format!(
+                    "unsupported projection in constant SELECT: {other:?}"
+                )));
+            }
+        };
+
+        let value = SqlValue::try_from_expr(expr)?;
+        row.push(DslValue::from(value));
+    }
+
+    Ok(Some(vec![row]))
+}
+
 fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> {
     if from.len() != 1 {
         return Err(Error::InvalidArgumentError(
@@ -1122,7 +1172,7 @@ fn group_by_is_empty(expr: &GroupByExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, StringArray};
+    use arrow::array::{Array, Int64Array, StringArray};
     use llkv_storage::pager::MemPager;
 
     #[test]
@@ -1164,5 +1214,66 @@ mod tests {
             .expect("string column");
         assert_eq!(column.len(), 1);
         assert_eq!(column.value(0), "bob");
+    }
+
+    #[test]
+    fn insert_select_constant_including_null() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE integers(i INTEGER)")
+            .expect("create table");
+
+        let result = engine
+            .execute("INSERT INTO integers SELECT 42")
+            .expect("insert literal");
+        assert!(matches!(
+            result[0],
+            StatementResult::Insert {
+                rows_inserted: 1,
+                ..
+            }
+        ));
+
+        let result = engine
+            .execute("INSERT INTO integers SELECT CAST(NULL AS VARCHAR)")
+            .expect("insert null literal");
+        assert!(matches!(
+            result[0],
+            StatementResult::Insert {
+                rows_inserted: 1,
+                ..
+            }
+        ));
+
+        let mut result = engine
+            .execute("SELECT * FROM integers")
+            .expect("select rows");
+        let select_result = result.remove(0);
+        let batches = match select_result {
+            StatementResult::Select { execution, .. } => {
+                execution.collect().expect("collect batches")
+            }
+            _ => panic!("expected select result"),
+        };
+
+        let mut values: Vec<Option<i64>> = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int column");
+            for idx in 0..column.len() {
+                if column.is_null(idx) {
+                    values.push(None);
+                } else {
+                    values.push(Some(column.value(idx)));
+                }
+            }
+        }
+
+        assert_eq!(values, vec![Some(42), None]);
     }
 }
