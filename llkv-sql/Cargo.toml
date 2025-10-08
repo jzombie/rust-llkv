@@ -17,6 +17,7 @@ llkv-table.workspace = true
 simd-r-drive-entry-handle.workspace = true
 sqlparser.workspace = true
 time = { workspace = true, features = ["parsing"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 async-trait.workspace = true

@@ -1175,6 +1175,7 @@ dependencies = [
  "rustc-hash",
  "simd-r-drive-entry-handle",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -1190,6 +1191,7 @@ dependencies = [
  "rand 0.9.2",
  "simd-r-drive-entry-handle",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -1255,6 +1257,7 @@ dependencies = [
  "sqlparser",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -44,7 +44,7 @@ fn test_layout_integrity_under_churn() {
     let b0 = RecordBatch::try_new(schema.clone(), vec![r0, v0]).unwrap();
     store.append(&b0).unwrap();
 
-    println!("--- After Initial Ingestion ---");
+    tracing::info!("--- After Initial Ingestion ---");
     // VERIFY 1: The store must be consistent after the initial multi-chunk append.
     store
         .verify_integrity()
@@ -56,9 +56,10 @@ fn test_layout_integrity_under_churn() {
         col_stats1.total_chunks > 1,
         "Append should have created multiple chunks"
     );
-    println!(
+    tracing::info!(
         "OK: Store is consistent with {} rows in {} chunks.",
-        col_stats1.total_rows, col_stats1.total_chunks
+        col_stats1.total_rows,
+        col_stats1.total_chunks
     );
 
     // --- 3. LWW Updates ---
@@ -71,7 +72,7 @@ fn test_layout_integrity_under_churn() {
     let b1 = RecordBatch::try_new(schema.clone(), vec![r1, v1]).unwrap();
     store.append(&b1).unwrap();
 
-    println!("\n--- After LWW Updates ---");
+    tracing::info!("\n--- After LWW Updates ---");
     // VERIFY 2: The store must remain consistent after LWW updates.
     // The total row count should not have changed.
     store
@@ -83,7 +84,7 @@ fn test_layout_integrity_under_churn() {
         col_stats2.total_rows, INITIAL_ROWS as u64,
         "LWW update should not change total row count"
     );
-    println!(
+    tracing::info!(
         "OK: Store is consistent. Row count is unchanged at {}.",
         col_stats2.total_rows
     );
@@ -99,7 +100,7 @@ fn test_layout_integrity_under_churn() {
     let deletes: Vec<RowId> = to_delete.iter().collect();
     store.delete_rows(&[field_id], &deletes).unwrap();
 
-    println!("\n--- After Deletes ---");
+    tracing::info!("\n--- After Deletes ---");
     // VERIFY 3: The store must be consistent after deletes.
     // The total row count should be reduced by the number of deleted rows.
     store
@@ -112,7 +113,7 @@ fn test_layout_integrity_under_churn() {
         (INITIAL_ROWS - 5) as u64,
         "Row count should decrease by 5 after deletes"
     );
-    println!(
+    tracing::info!(
         "OK: Store is consistent. Row count correctly reduced to {}.",
         col_stats3.total_rows
     );

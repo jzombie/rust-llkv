@@ -26,7 +26,7 @@ async fn run_all_slt_files() {
     slt_files.sort();
 
     for path in slt_files {
-        println!("Running slt: {}", path.display());
+        tracing::info!("Running slt: {}", path.display());
 
         let content = std::fs::read_to_string(&path).expect("read slt file");
 
@@ -200,6 +200,6 @@ async fn run_all_slt_files() {
             }
         }
 
-        println!("  PASS: {}", path.display());
+        tracing::info!("  PASS: {}", path.display());
     }
 }

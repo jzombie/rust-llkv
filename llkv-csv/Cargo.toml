@@ -15,6 +15,7 @@ llkv-result.workspace = true
 llkv-storage.workspace = true
 llkv-table.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
+tracing.workspace = true
 
 [dev-dependencies]
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }

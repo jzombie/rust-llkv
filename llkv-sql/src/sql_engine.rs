@@ -260,10 +260,7 @@ where
             .table
             .store()
             .user_field_ids_for_table(stored_table.table.table_id());
-        eprintln!(
-            "CTAS registered field ids for table {}: {:?}",
-            display_name, field_ids
-        );
+        tracing::debug!(table = %display_name, ?field_ids, "CTAS registered field ids for table");
 
         Ok(SqlStatementResult::CreateTable {
             table_name: display_name,
@@ -309,7 +306,7 @@ where
             schema: select_schema,
             batches,
         } = self.execute_query_collect(*query)?;
-        eprintln!("CTAS source produced {} batches", batches.len());
+        tracing::info!(batch_count = batches.len(), "CTAS source produced batches");
 
         if select_schema.fields().is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -552,7 +549,7 @@ where
         };
 
         let row_count = rows.len();
-        eprintln!("INSERT row_count={}", row_count);
+        tracing::info!(row_count = row_count, "INSERT row_count");
 
         let mut column_values: Vec<Vec<SqlValue>> = table
             .schema
@@ -1358,7 +1355,7 @@ where
         match scan_result {
             Ok(()) => {}
             Err(Error::NotFound) if select.selection.is_none() => {
-                eprintln!(
+                tracing::debug!(
                     "scan_stream returned NotFound; synthesizing null batch for full table scan"
                 );
                 let total_rows = table.total_rows.load(Ordering::SeqCst);
@@ -1366,7 +1363,7 @@ where
                 batches = fallback_batches;
             }
             Err(err) => {
-                eprintln!("scan_stream failed: {err:?}");
+                tracing::error!(error = ?err, "scan_stream failed");
                 return Err(err);
             }
         }
@@ -1374,7 +1371,7 @@ where
         if batches.is_empty() && select.selection.is_none() {
             let total_rows = table.total_rows.load(Ordering::SeqCst);
             if total_rows > 0 {
-                eprintln!(
+                tracing::debug!(
                     "scan_stream produced no batches for full table scan; synthesizing null batch"
                 );
             }
@@ -2840,9 +2837,9 @@ mod tests {
             .table
             .store()
             .user_field_ids_for_table(integers_table.table.table_id());
-        eprintln!("integers stored field ids after insert: {:?}", stored_ids);
+        tracing::info!(?stored_ids, "integers stored field ids after insert");
         let total_rows = integers_table.table.total_rows().expect("table rows");
-        eprintln!("integers total_rows after insert: {}", total_rows);
+        tracing::info!(total_rows = total_rows, "integers total_rows after insert");
 
         let source_check = engine
             .execute("SELECT * FROM integers ORDER BY 1")
