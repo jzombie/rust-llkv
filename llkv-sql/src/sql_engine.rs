@@ -41,7 +41,7 @@ where
         }
     }
 
-    pub fn execute(&self, sql: &str) -> SqlResult<Vec<StatementResult>> {
+    pub fn execute(&self, sql: &str) -> SqlResult<Vec<StatementResult<P>>> {
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, sql)
             .map_err(|err| Error::InvalidArgumentError(format!("failed to parse SQL: {err}")))?;
@@ -53,7 +53,7 @@ where
         Ok(results)
     }
 
-    fn execute_statement(&self, statement: Statement) -> SqlResult<StatementResult> {
+    fn execute_statement(&self, statement: Statement) -> SqlResult<StatementResult<P>> {
         match statement {
             Statement::CreateTable(stmt) => self.handle_create_table(stmt),
             Statement::Insert(stmt) => self.handle_insert(stmt),
@@ -98,7 +98,7 @@ where
     fn handle_create_table(
         &self,
         mut stmt: sqlparser::ast::CreateTable,
-    ) -> SqlResult<StatementResult> {
+    ) -> SqlResult<StatementResult<P>> {
         validate_create_table_common(&stmt)?;
 
         let (display_name, canonical_name) = canonical_object_name(&stmt.name)?;
@@ -162,10 +162,10 @@ where
         _canonical_name: String,
         query: Query,
         if_not_exists: bool,
-    ) -> SqlResult<StatementResult> {
-        let SelectExecution {
-            schema, batches, ..
-        } = self.execute_query_collect(query)?;
+    ) -> SqlResult<StatementResult<P>> {
+        let execution = self.execute_query_collect(query)?;
+        let schema = execution.schema();
+        let batches = execution.collect()?;
 
         if schema.fields().is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -182,7 +182,7 @@ where
         self.context.create_table(plan)
     }
 
-    fn handle_insert(&self, stmt: sqlparser::ast::Insert) -> SqlResult<StatementResult> {
+    fn handle_insert(&self, stmt: sqlparser::ast::Insert) -> SqlResult<StatementResult<P>> {
         if stmt.replace_into || stmt.ignore || stmt.or.is_some() {
             return Err(Error::InvalidArgumentError(
                 "non-standard INSERT forms are not supported".into(),
@@ -265,8 +265,9 @@ where
                             .collect(),
                     )
                 } else {
-                    let SelectExecution { batches, .. } =
+                    let execution =
                         self.execute_query_collect((**source_expr).clone())?;
+                    let batches = execution.collect()?;
                     InsertSource::Batches(batches)
                 }
             }
@@ -292,7 +293,7 @@ where
         from: Option<UpdateTableFromKind>,
         selection: Option<SqlExpr>,
         returning: Option<Vec<SelectItem>>,
-    ) -> SqlResult<StatementResult> {
+    ) -> SqlResult<StatementResult<P>> {
         if from.is_some() {
             return Err(Error::InvalidArgumentError(
                 "UPDATE ... FROM is not supported yet".into(),
@@ -341,19 +342,18 @@ where
         self.context.update(plan)
     }
 
-    fn handle_query(&self, query: Query) -> SqlResult<StatementResult> {
-        let SelectExecution {
-            table_name,
-            batches,
-            ..
-        } = self.execute_query_collect(query)?;
+    fn handle_query(&self, query: Query) -> SqlResult<StatementResult<P>> {
+        let execution = self.execute_query_collect(query)?;
+        let table_name = execution.table_name().to_string();
+        let schema = execution.schema();
         Ok(StatementResult::Select {
             table_name,
-            batches,
+            schema,
+            execution,
         })
     }
 
-    fn execute_query_collect(&self, query: Query) -> SqlResult<SelectExecution> {
+    fn execute_query_collect(&self, query: Query) -> SqlResult<SelectExecution<P>> {
         validate_simple_query(&query)?;
         let select_plan = match query.body.as_ref() {
             SetExpr::Select(select) => self.translate_select(select.as_ref())?,
@@ -655,7 +655,7 @@ where
         statements: Vec<Statement>,
         exception: Option<Vec<ExceptionWhen>>,
         has_end_keyword: bool,
-    ) -> SqlResult<StatementResult> {
+    ) -> SqlResult<StatementResult<P>> {
         if !modes.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "transaction modes are not supported".into(),
@@ -687,7 +687,7 @@ where
         chain: bool,
         end: bool,
         modifier: Option<TransactionModifier>,
-    ) -> SqlResult<StatementResult> {
+    ) -> SqlResult<StatementResult<P>> {
         if chain {
             return Err(Error::InvalidArgumentError(
                 "COMMIT AND [NO] CHAIN is not supported".into(),
@@ -706,7 +706,11 @@ where
         self.context.commit_transaction()
     }
 
-    fn handle_rollback(&self, chain: bool, savepoint: Option<Ident>) -> SqlResult<StatementResult> {
+    fn handle_rollback(
+        &self,
+        chain: bool,
+        savepoint: Option<Ident>,
+    ) -> SqlResult<StatementResult<P>> {
         if chain {
             return Err(Error::InvalidArgumentError(
                 "ROLLBACK AND [NO] CHAIN is not supported".into(),
@@ -1415,11 +1419,14 @@ mod tests {
             }
         ));
 
-        let result = engine
+        let mut result = engine
             .execute("SELECT name FROM people WHERE id = 2")
             .expect("select rows");
-        let batches = match &result[0] {
-            StatementResult::Select { batches, .. } => batches,
+        let select_result = result.remove(0);
+        let batches = match select_result {
+            StatementResult::Select {
+                execution, ..
+            } => execution.collect().expect("collect batches"),
             _ => panic!("expected select result"),
         };
         assert_eq!(batches.len(), 1);

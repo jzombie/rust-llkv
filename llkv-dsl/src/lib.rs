@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -28,8 +29,11 @@ use time::{Date, Month};
 pub type DslResult<T> = llkv_result::Result<T>;
 
 /// Result of running a DSL statement.
-#[derive(Debug, Clone)]
-pub enum StatementResult {
+#[derive(Clone)]
+pub enum StatementResult<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
     CreateTable {
         table_name: String,
     },
@@ -43,11 +47,55 @@ pub enum StatementResult {
     },
     Select {
         table_name: String,
-        batches: Vec<RecordBatch>,
+        schema: Arc<Schema>,
+        execution: SelectExecution<P>,
     },
     Transaction {
         kind: TransactionKind,
     },
+}
+
+impl<P> fmt::Debug for StatementResult<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StatementResult::CreateTable { table_name } => f
+                .debug_struct("CreateTable")
+                .field("table_name", table_name)
+                .finish(),
+            StatementResult::Insert {
+                table_name,
+                rows_inserted,
+            } => f
+                .debug_struct("Insert")
+                .field("table_name", table_name)
+                .field("rows_inserted", rows_inserted)
+                .finish(),
+            StatementResult::Update {
+                table_name,
+                rows_updated,
+            } => f
+                .debug_struct("Update")
+                .field("table_name", table_name)
+                .field("rows_updated", rows_updated)
+                .finish(),
+            StatementResult::Select {
+                table_name,
+                schema,
+                ..
+            } => f
+                .debug_struct("Select")
+                .field("table_name", table_name)
+                .field("schema", schema)
+                .finish(),
+            StatementResult::Transaction { kind } => f
+                .debug_struct("Transaction")
+                .field("kind", kind)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,7 +349,7 @@ where
         }
     }
 
-    pub fn create_table(&self, plan: CreateTablePlan) -> DslResult<StatementResult> {
+    pub fn create_table(&self, plan: CreateTablePlan) -> DslResult<StatementResult<P>> {
         if plan.columns.is_empty() && plan.source.is_none() {
             return Err(Error::InvalidArgumentError(
                 "CREATE TABLE requires explicit columns or a source".into(),
@@ -315,7 +363,9 @@ where
         };
         if exists {
             if plan.if_not_exists {
-                return Ok(StatementResult::CreateTable { table_name: display_name });
+                return Ok(StatementResult::CreateTable {
+                    table_name: display_name,
+                });
             }
             return Err(Error::InvalidArgumentError(format!(
                 "table '{}' already exists",
@@ -342,7 +392,7 @@ where
         }
     }
 
-    pub fn insert(&self, plan: InsertPlan) -> DslResult<StatementResult> {
+    pub fn insert(&self, plan: InsertPlan) -> DslResult<StatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
         match plan.source {
@@ -353,13 +403,13 @@ where
         }
     }
 
-    pub fn update(&self, plan: UpdatePlan) -> DslResult<StatementResult> {
+    pub fn update(&self, plan: UpdatePlan) -> DslResult<StatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
         self.update_all_rows(table.as_ref(), display_name, plan.assignments)
     }
 
-    pub fn begin_transaction(&self) -> DslResult<StatementResult> {
+    pub fn begin_transaction(&self) -> DslResult<StatementResult<P>> {
         let mut active = self.transaction_active.lock().unwrap();
         if *active {
             return Err(Error::InvalidArgumentError(
@@ -372,7 +422,7 @@ where
         })
     }
 
-    pub fn commit_transaction(&self) -> DslResult<StatementResult> {
+    pub fn commit_transaction(&self) -> DslResult<StatementResult<P>> {
         let mut active = self.transaction_active.lock().unwrap();
         if !*active {
             return Err(Error::InvalidArgumentError(
@@ -385,7 +435,7 @@ where
         })
     }
 
-    pub fn rollback_transaction(&self) -> DslResult<StatementResult> {
+    pub fn rollback_transaction(&self) -> DslResult<StatementResult<P>> {
         let mut active = self.transaction_active.lock().unwrap();
         if !*active {
             return Err(Error::InvalidArgumentError(
@@ -398,13 +448,13 @@ where
         })
     }
 
-    pub fn execute_select(&self, plan: SelectPlan) -> DslResult<SelectExecution> {
+    pub fn execute_select(&self, plan: SelectPlan) -> DslResult<SelectExecution<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
         if !plan.aggregates.is_empty() {
-            self.execute_aggregates(table.as_ref(), display_name, plan)
+            self.execute_aggregates(Arc::clone(&table), display_name, plan)
         } else {
-            self.execute_projection(table.as_ref(), display_name, plan)
+            self.execute_projection(table, display_name, plan)
         }
     }
 
@@ -414,7 +464,7 @@ where
         canonical_name: String,
         columns: Vec<ColumnSpec>,
         if_not_exists: bool,
-    ) -> DslResult<StatementResult> {
+    ) -> DslResult<StatementResult<P>> {
         if columns.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "CREATE TABLE requires at least one column".into(),
@@ -472,7 +522,9 @@ where
         let mut tables = self.tables.write().unwrap();
         if tables.contains_key(&canonical_name) {
             if if_not_exists {
-                return Ok(StatementResult::CreateTable { table_name: display_name });
+                return Ok(StatementResult::CreateTable {
+                    table_name: display_name,
+                });
             }
             return Err(Error::InvalidArgumentError(format!(
                 "table '{}' already exists",
@@ -480,7 +532,9 @@ where
             )));
         }
         tables.insert(canonical_name, table_entry);
-        Ok(StatementResult::CreateTable { table_name: display_name })
+        Ok(StatementResult::CreateTable {
+            table_name: display_name,
+        })
     }
 
     fn create_table_from_batches(
@@ -490,7 +544,7 @@ where
         schema: Arc<Schema>,
         batches: Vec<RecordBatch>,
         if_not_exists: bool,
-    ) -> DslResult<StatementResult> {
+    ) -> DslResult<StatementResult<P>> {
         if schema.fields().is_empty() {
             return Err(Error::InvalidArgumentError(
                 "CREATE TABLE AS SELECT requires at least one column".into(),
@@ -608,7 +662,9 @@ where
         let mut tables = self.tables.write().unwrap();
         if tables.contains_key(&canonical_name) {
             if if_not_exists {
-                return Ok(StatementResult::CreateTable { table_name: display_name });
+                return Ok(StatementResult::CreateTable {
+                    table_name: display_name,
+                });
             }
             return Err(Error::InvalidArgumentError(format!(
                 "table '{}' already exists",
@@ -616,7 +672,9 @@ where
             )));
         }
         tables.insert(canonical_name, table_entry);
-        Ok(StatementResult::CreateTable { table_name: display_name })
+        Ok(StatementResult::CreateTable {
+            table_name: display_name,
+        })
     }
 
     fn insert_rows(
@@ -625,7 +683,7 @@ where
         display_name: String,
         rows: Vec<Vec<DslValue>>,
         columns: Vec<String>,
-    ) -> DslResult<StatementResult> {
+    ) -> DslResult<StatementResult<P>> {
         if rows.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "INSERT requires at least one row".into(),
@@ -699,7 +757,7 @@ where
         display_name: String,
         batches: Vec<RecordBatch>,
         columns: Vec<String>,
-    ) -> DslResult<StatementResult> {
+    ) -> DslResult<StatementResult<P>> {
         if batches.is_empty() {
             return Ok(StatementResult::Insert {
                 table_name: display_name,
@@ -760,7 +818,7 @@ where
         table: &DslTable<P>,
         display_name: String,
         assignments: Vec<ColumnAssignment>,
-    ) -> DslResult<StatementResult> {
+    ) -> DslResult<StatementResult<P>> {
         if assignments.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "UPDATE requires at least one assignment".into(),
@@ -833,21 +891,22 @@ where
 
     fn execute_projection(
         &self,
-        table: &DslTable<P>,
+        table: Arc<DslTable<P>>,
         display_name: String,
         plan: SelectPlan,
-    ) -> DslResult<SelectExecution> {
+    ) -> DslResult<SelectExecution<P>> {
+        let table_ref = table.as_ref();
         let projections = if plan.projections.is_empty() {
-            build_wildcard_projections(table)
+            build_wildcard_projections(table_ref)
         } else {
-            build_projected_columns(table, &plan.projections)?
+            build_projected_columns(table_ref, &plan.projections)?
         };
-        let schema = schema_for_projections(table, &projections)?;
+        let schema = schema_for_projections(table_ref, &projections)?;
 
         let filter_expr = match plan.filter {
-            Some(expr) => translate_predicate(expr, table.schema.as_ref())?,
+            Some(expr) => translate_predicate(expr, table_ref.schema.as_ref())?,
             None => {
-                let field_id = table.schema.first_field_id().ok_or_else(|| {
+                let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "table has no columns; cannot perform wildcard scan".into(),
                     )
@@ -856,36 +915,27 @@ where
             }
         };
 
-        let mut batches: Vec<RecordBatch> = Vec::new();
         let options = ScanStreamOptions {
             include_nulls: true,
         };
-        table
-            .table
-            .scan_stream(projections.clone(), &filter_expr, options, |batch| {
-                batches.push(batch.clone());
-            })?;
 
-        if batches.is_empty() {
-            let total_rows = table.total_rows.load(Ordering::SeqCst);
-            if total_rows > 0 {
-                batches = synthesize_null_scan(Arc::clone(&schema), total_rows)?;
-            }
-        }
-
-        Ok(SelectExecution {
-            table_name: display_name,
+        Ok(SelectExecution::new_projection(
+            display_name,
             schema,
-            batches,
-        })
+            table,
+            projections,
+            filter_expr,
+            options,
+        ))
     }
 
     fn execute_aggregates(
         &self,
-        table: &DslTable<P>,
+        table: Arc<DslTable<P>>,
         display_name: String,
         plan: SelectPlan,
-    ) -> DslResult<SelectExecution> {
+    ) -> DslResult<SelectExecution<P>> {
+        let table_ref = table.as_ref();
         let mut specs: Vec<AggregateSpec> = Vec::with_capacity(plan.aggregates.len());
         for aggregate in plan.aggregates {
             match aggregate {
@@ -900,7 +950,7 @@ where
                     alias,
                     function,
                 } => {
-                    let col = table.schema.resolve(&column).ok_or_else(|| {
+                    let col = table_ref.schema.resolve(&column).ok_or_else(|| {
                         Error::InvalidArgumentError(format!(
                             "unknown column '{}' in aggregate",
                             column
@@ -1057,11 +1107,11 @@ where
 
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
-        Ok(SelectExecution {
-            table_name: display_name,
+        Ok(SelectExecution::new_single_batch(
+            display_name,
             schema,
-            batches: vec![batch],
-        })
+            batch,
+        ))
     }
 
     fn lookup_table(&self, canonical_name: &str) -> DslResult<Arc<DslTable<P>>> {
@@ -1144,16 +1194,144 @@ where
         self
     }
 
-    pub fn collect(self) -> DslResult<SelectExecution> {
+    pub fn collect(self) -> DslResult<SelectExecution<P>> {
         self.context.execute_select(self.plan)
     }
 }
 
-/// Result of executing a select plan.
-pub struct SelectExecution {
-    pub table_name: String,
-    pub schema: Arc<Schema>,
-    pub batches: Vec<RecordBatch>,
+/// Streaming execution handle for SELECT queries.
+#[derive(Clone)]
+pub struct SelectExecution<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    table_name: String,
+    schema: Arc<Schema>,
+    stream: SelectStream<P>,
+}
+
+#[derive(Clone)]
+enum SelectStream<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    Projection {
+        table: Arc<DslTable<P>>,
+        projections: Vec<ScanProjection>,
+        filter_expr: LlkvExpr<'static, FieldId>,
+        options: ScanStreamOptions,
+    },
+    Aggregation {
+        batch: RecordBatch,
+    },
+}
+
+impl<P> SelectExecution<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn new_projection(
+        table_name: String,
+        schema: Arc<Schema>,
+        table: Arc<DslTable<P>>,
+        projections: Vec<ScanProjection>,
+        filter_expr: LlkvExpr<'static, FieldId>,
+        options: ScanStreamOptions,
+    ) -> Self {
+        Self {
+            table_name,
+            schema,
+            stream: SelectStream::Projection {
+                table,
+                projections,
+                filter_expr,
+                options,
+            },
+        }
+    }
+
+    fn new_single_batch(
+        table_name: String,
+        schema: Arc<Schema>,
+        batch: RecordBatch,
+    ) -> Self {
+        Self {
+            table_name,
+            schema,
+            stream: SelectStream::Aggregation { batch },
+        }
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    pub fn schema(&self) -> Arc<Schema> {
+        Arc::clone(&self.schema)
+    }
+
+    pub fn stream(
+        self,
+        mut on_batch: impl FnMut(RecordBatch) -> DslResult<()>,
+    ) -> DslResult<()> {
+        let schema = Arc::clone(&self.schema);
+        match self.stream {
+            SelectStream::Projection {
+                table,
+                projections,
+                filter_expr,
+                options,
+            } => {
+                let mut error: Option<Error> = None;
+                let mut produced = false;
+                table
+                    .table
+                    .scan_stream(projections, &filter_expr, options, |batch| {
+                        if error.is_some() {
+                            return;
+                        }
+                        produced = true;
+                        if let Err(err) = on_batch(batch) {
+                            error = Some(err);
+                        }
+                    })?;
+                if let Some(err) = error {
+                    return Err(err);
+                }
+                if !produced {
+                    let total_rows = table.total_rows.load(Ordering::SeqCst);
+                    if total_rows > 0 {
+                        for batch in synthesize_null_scan(Arc::clone(&schema), total_rows)? {
+                            on_batch(batch)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            SelectStream::Aggregation { batch } => on_batch(batch),
+        }
+    }
+
+    pub fn collect(self) -> DslResult<Vec<RecordBatch>> {
+        let mut batches = Vec::new();
+        self.stream(|batch| {
+            batches.push(batch);
+            Ok(())
+        })?;
+        Ok(batches)
+    }
+}
+
+impl<P> fmt::Debug for SelectExecution<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SelectExecution")
+            .field("table_name", &self.table_name)
+            .field("schema", &self.schema)
+            .finish()
+    }
 }
 
 struct DslTable<P>
@@ -1938,7 +2116,7 @@ fn translate_scalar(expr: &ScalarExpr<String>, schema: &DslSchema) -> DslResult<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, StringArray};
+    use arrow::array::{Array, Int64Array, StringArray};
     use llkv_storage::pager::MemPager;
 
     #[test]
@@ -1978,8 +2156,9 @@ mod tests {
                 alias: None,
             }]);
         let execution = context.execute_select(select_plan).expect("select rows");
-        assert_eq!(execution.batches.len(), 1);
-        let column = execution.batches[0]
+        let batches = execution.collect().expect("collect batches");
+        assert_eq!(batches.len(), 1);
+        let column = batches[0]
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
@@ -2017,8 +2196,9 @@ mod tests {
             "i",
             "nulls",
         )]);
-        let result = context.execute_select(plan).expect("select");
-        let column = result.batches[0]
+        let execution = context.execute_select(plan).expect("select");
+        let batches = execution.collect().expect("collect batches");
+        let column = batches[0]
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()

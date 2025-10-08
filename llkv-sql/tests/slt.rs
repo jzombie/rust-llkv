@@ -33,17 +33,19 @@ impl AsyncDB for EngineHarness {
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
         match self.engine.execute(sql) {
-            Ok(results) => {
+            Ok(mut results) => {
                 if results.is_empty() {
                     return Ok(DBOutput::StatementComplete(0));
                 }
-                match &results[0] {
+                let result = results.remove(0);
+                match result {
                     SqlStatementResult::Select {
-                        table_name: _,
-                        batches,
+                        execution,
+                        ..
                     } => {
+                        let batches = execution.collect()?;
                         let mut rows: Vec<Vec<String>> = Vec::new();
-                        for batch in batches {
+                        for batch in &batches {
                             for row_idx in 0..batch.num_rows() {
                                 let mut row: Vec<String> = Vec::new();
                                 for col in 0..batch.num_columns() {
@@ -101,7 +103,6 @@ impl AsyncDB for EngineHarness {
                             }
                         }
 
-                        // Map column types from the first batch when available.
                         let types = if let Some(first) = batches.first() {
                             (0..first.num_columns())
                                 .map(|col| match first.column(col).data_type() {
@@ -123,10 +124,10 @@ impl AsyncDB for EngineHarness {
                         Ok(DBOutput::Rows { types, rows })
                     }
                     SqlStatementResult::Insert { rows_inserted, .. } => {
-                        Ok(DBOutput::StatementComplete(*rows_inserted as u64))
+                        Ok(DBOutput::StatementComplete(rows_inserted as u64))
                     }
                     SqlStatementResult::Update { rows_updated, .. } => {
-                        Ok(DBOutput::StatementComplete(*rows_updated as u64))
+                        Ok(DBOutput::StatementComplete(rows_updated as u64))
                     }
                     SqlStatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
                     SqlStatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
