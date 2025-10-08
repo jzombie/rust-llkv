@@ -1,16 +1,17 @@
-use arrow::array::Array as ArrowArray;
+#![cfg(test)]
+
+use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Float64Array, Int64Array, StringArray, UInt64Array};
-use llkv_result::Error as LlkvError;
-use llkv_sql::{SqlEngine, StatementResult};
-use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType, Runner};
 
-pub struct EngineHarness {
+use crate::SqlEngine;
+use crate::SqlResult;
+use llkv_storage::pager::MemPager;
+
+struct EngineHarness {
     engine: SqlEngine<MemPager>,
 }
-
 impl EngineHarness {
     pub fn new() -> Self {
         let pager = Arc::new(MemPager::default());
@@ -20,15 +21,9 @@ impl EngineHarness {
     }
 }
 
-impl Default for EngineHarness {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait::async_trait]
 impl AsyncDB for EngineHarness {
-    type Error = LlkvError;
+    type Error = llkv_result::Error;
     type ColumnType = DefaultColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
@@ -39,7 +34,7 @@ impl AsyncDB for EngineHarness {
                 }
                 let result = results.remove(0);
                 match result {
-                    StatementResult::Select { execution, .. } => {
+                    llkv_dsl::StatementResult::Select { execution, .. } => {
                         let batches = execution.collect()?;
                         let mut rows: Vec<Vec<String>> = Vec::new();
                         for batch in &batches {
@@ -51,7 +46,7 @@ impl AsyncDB for EngineHarness {
                                         arrow::datatypes::DataType::Int64 => {
                                             let a = array
                                                 .as_any()
-                                                .downcast_ref::<Int64Array>()
+                                                .downcast_ref::<arrow::array::Int64Array>()
                                                 .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
@@ -62,7 +57,7 @@ impl AsyncDB for EngineHarness {
                                         arrow::datatypes::DataType::UInt64 => {
                                             let a = array
                                                 .as_any()
-                                                .downcast_ref::<UInt64Array>()
+                                                .downcast_ref::<arrow::array::UInt64Array>()
                                                 .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
@@ -73,7 +68,7 @@ impl AsyncDB for EngineHarness {
                                         arrow::datatypes::DataType::Float64 => {
                                             let a = array
                                                 .as_any()
-                                                .downcast_ref::<Float64Array>()
+                                                .downcast_ref::<arrow::array::Float64Array>()
                                                 .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
@@ -84,7 +79,7 @@ impl AsyncDB for EngineHarness {
                                         arrow::datatypes::DataType::Utf8 => {
                                             let a = array
                                                 .as_any()
-                                                .downcast_ref::<StringArray>()
+                                                .downcast_ref::<arrow::array::StringArray>()
                                                 .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
@@ -120,14 +115,18 @@ impl AsyncDB for EngineHarness {
 
                         Ok(DBOutput::Rows { types, rows })
                     }
-                    StatementResult::Insert { rows_inserted, .. } => {
+                    llkv_dsl::StatementResult::Insert { rows_inserted, .. } => {
                         Ok(DBOutput::StatementComplete(rows_inserted as u64))
                     }
-                    StatementResult::Update { rows_updated, .. } => {
+                    llkv_dsl::StatementResult::Update { rows_updated, .. } => {
                         Ok(DBOutput::StatementComplete(rows_updated as u64))
                     }
-                    StatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
-                    StatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
+                    llkv_dsl::StatementResult::CreateTable { .. } => {
+                        Ok(DBOutput::StatementComplete(0))
+                    }
+                    llkv_dsl::StatementResult::Transaction { .. } => {
+                        Ok(DBOutput::StatementComplete(0))
+                    }
                 }
             }
             Err(e) => Err(e),
@@ -137,37 +136,77 @@ impl AsyncDB for EngineHarness {
     async fn shutdown(&mut self) {}
 }
 
-#[tokio::test]
-async fn run_slt_basic() {
+/// Run a single slt file by path using the existing Async Runner.
+pub async fn run_slt_file<P: AsRef<Path>>(path: P) -> SqlResult<()> {
+    fn expand_loops(lines: &[String]) -> SqlResult<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        let mut i = 0usize;
+        while i < lines.len() {
+            let line = lines[i].trim_start().to_string();
+            if line.starts_with("loop ") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 4 {
+                    return Err(llkv_result::Error::Internal(format!(
+                        "malformed loop directive: {}",
+                        line
+                    )));
+                }
+                let var = parts[1];
+                let start: i64 = parts[2].parse().map_err(|e| {
+                    llkv_result::Error::Internal(format!("invalid loop start: {}", e))
+                })?;
+                let count: i64 = parts[3].parse().map_err(|e| {
+                    llkv_result::Error::Internal(format!("invalid loop count: {}", e))
+                })?;
+
+                let mut j = i + 1;
+                while j < lines.len() && lines[j].trim_start() != "endloop" {
+                    j += 1;
+                }
+                if j >= lines.len() {
+                    return Err(llkv_result::Error::Internal(
+                        "unterminated loop in slt".to_string(),
+                    ));
+                }
+
+                let inner = &lines[i + 1..j];
+                for k in 0..count {
+                    let val = (start + k).to_string();
+                    let substituted: Vec<String> = inner
+                        .iter()
+                        .map(|l| l.replace(&format!("${}", var), &val))
+                        .collect();
+                    let rec = expand_loops(&substituted)?;
+                    out.extend(rec);
+                }
+
+                i = j + 1;
+            } else {
+                out.push(lines[i].clone());
+                i += 1;
+            }
+        }
+        Ok(out)
+    }
+
+    let text = std::fs::read_to_string(path.as_ref())
+        .map_err(|e| llkv_result::Error::Internal(format!("failed to read slt file: {}", e)))?;
+    let raw_lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let expanded_lines = expand_loops(&raw_lines)?;
+
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("llkv_slt_{}.slt", std::process::id()));
+    let expanded_text = expanded_lines.join("\n");
+    std::fs::write(&tmp, expanded_text).map_err(|e| {
+        llkv_result::Error::Internal(format!("failed to write temp slt file: {}", e))
+    })?;
+
     let mut runner = Runner::new(|| async { Ok(EngineHarness::new()) });
-
-    // Create a tiny inline script in the system temp dir and run it via the runner.
-    let script = "";
-    let mut path = std::env::temp_dir();
-    path.push(format!("llkv_basic_{}.slt", std::process::id()));
-    std::fs::write(&path, script).expect("write slt");
-
-    // use the async variant
     runner
-        .run_file_async(&path)
+        .run_file_async(&tmp)
         .await
-        .expect("slt runner failed");
-}
+        .map_err(|e| llkv_result::Error::Internal(format!("slt runner failed: {}", e)))?;
 
-// Use the shared helper in the crate to run a single slt file.
-// run_single_slt is provided by the shared test helper `common_slt_runner`.
-// Re-export it here so other test modules can call `slt::run_single_slt`.
-// small helper functionality lives in `tests/slt_harness.rs` now.
-
-#[test]
-fn validator_space_vs_tab() {
-    use sqllogictest::runner::{default_normalizer, default_validator};
-
-    let actual = vec![
-        vec!["1".to_string(), "3.14".to_string()],
-        vec!["2".to_string(), "2.71".to_string()],
-    ];
-    let expected = vec!["1 3.14".to_string(), "2 2.71".to_string()];
-
-    assert!(default_validator(default_normalizer, &actual, &expected));
+    let _ = std::fs::remove_file(&tmp);
+    Ok(())
 }
