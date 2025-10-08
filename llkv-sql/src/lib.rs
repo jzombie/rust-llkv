@@ -1,9 +1,9 @@
 pub type SqlResult<T> = llkv_result::Result<T>;
 
 mod sql_engine;
+pub use sql_engine::SqlEngine;
 
-// TODO: Rename to `sql_value`
-mod value;
+mod sql_value;
+use sql_value::SqlValue;
 
 pub use llkv_dsl::{SelectExecution, StatementResult, TransactionKind};
-pub use sql_engine::SqlEngine;

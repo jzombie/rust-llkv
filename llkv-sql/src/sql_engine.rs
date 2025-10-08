@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::SqlResult;
-use crate::value::SqlValue;
+use crate::SqlValue;
 
 use llkv_dsl::{
     AggregateExpr, ColumnAssignment, ColumnSpec, CreateTablePlan, CreateTableSource, DslContext,
