@@ -13,4 +13,4 @@ arrow.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-llkv-test-utils = { path = "../llkv-test-utils", features = ["auto-init"], optional = false }
+llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }

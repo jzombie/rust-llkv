@@ -25,8 +25,8 @@ thiserror = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 line-ending = { workspace = true }
+llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
 rand = { workspace = true }
-llkv-test-utils = { path = "../llkv-test-utils", features = ["auto-init"], optional = false }
 
 [[bench]]
 name = "column_sum_bench"
