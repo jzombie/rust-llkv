@@ -11,3 +11,6 @@ publish.workspace = true
 [dependencies]
 arrow.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+llkv-test-utils = { path = "../llkv-test-utils", features = ["auto-init"], optional = false }

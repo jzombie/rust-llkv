@@ -11,3 +11,4 @@ publish.workspace = true
 [dependencies]
 arrow.workspace = true
 arrow-array.workspace = true
+llkv-test-utils = { path = "../llkv-test-utils", features = ["auto-init"], optional = false }

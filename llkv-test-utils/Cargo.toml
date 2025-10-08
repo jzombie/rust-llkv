@@ -1,0 +1,21 @@
+[package]
+name = "llkv-test-utils"
+description = "Test utilities for LLKV toolkit."
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# When enabled, tracing will be auto-initialized at test-binary startup via ctor.
+auto-init = ["ctor"]
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[dependencies.ctor]
+optional = true
+version = "0.5.0"

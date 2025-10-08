@@ -19,3 +19,4 @@ simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
 [dev-dependencies]
 tempfile.workspace = true
 rand.workspace = true
+llkv-test-utils = { path = "../llkv-test-utils", features = ["auto-init"], optional = false }

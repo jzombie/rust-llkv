@@ -45,6 +45,7 @@ sqllogictest = "0.28.4"
 time = { version = "0.3.44", features = ["parsing"] }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.2", features = ["env-filter"] }
 
 [workspace]
 members = [
@@ -56,6 +57,7 @@ members = [
     "llkv-result",
     "llkv-sql",
     "llkv-storage",
-    "llkv-table"
+    "llkv-table",
+    "llkv-test-utils"
 ]
 resolver = "2"
