@@ -74,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let options = ScanStreamOptions {
         include_nulls: false,
+        order: None,
     };
 
     println!("Starting streaming scan...");

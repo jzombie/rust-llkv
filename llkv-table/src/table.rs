@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::planner::TablePlanner;
+use crate::planner::{TablePlanner, collect_row_ids_for_table};
 use crate::types::TableId;
 
 use arrow::array::{ArrayRef, RecordBatch, StringArray, UInt32Array};
@@ -25,7 +25,7 @@ where
     table_id: TableId,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct ScanStreamOptions {
     /// Preserve null rows emitted by the projected columns when `true`.
     /// When `false`, the scan gatherer drops rows where all projected
@@ -33,6 +33,39 @@ pub struct ScanStreamOptions {
     /// the table scan column-oriented while delegating row-level
     /// filtering to the column-map layer.
     pub include_nulls: bool,
+    /// Optional ordering specification applied to the gathered row ids
+    /// before projection results are materialized.
+    pub order: Option<ScanOrderSpec>,
+}
+
+impl Default for ScanStreamOptions {
+    fn default() -> Self {
+        Self {
+            include_nulls: false,
+            order: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ScanOrderSpec {
+    pub field_id: FieldId,
+    pub direction: ScanOrderDirection,
+    pub nulls_first: bool,
+    pub transform: ScanOrderTransform,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanOrderDirection {
+    Ascending,
+    Descending,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanOrderTransform {
+    IdentityInteger,
+    IdentityUtf8,
+    CastUtf8ToInteger,
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +240,11 @@ where
         F: FnMut(RecordBatch),
     {
         TablePlanner::new(self).scan_stream_with_exprs(projections, filter_expr, options, on_batch)
+    }
+
+    // TODO: Return `LlkvResult<Vec<RowId>>`
+    pub fn filter_row_ids<'a>(&self, filter_expr: &Expr<'a, FieldId>) -> LlkvResult<Vec<u64>> {
+        collect_row_ids_for_table(self, filter_expr)
     }
 
     #[inline]
@@ -1232,6 +1270,7 @@ mod tests {
                 &filter,
                 ScanStreamOptions {
                     include_nulls: true,
+                    order: None,
                 },
                 |b| {
                     let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();

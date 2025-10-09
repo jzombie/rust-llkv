@@ -127,6 +127,7 @@ impl AsyncDB for EngineHarness {
                         Ok(DBOutput::StatementComplete(rows_updated as u64))
                     }
                     StatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
+                    StatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
                     StatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
                 }
             }
@@ -154,6 +155,7 @@ async fn run_slt_basic() {
         .expect("slt runner failed");
 }
 
+// TODO: Improve test
 #[test]
 fn validator_space_vs_tab() {
     use sqllogictest::runner::{default_normalizer, default_validator};

@@ -1,6 +1,6 @@
 pub mod plan_graph;
 
-use std::cmp;
+use std::cmp::{self, Ordering};
 use std::convert::TryFrom;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -32,7 +32,9 @@ use rayon::prelude::*;
 
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::scalar_eval::{NumericArrayMap, NumericKernels};
-use crate::table::{ScanProjection, ScanStreamOptions, Table};
+use crate::table::{
+    ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
+};
 use crate::types::FieldId;
 
 use self::plan_graph::{
@@ -433,6 +435,7 @@ where
         TableExecutor::new(self.table).execute(plan, on_batch)
     }
 
+    // TODO: Return `LlkvResult<Vec<RowId>>`
     fn plan_scan<'expr>(
         &self,
         projections: &[ScanProjection],
@@ -691,7 +694,7 @@ where
 
         let fusion_cache = PredicateFusionCache::from_expr(&filter_expr);
         let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
-        let row_ids =
+        let mut row_ids =
             self.collect_row_ids_for_expr(&filter_expr, &fusion_cache, &mut all_rows_cache)?;
         if row_ids.is_empty() {
             if is_trivial_filter(&filter_expr) {
@@ -720,6 +723,10 @@ where
                 on_batch(batch);
             }
             return Ok(());
+        }
+
+        if let Some(order_spec) = options.order {
+            row_ids = self.sort_row_ids_with_order(row_ids, order_spec)?;
         }
 
         let null_policy = if options.include_nulls {
@@ -1341,6 +1348,123 @@ where
         }
     }
 
+    fn sort_row_ids_with_order(
+        &self,
+        mut row_ids: Vec<u64>,
+        order: ScanOrderSpec,
+    ) -> LlkvResult<Vec<u64>> {
+        if row_ids.len() <= 1 {
+            return Ok(row_ids);
+        }
+
+        let lfid = LogicalFieldId::for_user(self.table.table_id(), order.field_id);
+        let batch =
+            self.table
+                .store()
+                .gather_rows(&[lfid], &row_ids, GatherNullPolicy::IncludeNulls)?;
+
+        if batch.num_columns() != 1 || batch.num_rows() != row_ids.len() {
+            return Err(Error::Internal(
+                "ORDER BY gather produced unexpected column count".into(),
+            ));
+        }
+
+        let ascending = matches!(order.direction, ScanOrderDirection::Ascending);
+
+        match order.transform {
+            ScanOrderTransform::IdentityInteger => {
+                let array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError("ORDER BY integer expects Int64 column".into())
+                    })?;
+                let mut indices: Vec<(usize, u64)> = row_ids.iter().copied().enumerate().collect();
+                indices.sort_by(|(ai, arid), (bi, brid)| {
+                    let left = if array.is_null(*ai) {
+                        None
+                    } else {
+                        Some(array.value(*ai))
+                    };
+                    let right = if array.is_null(*bi) {
+                        None
+                    } else {
+                        Some(array.value(*bi))
+                    };
+                    let ord = compare_option_values(left, right, ascending, order.nulls_first);
+                    if ord == Ordering::Equal {
+                        arid.cmp(brid)
+                    } else {
+                        ord
+                    }
+                });
+                row_ids = indices.into_iter().map(|(_, rid)| rid).collect();
+            }
+            ScanOrderTransform::IdentityUtf8 => {
+                let array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError("ORDER BY text expects Utf8 column".into())
+                    })?;
+                let mut indices: Vec<(usize, u64)> = row_ids.iter().copied().enumerate().collect();
+                indices.sort_by(|(ai, arid), (bi, brid)| {
+                    let left = if array.is_null(*ai) {
+                        None
+                    } else {
+                        Some(array.value(*ai))
+                    };
+                    let right = if array.is_null(*bi) {
+                        None
+                    } else {
+                        Some(array.value(*bi))
+                    };
+                    let ord = compare_option_values(left, right, ascending, order.nulls_first);
+                    if ord == Ordering::Equal {
+                        arid.cmp(brid)
+                    } else {
+                        ord
+                    }
+                });
+                row_ids = indices.into_iter().map(|(_, rid)| rid).collect();
+            }
+            ScanOrderTransform::CastUtf8ToInteger => {
+                let array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError("ORDER BY CAST expects Utf8 column".into())
+                    })?;
+                let mut keys: Vec<Option<i64>> = Vec::with_capacity(row_ids.len());
+                for idx in 0..row_ids.len() {
+                    let key = if array.is_null(idx) {
+                        None
+                    } else {
+                        array.value(idx).parse::<i64>().ok()
+                    };
+                    keys.push(key);
+                }
+                let mut indices: Vec<(usize, u64)> = row_ids.iter().copied().enumerate().collect();
+                indices.sort_by(|(ai, arid), (bi, brid)| {
+                    let left = keys[*ai];
+                    let right = keys[*bi];
+                    let ord = compare_option_values(left, right, ascending, order.nulls_first);
+                    if ord == Ordering::Equal {
+                        arid.cmp(brid)
+                    } else {
+                        ord
+                    }
+                });
+                row_ids = indices.into_iter().map(|(_, rid)| rid).collect();
+            }
+        }
+
+        Ok(row_ids)
+    }
+
     fn collect_all_row_ids_for_field(
         &self,
         field_id: FieldId,
@@ -1470,6 +1594,20 @@ where
         )?;
         Ok(fused)
     }
+}
+
+// TODO: Return `LlkvResult<Vec<RowId>>`
+pub(crate) fn collect_row_ids_for_table<'expr, P>(
+    table: &Table<P>,
+    filter_expr: &Expr<'expr, FieldId>,
+) -> LlkvResult<Vec<u64>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let executor = TableExecutor::new(table);
+    let fusion_cache = PredicateFusionCache::from_expr(filter_expr);
+    let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
+    executor.collect_row_ids_for_expr(filter_expr, &fusion_cache, &mut all_rows_cache)
 }
 
 fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
@@ -1665,6 +1803,38 @@ fn format_literal(lit: &Literal) -> String {
 
 fn escape_string(value: &str) -> String {
     value.chars().flat_map(|c| c.escape_default()).collect()
+}
+
+fn compare_option_values<T: Ord>(
+    left: Option<T>,
+    right: Option<T>,
+    ascending: bool,
+    nulls_first: bool,
+) -> Ordering {
+    match (left, right) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => {
+            if nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (Some(_), None) => {
+            if nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (Some(a), Some(b)) => {
+            if ascending {
+                a.cmp(&b)
+            } else {
+                b.cmp(&a)
+            }
+        }
+    }
 }
 
 fn is_full_range_filter(expr: &Expr<'_, FieldId>, expected_field: FieldId) -> bool {

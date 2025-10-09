@@ -198,6 +198,7 @@ where
         let mut write_error: Option<Error> = None;
         let scan_options = ScanStreamOptions {
             include_nulls: self.options.include_nulls,
+            order: None,
         };
 
         self.table

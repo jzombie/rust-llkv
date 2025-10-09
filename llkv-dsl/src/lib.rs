@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
     Array, ArrayRef, Date32Array, Date32Builder, Float64Array, Float64Builder, Int64Array,
-    Int64Builder, StringArray, StringBuilder, UInt64Builder, new_null_array,
+    Int64Builder, StringArray, StringBuilder, UInt64Array, UInt64Builder, new_null_array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -20,7 +20,9 @@ use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
-use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
+use llkv_table::table::{
+    ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
+};
 use llkv_table::types::{FieldId, TableId};
 use llkv_table::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -42,6 +44,7 @@ where
     CreateTable {
         table_name: String,
     },
+    NoOp,
     Insert {
         table_name: String,
         rows_inserted: usize,
@@ -70,6 +73,7 @@ where
                 .debug_struct("CreateTable")
                 .field("table_name", table_name)
                 .finish(),
+            StatementResult::NoOp => f.debug_struct("NoOp").finish(),
             StatementResult::Insert {
                 table_name,
                 rows_inserted,
@@ -269,6 +273,7 @@ pub enum InsertSource {
 pub struct UpdatePlan {
     pub table: String,
     pub assignments: Vec<ColumnAssignment>,
+    pub filter: Option<LlkvExpr<'static, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -284,6 +289,7 @@ pub struct SelectPlan {
     pub projections: Vec<SelectProjection>,
     pub filter: Option<LlkvExpr<'static, String>>,
     pub aggregates: Vec<AggregateExpr>,
+    pub order_by: Option<OrderByPlan>,
 }
 
 impl SelectPlan {
@@ -293,6 +299,7 @@ impl SelectPlan {
             projections: Vec::new(),
             filter: None,
             aggregates: Vec::new(),
+            order_by: None,
         }
     }
 
@@ -310,6 +317,31 @@ impl SelectPlan {
         self.aggregates = aggregates;
         self
     }
+
+    pub fn with_order_by(mut self, order_by: Option<OrderByPlan>) -> Self {
+        self.order_by = order_by;
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderByPlan {
+    pub target: OrderTarget,
+    pub sort_type: OrderSortType,
+    pub ascending: bool,
+    pub nulls_first: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum OrderSortType {
+    Native,
+    CastTextToInteger,
+}
+
+#[derive(Clone, Debug)]
+pub enum OrderTarget {
+    Column(String),
+    Index(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -529,7 +561,12 @@ where
     pub fn update(&self, plan: UpdatePlan) -> DslResult<StatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
-        self.update_all_rows(table.as_ref(), display_name, plan.assignments)
+        match plan.filter {
+            Some(filter) => {
+                self.update_filtered_rows(table.as_ref(), display_name, plan.assignments, filter)
+            }
+            None => self.update_all_rows(table.as_ref(), display_name, plan.assignments),
+        }
     }
 
     pub fn table_handle(self: &Arc<Self>, name: &str) -> DslResult<TableHandle<P>> {
@@ -932,6 +969,78 @@ where
         })
     }
 
+    fn update_filtered_rows(
+        &self,
+        table: &DslTable<P>,
+        display_name: String,
+        assignments: Vec<ColumnAssignment>,
+        filter: LlkvExpr<'static, String>,
+    ) -> DslResult<StatementResult<P>> {
+        if assignments.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "UPDATE requires at least one assignment".into(),
+            ));
+        }
+
+        let filter_expr = translate_predicate(filter, table.schema.as_ref())?;
+        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+
+        if row_ids.is_empty() {
+            return Ok(StatementResult::Update {
+                table_name: display_name,
+                rows_updated: 0,
+            });
+        }
+
+        let row_count = row_ids.len();
+
+        let mut seen_columns: HashSet<String> = HashSet::new();
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(assignments.len() + 1);
+        arrays.push(Arc::new(UInt64Array::from(row_ids.clone())));
+
+        let mut fields: Vec<Field> = Vec::with_capacity(assignments.len() + 1);
+        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+
+        for assignment in assignments {
+            let normalized = assignment.column.to_ascii_lowercase();
+            if !seen_columns.insert(normalized.clone()) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "duplicate column '{}' in UPDATE assignments",
+                    assignment.column
+                )));
+            }
+            let column = table.schema.resolve(&assignment.column).ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "unknown column '{}' in UPDATE",
+                    assignment.column
+                ))
+            })?;
+
+            let values: Vec<DslValue> = std::iter::repeat(assignment.value.clone())
+                .take(row_count)
+                .collect();
+            let array = build_array_for_column(&column.data_type, &values)?;
+            arrays.push(array);
+
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+                column.field_id.to_string(),
+            );
+            let field = Field::new(&column.name, column.data_type.clone(), column.nullable)
+                .with_metadata(metadata);
+            fields.push(field);
+        }
+
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
+        table.table.append(&batch)?;
+
+        Ok(StatementResult::Update {
+            table_name: display_name,
+            rows_updated: row_count,
+        })
+    }
+
     fn update_all_rows(
         &self,
         table: &DslTable<P>,
@@ -1031,9 +1140,12 @@ where
             }
         };
 
-        let options = ScanStreamOptions {
-            include_nulls: true,
-        };
+        let mut options = ScanStreamOptions::default();
+        options.include_nulls = true;
+        if let Some(order_plan) = &plan.order_by {
+            let order_spec = resolve_scan_order(table_ref, &projections, order_plan)?;
+            options.order = Some(order_spec);
+        }
 
         Ok(SelectExecution::new_projection(
             display_name,
@@ -1165,9 +1277,8 @@ where
             )));
         }
 
-        let options = ScanStreamOptions {
-            include_nulls: true,
-        };
+        let mut options = ScanStreamOptions::default();
+        options.include_nulls = true;
 
         let mut states: Vec<AggregateState> = Vec::with_capacity(specs.len());
         let mut count_star_override: Option<i64> = None;
@@ -1272,6 +1383,83 @@ where
         catalog.put_next_table_id(following)?;
         Ok(next)
     }
+}
+
+fn resolve_scan_order<P>(
+    table: &DslTable<P>,
+    projections: &[ScanProjection],
+    order_plan: &OrderByPlan,
+) -> DslResult<ScanOrderSpec>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let (column, field_id) = match &order_plan.target {
+        OrderTarget::Column(name) => {
+            let column = table.schema.resolve(name).ok_or_else(|| {
+                Error::InvalidArgumentError(format!("unknown column '{}' in ORDER BY", name))
+            })?;
+            (column, column.field_id)
+        }
+        OrderTarget::Index(position) => {
+            let projection = projections.get(*position).ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "ORDER BY position {} is out of range",
+                    position + 1
+                ))
+            })?;
+            match projection {
+                ScanProjection::Column(store_projection) => {
+                    let field_id = store_projection.logical_field_id.field_id();
+                    let column = table.schema.column_by_field_id(field_id).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!(
+                            "unknown column with field id {field_id} in ORDER BY"
+                        ))
+                    })?;
+                    (column, field_id)
+                }
+                ScanProjection::Computed { .. } => {
+                    return Err(Error::InvalidArgumentError(
+                        "ORDER BY position referring to computed projection is not supported"
+                            .into(),
+                    ));
+                }
+            }
+        }
+    };
+
+    let transform = match order_plan.sort_type {
+        OrderSortType::Native => match column.data_type {
+            DataType::Int64 => ScanOrderTransform::IdentityInteger,
+            DataType::Utf8 => ScanOrderTransform::IdentityUtf8,
+            ref other => {
+                return Err(Error::InvalidArgumentError(format!(
+                    "ORDER BY on column type {:?} is not supported",
+                    other
+                )));
+            }
+        },
+        OrderSortType::CastTextToInteger => {
+            if column.data_type != DataType::Utf8 {
+                return Err(Error::InvalidArgumentError(
+                    "ORDER BY CAST expects a text column".into(),
+                ));
+            }
+            ScanOrderTransform::CastUtf8ToInteger
+        }
+    };
+
+    let direction = if order_plan.ascending {
+        ScanOrderDirection::Ascending
+    } else {
+        ScanOrderDirection::Descending
+    };
+
+    Ok(ScanOrderSpec {
+        field_id,
+        direction,
+        nulls_first: order_plan.nulls_first,
+        transform,
+    })
 }
 
 /// Lazily built logical plan.
@@ -1383,6 +1571,10 @@ where
         }
     }
 
+    pub fn from_batch(table_name: String, schema: Arc<Schema>, batch: RecordBatch) -> Self {
+        Self::new_single_batch(table_name, schema, batch)
+    }
+
     pub fn table_name(&self) -> &str {
         &self.table_name
     }
@@ -1404,6 +1596,8 @@ where
                 let mut error: Option<Error> = None;
                 let mut produced = false;
                 let mut produced_rows: u64 = 0;
+                let capture_nulls_first = matches!(options.order, Some(spec) if spec.nulls_first);
+                let mut buffered_batches: Vec<RecordBatch> = Vec::new();
                 table
                     .table
                     .scan_stream(projections, &filter_expr, options, |batch| {
@@ -1412,7 +1606,9 @@ where
                         }
                         produced = true;
                         produced_rows = produced_rows.saturating_add(batch.num_rows() as u64);
-                        if let Err(err) = on_batch(batch) {
+                        if capture_nulls_first {
+                            buffered_batches.push(batch);
+                        } else if let Err(err) = on_batch(batch) {
                             error = Some(err);
                         }
                     })?;
@@ -1428,10 +1624,24 @@ where
                     }
                     return Ok(());
                 }
+                let mut null_batches: Vec<RecordBatch> = Vec::new();
                 if options.include_nulls && full_table_scan && produced_rows < total_rows {
                     let missing = total_rows - produced_rows;
                     if missing > 0 {
-                        for batch in synthesize_null_scan(Arc::clone(&schema), missing)? {
+                        null_batches = synthesize_null_scan(Arc::clone(&schema), missing)?;
+                    }
+                }
+
+                if capture_nulls_first {
+                    for batch in null_batches {
+                        on_batch(batch)?;
+                    }
+                    for batch in buffered_batches {
+                        on_batch(batch)?;
+                    }
+                } else {
+                    if !null_batches.is_empty() {
+                        for batch in null_batches {
                             on_batch(batch)?;
                         }
                     }
