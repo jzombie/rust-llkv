@@ -25,7 +25,7 @@ where
     table_id: TableId,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ScanStreamOptions {
     /// Preserve null rows emitted by the projected columns when `true`.
     /// When `false`, the scan gatherer drops rows where all projected
@@ -36,15 +36,6 @@ pub struct ScanStreamOptions {
     /// Optional ordering specification applied to the gathered row ids
     /// before projection results are materialized.
     pub order: Option<ScanOrderSpec>,
-}
-
-impl Default for ScanStreamOptions {
-    fn default() -> Self {
-        Self {
-            include_nulls: false,
-            order: None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]

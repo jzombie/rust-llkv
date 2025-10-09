@@ -1111,28 +1111,25 @@ fn translate_comparison(
         llkv_expr::expr::ScalarExpr::Column(column),
         llkv_expr::expr::ScalarExpr::Literal(literal),
     ) = (&left_scalar, &right_scalar)
+        && let Some(op) = compare_op_to_filter_operator(compare_op, literal)
     {
-        if let Some(op) = compare_op_to_filter_operator(compare_op, literal) {
-            return Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
-                field_id: column.clone(),
-                op,
-            }));
-        }
+        return Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
+            field_id: column.clone(),
+            op,
+        }));
     }
 
     if let (
         llkv_expr::expr::ScalarExpr::Literal(literal),
         llkv_expr::expr::ScalarExpr::Column(column),
     ) = (&left_scalar, &right_scalar)
+        && let Some(flipped) = flip_compare_op(compare_op)
+        && let Some(op) = compare_op_to_filter_operator(flipped, literal)
     {
-        if let Some(flipped) = flip_compare_op(compare_op) {
-            if let Some(op) = compare_op_to_filter_operator(flipped, literal) {
-                return Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
-                    field_id: column.clone(),
-                    op,
-                }));
-            }
-        }
+        return Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
+            field_id: column.clone(),
+            op,
+        }));
     }
 
     Ok(llkv_expr::expr::Expr::Compare {

@@ -1016,9 +1016,8 @@ where
                 ))
             })?;
 
-            let values: Vec<DslValue> = std::iter::repeat(assignment.value.clone())
-                .take(row_count)
-                .collect();
+            let values: Vec<DslValue> =
+                std::iter::repeat_n(assignment.value.clone(), row_count).collect();
             let array = build_array_for_column(&column.data_type, &values)?;
             arrays.push(array);
 
@@ -1140,12 +1139,18 @@ where
             }
         };
 
-        let mut options = ScanStreamOptions::default();
-        options.include_nulls = true;
-        if let Some(order_plan) = &plan.order_by {
+        let options = if let Some(order_plan) = &plan.order_by {
             let order_spec = resolve_scan_order(table_ref, &projections, order_plan)?;
-            options.order = Some(order_spec);
-        }
+            ScanStreamOptions {
+                include_nulls: true,
+                order: Some(order_spec),
+            }
+        } else {
+            ScanStreamOptions {
+                include_nulls: true,
+                order: None,
+            }
+        };
 
         Ok(SelectExecution::new_projection(
             display_name,
@@ -1277,8 +1282,10 @@ where
             )));
         }
 
-        let mut options = ScanStreamOptions::default();
-        options.include_nulls = true;
+        let options = ScanStreamOptions {
+            include_nulls: true,
+            ..Default::default()
+        };
 
         let mut states: Vec<AggregateState> = Vec::with_capacity(specs.len());
         let mut count_star_override: Option<i64> = None;
@@ -1639,11 +1646,9 @@ where
                     for batch in buffered_batches {
                         on_batch(batch)?;
                     }
-                } else {
-                    if !null_batches.is_empty() {
-                        for batch in null_batches {
-                            on_batch(batch)?;
-                        }
+                } else if !null_batches.is_empty() {
+                    for batch in null_batches {
+                        on_batch(batch)?;
                     }
                 }
                 Ok(())
