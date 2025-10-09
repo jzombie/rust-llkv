@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use crate::SqlResult;
 use crate::SqlValue;
 
 use llkv_dsl::{
     AggregateExpr, ColumnAssignment, ColumnSpec, CreateTablePlan, CreateTableSource, DslContext,
-    DslValue, InsertPlan, InsertSource, SelectExecution, SelectPlan, SelectProjection,
-    StatementResult, UpdatePlan, extract_rows_from_range,
+    DslValue, InsertPlan, InsertSource, OrderByPlan, OrderSortType, OrderTarget, SelectExecution,
+    SelectPlan, SelectProjection, StatementResult, UpdatePlan, extract_rows_from_range,
 };
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
@@ -17,9 +18,10 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
     ColumnOptionDef, DataType as SqlDataType, ExceptionWhen, Expr as SqlExpr, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName,
-    ObjectNamePart, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
-    TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
-    UpdateTableFromKind, Value, ValueWithSpan,
+    ObjectNamePart, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, Set, SetExpr, Statement, TableFactor, TableObject,
+    TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator, UpdateTableFromKind,
+    Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -29,6 +31,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     context: Arc<DslContext<P>>,
+    default_nulls_first: AtomicBool,
 }
 
 impl<P> SqlEngine<P>
@@ -38,7 +41,13 @@ where
     pub fn new(pager: Arc<P>) -> Self {
         Self {
             context: Arc::new(DslContext::new(pager)),
+            default_nulls_first: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    fn default_nulls_first_for_tests(&self) -> bool {
+        self.default_nulls_first.load(AtomicOrdering::Relaxed)
     }
 
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<StatementResult<P>>> {
@@ -89,6 +98,7 @@ where
                 modifier,
             } => self.handle_commit(chain, end, modifier),
             Statement::Rollback { chain, savepoint } => self.handle_rollback(chain, savepoint),
+            Statement::Set(set_stmt) => self.handle_set(set_stmt),
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported SQL statement: {other:?}"
             ))),
@@ -294,11 +304,6 @@ where
                 "UPDATE ... FROM is not supported yet".into(),
             ));
         }
-        if selection.is_some() {
-            return Err(Error::InvalidArgumentError(
-                "UPDATE with WHERE clauses is not supported yet".into(),
-            ));
-        }
         if returning.is_some() {
             return Err(Error::InvalidArgumentError(
                 "UPDATE ... RETURNING is not supported".into(),
@@ -330,9 +335,15 @@ where
             });
         }
 
+        let filter = match selection {
+            Some(expr) => Some(translate_condition(&expr)?),
+            None => None,
+        };
+
         let plan = UpdatePlan {
             table: display_name,
             assignments: column_assignments,
+            filter,
         };
         self.context.update(plan)
     }
@@ -350,7 +361,7 @@ where
 
     fn execute_query_collect(&self, query: Query) -> SqlResult<SelectExecution<P>> {
         validate_simple_query(&query)?;
-        let select_plan = match query.body.as_ref() {
+        let mut select_plan = match query.body.as_ref() {
             SetExpr::Select(select) => self.translate_select(select.as_ref())?,
             other => {
                 return Err(Error::InvalidArgumentError(format!(
@@ -358,8 +369,14 @@ where
                 )));
             }
         };
-        if query.order_by.is_some() {
-            // TODO: support ORDER BY clauses
+        if let Some(order_by) = &query.order_by {
+            if !select_plan.aggregates.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "ORDER BY is not supported for aggregate queries".into(),
+                ));
+            }
+            let order_plan = self.translate_order_by(order_by)?;
+            select_plan = select_plan.with_order_by(Some(order_plan));
         }
         self.context.execute_select(select_plan)
     }
@@ -434,6 +451,95 @@ where
         };
         plan = plan.with_filter(filter_expr);
         Ok(plan)
+    }
+
+    fn translate_order_by(&self, order_by: &OrderBy) -> SqlResult<OrderByPlan> {
+        let exprs = match &order_by.kind {
+            OrderByKind::Expressions(exprs) => exprs,
+            _ => {
+                return Err(Error::InvalidArgumentError(
+                    "unsupported ORDER BY clause".into(),
+                ));
+            }
+        };
+
+        if exprs.len() != 1 {
+            return Err(Error::InvalidArgumentError(
+                "ORDER BY currently supports a single expression".into(),
+            ));
+        }
+
+        let order_expr: &OrderByExpr = &exprs[0];
+        let ascending = order_expr.options.asc.unwrap_or(true);
+        let base_nulls_first = self.default_nulls_first.load(AtomicOrdering::Relaxed);
+        let default_nulls_first_for_direction = if ascending {
+            base_nulls_first
+        } else {
+            !base_nulls_first
+        };
+        let nulls_first = order_expr
+            .options
+            .nulls_first
+            .unwrap_or(default_nulls_first_for_direction);
+
+        let (target, sort_type) = match &order_expr.expr {
+            SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => (
+                OrderTarget::Column(resolve_column_name(&order_expr.expr)?),
+                OrderSortType::Native,
+            ),
+            SqlExpr::Cast {
+                expr,
+                data_type:
+                    SqlDataType::Int(_)
+                    | SqlDataType::Integer(_)
+                    | SqlDataType::BigInt(_)
+                    | SqlDataType::SmallInt(_)
+                    | SqlDataType::TinyInt(_),
+                ..
+            } => (
+                OrderTarget::Column(resolve_column_name(expr)?),
+                OrderSortType::CastTextToInteger,
+            ),
+            SqlExpr::Cast { data_type, .. } => {
+                return Err(Error::InvalidArgumentError(format!(
+                    "ORDER BY CAST target type {:?} is not supported",
+                    data_type
+                )));
+            }
+            SqlExpr::Value(value_with_span) => match &value_with_span.value {
+                Value::Number(raw, _) => {
+                    let position: usize = raw.parse().map_err(|_| {
+                        Error::InvalidArgumentError(format!(
+                            "ORDER BY position '{}' is not a valid positive integer",
+                            raw
+                        ))
+                    })?;
+                    if position == 0 {
+                        return Err(Error::InvalidArgumentError(
+                            "ORDER BY position must be at least 1".into(),
+                        ));
+                    }
+                    (OrderTarget::Index(position - 1), OrderSortType::Native)
+                }
+                other => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported ORDER BY literal expression: {other:?}"
+                    )));
+                }
+            },
+            other => {
+                return Err(Error::InvalidArgumentError(format!(
+                    "unsupported ORDER BY expression: {other:?}"
+                )));
+            }
+        };
+
+        Ok(OrderByPlan {
+            target,
+            sort_type,
+            ascending,
+            nulls_first,
+        })
     }
 
     fn detect_simple_aggregates(
@@ -720,6 +826,62 @@ where
         }
         self.context.rollback_transaction()
     }
+
+    fn handle_set(&self, set_stmt: Set) -> SqlResult<StatementResult<P>> {
+        match set_stmt {
+            Set::SingleAssignment {
+                scope,
+                hivevar,
+                variable,
+                values,
+            } => {
+                if scope.is_some() || hivevar {
+                    return Err(Error::InvalidArgumentError(
+                        "SET modifiers are not supported".into(),
+                    ));
+                }
+
+                let variable_name = variable.to_string();
+                if !variable_name.eq_ignore_ascii_case("default_null_order") {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported SET variable: {variable_name}"
+                    )));
+                }
+
+                if values.len() != 1 {
+                    return Err(Error::InvalidArgumentError(
+                        "SET default_null_order expects exactly one value".into(),
+                    ));
+                }
+
+                let value_expr = &values[0];
+                let normalized = match value_expr {
+                    SqlExpr::Value(value_with_span) => value_with_span
+                        .value
+                        .clone()
+                        .into_string()
+                        .map(|s| s.to_ascii_lowercase()),
+                    SqlExpr::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
+                    _ => None,
+                };
+
+                if !matches!(normalized.as_deref(), Some("nulls_first" | "nulls_last")) {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported value for SET default_null_order: {value_expr:?}"
+                    )));
+                }
+
+                let use_nulls_first = matches!(normalized.as_deref(), Some("nulls_first"));
+                self.default_nulls_first
+                    .store(use_nulls_first, AtomicOrdering::Relaxed);
+
+                Ok(StatementResult::NoOp)
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "unsupported SQL SET statement: {other:?}",
+            ))),
+        }
+    }
 }
 
 fn canonical_object_name(name: &ObjectName) -> SqlResult<(String, String)> {
@@ -944,11 +1106,65 @@ fn translate_comparison(
             )));
         }
     };
+
+    if let (
+        llkv_expr::expr::ScalarExpr::Column(column),
+        llkv_expr::expr::ScalarExpr::Literal(literal),
+    ) = (&left_scalar, &right_scalar)
+        && let Some(op) = compare_op_to_filter_operator(compare_op, literal)
+    {
+        return Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
+            field_id: column.clone(),
+            op,
+        }));
+    }
+
+    if let (
+        llkv_expr::expr::ScalarExpr::Literal(literal),
+        llkv_expr::expr::ScalarExpr::Column(column),
+    ) = (&left_scalar, &right_scalar)
+        && let Some(flipped) = flip_compare_op(compare_op)
+        && let Some(op) = compare_op_to_filter_operator(flipped, literal)
+    {
+        return Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
+            field_id: column.clone(),
+            op,
+        }));
+    }
+
     Ok(llkv_expr::expr::Expr::Compare {
         left: left_scalar,
         op: compare_op,
         right: right_scalar,
     })
+}
+
+fn compare_op_to_filter_operator(
+    op: llkv_expr::expr::CompareOp,
+    literal: &Literal,
+) -> Option<llkv_expr::expr::Operator<'static>> {
+    let lit = literal.clone();
+    match op {
+        llkv_expr::expr::CompareOp::Eq => Some(llkv_expr::expr::Operator::Equals(lit)),
+        llkv_expr::expr::CompareOp::Lt => Some(llkv_expr::expr::Operator::LessThan(lit)),
+        llkv_expr::expr::CompareOp::LtEq => Some(llkv_expr::expr::Operator::LessThanOrEquals(lit)),
+        llkv_expr::expr::CompareOp::Gt => Some(llkv_expr::expr::Operator::GreaterThan(lit)),
+        llkv_expr::expr::CompareOp::GtEq => {
+            Some(llkv_expr::expr::Operator::GreaterThanOrEquals(lit))
+        }
+        llkv_expr::expr::CompareOp::NotEq => None,
+    }
+}
+
+fn flip_compare_op(op: llkv_expr::expr::CompareOp) -> Option<llkv_expr::expr::CompareOp> {
+    match op {
+        llkv_expr::expr::CompareOp::Eq => Some(llkv_expr::expr::CompareOp::Eq),
+        llkv_expr::expr::CompareOp::Lt => Some(llkv_expr::expr::CompareOp::Gt),
+        llkv_expr::expr::CompareOp::LtEq => Some(llkv_expr::expr::CompareOp::GtEq),
+        llkv_expr::expr::CompareOp::Gt => Some(llkv_expr::expr::CompareOp::Lt),
+        llkv_expr::expr::CompareOp::GtEq => Some(llkv_expr::expr::CompareOp::LtEq),
+        llkv_expr::expr::CompareOp::NotEq => None,
+    }
 }
 
 fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
@@ -1174,7 +1390,27 @@ fn group_by_is_empty(expr: &GroupByExpr) -> bool {
 mod tests {
     use super::*;
     use arrow::array::{Array, Int64Array, StringArray};
+    use arrow::record_batch::RecordBatch;
     use llkv_storage::pager::MemPager;
+
+    fn extract_string_options(batches: &[RecordBatch]) -> Vec<Option<String>> {
+        let mut values: Vec<Option<String>> = Vec::new();
+        for batch in batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("string column");
+            for idx in 0..column.len() {
+                if column.is_null(idx) {
+                    values.push(None);
+                } else {
+                    values.push(Some(column.value(idx).to_string()));
+                }
+            }
+        }
+        values
+    }
 
     #[test]
     fn create_insert_select_roundtrip() {
@@ -1276,5 +1512,135 @@ mod tests {
         }
 
         assert_eq!(values, vec![Some(42), None]);
+    }
+
+    #[test]
+    fn update_with_where_clause_filters_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("SET default_null_order='nulls_first'")
+            .expect("set default null order");
+
+        engine
+            .execute("CREATE TABLE strings(a VARCHAR)")
+            .expect("create table");
+
+        engine
+            .execute("INSERT INTO strings VALUES ('3'), ('4'), (NULL)")
+            .expect("insert seed rows");
+
+        let result = engine
+            .execute("UPDATE strings SET a = 13 WHERE a = '3'")
+            .expect("update rows");
+        assert!(matches!(
+            result[0],
+            StatementResult::Update {
+                rows_updated: 1,
+                ..
+            }
+        ));
+
+        let mut result = engine
+            .execute("SELECT * FROM strings ORDER BY cast(a AS INTEGER)")
+            .expect("select rows");
+        let select_result = result.remove(0);
+        let batches = match select_result {
+            StatementResult::Select { execution, .. } => {
+                execution.collect().expect("collect batches")
+            }
+            _ => panic!("expected select result"),
+        };
+
+        let mut values: Vec<Option<String>> = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("string column");
+            for idx in 0..column.len() {
+                if column.is_null(idx) {
+                    values.push(None);
+                } else {
+                    values.push(Some(column.value(idx).to_string()));
+                }
+            }
+        }
+
+        values.sort_by(|a, b| match (a, b) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(av), Some(bv)) => {
+                let a_val = av.parse::<i64>().unwrap_or_default();
+                let b_val = bv.parse::<i64>().unwrap_or_default();
+                a_val.cmp(&b_val)
+            }
+        });
+
+        assert_eq!(
+            values,
+            vec![None, Some("4".to_string()), Some("13".to_string())]
+        );
+    }
+
+    #[test]
+    fn order_by_honors_configured_default_null_order() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE strings(a VARCHAR)")
+            .expect("create table");
+        engine
+            .execute("INSERT INTO strings VALUES ('3'), ('4'), (NULL)")
+            .expect("insert values");
+        engine
+            .execute("UPDATE strings SET a = 13 WHERE a = '3'")
+            .expect("update value");
+
+        let mut result = engine
+            .execute("SELECT * FROM strings ORDER BY cast(a AS INTEGER)")
+            .expect("select rows");
+        let select_result = result.remove(0);
+        let batches = match select_result {
+            StatementResult::Select { execution, .. } => {
+                execution.collect().expect("collect batches")
+            }
+            _ => panic!("expected select result"),
+        };
+
+        let values = extract_string_options(&batches);
+        assert_eq!(
+            values,
+            vec![Some("4".to_string()), Some("13".to_string()), None]
+        );
+
+        assert!(!engine.default_nulls_first_for_tests());
+
+        engine
+            .execute("SET default_null_order='nulls_first'")
+            .expect("set default null order");
+
+        assert!(engine.default_nulls_first_for_tests());
+
+        let mut result = engine
+            .execute("SELECT * FROM strings ORDER BY cast(a AS INTEGER)")
+            .expect("select rows");
+        let select_result = result.remove(0);
+        let batches = match select_result {
+            StatementResult::Select { execution, .. } => {
+                execution.collect().expect("collect batches")
+            }
+            _ => panic!("expected select result"),
+        };
+
+        let values = extract_string_options(&batches);
+        assert_eq!(
+            values,
+            vec![None, Some("4".to_string()), Some("13".to_string())]
+        );
     }
 }

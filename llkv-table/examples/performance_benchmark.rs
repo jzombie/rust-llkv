@@ -133,6 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let default_options = ScanStreamOptions {
         include_nulls: false,
+        order: None,
     };
 
     benchmark_scenario(
@@ -160,6 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Single column with nulls included (should bypass streaming optimization)
     let with_nulls_options = ScanStreamOptions {
         include_nulls: true,
+        order: None,
     };
 
     benchmark_scenario(

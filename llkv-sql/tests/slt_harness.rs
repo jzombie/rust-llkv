@@ -159,6 +159,7 @@ async fn run_single_slt(path: &std::path::Path) -> Result<(), llkv_result::Error
                         }
                         StatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
                         StatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
+                        StatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
                     }
                 }
                 Err(e) => Err(e),
