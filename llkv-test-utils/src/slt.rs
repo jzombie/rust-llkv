@@ -65,17 +65,14 @@ where
 /// The `factory` closure should return a future that constructs a new DB
 /// instance for each trial. This keeps the harness engine-agnostic so
 /// different crates can provide their own engine adapters.
-#[cfg(feature = "harness")]
 pub fn run_slt_harness<F, Fut, D, E>(slt_dir: &str, factory: F)
 where
     F: Fn() -> Fut + Send + Sync + 'static + Clone,
     Fut: std::future::Future<Output = Result<D, E>> + Send + 'static,
-    D: AsyncDB<Error = llkv_result::Error, ColumnType = DefaultColumnType>
-        + Send
-        + 'static,
+    D: AsyncDB<Error = llkv_result::Error, ColumnType = DefaultColumnType> + Send + 'static,
     E: std::fmt::Debug + Send + 'static,
 {
-    use libtest_mimic::{Arguments, Trial};
+    use sqllogictest::harness::{Arguments, Trial, run};
 
     // Discover files
     let files = {
@@ -90,7 +87,9 @@ where
                             stack.push(entry.path());
                         }
                     }
-                } else if let Some(ext) = p.extension() && ext == "slt" {
+                } else if let Some(ext) = p.extension()
+                    && ext == "slt"
+                {
                     out.push(p);
                 }
             }
@@ -116,9 +115,8 @@ where
                 .enable_all()
                 .build()
                 .expect("tokio rt");
-            let res: Result<(), llkv_result::Error> = rt.block_on(async move {
-                run_slt_file_with_factory(&p, fac).await
-            });
+            let res: Result<(), llkv_result::Error> =
+                rt.block_on(async move { run_slt_file_with_factory(&p, fac).await });
             match res {
                 Ok(()) => Ok(()),
                 Err(e) => panic!("slt runner error: {}", e),
@@ -127,7 +125,7 @@ where
     }
 
     let args = Arguments::from_args();
-    let _ = libtest_mimic::run(&args, trials);
+    let _ = run(&args, trials);
 }
 
 /// Expand `loop var start count` directives, returning the expanded lines and

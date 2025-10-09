@@ -23,7 +23,6 @@ tracing = { workspace = true }
 [dev-dependencies]
 async-trait.workspace = true
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
-llkv-test-utils = { workspace = true, features = ["auto-init", "harness"], optional = false }
 sqllogictest.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
