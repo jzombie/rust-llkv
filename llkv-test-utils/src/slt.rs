@@ -59,6 +59,77 @@ where
     Ok(())
 }
 
+/// Discover `.slt` files under the given directory and run them as
+/// libtest_mimic trials using the provided AsyncDB factory constructor.
+///
+/// The `factory` closure should return a future that constructs a new DB
+/// instance for each trial. This keeps the harness engine-agnostic so
+/// different crates can provide their own engine adapters.
+#[cfg(feature = "harness")]
+pub fn run_slt_harness<F, Fut, D, E>(slt_dir: &str, factory: F)
+where
+    F: Fn() -> Fut + Send + Sync + 'static + Clone,
+    Fut: std::future::Future<Output = Result<D, E>> + Send + 'static,
+    D: AsyncDB<Error = llkv_result::Error, ColumnType = DefaultColumnType>
+        + Send
+        + 'static,
+    E: std::fmt::Debug + Send + 'static,
+{
+    use libtest_mimic::{Arguments, Trial};
+
+    // Discover files
+    let files = {
+        let mut out = Vec::new();
+        let base = std::path::Path::new(slt_dir);
+        if base.exists() {
+            let mut stack = vec![base.to_path_buf()];
+            while let Some(p) = stack.pop() {
+                if p.is_dir() {
+                    if let Ok(read) = std::fs::read_dir(&p) {
+                        for entry in read.flatten() {
+                            stack.push(entry.path());
+                        }
+                    }
+                } else if let Some(ext) = p.extension() && ext == "slt" {
+                    out.push(p);
+                }
+            }
+        }
+        out.sort();
+        out
+    };
+
+    let mut trials: Vec<Trial> = Vec::new();
+    for f in files {
+        let name = f
+            .strip_prefix("tests")
+            .unwrap_or(&f)
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        let path_clone = f.clone();
+        let factory_clone = factory.clone();
+        trials.push(Trial::test(name, move || {
+            let p = path_clone.clone();
+            let fac = factory_clone.clone();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio rt");
+            let res: Result<(), llkv_result::Error> = rt.block_on(async move {
+                run_slt_file_with_factory(&p, fac).await
+            });
+            match res {
+                Ok(()) => Ok(()),
+                Err(e) => panic!("slt runner error: {}", e),
+            }
+        }));
+    }
+
+    let args = Arguments::from_args();
+    let _ = libtest_mimic::run(&args, trials);
+}
+
 /// Expand `loop var start count` directives, returning the expanded lines and
 /// a mapping from expanded line index to the original 1-based source line.
 pub fn expand_loops_with_mapping(

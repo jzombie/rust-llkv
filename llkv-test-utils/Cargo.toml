@@ -11,6 +11,8 @@ publish.workspace = true
 [features]
 # When enabled, tracing will be auto-initialized at test-binary startup via ctor.
 auto-init = ["ctor"]
+# Enable the harness helper (depends on libtest-mimic & tokio).
+harness = ["libtest-mimic", "tokio"]
 
 [dependencies]
 tracing = { workspace = true }
@@ -19,10 +21,11 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 llkv-result.workspace = true
 sqllogictest.workspace = true
 tempfile.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+libtest-mimic = { version = "0.4", optional = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"], optional = true }
 
 [dependencies.ctor]
 optional = true
 version = "0.5.0"
+
+[dev-dependencies]
