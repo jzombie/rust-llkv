@@ -26,32 +26,21 @@ fn slt_harness() {
         }
     }
 
-    struct EngineFactory {
+    // Shared context holder that's created once per test file
+    #[derive(Clone)]
+    struct SharedContext {
         context: Arc<DslContext<MemPager>>,
-        default_nulls_first: bool,
     }
 
-    impl EngineFactory {
+    impl SharedContext {
         fn new() -> Self {
             let pager = Arc::new(MemPager::default());
             let context = Arc::new(DslContext::new(pager));
-            Self {
-                context,
-                default_nulls_first: false,
-            }
+            Self { context }
         }
 
         fn make_engine(&self) -> SqlEngine<MemPager> {
-            SqlEngine::with_context(Arc::clone(&self.context), self.default_nulls_first)
-        }
-    }
-
-    impl Clone for EngineFactory {
-        fn clone(&self) -> Self {
-            // Note: Each clone creates a new database context for isolation.
-            // For multi-connection tests within the same database, the test framework
-            // should create connections from the same factory instance, not clone the factory.
-            EngineFactory::new()
+            SqlEngine::with_context(Arc::clone(&self.context), false)
         }
     }
 
@@ -170,11 +159,21 @@ fn slt_harness() {
         async fn shutdown(&mut self) {}
     }
 
-    // Construct and pass a factory closure to the shared harness.
-    let factory = EngineFactory::new();
-    slt::run_slt_harness("tests/slt", move || {
-        let engine = factory.make_engine();
-        async move { Ok::<_, ()>(EngineHarness::new(engine)) }
+    // Construct and pass a factory-factory closure to the shared harness.
+    // The outer closure is called once per test file to create a fresh SharedContext.
+    // The returned inner closure is called once per connection within that test file.
+    // This ensures connections within a test share state, but different tests are isolated.
+    slt::run_slt_harness("tests/slt", || {
+        // This outer closure is called once per test file - create a fresh context
+        let shared = SharedContext::new();
+        // Return a factory that will be called for each connection in this test
+        move || {
+            let shared_clone = shared.clone();
+            async move {
+                let engine = shared_clone.make_engine();
+                Ok::<_, ()>(EngineHarness::new(engine))
+            }
+        }
     });
 }
 

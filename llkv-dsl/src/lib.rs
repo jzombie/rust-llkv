@@ -683,7 +683,7 @@ where
             fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
 
             // Reconstruct fields with proper field_id metadata
-            for (idx, field) in batch.schema().fields().iter().enumerate() {
+            for (idx, _field) in batch.schema().fields().iter().enumerate() {
                 let col = &table.schema.columns[idx];
                 let mut metadata = HashMap::new();
                 metadata.insert(
@@ -2026,6 +2026,13 @@ where
                 options,
                 full_table_scan,
             } => {
+                // Early return for empty tables to avoid ColumnStore data_type() errors
+                let total_rows = table.total_rows.load(Ordering::SeqCst);
+                if total_rows == 0 {
+                    // Empty table - return empty result with correct schema
+                    return Ok(());
+                }
+
                 let mut error: Option<Error> = None;
                 let mut produced = false;
                 let mut produced_rows: u64 = 0;
@@ -2048,7 +2055,6 @@ where
                 if let Some(err) = error {
                     return Err(err);
                 }
-                let total_rows = table.total_rows.load(Ordering::SeqCst);
                 if !produced {
                     if total_rows > 0 {
                         for batch in synthesize_null_scan(Arc::clone(&schema), total_rows)? {
