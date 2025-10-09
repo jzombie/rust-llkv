@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::mem;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -53,6 +54,10 @@ where
         table_name: String,
         rows_updated: usize,
     },
+    Delete {
+        table_name: String,
+        rows_deleted: usize,
+    },
     Select {
         table_name: String,
         schema: Arc<Schema>,
@@ -89,6 +94,14 @@ where
                 .debug_struct("Update")
                 .field("table_name", table_name)
                 .field("rows_updated", rows_updated)
+                .finish(),
+            StatementResult::Delete {
+                table_name,
+                rows_deleted,
+            } => f
+                .debug_struct("Delete")
+                .field("table_name", table_name)
+                .field("rows_deleted", rows_deleted)
                 .finish(),
             StatementResult::Select {
                 table_name, schema, ..
@@ -277,9 +290,21 @@ pub struct UpdatePlan {
 }
 
 #[derive(Clone, Debug)]
+pub enum AssignmentValue {
+    Literal(DslValue),
+    Expression(ScalarExpr<String>),
+}
+
+#[derive(Clone, Debug)]
 pub struct ColumnAssignment {
     pub column: String,
-    pub value: DslValue,
+    pub value: AssignmentValue,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeletePlan {
+    pub table: String,
+    pub filter: Option<LlkvExpr<'static, String>>,
 }
 
 /// Logical query plan consumed by the DSL execution engine.
@@ -588,6 +613,15 @@ where
                 self.update_filtered_rows(table.as_ref(), display_name, plan.assignments, filter)
             }
             None => self.update_all_rows(table.as_ref(), display_name, plan.assignments),
+        }
+    }
+
+    pub fn delete(&self, plan: DeletePlan) -> DslResult<StatementResult<P>> {
+        let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
+        let table = self.lookup_table(&canonical_name)?;
+        match plan.filter {
+            Some(filter) => self.delete_filtered_rows(table.as_ref(), display_name, filter),
+            None => self.delete_all_rows(table.as_ref(), display_name),
         }
     }
 
@@ -1004,24 +1038,17 @@ where
             ));
         }
 
-        let filter_expr = translate_predicate(filter, table.schema.as_ref())?;
-        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        let schema = table.schema.as_ref();
+        let filter_expr = translate_predicate(filter, schema)?;
 
-        if row_ids.is_empty() {
-            return Ok(StatementResult::Update {
-                table_name: display_name,
-                rows_updated: 0,
-            });
+        enum PreparedValue {
+            Literal(DslValue),
+            Expression { expr_index: usize },
         }
 
-        let row_count = row_ids.len();
-
         let mut seen_columns: HashSet<String> = HashSet::new();
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(assignments.len() + 1);
-        arrays.push(Arc::new(UInt64Array::from(row_ids.clone())));
-
-        let mut fields: Vec<Field> = Vec::with_capacity(assignments.len() + 1);
-        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+        let mut prepared: Vec<(DslColumn, PreparedValue)> = Vec::with_capacity(assignments.len());
+        let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
 
         for assignment in assignments {
             let normalized = assignment.column.to_ascii_lowercase();
@@ -1038,8 +1065,53 @@ where
                 ))
             })?;
 
-            let values: Vec<DslValue> =
-                std::iter::repeat_n(assignment.value.clone(), row_count).collect();
+            match assignment.value {
+                AssignmentValue::Literal(value) => {
+                    prepared.push((column.clone(), PreparedValue::Literal(value)));
+                }
+                AssignmentValue::Expression(expr) => {
+                    let translated = translate_scalar(&expr, schema)?;
+                    let expr_index = scalar_exprs.len();
+                    scalar_exprs.push(translated);
+                    prepared.push((column.clone(), PreparedValue::Expression { expr_index }));
+                }
+            }
+        }
+
+        let (row_ids, mut expr_values) =
+            self.collect_update_rows(table, &filter_expr, &scalar_exprs)?;
+
+        if row_ids.is_empty() {
+            return Ok(StatementResult::Update {
+                table_name: display_name,
+                rows_updated: 0,
+            });
+        }
+
+        let row_count = row_ids.len();
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(prepared.len() + 1);
+        arrays.push(Arc::new(UInt64Array::from(row_ids.clone())));
+
+        let mut fields: Vec<Field> = Vec::with_capacity(prepared.len() + 1);
+        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+
+        for (column, value) in prepared {
+            let values = match value {
+                PreparedValue::Literal(lit) => vec![lit; row_count],
+                PreparedValue::Expression { expr_index } => {
+                    let column_values = expr_values.get_mut(expr_index).ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "expression assignment value missing during UPDATE".into(),
+                        )
+                    })?;
+                    if column_values.len() != row_count {
+                        return Err(Error::InvalidArgumentError(
+                            "expression result count did not match targeted row count".into(),
+                        ));
+                    }
+                    mem::take(column_values)
+                }
+            };
             let array = build_array_for_column(&column.data_type, &values)?;
             arrays.push(array);
 
@@ -1085,17 +1157,17 @@ where
             });
         }
 
-        let mut seen_columns: HashSet<String> = HashSet::new();
-        let mut row_id_builder = UInt64Builder::with_capacity(total_rows_usize);
-        for row_id in 0..total_rows {
-            row_id_builder.append_value(row_id);
+        let schema = table.schema.as_ref();
+
+        enum PreparedValue {
+            Literal(DslValue),
+            Expression { expr_index: usize },
         }
 
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(assignments.len() + 1);
-        arrays.push(Arc::new(row_id_builder.finish()));
-
-        let mut fields: Vec<Field> = Vec::with_capacity(assignments.len() + 1);
-        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+        let mut seen_columns: HashSet<String> = HashSet::new();
+        let mut prepared: Vec<(DslColumn, PreparedValue)> = Vec::with_capacity(assignments.len());
+        let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
+        let mut first_field_id: Option<FieldId> = None;
 
         for assignment in assignments {
             let normalized = assignment.column.to_ascii_lowercase();
@@ -1111,8 +1183,62 @@ where
                     assignment.column
                 ))
             })?;
+            if first_field_id.is_none() {
+                first_field_id = Some(column.field_id);
+            }
 
-            let values = vec![assignment.value.clone(); total_rows_usize];
+            match assignment.value {
+                AssignmentValue::Literal(value) => {
+                    prepared.push((column.clone(), PreparedValue::Literal(value)));
+                }
+                AssignmentValue::Expression(expr) => {
+                    let translated = translate_scalar(&expr, schema)?;
+                    let expr_index = scalar_exprs.len();
+                    scalar_exprs.push(translated);
+                    prepared.push((column.clone(), PreparedValue::Expression { expr_index }));
+                }
+            }
+        }
+
+        let anchor_field = first_field_id.ok_or_else(|| {
+            Error::InvalidArgumentError("UPDATE requires at least one target column".into())
+        })?;
+
+        let filter_expr = full_table_scan_filter(anchor_field);
+        let (row_ids, mut expr_values) =
+            self.collect_update_rows(table, &filter_expr, &scalar_exprs)?;
+
+        if row_ids.is_empty() {
+            return Ok(StatementResult::Update {
+                table_name: display_name,
+                rows_updated: 0,
+            });
+        }
+
+        let row_count = row_ids.len();
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(prepared.len() + 1);
+        arrays.push(Arc::new(UInt64Array::from(row_ids.clone())));
+
+        let mut fields: Vec<Field> = Vec::with_capacity(prepared.len() + 1);
+        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+
+        for (column, value) in prepared {
+            let values = match value {
+                PreparedValue::Literal(lit) => vec![lit; row_count],
+                PreparedValue::Expression { expr_index } => {
+                    let column_values = expr_values.get_mut(expr_index).ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "expression assignment value missing during UPDATE".into(),
+                        )
+                    })?;
+                    if column_values.len() != row_count {
+                        return Err(Error::InvalidArgumentError(
+                            "expression result count did not match targeted row count".into(),
+                        ));
+                    }
+                    mem::take(column_values)
+                }
+            };
             let array = build_array_for_column(&column.data_type, &values)?;
             arrays.push(array);
 
@@ -1131,8 +1257,149 @@ where
 
         Ok(StatementResult::Update {
             table_name: display_name,
-            rows_updated: total_rows_usize,
+            rows_updated: row_count,
         })
+    }
+
+    fn delete_filtered_rows(
+        &self,
+        table: &DslTable<P>,
+        display_name: String,
+        filter: LlkvExpr<'static, String>,
+    ) -> DslResult<StatementResult<P>> {
+        let schema = table.schema.as_ref();
+        let filter_expr = translate_predicate(filter, schema)?;
+        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        self.apply_delete(table, display_name, row_ids)
+    }
+
+    fn delete_all_rows(
+        &self,
+        table: &DslTable<P>,
+        display_name: String,
+    ) -> DslResult<StatementResult<P>> {
+        let total_rows = table.total_rows.load(Ordering::SeqCst);
+        if total_rows == 0 {
+            return Ok(StatementResult::Delete {
+                table_name: display_name,
+                rows_deleted: 0,
+            });
+        }
+
+        let anchor_field = table.schema.first_field_id().ok_or_else(|| {
+            Error::InvalidArgumentError("DELETE requires a table with at least one column".into())
+        })?;
+        let filter_expr = full_table_scan_filter(anchor_field);
+        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        self.apply_delete(table, display_name, row_ids)
+    }
+
+    fn apply_delete(
+        &self,
+        table: &DslTable<P>,
+        display_name: String,
+        row_ids: Vec<u64>,
+    ) -> DslResult<StatementResult<P>> {
+        if row_ids.is_empty() {
+            return Ok(StatementResult::Delete {
+                table_name: display_name,
+                rows_deleted: 0,
+            });
+        }
+
+        let logical_fields: Vec<LogicalFieldId> = table
+            .schema
+            .columns
+            .iter()
+            .map(|column| LogicalFieldId::for_user(table.table.table_id(), column.field_id))
+            .collect();
+
+        if logical_fields.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "DELETE requires a table with at least one column".into(),
+            ));
+        }
+
+        table.table.store().delete_rows(&logical_fields, &row_ids)?;
+
+        let removed = row_ids.len();
+        let removed_u64 = u64::try_from(removed)
+            .map_err(|_| Error::InvalidArgumentError("row count exceeds supported range".into()))?;
+        table.total_rows.fetch_sub(removed_u64, Ordering::SeqCst);
+
+        Ok(StatementResult::Delete {
+            table_name: display_name,
+            rows_deleted: removed,
+        })
+    }
+
+    fn collect_update_rows(
+        &self,
+        table: &DslTable<P>,
+        filter_expr: &LlkvExpr<'static, FieldId>,
+        expressions: &[ScalarExpr<FieldId>],
+    ) -> DslResult<(Vec<u64>, Vec<Vec<DslValue>>)> {
+        let row_ids = table.table.filter_row_ids(filter_expr)?;
+        if row_ids.is_empty() {
+            return Ok((row_ids, vec![Vec::new(); expressions.len()]));
+        }
+
+        if expressions.is_empty() {
+            return Ok((row_ids, Vec::new()));
+        }
+
+        let mut projections: Vec<ScanProjection> = Vec::with_capacity(expressions.len());
+        for (idx, expr) in expressions.iter().enumerate() {
+            let alias = format!("__expr_{idx}");
+            projections.push(ScanProjection::computed(expr.clone(), alias));
+        }
+
+        let mut expr_values: Vec<Vec<DslValue>> =
+            vec![Vec::with_capacity(row_ids.len()); expressions.len()];
+        let mut error: Option<Error> = None;
+        let options = ScanStreamOptions {
+            include_nulls: true,
+            order: None,
+        };
+
+        table
+            .table
+            .scan_stream_with_exprs(&projections, filter_expr, options, |batch| {
+                if error.is_some() {
+                    return;
+                }
+                if let Err(err) = Self::collect_expression_values(&mut expr_values, batch) {
+                    error = Some(err);
+                }
+            })?;
+
+        if let Some(err) = error {
+            return Err(err);
+        }
+
+        for values in &expr_values {
+            if values.len() != row_ids.len() {
+                return Err(Error::InvalidArgumentError(
+                    "expression result count did not match targeted row count".into(),
+                ));
+            }
+        }
+
+        Ok((row_ids, expr_values))
+    }
+
+    fn collect_expression_values(
+        expr_values: &mut [Vec<DslValue>],
+        batch: RecordBatch,
+    ) -> DslResult<()> {
+        for row_idx in 0..batch.num_rows() {
+            for (expr_index, values) in expr_values.iter_mut().enumerate() {
+                let value = dsl_value_from_array(batch.column(expr_index), row_idx)?;
+                values.push(value);
+            }
+        }
+
+        Ok(())
     }
 
     fn execute_projection(

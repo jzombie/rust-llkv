@@ -5,16 +5,18 @@ use std::sync::{Arc, Mutex};
 use crate::SqlResult;
 use crate::SqlValue;
 
-use arrow::array::{Array, ArrayRef, Int64Array, Int64Builder};
-use arrow::compute::concat_batches;
+use arrow::array::{Array, ArrayRef, Int64Array, Int64Builder, UInt32Array};
+use arrow::compute::{
+    SortColumn, SortOptions, TakeOptions, concat_batches, lexsort_to_indices, take,
+};
 use arrow::record_batch::RecordBatch;
 
 use llkv_dsl::TransactionKind;
 use llkv_dsl::{
-    AggregateExpr, AggregateFunction, ColumnAssignment, ColumnSpec, CreateTablePlan,
-    CreateTableSource, DslContext, DslValue, InsertPlan, InsertSource, OrderByPlan, OrderSortType,
-    OrderTarget, SelectExecution, SelectPlan, SelectProjection, StatementResult, UpdatePlan,
-    extract_rows_from_range,
+    AggregateExpr, AggregateFunction, AssignmentValue, ColumnAssignment, ColumnSpec,
+    CreateTablePlan, CreateTableSource, DeletePlan, DslContext, DslValue, InsertPlan, InsertSource,
+    OrderByPlan, OrderSortType, OrderTarget, SelectExecution, SelectPlan, SelectProjection,
+    StatementResult, UpdatePlan, extract_rows_from_range,
 };
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
@@ -22,8 +24,8 @@ use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
-    ColumnOptionDef, DataType as SqlDataType, ExceptionWhen, Expr as SqlExpr, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName,
+    ColumnOptionDef, DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName,
     ObjectNamePart, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, Set, SetExpr, Statement, TableFactor, TableObject,
     TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator, UpdateTableFromKind,
@@ -31,7 +33,6 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use sqlparser::tokenizer::Span;
 
 struct TableDeltaState {
     seeded_filters: HashSet<String>,
@@ -52,8 +53,9 @@ impl TableDeltaState {
 struct TransactionState {
     staging: Box<SqlEngine<MemPager>>,
     statements: Vec<String>,
-    copied_tables: HashSet<String>,
+    staged_tables: HashSet<String>,
     table_deltas: HashMap<String, TableDeltaState>,
+    new_tables: HashSet<String>,
 }
 
 pub struct SqlEngine<P>
@@ -84,6 +86,32 @@ impl<P> SqlEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
+    fn map_table_error(table_name: &str, err: Error) -> Error {
+        match err {
+            Error::NotFound => Self::table_not_found_error(table_name),
+            Error::InvalidArgumentError(msg) if msg.contains("unknown table") => {
+                Self::table_not_found_error(table_name)
+            }
+            other => other,
+        }
+    }
+
+    fn table_not_found_error(table_name: &str) -> Error {
+        Error::InvalidArgumentError(format!(
+            "Catalog Error: Table '{table_name}' does not exist"
+        ))
+    }
+
+    fn is_table_missing_error(err: &Error) -> bool {
+        match err {
+            Error::NotFound => true,
+            Error::InvalidArgumentError(msg) => {
+                msg.contains("Catalog Error: Table") || msg.contains("unknown table")
+            }
+            _ => false,
+        }
+    }
+
     pub fn new(pager: Arc<P>) -> Self {
         Self {
             context: Arc::new(DslContext::new(pager)),
@@ -179,6 +207,7 @@ where
                 returning,
                 ..
             } => self.handle_update(table, assignments, from, selection, returning),
+            Statement::Delete(delete) => self.handle_delete(delete),
             Statement::Set(set_stmt) => self.handle_set(set_stmt),
             Statement::Pragma { name, value, is_eq } => self.handle_pragma(name, value, is_eq),
             other => Err(Error::InvalidArgumentError(format!(
@@ -217,6 +246,7 @@ where
                 for table in &tables {
                     self.ensure_table_in_delta(tx, table)?;
                 }
+                let all_tables_local = tables.iter().all(|table| tx.new_tables.contains(table));
 
                 let aggregate_specs = if let SetExpr::Select(select) = query.body.as_ref() {
                     self.detect_simple_aggregates(&select.projection)?
@@ -225,13 +255,21 @@ where
                 };
 
                 let mut base_query = *query.clone();
+                let order_by_exprs: Vec<OrderByExpr> = base_query
+                    .order_by
+                    .as_ref()
+                    .and_then(|order| match &order.kind {
+                        OrderByKind::Expressions(exprs) => Some(exprs.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
                 let skip_base = Self::apply_transaction_filters(tx, &mut base_query)?;
-                let base_result = if skip_base {
+                let base_result = if skip_base || all_tables_local {
                     None
                 } else {
                     match self.handle_query(base_query) {
                         Ok(result) => Some(result),
-                        Err(Error::NotFound) => None,
+                        Err(err) if Self::is_table_missing_error(&err) => None,
                         Err(err) => return Err(err),
                     }
                 };
@@ -243,7 +281,33 @@ where
                 }
                 let delta_raw = delta_results.remove(0);
                 let delta_converted = Self::convert_statement_result(delta_raw)?;
-                Self::merge_select_results(base_result, delta_converted, aggregate_specs)
+                let default_nulls_first = self.default_nulls_first.load(AtomicOrdering::Relaxed);
+                Self::merge_select_results(
+                    base_result,
+                    delta_converted,
+                    aggregate_specs,
+                    &order_by_exprs,
+                    default_nulls_first,
+                )
+            }
+            Statement::CreateTable(stmt) => {
+                let table_name = Self::object_name_to_string(&stmt.name)?;
+                let mut delta_results = match tx.staging.execute(&sql_text) {
+                    Ok(results) => results,
+                    Err(err) => {
+                        println!("delta create table error: {err:?}");
+                        return Err(err);
+                    }
+                };
+                if delta_results.len() != 1 {
+                    return Err(Error::Internal(
+                        "transaction statements must yield exactly one result".into(),
+                    ));
+                }
+                let delta_raw = delta_results.remove(0);
+                tx.new_tables.insert(table_name);
+                tx.statements.push(sql_text);
+                Self::convert_statement_result(delta_raw)
             }
             Statement::Insert(insert) => {
                 let table_name = Self::table_name_from_insert(&insert)?;
@@ -290,6 +354,32 @@ where
                 tx.statements.push(sql_text);
                 Self::convert_statement_result(delta_raw)
             }
+            Statement::Delete(delete) => {
+                let selection_ref = delete.selection.as_ref();
+                let table_name = Self::table_name_from_delete(&delete)?;
+                if let Some(name) = table_name.as_ref() {
+                    self.ensure_table_in_delta(tx, name)?;
+                    self.seed_rows_for_update(tx, name, selection_ref)?;
+                }
+                let mut delta_results = match tx.staging.execute(&sql_text) {
+                    Ok(results) => results,
+                    Err(err) => {
+                        println!("delta delete error: {err:?}");
+                        return Err(err);
+                    }
+                };
+                if delta_results.len() != 1 {
+                    return Err(Error::Internal(
+                        "transaction statements must yield exactly one result".into(),
+                    ));
+                }
+                let delta_raw = delta_results.remove(0);
+                if let Some(name) = table_name.as_ref() {
+                    Self::record_update_exclusion(tx, name, selection_ref);
+                }
+                tx.statements.push(sql_text);
+                Self::convert_statement_result(delta_raw)
+            }
             other => {
                 let mut delta_results = match tx.staging.execute(&sql_text) {
                     Ok(results) => results,
@@ -313,17 +403,44 @@ where
     }
 
     fn ensure_table_in_delta(&self, tx: &mut TransactionState, table_name: &str) -> SqlResult<()> {
-        if tx.copied_tables.contains(table_name) {
+        if tx.staged_tables.contains(table_name) {
             return Ok(());
         }
 
-        let specs = self.context.table_column_specs(table_name)?;
-        let mut plan = CreateTablePlan::new(table_name.to_string());
-        plan.if_not_exists = true;
-        plan.columns = specs;
-        tx.staging.context_arc().create_table_plan(plan)?;
+        let specs_result = self.context.table_column_specs(table_name);
+        match specs_result {
+            Ok(specs) => {
+                let mut plan = CreateTablePlan::new(table_name.to_string());
+                plan.if_not_exists = true;
+                plan.columns = specs;
+                tx.staging.context_arc().create_table_plan(plan)?;
+            }
+            Err(Error::NotFound) => match tx.staging.context_arc().table_column_specs(table_name) {
+                Ok(_) => {
+                    tx.staged_tables.insert(table_name.to_string());
+                    return Ok(());
+                }
+                Err(Error::NotFound) => {
+                    return Err(Self::table_not_found_error(table_name));
+                }
+                Err(other) => return Err(other),
+            },
+            Err(Error::InvalidArgumentError(msg)) if msg.contains("unknown table") => {
+                match tx.staging.context_arc().table_column_specs(table_name) {
+                    Ok(_) => {
+                        tx.staged_tables.insert(table_name.to_string());
+                        return Ok(());
+                    }
+                    Err(Error::NotFound) => {
+                        return Err(Self::table_not_found_error(table_name));
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+            Err(other) => return Err(other),
+        }
 
-        tx.copied_tables.insert(table_name.to_string());
+        tx.staged_tables.insert(table_name.to_string());
         Ok(())
     }
 
@@ -371,7 +488,15 @@ where
             ));
         };
 
-        let select_result = self.handle_query(*query)?;
+        let select_result = match self.handle_query(*query) {
+            Ok(result) => Some(result),
+            Err(err) if Self::is_table_missing_error(&err) => None,
+            Err(other) => return Err(other),
+        };
+        let Some(select_result) = select_result else {
+            return Ok(());
+        };
+
         let (schema, execution) = match select_result {
             StatementResult::Select {
                 schema, execution, ..
@@ -492,7 +617,10 @@ where
     fn is_mutating_statement(statement: &Statement) -> bool {
         matches!(
             statement,
-            Statement::CreateTable(_) | Statement::Insert(_) | Statement::Update { .. }
+            Statement::CreateTable(_)
+                | Statement::Insert(_)
+                | Statement::Update { .. }
+                | Statement::Delete(_)
         )
     }
 
@@ -517,6 +645,13 @@ where
             } => Ok(StatementResult::Update {
                 table_name,
                 rows_updated,
+            }),
+            StatementResult::Delete {
+                table_name,
+                rows_deleted,
+            } => Ok(StatementResult::Delete {
+                table_name,
+                rows_deleted,
             }),
             StatementResult::Select {
                 table_name,
@@ -552,6 +687,8 @@ where
         base: Option<StatementResult<P>>,
         delta: StatementResult<P>,
         aggregates: Option<Vec<AggregateExpr>>,
+        order_by: &[OrderByExpr],
+        default_nulls_first: bool,
     ) -> SqlResult<StatementResult<P>> {
         let (delta_table_name, delta_schema, delta_execution) = match delta {
             StatementResult::Select {
@@ -673,7 +810,7 @@ where
         let schema = base_schema_opt
             .clone()
             .unwrap_or_else(|| Arc::clone(&delta_schema));
-        let combined = if all_batches.is_empty() {
+        let mut combined = if all_batches.is_empty() {
             RecordBatch::new_empty(Arc::clone(&schema))
         } else if all_batches.len() == 1 {
             all_batches.remove(0)
@@ -683,6 +820,10 @@ where
                 Error::Internal(format!("failed to merge transaction select batches: {err}"))
             })?
         };
+
+        if !order_by.is_empty() && combined.num_rows() > 1 {
+            combined = Self::resort_record_batch(combined, order_by, default_nulls_first)?;
+        }
 
         let execution =
             SelectExecution::from_batch(delta_table_name.clone(), Arc::clone(&schema), combined);
@@ -719,6 +860,66 @@ where
         Ok(None)
     }
 
+    fn resort_record_batch(
+        batch: RecordBatch,
+        order_by: &[OrderByExpr],
+        default_nulls_first: bool,
+    ) -> SqlResult<RecordBatch> {
+        let schema = batch.schema();
+        let mut sort_columns: Vec<SortColumn> = Vec::with_capacity(order_by.len());
+
+        for order_expr in order_by {
+            let SqlExpr::Identifier(ident) = &order_expr.expr else {
+                // Fall back to the existing order if we cannot interpret the expression.
+                return Ok(batch);
+            };
+
+            let (index, _) = schema.column_with_name(&ident.value).ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "ORDER BY column '{}' not found in projection",
+                    ident.value
+                ))
+            })?;
+
+            let descending = order_expr.options.asc.map(|asc| !asc).unwrap_or(false);
+            let nulls_first = order_expr
+                .options
+                .nulls_first
+                .unwrap_or(default_nulls_first);
+
+            sort_columns.push(SortColumn {
+                values: batch.column(index).clone(),
+                options: Some(SortOptions {
+                    descending,
+                    nulls_first,
+                }),
+            });
+        }
+
+        if sort_columns.is_empty() {
+            return Ok(batch);
+        }
+
+        let indices: UInt32Array = lexsort_to_indices(&sort_columns, None)
+            .map_err(|err| Error::Internal(format!("failed to sort transaction result: {err}")))?;
+
+        let mut sorted_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+        for column_index in 0..schema.fields().len() {
+            let column = batch.column(column_index);
+            let taken = take(
+                column.as_ref(),
+                &indices,
+                Some(TakeOptions { check_bounds: true }),
+            )
+            .map_err(|err| Error::Internal(format!("failed to reorder rows: {err}")))?;
+            sorted_columns.push(taken);
+        }
+
+        RecordBatch::try_new(schema, sorted_columns).map_err(|err| {
+            Error::Internal(format!("failed to build sorted transaction batch: {err}"))
+        })
+    }
+
     fn table_name_from_insert(insert: &sqlparser::ast::Insert) -> SqlResult<String> {
         match &insert.table {
             TableObject::TableName(name) => Self::object_name_to_string(name),
@@ -735,6 +936,26 @@ where
             ));
         }
         Self::table_with_joins_name(table)
+    }
+
+    fn table_name_from_delete(delete: &Delete) -> SqlResult<Option<String>> {
+        if !delete.tables.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "multi-table DELETE is not supported yet".into(),
+            ));
+        }
+        let from_tables = match &delete.from {
+            FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+        };
+        if from_tables.is_empty() {
+            return Ok(None);
+        }
+        if from_tables.len() != 1 {
+            return Err(Error::InvalidArgumentError(
+                "DELETE over multiple tables is not supported yet".into(),
+            ));
+        }
+        Self::table_with_joins_name(&from_tables[0])
     }
 
     fn object_name_to_string(name: &ObjectName) -> SqlResult<String> {
@@ -947,11 +1168,13 @@ where
         };
 
         let plan = InsertPlan {
-            table: display_name,
+            table: display_name.clone(),
             columns,
             source: insert_source,
         };
-        self.context.insert(plan)
+        self.context
+            .insert(plan)
+            .map_err(|err| Self::map_table_error(&display_name, err))
     }
 
     fn handle_update(
@@ -991,10 +1214,19 @@ where
                     column_name
                 )));
             }
-            let value = SqlValue::try_from_expr(&assignment.value)?;
+            let value = match SqlValue::try_from_expr(&assignment.value) {
+                Ok(literal) => AssignmentValue::Literal(DslValue::from(literal)),
+                Err(Error::InvalidArgumentError(msg))
+                    if msg.contains("unsupported literal expression") =>
+                {
+                    let translated = translate_scalar(&assignment.value)?;
+                    AssignmentValue::Expression(translated)
+                }
+                Err(err) => return Err(err),
+            };
             column_assignments.push(ColumnAssignment {
                 column: column_name,
-                value: DslValue::from(value),
+                value,
             });
         }
 
@@ -1004,11 +1236,70 @@ where
         };
 
         let plan = UpdatePlan {
-            table: display_name,
+            table: display_name.clone(),
             assignments: column_assignments,
             filter,
         };
-        self.context.update(plan)
+        self.context
+            .update(plan)
+            .map_err(|err| Self::map_table_error(&display_name, err))
+    }
+
+    fn handle_delete(&self, delete: Delete) -> SqlResult<StatementResult<P>> {
+        let Delete {
+            tables,
+            from,
+            using,
+            selection,
+            returning,
+            order_by,
+            limit,
+        } = delete;
+
+        if !tables.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "multi-table DELETE is not supported yet".into(),
+            ));
+        }
+        if let Some(using_tables) = using {
+            if !using_tables.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "DELETE ... USING is not supported yet".into(),
+                ));
+            }
+        }
+        if returning.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "DELETE ... RETURNING is not supported".into(),
+            ));
+        }
+        if !order_by.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "DELETE ... ORDER BY is not supported yet".into(),
+            ));
+        }
+        if limit.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "DELETE ... LIMIT is not supported yet".into(),
+            ));
+        }
+
+        let from_tables = match from {
+            FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+        };
+        let (display_name, _) = extract_single_table(&from_tables)?;
+
+        let filter = selection
+            .map(|expr| translate_condition(&expr))
+            .transpose()?;
+
+        let plan = DeletePlan {
+            table: display_name.clone(),
+            filter,
+        };
+        self.context
+            .delete(plan)
+            .map_err(|err| Self::map_table_error(&display_name, err))
     }
 
     fn handle_query(&self, query: Query) -> SqlResult<StatementResult<P>> {
@@ -1041,7 +1332,10 @@ where
             let order_plan = self.translate_order_by(order_by)?;
             select_plan = select_plan.with_order_by(Some(order_plan));
         }
-        self.context.execute_select(select_plan)
+        let table_name = select_plan.table.clone();
+        self.context
+            .execute_select(select_plan)
+            .map_err(|err| Self::map_table_error(&table_name, err))
     }
 
     fn translate_select(&self, select: &Select) -> SqlResult<SelectPlan> {
@@ -1456,8 +1750,9 @@ where
         let state = TransactionState {
             staging: Box::new(staging_engine),
             statements: Vec::new(),
-            copied_tables: HashSet::new(),
+            staged_tables: HashSet::new(),
             table_deltas: HashMap::new(),
+            new_tables: HashSet::new(),
         };
 
         *guard = Some(state);

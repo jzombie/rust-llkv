@@ -51,3 +51,15 @@ fn standalone_engine_insert_select() {
         .execute("SELECT COUNT(*) FROM numbers")
         .expect("count rows");
 }
+
+#[test]
+fn commit_rollback_require_active_transaction() {
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+    assert!(engine.execute("COMMIT").is_err());
+    assert!(engine.execute("ROLLBACK").is_err());
+
+    engine.execute("BEGIN").expect("begin");
+    assert!(engine.execute("BEGIN").is_err());
+    engine.execute("ROLLBACK").expect("rollback");
+    assert!(engine.execute("COMMIT").is_err());
+}

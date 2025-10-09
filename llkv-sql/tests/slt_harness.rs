@@ -152,6 +152,9 @@ fn slt_harness() {
                         StatementResult::Update { rows_updated, .. } => {
                             Ok(DBOutput::StatementComplete(rows_updated as u64))
                         }
+                        StatementResult::Delete { rows_deleted, .. } => {
+                            Ok(DBOutput::StatementComplete(rows_deleted as u64))
+                        }
                         StatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
                         StatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
                         StatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
