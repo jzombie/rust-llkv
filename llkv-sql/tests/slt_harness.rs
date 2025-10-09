@@ -48,6 +48,9 @@ fn slt_harness() {
 
     impl Clone for EngineFactory {
         fn clone(&self) -> Self {
+            // Note: Each clone creates a new database context for isolation.
+            // For multi-connection tests within the same database, the test framework
+            // should create connections from the same factory instance, not clone the factory.
             EngineFactory::new()
         }
     }

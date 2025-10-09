@@ -190,6 +190,8 @@ pub fn expand_loops_with_mapping(
 
 /// Convert legacy sqllogictest inline connection syntax (e.g. `statement ok con1`)
 /// into explicit `connection` records so the upstream parser can understand them.
+/// Also ensures proper termination of statement error blocks by adding a blank line
+/// after ---- when there's no expected error pattern.
 fn normalize_inline_connections(
     lines: Vec<String>,
     mapping: Vec<usize>,
@@ -204,8 +206,13 @@ fn normalize_inline_connections(
     let mut out_lines = Vec::with_capacity(lines.len());
     let mut out_map = Vec::with_capacity(mapping.len());
 
-    for (line, orig) in lines.into_iter().zip(mapping.into_iter()) {
+    let mut i = 0;
+    while i < lines.len() {
+        let line = &lines[i];
+        let orig = mapping[i];
         let trimmed = line.trim_start();
+
+        // Handle connection syntax normalization
         if trimmed.starts_with("statement ") || trimmed.starts_with("query ") {
             let mut tokens: Vec<&str> = trimmed.split_whitespace().collect();
             if tokens.len() >= 3 {
@@ -221,13 +228,66 @@ fn normalize_inline_connections(
 
                     out_lines.push(format!("{indent}{}", tokens.join(" ")));
                     out_map.push(orig);
+                    i += 1;
                     continue;
                 }
             }
         }
 
-        out_lines.push(line);
+        // Check if this is a statement error followed by ---- with no expected pattern
+        if trimmed.starts_with("statement error") {
+            out_lines.push(line.clone());
+            out_map.push(orig);
+            i += 1;
+
+            // Collect the SQL statement lines until we hit ----
+            let mut sql_lines = Vec::new();
+            while i < lines.len() {
+                let next_line = &lines[i];
+                let next_trimmed = next_line.trim_start();
+
+                if next_trimmed == "----" {
+                    // Found the delimiter - now check what follows
+                    i += 1;
+
+                    let has_expected_pattern = if i < lines.len() {
+                        let following = lines[i].trim();
+                        !following.is_empty() && following.starts_with("<REGEX>:")
+                    } else {
+                        false
+                    };
+
+                    if has_expected_pattern {
+                        // Keep the ---- and continue normally
+                        for sql_line in sql_lines {
+                            out_lines.push(sql_line);
+                            out_map.push(orig); // Use same orig for SQL lines
+                        }
+                        out_lines.push("----".to_string());
+                        out_map.push(mapping[i - 1]);
+                    } else {
+                        // No expected pattern - omit the ---- delimiter entirely
+                        for sql_line in sql_lines {
+                            out_lines.push(sql_line);
+                            out_map.push(orig); // Use same orig for SQL lines
+                        }
+                        // Add a blank line to ensure proper termination
+                        out_lines.push(String::new());
+                        out_map.push(mapping[i - 1]);
+                    }
+                    break;
+                } else {
+                    // Part of the SQL statement
+                    sql_lines.push(next_line.clone());
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        out_lines.push(line.clone());
         out_map.push(orig);
+        i += 1;
     }
 
     (out_lines, out_map)

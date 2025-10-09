@@ -100,7 +100,7 @@ where
     }
 
     fn table_not_found_error(table_name: &str) -> Error {
-        Error::InvalidArgumentError(format!(
+        Error::CatalogError(format!(
             "Catalog Error: Table '{table_name}' does not exist"
         ))
     }
@@ -108,6 +108,9 @@ where
     fn is_table_missing_error(err: &Error) -> bool {
         match err {
             Error::NotFound => true,
+            Error::CatalogError(msg) => {
+                msg.contains("Catalog Error: Table") || msg.contains("unknown table")
+            }
             Error::InvalidArgumentError(msg) => {
                 msg.contains("Catalog Error: Table") || msg.contains("unknown table")
             }
