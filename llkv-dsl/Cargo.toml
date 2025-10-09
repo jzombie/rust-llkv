@@ -1,5 +1,5 @@
 [package]
-name = "llkv-sql"
+name = "llkv-dsl"
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -10,18 +10,11 @@ publish.workspace = true
 [dependencies]
 arrow = { workspace = true, default-features = false }
 llkv-column-map.workspace = true
-llkv-dsl.workspace = true
+llkv-expr.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true
-llkv-expr.workspace = true
 llkv-table.workspace = true
 simd-r-drive-entry-handle.workspace = true
 sqlparser.workspace = true
 time = { workspace = true, features = ["parsing"] }
-tracing = { workspace = true }
-
-[dev-dependencies]
-async-trait.workspace = true
-llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
-sqllogictest.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing.workspace = true

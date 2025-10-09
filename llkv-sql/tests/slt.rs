@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int64Array, StringArray, UInt64Array};
 use llkv_result::Error as LlkvError;
-use llkv_sql::{SqlEngine, SqlStatementResult};
+use llkv_sql::{SqlEngine, StatementResult};
 use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType, Runner};
 
@@ -33,17 +33,16 @@ impl AsyncDB for EngineHarness {
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
         match self.engine.execute(sql) {
-            Ok(results) => {
+            Ok(mut results) => {
                 if results.is_empty() {
                     return Ok(DBOutput::StatementComplete(0));
                 }
-                match &results[0] {
-                    SqlStatementResult::Select {
-                        table_name: _,
-                        batches,
-                    } => {
+                let result = results.remove(0);
+                match result {
+                    StatementResult::Select { execution, .. } => {
+                        let batches = execution.collect()?;
                         let mut rows: Vec<Vec<String>> = Vec::new();
-                        for batch in batches {
+                        for batch in &batches {
                             for row_idx in 0..batch.num_rows() {
                                 let mut row: Vec<String> = Vec::new();
                                 for col in 0..batch.num_columns() {
@@ -101,7 +100,6 @@ impl AsyncDB for EngineHarness {
                             }
                         }
 
-                        // Map column types from the first batch when available.
                         let types = if let Some(first) = batches.first() {
                             (0..first.num_columns())
                                 .map(|col| match first.column(col).data_type() {
@@ -122,14 +120,15 @@ impl AsyncDB for EngineHarness {
 
                         Ok(DBOutput::Rows { types, rows })
                     }
-                    SqlStatementResult::Insert { rows_inserted, .. } => {
-                        Ok(DBOutput::StatementComplete(*rows_inserted as u64))
+                    StatementResult::Insert { rows_inserted, .. } => {
+                        Ok(DBOutput::StatementComplete(rows_inserted as u64))
                     }
-                    SqlStatementResult::Update { rows_updated, .. } => {
-                        Ok(DBOutput::StatementComplete(*rows_updated as u64))
+                    StatementResult::Update { rows_updated, .. } => {
+                        Ok(DBOutput::StatementComplete(rows_updated as u64))
                     }
-                    SqlStatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
-                    SqlStatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
+                    StatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
+                    StatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
+                    StatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
                 }
             }
             Err(e) => Err(e),
@@ -156,6 +155,7 @@ async fn run_slt_basic() {
         .expect("slt runner failed");
 }
 
+// TODO: Improve test
 #[test]
 fn validator_space_vs_tab() {
     use sqllogictest::runner::{default_normalizer, default_validator};
