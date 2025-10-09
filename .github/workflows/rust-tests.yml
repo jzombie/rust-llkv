@@ -1,11 +1,6 @@
 name: rust-tests
 
-on:
-  push:
-    branches: [main, dev]
-    tags: ["v*"]
-  pull_request:
-    branches: [main, dev]
+on: [pull_request]
 
 # Ensure only one run per branch/PR at a time. If new commits are pushed,
 # older jobs will be automatically canceled.
