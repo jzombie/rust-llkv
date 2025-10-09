@@ -56,6 +56,9 @@ struct TransactionState {
     staged_tables: HashSet<String>,
     table_deltas: HashMap<String, TableDeltaState>,
     new_tables: HashSet<String>,
+    snapshotted_tables: HashSet<String>,
+    missing_tables: HashSet<String>,
+    catalog_snapshot: HashSet<String>,
 }
 
 pub struct SqlEngine<P>
@@ -246,7 +249,9 @@ where
                 for table in &tables {
                     self.ensure_table_in_delta(tx, table)?;
                 }
-                let all_tables_local = tables.iter().all(|table| tx.new_tables.contains(table));
+                let all_tables_local = tables.iter().all(|table| {
+                    tx.new_tables.contains(table) || tx.snapshotted_tables.contains(table)
+                });
 
                 let aggregate_specs = if let SetExpr::Select(select) = query.body.as_ref() {
                     self.detect_simple_aggregates(&select.projection)?
@@ -305,7 +310,8 @@ where
                     ));
                 }
                 let delta_raw = delta_results.remove(0);
-                tx.new_tables.insert(table_name);
+                tx.new_tables.insert(table_name.clone());
+                tx.missing_tables.remove(table_name.as_str());
                 tx.statements.push(sql_text);
                 Self::convert_statement_result(delta_raw)
             }
@@ -407,13 +413,41 @@ where
             return Ok(());
         }
 
-        let specs_result = self.context.table_column_specs(table_name);
-        match specs_result {
+        let canonical_name = table_name.to_ascii_lowercase();
+        if !tx.catalog_snapshot.contains(&canonical_name) && !tx.new_tables.contains(table_name) {
+            tx.missing_tables.insert(table_name.to_string());
+            return Err(Self::table_not_found_error(table_name));
+        }
+
+        if tx.missing_tables.contains(table_name) {
+            return Err(Self::table_not_found_error(table_name));
+        }
+
+        match self.context.table_column_specs(table_name) {
             Ok(specs) => {
+                tx.missing_tables.remove(table_name);
                 let mut plan = CreateTablePlan::new(table_name.to_string());
                 plan.if_not_exists = true;
                 plan.columns = specs;
                 tx.staging.context_arc().create_table_plan(plan)?;
+
+                match self.context.export_table_rows(table_name) {
+                    Ok(snapshot) => {
+                        if !snapshot.rows.is_empty() {
+                            let insert_plan = InsertPlan {
+                                table: table_name.to_string(),
+                                columns: snapshot.columns.clone(),
+                                source: InsertSource::Rows(snapshot.rows),
+                            };
+                            tx.staging.context_arc().insert(insert_plan)?;
+                        }
+                        tx.snapshotted_tables.insert(table_name.to_string());
+                    }
+                    Err(Error::NotFound) => {
+                        tx.snapshotted_tables.insert(table_name.to_string());
+                    }
+                    Err(other) => return Err(other),
+                }
             }
             Err(Error::NotFound) => match tx.staging.context_arc().table_column_specs(table_name) {
                 Ok(_) => {
@@ -421,9 +455,16 @@ where
                     return Ok(());
                 }
                 Err(Error::NotFound) => {
+                    tx.missing_tables.insert(table_name.to_string());
                     return Err(Self::table_not_found_error(table_name));
                 }
-                Err(other) => return Err(other),
+                Err(Error::InvalidArgumentError(msg)) if msg.contains("unknown table") => {
+                    tx.missing_tables.insert(table_name.to_string());
+                    return Err(Self::table_not_found_error(table_name));
+                }
+                Err(other) => {
+                    return Err(other);
+                }
             },
             Err(Error::InvalidArgumentError(msg)) if msg.contains("unknown table") => {
                 match tx.staging.context_arc().table_column_specs(table_name) {
@@ -432,12 +473,21 @@ where
                         return Ok(());
                     }
                     Err(Error::NotFound) => {
+                        tx.missing_tables.insert(table_name.to_string());
                         return Err(Self::table_not_found_error(table_name));
                     }
-                    Err(other) => return Err(other),
+                    Err(Error::InvalidArgumentError(inner)) if inner.contains("unknown table") => {
+                        tx.missing_tables.insert(table_name.to_string());
+                        return Err(Self::table_not_found_error(table_name));
+                    }
+                    Err(other) => {
+                        return Err(other);
+                    }
                 }
             }
-            Err(other) => return Err(other),
+            Err(other) => {
+                return Err(other);
+            }
         }
 
         tx.staged_tables.insert(table_name.to_string());
@@ -465,50 +515,20 @@ where
 
         self.ensure_table_in_delta(tx, table_name)?;
 
-        let mut select_sql = format!("SELECT * FROM {table_name}");
-        if let Some(expr) = selection {
-            select_sql.push_str(" WHERE ");
-            select_sql.push_str(&expr.to_string());
-        }
+        // Convert SQL WHERE expression to LlkvExpr if present
+        let filter = selection
+            .map(|expr| translate_condition(expr))
+            .transpose()?;
 
-        let mut statements = Parser::parse_sql(&GenericDialect {}, &select_sql).map_err(|err| {
-            Error::InvalidArgumentError(format!(
-                "failed to build seed query for transaction update: {err}"
-            ))
-        })?;
-        if statements.len() != 1 {
-            return Err(Error::Internal(
-                "unexpected statement count when seeding transaction rows".into(),
-            ));
-        }
-        let statement = statements.remove(0);
-        let Statement::Query(query) = statement else {
-            return Err(Error::Internal(
-                "expected SELECT statement when seeding transaction rows".into(),
-            ));
-        };
-
-        let select_result = match self.handle_query(*query) {
-            Ok(result) => Some(result),
-            Err(err) if Self::is_table_missing_error(&err) => None,
+        // Get batches from the base table with row_ids preserved
+        let batches = match self.context.get_batches_with_row_ids(table_name, filter) {
+            Ok(batches) => batches,
+            Err(err) if Self::is_table_missing_error(&err) => {
+                return Ok(());
+            }
             Err(other) => return Err(other),
         };
-        let Some(select_result) = select_result else {
-            return Ok(());
-        };
 
-        let (schema, execution) = match select_result {
-            StatementResult::Select {
-                schema, execution, ..
-            } => (schema, execution),
-            other => {
-                return Err(Error::Internal(format!(
-                    "seeding update rows expected SELECT result, found {other:?}"
-                )));
-            }
-        };
-
-        let rows = execution.into_rows()?;
         {
             let delta = tx
                 .table_deltas
@@ -516,21 +536,16 @@ where
                 .or_insert_with(TableDeltaState::new);
             delta.seeded_filters.insert(filter_key.clone());
         }
-        if rows.is_empty() {
+
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return Ok(());
         }
 
-        let columns: Vec<String> = schema
-            .fields()
-            .iter()
-            .map(|field| field.name().to_string())
-            .collect();
-        let plan = InsertPlan {
-            table: table_name.to_string(),
-            columns,
-            source: InsertSource::Rows(rows),
-        };
-        tx.staging.context_arc().insert(plan).map(|_| ())
+        // Use append_batches_with_row_ids to preserve row_ids when seeding
+        tx.staging
+            .context_arc()
+            .append_batches_with_row_ids(table_name, batches)
+            .map(|_| ())
     }
 
     fn record_update_exclusion(
@@ -658,7 +673,11 @@ where
                 schema,
                 execution,
             } => {
-                let mut batches = execution.collect()?;
+                let mut batches = match execution.collect() {
+                    Ok(batches) => batches,
+                    Err(Error::NotFound) => Vec::new(),
+                    Err(other) => return Err(other),
+                };
                 let combined = if batches.is_empty() {
                     RecordBatch::new_empty(schema.clone())
                 } else if batches.len() == 1 {
@@ -709,7 +728,11 @@ where
                 schema,
                 execution,
             }) => {
-                let batches = execution.collect()?;
+                let batches = match execution.collect() {
+                    Ok(batches) => batches,
+                    Err(Error::NotFound) => Vec::new(),
+                    Err(other) => return Err(other),
+                };
                 (Some(table_name), Some(schema), batches)
             }
             Some(other) => {
@@ -720,7 +743,11 @@ where
             None => (None, None, Vec::new()),
         };
 
-        let delta_batches = delta_execution.collect()?;
+        let delta_batches = match delta_execution.collect() {
+            Ok(batches) => batches,
+            Err(Error::NotFound) => Vec::new(),
+            Err(other) => return Err(other),
+        };
 
         if let Some(base_schema) = &base_schema_opt {
             if base_schema.fields().len() != delta_schema.fields().len() {
@@ -1747,12 +1774,16 @@ where
         }
 
         let staging_engine = SqlEngine::new(Arc::new(MemPager::default()));
+        let catalog_snapshot = self.context.table_names().into_iter().collect();
         let state = TransactionState {
             staging: Box::new(staging_engine),
             statements: Vec::new(),
             staged_tables: HashSet::new(),
             table_deltas: HashMap::new(),
             new_tables: HashSet::new(),
+            snapshotted_tables: HashSet::new(),
+            missing_tables: HashSet::new(),
+            catalog_snapshot,
         };
 
         *guard = Some(state);

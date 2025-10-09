@@ -534,6 +534,11 @@ where
         }
     }
 
+    pub fn table_names(self: &Arc<Self>) -> Vec<String> {
+        let tables = self.tables.read().unwrap();
+        tables.keys().cloned().collect()
+    }
+
     pub fn create_table_builder(&self, name: &str) -> CreateTableBuilder<'_, P> {
         CreateTableBuilder {
             ctx: self,
@@ -603,6 +608,131 @@ where
                 self.insert_batches(table.as_ref(), display_name, batches, plan.columns)
             }
         }
+    }
+
+    /// Get raw batches from a table including row_ids, optionally filtered.
+    /// This is used for transaction seeding where we need to preserve existing row_ids.
+    pub fn get_batches_with_row_ids(
+        &self,
+        table_name: &str,
+        filter: Option<LlkvExpr<'static, String>>,
+    ) -> DslResult<Vec<RecordBatch>> {
+        let (_, canonical_name) = canonical_table_name(table_name)?;
+        let table = self.lookup_table(&canonical_name)?;
+
+        let filter_expr = match filter {
+            Some(expr) => translate_predicate(expr, table.schema.as_ref())?,
+            None => {
+                let field_id = table.schema.first_field_id().ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "table has no columns; cannot perform wildcard scan".into(),
+                    )
+                })?;
+                full_table_scan_filter(field_id)
+            }
+        };
+
+        // First, get the row_ids that match the filter
+        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        if row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Scan to get the column data
+        let mut batches_without_rowid = Vec::new();
+        let table_id = table.table.table_id();
+        let projections: Vec<ScanProjection> = table
+            .schema
+            .columns
+            .iter()
+            .map(|col| {
+                let logical_field_id = LogicalFieldId::for_user(table_id, col.field_id);
+                ScanProjection::column((logical_field_id, col.name.clone()))
+            })
+            .collect();
+
+        let options = ScanStreamOptions {
+            include_nulls: true,
+            order: None,
+        };
+
+        table
+            .table
+            .scan_stream_with_exprs(&projections, &filter_expr, options, |batch| {
+                batches_without_rowid.push(batch.clone());
+            })?;
+
+        // Now add row_id column to each batch
+        let mut batches_with_rowid = Vec::new();
+        let mut row_id_offset = 0usize;
+
+        for batch in batches_without_rowid {
+            let batch_size = batch.num_rows();
+            let batch_row_ids: Vec<u64> =
+                row_ids[row_id_offset..row_id_offset + batch_size].to_vec();
+            row_id_offset += batch_size;
+
+            // Create a new batch with row_id as the first column
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns() + 1);
+            arrays.push(Arc::new(UInt64Array::from(batch_row_ids)));
+            for i in 0..batch.num_columns() {
+                arrays.push(batch.column(i).clone());
+            }
+
+            let mut fields: Vec<Field> = Vec::with_capacity(batch.schema().fields().len() + 1);
+            fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+
+            // Reconstruct fields with proper field_id metadata
+            for (idx, field) in batch.schema().fields().iter().enumerate() {
+                let col = &table.schema.columns[idx];
+                let mut metadata = HashMap::new();
+                metadata.insert(
+                    llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+                    col.field_id.to_string(),
+                );
+                let field_with_metadata =
+                    Field::new(&col.name, col.data_type.clone(), col.nullable)
+                        .with_metadata(metadata);
+                fields.push(field_with_metadata);
+            }
+
+            let schema_with_rowid = Arc::new(Schema::new(fields));
+            let batch_with_rowid = RecordBatch::try_new(schema_with_rowid, arrays)?;
+            batches_with_rowid.push(batch_with_rowid);
+        }
+
+        Ok(batches_with_rowid)
+    }
+
+    /// Append batches directly to a table, preserving row_ids from the batches.
+    /// This is used for transaction seeding where we need to preserve existing row_ids.
+    pub fn append_batches_with_row_ids(
+        &self,
+        table_name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> DslResult<usize> {
+        let (_, canonical_name) = canonical_table_name(table_name)?;
+        let table = self.lookup_table(&canonical_name)?;
+
+        let mut total_rows = 0;
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Verify the batch has a row_id column
+            let _row_id_idx = batch.schema().index_of(ROW_ID_COLUMN_NAME).map_err(|_| {
+                Error::InvalidArgumentError(
+                    "batch must contain row_id column for direct append".into(),
+                )
+            })?;
+
+            // Append the batch directly to the underlying table
+            table.table.append(&batch)?;
+            total_rows += batch.num_rows();
+        }
+
+        Ok(total_rows)
     }
 
     pub fn update(&self, plan: UpdatePlan) -> DslResult<StatementResult<P>> {
