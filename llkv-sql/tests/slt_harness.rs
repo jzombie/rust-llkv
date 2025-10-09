@@ -5,6 +5,7 @@ fn slt_harness() {
     // Create an engine factory closure that will be passed to the shared
     // harness. Keep this file minimal — the real harness lives in
     // `llkv-test-utils`.
+    use llkv_dsl::DslContext;
     use llkv_sql::SqlEngine;
     use llkv_storage::pager::MemPager;
     use std::sync::Arc;
@@ -20,11 +21,34 @@ fn slt_harness() {
         engine: SqlEngine<MemPager>,
     }
     impl EngineHarness {
-        pub fn new() -> Self {
+        pub fn new(engine: SqlEngine<MemPager>) -> Self {
+            Self { engine }
+        }
+    }
+
+    struct EngineFactory {
+        context: Arc<DslContext<MemPager>>,
+        default_nulls_first: bool,
+    }
+
+    impl EngineFactory {
+        fn new() -> Self {
             let pager = Arc::new(MemPager::default());
+            let context = Arc::new(DslContext::new(pager));
             Self {
-                engine: SqlEngine::new(pager),
+                context,
+                default_nulls_first: false,
             }
+        }
+
+        fn make_engine(&self) -> SqlEngine<MemPager> {
+            SqlEngine::with_context(Arc::clone(&self.context), self.default_nulls_first)
+        }
+    }
+
+    impl Clone for EngineFactory {
+        fn clone(&self) -> Self {
+            EngineFactory::new()
         }
     }
 
@@ -141,7 +165,11 @@ fn slt_harness() {
     }
 
     // Construct and pass a factory closure to the shared harness.
-    slt::run_slt_harness("tests/slt", || async { Ok::<_, ()>(EngineHarness::new()) });
+    let factory = EngineFactory::new();
+    slt::run_slt_harness("tests/slt", move || {
+        let engine = factory.make_engine();
+        async move { Ok::<_, ()>(EngineHarness::new(engine)) }
+    });
 }
 
 // Unit tests for the mapping/expansion helpers live in `llkv-test-utils`.

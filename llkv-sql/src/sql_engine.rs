@@ -1,10 +1,14 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 use crate::SqlResult;
 use crate::SqlValue;
 
+use arrow::compute::concat_batches;
+use arrow::record_batch::RecordBatch;
+
+use llkv_dsl::TransactionKind;
 use llkv_dsl::{
     AggregateExpr, ColumnAssignment, ColumnSpec, CreateTablePlan, CreateTableSource, DslContext,
     DslValue, InsertPlan, InsertSource, OrderByPlan, OrderSortType, OrderTarget, SelectExecution,
@@ -12,7 +16,7 @@ use llkv_dsl::{
 };
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
-use llkv_storage::pager::Pager;
+use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
@@ -26,12 +30,36 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+struct TransactionState {
+    context: Arc<DslContext<MemPager>>,
+    default_nulls_first: bool,
+    statements: Vec<String>,
+    copied_tables: HashSet<String>,
+    new_tables: HashSet<String>,
+}
+
 pub struct SqlEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     context: Arc<DslContext<P>>,
     default_nulls_first: AtomicBool,
+    transaction: Mutex<Option<TransactionState>>,
+}
+
+impl<P> Clone for SqlEngine<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            context: Arc::clone(&self.context),
+            default_nulls_first: AtomicBool::new(
+                self.default_nulls_first.load(AtomicOrdering::Relaxed),
+            ),
+            transaction: Mutex::new(None),
+        }
+    }
 }
 
 impl<P> SqlEngine<P>
@@ -42,12 +70,28 @@ where
         Self {
             context: Arc::new(DslContext::new(pager)),
             default_nulls_first: AtomicBool::new(false),
+            transaction: Mutex::new(None),
+        }
+    }
+
+    pub fn with_context(context: Arc<DslContext<P>>, default_nulls_first: bool) -> Self {
+        Self {
+            context,
+            default_nulls_first: AtomicBool::new(default_nulls_first),
+            transaction: Mutex::new(None),
         }
     }
 
     #[cfg(test)]
     fn default_nulls_first_for_tests(&self) -> bool {
         self.default_nulls_first.load(AtomicOrdering::Relaxed)
+    }
+
+    fn has_active_transaction(&self) -> bool {
+        self.transaction
+            .lock()
+            .expect("transaction lock poisoned")
+            .is_some()
     }
 
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<StatementResult<P>>> {
@@ -64,17 +108,6 @@ where
 
     fn execute_statement(&self, statement: Statement) -> SqlResult<StatementResult<P>> {
         match statement {
-            Statement::CreateTable(stmt) => self.handle_create_table(stmt),
-            Statement::Insert(stmt) => self.handle_insert(stmt),
-            Statement::Query(query) => self.handle_query(*query),
-            Statement::Update {
-                table,
-                assignments,
-                from,
-                selection,
-                returning,
-                ..
-            } => self.handle_update(table, assignments, from, selection, returning),
             Statement::StartTransaction {
                 modes,
                 begin,
@@ -98,11 +131,243 @@ where
                 modifier,
             } => self.handle_commit(chain, end, modifier),
             Statement::Rollback { chain, savepoint } => self.handle_rollback(chain, savepoint),
+            other => {
+                if self.has_active_transaction() {
+                    self.execute_statement_in_transaction(other)
+                } else {
+                    self.execute_statement_non_transactional(other)
+                }
+            }
+        }
+    }
+
+    fn execute_statement_non_transactional(
+        &self,
+        statement: Statement,
+    ) -> SqlResult<StatementResult<P>> {
+        match statement {
+            Statement::CreateTable(stmt) => self.handle_create_table(stmt),
+            Statement::Insert(stmt) => self.handle_insert(stmt),
+            Statement::Query(query) => self.handle_query(*query),
+            Statement::Update {
+                table,
+                assignments,
+                from,
+                selection,
+                returning,
+                ..
+            } => self.handle_update(table, assignments, from, selection, returning),
             Statement::Set(set_stmt) => self.handle_set(set_stmt),
+            Statement::Pragma { name, value, is_eq } => self.handle_pragma(name, value, is_eq),
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported SQL statement: {other:?}"
             ))),
         }
+    }
+
+    fn execute_statement_in_transaction(
+        &self,
+        statement: Statement,
+    ) -> SqlResult<StatementResult<P>> {
+        let sql_text = statement.to_string();
+        let mut guard = self.transaction.lock().expect("transaction lock poisoned");
+        let tx = guard.as_mut().ok_or_else(|| {
+            Error::InvalidArgumentError("no transaction is currently in progress".into())
+        })?;
+
+        // Handle connection-scoped statements directly.
+        match &statement {
+            Statement::Set(set_stmt) => {
+                let result = self.handle_set(set_stmt.clone())?;
+                tx.default_nulls_first = self.default_nulls_first.load(AtomicOrdering::Relaxed);
+                return Ok(result);
+            }
+            Statement::Pragma { name, value, is_eq } => {
+                let result = self.handle_pragma(name.clone(), value.clone(), *is_eq)?;
+                return Ok(result);
+            }
+            _ => {}
+        }
+
+        self.prepare_staging_for_statement(tx, &statement)?;
+        let mut results = Self::execute_in_staging(tx, &sql_text)?;
+        if results.len() != 1 {
+            return Err(Error::Internal(
+                "transaction statements must yield exactly one result".into(),
+            ));
+        }
+        let overlay_result = results.remove(0);
+
+        if Self::is_mutating_statement(&statement) {
+            tx.statements.push(sql_text);
+        }
+
+        Self::convert_statement_result(overlay_result)
+    }
+
+    fn execute_in_staging(
+        tx: &TransactionState,
+        sql: &str,
+    ) -> SqlResult<Vec<StatementResult<MemPager>>> {
+        let engine = SqlEngine::with_context(Arc::clone(&tx.context), tx.default_nulls_first);
+        engine.execute(sql)
+    }
+
+    fn prepare_staging_for_statement(
+        &self,
+        tx: &mut TransactionState,
+        statement: &Statement,
+    ) -> SqlResult<()> {
+        match statement {
+            Statement::CreateTable(create) => {
+                let name = Self::object_name_to_string(&create.name)?;
+                tx.new_tables.insert(name);
+                Ok(())
+            }
+            Statement::Insert(insert) => {
+                if let Some(table) = Self::table_object_to_name(&insert.table)? {
+                    if !tx.new_tables.contains(&table) {
+                        self.ensure_table_in_staging(tx, &table)?;
+                    }
+                }
+                Ok(())
+            }
+            Statement::Update { table, .. } => {
+                if let Some(name) = Self::table_with_joins_name(table)? {
+                    if !tx.new_tables.contains(&name) {
+                        self.ensure_table_in_staging(tx, &name)?;
+                    }
+                }
+                Ok(())
+            }
+            Statement::Query(query) => {
+                for table in Self::tables_in_query(query)? {
+                    if !tx.new_tables.contains(&table) {
+                        self.ensure_table_in_staging(tx, &table)?;
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn ensure_table_in_staging(
+        &self,
+        tx: &mut TransactionState,
+        table_name: &str,
+    ) -> SqlResult<()> {
+        if tx.copied_tables.contains(table_name) {
+            return Ok(());
+        }
+
+        let specs = self.context.table_column_specs(table_name)?;
+        let mut plan = CreateTablePlan::new(table_name.to_string());
+        plan.columns = specs;
+        tx.context.create_table_plan(plan)?;
+
+        let batch = self.context.export_table_rows(table_name)?;
+        if !batch.rows.is_empty() {
+            let insert_plan = InsertPlan {
+                table: table_name.to_string(),
+                columns: batch.columns,
+                source: InsertSource::Rows(batch.rows),
+            };
+            tx.context.insert(insert_plan)?;
+        }
+
+        tx.copied_tables.insert(table_name.to_string());
+        Ok(())
+    }
+
+    fn is_mutating_statement(statement: &Statement) -> bool {
+        matches!(
+            statement,
+            Statement::CreateTable(_) | Statement::Insert(_) | Statement::Update { .. }
+        )
+    }
+
+    fn convert_statement_result(
+        result: StatementResult<MemPager>,
+    ) -> SqlResult<StatementResult<P>> {
+        match result {
+            StatementResult::CreateTable { table_name } => {
+                Ok(StatementResult::CreateTable { table_name })
+            }
+            StatementResult::NoOp => Ok(StatementResult::NoOp),
+            StatementResult::Insert {
+                table_name,
+                rows_inserted,
+            } => Ok(StatementResult::Insert {
+                table_name,
+                rows_inserted,
+            }),
+            StatementResult::Update {
+                table_name,
+                rows_updated,
+            } => Ok(StatementResult::Update {
+                table_name,
+                rows_updated,
+            }),
+            StatementResult::Select {
+                table_name,
+                schema,
+                execution,
+            } => {
+                let mut batches = execution.collect()?;
+                let combined = if batches.is_empty() {
+                    RecordBatch::new_empty(schema.clone())
+                } else if batches.len() == 1 {
+                    batches.remove(0)
+                } else {
+                    let refs: Vec<&RecordBatch> = batches.iter().collect();
+                    concat_batches(&schema, refs).map_err(|err| {
+                        Error::Internal(format!(
+                            "failed to concatenate select batches in transaction: {err}"
+                        ))
+                    })?
+                };
+                let execution =
+                    SelectExecution::from_batch(table_name.clone(), schema.clone(), combined);
+                Ok(StatementResult::Select {
+                    table_name,
+                    schema,
+                    execution,
+                })
+            }
+            StatementResult::Transaction { kind } => Ok(StatementResult::Transaction { kind }),
+        }
+    }
+
+    fn object_name_to_string(name: &ObjectName) -> SqlResult<String> {
+        let (display, _) = canonical_object_name(name)?;
+        Ok(display)
+    }
+
+    fn table_object_to_name(table: &TableObject) -> SqlResult<Option<String>> {
+        match table {
+            TableObject::TableName(name) => Ok(Some(Self::object_name_to_string(name)?)),
+            TableObject::TableFunction(_) => Ok(None),
+        }
+    }
+
+    fn table_with_joins_name(table: &TableWithJoins) -> SqlResult<Option<String>> {
+        match &table.relation {
+            TableFactor::Table { name, .. } => Ok(Some(Self::object_name_to_string(name)?)),
+            _ => Ok(None),
+        }
+    }
+
+    fn tables_in_query(query: &Query) -> SqlResult<Vec<String>> {
+        let mut tables = Vec::new();
+        if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
+            for table in &select.from {
+                if let TableFactor::Table { name, .. } = &table.relation {
+                    tables.push(Self::object_name_to_string(name)?);
+                }
+            }
+        }
+        Ok(tables)
     }
 
     fn handle_create_table(
@@ -782,7 +1047,28 @@ where
             // Currently treat START TRANSACTION same as BEGIN
             tracing::warn!("Currently treat `START TRANSACTION` same as `BEGIN`")
         }
-        self.context.begin_transaction()
+        let mut guard = self.transaction.lock().expect("transaction lock poisoned");
+        if guard.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "a transaction is already in progress".into(),
+            ));
+        }
+
+        let staging_pager = Arc::new(MemPager::default());
+        let staging_context = Arc::new(DslContext::new(staging_pager));
+        let default_nulls_first = self.default_nulls_first.load(AtomicOrdering::Relaxed);
+        let state = TransactionState {
+            context: staging_context,
+            default_nulls_first,
+            statements: Vec::new(),
+            copied_tables: HashSet::new(),
+            new_tables: HashSet::new(),
+        };
+
+        *guard = Some(state);
+        Ok(StatementResult::Transaction {
+            kind: TransactionKind::Begin,
+        })
     }
 
     fn handle_commit(
@@ -806,7 +1092,19 @@ where
                 "transaction modifiers are not supported".into(),
             ));
         }
-        self.context.commit_transaction()
+        let mut guard = self.transaction.lock().expect("transaction lock poisoned");
+        let tx = guard.take().ok_or_else(|| {
+            Error::InvalidArgumentError("no transaction is currently in progress".into())
+        })?;
+        drop(guard);
+
+        for stmt in tx.statements {
+            let _ = self.execute(&stmt)?;
+        }
+
+        Ok(StatementResult::Transaction {
+            kind: TransactionKind::Commit,
+        })
     }
 
     fn handle_rollback(
@@ -824,7 +1122,15 @@ where
                 "ROLLBACK TO SAVEPOINT is not supported".into(),
             ));
         }
-        self.context.rollback_transaction()
+        let mut guard = self.transaction.lock().expect("transaction lock poisoned");
+        if guard.take().is_none() {
+            return Err(Error::InvalidArgumentError(
+                "no transaction is currently in progress".into(),
+            ));
+        }
+        Ok(StatementResult::Transaction {
+            kind: TransactionKind::Rollback,
+        })
     }
 
     fn handle_set(&self, set_stmt: Set) -> SqlResult<StatementResult<P>> {
@@ -879,6 +1185,28 @@ where
             }
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported SQL SET statement: {other:?}",
+            ))),
+        }
+    }
+
+    fn handle_pragma(
+        &self,
+        name: ObjectName,
+        value: Option<Value>,
+        is_eq: bool,
+    ) -> SqlResult<StatementResult<P>> {
+        let (display, canonical) = canonical_object_name(&name)?;
+        if value.is_some() || is_eq {
+            return Err(Error::InvalidArgumentError(format!(
+                "PRAGMA '{display}' does not accept a value"
+            )));
+        }
+
+        match canonical.as_str() {
+            "enable_verification" | "disable_verification" => Ok(StatementResult::NoOp),
+            _ => Err(Error::InvalidArgumentError(format!(
+                "unsupported PRAGMA '{}'",
+                display
             ))),
         }
     }

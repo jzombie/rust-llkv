@@ -18,8 +18,9 @@ where
         .map_err(|e| llkv_result::Error::Internal(format!("failed to read slt file: {}", e)))?;
     let raw_lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let (expanded_lines, mapping) = expand_loops_with_mapping(&raw_lines, 0)?;
+    let (normalized_lines, mapping) = normalize_inline_connections(expanded_lines, mapping);
 
-    let expanded_text = expanded_lines.join("\n");
+    let expanded_text = normalized_lines.join("\n");
     let mut named = tempfile::NamedTempFile::new().map_err(|e| {
         llkv_result::Error::Internal(format!("failed to create temp slt file: {}", e))
     })?;
@@ -36,7 +37,7 @@ where
     });
     if let Err(e) = runner.run_file_async(&tmp).await {
         let (mapped, opt_orig_line) =
-            map_temp_error_message(&format!("{}", e), &tmp, &expanded_lines, &mapping, path);
+            map_temp_error_message(&format!("{}", e), &tmp, &normalized_lines, &mapping, path);
         if let Some(orig_line) = opt_orig_line
             && let Ok(text) = std::fs::read_to_string(path)
             && let Some(line) = text.lines().nth(orig_line - 1)
@@ -185,6 +186,51 @@ pub fn expand_loops_with_mapping(
         }
     }
     Ok((out_lines, out_map))
+}
+
+/// Convert legacy sqllogictest inline connection syntax (e.g. `statement ok con1`)
+/// into explicit `connection` records so the upstream parser can understand them.
+fn normalize_inline_connections(
+    lines: Vec<String>,
+    mapping: Vec<usize>,
+) -> (Vec<String>, Vec<usize>) {
+    fn is_connection_token(token: &str) -> bool {
+        token
+            .strip_prefix("con")
+            .map(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
+            .unwrap_or(false)
+    }
+
+    let mut out_lines = Vec::with_capacity(lines.len());
+    let mut out_map = Vec::with_capacity(mapping.len());
+
+    for (line, orig) in lines.into_iter().zip(mapping.into_iter()) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("statement ") || trimmed.starts_with("query ") {
+            let mut tokens: Vec<&str> = trimmed.split_whitespace().collect();
+            if tokens.len() >= 3 {
+                if let Some(last) = tokens.last()
+                    && is_connection_token(last)
+                {
+                    let conn = tokens.pop().unwrap();
+                    let indent_len = line.len() - trimmed.len();
+                    let indent = &line[..indent_len];
+
+                    out_lines.push(format!("{indent}connection {conn}"));
+                    out_map.push(orig);
+
+                    out_lines.push(format!("{indent}{}", tokens.join(" ")));
+                    out_map.push(orig);
+                    continue;
+                }
+            }
+        }
+
+        out_lines.push(line);
+        out_map.push(orig);
+    }
+
+    (out_lines, out_map)
 }
 
 /// Map a temporary expanded-file error message back to the original file path

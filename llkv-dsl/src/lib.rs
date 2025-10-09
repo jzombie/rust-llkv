@@ -516,6 +516,28 @@ where
         }
     }
 
+    pub fn table_column_specs(self: &Arc<Self>, name: &str) -> DslResult<Vec<ColumnSpec>> {
+        let (_, canonical_name) = canonical_table_name(name)?;
+        let table = self.lookup_table(&canonical_name)?;
+        Ok(table
+            .schema
+            .columns
+            .iter()
+            .map(|column| {
+                ColumnSpec::new(
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect())
+    }
+
+    pub fn export_table_rows(self: &Arc<Self>, name: &str) -> DslResult<RowBatch> {
+        let handle = TableHandle::new(Arc::clone(self), name)?;
+        handle.lazy()?.collect_rows()
+    }
+
     fn execute_create_table(&self, plan: CreateTablePlan) -> DslResult<StatementResult<P>> {
         self.create_table_plan(plan)
     }
