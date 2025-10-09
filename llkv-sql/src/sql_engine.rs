@@ -519,9 +519,7 @@ where
         self.ensure_table_in_delta(tx, table_name)?;
 
         // Convert SQL WHERE expression to LlkvExpr if present
-        let filter = selection
-            .map(|expr| translate_condition(expr))
-            .transpose()?;
+        let filter = selection.map(translate_condition).transpose()?;
 
         // Get batches from the base table with row_ids preserved
         let batches = match self.context.get_batches_with_row_ids(table_name, filter) {
@@ -705,6 +703,7 @@ where
         }
     }
 
+    #[allow(clippy::collapsible_if)]
     fn merge_select_results(
         base: Option<StatementResult<P>>,
         delta: StatementResult<P>,
@@ -879,7 +878,7 @@ where
                 .ok_or_else(|| {
                     Error::Internal("aggregate output column is not INT64 as expected".into())
                 })?;
-            if array.len() == 0 {
+            if array.is_empty() {
                 continue;
             }
             if array.is_null(0) {
@@ -993,6 +992,7 @@ where
         Ok(display)
     }
 
+    #[allow(dead_code)]
     fn table_object_to_name(table: &TableObject) -> SqlResult<Option<String>> {
         match table {
             TableObject::TableName(name) => Ok(Some(Self::object_name_to_string(name)?)),
@@ -1275,6 +1275,7 @@ where
             .map_err(|err| Self::map_table_error(&display_name, err))
     }
 
+    #[allow(clippy::collapsible_if)]
     fn handle_delete(&self, delete: Delete) -> SqlResult<StatementResult<P>> {
         let Delete {
             tables,

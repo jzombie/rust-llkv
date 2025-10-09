@@ -210,7 +210,7 @@ fn normalize_inline_connections(
     let mut out_lines = Vec::with_capacity(lines.len());
     let mut out_map = Vec::with_capacity(mapping.len());
 
-    let mut i = 0;
+    let mut i = 0usize;
     while i < lines.len() {
         let line = &lines[i];
         let orig = mapping[i];
@@ -219,79 +219,73 @@ fn normalize_inline_connections(
         // Handle connection syntax normalization
         if trimmed.starts_with("statement ") || trimmed.starts_with("query ") {
             let mut tokens: Vec<&str> = trimmed.split_whitespace().collect();
-            if tokens.len() >= 3 {
-                if let Some(last) = tokens.last()
-                    && is_connection_token(last)
-                {
-                    let conn = tokens.pop().unwrap();
-                    let indent_len = line.len() - trimmed.len();
-                    let indent = &line[..indent_len];
+            if tokens.len() >= 3 && tokens.last().is_some_and(|last| is_connection_token(last)) {
+                let conn = tokens.pop().unwrap();
+                let indent_len = line.len() - trimmed.len();
+                let indent = &line[..indent_len];
 
-                    out_lines.push(format!("{indent}connection {conn}"));
+                out_lines.push(format!("{indent}connection {conn}"));
+                out_map.push(orig);
+
+                let normalized = format!("{indent}{}", tokens.join(" "));
+                let normalized_trimmed = normalized.trim_start();
+
+                // Check if this is a statement error that needs special handling
+                if normalized_trimmed.starts_with("statement error") {
+                    out_lines.push(normalized.clone());
                     out_map.push(orig);
+                    i += 1;
 
-                    let normalized = format!("{indent}{}", tokens.join(" "));
-                    let normalized_trimmed = normalized.trim_start();
+                    // Collect the SQL statement lines until we hit ----
+                    let mut sql_lines = Vec::new();
+                    while i < lines.len() {
+                        let next_line = &lines[i];
+                        let next_trimmed = next_line.trim_start();
 
-                    // Check if this is a statement error that needs special handling
-                    if normalized_trimmed.starts_with("statement error") {
-                        out_lines.push(normalized.clone());
-                        out_map.push(orig);
-                        i += 1;
+                        if next_trimmed == "----" {
+                            // Found the delimiter - now check what follows
+                            i += 1;
 
-                        // Collect the SQL statement lines until we hit ----
-                        let mut sql_lines = Vec::new();
-                        while i < lines.len() {
-                            let next_line = &lines[i];
-                            let next_trimmed = next_line.trim_start();
-
-                            if next_trimmed == "----" {
-                                // Found the delimiter - now check what follows
-                                i += 1;
-
-                                let has_expected_pattern = if i < lines.len() {
-                                    let following = lines[i].trim();
-                                    !following.is_empty() && following.starts_with("<REGEX>:")
-                                } else {
-                                    false
-                                };
-
-                                if has_expected_pattern {
-                                    // OMIT the ---- and output the expected pattern line directly
-                                    for sql_line in sql_lines {
-                                        out_lines.push(sql_line);
-                                        out_map.push(orig); // Use same orig for SQL lines
-                                    }
-                                    // Output the expected pattern line WITHOUT the ---- delimiter
-                                    out_lines.push(lines[i].clone());
-                                    out_map.push(mapping[i]);
-                                    i += 1; // Move past the expected pattern line
-                                // The blank line terminating the error pattern should already be in the input
-                                } else {
-                                    // No expected pattern - omit the ---- delimiter entirely
-                                    for sql_line in sql_lines {
-                                        out_lines.push(sql_line);
-                                        out_map.push(orig); // Use same orig for SQL lines
-                                    }
-                                    // Add a blank line to ensure proper termination
-                                    out_lines.push(String::new());
-                                    out_map.push(mapping[i - 1]);
-                                }
-                                break;
+                            let has_expected_pattern = if i < lines.len() {
+                                let following = lines[i].trim();
+                                !following.is_empty() && following.starts_with("<REGEX>:")
                             } else {
-                                // Part of the SQL statement
-                                sql_lines.push(next_line.clone());
-                                i += 1;
+                                false
+                            };
+
+                            if has_expected_pattern {
+                                // OMIT the ---- and output the expected pattern line directly
+                                for sql_line in sql_lines {
+                                    out_lines.push(sql_line);
+                                    out_map.push(orig);
+                                }
+                                // Output the expected pattern line WITHOUT the ---- delimiter
+                                out_lines.push(lines[i].clone());
+                                out_map.push(mapping[i]);
+                                i += 1; // Move past the expected pattern line
+                            } else {
+                                // No expected pattern - omit the ---- delimiter entirely
+                                for sql_line in sql_lines {
+                                    out_lines.push(sql_line);
+                                    out_map.push(orig);
+                                }
+                                // Add a blank line to ensure proper termination
+                                out_lines.push(String::new());
+                                out_map.push(mapping[i - 1]);
                             }
+                            break;
+                        } else {
+                            sql_lines.push(next_line.clone());
+                            i += 1;
                         }
-                        continue;
-                    } else {
-                        // Not a statement error, just output the normalized line
-                        out_lines.push(normalized);
-                        out_map.push(orig);
-                        i += 1;
-                        continue;
                     }
+                    continue;
+                } else {
+                    // Not a statement error, just output the normalized line
+                    out_lines.push(normalized);
+                    out_map.push(orig);
+                    i += 1;
+                    continue;
                 }
             }
         }
