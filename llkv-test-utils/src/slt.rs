@@ -1,6 +1,5 @@
+use sqllogictest::{AsyncDB, DefaultColumnType, Runner};
 use std::path::Path;
-use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType, Runner};
-use std::sync::Arc;
 
 /// Run a single slt file using the provided AsyncDB factory. The factory is
 /// a closure that returns a future resolving to a new DB instance for the
@@ -25,23 +24,35 @@ where
         llkv_result::Error::Internal(format!("failed to create temp slt file: {}", e))
     })?;
     use std::io::Write as _;
-    named
-        .write_all(expanded_text.as_bytes())
-        .map_err(|e| llkv_result::Error::Internal(format!("failed to write temp slt file: {}", e)))?;
+    named.write_all(expanded_text.as_bytes()).map_err(|e| {
+        llkv_result::Error::Internal(format!("failed to write temp slt file: {}", e))
+    })?;
     let tmp = named.path().to_path_buf();
 
-    let mut runner = Runner::new(|| async { factory().await.map_err(|e| llkv_result::Error::Internal(format!("factory error: {:?}", e))) });
+    let mut runner = Runner::new(|| async {
+        factory()
+            .await
+            .map_err(|e| llkv_result::Error::Internal(format!("factory error: {:?}", e)))
+    });
     if let Err(e) = runner.run_file_async(&tmp).await {
-        let (mapped, opt_orig_line) = map_temp_error_message(&format!("{}", e), &tmp, &expanded_lines, &mapping, path);
-        if let Some(orig_line) = opt_orig_line {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                if let Some(line) = text.lines().nth(orig_line - 1) {
-                    eprintln!("[llkv-slt] original {}:{}: {}", path.display(), orig_line, line.trim());
-                }
-            }
+        let (mapped, opt_orig_line) =
+            map_temp_error_message(&format!("{}", e), &tmp, &expanded_lines, &mapping, path);
+        if let Some(orig_line) = opt_orig_line
+            && let Ok(text) = std::fs::read_to_string(path)
+            && let Some(line) = text.lines().nth(orig_line - 1)
+        {
+            eprintln!(
+                "[llkv-slt] original {}:{}: {}",
+                path.display(),
+                orig_line,
+                line.trim()
+            );
         }
         drop(named);
-        return Err(llkv_result::Error::Internal(format!("slt runner failed: {}", mapped)));
+        return Err(llkv_result::Error::Internal(format!(
+            "slt runner failed: {}",
+            mapped
+        )));
     }
 
     drop(named);
@@ -120,9 +131,9 @@ pub fn map_temp_error_message(
     let mut out = err_msg.to_string();
     if let Some(pos) = out.find(&tmp_str) {
         let after = &out[pos + tmp_str.len()..];
-        if after.starts_with(':') {
+        if let Some(stripped) = after.strip_prefix(':') {
             let mut digits = String::new();
-            for ch in after[1..].chars() {
+            for ch in stripped.chars() {
                 if ch.is_ascii_digit() {
                     digits.push(ch);
                 } else {

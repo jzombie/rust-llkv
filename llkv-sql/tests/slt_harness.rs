@@ -18,19 +18,17 @@ fn find_slt_files(dir: &str) -> Vec<PathBuf> {
                     stack.push(entry.path());
                 }
             }
-        } else if let Some(ext) = p.extension() {
-            if ext == "slt" {
-                out.push(p);
-            }
+        } else if let Some(ext) = p.extension()
+            && ext == "slt"
+        {
+            out.push(p);
         }
     }
     out.sort();
     out
 }
 
-use llkv_test_utils::slt::{
-    expand_loops_with_mapping, map_temp_error_message, run_slt_file_with_factory,
-};
+use llkv_test_utils::slt::run_slt_file_with_factory;
 
 async fn run_single_slt(path: &std::path::Path) -> Result<(), llkv_result::Error> {
     // Delegate to the shared test-utils implementation. Provide a factory
