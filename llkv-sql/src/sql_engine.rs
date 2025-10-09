@@ -5,14 +5,16 @@ use std::sync::{Arc, Mutex};
 use crate::SqlResult;
 use crate::SqlValue;
 
+use arrow::array::{Array, ArrayRef, Int64Array, Int64Builder};
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 
 use llkv_dsl::TransactionKind;
 use llkv_dsl::{
-    AggregateExpr, ColumnAssignment, ColumnSpec, CreateTablePlan, CreateTableSource, DslContext,
-    DslValue, InsertPlan, InsertSource, OrderByPlan, OrderSortType, OrderTarget, SelectExecution,
-    SelectPlan, SelectProjection, StatementResult, UpdatePlan, extract_rows_from_range,
+    AggregateExpr, AggregateFunction, ColumnAssignment, ColumnSpec, CreateTablePlan,
+    CreateTableSource, DslContext, DslValue, InsertPlan, InsertSource, OrderByPlan, OrderSortType,
+    OrderTarget, SelectExecution, SelectPlan, SelectProjection, StatementResult, UpdatePlan,
+    extract_rows_from_range,
 };
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
@@ -29,13 +31,29 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::Span;
+
+struct TableDeltaState {
+    seeded_filters: HashSet<String>,
+    exclusion_predicates: Vec<SqlExpr>,
+    exclude_all_rows: bool,
+}
+
+impl TableDeltaState {
+    fn new() -> Self {
+        Self {
+            seeded_filters: HashSet::new(),
+            exclusion_predicates: Vec::new(),
+            exclude_all_rows: false,
+        }
+    }
+}
 
 struct TransactionState {
-    context: Arc<DslContext<MemPager>>,
-    default_nulls_first: bool,
+    staging: Box<SqlEngine<MemPager>>,
     statements: Vec<String>,
     copied_tables: HashSet<String>,
-    new_tables: HashSet<String>,
+    table_deltas: HashMap<String, TableDeltaState>,
 }
 
 pub struct SqlEngine<P>
@@ -72,6 +90,10 @@ where
             default_nulls_first: AtomicBool::new(false),
             transaction: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn context_arc(&self) -> Arc<DslContext<P>> {
+        Arc::clone(&self.context)
     }
 
     pub fn with_context(context: Arc<DslContext<P>>, default_nulls_first: bool) -> Self {
@@ -175,109 +197,296 @@ where
             Error::InvalidArgumentError("no transaction is currently in progress".into())
         })?;
 
-        // Handle connection-scoped statements directly.
         match &statement {
             Statement::Set(set_stmt) => {
                 let result = self.handle_set(set_stmt.clone())?;
-                tx.default_nulls_first = self.default_nulls_first.load(AtomicOrdering::Relaxed);
+                tx.staging.execute(&sql_text)?;
                 return Ok(result);
             }
             Statement::Pragma { name, value, is_eq } => {
                 let result = self.handle_pragma(name.clone(), value.clone(), *is_eq)?;
+                tx.staging.execute(&sql_text)?;
                 return Ok(result);
             }
             _ => {}
         }
 
-        self.prepare_staging_for_statement(tx, &statement)?;
-        let mut results = Self::execute_in_staging(tx, &sql_text)?;
-        if results.len() != 1 {
-            return Err(Error::Internal(
-                "transaction statements must yield exactly one result".into(),
-            ));
-        }
-        let overlay_result = results.remove(0);
-
-        if Self::is_mutating_statement(&statement) {
-            tx.statements.push(sql_text);
-        }
-
-        Self::convert_statement_result(overlay_result)
-    }
-
-    fn execute_in_staging(
-        tx: &TransactionState,
-        sql: &str,
-    ) -> SqlResult<Vec<StatementResult<MemPager>>> {
-        let engine = SqlEngine::with_context(Arc::clone(&tx.context), tx.default_nulls_first);
-        engine.execute(sql)
-    }
-
-    fn prepare_staging_for_statement(
-        &self,
-        tx: &mut TransactionState,
-        statement: &Statement,
-    ) -> SqlResult<()> {
         match statement {
-            Statement::CreateTable(create) => {
-                let name = Self::object_name_to_string(&create.name)?;
-                tx.new_tables.insert(name);
-                Ok(())
+            Statement::Query(query) => {
+                let tables = Self::tables_in_query(&query)?;
+                for table in &tables {
+                    self.ensure_table_in_delta(tx, table)?;
+                }
+
+                let aggregate_specs = if let SetExpr::Select(select) = query.body.as_ref() {
+                    self.detect_simple_aggregates(&select.projection)?
+                } else {
+                    None
+                };
+
+                let mut base_query = *query.clone();
+                let skip_base = Self::apply_transaction_filters(tx, &mut base_query)?;
+                let base_result = if skip_base {
+                    None
+                } else {
+                    match self.handle_query(base_query) {
+                        Ok(result) => Some(result),
+                        Err(Error::NotFound) => None,
+                        Err(err) => return Err(err),
+                    }
+                };
+                let mut delta_results = tx.staging.execute(&sql_text)?;
+                if delta_results.len() != 1 {
+                    return Err(Error::Internal(
+                        "transaction statements must yield exactly one result".into(),
+                    ));
+                }
+                let delta_raw = delta_results.remove(0);
+                let delta_converted = Self::convert_statement_result(delta_raw)?;
+                Self::merge_select_results(base_result, delta_converted, aggregate_specs)
             }
             Statement::Insert(insert) => {
-                if let Some(table) = Self::table_object_to_name(&insert.table)? {
-                    if !tx.new_tables.contains(&table) {
-                        self.ensure_table_in_staging(tx, &table)?;
+                let table_name = Self::table_name_from_insert(&insert)?;
+                self.ensure_table_in_delta(tx, &table_name)?;
+                let mut delta_results = match tx.staging.execute(&sql_text) {
+                    Ok(results) => results,
+                    Err(err) => {
+                        println!("delta insert error: {err:?}");
+                        return Err(err);
                     }
+                };
+                if delta_results.len() != 1 {
+                    return Err(Error::Internal(
+                        "transaction statements must yield exactly one result".into(),
+                    ));
                 }
-                Ok(())
+                let delta_raw = delta_results.remove(0);
+                tx.statements.push(sql_text);
+                Self::convert_statement_result(delta_raw)
             }
-            Statement::Update { table, .. } => {
-                if let Some(name) = Self::table_with_joins_name(table)? {
-                    if !tx.new_tables.contains(&name) {
-                        self.ensure_table_in_staging(tx, &name)?;
+            Statement::Update {
+                table, selection, ..
+            } => {
+                if let Some(name) = Self::table_name_from_update(&table)? {
+                    self.ensure_table_in_delta(tx, &name)?;
+                    self.seed_rows_for_update(tx, &name, selection.as_ref())?;
+                }
+                let mut delta_results = match tx.staging.execute(&sql_text) {
+                    Ok(results) => results,
+                    Err(err) => {
+                        println!("delta update error: {err:?}");
+                        return Err(err);
                     }
+                };
+                if delta_results.len() != 1 {
+                    return Err(Error::Internal(
+                        "transaction statements must yield exactly one result".into(),
+                    ));
                 }
-                Ok(())
+                let delta_raw = delta_results.remove(0);
+                if let Some(name) = Self::table_name_from_update(&table)? {
+                    Self::record_update_exclusion(tx, &name, selection.as_ref());
+                }
+                tx.statements.push(sql_text);
+                Self::convert_statement_result(delta_raw)
             }
-            Statement::Query(query) => {
-                for table in Self::tables_in_query(query)? {
-                    if !tx.new_tables.contains(&table) {
-                        self.ensure_table_in_staging(tx, &table)?;
+            other => {
+                let mut delta_results = match tx.staging.execute(&sql_text) {
+                    Ok(results) => results,
+                    Err(err) => {
+                        println!("delta misc error: {err:?}");
+                        return Err(err);
                     }
+                };
+                if delta_results.len() != 1 {
+                    return Err(Error::Internal(
+                        "transaction statements must yield exactly one result".into(),
+                    ));
                 }
-                Ok(())
+                let delta_raw = delta_results.remove(0);
+                if Self::is_mutating_statement(&other) {
+                    tx.statements.push(sql_text);
+                }
+                Self::convert_statement_result(delta_raw)
             }
-            _ => Ok(()),
         }
     }
 
-    fn ensure_table_in_staging(
-        &self,
-        tx: &mut TransactionState,
-        table_name: &str,
-    ) -> SqlResult<()> {
+    fn ensure_table_in_delta(&self, tx: &mut TransactionState, table_name: &str) -> SqlResult<()> {
         if tx.copied_tables.contains(table_name) {
             return Ok(());
         }
 
         let specs = self.context.table_column_specs(table_name)?;
         let mut plan = CreateTablePlan::new(table_name.to_string());
+        plan.if_not_exists = true;
         plan.columns = specs;
-        tx.context.create_table_plan(plan)?;
-
-        let batch = self.context.export_table_rows(table_name)?;
-        if !batch.rows.is_empty() {
-            let insert_plan = InsertPlan {
-                table: table_name.to_string(),
-                columns: batch.columns,
-                source: InsertSource::Rows(batch.rows),
-            };
-            tx.context.insert(insert_plan)?;
-        }
+        tx.staging.context_arc().create_table_plan(plan)?;
 
         tx.copied_tables.insert(table_name.to_string());
         Ok(())
+    }
+
+    fn seed_rows_for_update(
+        &self,
+        tx: &mut TransactionState,
+        table_name: &str,
+        selection: Option<&SqlExpr>,
+    ) -> SqlResult<()> {
+        let filter_key = selection
+            .map(|expr| expr.to_string())
+            .unwrap_or_else(|| "__all__".to_string());
+
+        if tx
+            .table_deltas
+            .get(table_name)
+            .map(|delta| delta.seeded_filters.contains(&filter_key))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        self.ensure_table_in_delta(tx, table_name)?;
+
+        let mut select_sql = format!("SELECT * FROM {table_name}");
+        if let Some(expr) = selection {
+            select_sql.push_str(" WHERE ");
+            select_sql.push_str(&expr.to_string());
+        }
+
+        let mut statements = Parser::parse_sql(&GenericDialect {}, &select_sql).map_err(|err| {
+            Error::InvalidArgumentError(format!(
+                "failed to build seed query for transaction update: {err}"
+            ))
+        })?;
+        if statements.len() != 1 {
+            return Err(Error::Internal(
+                "unexpected statement count when seeding transaction rows".into(),
+            ));
+        }
+        let statement = statements.remove(0);
+        let Statement::Query(query) = statement else {
+            return Err(Error::Internal(
+                "expected SELECT statement when seeding transaction rows".into(),
+            ));
+        };
+
+        let select_result = self.handle_query(*query)?;
+        let (schema, execution) = match select_result {
+            StatementResult::Select {
+                schema, execution, ..
+            } => (schema, execution),
+            other => {
+                return Err(Error::Internal(format!(
+                    "seeding update rows expected SELECT result, found {other:?}"
+                )));
+            }
+        };
+
+        let rows = execution.into_rows()?;
+        {
+            let delta = tx
+                .table_deltas
+                .entry(table_name.to_string())
+                .or_insert_with(TableDeltaState::new);
+            delta.seeded_filters.insert(filter_key.clone());
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let columns: Vec<String> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect();
+        let plan = InsertPlan {
+            table: table_name.to_string(),
+            columns,
+            source: InsertSource::Rows(rows),
+        };
+        tx.staging.context_arc().insert(plan).map(|_| ())
+    }
+
+    fn record_update_exclusion(
+        tx: &mut TransactionState,
+        table_name: &str,
+        selection: Option<&SqlExpr>,
+    ) {
+        let delta = tx
+            .table_deltas
+            .entry(table_name.to_string())
+            .or_insert_with(TableDeltaState::new);
+        match selection {
+            Some(expr) => {
+                if !delta.exclude_all_rows {
+                    delta.exclusion_predicates.push(expr.clone());
+                }
+            }
+            None => {
+                delta.exclude_all_rows = true;
+                delta.exclusion_predicates.clear();
+            }
+        }
+    }
+
+    fn apply_transaction_filters(tx: &TransactionState, query: &mut Query) -> SqlResult<bool> {
+        let set_expr = query.body.as_mut();
+        let SetExpr::Select(select) = set_expr else {
+            return Ok(false);
+        };
+
+        if select.from.is_empty() {
+            return Ok(false);
+        }
+
+        let Ok((table_name, _)) = extract_single_table(&select.from) else {
+            return Ok(false);
+        };
+        let Some(delta) = tx.table_deltas.get(&table_name) else {
+            return Ok(false);
+        };
+
+        if delta.exclude_all_rows {
+            return Ok(true);
+        }
+
+        if delta.exclusion_predicates.is_empty() {
+            return Ok(false);
+        }
+
+        let mut combined: Option<SqlExpr> = None;
+        for predicate in &delta.exclusion_predicates {
+            let not_expr = SqlExpr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr: Box::new(predicate.clone()),
+            };
+            combined = Some(match combined {
+                Some(existing) => SqlExpr::BinaryOp {
+                    left: Box::new(existing),
+                    op: BinaryOperator::And,
+                    right: Box::new(not_expr),
+                },
+                None => not_expr,
+            });
+        }
+
+        if let Some(extra_filter) = combined {
+            let merged = Self::combine_with_and(select.selection.take(), extra_filter);
+            select.selection = Some(merged);
+        }
+        Ok(false)
+    }
+
+    fn combine_with_and(existing: Option<SqlExpr>, new_expr: SqlExpr) -> SqlExpr {
+        match existing {
+            Some(expr) => SqlExpr::BinaryOp {
+                left: Box::new(expr),
+                op: BinaryOperator::And,
+                right: Box::new(new_expr),
+            },
+            None => new_expr,
+        }
     }
 
     fn is_mutating_statement(statement: &Statement) -> bool {
@@ -337,6 +546,195 @@ where
             }
             StatementResult::Transaction { kind } => Ok(StatementResult::Transaction { kind }),
         }
+    }
+
+    fn merge_select_results(
+        base: Option<StatementResult<P>>,
+        delta: StatementResult<P>,
+        aggregates: Option<Vec<AggregateExpr>>,
+    ) -> SqlResult<StatementResult<P>> {
+        let (delta_table_name, delta_schema, delta_execution) = match delta {
+            StatementResult::Select {
+                table_name,
+                schema,
+                execution,
+            } => (table_name, schema, execution),
+            other => {
+                return Err(Error::Internal(format!(
+                    "expected SELECT result from transaction delta, found {other:?}"
+                )));
+            }
+        };
+
+        let (base_table_name_opt, base_schema_opt, base_batches) = match base {
+            Some(StatementResult::Select {
+                table_name,
+                schema,
+                execution,
+            }) => {
+                let batches = execution.collect()?;
+                (Some(table_name), Some(schema), batches)
+            }
+            Some(other) => {
+                return Err(Error::Internal(format!(
+                    "expected SELECT result from base context, found {other:?}"
+                )));
+            }
+            None => (None, None, Vec::new()),
+        };
+
+        let delta_batches = delta_execution.collect()?;
+
+        if let Some(base_schema) = &base_schema_opt {
+            if base_schema.fields().len() != delta_schema.fields().len() {
+                return Err(Error::Internal(
+                    "mismatched schemas when merging transaction select results".into(),
+                ));
+            }
+        }
+
+        if let Some(base_table_name) = &base_table_name_opt {
+            if base_table_name != &delta_table_name {
+                return Err(Error::Internal(
+                    "mismatched table names when merging transaction select results".into(),
+                ));
+            }
+        }
+
+        if let Some(specs) = aggregates.clone() {
+            if !specs.is_empty() {
+                let schema = base_schema_opt
+                    .clone()
+                    .unwrap_or_else(|| Arc::clone(&delta_schema));
+                let mut columns: Vec<ArrayRef> = Vec::with_capacity(specs.len());
+
+                for (idx, spec) in specs.iter().enumerate() {
+                    let base_value = Self::extract_aggregate_value(&base_batches, idx)?;
+                    let delta_value = Self::extract_aggregate_value(&delta_batches, idx)?;
+                    let combined = match spec {
+                        AggregateExpr::CountStar { .. } => {
+                            Some(base_value.unwrap_or(0) + delta_value.unwrap_or(0))
+                        }
+                        AggregateExpr::Column { function, .. } => match function {
+                            AggregateFunction::Count | AggregateFunction::CountNulls => {
+                                Some(base_value.unwrap_or(0) + delta_value.unwrap_or(0))
+                            }
+                            AggregateFunction::SumInt64 => {
+                                if base_value.is_none() && delta_value.is_none() {
+                                    None
+                                } else {
+                                    Some(base_value.unwrap_or(0) + delta_value.unwrap_or(0))
+                                }
+                            }
+                            AggregateFunction::MinInt64 => match (base_value, delta_value) {
+                                (Some(b), Some(d)) => Some(std::cmp::min(b, d)),
+                                (Some(b), None) => Some(b),
+                                (None, Some(d)) => Some(d),
+                                (None, None) => None,
+                            },
+                            AggregateFunction::MaxInt64 => match (base_value, delta_value) {
+                                (Some(b), Some(d)) => Some(std::cmp::max(b, d)),
+                                (Some(b), None) => Some(b),
+                                (None, Some(d)) => Some(d),
+                                (None, None) => None,
+                            },
+                        },
+                    };
+
+                    let mut builder = Int64Builder::with_capacity(1);
+                    if let Some(value) = combined {
+                        builder.append_value(value);
+                    } else {
+                        builder.append_null();
+                    }
+                    columns.push(Arc::new(builder.finish()) as ArrayRef);
+                }
+
+                let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(|err| {
+                    Error::Internal(format!("failed to build merged aggregate batch: {err}"))
+                })?;
+                let execution = SelectExecution::from_batch(
+                    delta_table_name.clone(),
+                    Arc::clone(&schema),
+                    batch,
+                );
+                return Ok(StatementResult::Select {
+                    table_name: delta_table_name,
+                    schema,
+                    execution,
+                });
+            }
+        }
+
+        let mut all_batches: Vec<RecordBatch> = Vec::new();
+        all_batches.extend(base_batches);
+        all_batches.extend(delta_batches);
+
+        let schema = base_schema_opt
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&delta_schema));
+        let combined = if all_batches.is_empty() {
+            RecordBatch::new_empty(Arc::clone(&schema))
+        } else if all_batches.len() == 1 {
+            all_batches.remove(0)
+        } else {
+            let refs: Vec<&RecordBatch> = all_batches.iter().collect();
+            concat_batches(&schema, refs).map_err(|err| {
+                Error::Internal(format!("failed to merge transaction select batches: {err}"))
+            })?
+        };
+
+        let execution =
+            SelectExecution::from_batch(delta_table_name.clone(), Arc::clone(&schema), combined);
+        Ok(StatementResult::Select {
+            table_name: delta_table_name,
+            schema,
+            execution,
+        })
+    }
+
+    fn extract_aggregate_value(
+        batches: &[RecordBatch],
+        column_idx: usize,
+    ) -> SqlResult<Option<i64>> {
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let array = batch
+                .column(column_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    Error::Internal("aggregate output column is not INT64 as expected".into())
+                })?;
+            if array.len() == 0 {
+                continue;
+            }
+            if array.is_null(0) {
+                return Ok(None);
+            }
+            return Ok(Some(array.value(0)));
+        }
+        Ok(None)
+    }
+
+    fn table_name_from_insert(insert: &sqlparser::ast::Insert) -> SqlResult<String> {
+        match &insert.table {
+            TableObject::TableName(name) => Self::object_name_to_string(name),
+            _ => Err(Error::InvalidArgumentError(
+                "INSERT requires a plain table name".into(),
+            )),
+        }
+    }
+
+    fn table_name_from_update(table: &TableWithJoins) -> SqlResult<Option<String>> {
+        if !table.joins.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "UPDATE with JOIN targets is not supported yet".into(),
+            ));
+        }
+        Self::table_with_joins_name(table)
     }
 
     fn object_name_to_string(name: &ObjectName) -> SqlResult<String> {
@@ -1054,15 +1452,12 @@ where
             ));
         }
 
-        let staging_pager = Arc::new(MemPager::default());
-        let staging_context = Arc::new(DslContext::new(staging_pager));
-        let default_nulls_first = self.default_nulls_first.load(AtomicOrdering::Relaxed);
+        let staging_engine = SqlEngine::new(Arc::new(MemPager::default()));
         let state = TransactionState {
-            context: staging_context,
-            default_nulls_first,
+            staging: Box::new(staging_engine),
             statements: Vec::new(),
             copied_tables: HashSet::new(),
-            new_tables: HashSet::new(),
+            table_deltas: HashMap::new(),
         };
 
         *guard = Some(state);

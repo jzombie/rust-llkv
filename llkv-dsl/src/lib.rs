@@ -1337,7 +1337,7 @@ where
         }
 
         let mut error: Option<Error> = None;
-        table
+        match table
             .table
             .scan_stream(projections, &filter_expr, options, |batch| {
                 if error.is_some() {
@@ -1349,7 +1349,14 @@ where
                         return;
                     }
                 }
-            })?;
+            }) {
+            Ok(()) => {}
+            Err(llkv_result::Error::NotFound) => {
+                // Treat missing storage keys as an empty result set. This occurs
+                // for freshly created tables that have no persisted chunks yet.
+            }
+            Err(err) => return Err(err),
+        }
         if let Some(err) = error {
             return Err(err);
         }
