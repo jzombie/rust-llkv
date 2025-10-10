@@ -203,9 +203,14 @@ where
             }
         };
 
+        // Build projections and track which projection index each spec uses
         let mut projections = Vec::new();
+        let mut spec_to_projection: Vec<Option<usize>> = Vec::with_capacity(specs.len());
+
         for spec in &specs {
             if let Some(field_id) = spec.kind.field_id() {
+                let proj_idx = projections.len();
+                spec_to_projection.push(Some(proj_idx));
                 projections.push(ScanProjection::from(StoreProjection::with_alias(
                     LogicalFieldId::for_user(table.table.table_id(), field_id),
                     table
@@ -214,6 +219,8 @@ where
                         .map(|c| c.name.clone())
                         .unwrap_or_else(|| format!("col{field_id}")),
                 )));
+            } else {
+                spec_to_projection.push(None);
             }
         }
 
@@ -250,12 +257,12 @@ where
             count_star_override = Some(total_rows as i64);
         }
 
-        for spec in &specs {
+        for (idx, spec) in specs.iter().enumerate() {
             states.push(AggregateState {
                 alias: spec.alias.clone(),
-                accumulator: AggregateAccumulator::new(
-                    table.schema.as_ref(),
+                accumulator: AggregateAccumulator::new_with_projection_index(
                     spec,
+                    spec_to_projection[idx],
                     count_star_override,
                 )?,
                 override_value: match spec.kind {
@@ -615,6 +622,72 @@ enum AggregateAccumulator {
 }
 
 impl AggregateAccumulator {
+    /// Create accumulator using projection index (position in the batch columns)
+    /// instead of table schema position. projection_idx is None for CountStar.
+    fn new_with_projection_index(
+        spec: &AggregateSpec,
+        projection_idx: Option<usize>,
+        total_rows_hint: Option<i64>,
+    ) -> DslResult<Self> {
+        match spec.kind {
+            AggregateKind::CountStar => Ok(AggregateAccumulator::CountStar { value: 0 }),
+            AggregateKind::CountField { .. } => {
+                let idx = projection_idx.ok_or_else(|| {
+                    Error::Internal("CountField aggregate requires projection index".into())
+                })?;
+                Ok(AggregateAccumulator::CountColumn {
+                    column_index: idx,
+                    value: 0,
+                })
+            }
+            AggregateKind::SumInt64 { .. } => {
+                let idx = projection_idx.ok_or_else(|| {
+                    Error::Internal("SumInt64 aggregate requires projection index".into())
+                })?;
+                Ok(AggregateAccumulator::SumInt64 {
+                    column_index: idx,
+                    value: 0,
+                    saw_value: false,
+                })
+            }
+            AggregateKind::MinInt64 { .. } => {
+                let idx = projection_idx.ok_or_else(|| {
+                    Error::Internal("MinInt64 aggregate requires projection index".into())
+                })?;
+                Ok(AggregateAccumulator::MinInt64 {
+                    column_index: idx,
+                    value: None,
+                })
+            }
+            AggregateKind::MaxInt64 { .. } => {
+                let idx = projection_idx.ok_or_else(|| {
+                    Error::Internal("MaxInt64 aggregate requires projection index".into())
+                })?;
+                Ok(AggregateAccumulator::MaxInt64 {
+                    column_index: idx,
+                    value: None,
+                })
+            }
+            AggregateKind::CountNulls { .. } => {
+                let idx = projection_idx.ok_or_else(|| {
+                    Error::Internal("CountNulls aggregate requires projection index".into())
+                })?;
+                let total_rows = total_rows_hint.ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "SUM(CASE WHEN ... IS NULL ...) with WHERE clauses is not supported yet"
+                            .into(),
+                    )
+                })?;
+                Ok(AggregateAccumulator::CountNulls {
+                    column_index: idx,
+                    non_null_rows: 0,
+                    total_rows,
+                })
+            }
+        }
+    }
+
+    #[allow(dead_code)]
     fn new(
         schema: &DslSchema,
         spec: &AggregateSpec,

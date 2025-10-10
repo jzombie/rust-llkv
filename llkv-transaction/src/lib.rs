@@ -842,12 +842,20 @@ where
 {
     fn drop(&mut self) {
         // Auto-rollback on drop if transaction is active
-        let mut guard = self
-            .transactions
-            .lock()
-            .expect("transactions lock poisoned");
-        if guard.remove(&self.session_id).is_some() {
-            eprintln!("Warning: DslSession dropped with active transaction - auto-rolling back");
+        // Handle poisoned mutex gracefully to avoid panic during cleanup
+        match self.transactions.lock() {
+            Ok(mut guard) => {
+                if guard.remove(&self.session_id).is_some() {
+                    eprintln!(
+                        "Warning: DslSession dropped with active transaction - auto-rolling back"
+                    );
+                }
+            }
+            Err(_) => {
+                // Mutex is poisoned, likely due to a panic elsewhere
+                // Don't panic again during cleanup
+                eprintln!("Warning: DslSession dropped with poisoned transaction mutex");
+            }
         }
     }
 }

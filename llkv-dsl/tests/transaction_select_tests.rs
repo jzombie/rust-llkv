@@ -78,7 +78,6 @@ fn test_dsl_transaction_select() {
 }
 
 #[test]
-#[ignore] // TODO: Fix aggregate issue
 fn test_dsl_transaction_select_with_aggregates() {
     let pager = Arc::new(MemPager::default());
     let ctx = Arc::new(DslContext::new(pager));
