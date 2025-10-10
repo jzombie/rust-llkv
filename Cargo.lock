@@ -1174,6 +1174,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd945864f07fe9f5371a27ad7b52a172b4b499999f1d97574c9fa68373937e12"
 
 [[package]]
+name = "llkv-aggregate"
+version = "0.2.0-alpha"
+dependencies = [
+ "arrow",
+ "llkv-result",
+ "llkv-table",
+]
+
+[[package]]
 name = "llkv-column-map"
 version = "0.2.0-alpha"
 dependencies = [
@@ -1217,12 +1226,32 @@ version = "0.2.0-alpha"
 dependencies = [
  "arrow",
  "llkv-column-map",
+ "llkv-executor",
  "llkv-expr",
+ "llkv-plan",
+ "llkv-result",
+ "llkv-storage",
+ "llkv-table",
+ "llkv-transaction",
+ "simd-r-drive-entry-handle",
+ "sqlparser",
+ "time",
+ "tracing",
+]
+
+[[package]]
+name = "llkv-executor"
+version = "0.2.0-alpha"
+dependencies = [
+ "arrow",
+ "llkv-aggregate",
+ "llkv-column-map",
+ "llkv-expr",
+ "llkv-plan",
  "llkv-result",
  "llkv-storage",
  "llkv-table",
  "simd-r-drive-entry-handle",
- "sqlparser",
  "time",
  "tracing",
 ]
@@ -1258,6 +1287,9 @@ dependencies = [
 name = "llkv-plan"
 version = "0.2.0-alpha"
 dependencies = [
+ "arrow",
+ "llkv-expr",
+ "llkv-result",
  "llkv-test-utils",
  "serde",
  "serde_json",
@@ -1282,10 +1314,12 @@ dependencies = [
  "llkv-column-map",
  "llkv-dsl",
  "llkv-expr",
+ "llkv-plan",
  "llkv-result",
  "llkv-storage",
  "llkv-table",
  "llkv-test-utils",
+ "llkv-transaction",
  "simd-r-drive-entry-handle",
  "sqllogictest",
  "sqlparser",
@@ -1345,6 +1379,22 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "llkv-transaction"
+version = "0.2.0-alpha"
+dependencies = [
+ "arrow",
+ "llkv-column-map",
+ "llkv-executor",
+ "llkv-expr",
+ "llkv-plan",
+ "llkv-result",
+ "llkv-storage",
+ "llkv-table",
+ "rustc-hash",
+ "simd-r-drive-entry-handle",
 ]
 
 [[package]]
@@ -2737,11 +2787,3 @@ dependencies = [
  "quote",
  "syn",
 ]
-
-[[patch.unused]]
-name = "simd-r-drive"
-version = "0.14.0-alpha"
-
-[[patch.unused]]
-name = "simd-r-drive-entry-handle"
-version = "0.14.0-alpha"

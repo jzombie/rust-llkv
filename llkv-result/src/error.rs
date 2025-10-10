@@ -15,6 +15,9 @@ pub enum Error {
     #[error("Storage key not found")]
     NotFound,
 
+    #[error("{0}")]
+    CatalogError(String),
+
     #[error("An internal operation failed: {0}")]
     Internal(String),
 

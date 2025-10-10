@@ -18,8 +18,9 @@ where
         .map_err(|e| llkv_result::Error::Internal(format!("failed to read slt file: {}", e)))?;
     let raw_lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let (expanded_lines, mapping) = expand_loops_with_mapping(&raw_lines, 0)?;
+    let (normalized_lines, mapping) = normalize_inline_connections(expanded_lines, mapping);
 
-    let expanded_text = expanded_lines.join("\n");
+    let expanded_text = normalized_lines.join("\n");
     let mut named = tempfile::NamedTempFile::new().map_err(|e| {
         llkv_result::Error::Internal(format!("failed to create temp slt file: {}", e))
     })?;
@@ -36,7 +37,7 @@ where
     });
     if let Err(e) = runner.run_file_async(&tmp).await {
         let (mapped, opt_orig_line) =
-            map_temp_error_message(&format!("{}", e), &tmp, &expanded_lines, &mapping, path);
+            map_temp_error_message(&format!("{}", e), &tmp, &normalized_lines, &mapping, path);
         if let Some(orig_line) = opt_orig_line
             && let Ok(text) = std::fs::read_to_string(path)
             && let Some(line) = text.lines().nth(orig_line - 1)
@@ -62,12 +63,15 @@ where
 /// Discover `.slt` files under the given directory and run them as
 /// libtest_mimic trials using the provided AsyncDB factory constructor.
 ///
-/// The `factory` closure should return a future that constructs a new DB
-/// instance for each trial. This keeps the harness engine-agnostic so
-/// different crates can provide their own engine adapters.
-pub fn run_slt_harness<F, Fut, D, E>(slt_dir: &str, factory: F)
+/// The `factory_factory` closure is called once per test file and should return
+/// a factory closure that creates DB instances. This allows each test file to
+/// have isolated state while enabling multiple connections within a test to
+/// share state. This keeps the harness engine-agnostic so different crates
+/// can provide their own engine adapters.
+pub fn run_slt_harness<FF, F, Fut, D, E>(slt_dir: &str, factory_factory: FF)
 where
-    F: Fn() -> Fut + Send + Sync + 'static + Clone,
+    FF: Fn() -> F + Send + Sync + 'static + Clone,
+    F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<D, E>> + Send + 'static,
     D: AsyncDB<Error = llkv_result::Error, ColumnType = DefaultColumnType> + Send + 'static,
     E: std::fmt::Debug + Send + 'static,
@@ -107,10 +111,11 @@ where
             .trim_start_matches('/')
             .to_string();
         let path_clone = f.clone();
-        let factory_clone = factory.clone();
+        let factory_factory_clone = factory_factory.clone();
         trials.push(Trial::test(name, move || {
             let p = path_clone.clone();
-            let fac = factory_clone.clone();
+            // Call the factory_factory to get a fresh factory for this test file
+            let fac = factory_factory_clone();
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -185,6 +190,166 @@ pub fn expand_loops_with_mapping(
         }
     }
     Ok((out_lines, out_map))
+}
+
+/// Convert legacy sqllogictest inline connection syntax (e.g. `statement ok con1`)
+/// into explicit `connection` records so the upstream parser can understand them.
+/// Also ensures proper termination of statement error blocks by adding a blank line
+/// after ---- when there's no expected error pattern.
+fn normalize_inline_connections(
+    lines: Vec<String>,
+    mapping: Vec<usize>,
+) -> (Vec<String>, Vec<usize>) {
+    fn is_connection_token(token: &str) -> bool {
+        token
+            .strip_prefix("con")
+            .map(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
+            .unwrap_or(false)
+    }
+
+    let mut out_lines = Vec::with_capacity(lines.len());
+    let mut out_map = Vec::with_capacity(mapping.len());
+
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = &lines[i];
+        let orig = mapping[i];
+        let trimmed = line.trim_start();
+
+        // Handle connection syntax normalization
+        if trimmed.starts_with("statement ") || trimmed.starts_with("query ") {
+            let mut tokens: Vec<&str> = trimmed.split_whitespace().collect();
+            if tokens.len() >= 3 && tokens.last().is_some_and(|last| is_connection_token(last)) {
+                let conn = tokens.pop().unwrap();
+                let indent_len = line.len() - trimmed.len();
+                let indent = &line[..indent_len];
+
+                out_lines.push(format!("{indent}connection {conn}"));
+                out_map.push(orig);
+
+                let normalized = format!("{indent}{}", tokens.join(" "));
+                let normalized_trimmed = normalized.trim_start();
+
+                // Check if this is a statement error that needs special handling
+                if normalized_trimmed.starts_with("statement error") {
+                    out_lines.push(normalized.clone());
+                    out_map.push(orig);
+                    i += 1;
+
+                    // Collect the SQL statement lines until we hit ----
+                    let mut sql_lines = Vec::new();
+                    while i < lines.len() {
+                        let next_line = &lines[i];
+                        let next_trimmed = next_line.trim_start();
+
+                        if next_trimmed == "----" {
+                            // Found the delimiter - now check what follows
+                            i += 1;
+
+                            let has_expected_pattern = if i < lines.len() {
+                                let following = lines[i].trim();
+                                !following.is_empty() && following.starts_with("<REGEX>:")
+                            } else {
+                                false
+                            };
+
+                            if has_expected_pattern {
+                                // OMIT the ---- and output the expected pattern line directly
+                                for sql_line in sql_lines {
+                                    out_lines.push(sql_line);
+                                    out_map.push(orig);
+                                }
+                                // Output the expected pattern line WITHOUT the ---- delimiter
+                                out_lines.push(lines[i].clone());
+                                out_map.push(mapping[i]);
+                                i += 1; // Move past the expected pattern line
+                            } else {
+                                // No expected pattern - omit the ---- delimiter entirely
+                                for sql_line in sql_lines {
+                                    out_lines.push(sql_line);
+                                    out_map.push(orig);
+                                }
+                                // Add a blank line to ensure proper termination
+                                out_lines.push(String::new());
+                                out_map.push(mapping[i - 1]);
+                            }
+                            break;
+                        } else {
+                            sql_lines.push(next_line.clone());
+                            i += 1;
+                        }
+                    }
+                    continue;
+                } else {
+                    // Not a statement error, just output the normalized line
+                    out_lines.push(normalized);
+                    out_map.push(orig);
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
+        // Check if this is a statement error (without inline connection) followed by ----
+        if trimmed.starts_with("statement error") {
+            out_lines.push(line.clone());
+            out_map.push(orig);
+            i += 1;
+
+            // Collect the SQL statement lines until we hit ----
+            let mut sql_lines = Vec::new();
+            while i < lines.len() {
+                let next_line = &lines[i];
+                let next_trimmed = next_line.trim_start();
+
+                if next_trimmed == "----" {
+                    // Found the delimiter - now check what follows
+                    i += 1;
+
+                    let has_expected_pattern = if i < lines.len() {
+                        let following = lines[i].trim();
+                        !following.is_empty() && following.starts_with("<REGEX>:")
+                    } else {
+                        false
+                    };
+
+                    if has_expected_pattern {
+                        // OMIT the ---- and output the expected pattern line directly
+                        for sql_line in sql_lines {
+                            out_lines.push(sql_line);
+                            out_map.push(orig); // Use same orig for SQL lines
+                        }
+                        // Output the expected pattern line WITHOUT the ---- delimiter
+                        out_lines.push(lines[i].clone());
+                        out_map.push(mapping[i]);
+                        i += 1; // Move past the expected pattern line
+                    // The blank line terminating the error pattern should already be in the input
+                    } else {
+                        // No expected pattern - omit the ---- delimiter entirely
+                        for sql_line in sql_lines {
+                            out_lines.push(sql_line);
+                            out_map.push(orig); // Use same orig for SQL lines
+                        }
+                        // Add a blank line to ensure proper termination
+                        out_lines.push(String::new());
+                        out_map.push(mapping[i - 1]);
+                    }
+                    break;
+                } else {
+                    // Part of the SQL statement
+                    sql_lines.push(next_line.clone());
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        out_lines.push(line.clone());
+        out_map.push(orig);
+        i += 1;
+    }
+
+    (out_lines, out_map)
 }
 
 /// Map a temporary expanded-file error message back to the original file path

@@ -2,27 +2,26 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::mem;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
-    Array, ArrayRef, Date32Array, Date32Builder, Float64Array, Float64Builder, Int64Array,
-    Int64Builder, StringArray, StringBuilder, UInt64Array, UInt64Builder, new_null_array,
+    ArrayRef, Date32Builder, Float64Builder, Int64Builder, StringBuilder, UInt64Array,
+    UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
-use llkv_column_map::store::{Projection as StoreProjection, ROW_ID_COLUMN_NAME};
+use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
-use llkv_expr::literal::Literal;
+// Literal is not used at top-level; keep it out to avoid unused import warnings.
 use llkv_result::Error;
-use llkv_storage::pager::Pager;
-use llkv_table::table::{
-    ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
-};
+use llkv_storage::pager::{MemPager, Pager};
+use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, TableId};
 use llkv_table::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -35,6 +34,32 @@ use time::{Date, Month};
 
 pub type DslResult<T> = llkv_result::Result<T>;
 
+// Re-export plan structures from llkv-plan
+pub use llkv_plan::{
+    AggregateExpr, AggregateFunction, AssignmentValue, ColumnAssignment, ColumnNullability,
+    ColumnSpec, CreateTablePlan, CreateTableSource, DeletePlan, DslOperation, InsertPlan,
+    InsertSource, IntoColumnSpec, NotNull, Nullable, OrderByPlan, OrderSortType, OrderTarget,
+    PlanValue, SelectPlan, SelectProjection, UpdatePlan,
+};
+
+// Execution structures from llkv-executor
+// Keep DSL-prefixed types private to this crate so they are not exposed as
+// part of the llkv-dsl public API. Publicly re-export only the generic
+// execution APIs that are not DSL-prefixed.
+use llkv_executor::{ExecutorColumn, ExecutorSchema, ExecutorTable};
+pub use llkv_executor::{QueryExecutor, RowBatch, SelectExecution, TableProvider};
+
+// Import transaction structures from llkv-transaction for internal use.
+// NOTE: we intentionally do NOT re-export these types from the DSL crate so
+// non-DSL crates do not get `Dsl*` symbols pulled into their public API.
+use llkv_transaction::{TransactionContext, TransactionKind, TransactionManager};
+
+// Internal low-level transaction session type (from llkv-transaction)
+use llkv_transaction::TransactionSession;
+
+// Note: Session is the high-level wrapper that users should use instead of raw DslSession
+
+// TODO: Rename to `DslStatementResult`
 /// Result of running a DSL statement.
 #[derive(Clone)]
 pub enum StatementResult<P>
@@ -52,6 +77,10 @@ where
     Update {
         table_name: String,
         rows_updated: usize,
+    },
+    Delete {
+        table_name: String,
+        rows_deleted: usize,
     },
     Select {
         table_name: String,
@@ -90,6 +119,14 @@ where
                 .field("table_name", table_name)
                 .field("rows_updated", rows_updated)
                 .finish(),
+            StatementResult::Delete {
+                table_name,
+                rows_deleted,
+            } => f
+                .debug_struct("Delete")
+                .field("table_name", table_name)
+                .field("rows_deleted", rows_deleted)
+                .finish(),
             StatementResult::Select {
                 table_name, schema, ..
             } => f
@@ -104,324 +141,275 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransactionKind {
-    Begin,
-    Commit,
-    Rollback,
-}
-
-/// Value literal used by the DSL.
-#[derive(Clone, Debug, PartialEq)]
-pub enum DslValue {
-    Null,
-    Integer(i64),
-    Float(f64),
-    String(String),
-}
-
-impl From<&str> for DslValue {
-    fn from(value: &str) -> Self {
-        Self::String(value.to_string())
-    }
-}
-
-impl From<String> for DslValue {
-    fn from(value: String) -> Self {
-        Self::String(value)
-    }
-}
-
-impl From<i64> for DslValue {
-    fn from(value: i64) -> Self {
-        Self::Integer(value)
-    }
-}
-
-impl From<f64> for DslValue {
-    fn from(value: f64) -> Self {
-        Self::Float(value)
-    }
-}
-
-impl From<bool> for DslValue {
-    fn from(value: bool) -> Self {
-        if value {
-            Self::Integer(1)
-        } else {
-            Self::Integer(0)
-        }
-    }
-}
-
-/// Specification for creating a table.
-#[derive(Clone, Debug)]
-pub struct CreateTablePlan {
-    pub name: String,
-    pub if_not_exists: bool,
-    pub columns: Vec<ColumnSpec>,
-    pub source: Option<CreateTableSource>,
-}
-
-impl CreateTablePlan {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            if_not_exists: false,
-            columns: Vec::new(),
-            source: None,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ColumnSpec {
-    pub name: String,
-    pub data_type: DataType,
-    pub nullable: bool,
-}
-
-impl ColumnSpec {
-    pub fn new(name: impl Into<String>, data_type: DataType, nullable: bool) -> Self {
-        Self {
-            name: name.into(),
-            data_type,
-            nullable,
-        }
-    }
-}
-
-pub trait IntoColumnSpec {
-    fn into_column_spec(self) -> ColumnSpec;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ColumnNullability {
-    Nullable,
-    NotNull,
-}
-
-impl ColumnNullability {
-    fn is_nullable(self) -> bool {
-        matches!(self, ColumnNullability::Nullable)
-    }
-}
-
-#[allow(non_upper_case_globals)]
-pub const Nullable: ColumnNullability = ColumnNullability::Nullable;
-
-#[allow(non_upper_case_globals)]
-pub const NotNull: ColumnNullability = ColumnNullability::NotNull;
-
-impl IntoColumnSpec for ColumnSpec {
-    fn into_column_spec(self) -> ColumnSpec {
-        self
-    }
-}
-
-impl<T> IntoColumnSpec for &T
+impl<P> StatementResult<P>
 where
-    T: Clone + IntoColumnSpec,
+    P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn into_column_spec(self) -> ColumnSpec {
-        self.clone().into_column_spec()
+    /// Convert a StatementResult from one pager type to another.
+    /// Only works for non-SELECT results (CreateTable, Insert, Update, Delete, NoOp, Transaction).
+    #[allow(dead_code)]
+    pub(crate) fn convert_pager_type<Q>(self) -> DslResult<StatementResult<Q>>
+    where
+        Q: Pager<Blob = EntryHandle> + Send + Sync,
+    {
+        match self {
+            StatementResult::CreateTable { table_name } => {
+                Ok(StatementResult::CreateTable { table_name })
+            }
+            StatementResult::NoOp => Ok(StatementResult::NoOp),
+            StatementResult::Insert {
+                table_name,
+                rows_inserted,
+            } => Ok(StatementResult::Insert {
+                table_name,
+                rows_inserted,
+            }),
+            StatementResult::Update {
+                table_name,
+                rows_updated,
+            } => Ok(StatementResult::Update {
+                table_name,
+                rows_updated,
+            }),
+            StatementResult::Delete {
+                table_name,
+                rows_deleted,
+            } => Ok(StatementResult::Delete {
+                table_name,
+                rows_deleted,
+            }),
+            StatementResult::Transaction { kind } => Ok(StatementResult::Transaction { kind }),
+            StatementResult::Select { .. } => Err(Error::Internal(
+                "Cannot convert SELECT result between pager types in transaction".into(),
+            )),
+        }
     }
 }
 
-impl IntoColumnSpec for (&str, DataType) {
-    fn into_column_spec(self) -> ColumnSpec {
-        ColumnSpec::new(self.0, self.1, true)
+// ============================================================================
+// Plan Structures (now in llkv-plan and re-exported above)
+// ============================================================================
+//
+// The following types are defined in llkv-plan and re-exported:
+// - DslValue, CreateTablePlan, ColumnSpec, IntoColumnSpec
+// - InsertPlan, InsertSource, UpdatePlan, DeletePlan
+// - SelectPlan, SelectProjection, AggregateExpr, AggregateFunction
+// - OrderByPlan, OrderSortType, OrderTarget
+// - DslOperation
+//
+// This separation allows plans to be used independently of execution logic.
+// ============================================================================
+
+// Transaction management is now handled by llkv-transaction crate
+// The DslTransaction and TableDeltaState types are re-exported from there
+
+/// Wrapper for DslContext that implements TransactionContext
+pub struct DslContextWrapper<P>(Arc<DslContext<P>>)
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync;
+
+impl<P> DslContextWrapper<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn new(ctx: Arc<DslContext<P>>) -> Self {
+        Self(ctx)
     }
 }
 
-impl IntoColumnSpec for (&str, DataType, bool) {
-    fn into_column_spec(self) -> ColumnSpec {
-        ColumnSpec::new(self.0, self.1, self.2)
+// TODO: Rename to `DslSession`
+/// A session for executing operations with optional transaction support.
+///
+/// This is a high-level wrapper around the transaction machinery that provides
+/// a clean API for users. Operations can be executed directly or within a transaction.
+pub struct Session<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    // TODO: Allow generic pager type
+    inner: TransactionSession<DslContextWrapper<P>, DslContextWrapper<MemPager>>,
+}
+
+impl<P> Session<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    /// Begin a transaction in this session.
+    /// Creates an isolated staging context automatically.
+    pub fn begin_transaction(&self) -> DslResult<StatementResult<P>> {
+        let staging_pager = Arc::new(MemPager::default());
+        let staging_ctx = Arc::new(DslContext::new(staging_pager));
+        let staging_wrapper = Arc::new(DslContextWrapper::new(staging_ctx));
+
+        self.inner.begin_transaction(staging_wrapper)?;
+        Ok(StatementResult::Transaction {
+            kind: TransactionKind::Begin,
+        })
     }
-}
 
-impl IntoColumnSpec for (&str, DataType, ColumnNullability) {
-    fn into_column_spec(self) -> ColumnSpec {
-        ColumnSpec::new(self.0, self.1, self.2.is_nullable())
+    /// Commit the current transaction and apply changes to the base context.
+    pub fn commit_transaction(&self) -> DslResult<StatementResult<P>> {
+        let (_tx_result, operations) = self.inner.commit_transaction()?;
+
+        // Replay operations on the base context via TransactionContext trait
+        for operation in operations {
+            match operation {
+                DslOperation::CreateTable(plan) => {
+                    TransactionContext::create_table_plan(&**self.inner.context(), plan)?;
+                }
+                DslOperation::Insert(plan) => {
+                    TransactionContext::insert(&**self.inner.context(), plan)?;
+                }
+                DslOperation::Update(plan) => {
+                    TransactionContext::update(&**self.inner.context(), plan)?;
+                }
+                DslOperation::Delete(plan) => {
+                    TransactionContext::delete(&**self.inner.context(), plan)?;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(StatementResult::Transaction {
+            kind: TransactionKind::Commit,
+        })
     }
-}
 
-#[derive(Clone, Debug)]
-pub enum CreateTableSource {
-    Batches {
-        schema: Arc<Schema>,
-        batches: Vec<RecordBatch>,
-    },
-}
+    /// Rollback the current transaction, discarding all changes.
+    pub fn rollback_transaction(&self) -> DslResult<StatementResult<P>> {
+        self.inner.rollback_transaction()?;
+        Ok(StatementResult::Transaction {
+            kind: TransactionKind::Rollback,
+        })
+    }
 
-/// Plan describing an insert operation.
-#[derive(Clone, Debug)]
-pub struct InsertPlan {
-    pub table: String,
-    pub columns: Vec<String>,
-    pub source: InsertSource,
-}
+    /// Check if this session has an active transaction.
+    pub fn has_active_transaction(&self) -> bool {
+        self.inner.has_active_transaction()
+    }
 
-#[derive(Clone, Debug)]
-pub enum InsertSource {
-    Rows(Vec<Vec<DslValue>>),
-    Batches(Vec<RecordBatch>),
-}
-
-/// Plan describing an update operation.
-#[derive(Clone, Debug)]
-pub struct UpdatePlan {
-    pub table: String,
-    pub assignments: Vec<ColumnAssignment>,
-    pub filter: Option<LlkvExpr<'static, String>>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ColumnAssignment {
-    pub column: String,
-    pub value: DslValue,
-}
-
-/// Logical query plan consumed by the DSL execution engine.
-#[derive(Clone, Debug)]
-pub struct SelectPlan {
-    pub table: String,
-    pub projections: Vec<SelectProjection>,
-    pub filter: Option<LlkvExpr<'static, String>>,
-    pub aggregates: Vec<AggregateExpr>,
-    pub order_by: Option<OrderByPlan>,
-}
-
-impl SelectPlan {
-    pub fn new(table: impl Into<String>) -> Self {
-        Self {
-            table: table.into(),
-            projections: Vec::new(),
-            filter: None,
-            aggregates: Vec::new(),
-            order_by: None,
+    /// Create a table (outside or inside transaction).
+    pub fn create_table_plan(&self, plan: CreateTablePlan) -> DslResult<StatementResult<P>> {
+        if self.has_active_transaction() {
+            let table_name = plan.name.clone();
+            self.inner
+                .execute_operation(DslOperation::CreateTable(plan))?;
+            Ok(StatementResult::CreateTable { table_name })
+        } else {
+            // Call via TransactionContext trait
+            let table_name = plan.name.clone();
+            TransactionContext::create_table_plan(&**self.inner.context(), plan)?;
+            Ok(StatementResult::CreateTable { table_name })
         }
     }
 
-    pub fn with_projections(mut self, projections: Vec<SelectProjection>) -> Self {
-        self.projections = projections;
-        self
-    }
-
-    pub fn with_filter(mut self, filter: Option<LlkvExpr<'static, String>>) -> Self {
-        self.filter = filter;
-        self
-    }
-
-    pub fn with_aggregates(mut self, aggregates: Vec<AggregateExpr>) -> Self {
-        self.aggregates = aggregates;
-        self
-    }
-
-    pub fn with_order_by(mut self, order_by: Option<OrderByPlan>) -> Self {
-        self.order_by = order_by;
-        self
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct OrderByPlan {
-    pub target: OrderTarget,
-    pub sort_type: OrderSortType,
-    pub ascending: bool,
-    pub nulls_first: bool,
-}
-
-#[derive(Clone, Debug)]
-pub enum OrderSortType {
-    Native,
-    CastTextToInteger,
-}
-
-#[derive(Clone, Debug)]
-pub enum OrderTarget {
-    Column(String),
-    Index(usize),
-}
-
-#[derive(Clone, Debug)]
-pub enum SelectProjection {
-    AllColumns,
-    Column {
-        name: String,
-        alias: Option<String>,
-    },
-    Computed {
-        expr: ScalarExpr<String>,
-        alias: String,
-    },
-}
-
-#[derive(Clone, Debug)]
-pub enum AggregateExpr {
-    CountStar {
-        alias: String,
-    },
-    Column {
-        column: String,
-        alias: String,
-        function: AggregateFunction,
-    },
-}
-
-#[derive(Clone, Debug)]
-pub enum AggregateFunction {
-    Count,
-    SumInt64,
-    MinInt64,
-    MaxInt64,
-    CountNulls,
-}
-
-impl AggregateExpr {
-    pub fn count_star(alias: impl Into<String>) -> Self {
-        Self::CountStar {
-            alias: alias.into(),
+    /// Insert rows (outside or inside transaction).
+    pub fn insert(&self, plan: InsertPlan) -> DslResult<StatementResult<P>> {
+        if self.has_active_transaction() {
+            let table_name = plan.table.clone();
+            let rows_inserted = match &plan.source {
+                InsertSource::Rows(rows) => rows.len(),
+                _ => 0,
+            };
+            self.inner.execute_operation(DslOperation::Insert(plan))?;
+            Ok(StatementResult::Insert {
+                rows_inserted,
+                table_name,
+            })
+        } else {
+            // Call via TransactionContext trait
+            let table_name = plan.table.clone();
+            let rows_inserted = match &plan.source {
+                InsertSource::Rows(rows) => rows.len(),
+                _ => 0,
+            };
+            TransactionContext::insert(&**self.inner.context(), plan)?;
+            Ok(StatementResult::Insert {
+                rows_inserted,
+                table_name,
+            })
         }
     }
 
-    pub fn count_column(column: impl Into<String>, alias: impl Into<String>) -> Self {
-        Self::Column {
-            column: column.into(),
-            alias: alias.into(),
-            function: AggregateFunction::Count,
+    /// Select rows (outside or inside transaction).
+    pub fn select(&self, plan: SelectPlan) -> DslResult<StatementResult<P>> {
+        if self.has_active_transaction() {
+            let tx_result = self
+                .inner
+                .execute_operation(DslOperation::Select(plan.clone()))?;
+            match tx_result {
+                llkv_transaction::StatementResult::Select {
+                    table_name,
+                    schema,
+                    execution,
+                } => Ok(StatementResult::Select {
+                    execution,
+                    table_name,
+                    schema,
+                }),
+                _ => Err(Error::Internal("expected Select result".into())),
+            }
+        } else {
+            // Call via TransactionContext trait
+            let table_name = plan.table.clone();
+            let execution = TransactionContext::execute_select(&**self.inner.context(), plan)?;
+            let schema = execution.schema();
+            Ok(StatementResult::Select {
+                execution,
+                table_name,
+                schema,
+            })
         }
     }
 
-    pub fn sum_int64(column: impl Into<String>, alias: impl Into<String>) -> Self {
-        Self::Column {
-            column: column.into(),
-            alias: alias.into(),
-            function: AggregateFunction::SumInt64,
+    /// Update rows (outside or inside transaction).
+    pub fn update(&self, plan: UpdatePlan) -> DslResult<StatementResult<P>> {
+        if self.has_active_transaction() {
+            let table_name = plan.table.clone();
+            self.inner.execute_operation(DslOperation::Update(plan))?;
+            Ok(StatementResult::Update {
+                rows_updated: 0, // We don't track this in transactions yet
+                table_name,
+            })
+        } else {
+            // Call via TransactionContext trait
+            let table_name = plan.table.clone();
+            let result = TransactionContext::update(&**self.inner.context(), plan)?;
+            match result {
+                llkv_transaction::StatementResult::Update {
+                    rows_matched: _,
+                    rows_updated,
+                } => Ok(StatementResult::Update {
+                    rows_updated,
+                    table_name,
+                }),
+                _ => Err(Error::Internal("expected Update result".into())),
+            }
         }
     }
 
-    pub fn min_int64(column: impl Into<String>, alias: impl Into<String>) -> Self {
-        Self::Column {
-            column: column.into(),
-            alias: alias.into(),
-            function: AggregateFunction::MinInt64,
-        }
-    }
-
-    pub fn max_int64(column: impl Into<String>, alias: impl Into<String>) -> Self {
-        Self::Column {
-            column: column.into(),
-            alias: alias.into(),
-            function: AggregateFunction::MaxInt64,
-        }
-    }
-
-    pub fn count_nulls(column: impl Into<String>, alias: impl Into<String>) -> Self {
-        Self::Column {
-            column: column.into(),
-            alias: alias.into(),
-            function: AggregateFunction::CountNulls,
+    /// Delete rows (outside or inside transaction).
+    pub fn delete(&self, plan: DeletePlan) -> DslResult<StatementResult<P>> {
+        if self.has_active_transaction() {
+            let table_name = plan.table.clone();
+            self.inner.execute_operation(DslOperation::Delete(plan))?;
+            Ok(StatementResult::Delete {
+                rows_deleted: 0, // We don't track this in transactions yet
+                table_name,
+            })
+        } else {
+            // Call via TransactionContext trait
+            let table_name = plan.table.clone();
+            let result = TransactionContext::delete(&**self.inner.context(), plan)?;
+            match result {
+                llkv_transaction::StatementResult::Delete { rows_deleted } => {
+                    Ok(StatementResult::Delete {
+                        rows_deleted,
+                        table_name,
+                    })
+                }
+                _ => Err(Error::Internal("expected Delete result".into())),
+            }
         }
     }
 }
@@ -432,8 +420,9 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pager: Arc<P>,
-    tables: RwLock<HashMap<String, Arc<DslTable<P>>>>,
-    transaction_active: Mutex<bool>,
+    tables: RwLock<HashMap<String, Arc<ExecutorTable<P>>>>,
+    // Transaction manager for session-based transactions
+    transaction_manager: TransactionManager<DslContextWrapper<P>, DslContextWrapper<MemPager>>,
 }
 
 impl<P> DslContext<P>
@@ -444,8 +433,22 @@ where
         Self {
             pager,
             tables: RwLock::new(HashMap::new()),
-            transaction_active: Mutex::new(false),
+            transaction_manager: TransactionManager::new(),
         }
+    }
+
+    /// Create a new session for transaction management.
+    /// Each session can have its own independent transaction.
+    pub fn create_session(self: &Arc<Self>) -> Session<P> {
+        let wrapper = DslContextWrapper::new(Arc::clone(self));
+        let inner = self.transaction_manager.create_session(Arc::new(wrapper));
+        Session { inner }
+    }
+
+    /// Check if there's an active transaction (legacy - checks if ANY session has a transaction).
+    #[deprecated(note = "Use session-based transactions instead")]
+    pub fn has_active_transaction(&self) -> bool {
+        self.transaction_manager.has_active_transaction()
     }
 
     pub fn create_table<C, I>(self: &Arc<Self>, name: &str, columns: I) -> DslResult<TableHandle<P>>
@@ -509,11 +512,38 @@ where
         }
     }
 
+    pub fn table_names(self: &Arc<Self>) -> Vec<String> {
+        let tables = self.tables.read().unwrap();
+        tables.keys().cloned().collect()
+    }
+
     pub fn create_table_builder(&self, name: &str) -> CreateTableBuilder<'_, P> {
         CreateTableBuilder {
             ctx: self,
             plan: CreateTablePlan::new(name),
         }
+    }
+
+    pub fn table_column_specs(self: &Arc<Self>, name: &str) -> DslResult<Vec<ColumnSpec>> {
+        let (_, canonical_name) = canonical_table_name(name)?;
+        let table = self.lookup_table(&canonical_name)?;
+        Ok(table
+            .schema
+            .columns
+            .iter()
+            .map(|column| {
+                ColumnSpec::new(
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect())
+    }
+
+    pub fn export_table_rows(self: &Arc<Self>, name: &str) -> DslResult<RowBatch> {
+        let handle = TableHandle::new(Arc::clone(self), name)?;
+        handle.lazy()?.collect_rows()
     }
 
     fn execute_create_table(&self, plan: CreateTablePlan) -> DslResult<StatementResult<P>> {
@@ -558,6 +588,131 @@ where
         }
     }
 
+    /// Get raw batches from a table including row_ids, optionally filtered.
+    /// This is used for transaction seeding where we need to preserve existing row_ids.
+    pub fn get_batches_with_row_ids(
+        &self,
+        table_name: &str,
+        filter: Option<LlkvExpr<'static, String>>,
+    ) -> DslResult<Vec<RecordBatch>> {
+        let (_, canonical_name) = canonical_table_name(table_name)?;
+        let table = self.lookup_table(&canonical_name)?;
+
+        let filter_expr = match filter {
+            Some(expr) => translate_predicate(expr, table.schema.as_ref())?,
+            None => {
+                let field_id = table.schema.first_field_id().ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "table has no columns; cannot perform wildcard scan".into(),
+                    )
+                })?;
+                full_table_scan_filter(field_id)
+            }
+        };
+
+        // First, get the row_ids that match the filter
+        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        if row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Scan to get the column data
+        let mut batches_without_rowid = Vec::new();
+        let table_id = table.table.table_id();
+        let projections: Vec<ScanProjection> = table
+            .schema
+            .columns
+            .iter()
+            .map(|col| {
+                let logical_field_id = LogicalFieldId::for_user(table_id, col.field_id);
+                ScanProjection::column((logical_field_id, col.name.clone()))
+            })
+            .collect();
+
+        let options = ScanStreamOptions {
+            include_nulls: true,
+            order: None,
+        };
+
+        table
+            .table
+            .scan_stream_with_exprs(&projections, &filter_expr, options, |batch| {
+                batches_without_rowid.push(batch.clone());
+            })?;
+
+        // Now add row_id column to each batch
+        let mut batches_with_rowid = Vec::new();
+        let mut row_id_offset = 0usize;
+
+        for batch in batches_without_rowid {
+            let batch_size = batch.num_rows();
+            let batch_row_ids: Vec<u64> =
+                row_ids[row_id_offset..row_id_offset + batch_size].to_vec();
+            row_id_offset += batch_size;
+
+            // Create a new batch with row_id as the first column
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns() + 1);
+            arrays.push(Arc::new(UInt64Array::from(batch_row_ids)));
+            for i in 0..batch.num_columns() {
+                arrays.push(batch.column(i).clone());
+            }
+
+            let mut fields: Vec<Field> = Vec::with_capacity(batch.schema().fields().len() + 1);
+            fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+
+            // Reconstruct fields with proper field_id metadata
+            for (idx, _field) in batch.schema().fields().iter().enumerate() {
+                let col = &table.schema.columns[idx];
+                let mut metadata = HashMap::new();
+                metadata.insert(
+                    llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+                    col.field_id.to_string(),
+                );
+                let field_with_metadata =
+                    Field::new(&col.name, col.data_type.clone(), col.nullable)
+                        .with_metadata(metadata);
+                fields.push(field_with_metadata);
+            }
+
+            let schema_with_rowid = Arc::new(Schema::new(fields));
+            let batch_with_rowid = RecordBatch::try_new(schema_with_rowid, arrays)?;
+            batches_with_rowid.push(batch_with_rowid);
+        }
+
+        Ok(batches_with_rowid)
+    }
+
+    /// Append batches directly to a table, preserving row_ids from the batches.
+    /// This is used for transaction seeding where we need to preserve existing row_ids.
+    pub fn append_batches_with_row_ids(
+        &self,
+        table_name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> DslResult<usize> {
+        let (_, canonical_name) = canonical_table_name(table_name)?;
+        let table = self.lookup_table(&canonical_name)?;
+
+        let mut total_rows = 0;
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Verify the batch has a row_id column
+            let _row_id_idx = batch.schema().index_of(ROW_ID_COLUMN_NAME).map_err(|_| {
+                Error::InvalidArgumentError(
+                    "batch must contain row_id column for direct append".into(),
+                )
+            })?;
+
+            // Append the batch directly to the underlying table
+            table.table.append(&batch)?;
+            total_rows += batch.num_rows();
+        }
+
+        Ok(total_rows)
+    }
+
     pub fn update(&self, plan: UpdatePlan) -> DslResult<StatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
@@ -569,57 +724,34 @@ where
         }
     }
 
+    pub fn delete(&self, plan: DeletePlan) -> DslResult<StatementResult<P>> {
+        let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
+        let table = self.lookup_table(&canonical_name)?;
+        match plan.filter {
+            Some(filter) => self.delete_filtered_rows(table.as_ref(), display_name, filter),
+            None => self.delete_all_rows(table.as_ref(), display_name),
+        }
+    }
+
     pub fn table_handle(self: &Arc<Self>, name: &str) -> DslResult<TableHandle<P>> {
         TableHandle::new(Arc::clone(self), name)
     }
 
-    pub fn begin_transaction(&self) -> DslResult<StatementResult<P>> {
-        let mut active = self.transaction_active.lock().unwrap();
-        if *active {
-            return Err(Error::InvalidArgumentError(
-                "a transaction is already in progress".into(),
-            ));
-        }
-        *active = true;
-        Ok(StatementResult::Transaction {
-            kind: TransactionKind::Begin,
-        })
-    }
+    pub fn execute_select(self: &Arc<Self>, plan: SelectPlan) -> DslResult<SelectExecution<P>> {
+        let (_display_name, canonical_name) = canonical_table_name(&plan.table)?;
+        // Verify table exists
+        let _table = self.lookup_table(&canonical_name)?;
 
-    pub fn commit_transaction(&self) -> DslResult<StatementResult<P>> {
-        let mut active = self.transaction_active.lock().unwrap();
-        if !*active {
-            return Err(Error::InvalidArgumentError(
-                "no transaction is currently in progress".into(),
-            ));
-        }
-        *active = false;
-        Ok(StatementResult::Transaction {
-            kind: TransactionKind::Commit,
-        })
-    }
+        // Create a plan with canonical table name
+        let mut canonical_plan = plan.clone();
+        canonical_plan.table = canonical_name;
 
-    pub fn rollback_transaction(&self) -> DslResult<StatementResult<P>> {
-        let mut active = self.transaction_active.lock().unwrap();
-        if !*active {
-            return Err(Error::InvalidArgumentError(
-                "no transaction is currently in progress".into(),
-            ));
-        }
-        *active = false;
-        Ok(StatementResult::Transaction {
-            kind: TransactionKind::Rollback,
-        })
-    }
-
-    pub fn execute_select(&self, plan: SelectPlan) -> DslResult<SelectExecution<P>> {
-        let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
-        let table = self.lookup_table(&canonical_name)?;
-        if !plan.aggregates.is_empty() {
-            self.execute_aggregates(Arc::clone(&table), display_name, plan)
-        } else {
-            self.execute_projection(table, display_name, plan)
-        }
+        // Use the QueryExecutor from llkv-executor
+        let provider: Arc<dyn TableProvider<P>> = Arc::new(DslContextProvider {
+            context: Arc::clone(self),
+        });
+        let executor = QueryExecutor::new(provider);
+        executor.execute_select(canonical_plan)
     }
 
     fn create_table_from_columns(
@@ -635,7 +767,7 @@ where
             ));
         }
 
-        let mut column_defs: Vec<DslColumn> = Vec::with_capacity(columns.len());
+        let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(columns.len());
         let mut lookup: HashMap<String, usize> = HashMap::new();
         for (idx, column) in columns.iter().enumerate() {
             let normalized = column.name.to_ascii_lowercase();
@@ -645,7 +777,7 @@ where
                     column.name, display_name
                 )));
             }
-            column_defs.push(DslColumn {
+            column_defs.push(ExecutorColumn {
                 name: column.name.clone(),
                 data_type: column.data_type.clone(),
                 nullable: column.nullable,
@@ -672,11 +804,11 @@ where
             });
         }
 
-        let schema = Arc::new(DslSchema {
+        let schema = Arc::new(ExecutorSchema {
             columns: column_defs,
             lookup,
         });
-        let table_entry = Arc::new(DslTable {
+        let table_entry = Arc::new(ExecutorTable {
             table: Arc::new(table),
             schema,
             next_row_id: AtomicU64::new(0),
@@ -714,7 +846,7 @@ where
                 "CREATE TABLE AS SELECT requires at least one column".into(),
             ));
         }
-        let mut column_defs: Vec<DslColumn> = Vec::with_capacity(schema.fields().len());
+        let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(schema.fields().len());
         let mut lookup: HashMap<String, usize> = HashMap::new();
         for (idx, field) in schema.fields().iter().enumerate() {
             let data_type = match field.data_type() {
@@ -734,7 +866,7 @@ where
                     field.name()
                 )));
             }
-            column_defs.push(DslColumn {
+            column_defs.push(ExecutorColumn {
                 name: field.name().to_string(),
                 data_type,
                 nullable: field.is_nullable(),
@@ -761,11 +893,11 @@ where
             });
         }
 
-        let schema_arc = Arc::new(DslSchema {
+        let schema_arc = Arc::new(ExecutorSchema {
             columns: column_defs.clone(),
             lookup,
         });
-        let table_entry = Arc::new(DslTable {
+        let table_entry = Arc::new(ExecutorTable {
             table: Arc::new(table),
             schema: schema_arc,
             next_row_id: AtomicU64::new(0),
@@ -839,9 +971,9 @@ where
 
     fn insert_rows(
         &self,
-        table: &DslTable<P>,
+        table: &ExecutorTable<P>,
         display_name: String,
-        rows: Vec<Vec<DslValue>>,
+        rows: Vec<Vec<PlanValue>>,
         columns: Vec<String>,
     ) -> DslResult<StatementResult<P>> {
         if rows.is_empty() {
@@ -863,7 +995,7 @@ where
         }
 
         let row_count = rows.len();
-        let mut column_values: Vec<Vec<DslValue>> =
+        let mut column_values: Vec<Vec<PlanValue>> =
             vec![Vec::with_capacity(row_count); table.schema.columns.len()];
         for row in rows {
             for (idx, value) in row.into_iter().enumerate() {
@@ -914,7 +1046,7 @@ where
 
     fn insert_batches(
         &self,
-        table: &DslTable<P>,
+        table: &ExecutorTable<P>,
         display_name: String,
         batches: Vec<RecordBatch>,
         columns: Vec<String>,
@@ -945,12 +1077,12 @@ where
             if row_count == 0 {
                 continue;
             }
-            let mut rows: Vec<Vec<DslValue>> = Vec::with_capacity(row_count);
+            let mut rows: Vec<Vec<PlanValue>> = Vec::with_capacity(row_count);
             for row_idx in 0..row_count {
-                let mut row: Vec<DslValue> = Vec::with_capacity(expected_len);
+                let mut row: Vec<PlanValue> = Vec::with_capacity(expected_len);
                 for col_idx in 0..expected_len {
                     let array = batch.column(col_idx);
-                    row.push(dsl_value_from_array(array, row_idx)?);
+                    row.push(llkv_plan::plan_value_from_array(array, row_idx)?);
                 }
                 rows.push(row);
             }
@@ -971,7 +1103,7 @@ where
 
     fn update_filtered_rows(
         &self,
-        table: &DslTable<P>,
+        table: &ExecutorTable<P>,
         display_name: String,
         assignments: Vec<ColumnAssignment>,
         filter: LlkvExpr<'static, String>,
@@ -982,24 +1114,19 @@ where
             ));
         }
 
-        let filter_expr = translate_predicate(filter, table.schema.as_ref())?;
-        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        let schema = table.schema.as_ref();
+        let filter_expr = translate_predicate(filter, schema)?;
 
-        if row_ids.is_empty() {
-            return Ok(StatementResult::Update {
-                table_name: display_name,
-                rows_updated: 0,
-            });
+        // TODO: Dedupe
+        enum PreparedValue {
+            Literal(PlanValue),
+            Expression { expr_index: usize },
         }
 
-        let row_count = row_ids.len();
-
         let mut seen_columns: HashSet<String> = HashSet::new();
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(assignments.len() + 1);
-        arrays.push(Arc::new(UInt64Array::from(row_ids.clone())));
-
-        let mut fields: Vec<Field> = Vec::with_capacity(assignments.len() + 1);
-        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+        let mut prepared: Vec<(ExecutorColumn, PreparedValue)> =
+            Vec::with_capacity(assignments.len());
+        let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
 
         for assignment in assignments {
             let normalized = assignment.column.to_ascii_lowercase();
@@ -1016,8 +1143,53 @@ where
                 ))
             })?;
 
-            let values: Vec<DslValue> =
-                std::iter::repeat_n(assignment.value.clone(), row_count).collect();
+            match assignment.value {
+                AssignmentValue::Literal(value) => {
+                    prepared.push((column.clone(), PreparedValue::Literal(value)));
+                }
+                AssignmentValue::Expression(expr) => {
+                    let translated = translate_scalar(&expr, schema)?;
+                    let expr_index = scalar_exprs.len();
+                    scalar_exprs.push(translated);
+                    prepared.push((column.clone(), PreparedValue::Expression { expr_index }));
+                }
+            }
+        }
+
+        let (row_ids, mut expr_values) =
+            self.collect_update_rows(table, &filter_expr, &scalar_exprs)?;
+
+        if row_ids.is_empty() {
+            return Ok(StatementResult::Update {
+                table_name: display_name,
+                rows_updated: 0,
+            });
+        }
+
+        let row_count = row_ids.len();
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(prepared.len() + 1);
+        arrays.push(Arc::new(UInt64Array::from(row_ids.clone())));
+
+        let mut fields: Vec<Field> = Vec::with_capacity(prepared.len() + 1);
+        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+
+        for (column, value) in prepared {
+            let values = match value {
+                PreparedValue::Literal(lit) => vec![lit; row_count],
+                PreparedValue::Expression { expr_index } => {
+                    let column_values = expr_values.get_mut(expr_index).ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "expression assignment value missing during UPDATE".into(),
+                        )
+                    })?;
+                    if column_values.len() != row_count {
+                        return Err(Error::InvalidArgumentError(
+                            "expression result count did not match targeted row count".into(),
+                        ));
+                    }
+                    mem::take(column_values)
+                }
+            };
             let array = build_array_for_column(&column.data_type, &values)?;
             arrays.push(array);
 
@@ -1042,7 +1214,7 @@ where
 
     fn update_all_rows(
         &self,
-        table: &DslTable<P>,
+        table: &ExecutorTable<P>,
         display_name: String,
         assignments: Vec<ColumnAssignment>,
     ) -> DslResult<StatementResult<P>> {
@@ -1063,17 +1235,19 @@ where
             });
         }
 
-        let mut seen_columns: HashSet<String> = HashSet::new();
-        let mut row_id_builder = UInt64Builder::with_capacity(total_rows_usize);
-        for row_id in 0..total_rows {
-            row_id_builder.append_value(row_id);
+        let schema = table.schema.as_ref();
+
+        // TODO: Dedupe
+        enum PreparedValue {
+            Literal(PlanValue),
+            Expression { expr_index: usize },
         }
 
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(assignments.len() + 1);
-        arrays.push(Arc::new(row_id_builder.finish()));
-
-        let mut fields: Vec<Field> = Vec::with_capacity(assignments.len() + 1);
-        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+        let mut seen_columns: HashSet<String> = HashSet::new();
+        let mut prepared: Vec<(ExecutorColumn, PreparedValue)> =
+            Vec::with_capacity(assignments.len());
+        let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
+        let mut first_field_id: Option<FieldId> = None;
 
         for assignment in assignments {
             let normalized = assignment.column.to_ascii_lowercase();
@@ -1089,8 +1263,62 @@ where
                     assignment.column
                 ))
             })?;
+            if first_field_id.is_none() {
+                first_field_id = Some(column.field_id);
+            }
 
-            let values = vec![assignment.value.clone(); total_rows_usize];
+            match assignment.value {
+                AssignmentValue::Literal(value) => {
+                    prepared.push((column.clone(), PreparedValue::Literal(value)));
+                }
+                AssignmentValue::Expression(expr) => {
+                    let translated = translate_scalar(&expr, schema)?;
+                    let expr_index = scalar_exprs.len();
+                    scalar_exprs.push(translated);
+                    prepared.push((column.clone(), PreparedValue::Expression { expr_index }));
+                }
+            }
+        }
+
+        let anchor_field = first_field_id.ok_or_else(|| {
+            Error::InvalidArgumentError("UPDATE requires at least one target column".into())
+        })?;
+
+        let filter_expr = full_table_scan_filter(anchor_field);
+        let (row_ids, mut expr_values) =
+            self.collect_update_rows(table, &filter_expr, &scalar_exprs)?;
+
+        if row_ids.is_empty() {
+            return Ok(StatementResult::Update {
+                table_name: display_name,
+                rows_updated: 0,
+            });
+        }
+
+        let row_count = row_ids.len();
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(prepared.len() + 1);
+        arrays.push(Arc::new(UInt64Array::from(row_ids.clone())));
+
+        let mut fields: Vec<Field> = Vec::with_capacity(prepared.len() + 1);
+        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+
+        for (column, value) in prepared {
+            let values = match value {
+                PreparedValue::Literal(lit) => vec![lit; row_count],
+                PreparedValue::Expression { expr_index } => {
+                    let column_values = expr_values.get_mut(expr_index).ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "expression assignment value missing during UPDATE".into(),
+                        )
+                    })?;
+                    if column_values.len() != row_count {
+                        return Err(Error::InvalidArgumentError(
+                            "expression result count did not match targeted row count".into(),
+                        ));
+                    }
+                    mem::take(column_values)
+                }
+            };
             let array = build_array_for_column(&column.data_type, &values)?;
             arrays.push(array);
 
@@ -1109,247 +1337,152 @@ where
 
         Ok(StatementResult::Update {
             table_name: display_name,
-            rows_updated: total_rows_usize,
+            rows_updated: row_count,
         })
     }
 
-    fn execute_projection(
+    fn delete_filtered_rows(
         &self,
-        table: Arc<DslTable<P>>,
+        table: &ExecutorTable<P>,
         display_name: String,
-        plan: SelectPlan,
-    ) -> DslResult<SelectExecution<P>> {
-        let table_ref = table.as_ref();
-        let projections = if plan.projections.is_empty() {
-            build_wildcard_projections(table_ref)
-        } else {
-            build_projected_columns(table_ref, &plan.projections)?
-        };
-        let schema = schema_for_projections(table_ref, &projections)?;
-
-        let (filter_expr, full_table_scan) = match plan.filter {
-            Some(expr) => (translate_predicate(expr, table_ref.schema.as_ref())?, false),
-            None => {
-                let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "table has no columns; cannot perform wildcard scan".into(),
-                    )
-                })?;
-                (full_table_scan_filter(field_id), true)
-            }
-        };
-
-        let options = if let Some(order_plan) = &plan.order_by {
-            let order_spec = resolve_scan_order(table_ref, &projections, order_plan)?;
-            ScanStreamOptions {
-                include_nulls: true,
-                order: Some(order_spec),
-            }
-        } else {
-            ScanStreamOptions {
-                include_nulls: true,
-                order: None,
-            }
-        };
-
-        Ok(SelectExecution::new_projection(
-            display_name,
-            schema,
-            table,
-            projections,
-            filter_expr,
-            options,
-            full_table_scan,
-        ))
+        filter: LlkvExpr<'static, String>,
+    ) -> DslResult<StatementResult<P>> {
+        let schema = table.schema.as_ref();
+        let filter_expr = translate_predicate(filter, schema)?;
+        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        self.apply_delete(table, display_name, row_ids)
     }
 
-    fn execute_aggregates(
+    fn delete_all_rows(
         &self,
-        table: Arc<DslTable<P>>,
+        table: &ExecutorTable<P>,
         display_name: String,
-        plan: SelectPlan,
-    ) -> DslResult<SelectExecution<P>> {
-        let table_ref = table.as_ref();
-        let mut specs: Vec<AggregateSpec> = Vec::with_capacity(plan.aggregates.len());
-        for aggregate in plan.aggregates {
-            match aggregate {
-                AggregateExpr::CountStar { alias } => {
-                    specs.push(AggregateSpec {
-                        alias,
-                        kind: AggregateKind::CountStar,
-                    });
-                }
-                AggregateExpr::Column {
-                    column,
-                    alias,
-                    function,
-                } => {
-                    let col = table_ref.schema.resolve(&column).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "unknown column '{}' in aggregate",
-                            column
-                        ))
-                    })?;
-                    let kind = match function {
-                        AggregateFunction::Count => AggregateKind::CountField {
-                            field_id: col.field_id,
-                        },
-                        AggregateFunction::SumInt64 => {
-                            if col.data_type != DataType::Int64 {
-                                return Err(Error::InvalidArgumentError(
-                                    "SUM currently supports only INTEGER columns".into(),
-                                ));
-                            }
-                            AggregateKind::SumInt64 {
-                                field_id: col.field_id,
-                            }
-                        }
-                        AggregateFunction::MinInt64 => {
-                            if col.data_type != DataType::Int64 {
-                                return Err(Error::InvalidArgumentError(
-                                    "MIN currently supports only INTEGER columns".into(),
-                                ));
-                            }
-                            AggregateKind::MinInt64 {
-                                field_id: col.field_id,
-                            }
-                        }
-                        AggregateFunction::MaxInt64 => {
-                            if col.data_type != DataType::Int64 {
-                                return Err(Error::InvalidArgumentError(
-                                    "MAX currently supports only INTEGER columns".into(),
-                                ));
-                            }
-                            AggregateKind::MaxInt64 {
-                                field_id: col.field_id,
-                            }
-                        }
-                        AggregateFunction::CountNulls => AggregateKind::CountNulls {
-                            field_id: col.field_id,
-                        },
-                    };
-                    specs.push(AggregateSpec { alias, kind });
-                }
-            }
-        }
-
-        if specs.is_empty() {
-            return Err(Error::InvalidArgumentError(
-                "aggregate query requires at least one aggregate expression".into(),
-            ));
-        }
-
-        let had_filter = plan.filter.is_some();
-        let filter_expr = match plan.filter {
-            Some(expr) => translate_predicate(expr, table.schema.as_ref())?,
-            None => {
-                let field_id = table.schema.first_field_id().ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "table has no columns; cannot perform aggregate scan".into(),
-                    )
-                })?;
-                full_table_scan_filter(field_id)
-            }
-        };
-
-        let mut projections = Vec::new();
-        for spec in &specs {
-            if let Some(field_id) = spec.kind.field_id() {
-                projections.push(ScanProjection::from(StoreProjection::with_alias(
-                    LogicalFieldId::for_user(table.table.table_id(), field_id),
-                    table
-                        .schema
-                        .column_by_field_id(field_id)
-                        .map(|c| c.name.clone())
-                        .unwrap_or_else(|| format!("col{field_id}")),
-                )));
-            }
-        }
-
-        if projections.is_empty() {
-            let field_id = table.schema.first_field_id().ok_or_else(|| {
-                Error::InvalidArgumentError(
-                    "table has no columns; cannot perform aggregate scan".into(),
-                )
-            })?;
-            projections.push(ScanProjection::from(StoreProjection::with_alias(
-                LogicalFieldId::for_user(table.table.table_id(), field_id),
-                table
-                    .schema
-                    .column_by_field_id(field_id)
-                    .map(|c| c.name.clone())
-                    .unwrap_or_else(|| format!("col{field_id}")),
-            )));
-        }
-
-        let options = ScanStreamOptions {
-            include_nulls: true,
-            ..Default::default()
-        };
-
-        let mut states: Vec<AggregateState> = Vec::with_capacity(specs.len());
-        let mut count_star_override: Option<i64> = None;
+    ) -> DslResult<StatementResult<P>> {
         let total_rows = table.total_rows.load(Ordering::SeqCst);
-        if !had_filter {
-            if total_rows > i64::MAX as u64 {
-                return Err(Error::InvalidArgumentError(
-                    "COUNT(*) result exceeds supported range".into(),
-                ));
-            }
-            count_star_override = Some(total_rows as i64);
-        }
-
-        for spec in &specs {
-            states.push(AggregateState {
-                alias: spec.alias.clone(),
-                accumulator: AggregateAccumulator::new(
-                    table.schema.as_ref(),
-                    spec,
-                    count_star_override,
-                )?,
-                override_value: match spec.kind {
-                    AggregateKind::CountStar => count_star_override,
-                    _ => None,
-                },
+        if total_rows == 0 {
+            return Ok(StatementResult::Delete {
+                table_name: display_name,
+                rows_deleted: 0,
             });
         }
 
+        let anchor_field = table.schema.first_field_id().ok_or_else(|| {
+            Error::InvalidArgumentError("DELETE requires a table with at least one column".into())
+        })?;
+        let filter_expr = full_table_scan_filter(anchor_field);
+        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        self.apply_delete(table, display_name, row_ids)
+    }
+
+    fn apply_delete(
+        &self,
+        table: &ExecutorTable<P>,
+        display_name: String,
+        row_ids: Vec<u64>,
+    ) -> DslResult<StatementResult<P>> {
+        if row_ids.is_empty() {
+            return Ok(StatementResult::Delete {
+                table_name: display_name,
+                rows_deleted: 0,
+            });
+        }
+
+        let logical_fields: Vec<LogicalFieldId> = table
+            .schema
+            .columns
+            .iter()
+            .map(|column| LogicalFieldId::for_user(table.table.table_id(), column.field_id))
+            .collect();
+
+        if logical_fields.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "DELETE requires a table with at least one column".into(),
+            ));
+        }
+
+        table.table.store().delete_rows(&logical_fields, &row_ids)?;
+
+        let removed = row_ids.len();
+        let removed_u64 = u64::try_from(removed)
+            .map_err(|_| Error::InvalidArgumentError("row count exceeds supported range".into()))?;
+        table.total_rows.fetch_sub(removed_u64, Ordering::SeqCst);
+
+        Ok(StatementResult::Delete {
+            table_name: display_name,
+            rows_deleted: removed,
+        })
+    }
+
+    fn collect_update_rows(
+        &self,
+        table: &ExecutorTable<P>,
+        filter_expr: &LlkvExpr<'static, FieldId>,
+        expressions: &[ScalarExpr<FieldId>],
+    ) -> DslResult<(Vec<u64>, Vec<Vec<PlanValue>>)> {
+        let row_ids = table.table.filter_row_ids(filter_expr)?;
+        if row_ids.is_empty() {
+            return Ok((row_ids, vec![Vec::new(); expressions.len()]));
+        }
+
+        if expressions.is_empty() {
+            return Ok((row_ids, Vec::new()));
+        }
+
+        let mut projections: Vec<ScanProjection> = Vec::with_capacity(expressions.len());
+        for (idx, expr) in expressions.iter().enumerate() {
+            let alias = format!("__expr_{idx}");
+            projections.push(ScanProjection::computed(expr.clone(), alias));
+        }
+
+        let mut expr_values: Vec<Vec<PlanValue>> =
+            vec![Vec::with_capacity(row_ids.len()); expressions.len()];
         let mut error: Option<Error> = None;
+        let options = ScanStreamOptions {
+            include_nulls: true,
+            order: None,
+        };
+
         table
             .table
-            .scan_stream(projections, &filter_expr, options, |batch| {
+            .scan_stream_with_exprs(&projections, filter_expr, options, |batch| {
                 if error.is_some() {
                     return;
                 }
-                for state in &mut states {
-                    if let Err(err) = state.update(&batch) {
-                        error = Some(err);
-                        return;
-                    }
+                if let Err(err) = Self::collect_expression_values(&mut expr_values, batch) {
+                    error = Some(err);
                 }
             })?;
+
         if let Some(err) = error {
             return Err(err);
         }
 
-        let mut fields = Vec::with_capacity(states.len());
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(states.len());
-        for state in states {
-            let (field, array) = state.finalize()?;
-            fields.push(field);
-            arrays.push(array);
+        for values in &expr_values {
+            if values.len() != row_ids.len() {
+                return Err(Error::InvalidArgumentError(
+                    "expression result count did not match targeted row count".into(),
+                ));
+            }
         }
 
-        let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
-        Ok(SelectExecution::new_single_batch(
-            display_name,
-            schema,
-            batch,
-        ))
+        Ok((row_ids, expr_values))
     }
 
-    fn lookup_table(&self, canonical_name: &str) -> DslResult<Arc<DslTable<P>>> {
+    fn collect_expression_values(
+        expr_values: &mut [Vec<PlanValue>],
+        batch: RecordBatch,
+    ) -> DslResult<()> {
+        for row_idx in 0..batch.num_rows() {
+            for (expr_index, values) in expr_values.iter_mut().enumerate() {
+                let value = llkv_plan::plan_value_from_array(batch.column(expr_index), row_idx)?;
+                values.push(value);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn lookup_table(&self, canonical_name: &str) -> DslResult<Arc<ExecutorTable<P>>> {
         let tables = self.tables.read().unwrap();
         tables
             .get(canonical_name)
@@ -1392,84 +1525,128 @@ where
     }
 }
 
-fn resolve_scan_order<P>(
-    table: &DslTable<P>,
-    projections: &[ScanProjection],
-    order_plan: &OrderByPlan,
-) -> DslResult<ScanOrderSpec>
+// Implement TransactionContext for DslContextWrapper to enable llkv-transaction integration
+impl<P> TransactionContext for DslContextWrapper<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    type Pager = P;
+
+    fn table_column_specs(&self, table_name: &str) -> llkv_result::Result<Vec<ColumnSpec>> {
+        DslContext::table_column_specs(&self.0, table_name)
+    }
+
+    fn export_table_rows(
+        &self,
+        table_name: &str,
+    ) -> llkv_result::Result<llkv_transaction::RowBatch> {
+        let batch = DslContext::export_table_rows(&self.0, table_name)?;
+        // Convert from llkv_executor::RowBatch to llkv_transaction::RowBatch
+        Ok(llkv_transaction::RowBatch {
+            columns: batch.columns,
+            rows: batch.rows,
+        })
+    }
+
+    fn get_batches_with_row_ids(
+        &self,
+        table_name: &str,
+        filter: Option<LlkvExpr<'static, String>>,
+    ) -> llkv_result::Result<Vec<RecordBatch>> {
+        DslContext::get_batches_with_row_ids(&self.0, table_name, filter)
+    }
+
+    fn execute_select(
+        &self,
+        plan: SelectPlan,
+    ) -> llkv_result::Result<SelectExecution<Self::Pager>> {
+        DslContext::execute_select(&self.0, plan)
+    }
+
+    fn create_table_plan(
+        &self,
+        plan: CreateTablePlan,
+    ) -> llkv_result::Result<llkv_transaction::StatementResult<MemPager>> {
+        let result = DslContext::create_table_plan(&self.0, plan)?;
+        Ok(convert_statement_result(result))
+    }
+
+    fn insert(
+        &self,
+        plan: InsertPlan,
+    ) -> llkv_result::Result<llkv_transaction::StatementResult<MemPager>> {
+        let result = DslContext::insert(&self.0, plan)?;
+        Ok(convert_statement_result(result))
+    }
+
+    fn update(
+        &self,
+        plan: UpdatePlan,
+    ) -> llkv_result::Result<llkv_transaction::StatementResult<MemPager>> {
+        let result = DslContext::update(&self.0, plan)?;
+        Ok(convert_statement_result(result))
+    }
+
+    fn delete(
+        &self,
+        plan: DeletePlan,
+    ) -> llkv_result::Result<llkv_transaction::StatementResult<MemPager>> {
+        let result = DslContext::delete(&self.0, plan)?;
+        Ok(convert_statement_result(result))
+    }
+
+    fn append_batches_with_row_ids(
+        &self,
+        table_name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> llkv_result::Result<usize> {
+        DslContext::append_batches_with_row_ids(&self.0, table_name, batches)
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        DslContext::table_names(&self.0)
+    }
+}
+
+// Helper to convert StatementResult between types (legacy)
+fn convert_statement_result<P>(
+    result: StatementResult<P>,
+) -> llkv_transaction::StatementResult<MemPager>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    use llkv_transaction::StatementResult as TxResult;
+    match result {
+        StatementResult::CreateTable { table_name } => TxResult::CreateTable { table_name },
+        StatementResult::Insert { rows_inserted, .. } => TxResult::Insert { rows_inserted },
+        StatementResult::Update { rows_updated, .. } => TxResult::Update {
+            rows_matched: rows_updated,
+            rows_updated,
+        },
+        StatementResult::Delete { rows_deleted, .. } => TxResult::Delete { rows_deleted },
+        StatementResult::Transaction { kind } => TxResult::Transaction { kind },
+        _ => panic!("unsupported StatementResult conversion"),
+    }
+}
+
+// Wrapper to implement TableProvider for DslContext
+struct DslContextProvider<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    let (column, field_id) = match &order_plan.target {
-        OrderTarget::Column(name) => {
-            let column = table.schema.resolve(name).ok_or_else(|| {
-                Error::InvalidArgumentError(format!("unknown column '{}' in ORDER BY", name))
-            })?;
-            (column, column.field_id)
-        }
-        OrderTarget::Index(position) => {
-            let projection = projections.get(*position).ok_or_else(|| {
-                Error::InvalidArgumentError(format!(
-                    "ORDER BY position {} is out of range",
-                    position + 1
-                ))
-            })?;
-            match projection {
-                ScanProjection::Column(store_projection) => {
-                    let field_id = store_projection.logical_field_id.field_id();
-                    let column = table.schema.column_by_field_id(field_id).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "unknown column with field id {field_id} in ORDER BY"
-                        ))
-                    })?;
-                    (column, field_id)
-                }
-                ScanProjection::Computed { .. } => {
-                    return Err(Error::InvalidArgumentError(
-                        "ORDER BY position referring to computed projection is not supported"
-                            .into(),
-                    ));
-                }
-            }
-        }
-    };
-
-    let transform = match order_plan.sort_type {
-        OrderSortType::Native => match column.data_type {
-            DataType::Int64 => ScanOrderTransform::IdentityInteger,
-            DataType::Utf8 => ScanOrderTransform::IdentityUtf8,
-            ref other => {
-                return Err(Error::InvalidArgumentError(format!(
-                    "ORDER BY on column type {:?} is not supported",
-                    other
-                )));
-            }
-        },
-        OrderSortType::CastTextToInteger => {
-            if column.data_type != DataType::Utf8 {
-                return Err(Error::InvalidArgumentError(
-                    "ORDER BY CAST expects a text column".into(),
-                ));
-            }
-            ScanOrderTransform::CastUtf8ToInteger
-        }
-    };
-
-    let direction = if order_plan.ascending {
-        ScanOrderDirection::Ascending
-    } else {
-        ScanOrderDirection::Descending
-    };
-
-    Ok(ScanOrderSpec {
-        field_id,
-        direction,
-        nulls_first: order_plan.nulls_first,
-        transform,
-    })
+    context: Arc<DslContext<P>>,
 }
 
-/// Lazily built logical plan.
+impl<P> TableProvider<P> for DslContextProvider<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn get_table(&self, canonical_name: &str) -> DslResult<Arc<ExecutorTable<P>>> {
+        self.context.lookup_table(canonical_name)
+    }
+}
+
+/// Lazily built logical plan (thin wrapper over SelectPlan).
 pub struct LazyFrame<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -1516,579 +1693,6 @@ where
     }
 }
 
-/// Streaming execution handle for SELECT queries.
-#[derive(Clone)]
-pub struct SelectExecution<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    table_name: String,
-    schema: Arc<Schema>,
-    stream: SelectStream<P>,
-}
-
-#[derive(Clone)]
-enum SelectStream<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    Projection {
-        table: Arc<DslTable<P>>,
-        projections: Vec<ScanProjection>,
-        filter_expr: LlkvExpr<'static, FieldId>,
-        options: ScanStreamOptions,
-        full_table_scan: bool,
-    },
-    Aggregation {
-        batch: RecordBatch,
-    },
-}
-
-impl<P> SelectExecution<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    fn new_projection(
-        table_name: String,
-        schema: Arc<Schema>,
-        table: Arc<DslTable<P>>,
-        projections: Vec<ScanProjection>,
-        filter_expr: LlkvExpr<'static, FieldId>,
-        options: ScanStreamOptions,
-        full_table_scan: bool,
-    ) -> Self {
-        Self {
-            table_name,
-            schema,
-            stream: SelectStream::Projection {
-                table,
-                projections,
-                filter_expr,
-                options,
-                full_table_scan,
-            },
-        }
-    }
-
-    fn new_single_batch(table_name: String, schema: Arc<Schema>, batch: RecordBatch) -> Self {
-        Self {
-            table_name,
-            schema,
-            stream: SelectStream::Aggregation { batch },
-        }
-    }
-
-    pub fn from_batch(table_name: String, schema: Arc<Schema>, batch: RecordBatch) -> Self {
-        Self::new_single_batch(table_name, schema, batch)
-    }
-
-    pub fn table_name(&self) -> &str {
-        &self.table_name
-    }
-
-    pub fn schema(&self) -> Arc<Schema> {
-        Arc::clone(&self.schema)
-    }
-
-    pub fn stream(self, mut on_batch: impl FnMut(RecordBatch) -> DslResult<()>) -> DslResult<()> {
-        let schema = Arc::clone(&self.schema);
-        match self.stream {
-            SelectStream::Projection {
-                table,
-                projections,
-                filter_expr,
-                options,
-                full_table_scan,
-            } => {
-                let mut error: Option<Error> = None;
-                let mut produced = false;
-                let mut produced_rows: u64 = 0;
-                let capture_nulls_first = matches!(options.order, Some(spec) if spec.nulls_first);
-                let mut buffered_batches: Vec<RecordBatch> = Vec::new();
-                table
-                    .table
-                    .scan_stream(projections, &filter_expr, options, |batch| {
-                        if error.is_some() {
-                            return;
-                        }
-                        produced = true;
-                        produced_rows = produced_rows.saturating_add(batch.num_rows() as u64);
-                        if capture_nulls_first {
-                            buffered_batches.push(batch);
-                        } else if let Err(err) = on_batch(batch) {
-                            error = Some(err);
-                        }
-                    })?;
-                if let Some(err) = error {
-                    return Err(err);
-                }
-                let total_rows = table.total_rows.load(Ordering::SeqCst);
-                if !produced {
-                    if total_rows > 0 {
-                        for batch in synthesize_null_scan(Arc::clone(&schema), total_rows)? {
-                            on_batch(batch)?;
-                        }
-                    }
-                    return Ok(());
-                }
-                let mut null_batches: Vec<RecordBatch> = Vec::new();
-                if options.include_nulls && full_table_scan && produced_rows < total_rows {
-                    let missing = total_rows - produced_rows;
-                    if missing > 0 {
-                        null_batches = synthesize_null_scan(Arc::clone(&schema), missing)?;
-                    }
-                }
-
-                if capture_nulls_first {
-                    for batch in null_batches {
-                        on_batch(batch)?;
-                    }
-                    for batch in buffered_batches {
-                        on_batch(batch)?;
-                    }
-                } else if !null_batches.is_empty() {
-                    for batch in null_batches {
-                        on_batch(batch)?;
-                    }
-                }
-                Ok(())
-            }
-            SelectStream::Aggregation { batch } => on_batch(batch),
-        }
-    }
-
-    pub fn collect(self) -> DslResult<Vec<RecordBatch>> {
-        let mut batches = Vec::new();
-        self.stream(|batch| {
-            batches.push(batch);
-            Ok(())
-        })?;
-        Ok(batches)
-    }
-
-    pub fn collect_rows(self) -> DslResult<RowBatch> {
-        let schema = self.schema();
-        let mut rows: Vec<Vec<DslValue>> = Vec::new();
-        self.stream(|batch| {
-            for row_idx in 0..batch.num_rows() {
-                let mut row: Vec<DslValue> = Vec::with_capacity(batch.num_columns());
-                for col_idx in 0..batch.num_columns() {
-                    let value = dsl_value_from_array(batch.column(col_idx), row_idx)?;
-                    row.push(value);
-                }
-                rows.push(row);
-            }
-            Ok(())
-        })?;
-        let columns = schema
-            .fields()
-            .iter()
-            .map(|field| field.name().to_string())
-            .collect();
-        Ok(RowBatch { columns, rows })
-    }
-
-    pub fn into_rows(self) -> DslResult<Vec<Vec<DslValue>>> {
-        Ok(self.collect_rows()?.rows)
-    }
-}
-
-impl<P> fmt::Debug for SelectExecution<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SelectExecution")
-            .field("table_name", &self.table_name)
-            .field("schema", &self.schema)
-            .finish()
-    }
-}
-
-struct DslTable<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    table: Arc<Table<P>>,
-    schema: Arc<DslSchema>,
-    next_row_id: AtomicU64,
-    total_rows: AtomicU64,
-}
-
-struct DslSchema {
-    columns: Vec<DslColumn>,
-    lookup: HashMap<String, usize>,
-}
-
-impl DslSchema {
-    fn resolve(&self, name: &str) -> Option<&DslColumn> {
-        let normalized = name.to_ascii_lowercase();
-        self.lookup
-            .get(&normalized)
-            .and_then(|idx| self.columns.get(*idx))
-    }
-
-    fn first_field_id(&self) -> Option<FieldId> {
-        self.columns.first().map(|col| col.field_id)
-    }
-
-    fn column_by_field_id(&self, field_id: FieldId) -> Option<&DslColumn> {
-        self.columns.iter().find(|col| col.field_id == field_id)
-    }
-}
-
-#[derive(Clone)]
-struct DslColumn {
-    name: String,
-    data_type: DataType,
-    nullable: bool,
-    field_id: FieldId,
-}
-
-#[derive(Clone)]
-struct AggregateSpec {
-    alias: String,
-    kind: AggregateKind,
-}
-
-#[derive(Clone)]
-enum AggregateKind {
-    CountStar,
-    CountField { field_id: FieldId },
-    SumInt64 { field_id: FieldId },
-    MinInt64 { field_id: FieldId },
-    MaxInt64 { field_id: FieldId },
-    CountNulls { field_id: FieldId },
-}
-
-impl AggregateKind {
-    fn field_id(&self) -> Option<FieldId> {
-        match self {
-            AggregateKind::CountStar => None,
-            AggregateKind::CountField { field_id }
-            | AggregateKind::SumInt64 { field_id }
-            | AggregateKind::MinInt64 { field_id }
-            | AggregateKind::MaxInt64 { field_id }
-            | AggregateKind::CountNulls { field_id } => Some(*field_id),
-        }
-    }
-}
-
-struct AggregateState {
-    alias: String,
-    accumulator: AggregateAccumulator,
-    override_value: Option<i64>,
-}
-
-enum AggregateAccumulator {
-    CountStar {
-        value: i64,
-    },
-    CountColumn {
-        column_index: usize,
-        value: i64,
-    },
-    SumInt64 {
-        column_index: usize,
-        value: i64,
-        saw_value: bool,
-    },
-    MinInt64 {
-        column_index: usize,
-        value: Option<i64>,
-    },
-    MaxInt64 {
-        column_index: usize,
-        value: Option<i64>,
-    },
-    CountNulls {
-        column_index: usize,
-        non_null_rows: i64,
-        total_rows: i64,
-    },
-}
-
-impl AggregateAccumulator {
-    fn new(
-        schema: &DslSchema,
-        spec: &AggregateSpec,
-        total_rows_hint: Option<i64>,
-    ) -> DslResult<Self> {
-        match spec.kind {
-            AggregateKind::CountStar => Ok(AggregateAccumulator::CountStar { value: 0 }),
-            AggregateKind::CountField { field_id } => {
-                let position = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.field_id == field_id)
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "aggregate referenced unknown column field id".into(),
-                        )
-                    })?;
-                Ok(AggregateAccumulator::CountColumn {
-                    column_index: position,
-                    value: 0,
-                })
-            }
-            AggregateKind::SumInt64 { field_id } => {
-                let position = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.field_id == field_id)
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "aggregate referenced unknown column field id".into(),
-                        )
-                    })?;
-                Ok(AggregateAccumulator::SumInt64 {
-                    column_index: position,
-                    value: 0,
-                    saw_value: false,
-                })
-            }
-            AggregateKind::MinInt64 { field_id } => {
-                let position = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.field_id == field_id)
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "aggregate referenced unknown column field id".into(),
-                        )
-                    })?;
-                Ok(AggregateAccumulator::MinInt64 {
-                    column_index: position,
-                    value: None,
-                })
-            }
-            AggregateKind::MaxInt64 { field_id } => {
-                let position = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.field_id == field_id)
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "aggregate referenced unknown column field id".into(),
-                        )
-                    })?;
-                Ok(AggregateAccumulator::MaxInt64 {
-                    column_index: position,
-                    value: None,
-                })
-            }
-            AggregateKind::CountNulls { field_id } => {
-                let position = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.field_id == field_id)
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "aggregate referenced unknown column field id".into(),
-                        )
-                    })?;
-                let total_rows = total_rows_hint.ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "SUM(CASE WHEN ... IS NULL ...) with WHERE clauses is not supported yet"
-                            .into(),
-                    )
-                })?;
-                Ok(AggregateAccumulator::CountNulls {
-                    column_index: position,
-                    non_null_rows: 0,
-                    total_rows,
-                })
-            }
-        }
-    }
-
-    fn update(&mut self, batch: &RecordBatch) -> DslResult<()> {
-        match self {
-            AggregateAccumulator::CountStar { value } => {
-                let rows = i64::try_from(batch.num_rows()).map_err(|_| {
-                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
-                })?;
-                *value = value.checked_add(rows).ok_or_else(|| {
-                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
-                })?;
-            }
-            AggregateAccumulator::CountColumn {
-                column_index,
-                value,
-            } => {
-                let array = batch.column(*column_index);
-                let non_null = (0..array.len()).filter(|idx| array.is_valid(*idx)).count();
-                let non_null = i64::try_from(non_null).map_err(|_| {
-                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
-                })?;
-                *value = value.checked_add(non_null).ok_or_else(|| {
-                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
-                })?;
-            }
-            AggregateAccumulator::SumInt64 {
-                column_index,
-                value,
-                saw_value,
-            } => {
-                let array = batch.column(*column_index);
-                let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "SUM aggregate expected an INT column in execution".into(),
-                    )
-                })?;
-                for i in 0..array.len() {
-                    if array.is_valid(i) {
-                        let v = array.value(i);
-                        *value = value.checked_add(v).ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "SUM aggregate result exceeds i64 range".into(),
-                            )
-                        })?;
-                        *saw_value = true;
-                    }
-                }
-            }
-            AggregateAccumulator::MinInt64 {
-                column_index,
-                value,
-            } => {
-                let array = batch.column(*column_index);
-                let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "MIN aggregate expected an INT column in execution".into(),
-                    )
-                })?;
-                for i in 0..array.len() {
-                    if array.is_valid(i) {
-                        let v = array.value(i);
-                        *value = Some(match *value {
-                            Some(current) => current.min(v),
-                            None => v,
-                        });
-                    }
-                }
-            }
-            AggregateAccumulator::MaxInt64 {
-                column_index,
-                value,
-            } => {
-                let array = batch.column(*column_index);
-                let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "MAX aggregate expected an INT column in execution".into(),
-                    )
-                })?;
-                for i in 0..array.len() {
-                    if array.is_valid(i) {
-                        let v = array.value(i);
-                        *value = Some(match *value {
-                            Some(current) => current.max(v),
-                            None => v,
-                        });
-                    }
-                }
-            }
-            AggregateAccumulator::CountNulls {
-                column_index,
-                non_null_rows,
-                total_rows: _,
-            } => {
-                let array = batch.column(*column_index);
-                let non_null = (0..array.len()).filter(|idx| array.is_valid(*idx)).count();
-                let non_null = i64::try_from(non_null).map_err(|_| {
-                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
-                })?;
-                *non_null_rows = non_null_rows.checked_add(non_null).ok_or_else(|| {
-                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
-                })?;
-            }
-        }
-        Ok(())
-    }
-
-    fn finalize(self) -> DslResult<(Field, ArrayRef)> {
-        match self {
-            AggregateAccumulator::CountStar { value } => {
-                let mut builder = Int64Builder::with_capacity(1);
-                builder.append_value(value);
-                let array = Arc::new(builder.finish()) as ArrayRef;
-                Ok((Field::new("count", DataType::Int64, false), array))
-            }
-            AggregateAccumulator::CountColumn { value, .. } => {
-                let mut builder = Int64Builder::with_capacity(1);
-                builder.append_value(value);
-                let array = Arc::new(builder.finish()) as ArrayRef;
-                Ok((Field::new("count", DataType::Int64, false), array))
-            }
-            AggregateAccumulator::SumInt64 {
-                value, saw_value, ..
-            } => {
-                let mut builder = Int64Builder::with_capacity(1);
-                if saw_value {
-                    builder.append_value(value);
-                } else {
-                    builder.append_null();
-                }
-                let array = Arc::new(builder.finish()) as ArrayRef;
-                Ok((Field::new("sum", DataType::Int64, true), array))
-            }
-            AggregateAccumulator::MinInt64 { value, .. } => {
-                let mut builder = Int64Builder::with_capacity(1);
-                if let Some(v) = value {
-                    builder.append_value(v);
-                } else {
-                    builder.append_null();
-                }
-                let array = Arc::new(builder.finish()) as ArrayRef;
-                Ok((Field::new("min", DataType::Int64, true), array))
-            }
-            AggregateAccumulator::MaxInt64 { value, .. } => {
-                let mut builder = Int64Builder::with_capacity(1);
-                if let Some(v) = value {
-                    builder.append_value(v);
-                } else {
-                    builder.append_null();
-                }
-                let array = Arc::new(builder.finish()) as ArrayRef;
-                Ok((Field::new("max", DataType::Int64, true), array))
-            }
-            AggregateAccumulator::CountNulls {
-                non_null_rows,
-                total_rows,
-                ..
-            } => {
-                let nulls = total_rows.checked_sub(non_null_rows).ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "NULL-count aggregate observed more non-null rows than total rows".into(),
-                    )
-                })?;
-                let mut builder = Int64Builder::with_capacity(1);
-                builder.append_value(nulls);
-                let array = Arc::new(builder.finish()) as ArrayRef;
-                Ok((Field::new("count_nulls", DataType::Int64, false), array))
-            }
-        }
-    }
-}
-
-impl AggregateState {
-    fn update(&mut self, batch: &RecordBatch) -> DslResult<()> {
-        self.accumulator.update(batch)
-    }
-
-    fn finalize(self) -> DslResult<(Field, ArrayRef)> {
-        let (mut field, array) = self.accumulator.finalize()?;
-        field = field.with_name(self.alias);
-        if let Some(value) = self.override_value {
-            let mut builder = Int64Builder::with_capacity(1);
-            builder.append_value(value);
-            let array = Arc::new(builder.finish()) as ArrayRef;
-            return Ok((field, array));
-        }
-        Ok((field, array))
-    }
-}
-
 fn canonical_table_name(name: &str) -> DslResult<(String, String)> {
     if name.is_empty() {
         return Err(Error::InvalidArgumentError(
@@ -2107,7 +1711,7 @@ fn current_time_micros() -> u64 {
         .as_micros() as u64
 }
 
-fn resolve_insert_columns(columns: &[String], schema: &DslSchema) -> DslResult<Vec<usize>> {
+fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> DslResult<Vec<usize>> {
     if columns.is_empty() {
         return Ok((0..schema.columns.len()).collect());
     }
@@ -2123,16 +1727,16 @@ fn resolve_insert_columns(columns: &[String], schema: &DslSchema) -> DslResult<V
     Ok(resolved)
 }
 
-fn build_array_for_column(dtype: &DataType, values: &[DslValue]) -> DslResult<ArrayRef> {
+fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> DslResult<ArrayRef> {
     match dtype {
         DataType::Int64 => {
             let mut builder = Int64Builder::with_capacity(values.len());
             for value in values {
                 match value {
-                    DslValue::Null => builder.append_null(),
-                    DslValue::Integer(v) => builder.append_value(*v),
-                    DslValue::Float(v) => builder.append_value(*v as i64),
-                    DslValue::String(_) => {
+                    PlanValue::Null => builder.append_null(),
+                    PlanValue::Integer(v) => builder.append_value(*v),
+                    PlanValue::Float(v) => builder.append_value(*v as i64),
+                    PlanValue::String(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert string into INT column".into(),
                         ));
@@ -2145,10 +1749,10 @@ fn build_array_for_column(dtype: &DataType, values: &[DslValue]) -> DslResult<Ar
             let mut builder = Float64Builder::with_capacity(values.len());
             for value in values {
                 match value {
-                    DslValue::Null => builder.append_null(),
-                    DslValue::Integer(v) => builder.append_value(*v as f64),
-                    DslValue::Float(v) => builder.append_value(*v),
-                    DslValue::String(_) => {
+                    PlanValue::Null => builder.append_null(),
+                    PlanValue::Integer(v) => builder.append_value(*v as f64),
+                    PlanValue::Float(v) => builder.append_value(*v),
+                    PlanValue::String(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert string into DOUBLE column".into(),
                         ));
@@ -2161,10 +1765,10 @@ fn build_array_for_column(dtype: &DataType, values: &[DslValue]) -> DslResult<Ar
             let mut builder = StringBuilder::with_capacity(values.len(), values.len() * 8);
             for value in values {
                 match value {
-                    DslValue::Null => builder.append_null(),
-                    DslValue::Integer(v) => builder.append_value(v.to_string()),
-                    DslValue::Float(v) => builder.append_value(v.to_string()),
-                    DslValue::String(s) => builder.append_value(s),
+                    PlanValue::Null => builder.append_null(),
+                    PlanValue::Integer(v) => builder.append_value(v.to_string()),
+                    PlanValue::Float(v) => builder.append_value(v.to_string()),
+                    PlanValue::String(s) => builder.append_value(s),
                 }
             }
             Ok(Arc::new(builder.finish()))
@@ -2173,8 +1777,8 @@ fn build_array_for_column(dtype: &DataType, values: &[DslValue]) -> DslResult<Ar
             let mut builder = Date32Builder::with_capacity(values.len());
             for value in values {
                 match value {
-                    DslValue::Null => builder.append_null(),
-                    DslValue::Integer(days) => {
+                    PlanValue::Null => builder.append_null(),
+                    PlanValue::Integer(days) => {
                         let casted = i32::try_from(*days).map_err(|_| {
                             Error::InvalidArgumentError(
                                 "integer literal out of range for DATE column".into(),
@@ -2182,12 +1786,12 @@ fn build_array_for_column(dtype: &DataType, values: &[DslValue]) -> DslResult<Ar
                         })?;
                         builder.append_value(casted);
                     }
-                    DslValue::Float(_) => {
+                    PlanValue::Float(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert float into DATE column".into(),
                         ));
                     }
-                    DslValue::String(text) => {
+                    PlanValue::String(text) => {
                         let days = parse_date32_literal(text)?;
                         builder.append_value(days);
                     }
@@ -2245,156 +1849,7 @@ fn epoch_julian_day() -> i32 {
         .to_julian_day()
 }
 
-fn dsl_value_from_array(array: &ArrayRef, index: usize) -> DslResult<DslValue> {
-    if array.is_null(index) {
-        return Ok(DslValue::Null);
-    }
-    match array.data_type() {
-        DataType::Int64 => {
-            let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                Error::InvalidArgumentError("expected Int64 array in INSERT SELECT".into())
-            })?;
-            Ok(DslValue::Integer(values.value(index)))
-        }
-        DataType::Float64 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError("expected Float64 array in INSERT SELECT".into())
-                })?;
-            Ok(DslValue::Float(values.value(index)))
-        }
-        DataType::Utf8 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError("expected Utf8 array in INSERT SELECT".into())
-                })?;
-            Ok(DslValue::String(values.value(index).to_string()))
-        }
-        DataType::Date32 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError("expected Date32 array in INSERT SELECT".into())
-                })?;
-            Ok(DslValue::Integer(values.value(index) as i64))
-        }
-        other => Err(Error::InvalidArgumentError(format!(
-            "unsupported data type in INSERT SELECT: {other:?}"
-        ))),
-    }
-}
-
-fn build_wildcard_projections<P>(table: &DslTable<P>) -> Vec<ScanProjection>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    table
-        .schema
-        .columns
-        .iter()
-        .map(|column| {
-            ScanProjection::from(StoreProjection::with_alias(
-                LogicalFieldId::for_user(table.table.table_id(), column.field_id),
-                column.name.clone(),
-            ))
-        })
-        .collect()
-}
-
-fn build_projected_columns<P>(
-    table: &DslTable<P>,
-    projections: &[SelectProjection],
-) -> DslResult<Vec<ScanProjection>>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    let mut result = Vec::with_capacity(projections.len());
-    for projection in projections.iter() {
-        match projection {
-            SelectProjection::AllColumns => {
-                result.extend(build_wildcard_projections(table));
-            }
-            SelectProjection::Column { name, alias } => {
-                let column = table.schema.resolve(name).ok_or_else(|| {
-                    Error::InvalidArgumentError(format!("unknown column '{}' in projection", name))
-                })?;
-                let alias = alias.clone().unwrap_or_else(|| column.name.clone());
-                result.push(ScanProjection::from(StoreProjection::with_alias(
-                    LogicalFieldId::for_user(table.table.table_id(), column.field_id),
-                    alias,
-                )));
-            }
-            SelectProjection::Computed { expr, alias } => {
-                let scalar = translate_scalar(expr, table.schema.as_ref())?;
-                result.push(ScanProjection::computed(scalar, alias.clone()));
-            }
-        }
-    }
-    if result.is_empty() {
-        return Err(Error::InvalidArgumentError(
-            "projection must include at least one column".into(),
-        ));
-    }
-    Ok(result)
-}
-
-fn schema_for_projections<P>(
-    table: &DslTable<P>,
-    projections: &[ScanProjection],
-) -> DslResult<Arc<Schema>>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    let mut fields: Vec<Field> = Vec::with_capacity(projections.len());
-    for projection in projections {
-        match projection {
-            ScanProjection::Column(proj) => {
-                let field_id = proj.logical_field_id.field_id();
-                let column = table.schema.column_by_field_id(field_id).ok_or_else(|| {
-                    Error::InvalidArgumentError(format!(
-                        "unknown column with field id {} in projection",
-                        field_id
-                    ))
-                })?;
-                let name = proj.alias.clone().unwrap_or_else(|| column.name.clone());
-                let mut metadata = HashMap::new();
-                metadata.insert(
-                    llkv_table::constants::FIELD_ID_META_KEY.to_string(),
-                    column.field_id.to_string(),
-                );
-                let field = Field::new(&name, column.data_type.clone(), column.nullable)
-                    .with_metadata(metadata);
-                fields.push(field);
-            }
-            ScanProjection::Computed { alias, expr } => {
-                let dtype = match expr {
-                    ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
-                    ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
-                    ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
-                    ScalarExpr::Column(field_id) => {
-                        let column =
-                            table.schema.column_by_field_id(*field_id).ok_or_else(|| {
-                                Error::InvalidArgumentError(format!(
-                                    "unknown column with field id {} in computed projection",
-                                    field_id
-                                ))
-                            })?;
-                        column.data_type.clone()
-                    }
-                    ScalarExpr::Binary { .. } => DataType::Float64,
-                };
-                let field = Field::new(alias, dtype, true);
-                fields.push(field);
-            }
-        }
-    }
-    Ok(Arc::new(Schema::new(fields)))
-}
+// Array -> PlanValue conversion is provided by llkv-plan::plan_value_from_array
 
 fn full_table_scan_filter(field_id: FieldId) -> LlkvExpr<'static, FieldId> {
     LlkvExpr::Pred(Filter {
@@ -2406,27 +1861,9 @@ fn full_table_scan_filter(field_id: FieldId) -> LlkvExpr<'static, FieldId> {
     })
 }
 
-fn synthesize_null_scan(schema: Arc<Schema>, total_rows: u64) -> DslResult<Vec<RecordBatch>> {
-    let row_count = usize::try_from(total_rows).map_err(|_| {
-        Error::InvalidArgumentError("table row count exceeds supported in-memory batch size".into())
-    })?;
-
-    if row_count == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        columns.push(new_null_array(field.data_type(), row_count));
-    }
-
-    let batch = RecordBatch::try_new(schema, columns)?;
-    Ok(vec![batch])
-}
-
 fn translate_predicate(
     expr: LlkvExpr<'static, String>,
-    schema: &DslSchema,
+    schema: &ExecutorSchema,
 ) -> DslResult<LlkvExpr<'static, FieldId>> {
     match expr {
         LlkvExpr::And(list) => {
@@ -2465,7 +1902,7 @@ fn translate_predicate(
 
 fn translate_scalar(
     expr: &ScalarExpr<String>,
-    schema: &DslSchema,
+    schema: &ExecutorSchema,
 ) -> DslResult<ScalarExpr<FieldId>> {
     match expr {
         ScalarExpr::Column(name) => {
@@ -2487,16 +1924,16 @@ fn translate_scalar(
     }
 }
 
-fn dsl_value_from_sql_expr(expr: &SqlExpr) -> DslResult<DslValue> {
+fn dsl_value_from_sql_expr(expr: &SqlExpr) -> DslResult<PlanValue> {
     match expr {
         SqlExpr::Value(value) => dsl_value_from_sql_value(value),
         SqlExpr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
         } => match dsl_value_from_sql_expr(expr)? {
-            DslValue::Integer(v) => Ok(DslValue::Integer(-v)),
-            DslValue::Float(v) => Ok(DslValue::Float(-v)),
-            DslValue::Null | DslValue::String(_) => Err(Error::InvalidArgumentError(
+            PlanValue::Integer(v) => Ok(PlanValue::Integer(-v)),
+            PlanValue::Float(v) => Ok(PlanValue::Float(-v)),
+            PlanValue::Null | PlanValue::String(_) => Err(Error::InvalidArgumentError(
                 "cannot negate non-numeric literal".into(),
             )),
         },
@@ -2511,20 +1948,20 @@ fn dsl_value_from_sql_expr(expr: &SqlExpr) -> DslResult<DslValue> {
     }
 }
 
-fn dsl_value_from_sql_value(value: &ValueWithSpan) -> DslResult<DslValue> {
+fn dsl_value_from_sql_value(value: &ValueWithSpan) -> DslResult<PlanValue> {
     match &value.value {
-        Value::Null => Ok(DslValue::Null),
+        Value::Null => Ok(PlanValue::Null),
         Value::Number(text, _) => {
             if text.contains(['.', 'e', 'E']) {
                 let parsed = text.parse::<f64>().map_err(|err| {
                     Error::InvalidArgumentError(format!("invalid float literal: {err}"))
                 })?;
-                Ok(DslValue::Float(parsed))
+                Ok(PlanValue::Float(parsed))
             } else {
                 let parsed = text.parse::<i64>().map_err(|err| {
                     Error::InvalidArgumentError(format!("invalid integer literal: {err}"))
                 })?;
-                Ok(DslValue::Integer(parsed))
+                Ok(PlanValue::Integer(parsed))
             }
         }
         Value::Boolean(_) => Err(Error::InvalidArgumentError(
@@ -2532,7 +1969,7 @@ fn dsl_value_from_sql_value(value: &ValueWithSpan) -> DslResult<DslValue> {
         )),
         other => {
             if let Some(text) = other.clone().into_string() {
-                Ok(DslValue::String(text))
+                Ok(PlanValue::String(text))
             } else {
                 Err(Error::InvalidArgumentError(format!(
                     "unsupported literal: {other:?}"
@@ -2552,11 +1989,11 @@ fn group_by_is_empty(expr: &GroupByExpr) -> bool {
 
 #[derive(Clone)]
 pub struct RangeSelectRows {
-    rows: Vec<Vec<DslValue>>,
+    rows: Vec<Vec<PlanValue>>,
 }
 
 impl RangeSelectRows {
-    pub fn into_rows(self) -> Vec<Vec<DslValue>> {
+    pub fn into_rows(self) -> Vec<Vec<PlanValue>> {
         self.rows
     }
 }
@@ -2564,7 +2001,7 @@ impl RangeSelectRows {
 #[derive(Clone)]
 enum RangeProjection {
     Column,
-    Literal(DslValue),
+    Literal(PlanValue),
 }
 
 #[derive(Clone)]
@@ -2658,12 +2095,12 @@ pub fn extract_rows_from_range(select: &Select) -> DslResult<Option<RangeSelectR
         ));
     }
 
-    let mut rows: Vec<Vec<DslValue>> = Vec::with_capacity(spec.row_count);
+    let mut rows: Vec<Vec<PlanValue>> = Vec::with_capacity(spec.row_count);
     for idx in 0..spec.row_count {
-        let mut row: Vec<DslValue> = Vec::with_capacity(projections.len());
+        let mut row: Vec<PlanValue> = Vec::with_capacity(projections.len());
         for projection in &projections {
             match projection {
-                RangeProjection::Column => row.push(DslValue::Integer(idx as i64)),
+                RangeProjection::Column => row.push(PlanValue::Integer(idx as i64)),
                 RangeProjection::Literal(value) => row.push(value.clone()),
             }
         }
@@ -2789,8 +2226,8 @@ fn parse_range_spec_from_args(
 
     let value = dsl_value_from_sql_expr(arg_expr)?;
     let row_count = match value {
-        DslValue::Integer(v) if v >= 0 => v as usize,
-        DslValue::Integer(_) => {
+        PlanValue::Integer(v) if v >= 0 => v as usize,
+        PlanValue::Integer(_) => {
             return Err(Error::InvalidArgumentError(
                 "range() argument must be non-negative".into(),
             ));
@@ -2817,12 +2254,6 @@ fn parse_range_spec_from_args(
         column_name_lower,
         table_alias_lower,
     }))
-}
-
-#[derive(Clone, Debug)]
-pub struct RowBatch {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<DslValue>>,
 }
 
 pub struct CreateTableBuilder<'ctx, P>
@@ -2868,7 +2299,7 @@ where
 
 #[derive(Clone, Debug, Default)]
 pub struct Row {
-    values: Vec<(String, DslValue)>,
+    values: Vec<(String, PlanValue)>,
 }
 
 impl Row {
@@ -2876,12 +2307,12 @@ impl Row {
         Self { values: Vec::new() }
     }
 
-    pub fn with(mut self, name: impl Into<String>, value: impl Into<DslValue>) -> Self {
+    pub fn with(mut self, name: impl Into<String>, value: impl Into<PlanValue>) -> Self {
         self.set(name, value);
         self
     }
 
-    pub fn set(&mut self, name: impl Into<String>, value: impl Into<DslValue>) -> &mut Self {
+    pub fn set(&mut self, name: impl Into<String>, value: impl Into<PlanValue>) -> &mut Self {
         let name = name.into();
         let value = value.into();
         if let Some((_, existing)) = self.values.iter_mut().find(|(n, _)| *n == name) {
@@ -2896,7 +2327,7 @@ impl Row {
         self.values.iter().map(|(n, _)| n.clone()).collect()
     }
 
-    fn values_for_columns(&self, columns: &[String]) -> DslResult<Vec<DslValue>> {
+    fn values_for_columns(&self, columns: &[String]) -> DslResult<Vec<PlanValue>> {
         let mut out = Vec::with_capacity(columns.len());
         for column in columns {
             let value = self
@@ -2923,9 +2354,9 @@ pub fn row() -> Row {
 pub enum InsertRowKind {
     Named {
         columns: Vec<String>,
-        values: Vec<DslValue>,
+        values: Vec<PlanValue>,
     },
-    Positional(Vec<DslValue>),
+    Positional(Vec<PlanValue>),
 }
 
 pub trait IntoInsertRow {
@@ -2946,18 +2377,13 @@ impl IntoInsertRow for Row {
     }
 }
 
-impl<T> IntoInsertRow for &T
-where
-    T: Clone + IntoInsertRow,
-{
-    fn into_insert_row(self) -> DslResult<InsertRowKind> {
-        self.clone().into_insert_row()
-    }
-}
+// Remove the generic impl for `&T` which caused unconditional-recursion
+// and noop-clone clippy warnings. Callers can pass owned values or use
+// the provided tuple/array/Vec implementations.
 
 impl<T> IntoInsertRow for Vec<T>
 where
-    T: Into<DslValue>,
+    T: Into<PlanValue>,
 {
     fn into_insert_row(self) -> DslResult<InsertRowKind> {
         if self.is_empty() {
@@ -2973,7 +2399,7 @@ where
 
 impl<T, const N: usize> IntoInsertRow for [T; N]
 where
-    T: Into<DslValue>,
+    T: Into<PlanValue>,
 {
     fn into_insert_row(self) -> DslResult<InsertRowKind> {
         if N == 0 {
@@ -2991,7 +2417,7 @@ macro_rules! impl_into_insert_row_tuple {
     ($($type:ident => $value:ident),+) => {
         impl<$($type,)+> IntoInsertRow for ($($type,)+)
         where
-            $($type: Into<DslValue>,)+
+            $($type: Into<PlanValue>,)+
         {
             fn into_insert_row(self) -> DslResult<InsertRowKind> {
                 let ($($value,)+) = self;
@@ -3067,7 +2493,7 @@ where
         let schema = table.schema.as_ref();
         let schema_column_names: Vec<String> =
             schema.columns.iter().map(|col| col.name.clone()).collect();
-        let mut normalized_rows: Vec<Vec<DslValue>> = Vec::new();
+        let mut normalized_rows: Vec<Vec<PlanValue>> = Vec::new();
         let mut mode: Option<InsertMode> = None;
         let mut column_names: Option<Vec<String>> = None;
         let mut row_count = 0usize;
@@ -3243,9 +2669,9 @@ mod tests {
             .expect("create table");
         table
             .insert_rows([
-                (DslValue::Null,),
-                (DslValue::Integer(1),),
-                (DslValue::Null,),
+                (PlanValue::Null,),
+                (PlanValue::Integer(1),),
+                (PlanValue::Null,),
             ])
             .expect("insert rows");
 

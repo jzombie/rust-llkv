@@ -1,6 +1,5 @@
 [package]
-name = "llkv-plan"
-description = "Query planner for the LLKV toolkit."
+name = "llkv-transaction"
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -10,11 +9,14 @@ publish.workspace = true
 
 [dependencies]
 arrow = { workspace = true, default-features = false }
+llkv-column-map.workspace = true
+llkv-executor.workspace = true
 llkv-expr.workspace = true
+llkv-plan.workspace = true
 llkv-result.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
+llkv-storage.workspace = true
+llkv-table.workspace = true
+simd-r-drive-entry-handle.workspace = true
+rustc-hash.workspace = true
 
 [dev-dependencies]
-llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }

@@ -65,7 +65,7 @@ fn table_persistence_many_columns_simd_r_drive() {
         let table = Table::new(TID, pager).expect("new table");
 
         let schema = Arc::new(Schema::new(vec![
-            // row_id must be non-nullable u64
+            // Row ID must be non-nullable u64
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             field_with_fid("u64_col", DataType::UInt64, F_U64, false),
             field_with_fid("i32_col", DataType::Int32, F_I32, false),

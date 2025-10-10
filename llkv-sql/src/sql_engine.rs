@@ -6,9 +6,10 @@ use crate::SqlResult;
 use crate::SqlValue;
 
 use llkv_dsl::{
-    AggregateExpr, ColumnAssignment, ColumnSpec, CreateTablePlan, CreateTableSource, DslContext,
-    DslValue, InsertPlan, InsertSource, OrderByPlan, OrderSortType, OrderTarget, SelectExecution,
-    SelectPlan, SelectProjection, StatementResult, UpdatePlan, extract_rows_from_range,
+    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateTablePlan,
+    CreateTableSource, DeletePlan, DslContext, InsertPlan, InsertSource, OrderByPlan,
+    OrderSortType, OrderTarget, PlanValue, SelectExecution, SelectPlan, SelectProjection, Session,
+    StatementResult, UpdatePlan, extract_rows_from_range,
 };
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
@@ -16,8 +17,8 @@ use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
-    ColumnOptionDef, DataType as SqlDataType, ExceptionWhen, Expr as SqlExpr, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName,
+    ColumnOptionDef, DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName,
     ObjectNamePart, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, Set, SetExpr, Statement, TableFactor, TableObject,
     TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator, UpdateTableFromKind,
@@ -31,23 +32,90 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     context: Arc<DslContext<P>>,
+    session: Session<P>,
     default_nulls_first: AtomicBool,
 }
 
+impl<P> Clone for SqlEngine<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        // Create a new session from the same context
+        Self {
+            context: Arc::clone(&self.context),
+            session: self.context.create_session(),
+            default_nulls_first: AtomicBool::new(
+                self.default_nulls_first.load(AtomicOrdering::Relaxed),
+            ),
+        }
+    }
+}
+
+#[allow(dead_code)]
 impl<P> SqlEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
+    fn map_table_error(table_name: &str, err: Error) -> Error {
+        match err {
+            Error::NotFound => Self::table_not_found_error(table_name),
+            Error::InvalidArgumentError(msg) if msg.contains("unknown table") => {
+                Self::table_not_found_error(table_name)
+            }
+            other => other,
+        }
+    }
+
+    fn table_not_found_error(table_name: &str) -> Error {
+        Error::CatalogError(format!(
+            "Catalog Error: Table '{table_name}' does not exist"
+        ))
+    }
+
+    fn is_table_missing_error(err: &Error) -> bool {
+        match err {
+            Error::NotFound => true,
+            Error::CatalogError(msg) => {
+                msg.contains("Catalog Error: Table") || msg.contains("unknown table")
+            }
+            Error::InvalidArgumentError(msg) => {
+                msg.contains("Catalog Error: Table") || msg.contains("unknown table")
+            }
+            _ => false,
+        }
+    }
+
     pub fn new(pager: Arc<P>) -> Self {
+        let context = Arc::new(DslContext::new(pager));
+        let session = context.create_session();
         Self {
-            context: Arc::new(DslContext::new(pager)),
+            context: Arc::clone(&context),
+            session,
             default_nulls_first: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn context_arc(&self) -> Arc<DslContext<P>> {
+        Arc::clone(&self.context)
+    }
+
+    pub fn with_context(context: Arc<DslContext<P>>, default_nulls_first: bool) -> Self {
+        let session = context.create_session();
+        Self {
+            context: Arc::clone(&context),
+            session,
+            default_nulls_first: AtomicBool::new(default_nulls_first),
         }
     }
 
     #[cfg(test)]
     fn default_nulls_first_for_tests(&self) -> bool {
         self.default_nulls_first.load(AtomicOrdering::Relaxed)
+    }
+
+    fn has_active_transaction(&self) -> bool {
+        self.session.has_active_transaction()
     }
 
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<StatementResult<P>>> {
@@ -64,17 +132,6 @@ where
 
     fn execute_statement(&self, statement: Statement) -> SqlResult<StatementResult<P>> {
         match statement {
-            Statement::CreateTable(stmt) => self.handle_create_table(stmt),
-            Statement::Insert(stmt) => self.handle_insert(stmt),
-            Statement::Query(query) => self.handle_query(*query),
-            Statement::Update {
-                table,
-                assignments,
-                from,
-                selection,
-                returning,
-                ..
-            } => self.handle_update(table, assignments, from, selection, returning),
             Statement::StartTransaction {
                 modes,
                 begin,
@@ -98,11 +155,103 @@ where
                 modifier,
             } => self.handle_commit(chain, end, modifier),
             Statement::Rollback { chain, savepoint } => self.handle_rollback(chain, savepoint),
+            other => self.execute_statement_non_transactional(other),
+        }
+    }
+
+    fn execute_statement_non_transactional(
+        &self,
+        statement: Statement,
+    ) -> SqlResult<StatementResult<P>> {
+        match statement {
+            Statement::CreateTable(stmt) => self.handle_create_table(stmt),
+            Statement::Insert(stmt) => self.handle_insert(stmt),
+            Statement::Query(query) => self.handle_query(*query),
+            Statement::Update {
+                table,
+                assignments,
+                from,
+                selection,
+                returning,
+                ..
+            } => self.handle_update(table, assignments, from, selection, returning),
+            Statement::Delete(delete) => self.handle_delete(delete),
             Statement::Set(set_stmt) => self.handle_set(set_stmt),
+            Statement::Pragma { name, value, is_eq } => self.handle_pragma(name, value, is_eq),
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported SQL statement: {other:?}"
             ))),
         }
+    }
+
+    fn table_name_from_insert(insert: &sqlparser::ast::Insert) -> SqlResult<String> {
+        match &insert.table {
+            TableObject::TableName(name) => Self::object_name_to_string(name),
+            _ => Err(Error::InvalidArgumentError(
+                "INSERT requires a plain table name".into(),
+            )),
+        }
+    }
+
+    fn table_name_from_update(table: &TableWithJoins) -> SqlResult<Option<String>> {
+        if !table.joins.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "UPDATE with JOIN targets is not supported yet".into(),
+            ));
+        }
+        Self::table_with_joins_name(table)
+    }
+
+    fn table_name_from_delete(delete: &Delete) -> SqlResult<Option<String>> {
+        if !delete.tables.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "multi-table DELETE is not supported yet".into(),
+            ));
+        }
+        let from_tables = match &delete.from {
+            FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+        };
+        if from_tables.is_empty() {
+            return Ok(None);
+        }
+        if from_tables.len() != 1 {
+            return Err(Error::InvalidArgumentError(
+                "DELETE over multiple tables is not supported yet".into(),
+            ));
+        }
+        Self::table_with_joins_name(&from_tables[0])
+    }
+
+    fn object_name_to_string(name: &ObjectName) -> SqlResult<String> {
+        let (display, _) = canonical_object_name(name)?;
+        Ok(display)
+    }
+
+    #[allow(dead_code)]
+    fn table_object_to_name(table: &TableObject) -> SqlResult<Option<String>> {
+        match table {
+            TableObject::TableName(name) => Ok(Some(Self::object_name_to_string(name)?)),
+            TableObject::TableFunction(_) => Ok(None),
+        }
+    }
+
+    fn table_with_joins_name(table: &TableWithJoins) -> SqlResult<Option<String>> {
+        match &table.relation {
+            TableFactor::Table { name, .. } => Ok(Some(Self::object_name_to_string(name)?)),
+            _ => Ok(None),
+        }
+    }
+
+    fn tables_in_query(query: &Query) -> SqlResult<Vec<String>> {
+        let mut tables = Vec::new();
+        if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
+            for table in &select.from {
+                if let TableFactor::Table { name, .. } = &table.relation {
+                    tables.push(Self::object_name_to_string(name)?);
+                }
+            }
+        }
+        Ok(tables)
     }
 
     fn handle_create_table(
@@ -163,7 +312,7 @@ where
             columns,
             source: None,
         };
-        self.context.create_table_plan(plan)
+        self.session.create_table_plan(plan)
     }
 
     fn handle_create_table_as(
@@ -189,7 +338,7 @@ where
             columns: Vec::new(),
             source: Some(CreateTableSource::Batches { schema, batches }),
         };
-        self.context.create_table_plan(plan)
+        self.session.create_table_plan(plan)
     }
 
     fn handle_insert(&self, stmt: sqlparser::ast::Insert) -> SqlResult<StatementResult<P>> {
@@ -261,7 +410,7 @@ where
                 }
                 InsertSource::Rows(
                     rows.into_iter()
-                        .map(|row| row.into_iter().map(DslValue::from).collect())
+                        .map(|row| row.into_iter().map(PlanValue::from).collect())
                         .collect(),
                 )
             }
@@ -284,11 +433,13 @@ where
         };
 
         let plan = InsertPlan {
-            table: display_name,
+            table: display_name.clone(),
             columns,
             source: insert_source,
         };
-        self.context.insert(plan)
+        self.session
+            .insert(plan)
+            .map_err(|err| Self::map_table_error(&display_name, err))
     }
 
     fn handle_update(
@@ -328,10 +479,19 @@ where
                     column_name
                 )));
             }
-            let value = SqlValue::try_from_expr(&assignment.value)?;
+            let value = match SqlValue::try_from_expr(&assignment.value) {
+                Ok(literal) => AssignmentValue::Literal(PlanValue::from(literal)),
+                Err(Error::InvalidArgumentError(msg))
+                    if msg.contains("unsupported literal expression") =>
+                {
+                    let translated = translate_scalar(&assignment.value)?;
+                    AssignmentValue::Expression(translated)
+                }
+                Err(err) => return Err(err),
+            };
             column_assignments.push(ColumnAssignment {
                 column: column_name,
-                value: DslValue::from(value),
+                value,
             });
         }
 
@@ -341,11 +501,71 @@ where
         };
 
         let plan = UpdatePlan {
-            table: display_name,
+            table: display_name.clone(),
             assignments: column_assignments,
             filter,
         };
-        self.context.update(plan)
+        self.session
+            .update(plan)
+            .map_err(|err| Self::map_table_error(&display_name, err))
+    }
+
+    #[allow(clippy::collapsible_if)]
+    fn handle_delete(&self, delete: Delete) -> SqlResult<StatementResult<P>> {
+        let Delete {
+            tables,
+            from,
+            using,
+            selection,
+            returning,
+            order_by,
+            limit,
+        } = delete;
+
+        if !tables.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "multi-table DELETE is not supported yet".into(),
+            ));
+        }
+        if let Some(using_tables) = using {
+            if !using_tables.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "DELETE ... USING is not supported yet".into(),
+                ));
+            }
+        }
+        if returning.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "DELETE ... RETURNING is not supported".into(),
+            ));
+        }
+        if !order_by.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "DELETE ... ORDER BY is not supported yet".into(),
+            ));
+        }
+        if limit.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "DELETE ... LIMIT is not supported yet".into(),
+            ));
+        }
+
+        let from_tables = match from {
+            FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+        };
+        let (display_name, _) = extract_single_table(&from_tables)?;
+
+        let filter = selection
+            .map(|expr| translate_condition(&expr))
+            .transpose()?;
+
+        let plan = DeletePlan {
+            table: display_name.clone(),
+            filter,
+        };
+        self.session
+            .delete(plan)
+            .map_err(|err| Self::map_table_error(&display_name, err))
     }
 
     fn handle_query(&self, query: Query) -> SqlResult<StatementResult<P>> {
@@ -378,7 +598,16 @@ where
             let order_plan = self.translate_order_by(order_by)?;
             select_plan = select_plan.with_order_by(Some(order_plan));
         }
-        self.context.execute_select(select_plan)
+        let table_name = select_plan.table.clone();
+        // Use session.select() to go through transaction system if active
+        match self.session.select(select_plan) {
+            Ok(StatementResult::Select { execution, .. }) => Ok(execution),
+            Ok(other) => Err(Error::Internal(format!(
+                "Expected Select result, got {:?}",
+                other
+            ))),
+            Err(err) => Err(Self::map_table_error(&table_name, err)),
+        }
     }
 
     fn translate_select(&self, select: &Select) -> SqlResult<SelectPlan> {
@@ -782,7 +1011,8 @@ where
             // Currently treat START TRANSACTION same as BEGIN
             tracing::warn!("Currently treat `START TRANSACTION` same as `BEGIN`")
         }
-        self.context.begin_transaction()
+
+        self.session.begin_transaction()
     }
 
     fn handle_commit(
@@ -806,7 +1036,8 @@ where
                 "transaction modifiers are not supported".into(),
             ));
         }
-        self.context.commit_transaction()
+
+        self.session.commit_transaction()
     }
 
     fn handle_rollback(
@@ -824,7 +1055,8 @@ where
                 "ROLLBACK TO SAVEPOINT is not supported".into(),
             ));
         }
-        self.context.rollback_transaction()
+
+        self.session.rollback_transaction()
     }
 
     fn handle_set(&self, set_stmt: Set) -> SqlResult<StatementResult<P>> {
@@ -879,6 +1111,28 @@ where
             }
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported SQL SET statement: {other:?}",
+            ))),
+        }
+    }
+
+    fn handle_pragma(
+        &self,
+        name: ObjectName,
+        value: Option<Value>,
+        is_eq: bool,
+    ) -> SqlResult<StatementResult<P>> {
+        let (display, canonical) = canonical_object_name(&name)?;
+        if value.is_some() || is_eq {
+            return Err(Error::InvalidArgumentError(format!(
+                "PRAGMA '{display}' does not accept a value"
+            )));
+        }
+
+        match canonical.as_str() {
+            "enable_verification" | "disable_verification" => Ok(StatementResult::NoOp),
+            _ => Err(Error::InvalidArgumentError(format!(
+                "unsupported PRAGMA '{}'",
+                display
             ))),
         }
     }
@@ -1311,7 +1565,7 @@ fn arrow_type_from_sql(data_type: &SqlDataType) -> SqlResult<arrow::datatypes::D
     }
 }
 
-fn extract_constant_select_rows(select: &Select) -> SqlResult<Option<Vec<Vec<DslValue>>>> {
+fn extract_constant_select_rows(select: &Select) -> SqlResult<Option<Vec<Vec<PlanValue>>>> {
     if !select.from.is_empty() {
         return Ok(None);
     }
@@ -1339,7 +1593,7 @@ fn extract_constant_select_rows(select: &Select) -> SqlResult<Option<Vec<Vec<Dsl
         ));
     }
 
-    let mut row: Vec<DslValue> = Vec::with_capacity(select.projection.len());
+    let mut row: Vec<PlanValue> = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
         let expr = match item {
             SelectItem::UnnamedExpr(expr) => expr,
@@ -1352,7 +1606,7 @@ fn extract_constant_select_rows(select: &Select) -> SqlResult<Option<Vec<Vec<Dsl
         };
 
         let value = SqlValue::try_from_expr(expr)?;
-        row.push(DslValue::from(value));
+        row.push(PlanValue::from(value));
     }
 
     Ok(Some(vec![row]))

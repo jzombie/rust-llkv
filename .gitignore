@@ -25,3 +25,5 @@ out.txt
 **/*.dot
 
 .cargo_home/
+
+temp/

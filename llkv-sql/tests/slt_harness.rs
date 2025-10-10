@@ -5,6 +5,7 @@ fn slt_harness() {
     // Create an engine factory closure that will be passed to the shared
     // harness. Keep this file minimal — the real harness lives in
     // `llkv-test-utils`.
+    use llkv_dsl::DslContext;
     use llkv_sql::SqlEngine;
     use llkv_storage::pager::MemPager;
     use std::sync::Arc;
@@ -20,11 +21,26 @@ fn slt_harness() {
         engine: SqlEngine<MemPager>,
     }
     impl EngineHarness {
-        pub fn new() -> Self {
+        pub fn new(engine: SqlEngine<MemPager>) -> Self {
+            Self { engine }
+        }
+    }
+
+    // Shared context holder that's created once per test file
+    #[derive(Clone)]
+    struct SharedContext {
+        context: Arc<DslContext<MemPager>>,
+    }
+
+    impl SharedContext {
+        fn new() -> Self {
             let pager = Arc::new(MemPager::default());
-            Self {
-                engine: SqlEngine::new(pager),
-            }
+            let context = Arc::new(DslContext::new(pager));
+            Self { context }
+        }
+
+        fn make_engine(&self) -> SqlEngine<MemPager> {
+            SqlEngine::with_context(Arc::clone(&self.context), false)
         }
     }
 
@@ -128,6 +144,9 @@ fn slt_harness() {
                         StatementResult::Update { rows_updated, .. } => {
                             Ok(DBOutput::StatementComplete(rows_updated as u64))
                         }
+                        StatementResult::Delete { rows_deleted, .. } => {
+                            Ok(DBOutput::StatementComplete(rows_deleted as u64))
+                        }
                         StatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
                         StatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
                         StatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
@@ -140,8 +159,22 @@ fn slt_harness() {
         async fn shutdown(&mut self) {}
     }
 
-    // Construct and pass a factory closure to the shared harness.
-    slt::run_slt_harness("tests/slt", || async { Ok::<_, ()>(EngineHarness::new()) });
+    // Construct and pass a factory-factory closure to the shared harness.
+    // The outer closure is called once per test file to create a fresh SharedContext.
+    // The returned inner closure is called once per connection within that test file.
+    // This ensures connections within a test share state, but different tests are isolated.
+    slt::run_slt_harness("tests/slt", || {
+        // This outer closure is called once per test file - create a fresh context
+        let shared = SharedContext::new();
+        // Return a factory that will be called for each connection in this test
+        move || {
+            let shared_clone = shared.clone();
+            async move {
+                let engine = shared_clone.make_engine();
+                Ok::<_, ()>(EngineHarness::new(engine))
+            }
+        }
+    });
 }
 
 // Unit tests for the mapping/expansion helpers live in `llkv-test-utils`.

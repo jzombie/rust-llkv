@@ -1,5 +1,5 @@
 use crate::SqlResult;
-use llkv_dsl::DslValue;
+use llkv_plan::plans::PlanValue;
 use llkv_result::Error;
 use sqlparser::ast::{Expr as SqlExpr, UnaryOperator, Value, ValueWithSpan};
 
@@ -76,13 +76,13 @@ fn parse_number_literal(text: &str) -> SqlResult<SqlValue> {
     }
 }
 
-impl From<SqlValue> for DslValue {
+impl From<SqlValue> for PlanValue {
     fn from(value: SqlValue) -> Self {
         match value {
-            SqlValue::Null => DslValue::Null,
-            SqlValue::Integer(v) => DslValue::Integer(v),
-            SqlValue::Float(v) => DslValue::Float(v),
-            SqlValue::String(s) => DslValue::String(s),
+            SqlValue::Null => PlanValue::Null,
+            SqlValue::Integer(v) => PlanValue::Integer(v),
+            SqlValue::Float(v) => PlanValue::Float(v),
+            SqlValue::String(s) => PlanValue::String(s),
         }
     }
 }

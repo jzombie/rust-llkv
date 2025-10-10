@@ -1,7 +1,7 @@
 //! Simple and fragmented sum benches using the ColumnStore API.
 //!
 //! Notes for the new API:
-//! - Every RecordBatch must include a non-nullable UInt64 "row_id" column.
+//! - Every RecordBatch must include a non-nullable UInt64 "id" column.
 //! - Only data columns carry "field_id" metadata.
 //!
 //! Run:
