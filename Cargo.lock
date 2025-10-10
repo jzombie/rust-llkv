@@ -1218,6 +1218,7 @@ dependencies = [
  "arrow",
  "llkv-column-map",
  "llkv-expr",
+ "llkv-plan",
  "llkv-result",
  "llkv-storage",
  "llkv-table",
@@ -1258,6 +1259,9 @@ dependencies = [
 name = "llkv-plan"
 version = "0.2.0-alpha"
 dependencies = [
+ "arrow",
+ "llkv-expr",
+ "llkv-result",
  "llkv-test-utils",
  "serde",
  "serde_json",

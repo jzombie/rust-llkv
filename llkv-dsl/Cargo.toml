@@ -11,6 +11,7 @@ publish.workspace = true
 arrow = { workspace = true, default-features = false }
 llkv-column-map.workspace = true
 llkv-expr.workspace = true
+llkv-plan.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true
 llkv-table.workspace = true
