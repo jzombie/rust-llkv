@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 arrow = { workspace = true, default-features = false }
+llkv-aggregate.workspace = true
 llkv-column-map.workspace = true
 llkv-expr.workspace = true
 llkv-plan.workspace = true

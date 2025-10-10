@@ -7,6 +7,7 @@ repository = "https://github.com/jzombie/rust-llkv"
 publish = true
 
 [workspace.dependencies]
+llkv-aggregate = { path = "./llkv-aggregate", version = "0.2.0-alpha" }
 llkv-column-map = { path = "./llkv-column-map", version = "0.2.0-alpha" }
 llkv-csv = { path = "./llkv-csv", version = "0.2.0-alpha" }
 llkv-dsl = { path = "./llkv-dsl", version = "0.2.0-alpha" }
@@ -53,6 +54,7 @@ tracing-subscriber = { version = "0.3.2", features = ["env-filter"] }
 
 [workspace]
 members = [
+    "llkv-aggregate",
     "llkv-column-map",
     "llkv-csv",
     "llkv-dsl",

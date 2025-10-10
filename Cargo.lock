@@ -1174,6 +1174,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd945864f07fe9f5371a27ad7b52a172b4b499999f1d97574c9fa68373937e12"
 
 [[package]]
+name = "llkv-aggregate"
+version = "0.2.0-alpha"
+dependencies = [
+ "arrow",
+ "llkv-result",
+ "llkv-table",
+]
+
+[[package]]
 name = "llkv-column-map"
 version = "0.2.0-alpha"
 dependencies = [
@@ -1235,6 +1244,7 @@ name = "llkv-executor"
 version = "0.2.0-alpha"
 dependencies = [
  "arrow",
+ "llkv-aggregate",
  "llkv-column-map",
  "llkv-expr",
  "llkv-plan",
