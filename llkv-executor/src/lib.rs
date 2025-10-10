@@ -1,20 +1,18 @@
-use arrow::array::{
-    Array, ArrayRef, Date32Array, Float64Array, Int64Array, Int64Builder, RecordBatch, StringArray,
-};
+use arrow::array::{Array, ArrayRef, Int64Array, Int64Builder, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
-use llkv_expr::literal::Literal;
 use llkv_plan::{
-    AggregateExpr, AggregateFunction, OrderByPlan, OrderSortType, OrderTarget, SelectPlan, PlanValue,
+    AggregateExpr, AggregateFunction, OrderByPlan, OrderSortType, OrderTarget, PlanValue,
+    SelectPlan,
 };
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
 use llkv_table::table::{
-    ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
+    ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions,
 };
-use llkv_table::types::{FieldId, TableId};
+use llkv_table::types::FieldId;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::collections::HashMap;
 use std::fmt;

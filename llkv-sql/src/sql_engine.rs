@@ -8,8 +8,8 @@ use crate::SqlValue;
 use llkv_dsl::{
     AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateTablePlan,
     CreateTableSource, DeletePlan, DslContext, InsertPlan, InsertSource, OrderByPlan,
-    OrderSortType, OrderTarget, SelectExecution, SelectPlan, SelectProjection, Session,
-    StatementResult, UpdatePlan, extract_rows_from_range, PlanValue,
+    OrderSortType, OrderTarget, PlanValue, SelectExecution, SelectPlan, SelectProjection, Session,
+    StatementResult, UpdatePlan, extract_rows_from_range,
 };
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
@@ -52,6 +52,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 impl<P> SqlEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
@@ -1604,8 +1605,8 @@ fn extract_constant_select_rows(select: &Select) -> SqlResult<Option<Vec<Vec<Pla
             }
         };
 
-    let value = SqlValue::try_from_expr(expr)?;
-    row.push(PlanValue::from(value));
+        let value = SqlValue::try_from_expr(expr)?;
+        row.push(PlanValue::from(value));
     }
 
     Ok(Some(vec![row]))

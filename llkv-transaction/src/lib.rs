@@ -113,6 +113,11 @@ pub struct TableDeltaState {
 }
 
 impl TableDeltaState {
+    // This constructor is used by or_insert_with(TableDeltaState::new)
+    // in several places but may be flagged as unused by clippy in some
+    // build configurations. Allow dead_code here to silence that warning
+    // while keeping the constructor available for potential future use.
+    #[allow(dead_code)]
     fn new() -> Self {
         Self {
             seeded_filters: HashSet::new(),
@@ -288,6 +293,10 @@ where
     }
 
     /// Seed rows from base table for UPDATE/DELETE operations.
+    // May be used by UPDATE/DELETE code paths in the future; keep it
+    // but allow dead_code so CI (clippy -D warnings) won't fail when it's
+    // not referenced in all build configurations.
+    #[allow(dead_code)]
     fn seed_rows_for_update(
         &mut self,
         table_name: &str,
@@ -337,6 +346,9 @@ where
     }
 
     /// Record an exclusion predicate for UPDATE/DELETE.
+    // Similar rationale as seed_rows_for_update: keep the helper but
+    // allow dead_code until it's wired into all code paths.
+    #[allow(dead_code)]
     fn record_update_exclusion(
         &mut self,
         table_name: &str,
@@ -387,27 +399,29 @@ where
         } else {
             // Apply exclusion filters if needed
             let mut modified_plan = plan.clone();
-            if let Some(delta) = self.table_deltas.get(&plan.table) {
-                if !delta.exclusion_predicates.is_empty() {
-                    // Combine existing filter with NOT (exclusion predicates)
-                    let mut filters = Vec::new();
+            if let Some(delta) = self
+                .table_deltas
+                .get(&plan.table)
+                .filter(|d| !d.exclusion_predicates.is_empty())
+            {
+                // Combine existing filter with NOT (exclusion predicates)
+                let mut filters = Vec::new();
 
-                    // Add existing filter if present
-                    if let Some(existing) = modified_plan.filter.clone() {
-                        filters.push(existing);
-                    }
+                // Add existing filter if present
+                if let Some(existing) = modified_plan.filter.clone() {
+                    filters.push(existing);
+                }
 
-                    // Add NOT (exclusion) for each exclusion predicate
-                    for exclusion in &delta.exclusion_predicates {
-                        filters.push(LlkvExpr::Not(Box::new(exclusion.clone())));
-                    }
+                // Add NOT (exclusion) for each exclusion predicate
+                for exclusion in &delta.exclusion_predicates {
+                    filters.push(LlkvExpr::Not(Box::new(exclusion.clone())));
+                }
 
-                    // Combine all filters with AND
-                    if filters.len() == 1 {
-                        modified_plan.filter = Some(filters.into_iter().next().unwrap());
-                    } else if filters.len() > 1 {
-                        modified_plan.filter = Some(LlkvExpr::And(filters));
-                    }
+                // Combine all filters with AND
+                if filters.len() == 1 {
+                    modified_plan.filter = Some(filters.into_iter().next().unwrap());
+                } else if filters.len() > 1 {
+                    modified_plan.filter = Some(LlkvExpr::And(filters));
                 }
             }
 

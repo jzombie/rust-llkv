@@ -1,4 +1,4 @@
-use super::{ExecutorResult, ExecutorTable, FieldId, ScanProjection};
+use super::{ExecutorResult, ExecutorTable, ScanProjection};
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_expr::expr::ScalarExpr;
 use llkv_expr::literal::Literal;

@@ -5,25 +5,23 @@ use std::fmt;
 use std::mem;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
-    Array, ArrayRef, Date32Array, Date32Builder, Float64Array, Float64Builder, Int64Array,
-    Int64Builder, StringArray, StringBuilder, UInt64Array, UInt64Builder, new_null_array,
+    ArrayRef, Date32Builder, Float64Builder, Int64Builder, StringBuilder, UInt64Array,
+    UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
-use llkv_column_map::store::{Projection as StoreProjection, ROW_ID_COLUMN_NAME};
+use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
-use llkv_expr::literal::Literal;
+// Literal is not used at top-level; keep it out to avoid unused import warnings.
 use llkv_result::Error;
 use llkv_storage::pager::{MemPager, Pager};
-use llkv_table::table::{
-    ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
-};
+use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, TableId};
 use llkv_table::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -149,6 +147,7 @@ where
 {
     /// Convert a StatementResult from one pager type to another.
     /// Only works for non-SELECT results (CreateTable, Insert, Update, Delete, NoOp, Transaction).
+    #[allow(dead_code)]
     pub(crate) fn convert_pager_type<Q>(self) -> DslResult<StatementResult<Q>>
     where
         Q: Pager<Blob = EntryHandle> + Send + Sync,
@@ -378,7 +377,7 @@ where
             let result = TransactionContext::update(&**self.inner.context(), plan)?;
             match result {
                 llkv_transaction::StatementResult::Update {
-                    rows_matched,
+                    rows_matched: _,
                     rows_updated,
                 } => Ok(StatementResult::Update {
                     rows_updated,
@@ -2378,14 +2377,9 @@ impl IntoInsertRow for Row {
     }
 }
 
-impl<T> IntoInsertRow for &T
-where
-    T: Into<PlanValue>,
-{
-    fn into_insert_row(self) -> DslResult<InsertRowKind> {
-        self.clone().into_insert_row()
-    }
-}
+// Remove the generic impl for `&T` which caused unconditional-recursion
+// and noop-clone clippy warnings. Callers can pass owned values or use
+// the provided tuple/array/Vec implementations.
 
 impl<T> IntoInsertRow for Vec<T>
 where
