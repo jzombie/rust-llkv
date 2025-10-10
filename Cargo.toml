@@ -19,6 +19,7 @@ llkv-sql = { path = "./llkv-sql", version = "0.2.0-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.2.0-alpha" }
 llkv-table = { path = "./llkv-table", version = "0.2.0-alpha" }
 llkv-test-utils = { path = "./llkv-test-utils", version = "0.2.0-alpha" }
+llkv-transaction = { path = "./llkv-transaction", version = "0.2.0-alpha" }
 simd-r-drive = "0.15.0-alpha"
 simd-r-drive-entry-handle = "0.15.0-alpha"
 
@@ -63,6 +64,7 @@ members = [
     "llkv-sql",
     "llkv-storage",
     "llkv-table",
-    "llkv-test-utils"
+    "llkv-test-utils",
+    "llkv-transaction"
 ]
 resolver = "2"

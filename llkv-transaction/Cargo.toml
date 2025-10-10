@@ -1,5 +1,5 @@
 [package]
-name = "llkv-dsl"
+name = "llkv-transaction"
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -16,8 +16,7 @@ llkv-plan.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true
 llkv-table.workspace = true
-llkv-transaction.workspace = true
 simd-r-drive-entry-handle.workspace = true
-sqlparser.workspace = true
-time = { workspace = true, features = ["parsing"] }
-tracing.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]

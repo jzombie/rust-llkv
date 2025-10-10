@@ -7,8 +7,8 @@ use crate::SqlValue;
 
 use llkv_dsl::{
     AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateTablePlan,
-    CreateTableSource, DeletePlan, DslContext, DslSession, DslValue, InsertPlan, InsertSource,
-    OrderByPlan, OrderSortType, OrderTarget, SelectExecution, SelectPlan, SelectProjection,
+    CreateTableSource, DeletePlan, DslContext, DslValue, InsertPlan, InsertSource, OrderByPlan,
+    OrderSortType, OrderTarget, SelectExecution, SelectPlan, SelectProjection, Session,
     StatementResult, UpdatePlan, extract_rows_from_range,
 };
 use llkv_expr::literal::Literal;
@@ -31,19 +31,20 @@ pub struct SqlEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    session: DslSession<P>,
+    context: Arc<DslContext<P>>,
+    session: Session<P>,
     default_nulls_first: AtomicBool,
 }
 
 impl<P> Clone for SqlEngine<P>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         // Create a new session from the same context
-        let context = Arc::clone(self.session.context());
         Self {
-            session: context.create_session(),
+            context: Arc::clone(&self.context),
+            session: self.context.create_session(),
             default_nulls_first: AtomicBool::new(
                 self.default_nulls_first.load(AtomicOrdering::Relaxed),
             ),
@@ -86,19 +87,23 @@ where
 
     pub fn new(pager: Arc<P>) -> Self {
         let context = Arc::new(DslContext::new(pager));
+        let session = context.create_session();
         Self {
-            session: context.create_session(),
+            context: Arc::clone(&context),
+            session,
             default_nulls_first: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn context_arc(&self) -> Arc<DslContext<P>> {
-        Arc::clone(self.session.context())
+        Arc::clone(&self.context)
     }
 
     pub fn with_context(context: Arc<DslContext<P>>, default_nulls_first: bool) -> Self {
+        let session = context.create_session();
         Self {
-            session: context.create_session(),
+            context: Arc::clone(&context),
+            session,
             default_nulls_first: AtomicBool::new(default_nulls_first),
         }
     }
