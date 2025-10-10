@@ -1217,6 +1217,7 @@ version = "0.2.0-alpha"
 dependencies = [
  "arrow",
  "llkv-column-map",
+ "llkv-executor",
  "llkv-expr",
  "llkv-plan",
  "llkv-result",
@@ -1224,6 +1225,22 @@ dependencies = [
  "llkv-table",
  "simd-r-drive-entry-handle",
  "sqlparser",
+ "time",
+ "tracing",
+]
+
+[[package]]
+name = "llkv-executor"
+version = "0.2.0-alpha"
+dependencies = [
+ "arrow",
+ "llkv-column-map",
+ "llkv-expr",
+ "llkv-plan",
+ "llkv-result",
+ "llkv-storage",
+ "llkv-table",
+ "simd-r-drive-entry-handle",
  "time",
  "tracing",
 ]
