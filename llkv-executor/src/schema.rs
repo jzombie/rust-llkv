@@ -52,6 +52,7 @@ where
                         column.data_type.clone()
                     }
                     ScalarExpr::Binary { .. } => DataType::Float64,
+                    ScalarExpr::Aggregate(_) => DataType::Int64, // Aggregates return Int64
                 };
                 let field = Field::new(alias, dtype, true);
                 fields.push(field);

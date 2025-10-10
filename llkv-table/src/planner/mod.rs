@@ -684,6 +684,11 @@ where
                                     Error::Internal("missing dtype for computed column".into())
                                 })?
                             }
+                            ScalarExpr::Aggregate(_) => {
+                                // Aggregates in computed columns return Int64
+                                // TODO: Fix: This is a simplification - ideally we'd determine type from the aggregate
+                                DataType::Int64
+                            }
                         };
                         schema_fields.push(Field::new(info.alias.clone(), dtype, true));
                     }
@@ -1615,6 +1620,7 @@ fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::Literal(_) => false,
         ScalarExpr::Column(_) => true,
         ScalarExpr::Binary { .. } => true,
+        ScalarExpr::Aggregate(_) => false, // Aggregates are computed separately
     }
 }
 
@@ -1642,7 +1648,7 @@ fn synthesize_computed_literal_array(
         ScalarExpr::Literal(Literal::String(value)) => {
             Ok(Arc::new(StringArray::from(vec![value.clone(); row_count])) as ArrayRef)
         }
-        ScalarExpr::Column(_) | ScalarExpr::Binary { .. } => {
+        ScalarExpr::Column(_) | ScalarExpr::Binary { .. } | ScalarExpr::Aggregate(_) => {
             Ok(new_null_array(data_type, row_count))
         }
     }
@@ -1769,6 +1775,7 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
             format_binary_op(*op),
             format_scalar_expr(right)
         ),
+        ScalarExpr::Aggregate(agg) => format!("AGG({:?})", agg),
     }
 }
 

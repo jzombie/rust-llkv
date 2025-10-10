@@ -139,13 +139,25 @@ fn slt_harness() {
                             Ok(DBOutput::Rows { types, rows })
                         }
                         StatementResult::Insert { rows_inserted, .. } => {
-                            Ok(DBOutput::StatementComplete(rows_inserted as u64))
+                            // Return as a single-row result for compatibility with query directives
+                            Ok(DBOutput::Rows {
+                                types: vec![DefaultColumnType::Integer],
+                                rows: vec![vec![rows_inserted.to_string()]],
+                            })
                         }
                         StatementResult::Update { rows_updated, .. } => {
-                            Ok(DBOutput::StatementComplete(rows_updated as u64))
+                            // Return as a single-row result for compatibility with query directives
+                            Ok(DBOutput::Rows {
+                                types: vec![DefaultColumnType::Integer],
+                                rows: vec![vec![rows_updated.to_string()]],
+                            })
                         }
                         StatementResult::Delete { rows_deleted, .. } => {
-                            Ok(DBOutput::StatementComplete(rows_deleted as u64))
+                            // Return as a single-row result for compatibility with query directives
+                            Ok(DBOutput::Rows {
+                                types: vec![DefaultColumnType::Integer],
+                                rows: vec![vec![rows_deleted.to_string()]],
+                            })
                         }
                         StatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
                         StatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),

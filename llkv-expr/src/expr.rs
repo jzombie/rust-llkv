@@ -55,6 +55,20 @@ pub enum ScalarExpr<F> {
         op: BinaryOp,
         right: Box<ScalarExpr<F>>,
     },
+    /// Aggregate function call (e.g., COUNT(*), SUM(col), etc.)
+    /// This is used in expressions like COUNT(*) + 1
+    Aggregate(AggregateCall<F>),
+}
+
+/// Aggregate function call within a scalar expression
+#[derive(Clone, Debug)]
+pub enum AggregateCall<F> {
+    CountStar,
+    Count(F),
+    Sum(F),
+    Min(F),
+    Max(F),
+    CountNulls(F),
 }
 
 impl<F> ScalarExpr<F> {
@@ -75,6 +89,11 @@ impl<F> ScalarExpr<F> {
             op,
             right: Box::new(right),
         }
+    }
+
+    #[inline]
+    pub fn aggregate(call: AggregateCall<F>) -> Self {
+        Self::Aggregate(call)
     }
 }
 

@@ -366,11 +366,17 @@ where
     pub fn update(&self, plan: UpdatePlan) -> DslResult<StatementResult<P>> {
         if self.has_active_transaction() {
             let table_name = plan.table.clone();
-            self.inner.execute_operation(DslOperation::Update(plan))?;
-            Ok(StatementResult::Update {
-                rows_updated: 0, // We don't track this in transactions yet
-                table_name,
-            })
+            let result = self.inner.execute_operation(DslOperation::Update(plan))?;
+            match result {
+                llkv_transaction::StatementResult::Update {
+                    rows_matched: _,
+                    rows_updated,
+                } => Ok(StatementResult::Update {
+                    rows_updated,
+                    table_name,
+                }),
+                _ => Err(Error::Internal("expected Update result".into())),
+            }
         } else {
             // Call via TransactionContext trait
             let table_name = plan.table.clone();
@@ -392,11 +398,16 @@ where
     pub fn delete(&self, plan: DeletePlan) -> DslResult<StatementResult<P>> {
         if self.has_active_transaction() {
             let table_name = plan.table.clone();
-            self.inner.execute_operation(DslOperation::Delete(plan))?;
-            Ok(StatementResult::Delete {
-                rows_deleted: 0, // We don't track this in transactions yet
-                table_name,
-            })
+            let result = self.inner.execute_operation(DslOperation::Delete(plan))?;
+            match result {
+                llkv_transaction::StatementResult::Delete { rows_deleted } => {
+                    Ok(StatementResult::Delete {
+                        rows_deleted,
+                        table_name,
+                    })
+                }
+                _ => Err(Error::Internal("expected Delete result".into())),
+            }
         } else {
             // Call via TransactionContext trait
             let table_name = plan.table.clone();
@@ -1921,6 +1932,44 @@ fn translate_scalar(
                 right: Box::new(right_expr),
             })
         }
+        ScalarExpr::Aggregate(agg) => {
+            // Translate column names in aggregate calls to field IDs
+            use llkv_expr::expr::AggregateCall;
+            let translated_agg = match agg {
+                AggregateCall::CountStar => AggregateCall::CountStar,
+                AggregateCall::Count(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{name}' in aggregate"))
+                    })?;
+                    AggregateCall::Count(column.field_id)
+                }
+                AggregateCall::Sum(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{name}' in aggregate"))
+                    })?;
+                    AggregateCall::Sum(column.field_id)
+                }
+                AggregateCall::Min(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{name}' in aggregate"))
+                    })?;
+                    AggregateCall::Min(column.field_id)
+                }
+                AggregateCall::Max(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{name}' in aggregate"))
+                    })?;
+                    AggregateCall::Max(column.field_id)
+                }
+                AggregateCall::CountNulls(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{name}' in aggregate"))
+                    })?;
+                    AggregateCall::CountNulls(column.field_id)
+                }
+            };
+            Ok(ScalarExpr::Aggregate(translated_agg))
+        }
     }
 }
 
@@ -2006,6 +2055,9 @@ enum RangeProjection {
 
 #[derive(Clone)]
 pub struct RangeSpec {
+    start: i64,
+    #[allow(dead_code)] // Used for validation, computed into row_count
+    end: i64,
     row_count: usize,
     column_name_lower: String,
     table_alias_lower: Option<String>,
@@ -2064,43 +2116,44 @@ pub fn extract_rows_from_range(select: &Select) -> DslResult<Option<RangeSelectR
     }
 
     let mut projections: Vec<RangeProjection> = Vec::with_capacity(select.projection.len());
-    for item in &select.projection {
-        let projection = match item {
-            SelectItem::Wildcard(_) => RangeProjection::Column,
-            SelectItem::QualifiedWildcard(kind, _) => match kind {
-                SelectItemQualifiedWildcardKind::ObjectName(object_name) => {
-                    if spec.matches_object_name(object_name) {
-                        RangeProjection::Column
-                    } else {
+
+    // If projection is empty, treat it as SELECT * (implicit wildcard)
+    if select.projection.is_empty() {
+        projections.push(RangeProjection::Column);
+    } else {
+        for item in &select.projection {
+            let projection = match item {
+                SelectItem::Wildcard(_) => RangeProjection::Column,
+                SelectItem::QualifiedWildcard(kind, _) => match kind {
+                    SelectItemQualifiedWildcardKind::ObjectName(object_name) => {
+                        if spec.matches_object_name(object_name) {
+                            RangeProjection::Column
+                        } else {
+                            return Err(Error::InvalidArgumentError(
+                                "qualified wildcard must reference the range() source".into(),
+                            ));
+                        }
+                    }
+                    SelectItemQualifiedWildcardKind::Expr(_) => {
                         return Err(Error::InvalidArgumentError(
-                            "qualified wildcard must reference the range() source".into(),
+                            "expression-qualified wildcards are not supported for range() SELECT statements".into(),
                         ));
                     }
-                }
-                SelectItemQualifiedWildcardKind::Expr(_) => {
-                    return Err(Error::InvalidArgumentError(
-                        "expression-qualified wildcards are not supported for range() SELECT statements".into(),
-                    ));
-                }
-            },
-            SelectItem::UnnamedExpr(expr) => build_range_projection_expr(expr, &spec)?,
-            SelectItem::ExprWithAlias { expr, .. } => build_range_projection_expr(expr, &spec)?,
-        };
-        projections.push(projection);
-    }
-
-    if projections.is_empty() {
-        return Err(Error::InvalidArgumentError(
-            "SELECT projection must include at least one column".into(),
-        ));
+                },
+                SelectItem::UnnamedExpr(expr) => build_range_projection_expr(expr, &spec)?,
+                SelectItem::ExprWithAlias { expr, .. } => build_range_projection_expr(expr, &spec)?,
+            };
+            projections.push(projection);
+        }
     }
 
     let mut rows: Vec<Vec<PlanValue>> = Vec::with_capacity(spec.row_count);
     for idx in 0..spec.row_count {
         let mut row: Vec<PlanValue> = Vec::with_capacity(projections.len());
+        let value = spec.start + (idx as i64);
         for projection in &projections {
             match projection {
-                RangeProjection::Column => row.push(PlanValue::Integer(idx as i64)),
+                RangeProjection::Column => row.push(PlanValue::Integer(value)),
                 RangeProjection::Literal(value) => row.push(value.clone()),
             }
         }
@@ -2203,40 +2256,58 @@ fn parse_range_spec_from_args(
         return Ok(None);
     }
 
-    if args.len() != 1 {
+    if args.is_empty() || args.len() > 2 {
         return Err(Error::InvalidArgumentError(
-            "range() requires exactly one argument".into(),
+            "range() requires one or two arguments".into(),
         ));
     }
 
-    let arg_expr = match &args[0] {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
-        FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_))
-        | FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
-            return Err(Error::InvalidArgumentError(
+    // Helper to extract integer from argument
+    let extract_int = |arg: &FunctionArg| -> DslResult<i64> {
+        let arg_expr = match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+            FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_))
+            | FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                return Err(Error::InvalidArgumentError(
+                    "range() argument must be an integer literal".into(),
+                ));
+            }
+            FunctionArg::Named { .. } | FunctionArg::ExprNamed { .. } => {
+                return Err(Error::InvalidArgumentError(
+                    "named arguments are not supported for range()".into(),
+                ));
+            }
+        };
+
+        let value = dsl_value_from_sql_expr(arg_expr)?;
+        match value {
+            PlanValue::Integer(v) => Ok(v),
+            _ => Err(Error::InvalidArgumentError(
                 "range() argument must be an integer literal".into(),
-            ));
-        }
-        FunctionArg::Named { .. } | FunctionArg::ExprNamed { .. } => {
-            return Err(Error::InvalidArgumentError(
-                "named arguments are not supported for range()".into(),
-            ));
+            )),
         }
     };
 
-    let value = dsl_value_from_sql_expr(arg_expr)?;
-    let row_count = match value {
-        PlanValue::Integer(v) if v >= 0 => v as usize,
-        PlanValue::Integer(_) => {
+    let (start, end, row_count) = if args.len() == 1 {
+        // range(count) - generate [0, count)
+        let count = extract_int(&args[0])?;
+        if count < 0 {
             return Err(Error::InvalidArgumentError(
                 "range() argument must be non-negative".into(),
             ));
         }
-        _ => {
+        (0, count, count as usize)
+    } else {
+        // range(start, end) - generate [start, end)
+        let start = extract_int(&args[0])?;
+        let end = extract_int(&args[1])?;
+        if end < start {
             return Err(Error::InvalidArgumentError(
-                "range() argument must be an integer literal".into(),
+                "range() end must be >= start".into(),
             ));
         }
+        let row_count = (end - start) as usize;
+        (start, end, row_count)
     };
 
     let column_name_lower = alias
@@ -2250,6 +2321,8 @@ fn parse_range_spec_from_args(
     let table_alias_lower = alias.as_ref().map(|a| a.name.value.to_ascii_lowercase());
 
     Ok(Some(RangeSpec {
+        start,
+        end,
         row_count,
         column_name_lower,
         table_alias_lower,

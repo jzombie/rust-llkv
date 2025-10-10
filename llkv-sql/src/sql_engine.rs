@@ -1262,6 +1262,143 @@ fn resolve_column_name(expr: &SqlExpr) -> SqlResult<String> {
     }
 }
 
+/// Try to parse a function as an aggregate call for use in scalar expressions
+/// Check if a scalar expression contains any aggregate functions
+#[allow(dead_code)] // Utility function for future use
+fn expr_contains_aggregate(expr: &llkv_expr::expr::ScalarExpr<String>) -> bool {
+    match expr {
+        llkv_expr::expr::ScalarExpr::Aggregate(_) => true,
+        llkv_expr::expr::ScalarExpr::Binary { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
+        llkv_expr::expr::ScalarExpr::Column(_) | llkv_expr::expr::ScalarExpr::Literal(_) => false,
+    }
+}
+
+fn try_parse_aggregate_function(
+    func: &sqlparser::ast::Function,
+) -> SqlResult<Option<llkv_expr::expr::AggregateCall<String>>> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart};
+
+    if func.uses_odbc_syntax {
+        return Ok(None);
+    }
+    if !matches!(func.parameters, FunctionArguments::None) {
+        return Ok(None);
+    }
+    if func.filter.is_some()
+        || func.null_treatment.is_some()
+        || func.over.is_some()
+        || !func.within_group.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let func_name = if func.name.0.len() == 1 {
+        match &func.name.0[0] {
+            ObjectNamePart::Identifier(ident) => ident.value.to_ascii_lowercase(),
+            _ => return Ok(None),
+        }
+    } else {
+        return Ok(None);
+    };
+
+    let args_slice: &[FunctionArg] = match &func.args {
+        FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return Ok(None);
+            }
+            &list.args
+        }
+        FunctionArguments::None => &[],
+        FunctionArguments::Subquery(_) => return Ok(None),
+    };
+
+    let agg_call = match func_name.as_str() {
+        "count" => {
+            if args_slice.len() != 1 {
+                return Err(Error::InvalidArgumentError(
+                    "COUNT accepts exactly one argument".into(),
+                ));
+            }
+            match &args_slice[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                    llkv_expr::expr::AggregateCall::CountStar
+                }
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) => {
+                    let column = resolve_column_name(arg_expr)?;
+                    llkv_expr::expr::AggregateCall::Count(column)
+                }
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "unsupported COUNT argument".into(),
+                    ));
+                }
+            }
+        }
+        "sum" => {
+            if args_slice.len() != 1 {
+                return Err(Error::InvalidArgumentError(
+                    "SUM accepts exactly one argument".into(),
+                ));
+            }
+            let arg_expr = match &args_slice[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "SUM requires a column argument".into(),
+                    ));
+                }
+            };
+
+            // Check for COUNT(CASE ...) pattern
+            if let Some(column) = parse_count_nulls_case(arg_expr)? {
+                llkv_expr::expr::AggregateCall::CountNulls(column)
+            } else {
+                let column = resolve_column_name(arg_expr)?;
+                llkv_expr::expr::AggregateCall::Sum(column)
+            }
+        }
+        "min" => {
+            if args_slice.len() != 1 {
+                return Err(Error::InvalidArgumentError(
+                    "MIN accepts exactly one argument".into(),
+                ));
+            }
+            let arg_expr = match &args_slice[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "MIN requires a column argument".into(),
+                    ));
+                }
+            };
+            let column = resolve_column_name(arg_expr)?;
+            llkv_expr::expr::AggregateCall::Min(column)
+        }
+        "max" => {
+            if args_slice.len() != 1 {
+                return Err(Error::InvalidArgumentError(
+                    "MAX accepts exactly one argument".into(),
+                ));
+            }
+            let arg_expr = match &args_slice[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "MAX requires a column argument".into(),
+                    ));
+                }
+            };
+            let column = resolve_column_name(arg_expr)?;
+            llkv_expr::expr::AggregateCall::Max(column)
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(agg_call))
+}
+
 fn parse_count_nulls_case(expr: &SqlExpr) -> SqlResult<Option<String>> {
     let SqlExpr::Case {
         operand,
@@ -1475,6 +1612,17 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
             expr,
         } => translate_scalar(expr),
         SqlExpr::Nested(inner) => translate_scalar(inner),
+        SqlExpr::Function(func) => {
+            // Try to parse as an aggregate function
+            if let Some(agg_call) = try_parse_aggregate_function(func)? {
+                Ok(llkv_expr::expr::ScalarExpr::aggregate(agg_call))
+            } else {
+                Err(Error::InvalidArgumentError(format!(
+                    "unsupported function in scalar expression: {:?}",
+                    func.name
+                )))
+            }
+        }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported scalar expression: {other:?}"
         ))),
