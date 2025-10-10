@@ -7,7 +7,7 @@ use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_expr::literal::Literal;
 use llkv_plan::{
-    AggregateExpr, AggregateFunction, OrderByPlan, OrderSortType, OrderTarget, SelectPlan,
+    AggregateExpr, AggregateFunction, OrderByPlan, OrderSortType, OrderTarget, SelectPlan, PlanValue,
 };
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
@@ -22,7 +22,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub type DslResult<T> = Result<T, Error>;
+pub type ExecutorResult<T> = Result<T, Error>;
 
 mod projections;
 mod schema;
@@ -34,7 +34,7 @@ pub trait TableProvider<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn get_table(&self, canonical_name: &str) -> DslResult<Arc<DslTable<P>>>;
+    fn get_table(&self, canonical_name: &str) -> ExecutorResult<Arc<ExecutorTable<P>>>;
 }
 
 /// Query executor that executes SELECT plans.
@@ -53,7 +53,7 @@ where
         Self { provider }
     }
 
-    pub fn execute_select(&self, plan: SelectPlan) -> DslResult<SelectExecution<P>> {
+    pub fn execute_select(&self, plan: SelectPlan) -> ExecutorResult<SelectExecution<P>> {
         let table = self.provider.get_table(&plan.table)?;
         let display_name = plan.table.clone();
 
@@ -66,10 +66,10 @@ where
 
     fn execute_projection(
         &self,
-        table: Arc<DslTable<P>>,
+        table: Arc<ExecutorTable<P>>,
         display_name: String,
         plan: SelectPlan,
-    ) -> DslResult<SelectExecution<P>> {
+    ) -> ExecutorResult<SelectExecution<P>> {
         let table_ref = table.as_ref();
         let projections = if plan.projections.is_empty() {
             build_wildcard_projections(table_ref)
@@ -116,10 +116,10 @@ where
 
     fn execute_aggregates(
         &self,
-        table: Arc<DslTable<P>>,
+        table: Arc<ExecutorTable<P>>,
         display_name: String,
         plan: SelectPlan,
-    ) -> DslResult<SelectExecution<P>> {
+    ) -> ExecutorResult<SelectExecution<P>> {
         let table_ref = table.as_ref();
         let mut specs: Vec<AggregateSpec> = Vec::with_capacity(plan.aggregates.len());
         for aggregate in plan.aggregates {
@@ -332,7 +332,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     Projection {
-        table: Arc<DslTable<P>>,
+        table: Arc<ExecutorTable<P>>,
         projections: Vec<ScanProjection>,
         filter_expr: LlkvExpr<'static, FieldId>,
         options: ScanStreamOptions,
@@ -350,7 +350,7 @@ where
     fn new_projection(
         table_name: String,
         schema: Arc<Schema>,
-        table: Arc<DslTable<P>>,
+        table: Arc<ExecutorTable<P>>,
         projections: Vec<ScanProjection>,
         filter_expr: LlkvExpr<'static, FieldId>,
         options: ScanStreamOptions,
@@ -389,7 +389,10 @@ where
         Arc::clone(&self.schema)
     }
 
-    pub fn stream(self, mut on_batch: impl FnMut(RecordBatch) -> DslResult<()>) -> DslResult<()> {
+    pub fn stream(
+        self,
+        mut on_batch: impl FnMut(RecordBatch) -> ExecutorResult<()>,
+    ) -> ExecutorResult<()> {
         let schema = Arc::clone(&self.schema);
         match self.stream {
             SelectStream::Projection {
@@ -462,7 +465,7 @@ where
         }
     }
 
-    pub fn collect(self) -> DslResult<Vec<RecordBatch>> {
+    pub fn collect(self) -> ExecutorResult<Vec<RecordBatch>> {
         let mut batches = Vec::new();
         self.stream(|batch| {
             batches.push(batch);
@@ -471,14 +474,14 @@ where
         Ok(batches)
     }
 
-    pub fn collect_rows(self) -> DslResult<RowBatch> {
+    pub fn collect_rows(self) -> ExecutorResult<RowBatch> {
         let schema = self.schema();
-        let mut rows: Vec<Vec<DslValue>> = Vec::new();
+        let mut rows: Vec<Vec<PlanValue>> = Vec::new();
         self.stream(|batch| {
             for row_idx in 0..batch.num_rows() {
-                let mut row: Vec<DslValue> = Vec::with_capacity(batch.num_columns());
+                let mut row: Vec<PlanValue> = Vec::with_capacity(batch.num_columns());
                 for col_idx in 0..batch.num_columns() {
-                    let value = dsl_value_from_array(batch.column(col_idx), row_idx)?;
+                    let value = llkv_plan::plan_value_from_array(batch.column(col_idx), row_idx)?;
                     row.push(value);
                 }
                 rows.push(row);
@@ -493,7 +496,7 @@ where
         Ok(RowBatch { columns, rows })
     }
 
-    pub fn into_rows(self) -> DslResult<Vec<Vec<DslValue>>> {
+    pub fn into_rows(self) -> ExecutorResult<Vec<Vec<PlanValue>>> {
         Ok(self.collect_rows()?.rows)
     }
 }
@@ -510,23 +513,24 @@ where
     }
 }
 
-pub struct DslTable<P>
+pub struct ExecutorTable<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    pub table: Arc<Table<P>>,
-    pub schema: Arc<DslSchema>,
+    // underlying physical table from llkv_table
+    pub table: Arc<llkv_table::table::Table<P>>,
+    pub schema: Arc<ExecutorSchema>,
     pub next_row_id: AtomicU64,
     pub total_rows: AtomicU64,
 }
 
-pub struct DslSchema {
-    pub columns: Vec<DslColumn>,
+pub struct ExecutorSchema {
+    pub columns: Vec<ExecutorColumn>,
     pub lookup: HashMap<String, usize>,
 }
 
-impl DslSchema {
-    pub fn resolve(&self, name: &str) -> Option<&DslColumn> {
+impl ExecutorSchema {
+    pub fn resolve(&self, name: &str) -> Option<&ExecutorColumn> {
         let normalized = name.to_ascii_lowercase();
         self.lookup
             .get(&normalized)
@@ -537,13 +541,13 @@ impl DslSchema {
         self.columns.first().map(|col| col.field_id)
     }
 
-    pub fn column_by_field_id(&self, field_id: FieldId) -> Option<&DslColumn> {
+    pub fn column_by_field_id(&self, field_id: FieldId) -> Option<&ExecutorColumn> {
         self.columns.iter().find(|col| col.field_id == field_id)
     }
 }
 
 #[derive(Clone)]
-pub struct DslColumn {
+pub struct ExecutorColumn {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
@@ -551,13 +555,19 @@ pub struct DslColumn {
 }
 
 // Re-export from llkv-plan
-pub use llkv_plan::DslValue;
+// PlanValue is the plan-level value type; do not re-export DSL-prefixed symbols.
+
+// Export executor-local types with explicit Exec-prefixed names to avoid
+// colliding with Arrow / storage types imported above.
+// Executor types are public `ExecutorColumn`, `ExecutorSchema`, `ExecutorTable`.
+// No short `Exec*` aliases to avoid confusion.
 
 pub struct RowBatch {
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<DslValue>>,
+    pub rows: Vec<Vec<PlanValue>>,
 }
 
+// TODO: Extract aggregates to another crate
 #[derive(Clone)]
 struct AggregateSpec {
     alias: String,
@@ -628,7 +638,7 @@ impl AggregateAccumulator {
         spec: &AggregateSpec,
         projection_idx: Option<usize>,
         total_rows_hint: Option<i64>,
-    ) -> DslResult<Self> {
+    ) -> ExecutorResult<Self> {
         match spec.kind {
             AggregateKind::CountStar => Ok(AggregateAccumulator::CountStar { value: 0 }),
             AggregateKind::CountField { .. } => {
@@ -689,10 +699,10 @@ impl AggregateAccumulator {
 
     #[allow(dead_code)]
     fn new(
-        schema: &DslSchema,
+        schema: &ExecutorSchema,
         spec: &AggregateSpec,
         total_rows_hint: Option<i64>,
-    ) -> DslResult<Self> {
+    ) -> ExecutorResult<Self> {
         match spec.kind {
             AggregateKind::CountStar => Ok(AggregateAccumulator::CountStar { value: 0 }),
             AggregateKind::CountField { field_id } => {
@@ -781,7 +791,7 @@ impl AggregateAccumulator {
         }
     }
 
-    fn update(&mut self, batch: &RecordBatch) -> DslResult<()> {
+    fn update(&mut self, batch: &RecordBatch) -> ExecutorResult<()> {
         match self {
             AggregateAccumulator::CountStar { value } => {
                 let rows = i64::try_from(batch.num_rows()).map_err(|_| {
@@ -885,7 +895,7 @@ impl AggregateAccumulator {
         Ok(())
     }
 
-    fn finalize(self) -> DslResult<(Field, ArrayRef)> {
+    fn finalize(self) -> ExecutorResult<(Field, ArrayRef)> {
         match self {
             AggregateAccumulator::CountStar { value } => {
                 let mut builder = Int64Builder::with_capacity(1);
@@ -951,11 +961,11 @@ impl AggregateAccumulator {
 }
 
 impl AggregateState {
-    fn update(&mut self, batch: &RecordBatch) -> DslResult<()> {
+    fn update(&mut self, batch: &RecordBatch) -> ExecutorResult<()> {
         self.accumulator.update(batch)
     }
 
-    fn finalize(self) -> DslResult<(Field, ArrayRef)> {
+    fn finalize(self) -> ExecutorResult<(Field, ArrayRef)> {
         let (mut field, array) = self.accumulator.finalize()?;
         field = field.with_name(self.alias);
         if let Some(value) = self.override_value {
@@ -969,10 +979,10 @@ impl AggregateState {
 }
 
 fn resolve_scan_order<P>(
-    table: &DslTable<P>,
+    table: &ExecutorTable<P>,
     projections: &[ScanProjection],
     order_plan: &OrderByPlan,
-) -> DslResult<ScanOrderSpec>
+) -> ExecutorResult<ScanOrderSpec>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -1055,7 +1065,7 @@ fn full_table_scan_filter(field_id: FieldId) -> LlkvExpr<'static, FieldId> {
     })
 }
 
-fn synthesize_null_scan(schema: Arc<Schema>, total_rows: u64) -> DslResult<Vec<RecordBatch>> {
+fn synthesize_null_scan(schema: Arc<Schema>, total_rows: u64) -> ExecutorResult<Vec<RecordBatch>> {
     let row_count = usize::try_from(total_rows).map_err(|_| {
         Error::InvalidArgumentError("table row count exceeds supported in-memory batch size".into())
     })?;
@@ -1103,55 +1113,13 @@ fn synthesize_null_scan(schema: Arc<Schema>, total_rows: u64) -> DslResult<Vec<R
     Ok(vec![batch])
 }
 
-fn dsl_value_from_array(array: &ArrayRef, index: usize) -> DslResult<DslValue> {
-    if array.is_null(index) {
-        return Ok(DslValue::Null);
-    }
-    match array.data_type() {
-        DataType::Int64 => {
-            let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                Error::InvalidArgumentError("expected Int64 array in INSERT SELECT".into())
-            })?;
-            Ok(DslValue::Integer(values.value(index)))
-        }
-        DataType::Float64 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError("expected Float64 array in INSERT SELECT".into())
-                })?;
-            Ok(DslValue::Float(values.value(index)))
-        }
-        DataType::Utf8 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError("expected Utf8 array in INSERT SELECT".into())
-                })?;
-            Ok(DslValue::String(values.value(index).to_string()))
-        }
-        DataType::Date32 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError("expected Date32 array in INSERT SELECT".into())
-                })?;
-            Ok(DslValue::Integer(values.value(index) as i64))
-        }
-        other => Err(Error::InvalidArgumentError(format!(
-            "unsupported data type in INSERT SELECT: {other:?}"
-        ))),
-    }
-}
+// DSL-specific array -> value conversion is provided by llkv-plan::dsl_value_from_array
 
 // Translate predicate from column names to field IDs
 fn translate_predicate(
     expr: llkv_expr::expr::Expr<'static, String>,
-    schema: &DslSchema,
-) -> DslResult<llkv_expr::expr::Expr<'static, FieldId>> {
+    schema: &ExecutorSchema,
+) -> ExecutorResult<llkv_expr::expr::Expr<'static, FieldId>> {
     use llkv_expr::expr::Expr;
     match expr {
         Expr::And(exprs) => {
@@ -1192,8 +1160,8 @@ fn translate_predicate(
 // Translate scalar expressions
 fn translate_scalar(
     expr: &ScalarExpr<String>,
-    schema: &DslSchema,
-) -> DslResult<ScalarExpr<FieldId>> {
+    schema: &ExecutorSchema,
+) -> ExecutorResult<ScalarExpr<FieldId>> {
     match expr {
         ScalarExpr::Literal(lit) => Ok(ScalarExpr::Literal(lit.clone())),
         ScalarExpr::Column(name) => {

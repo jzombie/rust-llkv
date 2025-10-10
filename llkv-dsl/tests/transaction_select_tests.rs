@@ -1,7 +1,8 @@
 use llkv_dsl::{
-    AggregateExpr, ColumnSpec, CreateTablePlan, DslContext, DslValue, InsertPlan, InsertSource,
-    SelectPlan, SelectProjection,
+    AggregateExpr, ColumnSpec, CreateTablePlan, DslContext, InsertPlan, InsertSource, SelectPlan,
+    SelectProjection,
 };
+use llkv_plan::PlanValue;
 use llkv_storage::pager::MemPager;
 use std::sync::Arc;
 
@@ -28,8 +29,8 @@ fn test_dsl_transaction_select() {
         table: "users".into(),
         columns: vec![],
         source: InsertSource::Rows(vec![
-            vec![DslValue::Integer(1), DslValue::String("Alice".into())],
-            vec![DslValue::Integer(2), DslValue::String("Bob".into())],
+            vec![PlanValue::Integer(1), PlanValue::String("Alice".into())],
+            vec![PlanValue::Integer(2), PlanValue::String("Bob".into())],
         ]),
     };
     session.insert(insert_plan).unwrap();
@@ -42,8 +43,8 @@ fn test_dsl_transaction_select() {
         table: "users".into(),
         columns: vec![],
         source: InsertSource::Rows(vec![vec![
-            DslValue::Integer(3),
-            DslValue::String("Charlie".into()),
+            PlanValue::Integer(3),
+            PlanValue::String("Charlie".into()),
         ]]),
     };
     session.insert(insert_plan2).unwrap();
@@ -100,8 +101,8 @@ fn test_dsl_transaction_select_with_aggregates() {
         table: "products".into(),
         columns: vec![],
         source: InsertSource::Rows(vec![
-            vec![DslValue::Integer(1), DslValue::Integer(100)],
-            vec![DslValue::Integer(2), DslValue::Integer(200)],
+            vec![PlanValue::Integer(1), PlanValue::Integer(100)],
+            vec![PlanValue::Integer(2), PlanValue::Integer(200)],
         ]),
     };
     session.insert(insert_plan).unwrap();
@@ -113,7 +114,7 @@ fn test_dsl_transaction_select_with_aggregates() {
     let insert_plan2 = InsertPlan {
         table: "products".into(),
         columns: vec![],
-        source: InsertSource::Rows(vec![vec![DslValue::Integer(3), DslValue::Integer(300)]]),
+        source: InsertSource::Rows(vec![vec![PlanValue::Integer(3), PlanValue::Integer(300)]]),
     };
     session.insert(insert_plan2).unwrap();
 

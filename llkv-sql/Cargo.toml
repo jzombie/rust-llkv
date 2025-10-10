@@ -15,10 +15,12 @@ llkv-result.workspace = true
 llkv-storage.workspace = true
 llkv-expr.workspace = true
 llkv-table.workspace = true
+llkv-transaction.workspace = true
 simd-r-drive-entry-handle.workspace = true
 sqlparser.workspace = true
 time = { workspace = true, features = ["parsing"] }
 tracing = { workspace = true }
+llkv-plan.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

@@ -39,26 +39,29 @@ pub type DslResult<T> = llkv_result::Result<T>;
 // Re-export plan structures from llkv-plan
 pub use llkv_plan::{
     AggregateExpr, AggregateFunction, AssignmentValue, ColumnAssignment, ColumnNullability,
-    ColumnSpec, CreateTablePlan, CreateTableSource, DeletePlan, DslOperation, DslValue, InsertPlan,
+    ColumnSpec, CreateTablePlan, CreateTableSource, DeletePlan, DslOperation, InsertPlan,
     InsertSource, IntoColumnSpec, NotNull, Nullable, OrderByPlan, OrderSortType, OrderTarget,
-    SelectPlan, SelectProjection, UpdatePlan,
+    PlanValue, SelectPlan, SelectProjection, UpdatePlan,
 };
 
-// Re-export execution structures from llkv-executor
-pub use llkv_executor::{
-    DslColumn, DslSchema, DslTable, QueryExecutor, RowBatch, SelectExecution, TableProvider,
-};
+// Execution structures from llkv-executor
+// Keep DSL-prefixed types private to this crate so they are not exposed as
+// part of the llkv-dsl public API. Publicly re-export only the generic
+// execution APIs that are not DSL-prefixed.
+use llkv_executor::{ExecutorColumn, ExecutorSchema, ExecutorTable};
+pub use llkv_executor::{QueryExecutor, RowBatch, SelectExecution, TableProvider};
 
-// Import DslSession for internal use
-use llkv_transaction::DslSession;
+// Import transaction structures from llkv-transaction for internal use.
+// NOTE: we intentionally do NOT re-export these types from the DSL crate so
+// non-DSL crates do not get `Dsl*` symbols pulled into their public API.
+use llkv_transaction::{TransactionContext, TransactionKind, TransactionManager};
 
-// Re-export transaction structures from llkv-transaction (low-level, mostly for internal use)
-pub use llkv_transaction::{
-    DslTransaction, TableDeltaState, TransactionContext, TransactionKind, TransactionManager,
-};
+// Internal low-level transaction session type (from llkv-transaction)
+use llkv_transaction::TransactionSession;
 
 // Note: Session is the high-level wrapper that users should use instead of raw DslSession
 
+// TODO: Rename to `DslStatementResult`
 /// Result of running a DSL statement.
 #[derive(Clone)]
 pub enum StatementResult<P>
@@ -199,7 +202,7 @@ where
 // ============================================================================
 
 // Transaction management is now handled by llkv-transaction crate
-// The DslTransaction, TableDeltaState, DslSession types are re-exported from there
+// The DslTransaction and TableDeltaState types are re-exported from there
 
 /// Wrapper for DslContext that implements TransactionContext
 pub struct DslContextWrapper<P>(Arc<DslContext<P>>)
@@ -215,6 +218,7 @@ where
     }
 }
 
+// TODO: Rename to `DslSession`
 /// A session for executing operations with optional transaction support.
 ///
 /// This is a high-level wrapper around the transaction machinery that provides
@@ -223,7 +227,8 @@ pub struct Session<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    inner: DslSession<DslContextWrapper<P>, DslContextWrapper<MemPager>>,
+    // TODO: Allow generic pager type
+    inner: TransactionSession<DslContextWrapper<P>, DslContextWrapper<MemPager>>,
 }
 
 impl<P> Session<P>
@@ -416,7 +421,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pager: Arc<P>,
-    tables: RwLock<HashMap<String, Arc<DslTable<P>>>>,
+    tables: RwLock<HashMap<String, Arc<ExecutorTable<P>>>>,
     // Transaction manager for session-based transactions
     transaction_manager: TransactionManager<DslContextWrapper<P>, DslContextWrapper<MemPager>>,
 }
@@ -763,7 +768,7 @@ where
             ));
         }
 
-        let mut column_defs: Vec<DslColumn> = Vec::with_capacity(columns.len());
+        let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(columns.len());
         let mut lookup: HashMap<String, usize> = HashMap::new();
         for (idx, column) in columns.iter().enumerate() {
             let normalized = column.name.to_ascii_lowercase();
@@ -773,7 +778,7 @@ where
                     column.name, display_name
                 )));
             }
-            column_defs.push(DslColumn {
+            column_defs.push(ExecutorColumn {
                 name: column.name.clone(),
                 data_type: column.data_type.clone(),
                 nullable: column.nullable,
@@ -800,11 +805,11 @@ where
             });
         }
 
-        let schema = Arc::new(DslSchema {
+        let schema = Arc::new(ExecutorSchema {
             columns: column_defs,
             lookup,
         });
-        let table_entry = Arc::new(DslTable {
+        let table_entry = Arc::new(ExecutorTable {
             table: Arc::new(table),
             schema,
             next_row_id: AtomicU64::new(0),
@@ -842,7 +847,7 @@ where
                 "CREATE TABLE AS SELECT requires at least one column".into(),
             ));
         }
-        let mut column_defs: Vec<DslColumn> = Vec::with_capacity(schema.fields().len());
+        let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(schema.fields().len());
         let mut lookup: HashMap<String, usize> = HashMap::new();
         for (idx, field) in schema.fields().iter().enumerate() {
             let data_type = match field.data_type() {
@@ -862,7 +867,7 @@ where
                     field.name()
                 )));
             }
-            column_defs.push(DslColumn {
+            column_defs.push(ExecutorColumn {
                 name: field.name().to_string(),
                 data_type,
                 nullable: field.is_nullable(),
@@ -889,11 +894,11 @@ where
             });
         }
 
-        let schema_arc = Arc::new(DslSchema {
+        let schema_arc = Arc::new(ExecutorSchema {
             columns: column_defs.clone(),
             lookup,
         });
-        let table_entry = Arc::new(DslTable {
+        let table_entry = Arc::new(ExecutorTable {
             table: Arc::new(table),
             schema: schema_arc,
             next_row_id: AtomicU64::new(0),
@@ -967,9 +972,9 @@ where
 
     fn insert_rows(
         &self,
-        table: &DslTable<P>,
+        table: &ExecutorTable<P>,
         display_name: String,
-        rows: Vec<Vec<DslValue>>,
+        rows: Vec<Vec<PlanValue>>,
         columns: Vec<String>,
     ) -> DslResult<StatementResult<P>> {
         if rows.is_empty() {
@@ -991,7 +996,7 @@ where
         }
 
         let row_count = rows.len();
-        let mut column_values: Vec<Vec<DslValue>> =
+        let mut column_values: Vec<Vec<PlanValue>> =
             vec![Vec::with_capacity(row_count); table.schema.columns.len()];
         for row in rows {
             for (idx, value) in row.into_iter().enumerate() {
@@ -1042,7 +1047,7 @@ where
 
     fn insert_batches(
         &self,
-        table: &DslTable<P>,
+        table: &ExecutorTable<P>,
         display_name: String,
         batches: Vec<RecordBatch>,
         columns: Vec<String>,
@@ -1073,12 +1078,12 @@ where
             if row_count == 0 {
                 continue;
             }
-            let mut rows: Vec<Vec<DslValue>> = Vec::with_capacity(row_count);
+            let mut rows: Vec<Vec<PlanValue>> = Vec::with_capacity(row_count);
             for row_idx in 0..row_count {
-                let mut row: Vec<DslValue> = Vec::with_capacity(expected_len);
+                let mut row: Vec<PlanValue> = Vec::with_capacity(expected_len);
                 for col_idx in 0..expected_len {
                     let array = batch.column(col_idx);
-                    row.push(dsl_value_from_array(array, row_idx)?);
+                    row.push(llkv_plan::plan_value_from_array(array, row_idx)?);
                 }
                 rows.push(row);
             }
@@ -1099,7 +1104,7 @@ where
 
     fn update_filtered_rows(
         &self,
-        table: &DslTable<P>,
+        table: &ExecutorTable<P>,
         display_name: String,
         assignments: Vec<ColumnAssignment>,
         filter: LlkvExpr<'static, String>,
@@ -1115,12 +1120,13 @@ where
 
         // TODO: Dedupe
         enum PreparedValue {
-            Literal(DslValue),
+            Literal(PlanValue),
             Expression { expr_index: usize },
         }
 
         let mut seen_columns: HashSet<String> = HashSet::new();
-        let mut prepared: Vec<(DslColumn, PreparedValue)> = Vec::with_capacity(assignments.len());
+        let mut prepared: Vec<(ExecutorColumn, PreparedValue)> =
+            Vec::with_capacity(assignments.len());
         let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
 
         for assignment in assignments {
@@ -1209,7 +1215,7 @@ where
 
     fn update_all_rows(
         &self,
-        table: &DslTable<P>,
+        table: &ExecutorTable<P>,
         display_name: String,
         assignments: Vec<ColumnAssignment>,
     ) -> DslResult<StatementResult<P>> {
@@ -1234,12 +1240,13 @@ where
 
         // TODO: Dedupe
         enum PreparedValue {
-            Literal(DslValue),
+            Literal(PlanValue),
             Expression { expr_index: usize },
         }
 
         let mut seen_columns: HashSet<String> = HashSet::new();
-        let mut prepared: Vec<(DslColumn, PreparedValue)> = Vec::with_capacity(assignments.len());
+        let mut prepared: Vec<(ExecutorColumn, PreparedValue)> =
+            Vec::with_capacity(assignments.len());
         let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
         let mut first_field_id: Option<FieldId> = None;
 
@@ -1337,7 +1344,7 @@ where
 
     fn delete_filtered_rows(
         &self,
-        table: &DslTable<P>,
+        table: &ExecutorTable<P>,
         display_name: String,
         filter: LlkvExpr<'static, String>,
     ) -> DslResult<StatementResult<P>> {
@@ -1349,7 +1356,7 @@ where
 
     fn delete_all_rows(
         &self,
-        table: &DslTable<P>,
+        table: &ExecutorTable<P>,
         display_name: String,
     ) -> DslResult<StatementResult<P>> {
         let total_rows = table.total_rows.load(Ordering::SeqCst);
@@ -1370,7 +1377,7 @@ where
 
     fn apply_delete(
         &self,
-        table: &DslTable<P>,
+        table: &ExecutorTable<P>,
         display_name: String,
         row_ids: Vec<u64>,
     ) -> DslResult<StatementResult<P>> {
@@ -1409,10 +1416,10 @@ where
 
     fn collect_update_rows(
         &self,
-        table: &DslTable<P>,
+        table: &ExecutorTable<P>,
         filter_expr: &LlkvExpr<'static, FieldId>,
         expressions: &[ScalarExpr<FieldId>],
-    ) -> DslResult<(Vec<u64>, Vec<Vec<DslValue>>)> {
+    ) -> DslResult<(Vec<u64>, Vec<Vec<PlanValue>>)> {
         let row_ids = table.table.filter_row_ids(filter_expr)?;
         if row_ids.is_empty() {
             return Ok((row_ids, vec![Vec::new(); expressions.len()]));
@@ -1428,7 +1435,7 @@ where
             projections.push(ScanProjection::computed(expr.clone(), alias));
         }
 
-        let mut expr_values: Vec<Vec<DslValue>> =
+        let mut expr_values: Vec<Vec<PlanValue>> =
             vec![Vec::with_capacity(row_ids.len()); expressions.len()];
         let mut error: Option<Error> = None;
         let options = ScanStreamOptions {
@@ -1463,12 +1470,12 @@ where
     }
 
     fn collect_expression_values(
-        expr_values: &mut [Vec<DslValue>],
+        expr_values: &mut [Vec<PlanValue>],
         batch: RecordBatch,
     ) -> DslResult<()> {
         for row_idx in 0..batch.num_rows() {
             for (expr_index, values) in expr_values.iter_mut().enumerate() {
-                let value = dsl_value_from_array(batch.column(expr_index), row_idx)?;
+                let value = llkv_plan::plan_value_from_array(batch.column(expr_index), row_idx)?;
                 values.push(value);
             }
         }
@@ -1476,7 +1483,7 @@ where
         Ok(())
     }
 
-    fn lookup_table(&self, canonical_name: &str) -> DslResult<Arc<DslTable<P>>> {
+    fn lookup_table(&self, canonical_name: &str) -> DslResult<Arc<ExecutorTable<P>>> {
         let tables = self.tables.read().unwrap();
         tables
             .get(canonical_name)
@@ -1635,7 +1642,7 @@ impl<P> TableProvider<P> for DslContextProvider<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn get_table(&self, canonical_name: &str) -> DslResult<Arc<DslTable<P>>> {
+    fn get_table(&self, canonical_name: &str) -> DslResult<Arc<ExecutorTable<P>>> {
         self.context.lookup_table(canonical_name)
     }
 }
@@ -1705,7 +1712,7 @@ fn current_time_micros() -> u64 {
         .as_micros() as u64
 }
 
-fn resolve_insert_columns(columns: &[String], schema: &DslSchema) -> DslResult<Vec<usize>> {
+fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> DslResult<Vec<usize>> {
     if columns.is_empty() {
         return Ok((0..schema.columns.len()).collect());
     }
@@ -1721,16 +1728,16 @@ fn resolve_insert_columns(columns: &[String], schema: &DslSchema) -> DslResult<V
     Ok(resolved)
 }
 
-fn build_array_for_column(dtype: &DataType, values: &[DslValue]) -> DslResult<ArrayRef> {
+fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> DslResult<ArrayRef> {
     match dtype {
         DataType::Int64 => {
             let mut builder = Int64Builder::with_capacity(values.len());
             for value in values {
                 match value {
-                    DslValue::Null => builder.append_null(),
-                    DslValue::Integer(v) => builder.append_value(*v),
-                    DslValue::Float(v) => builder.append_value(*v as i64),
-                    DslValue::String(_) => {
+                    PlanValue::Null => builder.append_null(),
+                    PlanValue::Integer(v) => builder.append_value(*v),
+                    PlanValue::Float(v) => builder.append_value(*v as i64),
+                    PlanValue::String(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert string into INT column".into(),
                         ));
@@ -1743,10 +1750,10 @@ fn build_array_for_column(dtype: &DataType, values: &[DslValue]) -> DslResult<Ar
             let mut builder = Float64Builder::with_capacity(values.len());
             for value in values {
                 match value {
-                    DslValue::Null => builder.append_null(),
-                    DslValue::Integer(v) => builder.append_value(*v as f64),
-                    DslValue::Float(v) => builder.append_value(*v),
-                    DslValue::String(_) => {
+                    PlanValue::Null => builder.append_null(),
+                    PlanValue::Integer(v) => builder.append_value(*v as f64),
+                    PlanValue::Float(v) => builder.append_value(*v),
+                    PlanValue::String(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert string into DOUBLE column".into(),
                         ));
@@ -1759,10 +1766,10 @@ fn build_array_for_column(dtype: &DataType, values: &[DslValue]) -> DslResult<Ar
             let mut builder = StringBuilder::with_capacity(values.len(), values.len() * 8);
             for value in values {
                 match value {
-                    DslValue::Null => builder.append_null(),
-                    DslValue::Integer(v) => builder.append_value(v.to_string()),
-                    DslValue::Float(v) => builder.append_value(v.to_string()),
-                    DslValue::String(s) => builder.append_value(s),
+                    PlanValue::Null => builder.append_null(),
+                    PlanValue::Integer(v) => builder.append_value(v.to_string()),
+                    PlanValue::Float(v) => builder.append_value(v.to_string()),
+                    PlanValue::String(s) => builder.append_value(s),
                 }
             }
             Ok(Arc::new(builder.finish()))
@@ -1771,8 +1778,8 @@ fn build_array_for_column(dtype: &DataType, values: &[DslValue]) -> DslResult<Ar
             let mut builder = Date32Builder::with_capacity(values.len());
             for value in values {
                 match value {
-                    DslValue::Null => builder.append_null(),
-                    DslValue::Integer(days) => {
+                    PlanValue::Null => builder.append_null(),
+                    PlanValue::Integer(days) => {
                         let casted = i32::try_from(*days).map_err(|_| {
                             Error::InvalidArgumentError(
                                 "integer literal out of range for DATE column".into(),
@@ -1780,12 +1787,12 @@ fn build_array_for_column(dtype: &DataType, values: &[DslValue]) -> DslResult<Ar
                         })?;
                         builder.append_value(casted);
                     }
-                    DslValue::Float(_) => {
+                    PlanValue::Float(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert float into DATE column".into(),
                         ));
                     }
-                    DslValue::String(text) => {
+                    PlanValue::String(text) => {
                         let days = parse_date32_literal(text)?;
                         builder.append_value(days);
                     }
@@ -1843,49 +1850,7 @@ fn epoch_julian_day() -> i32 {
         .to_julian_day()
 }
 
-fn dsl_value_from_array(array: &ArrayRef, index: usize) -> DslResult<DslValue> {
-    if array.is_null(index) {
-        return Ok(DslValue::Null);
-    }
-    match array.data_type() {
-        DataType::Int64 => {
-            let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                Error::InvalidArgumentError("expected Int64 array in INSERT SELECT".into())
-            })?;
-            Ok(DslValue::Integer(values.value(index)))
-        }
-        DataType::Float64 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError("expected Float64 array in INSERT SELECT".into())
-                })?;
-            Ok(DslValue::Float(values.value(index)))
-        }
-        DataType::Utf8 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError("expected Utf8 array in INSERT SELECT".into())
-                })?;
-            Ok(DslValue::String(values.value(index).to_string()))
-        }
-        DataType::Date32 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError("expected Date32 array in INSERT SELECT".into())
-                })?;
-            Ok(DslValue::Integer(values.value(index) as i64))
-        }
-        other => Err(Error::InvalidArgumentError(format!(
-            "unsupported data type in INSERT SELECT: {other:?}"
-        ))),
-    }
-}
+// Array -> PlanValue conversion is provided by llkv-plan::plan_value_from_array
 
 fn full_table_scan_filter(field_id: FieldId) -> LlkvExpr<'static, FieldId> {
     LlkvExpr::Pred(Filter {
@@ -1899,7 +1864,7 @@ fn full_table_scan_filter(field_id: FieldId) -> LlkvExpr<'static, FieldId> {
 
 fn translate_predicate(
     expr: LlkvExpr<'static, String>,
-    schema: &DslSchema,
+    schema: &ExecutorSchema,
 ) -> DslResult<LlkvExpr<'static, FieldId>> {
     match expr {
         LlkvExpr::And(list) => {
@@ -1938,7 +1903,7 @@ fn translate_predicate(
 
 fn translate_scalar(
     expr: &ScalarExpr<String>,
-    schema: &DslSchema,
+    schema: &ExecutorSchema,
 ) -> DslResult<ScalarExpr<FieldId>> {
     match expr {
         ScalarExpr::Column(name) => {
@@ -1960,16 +1925,16 @@ fn translate_scalar(
     }
 }
 
-fn dsl_value_from_sql_expr(expr: &SqlExpr) -> DslResult<DslValue> {
+fn dsl_value_from_sql_expr(expr: &SqlExpr) -> DslResult<PlanValue> {
     match expr {
         SqlExpr::Value(value) => dsl_value_from_sql_value(value),
         SqlExpr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
         } => match dsl_value_from_sql_expr(expr)? {
-            DslValue::Integer(v) => Ok(DslValue::Integer(-v)),
-            DslValue::Float(v) => Ok(DslValue::Float(-v)),
-            DslValue::Null | DslValue::String(_) => Err(Error::InvalidArgumentError(
+            PlanValue::Integer(v) => Ok(PlanValue::Integer(-v)),
+            PlanValue::Float(v) => Ok(PlanValue::Float(-v)),
+            PlanValue::Null | PlanValue::String(_) => Err(Error::InvalidArgumentError(
                 "cannot negate non-numeric literal".into(),
             )),
         },
@@ -1984,20 +1949,20 @@ fn dsl_value_from_sql_expr(expr: &SqlExpr) -> DslResult<DslValue> {
     }
 }
 
-fn dsl_value_from_sql_value(value: &ValueWithSpan) -> DslResult<DslValue> {
+fn dsl_value_from_sql_value(value: &ValueWithSpan) -> DslResult<PlanValue> {
     match &value.value {
-        Value::Null => Ok(DslValue::Null),
+        Value::Null => Ok(PlanValue::Null),
         Value::Number(text, _) => {
             if text.contains(['.', 'e', 'E']) {
                 let parsed = text.parse::<f64>().map_err(|err| {
                     Error::InvalidArgumentError(format!("invalid float literal: {err}"))
                 })?;
-                Ok(DslValue::Float(parsed))
+                Ok(PlanValue::Float(parsed))
             } else {
                 let parsed = text.parse::<i64>().map_err(|err| {
                     Error::InvalidArgumentError(format!("invalid integer literal: {err}"))
                 })?;
-                Ok(DslValue::Integer(parsed))
+                Ok(PlanValue::Integer(parsed))
             }
         }
         Value::Boolean(_) => Err(Error::InvalidArgumentError(
@@ -2005,7 +1970,7 @@ fn dsl_value_from_sql_value(value: &ValueWithSpan) -> DslResult<DslValue> {
         )),
         other => {
             if let Some(text) = other.clone().into_string() {
-                Ok(DslValue::String(text))
+                Ok(PlanValue::String(text))
             } else {
                 Err(Error::InvalidArgumentError(format!(
                     "unsupported literal: {other:?}"
@@ -2025,11 +1990,11 @@ fn group_by_is_empty(expr: &GroupByExpr) -> bool {
 
 #[derive(Clone)]
 pub struct RangeSelectRows {
-    rows: Vec<Vec<DslValue>>,
+    rows: Vec<Vec<PlanValue>>,
 }
 
 impl RangeSelectRows {
-    pub fn into_rows(self) -> Vec<Vec<DslValue>> {
+    pub fn into_rows(self) -> Vec<Vec<PlanValue>> {
         self.rows
     }
 }
@@ -2037,7 +2002,7 @@ impl RangeSelectRows {
 #[derive(Clone)]
 enum RangeProjection {
     Column,
-    Literal(DslValue),
+    Literal(PlanValue),
 }
 
 #[derive(Clone)]
@@ -2131,12 +2096,12 @@ pub fn extract_rows_from_range(select: &Select) -> DslResult<Option<RangeSelectR
         ));
     }
 
-    let mut rows: Vec<Vec<DslValue>> = Vec::with_capacity(spec.row_count);
+    let mut rows: Vec<Vec<PlanValue>> = Vec::with_capacity(spec.row_count);
     for idx in 0..spec.row_count {
-        let mut row: Vec<DslValue> = Vec::with_capacity(projections.len());
+        let mut row: Vec<PlanValue> = Vec::with_capacity(projections.len());
         for projection in &projections {
             match projection {
-                RangeProjection::Column => row.push(DslValue::Integer(idx as i64)),
+                RangeProjection::Column => row.push(PlanValue::Integer(idx as i64)),
                 RangeProjection::Literal(value) => row.push(value.clone()),
             }
         }
@@ -2262,8 +2227,8 @@ fn parse_range_spec_from_args(
 
     let value = dsl_value_from_sql_expr(arg_expr)?;
     let row_count = match value {
-        DslValue::Integer(v) if v >= 0 => v as usize,
-        DslValue::Integer(_) => {
+        PlanValue::Integer(v) if v >= 0 => v as usize,
+        PlanValue::Integer(_) => {
             return Err(Error::InvalidArgumentError(
                 "range() argument must be non-negative".into(),
             ));
@@ -2335,7 +2300,7 @@ where
 
 #[derive(Clone, Debug, Default)]
 pub struct Row {
-    values: Vec<(String, DslValue)>,
+    values: Vec<(String, PlanValue)>,
 }
 
 impl Row {
@@ -2343,12 +2308,12 @@ impl Row {
         Self { values: Vec::new() }
     }
 
-    pub fn with(mut self, name: impl Into<String>, value: impl Into<DslValue>) -> Self {
+    pub fn with(mut self, name: impl Into<String>, value: impl Into<PlanValue>) -> Self {
         self.set(name, value);
         self
     }
 
-    pub fn set(&mut self, name: impl Into<String>, value: impl Into<DslValue>) -> &mut Self {
+    pub fn set(&mut self, name: impl Into<String>, value: impl Into<PlanValue>) -> &mut Self {
         let name = name.into();
         let value = value.into();
         if let Some((_, existing)) = self.values.iter_mut().find(|(n, _)| *n == name) {
@@ -2363,7 +2328,7 @@ impl Row {
         self.values.iter().map(|(n, _)| n.clone()).collect()
     }
 
-    fn values_for_columns(&self, columns: &[String]) -> DslResult<Vec<DslValue>> {
+    fn values_for_columns(&self, columns: &[String]) -> DslResult<Vec<PlanValue>> {
         let mut out = Vec::with_capacity(columns.len());
         for column in columns {
             let value = self
@@ -2390,9 +2355,9 @@ pub fn row() -> Row {
 pub enum InsertRowKind {
     Named {
         columns: Vec<String>,
-        values: Vec<DslValue>,
+        values: Vec<PlanValue>,
     },
-    Positional(Vec<DslValue>),
+    Positional(Vec<PlanValue>),
 }
 
 pub trait IntoInsertRow {
@@ -2415,7 +2380,7 @@ impl IntoInsertRow for Row {
 
 impl<T> IntoInsertRow for &T
 where
-    T: Clone + IntoInsertRow,
+    T: Into<PlanValue>,
 {
     fn into_insert_row(self) -> DslResult<InsertRowKind> {
         self.clone().into_insert_row()
@@ -2424,7 +2389,7 @@ where
 
 impl<T> IntoInsertRow for Vec<T>
 where
-    T: Into<DslValue>,
+    T: Into<PlanValue>,
 {
     fn into_insert_row(self) -> DslResult<InsertRowKind> {
         if self.is_empty() {
@@ -2440,7 +2405,7 @@ where
 
 impl<T, const N: usize> IntoInsertRow for [T; N]
 where
-    T: Into<DslValue>,
+    T: Into<PlanValue>,
 {
     fn into_insert_row(self) -> DslResult<InsertRowKind> {
         if N == 0 {
@@ -2458,7 +2423,7 @@ macro_rules! impl_into_insert_row_tuple {
     ($($type:ident => $value:ident),+) => {
         impl<$($type,)+> IntoInsertRow for ($($type,)+)
         where
-            $($type: Into<DslValue>,)+
+            $($type: Into<PlanValue>,)+
         {
             fn into_insert_row(self) -> DslResult<InsertRowKind> {
                 let ($($value,)+) = self;
@@ -2534,7 +2499,7 @@ where
         let schema = table.schema.as_ref();
         let schema_column_names: Vec<String> =
             schema.columns.iter().map(|col| col.name.clone()).collect();
-        let mut normalized_rows: Vec<Vec<DslValue>> = Vec::new();
+        let mut normalized_rows: Vec<Vec<PlanValue>> = Vec::new();
         let mut mode: Option<InsertMode> = None;
         let mut column_names: Option<Vec<String>> = None;
         let mut row_count = 0usize;
@@ -2710,9 +2675,9 @@ mod tests {
             .expect("create table");
         table
             .insert_rows([
-                (DslValue::Null,),
-                (DslValue::Integer(1),),
-                (DslValue::Null,),
+                (PlanValue::Null,),
+                (PlanValue::Integer(1),),
+                (PlanValue::Null,),
             ])
             .expect("insert rows");
 

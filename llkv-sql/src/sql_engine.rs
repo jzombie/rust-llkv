@@ -7,9 +7,9 @@ use crate::SqlValue;
 
 use llkv_dsl::{
     AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateTablePlan,
-    CreateTableSource, DeletePlan, DslContext, DslValue, InsertPlan, InsertSource, OrderByPlan,
+    CreateTableSource, DeletePlan, DslContext, InsertPlan, InsertSource, OrderByPlan,
     OrderSortType, OrderTarget, SelectExecution, SelectPlan, SelectProjection, Session,
-    StatementResult, UpdatePlan, extract_rows_from_range,
+    StatementResult, UpdatePlan, extract_rows_from_range, PlanValue,
 };
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
@@ -409,7 +409,7 @@ where
                 }
                 InsertSource::Rows(
                     rows.into_iter()
-                        .map(|row| row.into_iter().map(DslValue::from).collect())
+                        .map(|row| row.into_iter().map(PlanValue::from).collect())
                         .collect(),
                 )
             }
@@ -479,7 +479,7 @@ where
                 )));
             }
             let value = match SqlValue::try_from_expr(&assignment.value) {
-                Ok(literal) => AssignmentValue::Literal(DslValue::from(literal)),
+                Ok(literal) => AssignmentValue::Literal(PlanValue::from(literal)),
                 Err(Error::InvalidArgumentError(msg))
                     if msg.contains("unsupported literal expression") =>
                 {
@@ -1564,7 +1564,7 @@ fn arrow_type_from_sql(data_type: &SqlDataType) -> SqlResult<arrow::datatypes::D
     }
 }
 
-fn extract_constant_select_rows(select: &Select) -> SqlResult<Option<Vec<Vec<DslValue>>>> {
+fn extract_constant_select_rows(select: &Select) -> SqlResult<Option<Vec<Vec<PlanValue>>>> {
     if !select.from.is_empty() {
         return Ok(None);
     }
@@ -1592,7 +1592,7 @@ fn extract_constant_select_rows(select: &Select) -> SqlResult<Option<Vec<Vec<Dsl
         ));
     }
 
-    let mut row: Vec<DslValue> = Vec::with_capacity(select.projection.len());
+    let mut row: Vec<PlanValue> = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
         let expr = match item {
             SelectItem::UnnamedExpr(expr) => expr,
@@ -1604,8 +1604,8 @@ fn extract_constant_select_rows(select: &Select) -> SqlResult<Option<Vec<Vec<Dsl
             }
         };
 
-        let value = SqlValue::try_from_expr(expr)?;
-        row.push(DslValue::from(value));
+    let value = SqlValue::try_from_expr(expr)?;
+    row.push(PlanValue::from(value));
     }
 
     Ok(Some(vec![row]))

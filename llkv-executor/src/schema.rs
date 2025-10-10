@@ -1,4 +1,4 @@
-use super::{DslResult, DslTable, FieldId, ScanProjection};
+use super::{ExecutorResult, ExecutorTable, FieldId, ScanProjection};
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_expr::expr::ScalarExpr;
 use llkv_expr::literal::Literal;
@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub fn schema_for_projections<P>(
-    table: &DslTable<P>,
+    table: &ExecutorTable<P>,
     projections: &[ScanProjection],
-) -> DslResult<Arc<Schema>>
+) -> ExecutorResult<Arc<Schema>>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {

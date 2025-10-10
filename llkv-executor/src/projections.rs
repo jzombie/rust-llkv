@@ -1,10 +1,13 @@
-use super::{DslResult, DslSchema, DslTable, FieldId, ScanProjection, LogicalFieldId, StoreProjection};
+use super::{
+    ExecutorResult, ExecutorSchema, ExecutorTable, FieldId, LogicalFieldId, ScanProjection,
+    StoreProjection,
+};
 use llkv_plan::SelectProjection;
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-pub fn build_wildcard_projections<P>(table: &DslTable<P>) -> Vec<ScanProjection>
+pub fn build_wildcard_projections<P>(table: &ExecutorTable<P>) -> Vec<ScanProjection>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -22,9 +25,9 @@ where
 }
 
 pub fn build_projected_columns<P>(
-    table: &DslTable<P>,
+    table: &ExecutorTable<P>,
     projections: &[SelectProjection],
-) -> DslResult<Vec<ScanProjection>>
+) -> ExecutorResult<Vec<ScanProjection>>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -60,15 +63,15 @@ where
 
 fn translate_scalar(
     expr: &llkv_expr::expr::ScalarExpr<String>,
-    schema: &DslSchema,
-) -> DslResult<llkv_expr::expr::ScalarExpr<FieldId>> {
+    schema: &ExecutorSchema,
+) -> ExecutorResult<llkv_expr::expr::ScalarExpr<FieldId>> {
     use llkv_expr::expr::ScalarExpr;
     match expr {
         ScalarExpr::Literal(lit) => Ok(ScalarExpr::Literal(lit.clone())),
         ScalarExpr::Column(name) => {
-            let column = schema.resolve(name).ok_or_else(|| {
-                Error::InvalidArgumentError(format!("unknown column '{}'", name))
-            })?;
+            let column = schema
+                .resolve(name)
+                .ok_or_else(|| Error::InvalidArgumentError(format!("unknown column '{}'", name)))?;
             Ok(ScalarExpr::Column(column.field_id))
         }
         ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {

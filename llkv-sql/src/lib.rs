@@ -6,4 +6,5 @@ pub use sql_engine::SqlEngine;
 mod sql_value;
 use sql_value::SqlValue;
 
-pub use llkv_dsl::{SelectExecution, StatementResult, TransactionKind};
+pub use llkv_dsl::{SelectExecution, StatementResult};
+pub use llkv_transaction::TransactionKind;

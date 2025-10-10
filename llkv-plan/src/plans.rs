@@ -6,58 +6,51 @@
 
 use std::sync::Arc;
 
+use arrow::array::{ArrayRef, Date32Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
+use llkv_result::Error;
 
 /// Result type for plan operations.
 pub type PlanResult<T> = llkv_result::Result<T>;
 
 // ============================================================================
-// Value Types
+// PlanValue Types
 // ============================================================================
-//
-// Note: DslValue is defined here in llkv-plan even though it's logically part
-// of the DSL API, because plan structures need to reference it. This avoids
-// circular dependencies while keeping plans self-contained.
 
-// TODO: Rename `DslValue`
-/// A value that can be used in DSL operations (inserts, updates, etc.).
-///
-/// This is primarily an API convenience type for llkv-dsl users, but is defined
-/// here because plan structures reference it.
 #[derive(Clone, Debug, PartialEq)]
-pub enum DslValue {
+pub enum PlanValue {
     Null,
     Integer(i64),
     Float(f64),
     String(String),
 }
 
-impl From<&str> for DslValue {
+impl From<&str> for PlanValue {
     fn from(value: &str) -> Self {
         Self::String(value.to_string())
     }
 }
 
-impl From<String> for DslValue {
+impl From<String> for PlanValue {
     fn from(value: String) -> Self {
         Self::String(value)
     }
 }
 
-impl From<i64> for DslValue {
+impl From<i64> for PlanValue {
     fn from(value: i64) -> Self {
         Self::Integer(value)
     }
 }
 
-impl From<f64> for DslValue {
+impl From<f64> for PlanValue {
     fn from(value: f64) -> Self {
         Self::Float(value)
     }
 }
 
-impl From<bool> for DslValue {
+impl From<bool> for PlanValue {
     fn from(value: bool) -> Self {
         // Store booleans as integers for compatibility
         if value {
@@ -68,7 +61,7 @@ impl From<bool> for DslValue {
     }
 }
 
-impl From<i32> for DslValue {
+impl From<i32> for PlanValue {
     fn from(value: i32) -> Self {
         Self::Integer(value as i64)
     }
@@ -199,7 +192,7 @@ pub struct InsertPlan {
 /// Source data for INSERT operations.
 #[derive(Clone, Debug)]
 pub enum InsertSource {
-    Rows(Vec<Vec<DslValue>>),
+    Rows(Vec<Vec<PlanValue>>),
     Batches(Vec<RecordBatch>),
 }
 
@@ -218,7 +211,7 @@ pub struct UpdatePlan {
 /// Value to assign in an UPDATE.
 #[derive(Clone, Debug)]
 pub enum AssignmentValue {
-    Literal(DslValue),
+    Literal(PlanValue),
     Expression(llkv_expr::expr::ScalarExpr<String>),
 }
 
@@ -372,6 +365,51 @@ impl AggregateExpr {
             alias: alias.into(),
             function: AggregateFunction::CountNulls,
         }
+    }
+}
+
+/// Helper to convert an Arrow array cell into a plan-level Value.
+pub fn plan_value_from_array(array: &ArrayRef, index: usize) -> PlanResult<PlanValue> {
+    if array.is_null(index) {
+        return Ok(PlanValue::Null);
+    }
+    match array.data_type() {
+        DataType::Int64 => {
+            let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                Error::InvalidArgumentError("expected Int64 array in INSERT SELECT".into())
+            })?;
+            Ok(PlanValue::Integer(values.value(index)))
+        }
+        DataType::Float64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("expected Float64 array in INSERT SELECT".into())
+                })?;
+            Ok(PlanValue::Float(values.value(index)))
+        }
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("expected Utf8 array in INSERT SELECT".into())
+                })?;
+            Ok(PlanValue::String(values.value(index).to_string()))
+        }
+        DataType::Date32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("expected Date32 array in INSERT SELECT".into())
+                })?;
+            Ok(PlanValue::Integer(values.value(index) as i64))
+        }
+        other => Err(Error::InvalidArgumentError(format!(
+            "unsupported data type in INSERT SELECT: {other:?}"
+        ))),
     }
 }
 

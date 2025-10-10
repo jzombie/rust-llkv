@@ -8,7 +8,7 @@ use arrow::datatypes::{Field, Schema};
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
     AggregateExpr, AggregateFunction, ColumnSpec, CreateTablePlan, DeletePlan, DslOperation,
-    DslValue, InsertPlan, InsertSource, OrderByPlan, OrderTarget, SelectPlan, UpdatePlan,
+    InsertPlan, InsertSource, OrderByPlan, OrderTarget, PlanValue, SelectPlan, UpdatePlan,
 };
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::{MemPager, Pager};
@@ -23,7 +23,7 @@ use llkv_executor::SelectExecution;
 /// Simplified row batch for export/import
 pub struct RowBatch {
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<DslValue>>,
+    pub rows: Vec<Vec<PlanValue>>,
 }
 
 /// Transaction kind enum
@@ -702,7 +702,7 @@ where
 
 /// A session handle for transaction management.
 /// When dropped, automatically rolls back any active transaction.
-pub struct DslSession<BaseCtx, StagingCtx>
+pub struct TransactionSession<BaseCtx, StagingCtx>
 where
     BaseCtx: TransactionContext + 'static,
     StagingCtx: TransactionContext + 'static,
@@ -712,7 +712,7 @@ where
     transactions: Arc<Mutex<HashMap<u64, DslTransaction<BaseCtx, StagingCtx>>>>,
 }
 
-impl<BaseCtx, StagingCtx> DslSession<BaseCtx, StagingCtx>
+impl<BaseCtx, StagingCtx> TransactionSession<BaseCtx, StagingCtx>
 where
     BaseCtx: TransactionContext + 'static,
     StagingCtx: TransactionContext + 'static,
@@ -835,7 +835,7 @@ where
     }
 }
 
-impl<BaseCtx, StagingCtx> Drop for DslSession<BaseCtx, StagingCtx>
+impl<BaseCtx, StagingCtx> Drop for TransactionSession<BaseCtx, StagingCtx>
 where
     BaseCtx: TransactionContext,
     StagingCtx: TransactionContext,
@@ -847,14 +847,14 @@ where
             Ok(mut guard) => {
                 if guard.remove(&self.session_id).is_some() {
                     eprintln!(
-                        "Warning: DslSession dropped with active transaction - auto-rolling back"
+                        "Warning: TransactionSession dropped with active transaction - auto-rolling back"
                     );
                 }
             }
             Err(_) => {
                 // Mutex is poisoned, likely due to a panic elsewhere
                 // Don't panic again during cleanup
-                eprintln!("Warning: DslSession dropped with poisoned transaction mutex");
+                eprintln!("Warning: TransactionSession dropped with poisoned transaction mutex");
             }
         }
     }
@@ -883,9 +883,9 @@ where
     }
 
     /// Create a new session for transaction management.
-    pub fn create_session(&self, context: Arc<BaseCtx>) -> DslSession<BaseCtx, StagingCtx> {
+    pub fn create_session(&self, context: Arc<BaseCtx>) -> TransactionSession<BaseCtx, StagingCtx> {
         let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
-        DslSession::new(context, session_id, Arc::clone(&self.transactions))
+        TransactionSession::new(context, session_id, Arc::clone(&self.transactions))
     }
 
     /// Check if there's an active transaction (checks if ANY session has a transaction).
