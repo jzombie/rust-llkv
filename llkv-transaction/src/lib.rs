@@ -34,9 +34,9 @@ pub enum TransactionKind {
     Rollback,
 }
 
-/// Statement result enum (simplified version for transaction module)
+/// Transaction result enum (simplified version for transaction module)
 #[derive(Clone, Debug)]
-pub enum StatementResult<P>
+pub enum TransactionResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -63,35 +63,35 @@ where
     },
 }
 
-impl<P> StatementResult<P>
+impl<P> TransactionResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     /// Convert pager type for compatibility
-    pub fn convert_pager_type<P2>(self) -> LlkvResult<StatementResult<P2>>
+    pub fn convert_pager_type<P2>(self) -> LlkvResult<TransactionResult<P2>>
     where
         P2: Pager<Blob = EntryHandle> + Send + Sync + 'static,
     {
         match self {
-            StatementResult::CreateTable { table_name } => {
-                Ok(StatementResult::CreateTable { table_name })
+            TransactionResult::CreateTable { table_name } => {
+                Ok(TransactionResult::CreateTable { table_name })
             }
-            StatementResult::Insert { rows_inserted } => {
-                Ok(StatementResult::Insert { rows_inserted })
+            TransactionResult::Insert { rows_inserted } => {
+                Ok(TransactionResult::Insert { rows_inserted })
             }
-            StatementResult::Update {
+            TransactionResult::Update {
                 rows_matched,
                 rows_updated,
-            } => Ok(StatementResult::Update {
+            } => Ok(TransactionResult::Update {
                 rows_matched,
                 rows_updated,
             }),
-            StatementResult::Delete { rows_deleted } => {
-                Ok(StatementResult::Delete { rows_deleted })
+            TransactionResult::Delete { rows_deleted } => {
+                Ok(TransactionResult::Delete { rows_deleted })
             }
-            StatementResult::Transaction { kind } => Ok(StatementResult::Transaction { kind }),
-            StatementResult::Select { .. } => Err(Error::Internal(
-                "cannot convert SELECT StatementResult between pager types".into(),
+            TransactionResult::Transaction { kind } => Ok(TransactionResult::Transaction { kind }),
+            TransactionResult::Select { .. } => Err(Error::Internal(
+                "cannot convert SELECT TransactionResult between pager types".into(),
             )),
         }
     }
@@ -151,16 +151,16 @@ pub trait TransactionContext: Send + Sync {
     fn execute_select(&self, plan: SelectPlan) -> LlkvResult<SelectExecution<Self::Pager>>;
 
     /// Create a table from plan
-    fn create_table_plan(&self, plan: CreateTablePlan) -> LlkvResult<StatementResult<MemPager>>;
+    fn create_table_plan(&self, plan: CreateTablePlan) -> LlkvResult<TransactionResult<MemPager>>;
 
     /// Insert rows
-    fn insert(&self, plan: InsertPlan) -> LlkvResult<StatementResult<MemPager>>;
+    fn insert(&self, plan: InsertPlan) -> LlkvResult<TransactionResult<MemPager>>;
 
     /// Update rows
-    fn update(&self, plan: UpdatePlan) -> LlkvResult<StatementResult<MemPager>>;
+    fn update(&self, plan: UpdatePlan) -> LlkvResult<TransactionResult<MemPager>>;
 
     /// Delete rows
-    fn delete(&self, plan: DeletePlan) -> LlkvResult<StatementResult<MemPager>>;
+    fn delete(&self, plan: DeletePlan) -> LlkvResult<TransactionResult<MemPager>>;
 
     /// Append batches with row IDs
     fn append_batches_with_row_ids(
@@ -710,7 +710,7 @@ where
     pub fn execute_operation(
         &mut self,
         operation: DslOperation,
-    ) -> LlkvResult<StatementResult<BaseCtx::Pager>> {
+    ) -> LlkvResult<TransactionResult<BaseCtx::Pager>> {
         tracing::trace!(
             "[TX] DslTransaction::execute_operation called, operation={:?}",
             match &operation {
@@ -818,7 +818,7 @@ where
                 match self.execute_select(plan.clone()) {
                     Ok(execution) => {
                         let schema = execution.schema();
-                        StatementResult::Select {
+                        TransactionResult::Select {
                             table_name,
                             schema,
                             execution,
@@ -915,7 +915,7 @@ where
     pub fn begin_transaction(
         &self,
         staging: Arc<StagingCtx>,
-    ) -> LlkvResult<StatementResult<BaseCtx::Pager>> {
+    ) -> LlkvResult<TransactionResult<BaseCtx::Pager>> {
         let mut guard = self
             .transactions
             .lock()
@@ -929,7 +929,7 @@ where
             self.session_id,
             DslTransaction::new(Arc::clone(&self.context), staging),
         );
-        Ok(StatementResult::Transaction {
+        Ok(TransactionResult::Transaction {
             kind: TransactionKind::Begin,
         })
     }
@@ -938,7 +938,7 @@ where
     /// If the transaction is aborted, this acts as a ROLLBACK instead.
     pub fn commit_transaction(
         &self,
-    ) -> LlkvResult<(StatementResult<BaseCtx::Pager>, Vec<DslOperation>)> {
+    ) -> LlkvResult<(TransactionResult<BaseCtx::Pager>, Vec<DslOperation>)> {
         tracing::trace!(
             "[COMMIT] commit_transaction called for session {:?}",
             self.session_id
@@ -965,7 +965,7 @@ where
         if tx.is_aborted {
             tracing::trace!("DEBUG commit_transaction: returning Rollback with 0 operations");
             return Ok((
-                StatementResult::Transaction {
+                TransactionResult::Transaction {
                     kind: TransactionKind::Rollback,
                 },
                 Vec::new(),
@@ -979,7 +979,7 @@ where
         );
 
         Ok((
-            StatementResult::Transaction {
+            TransactionResult::Transaction {
                 kind: TransactionKind::Commit,
             },
             operations,
@@ -987,7 +987,7 @@ where
     }
 
     /// Rollback the transaction in this session.
-    pub fn rollback_transaction(&self) -> LlkvResult<StatementResult<BaseCtx::Pager>> {
+    pub fn rollback_transaction(&self) -> LlkvResult<TransactionResult<BaseCtx::Pager>> {
         let mut guard = self
             .transactions
             .lock()
@@ -997,7 +997,7 @@ where
                 "no transaction is currently in progress in this session".into(),
             ));
         }
-        Ok(StatementResult::Transaction {
+        Ok(TransactionResult::Transaction {
             kind: TransactionKind::Rollback,
         })
     }
@@ -1006,7 +1006,7 @@ where
     pub fn execute_operation(
         &self,
         operation: DslOperation,
-    ) -> LlkvResult<StatementResult<BaseCtx::Pager>> {
+    ) -> LlkvResult<TransactionResult<BaseCtx::Pager>> {
         if !self.has_active_transaction() {
             // No transaction - caller must handle direct execution
             return Err(Error::InvalidArgumentError(

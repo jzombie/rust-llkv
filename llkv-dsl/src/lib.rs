@@ -37,9 +37,9 @@ pub type DslResult<T> = llkv_result::Result<T>;
 // Re-export plan structures from llkv-plan
 pub use llkv_plan::{
     AggregateExpr, AggregateFunction, AssignmentValue, ColumnAssignment, ColumnNullability,
-    ColumnSpec, CreateTablePlan, CreateTableSource, DeletePlan, DslOperation, InsertPlan,
-    InsertSource, IntoColumnSpec, NotNull, Nullable, OrderByPlan, OrderSortType, OrderTarget,
-    PlanValue, SelectPlan, SelectProjection, UpdatePlan,
+    ColumnSpec, CreateTablePlan, CreateTableSource, DeletePlan, DslOperation, DslStatement,
+    InsertPlan, InsertSource, IntoColumnSpec, NotNull, Nullable, OrderByPlan, OrderSortType,
+    OrderTarget, PlanValue, SelectPlan, SelectProjection, UpdatePlan,
 };
 
 // Execution structures from llkv-executor
@@ -52,17 +52,18 @@ pub use llkv_executor::{QueryExecutor, RowBatch, SelectExecution, TableProvider}
 // Import transaction structures from llkv-transaction for internal use.
 // NOTE: we intentionally do NOT re-export these types from the DSL crate so
 // non-DSL crates do not get `Dsl*` symbols pulled into their public API.
-use llkv_transaction::{TransactionContext, TransactionKind, TransactionManager};
+use llkv_transaction::{
+    TransactionContext, TransactionKind, TransactionManager, TransactionResult,
+};
 
 // Internal low-level transaction session type (from llkv-transaction)
 use llkv_transaction::TransactionSession;
 
 // Note: Session is the high-level wrapper that users should use instead of raw DslSession
 
-// TODO: Rename to `DslStatementResult`
 /// Result of running a DSL statement.
 #[derive(Clone)]
-pub enum StatementResult<P>
+pub enum DslStatementResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -92,18 +93,18 @@ where
     },
 }
 
-impl<P> fmt::Debug for StatementResult<P>
+impl<P> fmt::Debug for DslStatementResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StatementResult::CreateTable { table_name } => f
+            DslStatementResult::CreateTable { table_name } => f
                 .debug_struct("CreateTable")
                 .field("table_name", table_name)
                 .finish(),
-            StatementResult::NoOp => f.debug_struct("NoOp").finish(),
-            StatementResult::Insert {
+            DslStatementResult::NoOp => f.debug_struct("NoOp").finish(),
+            DslStatementResult::Insert {
                 table_name,
                 rows_inserted,
             } => f
@@ -111,7 +112,7 @@ where
                 .field("table_name", table_name)
                 .field("rows_inserted", rows_inserted)
                 .finish(),
-            StatementResult::Update {
+            DslStatementResult::Update {
                 table_name,
                 rows_updated,
             } => f
@@ -119,7 +120,7 @@ where
                 .field("table_name", table_name)
                 .field("rows_updated", rows_updated)
                 .finish(),
-            StatementResult::Delete {
+            DslStatementResult::Delete {
                 table_name,
                 rows_deleted,
             } => f
@@ -127,62 +128,83 @@ where
                 .field("table_name", table_name)
                 .field("rows_deleted", rows_deleted)
                 .finish(),
-            StatementResult::Select {
+            DslStatementResult::Select {
                 table_name, schema, ..
             } => f
                 .debug_struct("Select")
                 .field("table_name", table_name)
                 .field("schema", schema)
                 .finish(),
-            StatementResult::Transaction { kind } => {
+            DslStatementResult::Transaction { kind } => {
                 f.debug_struct("Transaction").field("kind", kind).finish()
             }
         }
     }
 }
 
-impl<P> StatementResult<P>
+impl<P> DslStatementResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     /// Convert a StatementResult from one pager type to another.
     /// Only works for non-SELECT results (CreateTable, Insert, Update, Delete, NoOp, Transaction).
     #[allow(dead_code)]
-    pub(crate) fn convert_pager_type<Q>(self) -> DslResult<StatementResult<Q>>
+    pub(crate) fn convert_pager_type<Q>(self) -> DslResult<DslStatementResult<Q>>
     where
         Q: Pager<Blob = EntryHandle> + Send + Sync,
     {
         match self {
-            StatementResult::CreateTable { table_name } => {
-                Ok(StatementResult::CreateTable { table_name })
+            DslStatementResult::CreateTable { table_name } => {
+                Ok(DslStatementResult::CreateTable { table_name })
             }
-            StatementResult::NoOp => Ok(StatementResult::NoOp),
-            StatementResult::Insert {
+            DslStatementResult::NoOp => Ok(DslStatementResult::NoOp),
+            DslStatementResult::Insert {
                 table_name,
                 rows_inserted,
-            } => Ok(StatementResult::Insert {
+            } => Ok(DslStatementResult::Insert {
                 table_name,
                 rows_inserted,
             }),
-            StatementResult::Update {
+            DslStatementResult::Update {
                 table_name,
                 rows_updated,
-            } => Ok(StatementResult::Update {
+            } => Ok(DslStatementResult::Update {
                 table_name,
                 rows_updated,
             }),
-            StatementResult::Delete {
+            DslStatementResult::Delete {
                 table_name,
                 rows_deleted,
-            } => Ok(StatementResult::Delete {
+            } => Ok(DslStatementResult::Delete {
                 table_name,
                 rows_deleted,
             }),
-            StatementResult::Transaction { kind } => Ok(StatementResult::Transaction { kind }),
-            StatementResult::Select { .. } => Err(Error::Internal(
+            DslStatementResult::Transaction { kind } => {
+                Ok(DslStatementResult::Transaction { kind })
+            }
+            DslStatementResult::Select { .. } => Err(Error::Internal(
                 "Cannot convert SELECT result between pager types in transaction".into(),
             )),
         }
+    }
+}
+
+/// Return the table name referenced by a DSL statement, if any.
+///
+/// This is a small helper used by higher-level engines (for example the
+/// SQL front-end) to provide better error messages when a statement fails
+/// with a table-related error. It intentionally returns an `Option<&str>` so
+/// callers can decide how to report missing table context.
+pub fn statement_table_name(statement: &DslStatement) -> Option<&str> {
+    match statement {
+        DslStatement::CreateTable(plan) => Some(&plan.name),
+        DslStatement::Insert(plan) => Some(&plan.table),
+        DslStatement::Update(plan) => Some(&plan.table),
+        DslStatement::Delete(plan) => Some(&plan.table),
+        DslStatement::Select(plan) => Some(&plan.table),
+        DslStatement::BeginTransaction
+        | DslStatement::CommitTransaction
+        | DslStatement::RollbackTransaction => None,
     }
 }
 
@@ -236,7 +258,7 @@ where
 {
     /// Begin a transaction in this session.
     /// Creates an isolated staging context automatically.
-    pub fn begin_transaction(&self) -> DslResult<StatementResult<P>> {
+    pub fn begin_transaction(&self) -> DslResult<DslStatementResult<P>> {
         let staging_pager = Arc::new(MemPager::default());
         tracing::trace!(
             "BEGIN_TRANSACTION: Created staging pager at {:p}",
@@ -254,7 +276,7 @@ where
         let staging_wrapper = Arc::new(DslContextWrapper::new(staging_ctx));
 
         self.inner.begin_transaction(staging_wrapper)?;
-        Ok(StatementResult::Transaction {
+        Ok(DslStatementResult::Transaction {
             kind: TransactionKind::Begin,
         })
     }
@@ -279,7 +301,7 @@ where
 
     /// Commit the current transaction and apply changes to the base context.
     /// If the transaction was aborted, this acts as a ROLLBACK instead.
-    pub fn commit_transaction(&self) -> DslResult<StatementResult<P>> {
+    pub fn commit_transaction(&self) -> DslResult<DslStatementResult<P>> {
         tracing::trace!("Session::commit_transaction called");
         let (tx_result, operations) = self.inner.commit_transaction()?;
         tracing::trace!(
@@ -289,7 +311,7 @@ where
 
         // Extract the transaction kind from the transaction module's result
         let kind = match tx_result {
-            llkv_transaction::StatementResult::Transaction { kind } => kind,
+            TransactionResult::Transaction { kind } => kind,
             _ => {
                 return Err(Error::Internal(
                     "commit_transaction returned non-transaction result".into(),
@@ -318,26 +340,51 @@ where
         }
 
         // Return the DSL's StatementResult with the correct kind (Commit or Rollback)
-        Ok(StatementResult::Transaction { kind })
+        Ok(DslStatementResult::Transaction { kind })
     }
 
     /// Rollback the current transaction, discarding all changes.
-    pub fn rollback_transaction(&self) -> DslResult<StatementResult<P>> {
+    pub fn rollback_transaction(&self) -> DslResult<DslStatementResult<P>> {
         self.inner.rollback_transaction()?;
-        Ok(StatementResult::Transaction {
+        Ok(DslStatementResult::Transaction {
             kind: TransactionKind::Rollback,
         })
     }
 
+    fn materialize_create_table_plan(
+        &self,
+        mut plan: CreateTablePlan,
+    ) -> DslResult<CreateTablePlan> {
+        if let Some(CreateTableSource::Select { plan: select_plan }) = plan.source.take() {
+            let select_result = self.select(*select_plan)?;
+            let (schema, batches) = match select_result {
+                DslStatementResult::Select {
+                    schema, execution, ..
+                } => {
+                    let batches = execution.collect()?;
+                    (schema, batches)
+                }
+                _ => {
+                    return Err(Error::Internal(
+                        "expected SELECT result while executing CREATE TABLE AS SELECT".into(),
+                    ));
+                }
+            };
+            plan.source = Some(CreateTableSource::Batches { schema, batches });
+        }
+        Ok(plan)
+    }
+
     /// Create a table (outside or inside transaction).
-    pub fn create_table_plan(&self, plan: CreateTablePlan) -> DslResult<StatementResult<P>> {
+    pub fn create_table_plan(&self, plan: CreateTablePlan) -> DslResult<DslStatementResult<P>> {
+        let plan = self.materialize_create_table_plan(plan)?;
         if self.has_active_transaction() {
             let table_name = plan.name.clone();
             match self
                 .inner
                 .execute_operation(DslOperation::CreateTable(plan))
             {
-                Ok(_) => Ok(StatementResult::CreateTable { table_name }),
+                Ok(_) => Ok(DslStatementResult::CreateTable { table_name }),
                 Err(e) => {
                     // If an error occurs during a transaction, abort it
                     self.abort_transaction();
@@ -348,23 +395,74 @@ where
             // Call via TransactionContext trait
             let table_name = plan.name.clone();
             TransactionContext::create_table_plan(&**self.inner.context(), plan)?;
-            Ok(StatementResult::CreateTable { table_name })
+            Ok(DslStatementResult::CreateTable { table_name })
+        }
+    }
+
+    fn normalize_insert_plan(&self, plan: InsertPlan) -> DslResult<(InsertPlan, usize)> {
+        let InsertPlan {
+            table,
+            columns,
+            source,
+        } = plan;
+
+        match source {
+            InsertSource::Rows(rows) => {
+                let count = rows.len();
+                Ok((
+                    InsertPlan {
+                        table,
+                        columns,
+                        source: InsertSource::Rows(rows),
+                    },
+                    count,
+                ))
+            }
+            InsertSource::Batches(batches) => {
+                let count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+                Ok((
+                    InsertPlan {
+                        table,
+                        columns,
+                        source: InsertSource::Batches(batches),
+                    },
+                    count,
+                ))
+            }
+            InsertSource::Select { plan: select_plan } => {
+                let select_result = self.select(*select_plan)?;
+                let rows = match select_result {
+                    DslStatementResult::Select { execution, .. } => execution.into_rows()?,
+                    _ => {
+                        return Err(Error::Internal(
+                            "expected Select result when executing INSERT ... SELECT".into(),
+                        ));
+                    }
+                };
+                let count = rows.len();
+                Ok((
+                    InsertPlan {
+                        table,
+                        columns,
+                        source: InsertSource::Rows(rows),
+                    },
+                    count,
+                ))
+            }
         }
     }
 
     /// Insert rows (outside or inside transaction).
-    pub fn insert(&self, plan: InsertPlan) -> DslResult<StatementResult<P>> {
+    pub fn insert(&self, plan: InsertPlan) -> DslResult<DslStatementResult<P>> {
         tracing::trace!("Session::insert called for table={}", plan.table);
+        let (plan, rows_inserted) = self.normalize_insert_plan(plan)?;
+        let table_name = plan.table.clone();
+
         if self.has_active_transaction() {
-            let table_name = plan.table.clone();
-            let rows_inserted = match &plan.source {
-                InsertSource::Rows(rows) => rows.len(),
-                _ => 0,
-            };
             match self.inner.execute_operation(DslOperation::Insert(plan)) {
                 Ok(_) => {
                     tracing::trace!("Session::insert succeeded for table={}", table_name);
-                    Ok(StatementResult::Insert {
+                    Ok(DslStatementResult::Insert {
                         rows_inserted,
                         table_name,
                     })
@@ -385,13 +483,8 @@ where
             }
         } else {
             // Call via TransactionContext trait
-            let table_name = plan.table.clone();
-            let rows_inserted = match &plan.source {
-                InsertSource::Rows(rows) => rows.len(),
-                _ => 0,
-            };
             TransactionContext::insert(&**self.inner.context(), plan)?;
-            Ok(StatementResult::Insert {
+            Ok(DslStatementResult::Insert {
                 rows_inserted,
                 table_name,
             })
@@ -399,7 +492,7 @@ where
     }
 
     /// Select rows (outside or inside transaction).
-    pub fn select(&self, plan: SelectPlan) -> DslResult<StatementResult<P>> {
+    pub fn select(&self, plan: SelectPlan) -> DslResult<DslStatementResult<P>> {
         if self.has_active_transaction() {
             let tx_result = match self
                 .inner
@@ -416,11 +509,11 @@ where
                 }
             };
             match tx_result {
-                llkv_transaction::StatementResult::Select {
+                TransactionResult::Select {
                     table_name,
                     schema,
                     execution,
-                } => Ok(StatementResult::Select {
+                } => Ok(DslStatementResult::Select {
                     execution,
                     table_name,
                     schema,
@@ -432,7 +525,7 @@ where
             let table_name = plan.table.clone();
             let execution = TransactionContext::execute_select(&**self.inner.context(), plan)?;
             let schema = execution.schema();
-            Ok(StatementResult::Select {
+            Ok(DslStatementResult::Select {
                 execution,
                 table_name,
                 schema,
@@ -441,7 +534,7 @@ where
     }
 
     /// Update rows (outside or inside transaction).
-    pub fn update(&self, plan: UpdatePlan) -> DslResult<StatementResult<P>> {
+    pub fn update(&self, plan: UpdatePlan) -> DslResult<DslStatementResult<P>> {
         if self.has_active_transaction() {
             let table_name = plan.table.clone();
             let result = match self.inner.execute_operation(DslOperation::Update(plan)) {
@@ -453,10 +546,10 @@ where
                 }
             };
             match result {
-                llkv_transaction::StatementResult::Update {
+                TransactionResult::Update {
                     rows_matched: _,
                     rows_updated,
-                } => Ok(StatementResult::Update {
+                } => Ok(DslStatementResult::Update {
                     rows_updated,
                     table_name,
                 }),
@@ -467,10 +560,10 @@ where
             let table_name = plan.table.clone();
             let result = TransactionContext::update(&**self.inner.context(), plan)?;
             match result {
-                llkv_transaction::StatementResult::Update {
+                TransactionResult::Update {
                     rows_matched: _,
                     rows_updated,
-                } => Ok(StatementResult::Update {
+                } => Ok(DslStatementResult::Update {
                     rows_updated,
                     table_name,
                 }),
@@ -480,7 +573,7 @@ where
     }
 
     /// Delete rows (outside or inside transaction).
-    pub fn delete(&self, plan: DeletePlan) -> DslResult<StatementResult<P>> {
+    pub fn delete(&self, plan: DeletePlan) -> DslResult<DslStatementResult<P>> {
         if self.has_active_transaction() {
             let table_name = plan.table.clone();
             let result = match self.inner.execute_operation(DslOperation::Delete(plan)) {
@@ -492,12 +585,10 @@ where
                 }
             };
             match result {
-                llkv_transaction::StatementResult::Delete { rows_deleted } => {
-                    Ok(StatementResult::Delete {
-                        rows_deleted,
-                        table_name,
-                    })
-                }
+                TransactionResult::Delete { rows_deleted } => Ok(DslStatementResult::Delete {
+                    rows_deleted,
+                    table_name,
+                }),
                 _ => Err(Error::Internal("expected Delete result".into())),
             }
         } else {
@@ -505,15 +596,80 @@ where
             let table_name = plan.table.clone();
             let result = TransactionContext::delete(&**self.inner.context(), plan)?;
             match result {
-                llkv_transaction::StatementResult::Delete { rows_deleted } => {
-                    Ok(StatementResult::Delete {
-                        rows_deleted,
-                        table_name,
-                    })
-                }
+                TransactionResult::Delete { rows_deleted } => Ok(DslStatementResult::Delete {
+                    rows_deleted,
+                    table_name,
+                }),
                 _ => Err(Error::Internal("expected Delete result".into())),
             }
         }
+    }
+}
+
+pub struct DslEngine<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    context: Arc<DslContext<P>>,
+    session: Session<P>,
+}
+
+impl<P> Clone for DslEngine<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            context: Arc::clone(&self.context),
+            session: self.context.create_session(),
+        }
+    }
+}
+
+impl<P> DslEngine<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    pub fn new(pager: Arc<P>) -> Self {
+        let context = Arc::new(DslContext::new(pager));
+        Self::from_context(context)
+    }
+
+    pub fn from_context(context: Arc<DslContext<P>>) -> Self {
+        let session = context.create_session();
+        Self { context, session }
+    }
+
+    pub fn context(&self) -> Arc<DslContext<P>> {
+        Arc::clone(&self.context)
+    }
+
+    pub fn session(&self) -> &Session<P> {
+        &self.session
+    }
+
+    pub fn execute_statement(&self, statement: DslStatement) -> DslResult<DslStatementResult<P>> {
+        match statement {
+            DslStatement::BeginTransaction => self.session.begin_transaction(),
+            DslStatement::CommitTransaction => self.session.commit_transaction(),
+            DslStatement::RollbackTransaction => self.session.rollback_transaction(),
+            DslStatement::CreateTable(plan) => self.session.create_table_plan(plan),
+            DslStatement::Insert(plan) => self.session.insert(plan),
+            DslStatement::Update(plan) => self.session.update(plan),
+            DslStatement::Delete(plan) => self.session.delete(plan),
+            DslStatement::Select(plan) => self.session.select(plan),
+        }
+    }
+
+    pub fn execute_all<I>(&self, statements: I) -> DslResult<Vec<DslStatementResult<P>>>
+    where
+        I: IntoIterator<Item = DslStatement>,
+    {
+        let mut results = Vec::new();
+        for statement in statements {
+            results.push(self.execute_statement(statement)?);
+        }
+        Ok(results)
     }
 }
 
@@ -584,7 +740,7 @@ where
         self.create_table_with_options(name, columns, true)
     }
 
-    pub fn create_table_plan(&self, plan: CreateTablePlan) -> DslResult<StatementResult<P>> {
+    pub fn create_table_plan(&self, plan: CreateTablePlan) -> DslResult<DslStatementResult<P>> {
         if plan.columns.is_empty() && plan.source.is_none() {
             return Err(Error::InvalidArgumentError(
                 "CREATE TABLE requires explicit columns or a source".into(),
@@ -617,7 +773,7 @@ where
                     "DEBUG create_table_plan: table '{}' exists and if_not_exists=true, returning early WITHOUT creating",
                     display_name
                 );
-                return Ok(StatementResult::CreateTable {
+                return Ok(DslStatementResult::CreateTable {
                     table_name: display_name,
                 });
             }
@@ -635,6 +791,10 @@ where
                 batches,
                 plan.if_not_exists,
             ),
+            Some(CreateTableSource::Select { .. }) => Err(Error::Internal(
+                "CreateTableSource::Select should be materialized before reaching DslContext::create_table_plan"
+                    .into(),
+            )),
             None => self.create_table_from_columns(
                 display_name,
                 canonical_name,
@@ -738,7 +898,7 @@ where
         handle.lazy()?.collect_rows()
     }
 
-    fn execute_create_table(&self, plan: CreateTablePlan) -> DslResult<StatementResult<P>> {
+    fn execute_create_table(&self, plan: CreateTablePlan) -> DslResult<DslStatementResult<P>> {
         self.create_table_plan(plan)
     }
 
@@ -760,14 +920,14 @@ where
             .collect();
         let result = self.create_table_plan(plan)?;
         match result {
-            StatementResult::CreateTable { .. } => TableHandle::new(Arc::clone(self), name),
+            DslStatementResult::CreateTable { .. } => TableHandle::new(Arc::clone(self), name),
             other => Err(Error::InvalidArgumentError(format!(
                 "unexpected statement result {other:?} when creating table"
             ))),
         }
     }
 
-    pub fn insert(&self, plan: InsertPlan) -> DslResult<StatementResult<P>> {
+    pub fn insert(&self, plan: InsertPlan) -> DslResult<DslStatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
 
@@ -798,6 +958,10 @@ where
             InsertSource::Batches(batches) => {
                 self.insert_batches(table.as_ref(), display_name.clone(), batches, plan.columns)
             }
+            InsertSource::Select { .. } => Err(Error::Internal(
+                "InsertSource::Select should be materialized before reaching DslContext::insert"
+                    .into(),
+            )),
         };
 
         if display_name == "keys" {
@@ -938,7 +1102,7 @@ where
         Ok(total_rows)
     }
 
-    pub fn update(&self, plan: UpdatePlan) -> DslResult<StatementResult<P>> {
+    pub fn update(&self, plan: UpdatePlan) -> DslResult<DslStatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
         match plan.filter {
@@ -949,7 +1113,7 @@ where
         }
     }
 
-    pub fn delete(&self, plan: DeletePlan) -> DslResult<StatementResult<P>> {
+    pub fn delete(&self, plan: DeletePlan) -> DslResult<DslStatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
         match plan.filter {
@@ -985,7 +1149,7 @@ where
         canonical_name: String,
         columns: Vec<ColumnSpec>,
         if_not_exists: bool,
-    ) -> DslResult<StatementResult<P>> {
+    ) -> DslResult<DslStatementResult<P>> {
         tracing::trace!(
             "\n=== CREATE_TABLE_FROM_COLUMNS: table='{}' columns={} ===",
             display_name,
@@ -1078,7 +1242,7 @@ where
         let mut tables = self.tables.write().unwrap();
         if tables.contains_key(&canonical_name) {
             if if_not_exists {
-                return Ok(StatementResult::CreateTable {
+                return Ok(DslStatementResult::CreateTable {
                     table_name: display_name,
                 });
             }
@@ -1088,7 +1252,7 @@ where
             )));
         }
         tables.insert(canonical_name, table_entry);
-        Ok(StatementResult::CreateTable {
+        Ok(DslStatementResult::CreateTable {
             table_name: display_name,
         })
     }
@@ -1100,7 +1264,7 @@ where
         schema: Arc<Schema>,
         batches: Vec<RecordBatch>,
         if_not_exists: bool,
-    ) -> DslResult<StatementResult<P>> {
+    ) -> DslResult<DslStatementResult<P>> {
         if schema.fields().is_empty() {
             return Err(Error::InvalidArgumentError(
                 "CREATE TABLE AS SELECT requires at least one column".into(),
@@ -1215,7 +1379,7 @@ where
         let mut tables = self.tables.write().unwrap();
         if tables.contains_key(&canonical_name) {
             if if_not_exists {
-                return Ok(StatementResult::CreateTable {
+                return Ok(DslStatementResult::CreateTable {
                     table_name: display_name,
                 });
             }
@@ -1238,7 +1402,7 @@ where
             );
         }
         tables.insert(canonical_name.clone(), table_entry);
-        Ok(StatementResult::CreateTable {
+        Ok(DslStatementResult::CreateTable {
             table_name: display_name,
         })
     }
@@ -1359,7 +1523,7 @@ where
         display_name: String,
         rows: Vec<Vec<PlanValue>>,
         columns: Vec<String>,
-    ) -> DslResult<StatementResult<P>> {
+    ) -> DslResult<DslStatementResult<P>> {
         if rows.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "INSERT requires at least one row".into(),
@@ -1444,7 +1608,7 @@ where
             .total_rows
             .fetch_add(row_count as u64, Ordering::SeqCst);
 
-        Ok(StatementResult::Insert {
+        Ok(DslStatementResult::Insert {
             table_name: display_name,
             rows_inserted: row_count,
         })
@@ -1456,9 +1620,9 @@ where
         display_name: String,
         batches: Vec<RecordBatch>,
         columns: Vec<String>,
-    ) -> DslResult<StatementResult<P>> {
+    ) -> DslResult<DslStatementResult<P>> {
         if batches.is_empty() {
-            return Ok(StatementResult::Insert {
+            return Ok(DslStatementResult::Insert {
                 table_name: display_name,
                 rows_inserted: 0,
             });
@@ -1494,14 +1658,14 @@ where
             }
 
             match self.insert_rows(table, display_name.clone(), rows, columns.clone())? {
-                StatementResult::Insert { rows_inserted, .. } => {
+                DslStatementResult::Insert { rows_inserted, .. } => {
                     total_rows_inserted += rows_inserted;
                 }
                 _ => unreachable!("insert_rows must return Insert result"),
             }
         }
 
-        Ok(StatementResult::Insert {
+        Ok(DslStatementResult::Insert {
             table_name: display_name,
             rows_inserted: total_rows_inserted,
         })
@@ -1513,7 +1677,7 @@ where
         display_name: String,
         assignments: Vec<ColumnAssignment>,
         filter: LlkvExpr<'static, String>,
-    ) -> DslResult<StatementResult<P>> {
+    ) -> DslResult<DslStatementResult<P>> {
         if assignments.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "UPDATE requires at least one assignment".into(),
@@ -1566,7 +1730,7 @@ where
             self.collect_update_rows(table, &filter_expr, &scalar_exprs)?;
 
         if row_ids.is_empty() {
-            return Ok(StatementResult::Update {
+            return Ok(DslStatementResult::Update {
                 table_name: display_name,
                 rows_updated: 0,
             });
@@ -1612,7 +1776,7 @@ where
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
         table.table.append(&batch)?;
 
-        Ok(StatementResult::Update {
+        Ok(DslStatementResult::Update {
             table_name: display_name,
             rows_updated: row_count,
         })
@@ -1623,7 +1787,7 @@ where
         table: &ExecutorTable<P>,
         display_name: String,
         assignments: Vec<ColumnAssignment>,
-    ) -> DslResult<StatementResult<P>> {
+    ) -> DslResult<DslStatementResult<P>> {
         if assignments.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "UPDATE requires at least one assignment".into(),
@@ -1635,7 +1799,7 @@ where
             Error::InvalidArgumentError("table row count exceeds supported range".into())
         })?;
         if total_rows_usize == 0 {
-            return Ok(StatementResult::Update {
+            return Ok(DslStatementResult::Update {
                 table_name: display_name,
                 rows_updated: 0,
             });
@@ -1695,7 +1859,7 @@ where
             self.collect_update_rows(table, &filter_expr, &scalar_exprs)?;
 
         if row_ids.is_empty() {
-            return Ok(StatementResult::Update {
+            return Ok(DslStatementResult::Update {
                 table_name: display_name,
                 rows_updated: 0,
             });
@@ -1741,7 +1905,7 @@ where
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
         table.table.append(&batch)?;
 
-        Ok(StatementResult::Update {
+        Ok(DslStatementResult::Update {
             table_name: display_name,
             rows_updated: row_count,
         })
@@ -1752,7 +1916,7 @@ where
         table: &ExecutorTable<P>,
         display_name: String,
         filter: LlkvExpr<'static, String>,
-    ) -> DslResult<StatementResult<P>> {
+    ) -> DslResult<DslStatementResult<P>> {
         let schema = table.schema.as_ref();
         let filter_expr = translate_predicate(filter, schema)?;
         let row_ids = table.table.filter_row_ids(&filter_expr)?;
@@ -1763,10 +1927,10 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: String,
-    ) -> DslResult<StatementResult<P>> {
+    ) -> DslResult<DslStatementResult<P>> {
         let total_rows = table.total_rows.load(Ordering::SeqCst);
         if total_rows == 0 {
-            return Ok(StatementResult::Delete {
+            return Ok(DslStatementResult::Delete {
                 table_name: display_name,
                 rows_deleted: 0,
             });
@@ -1785,9 +1949,9 @@ where
         table: &ExecutorTable<P>,
         display_name: String,
         row_ids: Vec<u64>,
-    ) -> DslResult<StatementResult<P>> {
+    ) -> DslResult<DslStatementResult<P>> {
         if row_ids.is_empty() {
-            return Ok(StatementResult::Delete {
+            return Ok(DslStatementResult::Delete {
                 table_name: display_name,
                 rows_deleted: 0,
             });
@@ -1813,7 +1977,7 @@ where
             .map_err(|_| Error::InvalidArgumentError("row count exceeds supported range".into()))?;
         table.total_rows.fetch_sub(removed_u64, Ordering::SeqCst);
 
-        Ok(StatementResult::Delete {
+        Ok(DslStatementResult::Delete {
             table_name: display_name,
             rows_deleted: removed,
         })
@@ -1987,15 +2151,12 @@ where
     fn create_table_plan(
         &self,
         plan: CreateTablePlan,
-    ) -> llkv_result::Result<llkv_transaction::StatementResult<MemPager>> {
+    ) -> llkv_result::Result<TransactionResult<MemPager>> {
         let result = DslContext::create_table_plan(&self.0, plan)?;
         Ok(convert_statement_result(result))
     }
 
-    fn insert(
-        &self,
-        plan: InsertPlan,
-    ) -> llkv_result::Result<llkv_transaction::StatementResult<MemPager>> {
+    fn insert(&self, plan: InsertPlan) -> llkv_result::Result<TransactionResult<MemPager>> {
         tracing::trace!(
             "[WRAPPER] TransactionContext::insert called - plan.table='{}', wrapper_context_pager={:p}",
             plan.table,
@@ -2005,18 +2166,12 @@ where
         Ok(convert_statement_result(result))
     }
 
-    fn update(
-        &self,
-        plan: UpdatePlan,
-    ) -> llkv_result::Result<llkv_transaction::StatementResult<MemPager>> {
+    fn update(&self, plan: UpdatePlan) -> llkv_result::Result<TransactionResult<MemPager>> {
         let result = DslContext::update(&self.0, plan)?;
         Ok(convert_statement_result(result))
     }
 
-    fn delete(
-        &self,
-        plan: DeletePlan,
-    ) -> llkv_result::Result<llkv_transaction::StatementResult<MemPager>> {
+    fn delete(&self, plan: DeletePlan) -> llkv_result::Result<TransactionResult<MemPager>> {
         let result = DslContext::delete(&self.0, plan)?;
         Ok(convert_statement_result(result))
     }
@@ -2035,23 +2190,21 @@ where
 }
 
 // Helper to convert StatementResult between types (legacy)
-fn convert_statement_result<P>(
-    result: StatementResult<P>,
-) -> llkv_transaction::StatementResult<MemPager>
+fn convert_statement_result<P>(result: DslStatementResult<P>) -> TransactionResult<MemPager>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    use llkv_transaction::StatementResult as TxResult;
+    use llkv_transaction::TransactionResult as TxResult;
     match result {
-        StatementResult::CreateTable { table_name } => TxResult::CreateTable { table_name },
-        StatementResult::Insert { rows_inserted, .. } => TxResult::Insert { rows_inserted },
-        StatementResult::Update { rows_updated, .. } => TxResult::Update {
+        DslStatementResult::CreateTable { table_name } => TxResult::CreateTable { table_name },
+        DslStatementResult::Insert { rows_inserted, .. } => TxResult::Insert { rows_inserted },
+        DslStatementResult::Update { rows_updated, .. } => TxResult::Update {
             rows_matched: rows_updated,
             rows_updated,
         },
-        StatementResult::Delete { rows_deleted, .. } => TxResult::Delete { rows_deleted },
-        StatementResult::Transaction { kind } => TxResult::Transaction { kind },
-        _ => panic!("unsupported StatementResult conversion"),
+        DslStatementResult::Delete { rows_deleted, .. } => TxResult::Delete { rows_deleted },
+        DslStatementResult::Transaction { kind } => TxResult::Transaction { kind },
+        _ => panic!("unsupported DslStatementResult conversion"),
     }
 }
 
@@ -2780,7 +2933,7 @@ where
         self
     }
 
-    pub fn finish(self) -> DslResult<StatementResult<P>> {
+    pub fn finish(self) -> DslResult<DslStatementResult<P>> {
         self.ctx.execute_create_table(self.plan)
     }
 }
@@ -2968,7 +3121,10 @@ where
         LazyFrame::scan(Arc::clone(&self.context), &self.display_name)
     }
 
-    pub fn insert_rows<R>(&self, rows: impl IntoIterator<Item = R>) -> DslResult<StatementResult<P>>
+    pub fn insert_rows<R>(
+        &self,
+        rows: impl IntoIterator<Item = R>,
+    ) -> DslResult<DslStatementResult<P>>
     where
         R: IntoInsertRow,
     {
@@ -3064,7 +3220,7 @@ where
         })
     }
 
-    pub fn insert_row_batch(&self, batch: RowBatch) -> DslResult<StatementResult<P>> {
+    pub fn insert_row_batch(&self, batch: RowBatch) -> DslResult<DslStatementResult<P>> {
         if batch.rows.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "insert requires at least one row".into(),
@@ -3091,7 +3247,7 @@ where
         self.context.insert(plan)
     }
 
-    pub fn insert_batches(&self, batches: Vec<RecordBatch>) -> DslResult<StatementResult<P>> {
+    pub fn insert_batches(&self, batches: Vec<RecordBatch>) -> DslResult<DslStatementResult<P>> {
         let plan = InsertPlan {
             table: self.display_name.clone(),
             columns: Vec::new(),
@@ -3100,7 +3256,7 @@ where
         self.context.insert(plan)
     }
 
-    pub fn insert_lazy(&self, frame: LazyFrame<P>) -> DslResult<StatementResult<P>> {
+    pub fn insert_lazy(&self, frame: LazyFrame<P>) -> DslResult<DslStatementResult<P>> {
         let RowBatch { columns, rows } = frame.collect_rows()?;
         self.insert_row_batch(RowBatch { columns, rows })
     }

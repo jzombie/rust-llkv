@@ -3,9 +3,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::Array as ArrowArray;
-use llkv_dsl::DslContext;
+use llkv_dsl::{DslContext, DslStatementResult};
 use llkv_sql::SqlEngine;
-use llkv_sql::StatementResult;
 use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 
@@ -67,7 +66,7 @@ impl AsyncDB for EngineHarness {
                 }
                 let result = results.remove(0);
                 match result {
-                    StatementResult::Select { execution, .. } => {
+                    DslStatementResult::Select { execution, .. } => {
                         let batches = execution.collect()?;
                         let mut rows: Vec<Vec<String>> = Vec::new();
                         for batch in &batches {
@@ -148,30 +147,30 @@ impl AsyncDB for EngineHarness {
 
                         Ok(DBOutput::Rows { types, rows })
                     }
-                    StatementResult::Insert { rows_inserted, .. } => {
+                    DslStatementResult::Insert { rows_inserted, .. } => {
                         // Return as a single-row result for compatibility with query directives
                         Ok(DBOutput::Rows {
                             types: vec![DefaultColumnType::Integer],
                             rows: vec![vec![rows_inserted.to_string()]],
                         })
                     }
-                    StatementResult::Update { rows_updated, .. } => {
+                    DslStatementResult::Update { rows_updated, .. } => {
                         // Return as a single-row result for compatibility with query directives
                         Ok(DBOutput::Rows {
                             types: vec![DefaultColumnType::Integer],
                             rows: vec![vec![rows_updated.to_string()]],
                         })
                     }
-                    StatementResult::Delete { rows_deleted, .. } => {
+                    DslStatementResult::Delete { rows_deleted, .. } => {
                         // Return as a single-row result for compatibility with query directives
                         Ok(DBOutput::Rows {
                             types: vec![DefaultColumnType::Integer],
                             rows: vec![vec![rows_deleted.to_string()]],
                         })
                     }
-                    StatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
-                    StatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
-                    StatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
+                    DslStatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
+                    DslStatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
+                    DslStatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
                 }
             }
             Err(e) => {

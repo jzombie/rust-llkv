@@ -31,7 +31,7 @@ fn standalone_engine_insert_select() {
         .execute("SELECT SUM(i) FROM numbers")
         .expect("sum empty table");
     let select = sum_result.remove(0);
-    if let llkv_sql::StatementResult::Select { execution, .. } = select {
+    if let llkv_dsl::DslStatementResult::Select { execution, .. } = select {
         let batches = execution.collect().expect("collect");
         if let Some(batch) = batches.first() {
             let array = batch

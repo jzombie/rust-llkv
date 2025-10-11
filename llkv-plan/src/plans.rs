@@ -182,6 +182,9 @@ pub enum CreateTableSource {
         schema: Arc<Schema>,
         batches: Vec<RecordBatch>,
     },
+    Select {
+        plan: Box<SelectPlan>,
+    },
 }
 
 // ============================================================================
@@ -201,6 +204,7 @@ pub struct InsertPlan {
 pub enum InsertSource {
     Rows(Vec<Vec<PlanValue>>),
     Batches(Vec<RecordBatch>),
+    Select { plan: Box<SelectPlan> },
 }
 
 // ============================================================================
@@ -454,6 +458,19 @@ pub enum OrderTarget {
 /// Recordable DSL operation for transaction replay.
 #[derive(Clone, Debug)]
 pub enum DslOperation {
+    CreateTable(CreateTablePlan),
+    Insert(InsertPlan),
+    Update(UpdatePlan),
+    Delete(DeletePlan),
+    Select(SelectPlan),
+}
+
+/// Top-level DSL statements that can be executed against a `Session`.
+#[derive(Clone, Debug)]
+pub enum DslStatement {
+    BeginTransaction,
+    CommitTransaction,
+    RollbackTransaction,
     CreateTable(CreateTablePlan),
     Insert(InsertPlan),
     Update(UpdatePlan),
