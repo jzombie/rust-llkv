@@ -1311,6 +1311,7 @@ version = "0.2.0-alpha"
 dependencies = [
  "arrow",
  "async-trait",
+ "libtest-mimic 0.6.1",
  "llkv-column-map",
  "llkv-dsl",
  "llkv-expr",

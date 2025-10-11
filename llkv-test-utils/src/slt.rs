@@ -1,3 +1,4 @@
+use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
 use sqllogictest::{AsyncDB, DefaultColumnType, Runner};
 use std::path::Path;
 
@@ -76,12 +77,34 @@ where
     D: AsyncDB<Error = llkv_result::Error, ColumnType = DefaultColumnType> + Send + 'static,
     E: std::fmt::Debug + Send + 'static,
 {
-    use sqllogictest::harness::{Arguments, Trial, run};
+    let args = Arguments::from_args();
+    let conclusion = run_slt_harness_with_args(slt_dir, factory_factory, args);
+    if conclusion.has_failed() {
+        panic!(
+            "SLT harness reported {} failed test(s)",
+            conclusion.num_failed
+        );
+    }
+}
 
+/// Same as [`run_slt_harness`], but accepts pre-parsed [`Arguments`] so callers
+/// can control CLI parsing (e.g. custom binaries).
+pub fn run_slt_harness_with_args<FF, F, Fut, D, E>(
+    slt_dir: &str,
+    factory_factory: FF,
+    args: Arguments,
+) -> Conclusion
+where
+    FF: Fn() -> F + Send + Sync + 'static + Clone,
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<D, E>> + Send + 'static,
+    D: AsyncDB<Error = llkv_result::Error, ColumnType = DefaultColumnType> + Send + 'static,
+    E: std::fmt::Debug + Send + 'static,
+{
+    let base = std::path::Path::new(slt_dir);
     // Discover files
     let files = {
         let mut out = Vec::new();
-        let base = std::path::Path::new(slt_dir);
         if base.exists() {
             let mut stack = vec![base.to_path_buf()];
             while let Some(p) = stack.pop() {
@@ -102,14 +125,18 @@ where
         out
     };
 
+    let base_parent = base.parent();
     let mut trials: Vec<Trial> = Vec::new();
     for f in files {
-        let name = f
-            .strip_prefix("tests")
-            .unwrap_or(&f)
-            .to_string_lossy()
-            .trim_start_matches('/')
-            .to_string();
+        let name_path = base_parent
+            .and_then(|parent| f.strip_prefix(parent).ok())
+            .or_else(|| f.strip_prefix(base).ok())
+            .unwrap_or(&f);
+        let mut name = name_path.to_string_lossy().to_string();
+        if std::path::MAIN_SEPARATOR != '/' {
+            name = name.replace(std::path::MAIN_SEPARATOR, "/");
+        }
+        let name = name.trim_start_matches(&['/', '\\'][..]).to_string();
         let path_clone = f.clone();
         let factory_factory_clone = factory_factory.clone();
         trials.push(Trial::test(name, move || {
@@ -119,18 +146,14 @@ where
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("tokio rt");
+                .map_err(|e| Failed::from(format!("failed to build tokio runtime: {e}")))?;
             let res: Result<(), llkv_result::Error> =
                 rt.block_on(async move { run_slt_file_with_factory(&p, fac).await });
-            match res {
-                Ok(()) => Ok(()),
-                Err(e) => panic!("slt runner error: {}", e),
-            }
+            res.map_err(|e| Failed::from(format!("slt runner error: {e}")))
         }));
     }
 
-    let args = Arguments::from_args();
-    let _ = run(&args, trials);
+    libtest_mimic::run(&args, trials)
 }
 
 /// Expand `loop var start count` directives, returning the expanded lines and
