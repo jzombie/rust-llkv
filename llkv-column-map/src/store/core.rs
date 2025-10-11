@@ -483,6 +483,12 @@ where
             }
 
             let field = append_schema.field(i);
+            
+            // Skip MVCC system columns (they don't get stored in ColumnStore)
+            if field.name() == CREATED_BY_COLUMN_NAME || field.name() == DELETED_BY_COLUMN_NAME {
+                continue;
+            }
+            
             let field_id = field
                 .metadata()
                 .get(crate::store::FIELD_ID_META_KEY)

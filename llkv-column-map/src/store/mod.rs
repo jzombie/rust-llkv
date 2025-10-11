@@ -6,6 +6,8 @@ use config::*;
 mod constants;
 pub use constants::FIELD_ID_META_KEY;
 pub use constants::ROW_ID_COLUMN_NAME;
+pub use constants::CREATED_BY_COLUMN_NAME;
+pub use constants::DELETED_BY_COLUMN_NAME;
 use constants::*;
 
 pub mod core;

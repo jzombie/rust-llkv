@@ -15,7 +15,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
-use llkv_column_map::store::ROW_ID_COLUMN_NAME;
+use llkv_column_map::store::{ROW_ID_COLUMN_NAME, CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 // Literal is not used at top-level; keep it out to avoid unused import warnings.
@@ -48,7 +48,7 @@ pub use llkv_executor::{QueryExecutor, RowBatch, SelectExecution, TableProvider}
 
 // Import transaction structures from llkv-transaction for internal use.
 pub use llkv_transaction::TransactionKind;
-use llkv_transaction::{TransactionContext, TransactionManager, TransactionResult};
+use llkv_transaction::{TransactionContext, TransactionManager, TransactionResult, TXN_ID_AUTO_COMMIT, TXN_ID_NONE};
 
 // Internal low-level transaction session type (from llkv-transaction)
 use llkv_transaction::TransactionSession;
@@ -530,12 +530,32 @@ where
                 TransactionResult::Select {
                     table_name,
                     schema,
-                    execution,
-                } => Ok(StatementResult::Select {
-                    execution,
-                    table_name,
-                    schema,
-                }),
+                    execution: staging_execution,
+                } => {
+                    // Convert from staging (MemPager) execution to base pager execution
+                    // by collecting batches and rebuilding
+                    let batches = staging_execution.collect().unwrap_or_default();
+                    let combined = if batches.is_empty() {
+                        RecordBatch::new_empty(Arc::clone(&schema))
+                    } else if batches.len() == 1 {
+                        batches.into_iter().next().unwrap()
+                    } else {
+                        let refs: Vec<&RecordBatch> = batches.iter().collect();
+                        arrow::compute::concat_batches(&schema, refs)?
+                    };
+                    
+                    let execution = SelectExecution::from_batch(
+                        table_name.clone(),
+                        Arc::clone(&schema),
+                        combined,
+                    );
+                    
+                    Ok(StatementResult::Select {
+                        execution,
+                        table_name,
+                        schema,
+                    })
+                },
                 _ => Err(Error::Internal("expected Select result".into())),
             }
         } else {
@@ -1678,11 +1698,23 @@ where
             row_id_builder.append_value(start_row + offset as u64);
         }
 
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_values.len() + 1);
-        arrays.push(Arc::new(row_id_builder.finish()));
+        // MVCC: Build transaction ID columns
+        let mut created_by_builder = UInt64Builder::with_capacity(row_count);
+        let mut deleted_by_builder = UInt64Builder::with_capacity(row_count);
+        for _ in 0..row_count {
+            created_by_builder.append_value(TXN_ID_AUTO_COMMIT); // TODO: Use actual txn_id
+            deleted_by_builder.append_value(TXN_ID_NONE);
+        }
 
-        let mut fields: Vec<Field> = Vec::with_capacity(column_values.len() + 1);
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_values.len() + 3); // +3 for row_id, created_by, deleted_by
+        arrays.push(Arc::new(row_id_builder.finish()));
+        arrays.push(Arc::new(created_by_builder.finish()));
+        arrays.push(Arc::new(deleted_by_builder.finish()));
+
+        let mut fields: Vec<Field> = Vec::with_capacity(column_values.len() + 3);
         fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+        fields.push(Field::new(CREATED_BY_COLUMN_NAME, DataType::UInt64, false));
+        fields.push(Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false));
 
         for (column, values) in table.schema.columns.iter().zip(column_values.into_iter()) {
             let array = build_array_for_column(&column.data_type, &values)?;

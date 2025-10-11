@@ -1,9 +1,13 @@
+pub mod mvcc;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
+
+pub use mvcc::{TxnId, TxnIdManager, RowVersion, TXN_ID_NONE, TXN_ID_AUTO_COMMIT};
 
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
@@ -153,6 +157,8 @@ where
     BaseCtx: TransactionContext + 'static,
     StagingCtx: TransactionContext + 'static,
 {
+    /// Transaction ID for MVCC snapshot isolation
+    txn_id: TxnId,
     /// Staging context with MemPager for isolation.
     staging: Arc<StagingCtx>,
     /// Operations to replay on commit.
@@ -171,6 +177,8 @@ where
     base_context: Arc<BaseCtx>,
     /// Whether this transaction has been aborted due to an error.
     is_aborted: bool,
+    /// Transaction ID manager (shared across all transactions)
+    txn_manager: Arc<TxnIdManager>,
 }
 
 impl<BaseCtx, StagingCtx> SessionTransaction<BaseCtx, StagingCtx>
@@ -178,9 +186,14 @@ where
     BaseCtx: TransactionContext + 'static,
     StagingCtx: TransactionContext + 'static,
 {
-    pub fn new(base_context: Arc<BaseCtx>, staging: Arc<StagingCtx>) -> Self {
+    pub fn new(
+        base_context: Arc<BaseCtx>,
+        staging: Arc<StagingCtx>,
+        txn_manager: Arc<TxnIdManager>,
+    ) -> Self {
         let catalog_snapshot = base_context.table_names().into_iter().collect();
         let staged_tables: HashSet<String> = staging.table_names().into_iter().collect();
+        let txn_id = txn_manager.next_txn_id();
 
         Self {
             staging,
@@ -192,6 +205,8 @@ where
             catalog_snapshot,
             base_context,
             is_aborted: false,
+            txn_id,
+            txn_manager,
         }
     }
 
@@ -321,44 +336,21 @@ where
     pub fn execute_select(
         &mut self,
         plan: SelectPlan,
-    ) -> LlkvResult<SelectExecution<BaseCtx::Pager>> {
+    ) -> LlkvResult<SelectExecution<StagingCtx::Pager>> {
         // Ensure table exists in staging
         self.ensure_table_in_delta(&plan.table)?;
 
         // Query staging - it contains either:
         // 1. Snapshot + modifications (for existing tables)
         // 2. Just the new rows (for tables created in this transaction)
-        let staging_result = self.staging.execute_select(plan.clone())?;
-        let staging_schema = staging_result.schema();
-        let staging_batches = match staging_result.collect() {
-            Ok(batches) => batches,
-            Err(Error::NotFound) => Vec::new(),
-            Err(other) => return Err(other),
-        };
-
-        let combined = if staging_batches.is_empty() {
-            RecordBatch::new_empty(Arc::clone(&staging_schema))
-        } else if staging_batches.len() == 1 {
-            staging_batches.into_iter().next().unwrap()
-        } else {
-            let refs: Vec<&RecordBatch> = staging_batches.iter().collect();
-            arrow::compute::concat_batches(&staging_schema, refs).map_err(|err| {
-                Error::Internal(format!("failed to concatenate staging batches: {err}"))
-            })?
-        };
-
-        Ok(SelectExecution::from_batch(
-            plan.table.clone(),
-            Arc::clone(&staging_schema),
-            combined,
-        ))
+        self.staging.execute_select(plan)
     }
 
     /// Execute an operation in the transaction staging context
     pub fn execute_operation(
         &mut self,
         operation: PlanOperation,
-    ) -> LlkvResult<TransactionResult<BaseCtx::Pager>> {
+    ) -> LlkvResult<TransactionResult<StagingCtx::Pager>> {
         tracing::trace!(
             "[TX] SessionTransaction::execute_operation called, operation={:?}",
             match &operation {
@@ -464,8 +456,30 @@ where
                 // But still fails if transaction is aborted (already checked above)
                 let table_name = plan.table.clone();
                 match self.execute_select(plan.clone()) {
-                    Ok(execution) => {
-                        let schema = execution.schema();
+                    Ok(staging_execution) => {
+                        // Collect staging execution into batches
+                        let schema = staging_execution.schema();
+                        let batches = staging_execution.collect().unwrap_or_default();
+                        
+                        // Combine into single batch
+                        let combined = if batches.is_empty() {
+                            RecordBatch::new_empty(Arc::clone(&schema))
+                        } else if batches.len() == 1 {
+                            batches.into_iter().next().unwrap()
+                        } else {
+                            let refs: Vec<&RecordBatch> = batches.iter().collect();
+                            arrow::compute::concat_batches(&schema, refs).map_err(|err| {
+                                Error::Internal(format!("failed to concatenate batches: {err}"))
+                            })?
+                        };
+                        
+                        // Return execution with combined batch
+                        let execution = SelectExecution::from_batch(
+                            table_name.clone(),
+                            Arc::clone(&schema),
+                            combined,
+                        );
+                        
                         TransactionResult::Select {
                             table_name,
                             schema,
@@ -500,6 +514,7 @@ where
     context: Arc<BaseCtx>,
     session_id: u64,
     transactions: Arc<Mutex<HashMap<u64, SessionTransaction<BaseCtx, StagingCtx>>>>,
+    txn_manager: Arc<TxnIdManager>,
 }
 
 impl<BaseCtx, StagingCtx> TransactionSession<BaseCtx, StagingCtx>
@@ -511,11 +526,13 @@ where
         context: Arc<BaseCtx>,
         session_id: u64,
         transactions: Arc<Mutex<HashMap<u64, SessionTransaction<BaseCtx, StagingCtx>>>>,
+        txn_manager: Arc<TxnIdManager>,
     ) -> Self {
         Self {
             context,
             session_id,
             transactions,
+            txn_manager,
         }
     }
 
@@ -575,7 +592,11 @@ where
         }
         guard.insert(
             self.session_id,
-            SessionTransaction::new(Arc::clone(&self.context), staging),
+            SessionTransaction::new(
+                Arc::clone(&self.context),
+                staging,
+                Arc::clone(&self.txn_manager),
+            ),
         );
         Ok(TransactionResult::Transaction {
             kind: TransactionKind::Begin,
@@ -654,7 +675,7 @@ where
     pub fn execute_operation(
         &self,
         operation: PlanOperation,
-    ) -> LlkvResult<TransactionResult<BaseCtx::Pager>> {
+    ) -> LlkvResult<TransactionResult<StagingCtx::Pager>> {
         if !self.has_active_transaction() {
             // No transaction - caller must handle direct execution
             return Err(Error::InvalidArgumentError(
@@ -715,6 +736,7 @@ where
 {
     transactions: Arc<Mutex<HashMap<u64, SessionTransaction<BaseCtx, StagingCtx>>>>,
     next_session_id: AtomicU64,
+    txn_manager: Arc<TxnIdManager>,
 }
 
 impl<BaseCtx, StagingCtx> TransactionManager<BaseCtx, StagingCtx>
@@ -726,13 +748,19 @@ where
         Self {
             transactions: Arc::new(Mutex::new(HashMap::new())),
             next_session_id: AtomicU64::new(1),
+            txn_manager: Arc::new(TxnIdManager::new()),
         }
     }
 
     /// Create a new session for transaction management.
     pub fn create_session(&self, context: Arc<BaseCtx>) -> TransactionSession<BaseCtx, StagingCtx> {
         let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
-        TransactionSession::new(context, session_id, Arc::clone(&self.transactions))
+        TransactionSession::new(
+            context,
+            session_id,
+            Arc::clone(&self.transactions),
+            Arc::clone(&self.txn_manager),
+        )
     }
 
     /// Check if there's an active transaction (checks if ANY session has a transaction).

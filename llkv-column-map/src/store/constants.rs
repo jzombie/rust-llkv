@@ -1,6 +1,12 @@
 /// Canonical Arrow field name for physical row-id columns.
 pub const ROW_ID_COLUMN_NAME: &str = "rowid";
 
+/// MVCC: Transaction ID that created this row
+pub const CREATED_BY_COLUMN_NAME: &str = "_created_by";
+
+/// MVCC: Transaction ID that deleted this row (or TXN_ID_NONE if not deleted)
+pub const DELETED_BY_COLUMN_NAME: &str = "_deleted_by";
+
 /// Metadata key used to store the logical field id on Arrow `Field` metadata.
 /// Centralized here so the key is authoritative inside the store module.
 pub const FIELD_ID_META_KEY: &str = "field_id";

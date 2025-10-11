@@ -121,7 +121,12 @@ where
         let mut new_fields = Vec::with_capacity(batch.schema().fields().len());
         for field in batch.schema().fields() {
             let maybe_field_id = field.metadata().get(crate::constants::FIELD_ID_META_KEY);
-            if maybe_field_id.is_none() && field.name() == ROW_ID_COLUMN_NAME {
+            // System columns (row_id, MVCC columns) don't need field_id metadata
+            if maybe_field_id.is_none() && (
+                field.name() == ROW_ID_COLUMN_NAME ||
+                field.name() == llkv_column_map::store::CREATED_BY_COLUMN_NAME ||
+                field.name() == llkv_column_map::store::DELETED_BY_COLUMN_NAME
+            ) {
                 new_fields.push(field.as_ref().clone());
                 continue;
             }
