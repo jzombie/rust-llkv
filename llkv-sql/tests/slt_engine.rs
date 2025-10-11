@@ -48,8 +48,13 @@ impl AsyncDB for EngineHarness {
     type ColumnType = DefaultColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
+        tracing::trace!("[HARNESS] run() called with sql (length={}, lines={}):", sql.len(), sql.lines().count());
+        for (i, line) in sql.lines().enumerate() {
+            tracing::trace!("[HARNESS]   line {}: {:?}", i, line);
+        }
         match self.engine.execute(sql) {
             Ok(mut results) => {
+                tracing::trace!("[HARNESS] execute() returned Ok with {} results", results.len());
                 if results.is_empty() {
                     return Ok(DBOutput::StatementComplete(0));
                 }
@@ -162,7 +167,10 @@ impl AsyncDB for EngineHarness {
                     StatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                tracing::trace!("[HARNESS] execute() returned Err: {:?}", e);
+                Err(e)
+            }
         }
     }
 
@@ -174,11 +182,14 @@ pub type HarnessFactory = Box<dyn Fn() -> HarnessFuture + Send + Sync + 'static>
 
 pub fn make_factory_factory() -> impl Fn() -> HarnessFactory + Clone {
     || {
+        tracing::trace!("[FACTORY] make_factory_factory: Creating SharedContext");
         let shared = SharedContext::new();
         let factory: HarnessFactory = Box::new(move || {
+            tracing::trace!("[FACTORY] Factory called: Creating new EngineHarness");
             let shared_clone = shared.clone();
             Box::pin(async move {
                 let engine = shared_clone.make_engine();
+                tracing::trace!("[FACTORY] Created SqlEngine with new Session");
                 Ok::<_, ()>(EngineHarness::new(engine))
             })
         });

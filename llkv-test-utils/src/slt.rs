@@ -255,52 +255,62 @@ fn normalize_inline_connections(
 
                 // Check if this is a statement error that needs special handling
                 if normalized_trimmed.starts_with("statement error") {
-                    out_lines.push(normalized.clone());
-                    out_map.push(orig);
+                    // First, collect the SQL and check for regex pattern
                     i += 1;
-
-                    // Collect the SQL statement lines until we hit ----
                     let mut sql_lines = Vec::new();
+                    let mut regex_pattern = None;
+                    
                     while i < lines.len() {
                         let next_line = &lines[i];
                         let next_trimmed = next_line.trim_start();
 
                         if next_trimmed == "----" {
-                            // Found the delimiter - now check what follows
+                            // Found the delimiter - check what follows
                             i += 1;
-
-                            let has_expected_pattern = if i < lines.len() {
+                            if i < lines.len() {
                                 let following = lines[i].trim();
-                                !following.is_empty() && following.starts_with("<REGEX>:")
-                            } else {
-                                false
-                            };
-
-                            if has_expected_pattern {
-                                // OMIT the ---- and output the expected pattern line directly
-                                for sql_line in sql_lines {
-                                    out_lines.push(sql_line);
-                                    out_map.push(orig);
+                                if !following.is_empty() && following.starts_with("<REGEX>:") {
+                                    regex_pattern = Some(following.strip_prefix("<REGEX>:").unwrap().to_string());
+                                    i += 1; // Move past pattern line
+                                    // Skip blank line if present
+                                    if i < lines.len() && lines[i].trim().is_empty() {
+                                        i += 1;
+                                    }
                                 }
-                                // Output the expected pattern line WITHOUT the ---- delimiter
-                                out_lines.push(lines[i].clone());
-                                out_map.push(mapping[i]);
-                                i += 1; // Move past the expected pattern line
-                            } else {
-                                // No expected pattern - omit the ---- delimiter entirely
-                                for sql_line in sql_lines {
-                                    out_lines.push(sql_line);
-                                    out_map.push(orig);
-                                }
-                                // Add a blank line to ensure proper termination
-                                out_lines.push(String::new());
-                                out_map.push(mapping[i - 1]);
                             }
                             break;
                         } else {
                             sql_lines.push(next_line.clone());
                             i += 1;
                         }
+                    }
+                    
+                    // Now output in correct format
+                    if let Some(pattern) = regex_pattern {
+                        // Connection FIRST
+                        out_lines.push(format!("{indent}connection {conn}"));
+                        out_map.push(orig);
+                        // Then inline format: statement error pattern
+                        out_lines.push(format!("{indent}statement error {}", pattern));
+                        out_map.push(orig);
+                        // Then SQL
+                        for sql_line in sql_lines {
+                            out_lines.push(sql_line);
+                            out_map.push(orig);
+                        }
+                        // Add blank line to separate from next statement
+                        out_lines.push(String::new());
+                        out_map.push(orig);
+                    } else {
+                        // No pattern - output as before
+                        out_lines.push(normalized.clone());
+                        out_map.push(orig);
+                        for sql_line in sql_lines {
+                            out_lines.push(sql_line);
+                            out_map.push(orig);
+                        }
+                        out_lines.push(String::new());
+                        out_map.push(orig);
                     }
                     continue;
                 } else {
@@ -315,47 +325,28 @@ fn normalize_inline_connections(
 
         // Check if this is a statement error (without inline connection) followed by ----
         if trimmed.starts_with("statement error") {
-            out_lines.push(line.clone());
-            out_map.push(orig);
+            // First, collect the SQL and check for regex pattern
             i += 1;
-
-            // Collect the SQL statement lines until we hit ----
             let mut sql_lines = Vec::new();
+            let mut regex_pattern = None;
+            
             while i < lines.len() {
                 let next_line = &lines[i];
                 let next_trimmed = next_line.trim_start();
 
                 if next_trimmed == "----" {
-                    // Found the delimiter - now check what follows
+                    // Found the delimiter - check what follows
                     i += 1;
-
-                    let has_expected_pattern = if i < lines.len() {
+                    if i < lines.len() {
                         let following = lines[i].trim();
-                        !following.is_empty() && following.starts_with("<REGEX>:")
-                    } else {
-                        false
-                    };
-
-                    if has_expected_pattern {
-                        // OMIT the ---- and output the expected pattern line directly
-                        for sql_line in sql_lines {
-                            out_lines.push(sql_line);
-                            out_map.push(orig); // Use same orig for SQL lines
+                        if !following.is_empty() && following.starts_with("<REGEX>:") {
+                            regex_pattern = Some(following.strip_prefix("<REGEX>:").unwrap().to_string());
+                            i += 1; // Move past pattern line
+                            // Skip blank line if present
+                            if i < lines.len() && lines[i].trim().is_empty() {
+                                i += 1;
+                            }
                         }
-                        // Output the expected pattern line WITHOUT the ---- delimiter
-                        out_lines.push(lines[i].clone());
-                        out_map.push(mapping[i]);
-                        i += 1; // Move past the expected pattern line
-                    // The blank line terminating the error pattern should already be in the input
-                    } else {
-                        // No expected pattern - omit the ---- delimiter entirely
-                        for sql_line in sql_lines {
-                            out_lines.push(sql_line);
-                            out_map.push(orig); // Use same orig for SQL lines
-                        }
-                        // Add a blank line to ensure proper termination
-                        out_lines.push(String::new());
-                        out_map.push(mapping[i - 1]);
                     }
                     break;
                 } else {
@@ -363,6 +354,31 @@ fn normalize_inline_connections(
                     sql_lines.push(next_line.clone());
                     i += 1;
                 }
+            }
+            
+            // Now output in correct format
+            if let Some(pattern) = regex_pattern {
+                // Inline format: statement error pattern
+                out_lines.push(format!("statement error {}", pattern));
+                out_map.push(orig);
+                // Then SQL
+                for sql_line in sql_lines {
+                    out_lines.push(sql_line);
+                    out_map.push(orig);
+                }
+                // Add blank line to separate from next statement
+                out_lines.push(String::new());
+                out_map.push(orig);
+            } else {
+                // No pattern - output as before
+                out_lines.push(line.clone());
+                out_map.push(orig);
+                for sql_line in sql_lines {
+                    out_lines.push(sql_line);
+                    out_map.push(orig);
+                }
+                out_lines.push(String::new());
+                out_map.push(orig);
             }
             continue;
         }

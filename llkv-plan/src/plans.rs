@@ -97,6 +97,7 @@ pub struct ColumnSpec {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    pub primary_key: bool,
 }
 
 impl ColumnSpec {
@@ -105,7 +106,13 @@ impl ColumnSpec {
             name: name.into(),
             data_type,
             nullable,
+            primary_key: false,
         }
+    }
+
+    pub fn with_primary_key(mut self, primary_key: bool) -> Self {
+        self.primary_key = primary_key;
+        self
     }
 }
 

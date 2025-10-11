@@ -79,7 +79,12 @@ where
         // Lookup descriptor pk
         let descriptor_pk = {
             let catalog = self.catalog.read().unwrap();
-            *catalog.map.get(&field_id).ok_or(Error::NotFound)?
+            let result = catalog.map.get(&field_id);
+            if result.is_none() && (field_id.table_id() == 1 || field_id.table_id() == 2) {
+                tracing::trace!("!!! DTYPE_FOR_FIELD: NOT FOUND for field_id table_id={} field_id={}, DTypeCache at {:p}, catalog has {} entries",
+                    field_id.table_id(), field_id.field_id(), self as *const _, catalog.map.len());
+            }
+            *result.ok_or(Error::NotFound)?
         };
 
         // Load descriptor to gather first non-empty meta

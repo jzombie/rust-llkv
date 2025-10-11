@@ -13,9 +13,9 @@ async-trait.workspace = true
 libtest-mimic.workspace = true
 llkv-column-map.workspace = true
 llkv-dsl.workspace = true
+llkv-expr.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true
-llkv-expr.workspace = true
 llkv-table.workspace = true
 llkv-transaction.workspace = true
 llkv-test-utils = { workspace = true, features = ["auto-init"] }

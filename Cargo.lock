@@ -1396,6 +1396,7 @@ dependencies = [
  "llkv-table",
  "rustc-hash",
  "simd-r-drive-entry-handle",
+ "tracing",
 ]
 
 [[package]]
