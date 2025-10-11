@@ -1,5 +1,5 @@
 [package]
-name = "llkv-dsl"
+name = "llkv-runtime"
 authors.workspace = true
 version.workspace = true
 edition.workspace = true

@@ -86,7 +86,14 @@ where
     where
         T: FilterDispatch,
     {
-        T::run_filter(self, field_id, predicate)
+        tracing::warn!(field=?field_id, "filter_row_ids start");
+        let res = T::run_filter(self, field_id, predicate);
+        if let Err(ref err) = res {
+            tracing::warn!(field=?field_id, error=?err, "filter_row_ids error");
+        } else {
+            tracing::warn!(field=?field_id, "filter_row_ids ok");
+        }
+        res
     }
 
     pub fn filter_matches<T, F>(
@@ -896,6 +903,11 @@ where
         rows_to_delete: &[RowId],
         staged_puts: &mut Vec<BatchPut>,
     ) -> Result<bool> {
+        tracing::warn!(
+            field_id = ?field_id,
+            rows = rows_to_delete.len(),
+            "delete_rows stage_delete_rows_for_field: start"
+        );
         use crate::store::descriptor::DescriptorIterator;
         use crate::store::ingest::ChunkEdit;
 
@@ -910,16 +922,41 @@ where
 
         // Lookup descriptors (data and optional row_id).
         let catalog = self.catalog.read().unwrap();
-        let desc_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+        let desc_pk = match catalog.map.get(&field_id) {
+            Some(pk) => *pk,
+            None => {
+                tracing::trace!(
+                    field_id = ?field_id,
+                    "delete_rows stage_delete_rows_for_field: data descriptor missing"
+                );
+                return Err(Error::NotFound);
+            }
+        };
         let rid_fid = rowid_fid(field_id);
         let desc_pk_rid = catalog.map.get(&rid_fid).copied();
+        tracing::warn!(
+            field_id = ?field_id,
+            desc_pk,
+            desc_pk_rid = ?desc_pk_rid,
+            "delete_rows stage_delete_rows_for_field: descriptor keys"
+        );
 
         // Batch fetch descriptor blobs up front.
         let mut gets = vec![BatchGet::Raw { key: desc_pk }];
         if let Some(pk) = desc_pk_rid {
             gets.push(BatchGet::Raw { key: pk });
         }
-        let results = self.pager.batch_get(&gets)?;
+        let results = match self.pager.batch_get(&gets) {
+            Ok(res) => res,
+            Err(err) => {
+                tracing::trace!(
+                    field_id = ?field_id,
+                    error = ?err,
+                    "delete_rows stage_delete_rows_for_field: descriptor batch_get failed"
+                );
+                return Err(err);
+            }
+        };
         let mut blobs_by_pk = FxHashMap::default();
         for res in results {
             if let GetResult::Raw { key, bytes } = res {
@@ -927,7 +964,19 @@ where
             }
         }
 
+        tracing::warn!(
+            field_id = ?field_id,
+            desc_blob_found = blobs_by_pk.contains_key(&desc_pk),
+            rid_blob_found = desc_pk_rid.map(|pk| blobs_by_pk.contains_key(&pk)),
+            "delete_rows stage_delete_rows_for_field: descriptor fetch status"
+        );
+
         let desc_blob = blobs_by_pk.remove(&desc_pk).ok_or_else(|| {
+            tracing::trace!(
+                field_id = ?field_id,
+                desc_pk,
+                "delete_rows stage_delete_rows_for_field: descriptor blob missing"
+            );
             Error::Internal(format!(
                 "descriptor pk={} missing during delete_rows for field {:?}",
                 desc_pk, field_id
@@ -948,6 +997,12 @@ where
         // Optionally mirror metas for row_id column.
         let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
         let mut descriptor_rid: Option<ColumnDescriptor> = None;
+        tracing::warn!(
+            field_id = ?field_id,
+            metas_len = metas.len(),
+            desc_pk_rid = ?desc_pk_rid,
+            "delete_rows stage_delete_rows_for_field: data metas loaded"
+        );
         if let Some(pk_rid) = desc_pk_rid
             && let Some(desc_blob_rid) = blobs_by_pk.remove(&pk_rid)
         {
@@ -957,6 +1012,12 @@ where
             }
             descriptor_rid = Some(d_rid);
         }
+
+        tracing::warn!(
+            field_id = ?field_id,
+            metas_rid_len = metas_rid.len(),
+            "delete_rows stage_delete_rows_for_field: rowid metas loaded"
+        );
 
         let mut cum_rows = 0u64;
         let mut any_changed = false;
@@ -1005,7 +1066,18 @@ where
             if let Some(rm) = metas_rid.get(i) {
                 chunk_gets.push(BatchGet::Raw { key: rm.chunk_pk });
             }
-            let chunk_results = self.pager.batch_get(&chunk_gets)?;
+            let chunk_results = match self.pager.batch_get(&chunk_gets) {
+                Ok(res) => res,
+                Err(err) => {
+                    tracing::trace!(
+                        field_id = ?field_id,
+                        chunk_pk = meta.chunk_pk,
+                        error = ?err,
+                        "delete_rows stage_delete_rows_for_field: chunk batch_get failed"
+                    );
+                    return Err(err);
+                }
+            };
             let mut chunk_blobs = FxHashMap::default();
             for res in chunk_results {
                 if let GetResult::Raw { key, bytes } = res {
@@ -1013,11 +1085,42 @@ where
                 }
             }
 
-            let data_blob = chunk_blobs.remove(&meta.chunk_pk).ok_or(Error::NotFound)?;
+            tracing::warn!(
+                field_id = ?field_id,
+                chunk_pk = meta.chunk_pk,
+                rid_chunk_pk = metas_rid.get(i).map(|rm| rm.chunk_pk),
+                data_found = chunk_blobs.contains_key(&meta.chunk_pk),
+                rid_found = metas_rid
+                    .get(i)
+                    .map(|rm| chunk_blobs.contains_key(&rm.chunk_pk)),
+                "delete_rows stage_delete_rows_for_field: chunk fetch status"
+            );
+
+            let data_blob = match chunk_blobs.remove(&meta.chunk_pk) {
+                Some(bytes) => bytes,
+                None => {
+                    tracing::trace!(
+                        field_id = ?field_id,
+                        chunk_pk = meta.chunk_pk,
+                        "delete_rows stage_delete_rows_for_field: chunk missing"
+                    );
+                    return Err(Error::NotFound);
+                }
+            };
             let data_arr = deserialize_array(data_blob)?;
 
             let rid_arr_any = if let Some(rm) = metas_rid.get(i) {
-                let rid_blob = chunk_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?;
+                let rid_blob = match chunk_blobs.remove(&rm.chunk_pk) {
+                    Some(bytes) => bytes,
+                    None => {
+                        tracing::trace!(
+                            field_id = ?field_id,
+                            rowid_chunk_pk = rm.chunk_pk,
+                            "delete_rows stage_delete_rows_for_field: rowid chunk missing"
+                        );
+                        return Err(Error::NotFound);
+                    }
+                };
                 Some(deserialize_array(rid_blob)?)
             } else {
                 None
@@ -1075,6 +1178,11 @@ where
             rid_desc.rewrite_pages(Arc::clone(&self.pager), rid_pk, &mut metas_rid, staged_puts)?;
         }
         drop(catalog);
+        tracing::trace!(
+            field_id = ?field_id,
+            changed = any_changed,
+            "delete_rows stage_delete_rows_for_field: finished stage"
+        );
         Ok(any_changed)
     }
 
@@ -1092,7 +1200,13 @@ where
         let mut touched: FxHashSet<LogicalFieldId> = FxHashSet::default();
         let mut table_id: Option<TableId> = None;
 
+        tracing::warn!(
+            fields = fields.len(),
+            rows = rows_to_delete.len(),
+            "delete_rows begin"
+        );
         for field_id in fields {
+            tracing::warn!(field = ?field_id, "delete_rows iter field");
             if let Some(expected) = table_id {
                 if field_id.table_id() != expected {
                     return Err(Error::InvalidArgumentError(
@@ -1114,9 +1228,12 @@ where
 
         self.pager.batch_put(&puts)?;
 
+        tracing::warn!(touched = touched.len(), "delete_rows apply writes");
+
         for field_id in touched {
             self.compact_field_bounded(field_id)?;
         }
+        tracing::warn!("delete_rows complete");
         Ok(())
     }
 

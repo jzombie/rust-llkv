@@ -79,5 +79,43 @@ fn translate_scalar(
             op: *op,
             right: Box::new(translate_scalar(right, schema)?),
         }),
+        ScalarExpr::Aggregate(agg) => {
+            // Translate column names in aggregate calls to field IDs
+            use llkv_expr::expr::AggregateCall;
+            let translated_agg = match agg {
+                AggregateCall::CountStar => AggregateCall::CountStar,
+                AggregateCall::Count(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                    })?;
+                    AggregateCall::Count(column.field_id)
+                }
+                AggregateCall::Sum(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                    })?;
+                    AggregateCall::Sum(column.field_id)
+                }
+                AggregateCall::Min(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                    })?;
+                    AggregateCall::Min(column.field_id)
+                }
+                AggregateCall::Max(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                    })?;
+                    AggregateCall::Max(column.field_id)
+                }
+                AggregateCall::CountNulls(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                    })?;
+                    AggregateCall::CountNulls(column.field_id)
+                }
+            };
+            Ok(ScalarExpr::Aggregate(translated_agg))
+        }
     }
 }

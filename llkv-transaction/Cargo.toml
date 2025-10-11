@@ -18,5 +18,4 @@ llkv-storage.workspace = true
 llkv-table.workspace = true
 simd-r-drive-entry-handle.workspace = true
 rustc-hash.workspace = true
-
-[dev-dependencies]
+tracing.workspace = true

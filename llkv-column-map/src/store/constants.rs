@@ -1,5 +1,5 @@
 /// Canonical Arrow field name for physical row-id columns.
-pub const ROW_ID_COLUMN_NAME: &str = "id";
+pub const ROW_ID_COLUMN_NAME: &str = "rowid";
 
 /// Metadata key used to store the logical field id on Arrow `Field` metadata.
 /// Centralized here so the key is authoritative inside the store module.

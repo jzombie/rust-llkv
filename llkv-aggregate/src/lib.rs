@@ -4,8 +4,9 @@ use llkv_result::Error;
 use llkv_table::types::FieldId;
 use std::sync::Arc;
 
-pub type AggregateResult<T> = Result<T, Error>;
+pub use llkv_plan::{AggregateExpr, AggregateFunction};
 
+pub type AggregateResult<T> = Result<T, Error>;
 /// Specification for an aggregate operation
 #[derive(Clone)]
 pub struct AggregateSpec {

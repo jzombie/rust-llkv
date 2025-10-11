@@ -2,4 +2,4 @@
 
 #![forbid(unsafe_code)]
 
-pub use llkv_column_map::types::{FieldId, RowId, TableId};
+pub use llkv_column_map::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};

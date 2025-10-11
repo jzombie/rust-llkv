@@ -51,7 +51,7 @@ COMMIT
 # con two STILL should not see it because it was started before the
 # transaction committed
 statement error con2
-SELECT * FROM integers
+SELECT * FROM integersa
 ----
 <REGEX>:.*Catalog Error.*Table.*not exist.*
 

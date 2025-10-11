@@ -18,6 +18,12 @@ pub enum Error {
     #[error("{0}")]
     CatalogError(String),
 
+    #[error("Constraint Error: {0}")]
+    ConstraintError(String),
+
+    #[error("{0}")]
+    TransactionContextError(String),
+
     #[error("An internal operation failed: {0}")]
     Internal(String),
 

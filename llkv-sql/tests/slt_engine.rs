@@ -3,9 +3,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::Array as ArrowArray;
-use llkv_dsl::DslContext;
+use llkv_runtime::{Context, StatementResult};
 use llkv_sql::SqlEngine;
-use llkv_sql::StatementResult;
 use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 
@@ -21,7 +20,7 @@ impl EngineHarness {
 
 #[derive(Clone)]
 pub struct SharedContext {
-    context: Arc<DslContext<MemPager>>,
+    context: Arc<Context<MemPager>>,
 }
 
 impl Default for SharedContext {
@@ -33,7 +32,7 @@ impl Default for SharedContext {
 impl SharedContext {
     pub fn new() -> Self {
         let pager = Arc::new(MemPager::default());
-        let context = Arc::new(DslContext::new(pager));
+        let context = Arc::new(Context::new(pager));
         Self { context }
     }
 
@@ -48,8 +47,20 @@ impl AsyncDB for EngineHarness {
     type ColumnType = DefaultColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
+        tracing::trace!(
+            "[HARNESS] run() called with sql (length={}, lines={}):",
+            sql.len(),
+            sql.lines().count()
+        );
+        for (i, line) in sql.lines().enumerate() {
+            tracing::trace!("[HARNESS]   line {}: {:?}", i, line);
+        }
         match self.engine.execute(sql) {
             Ok(mut results) => {
+                tracing::trace!(
+                    "[HARNESS] execute() returned Ok with {} results",
+                    results.len()
+                );
                 if results.is_empty() {
                     return Ok(DBOutput::StatementComplete(0));
                 }
@@ -137,20 +148,35 @@ impl AsyncDB for EngineHarness {
                         Ok(DBOutput::Rows { types, rows })
                     }
                     StatementResult::Insert { rows_inserted, .. } => {
-                        Ok(DBOutput::StatementComplete(rows_inserted as u64))
+                        // Return as a single-row result for compatibility with query directives
+                        Ok(DBOutput::Rows {
+                            types: vec![DefaultColumnType::Integer],
+                            rows: vec![vec![rows_inserted.to_string()]],
+                        })
                     }
                     StatementResult::Update { rows_updated, .. } => {
-                        Ok(DBOutput::StatementComplete(rows_updated as u64))
+                        // Return as a single-row result for compatibility with query directives
+                        Ok(DBOutput::Rows {
+                            types: vec![DefaultColumnType::Integer],
+                            rows: vec![vec![rows_updated.to_string()]],
+                        })
                     }
                     StatementResult::Delete { rows_deleted, .. } => {
-                        Ok(DBOutput::StatementComplete(rows_deleted as u64))
+                        // Return as a single-row result for compatibility with query directives
+                        Ok(DBOutput::Rows {
+                            types: vec![DefaultColumnType::Integer],
+                            rows: vec![vec![rows_deleted.to_string()]],
+                        })
                     }
                     StatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
                     StatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
                     StatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                tracing::trace!("[HARNESS] execute() returned Err: {:?}", e);
+                Err(e)
+            }
         }
     }
 
@@ -162,11 +188,14 @@ pub type HarnessFactory = Box<dyn Fn() -> HarnessFuture + Send + Sync + 'static>
 
 pub fn make_factory_factory() -> impl Fn() -> HarnessFactory + Clone {
     || {
+        tracing::trace!("[FACTORY] make_factory_factory: Creating SharedContext");
         let shared = SharedContext::new();
         let factory: HarnessFactory = Box::new(move || {
+            tracing::trace!("[FACTORY] Factory called: Creating new EngineHarness");
             let shared_clone = shared.clone();
             Box::pin(async move {
                 let engine = shared_clone.make_engine();
+                tracing::trace!("[FACTORY] Created SqlEngine with new Session");
                 Ok::<_, ()>(EngineHarness::new(engine))
             })
         });
