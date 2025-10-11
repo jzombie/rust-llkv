@@ -6,10 +6,10 @@ use crate::SqlResult;
 use crate::SqlValue;
 
 use llkv_dsl::{
-    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateTablePlan,
-    CreateTableSource, DeletePlan, DslContext, DslEngine, DslStatement, DslStatementResult,
-    InsertPlan, InsertSource, OrderByPlan, OrderSortType, OrderTarget, PlanValue, SelectPlan,
-    SelectProjection, Session, UpdatePlan, extract_rows_from_range,
+    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, Context, CreateTablePlan,
+    CreateTableSource, DeletePlan, DslStatement, Engine, InsertPlan, InsertSource, OrderByPlan,
+    OrderSortType, OrderTarget, PlanValue, SelectPlan, SelectProjection, Session, StatementResult,
+    UpdatePlan, extract_rows_from_range,
 };
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
@@ -31,7 +31,7 @@ pub struct SqlEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    dsl: DslEngine<P>,
+    dsl: Engine<P>,
     default_nulls_first: AtomicBool,
 }
 
@@ -87,7 +87,7 @@ where
     // `statement_table_name` is provided by the DSL crate; use it to avoid
     // duplicating plan-level logic here.
 
-    fn execute_dsl_statement(&self, statement: DslStatement) -> SqlResult<DslStatementResult<P>> {
+    fn execute_dsl_statement(&self, statement: DslStatement) -> SqlResult<StatementResult<P>> {
         let table = llkv_dsl::statement_table_name(&statement).map(str::to_string);
         self.dsl.execute_statement(statement).map_err(|err| {
             if let Some(table_name) = table {
@@ -99,20 +99,20 @@ where
     }
 
     pub fn new(pager: Arc<P>) -> Self {
-        let dsl = DslEngine::new(pager);
+        let dsl = Engine::new(pager);
         Self {
             dsl,
             default_nulls_first: AtomicBool::new(false),
         }
     }
 
-    pub(crate) fn context_arc(&self) -> Arc<DslContext<P>> {
+    pub(crate) fn context_arc(&self) -> Arc<Context<P>> {
         self.dsl.context()
     }
 
-    pub fn with_context(context: Arc<DslContext<P>>, default_nulls_first: bool) -> Self {
+    pub fn with_context(context: Arc<Context<P>>, default_nulls_first: bool) -> Self {
         Self {
-            dsl: DslEngine::from_context(context),
+            dsl: Engine::from_context(context),
             default_nulls_first: AtomicBool::new(default_nulls_first),
         }
     }
@@ -131,7 +131,7 @@ where
         self.dsl.session()
     }
 
-    pub fn execute(&self, sql: &str) -> SqlResult<Vec<DslStatementResult<P>>> {
+    pub fn execute(&self, sql: &str) -> SqlResult<Vec<StatementResult<P>>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, sql)
@@ -148,7 +148,7 @@ where
         Ok(results)
     }
 
-    fn execute_statement(&self, statement: Statement) -> SqlResult<DslStatementResult<P>> {
+    fn execute_statement(&self, statement: Statement) -> SqlResult<StatementResult<P>> {
         tracing::trace!(
             "DEBUG SQL execute_statement: {:?}",
             match &statement {
@@ -195,7 +195,7 @@ where
     fn execute_statement_non_transactional(
         &self,
         statement: Statement,
-    ) -> SqlResult<DslStatementResult<P>> {
+    ) -> SqlResult<StatementResult<P>> {
         tracing::trace!("DEBUG SQL execute_statement_non_transactional called");
         match statement {
             Statement::CreateTable(stmt) => {
@@ -323,7 +323,7 @@ where
     fn handle_create_table(
         &self,
         mut stmt: sqlparser::ast::CreateTable,
-    ) -> SqlResult<DslStatementResult<P>> {
+    ) -> SqlResult<StatementResult<P>> {
         validate_create_table_common(&stmt)?;
 
         let (display_name, canonical_name) = canonical_object_name(&stmt.name)?;
@@ -422,7 +422,7 @@ where
         _canonical_name: String,
         query: Query,
         if_not_exists: bool,
-    ) -> SqlResult<DslStatementResult<P>> {
+    ) -> SqlResult<StatementResult<P>> {
         let select_plan = self.build_select_plan(query)?;
 
         if select_plan.projections.is_empty() && select_plan.aggregates.is_empty() {
@@ -442,7 +442,7 @@ where
         self.execute_dsl_statement(DslStatement::CreateTable(plan))
     }
 
-    fn handle_insert(&self, stmt: sqlparser::ast::Insert) -> SqlResult<DslStatementResult<P>> {
+    fn handle_insert(&self, stmt: sqlparser::ast::Insert) -> SqlResult<StatementResult<P>> {
         let table_name_debug =
             Self::table_name_from_insert(&stmt).unwrap_or_else(|_| "unknown".to_string());
         tracing::trace!(
@@ -559,7 +559,7 @@ where
         from: Option<UpdateTableFromKind>,
         selection: Option<SqlExpr>,
         returning: Option<Vec<SelectItem>>,
-    ) -> SqlResult<DslStatementResult<P>> {
+    ) -> SqlResult<StatementResult<P>> {
         if from.is_some() {
             return Err(Error::InvalidArgumentError(
                 "UPDATE ... FROM is not supported yet".into(),
@@ -619,7 +619,7 @@ where
     }
 
     #[allow(clippy::collapsible_if)]
-    fn handle_delete(&self, delete: Delete) -> SqlResult<DslStatementResult<P>> {
+    fn handle_delete(&self, delete: Delete) -> SqlResult<StatementResult<P>> {
         let Delete {
             tables,
             from,
@@ -674,7 +674,7 @@ where
         self.execute_dsl_statement(DslStatement::Delete(plan))
     }
 
-    fn handle_query(&self, query: Query) -> SqlResult<DslStatementResult<P>> {
+    fn handle_query(&self, query: Query) -> SqlResult<StatementResult<P>> {
         let select_plan = self.build_select_plan(query)?;
         self.execute_dsl_statement(DslStatement::Select(select_plan))
     }
@@ -1083,7 +1083,7 @@ where
         statements: Vec<Statement>,
         exception: Option<Vec<ExceptionWhen>>,
         has_end_keyword: bool,
-    ) -> SqlResult<DslStatementResult<P>> {
+    ) -> SqlResult<StatementResult<P>> {
         if !modes.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "transaction modes are not supported".into(),
@@ -1117,7 +1117,7 @@ where
         chain: bool,
         end: bool,
         modifier: Option<TransactionModifier>,
-    ) -> SqlResult<DslStatementResult<P>> {
+    ) -> SqlResult<StatementResult<P>> {
         if chain {
             return Err(Error::InvalidArgumentError(
                 "COMMIT AND [NO] CHAIN is not supported".into(),
@@ -1141,7 +1141,7 @@ where
         &self,
         chain: bool,
         savepoint: Option<Ident>,
-    ) -> SqlResult<DslStatementResult<P>> {
+    ) -> SqlResult<StatementResult<P>> {
         if chain {
             return Err(Error::InvalidArgumentError(
                 "ROLLBACK AND [NO] CHAIN is not supported".into(),
@@ -1156,7 +1156,7 @@ where
         self.execute_dsl_statement(DslStatement::RollbackTransaction)
     }
 
-    fn handle_set(&self, set_stmt: Set) -> SqlResult<DslStatementResult<P>> {
+    fn handle_set(&self, set_stmt: Set) -> SqlResult<StatementResult<P>> {
         match set_stmt {
             Set::SingleAssignment {
                 scope,
@@ -1204,7 +1204,7 @@ where
                 self.default_nulls_first
                     .store(use_nulls_first, AtomicOrdering::Relaxed);
 
-                Ok(DslStatementResult::NoOp)
+                Ok(StatementResult::NoOp)
             }
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported SQL SET statement: {other:?}",
@@ -1217,7 +1217,7 @@ where
         name: ObjectName,
         value: Option<Value>,
         is_eq: bool,
-    ) -> SqlResult<DslStatementResult<P>> {
+    ) -> SqlResult<StatementResult<P>> {
         let (display, canonical) = canonical_object_name(&name)?;
         if value.is_some() || is_eq {
             return Err(Error::InvalidArgumentError(format!(
@@ -1226,7 +1226,7 @@ where
         }
 
         match canonical.as_str() {
-            "enable_verification" | "disable_verification" => Ok(DslStatementResult::NoOp),
+            "enable_verification" | "disable_verification" => Ok(StatementResult::NoOp),
             _ => Err(Error::InvalidArgumentError(format!(
                 "unsupported PRAGMA '{}'",
                 display
@@ -1919,14 +1919,14 @@ mod tests {
         let result = engine
             .execute("CREATE TABLE people (id INT NOT NULL, name TEXT NOT NULL)")
             .expect("create table");
-        assert!(matches!(result[0], DslStatementResult::CreateTable { .. }));
+        assert!(matches!(result[0], StatementResult::CreateTable { .. }));
 
         let result = engine
             .execute("INSERT INTO people (id, name) VALUES (1, 'alice'), (2, 'bob')")
             .expect("insert rows");
         assert!(matches!(
             result[0],
-            DslStatementResult::Insert {
+            StatementResult::Insert {
                 rows_inserted: 2,
                 ..
             }
@@ -1937,7 +1937,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            DslStatementResult::Select { execution, .. } => {
+            StatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),
@@ -1966,7 +1966,7 @@ mod tests {
             .expect("insert literal");
         assert!(matches!(
             result[0],
-            DslStatementResult::Insert {
+            StatementResult::Insert {
                 rows_inserted: 1,
                 ..
             }
@@ -1977,7 +1977,7 @@ mod tests {
             .expect("insert null literal");
         assert!(matches!(
             result[0],
-            DslStatementResult::Insert {
+            StatementResult::Insert {
                 rows_inserted: 1,
                 ..
             }
@@ -1988,7 +1988,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            DslStatementResult::Select { execution, .. } => {
+            StatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),
@@ -2035,7 +2035,7 @@ mod tests {
             .expect("update rows");
         assert!(matches!(
             result[0],
-            DslStatementResult::Update {
+            StatementResult::Update {
                 rows_updated: 1,
                 ..
             }
@@ -2046,7 +2046,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            DslStatementResult::Select { execution, .. } => {
+            StatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),
@@ -2105,7 +2105,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            DslStatementResult::Select { execution, .. } => {
+            StatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),
@@ -2130,7 +2130,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            DslStatementResult::Select { execution, .. } => {
+            StatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),

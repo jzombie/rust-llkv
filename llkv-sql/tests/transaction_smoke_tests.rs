@@ -1,12 +1,12 @@
 use arrow::array::{Array, Int64Array};
-use llkv_dsl::DslContext;
+use llkv_dsl::Context;
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
 use std::sync::Arc;
 
 #[test]
 fn insert_rollback_smoke() {
-    let context = Arc::new(DslContext::new(Arc::new(MemPager::default())));
+    let context = Arc::new(Context::new(Arc::new(MemPager::default())));
     let engine = SqlEngine::with_context(Arc::clone(&context), false);
     engine.execute("CREATE TABLE integers(i INTEGER)").unwrap();
     engine.execute("BEGIN TRANSACTION").unwrap();
@@ -31,7 +31,7 @@ fn standalone_engine_insert_select() {
         .execute("SELECT SUM(i) FROM numbers")
         .expect("sum empty table");
     let select = sum_result.remove(0);
-    if let llkv_dsl::DslStatementResult::Select { execution, .. } = select {
+    if let llkv_dsl::StatementResult::Select { execution, .. } = select {
         let batches = execution.collect().expect("collect");
         if let Some(batch) = batches.first() {
             let array = batch
@@ -77,7 +77,7 @@ fn nested_begin_does_not_clear_transaction() {
 #[test]
 fn transaction_functionality_script() {
     let pager = Arc::new(MemPager::default());
-    let engine = SqlEngine::with_context(Arc::new(DslContext::new(pager)), false);
+    let engine = SqlEngine::with_context(Arc::new(Context::new(pager)), false);
 
     engine
         .execute("PRAGMA enable_verification;")
@@ -97,7 +97,7 @@ fn transaction_functionality_script() {
 #[test]
 fn basic_transaction_visibility() {
     let pager = Arc::new(MemPager::default());
-    let context = Arc::new(DslContext::new(pager));
+    let context = Arc::new(Context::new(pager));
     let conn1 = SqlEngine::with_context(Arc::clone(&context), false);
     let conn2 = SqlEngine::with_context(Arc::clone(&context), false);
 
@@ -145,7 +145,7 @@ fn basic_transaction_visibility() {
 #[test]
 fn commit_visibility_across_connections() {
     let pager = Arc::new(MemPager::default());
-    let shared = Arc::new(DslContext::new(pager));
+    let shared = Arc::new(Context::new(pager));
     let con1 = SqlEngine::with_context(Arc::clone(&shared), false);
     let con2 = SqlEngine::with_context(Arc::clone(&shared), false);
 
@@ -167,7 +167,7 @@ fn commit_visibility_across_connections() {
 #[test]
 fn duckdb_basic_transactions_script() {
     let pager = Arc::new(MemPager::default());
-    let context = Arc::new(DslContext::new(pager));
+    let context = Arc::new(Context::new(pager));
     let con1 = SqlEngine::with_context(Arc::clone(&context), false);
     let con2 = SqlEngine::with_context(Arc::clone(&context), false);
 
@@ -216,7 +216,7 @@ fn duckdb_basic_transactions_script() {
 #[test]
 fn duckdb_transaction_functionality_script() {
     let pager = Arc::new(MemPager::default());
-    let context = Arc::new(DslContext::new(pager));
+    let context = Arc::new(Context::new(pager));
     let engine = SqlEngine::with_context(Arc::clone(&context), false);
 
     engine

@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::Array as ArrowArray;
-use llkv_dsl::{DslContext, DslStatementResult};
+use llkv_dsl::{Context, StatementResult};
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
@@ -20,7 +20,7 @@ impl EngineHarness {
 
 #[derive(Clone)]
 pub struct SharedContext {
-    context: Arc<DslContext<MemPager>>,
+    context: Arc<Context<MemPager>>,
 }
 
 impl Default for SharedContext {
@@ -32,7 +32,7 @@ impl Default for SharedContext {
 impl SharedContext {
     pub fn new() -> Self {
         let pager = Arc::new(MemPager::default());
-        let context = Arc::new(DslContext::new(pager));
+        let context = Arc::new(Context::new(pager));
         Self { context }
     }
 
@@ -66,7 +66,7 @@ impl AsyncDB for EngineHarness {
                 }
                 let result = results.remove(0);
                 match result {
-                    DslStatementResult::Select { execution, .. } => {
+                    StatementResult::Select { execution, .. } => {
                         let batches = execution.collect()?;
                         let mut rows: Vec<Vec<String>> = Vec::new();
                         for batch in &batches {
@@ -147,30 +147,30 @@ impl AsyncDB for EngineHarness {
 
                         Ok(DBOutput::Rows { types, rows })
                     }
-                    DslStatementResult::Insert { rows_inserted, .. } => {
+                    StatementResult::Insert { rows_inserted, .. } => {
                         // Return as a single-row result for compatibility with query directives
                         Ok(DBOutput::Rows {
                             types: vec![DefaultColumnType::Integer],
                             rows: vec![vec![rows_inserted.to_string()]],
                         })
                     }
-                    DslStatementResult::Update { rows_updated, .. } => {
+                    StatementResult::Update { rows_updated, .. } => {
                         // Return as a single-row result for compatibility with query directives
                         Ok(DBOutput::Rows {
                             types: vec![DefaultColumnType::Integer],
                             rows: vec![vec![rows_updated.to_string()]],
                         })
                     }
-                    DslStatementResult::Delete { rows_deleted, .. } => {
+                    StatementResult::Delete { rows_deleted, .. } => {
                         // Return as a single-row result for compatibility with query directives
                         Ok(DBOutput::Rows {
                             types: vec![DefaultColumnType::Integer],
                             rows: vec![vec![rows_deleted.to_string()]],
                         })
                     }
-                    DslStatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
-                    DslStatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
-                    DslStatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
+                    StatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
+                    StatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
+                    StatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
                 }
             }
             Err(e) => {
