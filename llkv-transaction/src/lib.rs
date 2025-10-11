@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 
-pub use mvcc::{TxnId, TxnIdManager, RowVersion, TXN_ID_NONE, TXN_ID_AUTO_COMMIT};
+pub use mvcc::{RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TxnId, TxnIdManager};
 
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
-    ColumnSpec, CreateTablePlan, DeletePlan, InsertPlan,
-    PlanOperation, PlanValue, SelectPlan, UpdatePlan,
+    ColumnSpec, CreateTablePlan, DeletePlan, InsertPlan, PlanOperation, PlanValue, SelectPlan,
+    UpdatePlan,
 };
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
@@ -39,6 +39,7 @@ pub enum TransactionKind {
 }
 
 /// Transaction result enum (simplified version for transaction module)
+#[allow(clippy::large_enum_variant)] // TODO: Consider refactoring large variants
 #[derive(Clone, Debug)]
 pub enum TransactionResult<P>
 where
@@ -135,8 +136,10 @@ pub trait TransactionContext: Send + Sync {
     fn execute_select(&self, plan: SelectPlan) -> LlkvResult<SelectExecution<Self::Pager>>;
 
     /// Create a table from plan
-    fn create_table_plan(&self, plan: CreateTablePlan)
-        -> LlkvResult<TransactionResult<Self::Pager>>;
+    fn create_table_plan(
+        &self,
+        plan: CreateTablePlan,
+    ) -> LlkvResult<TransactionResult<Self::Pager>>;
 
     /// Insert rows
     fn insert(&self, plan: InsertPlan) -> LlkvResult<TransactionResult<Self::Pager>>;
@@ -469,7 +472,7 @@ where
                         // Collect staging execution into batches
                         let schema = staging_execution.schema();
                         let batches = staging_execution.collect().unwrap_or_default();
-                        
+
                         // Combine into single batch
                         let combined = if batches.is_empty() {
                             RecordBatch::new_empty(Arc::clone(&schema))
@@ -481,14 +484,14 @@ where
                                 Error::Internal(format!("failed to concatenate batches: {err}"))
                             })?
                         };
-                        
+
                         // Return execution with combined batch
                         let execution = SelectExecution::from_batch(
                             table_name.clone(),
                             Arc::clone(&schema),
                             combined,
                         );
-                        
+
                         TransactionResult::Select {
                             table_name,
                             schema,
@@ -641,8 +644,7 @@ where
 
         // If transaction is aborted, commit becomes a rollback (no operations to replay)
         if tx.is_aborted {
-            tx.txn_manager
-                .mark_aborted(tx.snapshot.txn_id);
+            tx.txn_manager.mark_aborted(tx.snapshot.txn_id);
             tracing::trace!("DEBUG commit_transaction: returning Rollback with 0 operations");
             return Ok((
                 TransactionResult::Transaction {
@@ -658,8 +660,7 @@ where
             operations.len()
         );
 
-        tx.txn_manager
-            .mark_committed(tx.snapshot.txn_id);
+        tx.txn_manager.mark_committed(tx.snapshot.txn_id);
         TransactionContext::set_snapshot(&*self.context, tx.snapshot);
 
         Ok((
@@ -677,8 +678,7 @@ where
             .lock()
             .expect("transactions lock poisoned");
         if let Some(tx) = guard.remove(&self.session_id) {
-            tx.txn_manager
-                .mark_aborted(tx.snapshot.txn_id);
+            tx.txn_manager.mark_aborted(tx.snapshot.txn_id);
         } else {
             return Err(Error::InvalidArgumentError(
                 "no transaction is currently in progress in this session".into(),

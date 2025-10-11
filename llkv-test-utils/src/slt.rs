@@ -38,7 +38,7 @@ where
         (filtered_lines, filtered_mapping)
     };
     let (normalized_lines, mapping) = normalize_inline_connections(expanded_lines, mapping);
-    
+
     // DuckDB-specific fix: add extra blank line after plain text error messages
     let normalized_lines = if path.to_string_lossy().contains("/duckdb/") {
         fix_error_message_spacing(normalized_lines)
@@ -253,6 +253,7 @@ pub fn expand_loops_with_mapping(
 /// into explicit `connection` records so the upstream parser can understand them.
 /// Also ensures proper termination of statement error blocks by adding a blank line
 /// after ---- when there's no expected error pattern.
+#[allow(clippy::type_complexity)] // TODO: Refactor type complexity
 fn normalize_inline_connections(
     lines: Vec<String>,
     mapping: Vec<usize>,
@@ -418,8 +419,6 @@ fn normalize_inline_connections(
     (out_lines, out_map)
 }
 
-
-
 /// Map a temporary expanded-file error message back to the original file path
 /// and line; returns (mapped_message, optional original line number).
 pub fn map_temp_error_message(
@@ -473,41 +472,41 @@ pub fn map_temp_error_message(
 /// Adds an extra blank line after plain text error messages (not regex patterns).
 fn fix_error_message_spacing(lines: Vec<String>) -> Vec<String> {
     let mut out_lines = Vec::with_capacity(lines.len() + 10);
-    
+
     let mut i = 0;
     while i < lines.len() {
         let line = &lines[i];
         let trimmed = line.trim();
-        
+
         // Detect error block: statement error followed by SQL, ----, optional message, blank line
         if trimmed.starts_with("statement error") && !trimmed.contains("<REGEX>:") {
             // Output the statement error line
             out_lines.push(line.clone());
             i += 1;
-            
+
             // Collect SQL lines until ----
             while i < lines.len() && lines[i].trim() != "----" {
                 out_lines.push(lines[i].clone());
                 i += 1;
             }
-            
+
             // Output ----
             if i < lines.len() && lines[i].trim() == "----" {
                 out_lines.push(lines[i].clone());
                 i += 1;
-                
+
                 // Check if there's an error message (non-empty line after ----)
                 if i < lines.len() && !lines[i].trim().is_empty() {
                     // Output the error message
                     out_lines.push(lines[i].clone());
                     i += 1;
-                    
+
                     // Output the existing blank line
                     if i < lines.len() && lines[i].trim().is_empty() {
                         out_lines.push(lines[i].clone());
                         i += 1;
                     }
-                    
+
                     // Add EXTRA blank line to prevent multiline interpretation
                     out_lines.push(String::new());
                 } else {
@@ -524,6 +523,6 @@ fn fix_error_message_spacing(lines: Vec<String>) -> Vec<String> {
             i += 1;
         }
     }
-    
+
     out_lines
 }

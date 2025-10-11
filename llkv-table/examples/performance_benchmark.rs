@@ -156,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &table,
         &multi_proj,
         &unbounded_filter,
-    default_options.clone(),
+        default_options.clone(),
     );
 
     // 3. Single column with nulls included (should bypass streaming optimization)
@@ -171,7 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &table,
         &single_proj,
         &unbounded_filter,
-    with_nulls_options.clone(),
+        with_nulls_options.clone(),
     );
 
     // 4. Single column with bounded filter (should bypass simple optimizations)
@@ -188,7 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &table,
         &single_proj,
         &bounded_filter,
-    default_options,
+        default_options,
     );
 
     println!("\n=== Summary ===");

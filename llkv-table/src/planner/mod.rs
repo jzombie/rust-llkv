@@ -514,7 +514,7 @@ where
     where
         F: FnMut(RecordBatch),
     {
-    let plan = self.plan_scan(projections, filter_expr, options)?;
+        let plan = self.plan_scan(projections, filter_expr, options)?;
         TableExecutor::new(self.table).execute(plan, on_batch)
     }
 
@@ -661,14 +661,11 @@ where
             return Ok(Vec::new());
         }
 
-        let expected = match self
+        let expected = self
             .table
             .store()
             .total_rows_for_table(self.table.table_id())
-        {
-            Ok(count) => count,
-            Err(_) => 0,
-        };
+            .unwrap_or_default();
 
         let mut seen: FxHashSet<u64> = FxHashSet::default();
         let mut collected: Vec<u64> = Vec::new();
@@ -2429,9 +2426,8 @@ fn normalize_row_ids(mut row_ids: Vec<u64>) -> Vec<u64> {
 }
 
 fn literal_to_u64(lit: &Literal) -> LlkvResult<u64> {
-    u64::from_literal(lit).map_err(|err| {
-        Error::InvalidArgumentError(format!("rowid literal cast failed: {err}").into())
-    })
+    u64::from_literal(lit)
+        .map_err(|err| Error::InvalidArgumentError(format!("rowid literal cast failed: {err}")))
 }
 
 fn lower_bound_index(row_ids: &[u64], bound: &Bound<Literal>) -> LlkvResult<usize> {

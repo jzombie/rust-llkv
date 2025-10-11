@@ -10,23 +10,14 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
-    Array,
-    ArrayRef,
-    Date32Builder,
-    Float64Builder,
-    Int64Builder,
-    StringBuilder,
-    UInt64Array,
+    Array, ArrayRef, Date32Builder, Float64Builder, Int64Builder, StringBuilder, UInt64Array,
     UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{
-    GatherNullPolicy,
-    ROW_ID_COLUMN_NAME,
-    CREATED_BY_COLUMN_NAME,
-    DELETED_BY_COLUMN_NAME,
+    CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME, GatherNullPolicy, ROW_ID_COLUMN_NAME,
 };
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
@@ -61,15 +52,8 @@ pub use llkv_executor::{QueryExecutor, RowBatch, SelectExecution, TableProvider}
 // Import transaction structures from llkv-transaction for internal use.
 pub use llkv_transaction::TransactionKind;
 use llkv_transaction::{
-    TransactionContext,
-    TransactionManager,
-    TransactionResult,
-    TxnIdManager,
-    mvcc::TransactionSnapshot,
-    RowVersion,
-    TxnId,
-    TXN_ID_AUTO_COMMIT,
-    TXN_ID_NONE,
+    RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TransactionContext, TransactionManager,
+    TransactionResult, TxnId, TxnIdManager, mvcc::TransactionSnapshot,
 };
 
 // Internal low-level transaction session type (from llkv-transaction)
@@ -78,6 +62,7 @@ use llkv_transaction::TransactionSession;
 // Note: Session is the high-level wrapper that users should use instead of the lower-level session API
 
 /// Result of running a plan statement.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum StatementResult<P>
 where
@@ -602,19 +587,19 @@ where
                         let refs: Vec<&RecordBatch> = batches.iter().collect();
                         arrow::compute::concat_batches(&schema, refs)?
                     };
-                    
+
                     let execution = SelectExecution::from_batch(
                         table_name.clone(),
                         Arc::clone(&schema),
                         combined,
                     );
-                    
+
                     Ok(StatementResult::Select {
                         execution,
                         table_name,
                         schema,
                     })
-                },
+                }
                 _ => Err(Error::Internal("expected Select result".into())),
             }
         } else {
@@ -1181,12 +1166,20 @@ where
         }
 
         let result = match plan.source {
-            InsertSource::Rows(rows) => {
-                self.insert_rows(table.as_ref(), display_name.clone(), rows, plan.columns, snapshot.txn_id)
-            }
-            InsertSource::Batches(batches) => {
-                self.insert_batches(table.as_ref(), display_name.clone(), batches, plan.columns, snapshot.txn_id)
-            }
+            InsertSource::Rows(rows) => self.insert_rows(
+                table.as_ref(),
+                display_name.clone(),
+                rows,
+                plan.columns,
+                snapshot.txn_id,
+            ),
+            InsertSource::Batches(batches) => self.insert_batches(
+                table.as_ref(),
+                display_name.clone(),
+                batches,
+                plan.columns,
+                snapshot.txn_id,
+            ),
             InsertSource::Select { .. } => Err(Error::Internal(
                 "InsertSource::Select should be materialized before reaching Context::insert"
                     .into(),
@@ -1326,15 +1319,13 @@ where
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
         match plan.filter {
-            Some(filter) => {
-                self.update_filtered_rows(
-                    table.as_ref(),
-                    display_name,
-                    plan.assignments,
-                    filter,
-                    snapshot,
-                )
-            }
+            Some(filter) => self.update_filtered_rows(
+                table.as_ref(),
+                display_name,
+                plan.assignments,
+                filter,
+                snapshot,
+            ),
             None => self.update_all_rows(table.as_ref(), display_name, plan.assignments, snapshot),
         }
     }
@@ -1354,8 +1345,13 @@ where
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
         match plan.filter {
-            Some(filter) =>
-                self.delete_filtered_rows(table.as_ref(), display_name, filter, snapshot, snapshot.txn_id),
+            Some(filter) => self.delete_filtered_rows(
+                table.as_ref(),
+                display_name,
+                filter,
+                snapshot,
+                snapshot.txn_id,
+            ),
             None => self.delete_all_rows(table.as_ref(), display_name, snapshot, snapshot.txn_id),
         }
     }
@@ -1873,8 +1869,8 @@ where
         arrays.push(Arc::clone(&created_by_array));
         arrays.push(Arc::clone(&deleted_by_array));
 
-    let mut fields: Vec<Field> = Vec::with_capacity(column_values.len() + 3);
-    fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+        let mut fields: Vec<Field> = Vec::with_capacity(column_values.len() + 3);
+        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
 
         fields.push(Field::new(CREATED_BY_COLUMN_NAME, DataType::UInt64, false));
         fields.push(Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false));
@@ -2050,9 +2046,9 @@ where
             vec![Vec::with_capacity(table.schema.columns.len()); row_count];
         for (col_idx, _column) in table.schema.columns.iter().enumerate() {
             let array = gathered.column(col_idx);
-            for row_idx in 0..row_count {
+            for (row_idx, row) in new_rows.iter_mut().enumerate().take(row_count) {
                 let value = llkv_plan::plan_value_from_array(array, row_idx)?;
-                new_rows[row_idx].push(value);
+                row.push(value);
             }
         }
 
@@ -2065,15 +2061,16 @@ where
             .collect();
 
         for (column, value) in prepared {
-            let column_index = column_positions
-                .get(&column.field_id)
-                .copied()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError(format!(
-                        "column '{}' missing in table schema during UPDATE",
-                        column.name
-                    ))
-                })?;
+            let column_index =
+                column_positions
+                    .get(&column.field_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!(
+                            "column '{}' missing in table schema during UPDATE",
+                            column.name
+                        ))
+                    })?;
 
             let values = match value {
                 PreparedValue::Literal(lit) => vec![lit; row_count],
@@ -2099,7 +2096,12 @@ where
             }
         }
 
-        let _ = self.apply_delete(table, display_name.clone(), row_ids.clone(), snapshot.txn_id)?;
+        let _ = self.apply_delete(
+            table,
+            display_name.clone(),
+            row_ids.clone(),
+            snapshot.txn_id,
+        )?;
 
         let column_names: Vec<String> = table
             .schema
@@ -2225,9 +2227,9 @@ where
             vec![Vec::with_capacity(table.schema.columns.len()); row_count];
         for (col_idx, _column) in table.schema.columns.iter().enumerate() {
             let array = gathered.column(col_idx);
-            for row_idx in 0..row_count {
+            for (row_idx, row) in new_rows.iter_mut().enumerate().take(row_count) {
                 let value = llkv_plan::plan_value_from_array(array, row_idx)?;
-                new_rows[row_idx].push(value);
+                row.push(value);
             }
         }
 
@@ -2240,15 +2242,16 @@ where
             .collect();
 
         for (column, value) in prepared {
-            let column_index = column_positions
-                .get(&column.field_id)
-                .copied()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError(format!(
-                        "column '{}' missing in table schema during UPDATE",
-                        column.name
-                    ))
-                })?;
+            let column_index =
+                column_positions
+                    .get(&column.field_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!(
+                            "column '{}' missing in table schema during UPDATE",
+                            column.name
+                        ))
+                    })?;
 
             let values = match value {
                 PreparedValue::Literal(lit) => vec![lit; row_count],
@@ -2274,7 +2277,12 @@ where
             }
         }
 
-        let _ = self.apply_delete(table, display_name.clone(), row_ids.clone(), snapshot.txn_id)?;
+        let _ = self.apply_delete(
+            table,
+            display_name.clone(),
+            row_ids.clone(),
+            snapshot.txn_id,
+        )?;
 
         let column_names: Vec<String> = table
             .schema

@@ -4,7 +4,6 @@
 /// and visibility checks used across the engine. The overarching goal is to
 /// allow transactions to operate directly on the base storage without copying
 /// tables into a staging area.
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -66,11 +65,18 @@ impl TxnIdManager {
         let txn_id = self.inner.next_txn_id.fetch_add(1, Ordering::SeqCst);
 
         {
-            let mut guard = self.inner.statuses.lock().expect("txn status lock poisoned");
+            let mut guard = self
+                .inner
+                .statuses
+                .lock()
+                .expect("txn status lock poisoned");
             guard.insert(txn_id, TxnStatus::Active);
         }
 
-        TransactionSnapshot { txn_id, snapshot_id }
+        TransactionSnapshot {
+            txn_id,
+            snapshot_id,
+        }
     }
 
     /// Legacy helper that only returns the allocated transaction ID.
@@ -88,14 +94,22 @@ impl TxnIdManager {
             return TxnStatus::Committed;
         }
 
-        let guard = self.inner.statuses.lock().expect("txn status lock poisoned");
+        let guard = self
+            .inner
+            .statuses
+            .lock()
+            .expect("txn status lock poisoned");
         guard.get(&txn_id).copied().unwrap_or(TxnStatus::Committed)
     }
 
     /// Mark a transaction as committed and advance the global watermark.
     pub fn mark_committed(&self, txn_id: TxnId) {
         {
-            let mut guard = self.inner.statuses.lock().expect("txn status lock poisoned");
+            let mut guard = self
+                .inner
+                .statuses
+                .lock()
+                .expect("txn status lock poisoned");
             guard.insert(txn_id, TxnStatus::Committed);
         }
 
@@ -120,7 +134,11 @@ impl TxnIdManager {
 
     /// Mark a transaction as aborted.
     pub fn mark_aborted(&self, txn_id: TxnId) {
-        let mut guard = self.inner.statuses.lock().expect("txn status lock poisoned");
+        let mut guard = self
+            .inner
+            .statuses
+            .lock()
+            .expect("txn status lock poisoned");
         guard.insert(txn_id, TxnStatus::Aborted);
     }
 
@@ -168,11 +186,7 @@ impl RowVersion {
     }
 
     /// Determine whether the row is visible for the supplied snapshot using full MVCC rules.
-    pub fn is_visible_for(
-        &self,
-        manager: &TxnIdManager,
-        snapshot: TransactionSnapshot,
-    ) -> bool {
+    pub fn is_visible_for(&self, manager: &TxnIdManager, snapshot: TransactionSnapshot) -> bool {
         // Rows created inside the current transaction are visible unless this
         // transaction also deleted them.
         if self.created_by == snapshot.txn_id {

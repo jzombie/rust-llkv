@@ -914,6 +914,7 @@ where
         self.execute_plan_statement(PlanStatement::Delete(plan))
     }
 
+    #[allow(clippy::too_many_arguments)] // TODO: Consider refactor
     fn handle_drop(
         &self,
         object_type: ObjectType,

@@ -317,16 +317,14 @@ where
         }
 
         let mut error: Option<Error> = None;
-        match table
-            .table
-            .scan_stream(
-                projections,
-                &filter_expr,
-                ScanStreamOptions {
-                    row_id_filter: row_filter.clone(),
-                    ..options
-                },
-                |batch| {
+        match table.table.scan_stream(
+            projections,
+            &filter_expr,
+            ScanStreamOptions {
+                row_id_filter: row_filter.clone(),
+                ..options
+            },
+            |batch| {
                 if error.is_some() {
                     return;
                 }
@@ -336,7 +334,8 @@ where
                         return;
                     }
                 }
-            }) {
+            },
+        ) {
             Ok(()) => {}
             Err(llkv_result::Error::NotFound) => {
                 // Treat missing storage keys as an empty result set. This occurs
