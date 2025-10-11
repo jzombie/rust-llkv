@@ -150,7 +150,9 @@ fn run(
 
         let lfid = llkv_column_map::types::LogicalFieldId::for_user(table.table_id(), fid);
         let alias = field.name().to_string();
-        projections.push(ScanProjection::from(Projection::with_alias(lfid, alias)));
+        let mut p = Projection::from(lfid);
+        p.alias = Some(alias.to_string());
+        projections.push(ScanProjection::from(p));
     }
     // Debug: the row-id shadow column is created per user field (presence index),
     // not as a single table-wide field. Check the first user field's shadow.

@@ -346,7 +346,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 2: Table Layer access using the same data
     println!("\n=== Table Layer Test ===");
     let table_elapsed = {
-        let projection = Projection::with_alias(lfid, "test_col");
+        let mut projection = Projection::from(lfid);
+        projection.alias = Some("test_col".to_string());
 
         let filter_expr = Expr::Pred(Filter {
             field_id: FIELD_ID,

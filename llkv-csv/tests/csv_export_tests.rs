@@ -127,16 +127,11 @@ fn export_with_projection_alias_inference() {
     let table = setup_table_with_sample_data().expect("create table with data");
     let out_file = NamedTempFile::new().expect("create export csv");
 
-    let projections = vec![
-        ScanProjection::from(Projection::with_alias(
-            LogicalFieldId::for_user(table.table_id(), 1),
-            "int_col_alias",
-        )),
-        ScanProjection::from(Projection::with_alias(
-            LogicalFieldId::for_user(table.table_id(), 3),
-            "text_col_alias",
-        )),
-    ];
+    let mut p1 = Projection::from(LogicalFieldId::for_user(table.table_id(), 1));
+    p1.alias = Some("int_col_alias".to_string());
+    let mut p2 = Projection::from(LogicalFieldId::for_user(table.table_id(), 3));
+    p2.alias = Some("text_col_alias".to_string());
+    let projections = vec![ScanProjection::from(p1), ScanProjection::from(p2)];
 
     let filter_expr = Expr::Pred(Filter {
         field_id: 1,
@@ -165,11 +160,10 @@ fn export_with_computed_projection_alias() {
     let table = setup_table_with_sample_data().expect("create table with data");
     let mut buffer: Vec<u8> = Vec::new();
 
+    let mut p1 = Projection::from(LogicalFieldId::for_user(table.table_id(), 1));
+    p1.alias = Some("int_col_alias".to_string());
     let projections = vec![
-        ScanProjection::from(Projection::with_alias(
-            LogicalFieldId::for_user(table.table_id(), 1),
-            "int_col_alias",
-        )),
+        ScanProjection::from(p1),
         ScanProjection::computed(
             ScalarExpr::binary(
                 ScalarExpr::column(1),

@@ -747,10 +747,13 @@ where
             Error::Internal(format!("Invalid field_id in schema: {}", field_id_str))
         })?;
         let lfid = LogicalFieldId::for_user(table.table_id(), field_id);
-        projections.push(ScanProjection::Column(Projection::with_alias(
-            lfid,
-            field.name().to_string(),
-        )));
+        // Use a canonical numeric alias (the LogicalFieldId) so downstream
+        // consumers can use the numeric id directly without allocating or
+        // comparing string aliases. Construct a Projection and set the
+        // canonical_alias to the logical id for numeric-only consumers.
+        let mut p = Projection::from(lfid);
+        p.canonical_alias = Some(lfid);
+        projections.push(ScanProjection::Column(p));
     }
 
     Ok(projections)

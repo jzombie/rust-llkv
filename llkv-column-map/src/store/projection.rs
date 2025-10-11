@@ -34,22 +34,27 @@ pub enum GatherNullPolicy {
 pub struct Projection {
     pub logical_field_id: LogicalFieldId,
     pub alias: Option<String>,
+    /// Optional canonical numeric alias for consumers that prefer
+    /// a stable numeric identifier over a human-facing string.
+    /// This allows downstream code to use the numeric id directly
+    /// (avoiding string allocations/comparisons) while preserving the
+    /// existing `alias: Option<String>` for display and compatibility.
+    pub canonical_alias: Option<LogicalFieldId>,
+    // Projection now carries only the canonical numeric logical field id.
+    // Human-facing names should be resolved at higher layers (planner,
+    // executor) when generating output schema or plan text.
 }
 
 impl Projection {
     pub fn new(logical_field_id: LogicalFieldId) -> Self {
         Self {
             logical_field_id,
+            canonical_alias: None,
             alias: None,
         }
     }
 
-    pub fn with_alias<S: Into<String>>(logical_field_id: LogicalFieldId, alias: S) -> Self {
-        Self {
-            logical_field_id,
-            alias: Some(alias.into()),
-        }
-    }
+    // Keep a convenience From<LogicalFieldId> -> Projection via impl From below.
 }
 
 impl From<LogicalFieldId> for Projection {
@@ -60,7 +65,12 @@ impl From<LogicalFieldId> for Projection {
 
 impl<S: Into<String>> From<(LogicalFieldId, S)> for Projection {
     fn from(value: (LogicalFieldId, S)) -> Self {
-        Projection::with_alias(value.0, value.1)
+        // Construct Projection directly without calling `with_alias` (removed).
+        Projection {
+            logical_field_id: value.0,
+            alias: Some(value.1.into()),
+            canonical_alias: None,
+        }
     }
 }
 
