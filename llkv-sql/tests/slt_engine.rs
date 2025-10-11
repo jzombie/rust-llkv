@@ -48,13 +48,20 @@ impl AsyncDB for EngineHarness {
     type ColumnType = DefaultColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
-        tracing::trace!("[HARNESS] run() called with sql (length={}, lines={}):", sql.len(), sql.lines().count());
+        tracing::trace!(
+            "[HARNESS] run() called with sql (length={}, lines={}):",
+            sql.len(),
+            sql.lines().count()
+        );
         for (i, line) in sql.lines().enumerate() {
             tracing::trace!("[HARNESS]   line {}: {:?}", i, line);
         }
         match self.engine.execute(sql) {
             Ok(mut results) => {
-                tracing::trace!("[HARNESS] execute() returned Ok with {} results", results.len());
+                tracing::trace!(
+                    "[HARNESS] execute() returned Ok with {} results",
+                    results.len()
+                );
                 if results.is_empty() {
                     return Ok(DBOutput::StatementComplete(0));
                 }

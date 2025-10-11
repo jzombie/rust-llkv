@@ -225,8 +225,14 @@ where
 
     /// Ensure a table exists in the staging context, snapshotting from base if needed.
     fn ensure_table_in_delta(&mut self, table_name: &str) -> LlkvResult<()> {
-        tracing::trace!("[ENSURE] ensure_table_in_delta called for table='{}'", table_name);
-        tracing::trace!("[ENSURE]   staged_tables.contains={}",  self.staged_tables.contains(table_name));
+        tracing::trace!(
+            "[ENSURE] ensure_table_in_delta called for table='{}'",
+            table_name
+        );
+        tracing::trace!(
+            "[ENSURE]   staged_tables.contains={}",
+            self.staged_tables.contains(table_name)
+        );
         if self.staged_tables.contains(table_name) {
             tracing::trace!("[ENSURE]   returning early - table already staged");
             return Ok(());
@@ -252,15 +258,26 @@ where
         tracing::trace!("[ENSURE] About to check base_context.table_column_specs");
         match self.base_context.table_column_specs(table_name) {
             Ok(specs) => {
-                tracing::trace!("[ENSURE] Got {} specs from BASE context for table '{}'", specs.len(), table_name);
+                tracing::trace!(
+                    "[ENSURE] Got {} specs from BASE context for table '{}'",
+                    specs.len(),
+                    table_name
+                );
                 for spec in &specs {
-                    tracing::trace!("[ENSURE]   spec: name='{}' primary_key={}", spec.name, spec.primary_key);
+                    tracing::trace!(
+                        "[ENSURE]   spec: name='{}' primary_key={}",
+                        spec.name,
+                        spec.primary_key
+                    );
                 }
                 self.missing_tables.remove(table_name);
                 let mut plan = CreateTablePlan::new(table_name.to_string());
                 plan.if_not_exists = true;
                 plan.columns = specs;
-                tracing::trace!("[ENSURE] About to create table in staging with {} columns", plan.columns.len());
+                tracing::trace!(
+                    "[ENSURE] About to create table in staging with {} columns",
+                    plan.columns.len()
+                );
                 self.staging.create_table_plan(plan)?;
                 tracing::trace!("[ENSURE] Created table in staging successfully");
 
@@ -270,20 +287,27 @@ where
                     Ok(snapshot) => {
                         tracing::trace!("[ENSURE] Got {} rows from base", snapshot.rows.len());
                         if !snapshot.rows.is_empty() {
-                            tracing::trace!("[ENSURE] About to INSERT {} rows into staging", snapshot.rows.len());
+                            tracing::trace!(
+                                "[ENSURE] About to INSERT {} rows into staging",
+                                snapshot.rows.len()
+                            );
                             let insert_plan = InsertPlan {
                                 table: table_name.to_string(),
                                 columns: snapshot.columns.clone(),
                                 source: InsertSource::Rows(snapshot.rows),
                             };
                             self.staging.insert(insert_plan)?;
-                            tracing::trace!("[ENSURE] Successfully inserted snapshot rows into staging");
+                            tracing::trace!(
+                                "[ENSURE] Successfully inserted snapshot rows into staging"
+                            );
                         }
                         self.snapshotted_tables.insert(table_name.to_string());
                         tracing::trace!("[ENSURE] Marked table as snapshotted");
                     }
                     Err(Error::NotFound) => {
-                        tracing::trace!("[ENSURE] No rows found in base, marking as snapshotted anyway");
+                        tracing::trace!(
+                            "[ENSURE] No rows found in base, marking as snapshotted anyway"
+                        );
                         self.snapshotted_tables.insert(table_name.to_string());
                     }
                     Err(other) => return Err(other),
@@ -308,7 +332,10 @@ where
                 }
             }
             Err(other) => {
-                tracing::trace!("[ENSURE] base_context.table_column_specs returned error: {:?}", other);
+                tracing::trace!(
+                    "[ENSURE] base_context.table_column_specs returned error: {:?}",
+                    other
+                );
                 return Err(other);
             }
         }
@@ -684,14 +711,16 @@ where
         &mut self,
         operation: DslOperation,
     ) -> LlkvResult<StatementResult<BaseCtx::Pager>> {
-        tracing::trace!("[TX] DslTransaction::execute_operation called, operation={:?}", 
+        tracing::trace!(
+            "[TX] DslTransaction::execute_operation called, operation={:?}",
             match &operation {
                 DslOperation::Insert(p) => format!("INSERT({})", p.table),
                 DslOperation::Update(p) => format!("UPDATE({})", p.table),
                 DslOperation::Delete(p) => format!("DELETE({})", p.table),
                 DslOperation::CreateTable(p) => format!("CREATE_TABLE({})", p.name),
                 _ => "OTHER".to_string(),
-            });
+            }
+        );
         // Check if transaction is aborted
         if self.is_aborted {
             return Err(Error::TransactionContextError(
@@ -720,7 +749,10 @@ where
                 }
             }
             DslOperation::Insert(ref plan) => {
-                tracing::trace!("[TX] DslTransaction::execute_operation INSERT for table='{}'", plan.table);
+                tracing::trace!(
+                    "[TX] DslTransaction::execute_operation INSERT for table='{}'",
+                    plan.table
+                );
                 // First ensure table exists
                 if let Err(e) = self.ensure_table_in_delta(&plan.table) {
                     self.is_aborted = true;
@@ -735,7 +767,10 @@ where
                         result.convert_pager_type()?
                     }
                     Err(e) => {
-                        tracing::trace!("DEBUG DslTransaction::execute_operation INSERT failed: {:?}", e);
+                        tracing::trace!(
+                            "DEBUG DslTransaction::execute_operation INSERT failed: {:?}",
+                            e
+                        );
                         tracing::trace!("DEBUG setting is_aborted=true");
                         self.is_aborted = true;
                         return Err(e);
@@ -904,14 +939,20 @@ where
     pub fn commit_transaction(
         &self,
     ) -> LlkvResult<(StatementResult<BaseCtx::Pager>, Vec<DslOperation>)> {
-        tracing::trace!("[COMMIT] commit_transaction called for session {:?}", self.session_id);
+        tracing::trace!(
+            "[COMMIT] commit_transaction called for session {:?}",
+            self.session_id
+        );
         let mut guard = self
             .transactions
             .lock()
             .expect("transactions lock poisoned");
         tracing::trace!("[COMMIT] commit_transaction got lock, checking for transaction...");
         let tx_opt = guard.remove(&self.session_id);
-        tracing::trace!("[COMMIT] commit_transaction remove returned: {}", tx_opt.is_some());
+        tracing::trace!(
+            "[COMMIT] commit_transaction remove returned: {}",
+            tx_opt.is_some()
+        );
         let tx = tx_opt.ok_or_else(|| {
             tracing::trace!("[COMMIT] commit_transaction: no transaction found!");
             Error::InvalidArgumentError(
@@ -932,7 +973,10 @@ where
         }
 
         let operations = tx.operations;
-        tracing::trace!("DEBUG commit_transaction: returning Commit with {} operations", operations.len());
+        tracing::trace!(
+            "DEBUG commit_transaction: returning Commit with {} operations",
+            operations.len()
+        );
 
         Ok((
             StatementResult::Transaction {
@@ -1007,7 +1051,9 @@ where
             Err(_) => {
                 // Mutex is poisoned, likely due to a panic elsewhere
                 // Don't panic again during cleanup
-                tracing::trace!("Warning: TransactionSession dropped with poisoned transaction mutex");
+                tracing::trace!(
+                    "Warning: TransactionSession dropped with poisoned transaction mutex"
+                );
             }
         }
     }

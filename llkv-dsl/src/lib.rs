@@ -238,13 +238,19 @@ where
     /// Creates an isolated staging context automatically.
     pub fn begin_transaction(&self) -> DslResult<StatementResult<P>> {
         let staging_pager = Arc::new(MemPager::default());
-        tracing::trace!("BEGIN_TRANSACTION: Created staging pager at {:p}", &*staging_pager);
+        tracing::trace!(
+            "BEGIN_TRANSACTION: Created staging pager at {:p}",
+            &*staging_pager
+        );
         let staging_ctx = Arc::new(DslContext::new(staging_pager));
-        
+
         // Copy table metadata from the main context to the staging context,
         // but create new Table instances that use the staging pager
-        self.inner.context().0.copy_tables_to_staging(&staging_ctx)?;
-        
+        self.inner
+            .context()
+            .0
+            .copy_tables_to_staging(&staging_ctx)?;
+
         let staging_wrapper = Arc::new(DslContextWrapper::new(staging_ctx));
 
         self.inner.begin_transaction(staging_wrapper)?;
@@ -276,7 +282,10 @@ where
     pub fn commit_transaction(&self) -> DslResult<StatementResult<P>> {
         tracing::trace!("Session::commit_transaction called");
         let (tx_result, operations) = self.inner.commit_transaction()?;
-        tracing::trace!("Session::commit_transaction got {} operations", operations.len());
+        tracing::trace!(
+            "Session::commit_transaction got {} operations",
+            operations.len()
+        );
 
         // Extract the transaction kind from the transaction module's result
         let kind = match tx_result {
@@ -284,7 +293,7 @@ where
             _ => {
                 return Err(Error::Internal(
                     "commit_transaction returned non-transaction result".into(),
-                ))
+                ));
             }
         };
         tracing::trace!("Session::commit_transaction kind={:?}", kind);
@@ -324,7 +333,10 @@ where
     pub fn create_table_plan(&self, plan: CreateTablePlan) -> DslResult<StatementResult<P>> {
         if self.has_active_transaction() {
             let table_name = plan.name.clone();
-            match self.inner.execute_operation(DslOperation::CreateTable(plan)) {
+            match self
+                .inner
+                .execute_operation(DslOperation::CreateTable(plan))
+            {
                 Ok(_) => Ok(StatementResult::CreateTable { table_name }),
                 Err(e) => {
                     // If an error occurs during a transaction, abort it
@@ -356,9 +368,13 @@ where
                         rows_inserted,
                         table_name,
                     })
-                },
+                }
                 Err(e) => {
-                    tracing::trace!("Session::insert failed for table={}, error={:?}", table_name, e);
+                    tracing::trace!(
+                        "Session::insert failed for table={}, error={:?}",
+                        table_name,
+                        e
+                    );
                     // Only abort transaction on constraint violations
                     if matches!(e, Error::ConstraintError(_)) {
                         tracing::trace!("Transaction is_aborted=true");
@@ -385,7 +401,10 @@ where
     /// Select rows (outside or inside transaction).
     pub fn select(&self, plan: SelectPlan) -> DslResult<StatementResult<P>> {
         if self.has_active_transaction() {
-            let tx_result = match self.inner.execute_operation(DslOperation::Select(plan.clone())) {
+            let tx_result = match self
+                .inner
+                .execute_operation(DslOperation::Select(plan.clone()))
+            {
                 Ok(result) => result,
                 Err(e) => {
                     // Only abort transaction on specific errors (constraint violations, etc.)
@@ -525,9 +544,15 @@ where
     /// Create a new session for transaction management.
     /// Each session can have its own independent transaction.
     pub fn create_session(self: &Arc<Self>) -> Session<P> {
-        tracing::trace!("DslContext::create_session called, pager={:p}", &*self.pager);
+        tracing::trace!(
+            "DslContext::create_session called, pager={:p}",
+            &*self.pager
+        );
         let wrapper = DslContextWrapper::new(Arc::clone(self));
-        tracing::trace!("Created DslContextWrapper, wrapper pager={:p}", &*self.pager);
+        tracing::trace!(
+            "Created DslContextWrapper, wrapper pager={:p}",
+            &*self.pager
+        );
         let inner = self.transaction_manager.create_session(Arc::new(wrapper));
         tracing::trace!("Created TransactionSession");
         Session { inner }
@@ -567,9 +592,19 @@ where
         }
 
         let (display_name, canonical_name) = canonical_table_name(&plan.name)?;
-        tracing::trace!("DEBUG create_table_plan: table='{}' if_not_exists={} columns={}", display_name, plan.if_not_exists, plan.columns.len());
+        tracing::trace!(
+            "DEBUG create_table_plan: table='{}' if_not_exists={} columns={}",
+            display_name,
+            plan.if_not_exists,
+            plan.columns.len()
+        );
         for (idx, col) in plan.columns.iter().enumerate() {
-            tracing::trace!("  plan column[{}]: name='{}' primary_key={}", idx, col.name, col.primary_key);
+            tracing::trace!(
+                "  plan column[{}]: name='{}' primary_key={}",
+                idx,
+                col.name,
+                col.primary_key
+            );
         }
         let exists = {
             let tables = self.tables.read().unwrap();
@@ -578,7 +613,10 @@ where
         tracing::trace!("DEBUG create_table_plan: exists={}", exists);
         if exists {
             if plan.if_not_exists {
-                tracing::trace!("DEBUG create_table_plan: table '{}' exists and if_not_exists=true, returning early WITHOUT creating", display_name);
+                tracing::trace!(
+                    "DEBUG create_table_plan: table '{}' exists and if_not_exists=true, returning early WITHOUT creating",
+                    display_name
+                );
                 return Ok(StatementResult::CreateTable {
                     table_name: display_name,
                 });
@@ -644,16 +682,25 @@ where
     {
         let source_tables = self.tables.read().unwrap();
         let mut staging_tables = staging.tables.write().unwrap();
-        
+
         for (table_name, source_table) in source_tables.iter() {
-            tracing::trace!("!!! COPY_TABLES_TO_STAGING: Copying table '{}' with {} columns:", table_name, source_table.schema.columns.len());
+            tracing::trace!(
+                "!!! COPY_TABLES_TO_STAGING: Copying table '{}' with {} columns:",
+                table_name,
+                source_table.schema.columns.len()
+            );
             for (idx, col) in source_table.schema.columns.iter().enumerate() {
-                tracing::trace!("    source column[{}]: name='{}' primary_key={}", idx, col.name, col.primary_key);
+                tracing::trace!(
+                    "    source column[{}]: name='{}' primary_key={}",
+                    idx,
+                    col.name,
+                    col.primary_key
+                );
             }
-            
+
             // Create a new Table instance with the same table_id but using the staging pager
             let new_table = Table::new(source_table.table.table_id(), Arc::clone(&staging.pager))?;
-            
+
             // Create a new ExecutorTable with the new table but same schema
             // Start with fresh row counters (0) for transaction isolation
             let new_executor_table = Arc::new(ExecutorTable {
@@ -662,16 +709,27 @@ where
                 next_row_id: AtomicU64::new(0),
                 total_rows: AtomicU64::new(0),
             });
-            
-            tracing::trace!("!!! COPY_TABLES_TO_STAGING: After copy, {} columns in new executor table:", new_executor_table.schema.columns.len());
+
+            tracing::trace!(
+                "!!! COPY_TABLES_TO_STAGING: After copy, {} columns in new executor table:",
+                new_executor_table.schema.columns.len()
+            );
             for (idx, col) in new_executor_table.schema.columns.iter().enumerate() {
-                tracing::trace!("    new column[{}]: name='{}' primary_key={}", idx, col.name, col.primary_key);
+                tracing::trace!(
+                    "    new column[{}]: name='{}' primary_key={}",
+                    idx,
+                    col.name,
+                    col.primary_key
+                );
             }
-            
+
             staging_tables.insert(table_name.clone(), new_executor_table);
         }
-        
-        tracing::trace!("!!! COPY_TABLES_TO_STAGING: Copied {} tables to staging context", staging_tables.len());
+
+        tracing::trace!(
+            "!!! COPY_TABLES_TO_STAGING: Copied {} tables to staging context",
+            staging_tables.len()
+        );
         Ok(())
     }
 
@@ -712,19 +770,27 @@ where
     pub fn insert(&self, plan: InsertPlan) -> DslResult<StatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
-        
+
         // Targeted debug for 'keys' table only
         if display_name == "keys" {
-            tracing::trace!("\n[KEYS] INSERT starting - table_id={}, context_pager={:p}", 
-                table.table.table_id(), &*self.pager);
-            tracing::trace!("[KEYS] Table has {} columns, primary_key columns: {:?}", 
+            tracing::trace!(
+                "\n[KEYS] INSERT starting - table_id={}, context_pager={:p}",
+                table.table.table_id(),
+                &*self.pager
+            );
+            tracing::trace!(
+                "[KEYS] Table has {} columns, primary_key columns: {:?}",
                 table.schema.columns.len(),
-                table.schema.columns.iter()
+                table
+                    .schema
+                    .columns
+                    .iter()
                     .filter(|c| c.primary_key)
                     .map(|c| &c.name)
-                    .collect::<Vec<_>>());
+                    .collect::<Vec<_>>()
+            );
         }
-        
+
         let result = match plan.source {
             InsertSource::Rows(rows) => {
                 self.insert_rows(table.as_ref(), display_name.clone(), rows, plan.columns)
@@ -733,11 +799,17 @@ where
                 self.insert_batches(table.as_ref(), display_name.clone(), batches, plan.columns)
             }
         };
-        
+
         if display_name == "keys" {
-            tracing::trace!("[KEYS] INSERT completed: {:?}", result.as_ref().map(|_| "OK").map_err(|e| format!("{:?}", e)));
+            tracing::trace!(
+                "[KEYS] INSERT completed: {:?}",
+                result
+                    .as_ref()
+                    .map(|_| "OK")
+                    .map_err(|e| format!("{:?}", e))
+            );
         }
-        
+
         result
     }
 
@@ -914,9 +986,18 @@ where
         columns: Vec<ColumnSpec>,
         if_not_exists: bool,
     ) -> DslResult<StatementResult<P>> {
-        tracing::trace!("\n=== CREATE_TABLE_FROM_COLUMNS: table='{}' columns={} ===", display_name, columns.len());
+        tracing::trace!(
+            "\n=== CREATE_TABLE_FROM_COLUMNS: table='{}' columns={} ===",
+            display_name,
+            columns.len()
+        );
         for (idx, col) in columns.iter().enumerate() {
-            tracing::trace!("  input column[{}]: name='{}' primary_key={}", idx, col.name, col.primary_key);
+            tracing::trace!(
+                "  input column[{}]: name='{}' primary_key={}",
+                idx,
+                col.name,
+                col.primary_key
+            );
         }
         if columns.is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -934,8 +1015,14 @@ where
                     column.name, display_name
                 )));
             }
-            tracing::trace!("DEBUG create_table_from_columns[{}]: name='{}' data_type={:?} nullable={} primary_key={}", 
-                idx, column.name, column.data_type, column.nullable, column.primary_key);
+            tracing::trace!(
+                "DEBUG create_table_from_columns[{}]: name='{}' data_type={:?} nullable={} primary_key={}",
+                idx,
+                column.name,
+                column.data_type,
+                column.nullable,
+                column.primary_key
+            );
             column_defs.push(ExecutorColumn {
                 name: column.name.clone(),
                 data_type: column.data_type.clone(),
@@ -944,12 +1031,21 @@ where
                 field_id: (idx + 1) as FieldId,
             });
             let pushed = column_defs.last().unwrap();
-            tracing::trace!("DEBUG create_table_from_columns[{}]: pushed ExecutorColumn name='{}' primary_key={}", 
-                idx, pushed.name, pushed.primary_key);
+            tracing::trace!(
+                "DEBUG create_table_from_columns[{}]: pushed ExecutorColumn name='{}' primary_key={}",
+                idx,
+                pushed.name,
+                pushed.primary_key
+            );
         }
 
         let table_id = self.reserve_table_id()?;
-        tracing::trace!("=== TABLE '{}' CREATED WITH table_id={} pager={:p} ===", display_name, table_id, &*self.pager);
+        tracing::trace!(
+            "=== TABLE '{}' CREATED WITH table_id={} pager={:p} ===",
+            display_name,
+            table_id,
+            &*self.pager
+        );
         let table = Table::new(table_id, Arc::clone(&self.pager))?;
         table.put_table_meta(&TableMeta {
             table_id,
@@ -1128,9 +1224,18 @@ where
                 display_name
             )));
         }
-        tracing::trace!("=== INSERTING TABLE '{}' INTO TABLES MAP (pager={:p}) ===", canonical_name, &*self.pager);
+        tracing::trace!(
+            "=== INSERTING TABLE '{}' INTO TABLES MAP (pager={:p}) ===",
+            canonical_name,
+            &*self.pager
+        );
         for (idx, col) in table_entry.schema.columns.iter().enumerate() {
-            tracing::trace!("  inserting column[{}]: name='{}' primary_key={}", idx, col.name, col.primary_key);
+            tracing::trace!(
+                "  inserting column[{}]: name='{}' primary_key={}",
+                idx,
+                col.name,
+                col.primary_key
+            );
         }
         tables.insert(canonical_name.clone(), table_entry);
         Ok(StatementResult::CreateTable {
@@ -1163,9 +1268,13 @@ where
             // Get existing values for this column from the table
             let field_id = column.field_id;
             let existing_values = self.scan_column_values(table, field_id)?;
-            
-            tracing::trace!("[DEBUG] PK check on column '{}': found {} existing values: {:?}", 
-                column.name, existing_values.len(), existing_values);
+
+            tracing::trace!(
+                "[DEBUG] PK check on column '{}': found {} existing values: {:?}",
+                column.name,
+                existing_values.len(),
+                existing_values
+            );
 
             // Check each new row value against existing values
             for row in rows {
@@ -1173,10 +1282,10 @@ where
                 let insert_position = column_order
                     .iter()
                     .position(|&dest_idx| dest_idx == col_idx);
-                
+
                 if let Some(pos) = insert_position {
                     let new_value = &row[pos];
-                    
+
                     // Skip NULL values (PRIMARY KEY typically requires NOT NULL, but we check anyway)
                     if matches!(new_value, PlanValue::Null) {
                         continue;
@@ -1206,7 +1315,7 @@ where
         use std::ops::Bound;
 
         let mut values = Vec::new();
-        
+
         let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
         let projection = ScanProjection::column((logical_field_id, "value".to_string()));
 
@@ -1271,21 +1380,24 @@ where
 
         // Check PRIMARY KEY constraints
         if display_name == "keys" {
-            tracing::trace!("[KEYS] Checking PRIMARY KEY constraints - {} rows to insert", rows.len());
+            tracing::trace!(
+                "[KEYS] Checking PRIMARY KEY constraints - {} rows to insert",
+                rows.len()
+            );
             for (i, row) in rows.iter().enumerate() {
                 tracing::trace!("[KEYS]   row[{}]: {:?}", i, row);
             }
         }
-        
+
         let constraint_result = self.check_primary_key_constraints(table, &rows, &column_order);
-        
+
         if display_name == "keys" {
             match &constraint_result {
                 Ok(_) => tracing::trace!("[KEYS] PRIMARY KEY check PASSED"),
                 Err(e) => tracing::trace!("[KEYS] PRIMARY KEY check FAILED: {:?}", e),
             }
         }
-        
+
         constraint_result?;
 
         let row_count = rows.len();
@@ -1778,14 +1890,23 @@ where
 
     fn lookup_table(&self, canonical_name: &str) -> DslResult<Arc<ExecutorTable<P>>> {
         let tables = self.tables.read().unwrap();
-        let table = tables
-            .get(canonical_name)
-            .cloned()
-            .ok_or_else(|| Error::InvalidArgumentError(format!("unknown table '{canonical_name}'")))?;
-        tracing::trace!("=== LOOKUP_TABLE '{}' table_id={} columns={} context_pager={:p} ===", 
-            canonical_name, table.table.table_id(), table.schema.columns.len(), &*self.pager);
+        let table = tables.get(canonical_name).cloned().ok_or_else(|| {
+            Error::InvalidArgumentError(format!("unknown table '{canonical_name}'"))
+        })?;
+        tracing::trace!(
+            "=== LOOKUP_TABLE '{}' table_id={} columns={} context_pager={:p} ===",
+            canonical_name,
+            table.table.table_id(),
+            table.schema.columns.len(),
+            &*self.pager
+        );
         for (idx, col) in table.schema.columns.iter().enumerate() {
-            tracing::trace!("  column[{}]: name='{}' primary_key={}", idx, col.name, col.primary_key);
+            tracing::trace!(
+                "  column[{}]: name='{}' primary_key={}",
+                idx,
+                col.name,
+                col.primary_key
+            );
         }
         Ok(table)
     }
@@ -1875,8 +1996,11 @@ where
         &self,
         plan: InsertPlan,
     ) -> llkv_result::Result<llkv_transaction::StatementResult<MemPager>> {
-        tracing::trace!("[WRAPPER] TransactionContext::insert called - plan.table='{}', wrapper_context_pager={:p}", 
-            plan.table, &*self.0.pager);
+        tracing::trace!(
+            "[WRAPPER] TransactionContext::insert called - plan.table='{}', wrapper_context_pager={:p}",
+            plan.table,
+            &*self.0.pager
+        );
         let result = DslContext::insert(&self.0, plan)?;
         Ok(convert_statement_result(result))
     }

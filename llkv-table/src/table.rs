@@ -108,7 +108,11 @@ where
             return Err(Error::reserved_table_id(table_id));
         }
 
-        tracing::trace!("!!! Table::new: Creating table table_id={} with pager at {:p}", table_id, &*pager);
+        tracing::trace!(
+            "!!! Table::new: Creating table table_id={} with pager at {:p}",
+            table_id,
+            &*pager
+        );
         let store = ColumnStore::open(pager)?;
         Ok(Self { store, table_id })
     }

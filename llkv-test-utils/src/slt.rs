@@ -259,7 +259,7 @@ fn normalize_inline_connections(
                     i += 1;
                     let mut sql_lines = Vec::new();
                     let mut regex_pattern = None;
-                    
+
                     while i < lines.len() {
                         let next_line = &lines[i];
                         let next_trimmed = next_line.trim_start();
@@ -270,7 +270,9 @@ fn normalize_inline_connections(
                             if i < lines.len() {
                                 let following = lines[i].trim();
                                 if !following.is_empty() && following.starts_with("<REGEX>:") {
-                                    regex_pattern = Some(following.strip_prefix("<REGEX>:").unwrap().to_string());
+                                    regex_pattern = Some(
+                                        following.strip_prefix("<REGEX>:").unwrap().to_string(),
+                                    );
                                     i += 1; // Move past pattern line
                                     // Skip blank line if present
                                     if i < lines.len() && lines[i].trim().is_empty() {
@@ -284,7 +286,7 @@ fn normalize_inline_connections(
                             i += 1;
                         }
                     }
-                    
+
                     // Now output in correct format
                     if let Some(pattern) = regex_pattern {
                         // Connection FIRST
@@ -329,7 +331,7 @@ fn normalize_inline_connections(
             i += 1;
             let mut sql_lines = Vec::new();
             let mut regex_pattern = None;
-            
+
             while i < lines.len() {
                 let next_line = &lines[i];
                 let next_trimmed = next_line.trim_start();
@@ -340,7 +342,8 @@ fn normalize_inline_connections(
                     if i < lines.len() {
                         let following = lines[i].trim();
                         if !following.is_empty() && following.starts_with("<REGEX>:") {
-                            regex_pattern = Some(following.strip_prefix("<REGEX>:").unwrap().to_string());
+                            regex_pattern =
+                                Some(following.strip_prefix("<REGEX>:").unwrap().to_string());
                             i += 1; // Move past pattern line
                             // Skip blank line if present
                             if i < lines.len() && lines[i].trim().is_empty() {
@@ -355,7 +358,7 @@ fn normalize_inline_connections(
                     i += 1;
                 }
             }
-            
+
             // Now output in correct format
             if let Some(pattern) = regex_pattern {
                 // Inline format: statement error pattern

@@ -141,17 +141,21 @@ where
     }
 
     fn execute_statement(&self, statement: Statement) -> SqlResult<StatementResult<P>> {
-        tracing::trace!("DEBUG SQL execute_statement: {:?}", match &statement {
-            Statement::Insert(insert) => format!("Insert(table={:?})", Self::table_name_from_insert(insert)),
-            Statement::Query(_) => "Query".to_string(),
-            Statement::StartTransaction { .. } => "StartTransaction".to_string(),
-            Statement::Commit { .. } => "Commit".to_string(),
-            Statement::Rollback { .. } => "Rollback".to_string(),
-            Statement::CreateTable(_) => "CreateTable".to_string(),
-            Statement::Update { .. } => "Update".to_string(),
-            Statement::Delete(_) => "Delete".to_string(),
-            other => format!("Other({:?})", other),
-        });
+        tracing::trace!(
+            "DEBUG SQL execute_statement: {:?}",
+            match &statement {
+                Statement::Insert(insert) =>
+                    format!("Insert(table={:?})", Self::table_name_from_insert(insert)),
+                Statement::Query(_) => "Query".to_string(),
+                Statement::StartTransaction { .. } => "StartTransaction".to_string(),
+                Statement::Commit { .. } => "Commit".to_string(),
+                Statement::Rollback { .. } => "Rollback".to_string(),
+                Statement::CreateTable(_) => "CreateTable".to_string(),
+                Statement::Update { .. } => "Update".to_string(),
+                Statement::Delete(_) => "Delete".to_string(),
+                other => format!("Other({:?})", other),
+            }
+        );
         match statement {
             Statement::StartTransaction {
                 modes,
@@ -189,16 +193,20 @@ where
             Statement::CreateTable(stmt) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateTable");
                 self.handle_create_table(stmt)
-            },
+            }
             Statement::Insert(stmt) => {
-                let table_name = Self::table_name_from_insert(&stmt).unwrap_or_else(|_| "unknown".to_string());
-                tracing::trace!("DEBUG SQL execute_statement_non_transactional: Insert(table={})", table_name);
+                let table_name =
+                    Self::table_name_from_insert(&stmt).unwrap_or_else(|_| "unknown".to_string());
+                tracing::trace!(
+                    "DEBUG SQL execute_statement_non_transactional: Insert(table={})",
+                    table_name
+                );
                 self.handle_insert(stmt)
-            },
+            }
             Statement::Query(query) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: Query");
                 self.handle_query(*query)
-            },
+            }
             Statement::Update {
                 table,
                 assignments,
@@ -209,25 +217,28 @@ where
             } => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: Update");
                 self.handle_update(table, assignments, from, selection, returning)
-            },
+            }
             Statement::Delete(delete) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: Delete");
                 self.handle_delete(delete)
-            },
+            }
             Statement::Set(set_stmt) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: Set");
                 self.handle_set(set_stmt)
-            },
+            }
             Statement::Pragma { name, value, is_eq } => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: Pragma");
                 self.handle_pragma(name, value, is_eq)
-            },
+            }
             other => {
-                tracing::trace!("DEBUG SQL execute_statement_non_transactional: Other({:?})", other);
+                tracing::trace!(
+                    "DEBUG SQL execute_statement_non_transactional: Other({:?})",
+                    other
+                );
                 Err(Error::InvalidArgumentError(format!(
                     "unsupported SQL statement: {other:?}"
                 )))
-            },
+            }
         }
     }
 
@@ -308,7 +319,11 @@ where
         validate_create_table_common(&stmt)?;
 
         let (display_name, canonical_name) = canonical_object_name(&stmt.name)?;
-        tracing::trace!("\n=== HANDLE_CREATE_TABLE: table='{}' columns={} ===", display_name, stmt.columns.len());
+        tracing::trace!(
+            "\n=== HANDLE_CREATE_TABLE: table='{}' columns={} ===",
+            display_name,
+            stmt.columns.len()
+        );
         if display_name.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "table name must not be empty".into(),
@@ -340,24 +355,40 @@ where
                 .options
                 .iter()
                 .all(|opt| !matches!(opt.option, ColumnOption::NotNull));
-            
-            let is_primary_key = column_def
-                .options
-                .iter()
-                .any(|opt| matches!(opt.option, ColumnOption::Unique { is_primary: true, characteristics: _ }));
-            
-            tracing::trace!("DEBUG CREATE TABLE column '{}' is_primary_key={}", column_def.name.value, is_primary_key);
-            
+
+            let is_primary_key = column_def.options.iter().any(|opt| {
+                matches!(
+                    opt.option,
+                    ColumnOption::Unique {
+                        is_primary: true,
+                        characteristics: _
+                    }
+                )
+            });
+
+            tracing::trace!(
+                "DEBUG CREATE TABLE column '{}' is_primary_key={}",
+                column_def.name.value,
+                is_primary_key
+            );
+
             let mut column = ColumnSpec::new(
                 column_def.name.value.clone(),
                 arrow_type_from_sql(&column_def.data_type)?,
                 is_nullable,
             );
-            tracing::trace!("DEBUG ColumnSpec after new(): primary_key={}", column.primary_key);
-            
+            tracing::trace!(
+                "DEBUG ColumnSpec after new(): primary_key={}",
+                column.primary_key
+            );
+
             column = column.with_primary_key(is_primary_key);
-            tracing::trace!("DEBUG ColumnSpec after with_primary_key({}): primary_key={}", is_primary_key, column.primary_key);
-            
+            tracing::trace!(
+                "DEBUG ColumnSpec after with_primary_key({}): primary_key={}",
+                is_primary_key,
+                column.primary_key
+            );
+
             let normalized = column.name.to_ascii_lowercase();
             if names.insert(normalized, ()).is_some() {
                 return Err(Error::InvalidArgumentError(format!(
@@ -404,8 +435,12 @@ where
     }
 
     fn handle_insert(&self, stmt: sqlparser::ast::Insert) -> SqlResult<StatementResult<P>> {
-        let table_name_debug = Self::table_name_from_insert(&stmt).unwrap_or_else(|_| "unknown".to_string());
-        tracing::trace!("DEBUG SQL handle_insert called for table={}", table_name_debug);
+        let table_name_debug =
+            Self::table_name_from_insert(&stmt).unwrap_or_else(|_| "unknown".to_string());
+        tracing::trace!(
+            "DEBUG SQL handle_insert called for table={}",
+            table_name_debug
+        );
         if stmt.replace_into || stmt.ignore || stmt.or.is_some() {
             return Err(Error::InvalidArgumentError(
                 "non-standard INSERT forms are not supported".into(),
@@ -501,9 +536,16 @@ where
             columns,
             source: insert_source,
         };
-        tracing::trace!("DEBUG SQL handle_insert: about to call session.insert for table={}", display_name);
+        tracing::trace!(
+            "DEBUG SQL handle_insert: about to call session.insert for table={}",
+            display_name
+        );
         let result = self.session.insert(plan);
-        tracing::trace!("DEBUG SQL handle_insert: session.insert returned {} for table={}", if result.is_ok() { "Ok" } else { "Err" }, display_name);
+        tracing::trace!(
+            "DEBUG SQL handle_insert: session.insert returned {} for table={}",
+            if result.is_ok() { "Ok" } else { "Err" },
+            display_name
+        );
         result.map_err(|err| Self::map_table_error(&display_name, err))
     }
 
@@ -648,10 +690,10 @@ where
         // Check if transaction is aborted FIRST before any parsing/translation
         if self.session.has_active_transaction() && self.session.is_aborted() {
             return Err(Error::TransactionContextError(
-                "TransactionContext Error: transaction is aborted".into()
+                "TransactionContext Error: transaction is aborted".into(),
             ));
         }
-        
+
         validate_simple_query(&query)?;
         let mut select_plan = match query.body.as_ref() {
             SetExpr::Select(select) => self.translate_select(select.as_ref())?,
