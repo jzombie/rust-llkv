@@ -1591,6 +1591,8 @@ where
 
         let mut next_row_id: u64 = 0;
         let mut total_rows: u64 = 0;
+        let creator_snapshot = self.txn_manager.begin_transaction();
+        let creator_txn_id = creator_snapshot.txn_id;
         for batch in batches {
             let row_count = batch.num_rows();
             if row_count == 0 {
@@ -1610,11 +1612,22 @@ where
                 row_builder.append_value(start_row + offset as u64);
             }
 
-            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(row_count + 1);
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_defs.len() + 3);
             arrays.push(Arc::new(row_builder.finish()) as ArrayRef);
 
-            let mut fields: Vec<Field> = Vec::with_capacity(column_defs.len() + 1);
+            let mut created_builder = UInt64Builder::with_capacity(row_count);
+            let mut deleted_builder = UInt64Builder::with_capacity(row_count);
+            for _ in 0..row_count {
+                created_builder.append_value(creator_txn_id);
+                deleted_builder.append_value(TXN_ID_NONE);
+            }
+            arrays.push(Arc::new(created_builder.finish()) as ArrayRef);
+            arrays.push(Arc::new(deleted_builder.finish()) as ArrayRef);
+
+            let mut fields: Vec<Field> = Vec::with_capacity(column_defs.len() + 3);
             fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+            fields.push(Field::new(CREATED_BY_COLUMN_NAME, DataType::UInt64, false));
+            fields.push(Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false));
 
             for (idx, column) in column_defs.iter().enumerate() {
                 let mut metadata = HashMap::new();
@@ -1632,6 +1645,8 @@ where
             let append_batch = RecordBatch::try_new(append_schema, arrays)?;
             table_entry.table.append(&append_batch)?;
         }
+
+        self.txn_manager.mark_committed(creator_txn_id);
 
         table_entry.next_row_id.store(next_row_id, Ordering::SeqCst);
         table_entry.total_rows.store(total_rows, Ordering::SeqCst);

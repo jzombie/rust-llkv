@@ -247,16 +247,31 @@ mod tests {
 
     #[test]
     fn test_row_visibility_simple() {
-        let mut manager = TxnIdManager::new();
-        let snapshot = manager.begin_transaction();
-        manager.mark_committed(snapshot.txn_id);
+        let manager = TxnIdManager::new();
+        let writer_snapshot = manager.begin_transaction();
+        let mut row = RowVersion::new(writer_snapshot.txn_id);
 
-        let mut row = RowVersion::new(snapshot.txn_id);
+        // Newly created rows are visible to the creating transaction.
+        assert!(row.is_visible(writer_snapshot.txn_id));
+        assert!(row.is_visible_for(&manager, writer_snapshot));
 
-        assert!(row.is_visible(snapshot.snapshot_id));
-        assert!(row.is_visible_for(&manager, snapshot));
+        // After the writer commits, the row becomes visible to later snapshots.
+        manager.mark_committed(writer_snapshot.txn_id);
+        let committed = manager.last_committed();
+        assert!(row.is_visible(committed));
 
-        row.delete(snapshot.txn_id);
-        assert!(!row.is_visible_for(&manager, snapshot));
+        let reader_snapshot = manager.begin_transaction();
+        assert!(row.is_visible_for(&manager, reader_snapshot));
+
+        // Deleting transaction must commit before other readers stop seeing the row.
+        let deleter_snapshot = manager.begin_transaction();
+        row.delete(deleter_snapshot.txn_id);
+        assert!(row.is_visible_for(&manager, reader_snapshot));
+
+        manager.mark_committed(deleter_snapshot.txn_id);
+        assert!(row.is_visible_for(&manager, reader_snapshot));
+
+        let post_delete_snapshot = manager.begin_transaction();
+        assert!(!row.is_visible_for(&manager, post_delete_snapshot));
     }
 }

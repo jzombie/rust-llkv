@@ -199,6 +199,7 @@ where
         let scan_options = ScanStreamOptions {
             include_nulls: self.options.include_nulls,
             order: None,
+            row_id_filter: None,
         };
 
         self.table

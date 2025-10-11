@@ -134,6 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let default_options = ScanStreamOptions {
         include_nulls: false,
         order: None,
+        row_id_filter: None,
     };
 
     benchmark_scenario(
@@ -141,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &table,
         &single_proj,
         &unbounded_filter,
-        default_options,
+        default_options.clone(),
     );
 
     // 2. Multiple columns (should use materialization path)
@@ -155,13 +156,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &table,
         &multi_proj,
         &unbounded_filter,
-        default_options,
+    default_options.clone(),
     );
 
     // 3. Single column with nulls included (should bypass streaming optimization)
     let with_nulls_options = ScanStreamOptions {
         include_nulls: true,
         order: None,
+        row_id_filter: None,
     };
 
     benchmark_scenario(
@@ -169,7 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &table,
         &single_proj,
         &unbounded_filter,
-        with_nulls_options,
+    with_nulls_options.clone(),
     );
 
     // 4. Single column with bounded filter (should bypass simple optimizations)
@@ -186,7 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &table,
         &single_proj,
         &bounded_filter,
-        default_options,
+    default_options,
     );
 
     println!("\n=== Summary ===");

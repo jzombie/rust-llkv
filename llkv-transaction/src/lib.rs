@@ -15,7 +15,7 @@ use llkv_plan::plans::{
     PlanOperation, PlanValue, SelectPlan, UpdatePlan,
 };
 use llkv_result::{Error, Result as LlkvResult};
-use llkv_storage::pager::{MemPager, Pager};
+use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
 use llkv_executor::SelectExecution;
