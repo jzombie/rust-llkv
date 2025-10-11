@@ -34,9 +34,9 @@ pub enum TransactionKind {
     Rollback,
 }
 
-/// Statement result enum (simplified version for transaction module)
+/// Transaction result enum (simplified version for transaction module)
 #[derive(Clone, Debug)]
-pub enum StatementResult<P>
+pub enum TransactionResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -63,35 +63,35 @@ where
     },
 }
 
-impl<P> StatementResult<P>
+impl<P> TransactionResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     /// Convert pager type for compatibility
-    pub fn convert_pager_type<P2>(self) -> LlkvResult<StatementResult<P2>>
+    pub fn convert_pager_type<P2>(self) -> LlkvResult<TransactionResult<P2>>
     where
         P2: Pager<Blob = EntryHandle> + Send + Sync + 'static,
     {
         match self {
-            StatementResult::CreateTable { table_name } => {
-                Ok(StatementResult::CreateTable { table_name })
+            TransactionResult::CreateTable { table_name } => {
+                Ok(TransactionResult::CreateTable { table_name })
             }
-            StatementResult::Insert { rows_inserted } => {
-                Ok(StatementResult::Insert { rows_inserted })
+            TransactionResult::Insert { rows_inserted } => {
+                Ok(TransactionResult::Insert { rows_inserted })
             }
-            StatementResult::Update {
+            TransactionResult::Update {
                 rows_matched,
                 rows_updated,
-            } => Ok(StatementResult::Update {
+            } => Ok(TransactionResult::Update {
                 rows_matched,
                 rows_updated,
             }),
-            StatementResult::Delete { rows_deleted } => {
-                Ok(StatementResult::Delete { rows_deleted })
+            TransactionResult::Delete { rows_deleted } => {
+                Ok(TransactionResult::Delete { rows_deleted })
             }
-            StatementResult::Transaction { kind } => Ok(StatementResult::Transaction { kind }),
-            StatementResult::Select { .. } => Err(Error::Internal(
-                "cannot convert SELECT StatementResult between pager types".into(),
+            TransactionResult::Transaction { kind } => Ok(TransactionResult::Transaction { kind }),
+            TransactionResult::Select { .. } => Err(Error::Internal(
+                "cannot convert SELECT TransactionResult between pager types".into(),
             )),
         }
     }
@@ -151,16 +151,16 @@ pub trait TransactionContext: Send + Sync {
     fn execute_select(&self, plan: SelectPlan) -> LlkvResult<SelectExecution<Self::Pager>>;
 
     /// Create a table from plan
-    fn create_table_plan(&self, plan: CreateTablePlan) -> LlkvResult<StatementResult<MemPager>>;
+    fn create_table_plan(&self, plan: CreateTablePlan) -> LlkvResult<TransactionResult<MemPager>>;
 
     /// Insert rows
-    fn insert(&self, plan: InsertPlan) -> LlkvResult<StatementResult<MemPager>>;
+    fn insert(&self, plan: InsertPlan) -> LlkvResult<TransactionResult<MemPager>>;
 
     /// Update rows
-    fn update(&self, plan: UpdatePlan) -> LlkvResult<StatementResult<MemPager>>;
+    fn update(&self, plan: UpdatePlan) -> LlkvResult<TransactionResult<MemPager>>;
 
     /// Delete rows
-    fn delete(&self, plan: DeletePlan) -> LlkvResult<StatementResult<MemPager>>;
+    fn delete(&self, plan: DeletePlan) -> LlkvResult<TransactionResult<MemPager>>;
 
     /// Append batches with row IDs
     fn append_batches_with_row_ids(
@@ -197,6 +197,8 @@ where
     catalog_snapshot: HashSet<String>,
     /// Base context for table snapshotting.
     base_context: Arc<BaseCtx>,
+    /// Whether this transaction has been aborted due to an error.
+    is_aborted: bool,
 }
 
 impl<BaseCtx, StagingCtx> DslTransaction<BaseCtx, StagingCtx>
@@ -217,12 +219,22 @@ where
             missing_tables: HashSet::new(),
             catalog_snapshot,
             base_context,
+            is_aborted: false,
         }
     }
 
     /// Ensure a table exists in the staging context, snapshotting from base if needed.
     fn ensure_table_in_delta(&mut self, table_name: &str) -> LlkvResult<()> {
+        tracing::trace!(
+            "[ENSURE] ensure_table_in_delta called for table='{}'",
+            table_name
+        );
+        tracing::trace!(
+            "[ENSURE]   staged_tables.contains={}",
+            self.staged_tables.contains(table_name)
+        );
         if self.staged_tables.contains(table_name) {
+            tracing::trace!("[ENSURE]   returning early - table already staged");
             return Ok(());
         }
 
@@ -243,41 +255,75 @@ where
         }
 
         // Try to get specs from base context
+        tracing::trace!("[ENSURE] About to check base_context.table_column_specs");
         match self.base_context.table_column_specs(table_name) {
             Ok(specs) => {
+                tracing::trace!(
+                    "[ENSURE] Got {} specs from BASE context for table '{}'",
+                    specs.len(),
+                    table_name
+                );
+                for spec in &specs {
+                    tracing::trace!(
+                        "[ENSURE]   spec: name='{}' primary_key={}",
+                        spec.name,
+                        spec.primary_key
+                    );
+                }
                 self.missing_tables.remove(table_name);
                 let mut plan = CreateTablePlan::new(table_name.to_string());
                 plan.if_not_exists = true;
                 plan.columns = specs;
+                tracing::trace!(
+                    "[ENSURE] About to create table in staging with {} columns",
+                    plan.columns.len()
+                );
                 self.staging.create_table_plan(plan)?;
+                tracing::trace!("[ENSURE] Created table in staging successfully");
 
                 // Snapshot rows from base
+                tracing::trace!("[ENSURE] About to snapshot rows from base context");
                 match self.base_context.export_table_rows(table_name) {
                     Ok(snapshot) => {
+                        tracing::trace!("[ENSURE] Got {} rows from base", snapshot.rows.len());
                         if !snapshot.rows.is_empty() {
+                            tracing::trace!(
+                                "[ENSURE] About to INSERT {} rows into staging",
+                                snapshot.rows.len()
+                            );
                             let insert_plan = InsertPlan {
                                 table: table_name.to_string(),
                                 columns: snapshot.columns.clone(),
                                 source: InsertSource::Rows(snapshot.rows),
                             };
                             self.staging.insert(insert_plan)?;
+                            tracing::trace!(
+                                "[ENSURE] Successfully inserted snapshot rows into staging"
+                            );
                         }
                         self.snapshotted_tables.insert(table_name.to_string());
+                        tracing::trace!("[ENSURE] Marked table as snapshotted");
                     }
                     Err(Error::NotFound) => {
+                        tracing::trace!(
+                            "[ENSURE] No rows found in base, marking as snapshotted anyway"
+                        );
                         self.snapshotted_tables.insert(table_name.to_string());
                     }
                     Err(other) => return Err(other),
                 }
             }
             Err(Error::NotFound) => {
+                tracing::trace!("[ENSURE] Table not found in BASE context, checking STAGING");
                 // Check if it exists in staging only
                 match self.staging.table_column_specs(table_name) {
                     Ok(_) => {
+                        tracing::trace!("[ENSURE] Found in STAGING only, marking as staged");
                         self.staged_tables.insert(table_name.to_string());
                         return Ok(());
                     }
                     Err(_) => {
+                        tracing::trace!("[ENSURE] Not found in STAGING either, returning error");
                         self.missing_tables.insert(table_name.to_string());
                         return Err(Error::CatalogError(format!(
                             "Catalog Error: Table '{table_name}' does not exist"
@@ -285,7 +331,13 @@ where
                     }
                 }
             }
-            Err(other) => return Err(other),
+            Err(other) => {
+                tracing::trace!(
+                    "[ENSURE] base_context.table_column_specs returned error: {:?}",
+                    other
+                );
+                return Err(other);
+            }
         }
 
         self.staged_tables.insert(table_name.to_string());
@@ -658,49 +710,125 @@ where
     pub fn execute_operation(
         &mut self,
         operation: DslOperation,
-    ) -> LlkvResult<StatementResult<BaseCtx::Pager>> {
+    ) -> LlkvResult<TransactionResult<BaseCtx::Pager>> {
+        tracing::trace!(
+            "[TX] DslTransaction::execute_operation called, operation={:?}",
+            match &operation {
+                DslOperation::Insert(p) => format!("INSERT({})", p.table),
+                DslOperation::Update(p) => format!("UPDATE({})", p.table),
+                DslOperation::Delete(p) => format!("DELETE({})", p.table),
+                DslOperation::CreateTable(p) => format!("CREATE_TABLE({})", p.name),
+                _ => "OTHER".to_string(),
+            }
+        );
+        // Check if transaction is aborted
+        if self.is_aborted {
+            return Err(Error::TransactionContextError(
+                "TransactionContext Error: transaction is aborted".into(),
+            ));
+        }
+
+        // Execute operation and catch errors to mark transaction as aborted
         let result = match operation {
             DslOperation::CreateTable(ref plan) => {
-                let result = self.staging.create_table_plan(plan.clone())?;
-                // Track new table so it's visible to subsequent operations in this transaction
-                self.new_tables.insert(plan.name.clone());
-                self.missing_tables.remove(&plan.name);
-                self.staged_tables.insert(plan.name.clone());
-                // Track for commit replay
-                self.operations
-                    .push(DslOperation::CreateTable(plan.clone()));
-                result.convert_pager_type()?
+                match self.staging.create_table_plan(plan.clone()) {
+                    Ok(result) => {
+                        // Track new table so it's visible to subsequent operations in this transaction
+                        self.new_tables.insert(plan.name.clone());
+                        self.missing_tables.remove(&plan.name);
+                        self.staged_tables.insert(plan.name.clone());
+                        // Track for commit replay
+                        self.operations
+                            .push(DslOperation::CreateTable(plan.clone()));
+                        result.convert_pager_type()?
+                    }
+                    Err(e) => {
+                        self.is_aborted = true;
+                        return Err(e);
+                    }
+                }
             }
             DslOperation::Insert(ref plan) => {
-                self.ensure_table_in_delta(&plan.table)?;
-                let result = self.staging.insert(plan.clone())?;
-                // Track for commit replay
-                self.operations.push(DslOperation::Insert(plan.clone()));
-                result.convert_pager_type()?
+                tracing::trace!(
+                    "[TX] DslTransaction::execute_operation INSERT for table='{}'",
+                    plan.table
+                );
+                // First ensure table exists
+                if let Err(e) = self.ensure_table_in_delta(&plan.table) {
+                    self.is_aborted = true;
+                    return Err(e);
+                }
+                tracing::trace!("[TX] About to call self.staging.insert...");
+                match self.staging.insert(plan.clone()) {
+                    Ok(result) => {
+                        tracing::trace!("[TX] INSERT succeeded, pushing operation to replay queue");
+                        // Track for commit replay
+                        self.operations.push(DslOperation::Insert(plan.clone()));
+                        result.convert_pager_type()?
+                    }
+                    Err(e) => {
+                        tracing::trace!(
+                            "DEBUG DslTransaction::execute_operation INSERT failed: {:?}",
+                            e
+                        );
+                        tracing::trace!("DEBUG setting is_aborted=true");
+                        self.is_aborted = true;
+                        return Err(e);
+                    }
+                }
             }
             DslOperation::Update(ref plan) => {
-                self.ensure_table_in_delta(&plan.table)?;
-                let result = self.staging.update(plan.clone())?;
-                // Track for commit replay
-                self.operations.push(DslOperation::Update(plan.clone()));
-                result.convert_pager_type()?
+                if let Err(e) = self.ensure_table_in_delta(&plan.table) {
+                    self.is_aborted = true;
+                    return Err(e);
+                }
+                match self.staging.update(plan.clone()) {
+                    Ok(result) => {
+                        // Track for commit replay
+                        self.operations.push(DslOperation::Update(plan.clone()));
+                        result.convert_pager_type()?
+                    }
+                    Err(e) => {
+                        self.is_aborted = true;
+                        return Err(e);
+                    }
+                }
             }
             DslOperation::Delete(ref plan) => {
-                self.ensure_table_in_delta(&plan.table)?;
-                let result = self.staging.delete(plan.clone())?;
-                // Track for commit replay
-                self.operations.push(DslOperation::Delete(plan.clone()));
-                result.convert_pager_type()?
+                if let Err(e) = self.ensure_table_in_delta(&plan.table) {
+                    self.is_aborted = true;
+                    return Err(e);
+                }
+                match self.staging.delete(plan.clone()) {
+                    Ok(result) => {
+                        // Track for commit replay
+                        self.operations.push(DslOperation::Delete(plan.clone()));
+                        result.convert_pager_type()?
+                    }
+                    Err(e) => {
+                        self.is_aborted = true;
+                        return Err(e);
+                    }
+                }
             }
             DslOperation::Select(ref plan) => {
                 // SELECT is read-only, not tracked for replay
+                // But still fails if transaction is aborted (already checked above)
                 let table_name = plan.table.clone();
-                let execution = self.execute_select(plan.clone())?;
-                let schema = execution.schema();
-                StatementResult::Select {
-                    table_name,
-                    schema,
-                    execution,
+                match self.execute_select(plan.clone()) {
+                    Ok(execution) => {
+                        let schema = execution.schema();
+                        TransactionResult::Select {
+                            table_name,
+                            schema,
+                            execution,
+                        }
+                    }
+                    Err(e) => {
+                        // Don't abort on SELECT errors (like table not found)
+                        // Only Session layer aborts on constraint violations
+                        return Err(e);
+                    }
                 }
             }
         };
@@ -761,11 +889,33 @@ where
             .contains_key(&self.session_id)
     }
 
+    /// Check if the current transaction has been aborted due to an error.
+    pub fn is_aborted(&self) -> bool {
+        self.transactions
+            .lock()
+            .expect("transactions lock poisoned")
+            .get(&self.session_id)
+            .map(|tx| tx.is_aborted)
+            .unwrap_or(false)
+    }
+
+    /// Mark the current transaction as aborted due to an error.
+    /// This should be called when any error occurs during a transaction.
+    pub fn abort_transaction(&self) {
+        let mut guard = self
+            .transactions
+            .lock()
+            .expect("transactions lock poisoned");
+        if let Some(tx) = guard.get_mut(&self.session_id) {
+            tx.is_aborted = true;
+        }
+    }
+
     /// Begin a transaction in this session.
     pub fn begin_transaction(
         &self,
         staging: Arc<StagingCtx>,
-    ) -> LlkvResult<StatementResult<BaseCtx::Pager>> {
+    ) -> LlkvResult<TransactionResult<BaseCtx::Pager>> {
         let mut guard = self
             .transactions
             .lock()
@@ -779,29 +929,57 @@ where
             self.session_id,
             DslTransaction::new(Arc::clone(&self.context), staging),
         );
-        Ok(StatementResult::Transaction {
+        Ok(TransactionResult::Transaction {
             kind: TransactionKind::Begin,
         })
     }
 
     /// Commit the transaction in this session.
+    /// If the transaction is aborted, this acts as a ROLLBACK instead.
     pub fn commit_transaction(
         &self,
-    ) -> LlkvResult<(StatementResult<BaseCtx::Pager>, Vec<DslOperation>)> {
+    ) -> LlkvResult<(TransactionResult<BaseCtx::Pager>, Vec<DslOperation>)> {
+        tracing::trace!(
+            "[COMMIT] commit_transaction called for session {:?}",
+            self.session_id
+        );
         let mut guard = self
             .transactions
             .lock()
             .expect("transactions lock poisoned");
-        let tx = guard.remove(&self.session_id).ok_or_else(|| {
+        tracing::trace!("[COMMIT] commit_transaction got lock, checking for transaction...");
+        let tx_opt = guard.remove(&self.session_id);
+        tracing::trace!(
+            "[COMMIT] commit_transaction remove returned: {}",
+            tx_opt.is_some()
+        );
+        let tx = tx_opt.ok_or_else(|| {
+            tracing::trace!("[COMMIT] commit_transaction: no transaction found!");
             Error::InvalidArgumentError(
                 "no transaction is currently in progress in this session".into(),
             )
         })?;
+        tracing::trace!("DEBUG commit_transaction: is_aborted={}", tx.is_aborted);
+
+        // If transaction is aborted, commit becomes a rollback (no operations to replay)
+        if tx.is_aborted {
+            tracing::trace!("DEBUG commit_transaction: returning Rollback with 0 operations");
+            return Ok((
+                TransactionResult::Transaction {
+                    kind: TransactionKind::Rollback,
+                },
+                Vec::new(),
+            ));
+        }
 
         let operations = tx.operations;
+        tracing::trace!(
+            "DEBUG commit_transaction: returning Commit with {} operations",
+            operations.len()
+        );
 
         Ok((
-            StatementResult::Transaction {
+            TransactionResult::Transaction {
                 kind: TransactionKind::Commit,
             },
             operations,
@@ -809,7 +987,7 @@ where
     }
 
     /// Rollback the transaction in this session.
-    pub fn rollback_transaction(&self) -> LlkvResult<StatementResult<BaseCtx::Pager>> {
+    pub fn rollback_transaction(&self) -> LlkvResult<TransactionResult<BaseCtx::Pager>> {
         let mut guard = self
             .transactions
             .lock()
@@ -819,7 +997,7 @@ where
                 "no transaction is currently in progress in this session".into(),
             ));
         }
-        Ok(StatementResult::Transaction {
+        Ok(TransactionResult::Transaction {
             kind: TransactionKind::Rollback,
         })
     }
@@ -828,7 +1006,7 @@ where
     pub fn execute_operation(
         &self,
         operation: DslOperation,
-    ) -> LlkvResult<StatementResult<BaseCtx::Pager>> {
+    ) -> LlkvResult<TransactionResult<BaseCtx::Pager>> {
         if !self.has_active_transaction() {
             // No transaction - caller must handle direct execution
             return Err(Error::InvalidArgumentError(
@@ -845,7 +1023,12 @@ where
             .get_mut(&self.session_id)
             .ok_or_else(|| Error::Internal("transaction disappeared during execution".into()))?;
 
-        tx.execute_operation(operation)
+        let result = tx.execute_operation(operation);
+        if let Err(ref e) = result {
+            tracing::trace!("DEBUG TransactionSession::execute_operation error: {:?}", e);
+            tracing::trace!("DEBUG Transaction is_aborted={}", tx.is_aborted);
+        }
+        result
     }
 }
 
@@ -868,7 +1051,9 @@ where
             Err(_) => {
                 // Mutex is poisoned, likely due to a panic elsewhere
                 // Don't panic again during cleanup
-                eprintln!("Warning: TransactionSession dropped with poisoned transaction mutex");
+                tracing::trace!(
+                    "Warning: TransactionSession dropped with poisoned transaction mutex"
+                );
             }
         }
     }

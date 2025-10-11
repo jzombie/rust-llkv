@@ -1225,18 +1225,8 @@ name = "llkv-dsl"
 version = "0.2.0-alpha"
 dependencies = [
  "arrow",
- "llkv-column-map",
- "llkv-executor",
- "llkv-expr",
- "llkv-plan",
- "llkv-result",
+ "llkv-runtime",
  "llkv-storage",
- "llkv-table",
- "llkv-transaction",
- "simd-r-drive-entry-handle",
- "sqlparser",
- "time",
- "tracing",
 ]
 
 [[package]]
@@ -1303,6 +1293,25 @@ dependencies = [
  "arrow",
  "llkv-test-utils",
  "thiserror",
+]
+
+[[package]]
+name = "llkv-runtime"
+version = "0.2.0-alpha"
+dependencies = [
+ "arrow",
+ "llkv-column-map",
+ "llkv-executor",
+ "llkv-expr",
+ "llkv-plan",
+ "llkv-result",
+ "llkv-storage",
+ "llkv-table",
+ "llkv-transaction",
+ "simd-r-drive-entry-handle",
+ "sqlparser",
+ "time",
+ "tracing",
 ]
 
 [[package]]
@@ -1396,6 +1405,7 @@ dependencies = [
  "llkv-table",
  "rustc-hash",
  "simd-r-drive-entry-handle",
+ "tracing",
 ]
 
 [[package]]

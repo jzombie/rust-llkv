@@ -908,6 +908,7 @@ pub struct ExecutorColumn {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    pub primary_key: bool,
     pub field_id: FieldId,
 }
 
