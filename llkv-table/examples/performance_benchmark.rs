@@ -123,7 +123,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lfid_b = LogicalFieldId::for_user(TABLE_ID, FIELD_B);
 
     // 1. Single column, unbounded scan (should use fastest path)
-    let single_proj = vec![Projection::with_alias(lfid_a, "col_a")];
+    let mut single_p = Projection::from(lfid_a);
+    single_p.alias = Some("col_a".to_string());
+    let single_proj = vec![single_p];
     let unbounded_filter = Expr::Pred(Filter {
         field_id: FIELD_A,
         op: Operator::Range {
@@ -145,10 +147,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 2. Multiple columns (should use materialization path)
-    let multi_proj = vec![
-        Projection::with_alias(lfid_a, "col_a"),
-        Projection::with_alias(lfid_b, "col_b"),
-    ];
+    let mut ma = Projection::from(lfid_a);
+    ma.alias = Some("col_a".to_string());
+    let mut mb = Projection::from(lfid_b);
+    mb.alias = Some("col_b".to_string());
+    let multi_proj = vec![ma, mb];
 
     benchmark_scenario(
         "Multi-Column Scan",

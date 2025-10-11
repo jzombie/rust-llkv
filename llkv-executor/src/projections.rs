@@ -16,10 +16,13 @@ where
         .columns
         .iter()
         .map(|column| {
-            ScanProjection::from(StoreProjection::with_alias(
-                LogicalFieldId::for_user(table.table.table_id(), column.field_id),
-                column.name.clone(),
-            ))
+            let mut p = StoreProjection::from(LogicalFieldId::for_user(
+                table.table.table_id(),
+                column.field_id,
+            ));
+            // preserve human-visible name for downstream results
+            p.alias = Some(column.name.clone());
+            ScanProjection::from(p)
         })
         .collect()
 }
@@ -41,11 +44,16 @@ where
                 let column = table.schema.resolve(name).ok_or_else(|| {
                     Error::InvalidArgumentError(format!("unknown column '{}' in projection", name))
                 })?;
-                let alias = alias.clone().unwrap_or_else(|| column.name.clone());
-                result.push(ScanProjection::from(StoreProjection::with_alias(
-                    LogicalFieldId::for_user(table.table.table_id(), column.field_id),
-                    alias,
-                )));
+                // We keep user-visible alias names at the SQL/executor layer
+                // for final result schema, but internal projections are numeric.
+                let mut p = StoreProjection::from(LogicalFieldId::for_user(
+                    table.table.table_id(),
+                    column.field_id,
+                ));
+                // If the SQL projection provided an alias, use it; otherwise use the
+                // original column name so downstream batches are labeled correctly.
+                p.alias = alias.clone().or_else(|| Some(column.name.clone()));
+                result.push(ScanProjection::from(p));
             }
             SelectProjection::Computed { expr, alias } => {
                 let scalar = translate_scalar(expr, table.schema.as_ref())?;

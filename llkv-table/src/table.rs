@@ -473,8 +473,13 @@ mod tests {
         Projection::from(LogicalFieldId::for_user(table.table_id, field_id))
     }
 
-    fn proj_alias<S: Into<String>>(table: &Table, field_id: FieldId, alias: S) -> Projection {
-        Projection::with_alias(LogicalFieldId::for_user(table.table_id, field_id), alias)
+    fn proj_alias<S: Into<String>>(_table: &Table, field_id: FieldId, _alias: S) -> Projection {
+        // String aliases are no longer stored on Projection; resolve display
+        // names in the planner/executor. Here we just return a numeric
+        // projection for the given field id.
+        let mut p = Projection::from(LogicalFieldId::for_user(_table.table_id, field_id));
+        p.alias = Some(_alias.into());
+        p
     }
 
     #[test]

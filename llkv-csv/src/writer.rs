@@ -3,8 +3,10 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::ops::Bound;
 use std::path::Path;
+use std::sync::Arc;
 
 use arrow::csv::WriterBuilder;
+use arrow::record_batch::RecordBatch;
 use llkv_column_map::store::Projection;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_result::{Error, Result as LlkvResult};
@@ -131,7 +133,39 @@ where
         C: AsRef<Path>,
     {
         let projections = build_column_projections(self.table, columns)?;
-        self.write_projections_to_path(csv_path, projections, filter_expr)
+
+        // Resolve header names for CSV output (one per column)
+        let field_ids: Vec<FieldId> = columns.iter().map(|c| c.field_id).collect();
+        let metas = self.table.get_cols_meta(&field_ids);
+        let header_names: Vec<String> = columns
+            .iter()
+            .enumerate()
+            .map(|(idx, col)| {
+                col.alias
+                    .clone()
+                    .or_else(|| {
+                        metas
+                            .get(idx)
+                            .and_then(|meta| meta.as_ref().and_then(|m| m.name.clone()))
+                    })
+                    .unwrap_or_else(|| format!("col_{}", col.field_id))
+            })
+            .collect();
+
+        // Create file and writer, then stream batches and rename schema fields
+        let file = File::create(csv_path.as_ref()).map_err(|err| {
+            Error::Internal(format!(
+                "failed to create CSV file '{}': {err}",
+                csv_path.as_ref().display()
+            ))
+        })?;
+        let writer = BufWriter::new(file);
+        self.write_projections_to_writer_with_headers(
+            writer,
+            projections,
+            filter_expr,
+            header_names,
+        )
     }
 
     pub fn write_columns_to_writer<W>(
@@ -144,7 +178,30 @@ where
         W: Write,
     {
         let projections = build_column_projections(self.table, columns)?;
-        self.write_projections_to_writer(writer, projections, filter_expr)
+
+        let field_ids: Vec<FieldId> = columns.iter().map(|c| c.field_id).collect();
+        let metas = self.table.get_cols_meta(&field_ids);
+        let header_names: Vec<String> = columns
+            .iter()
+            .enumerate()
+            .map(|(idx, col)| {
+                col.alias
+                    .clone()
+                    .or_else(|| {
+                        metas
+                            .get(idx)
+                            .and_then(|meta| meta.as_ref().and_then(|m| m.name.clone()))
+                    })
+                    .unwrap_or_else(|| format!("col_{}", col.field_id))
+            })
+            .collect();
+
+        self.write_projections_to_writer_with_headers(
+            writer,
+            projections,
+            filter_expr,
+            header_names,
+        )
     }
 
     pub fn write_projections_to_path<C, I, SP>(
@@ -188,7 +245,13 @@ where
             ));
         }
 
-        ensure_column_aliases(self.table, &mut projections)?;
+        // CSV output needs human-friendly column names. Resolve them once
+        // here from the provided CsvExportColumn list rather than relying on
+        // Projection.alias which has been removed. We'll compute a vector of
+        // header names (one per projection) and use it to rename each
+        // RecordBatch produced by the scan stream before writing.
+        // Note: build_column_projections already ensured projections match
+        // the requested columns and validated types.
 
         let mut builder = WriterBuilder::new();
         builder = builder.with_delimiter(self.options.delimiter);
@@ -223,6 +286,89 @@ where
 
         Ok(())
     }
+
+    fn write_projections_to_writer_with_headers<W, I, SP>(
+        &self,
+        writer: W,
+        projections: I,
+        filter_expr: &Expr<'_, FieldId>,
+        header_names: Vec<String>,
+    ) -> LlkvResult<()>
+    where
+        W: Write,
+        I: IntoIterator<Item = SP>,
+        SP: Into<ScanProjection>,
+    {
+        let mut projections: Vec<ScanProjection> =
+            projections.into_iter().map(|p| p.into()).collect();
+
+        if projections.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "at least one projection must be provided for CSV export".into(),
+            ));
+        }
+
+        let mut builder = WriterBuilder::new();
+        builder = builder.with_delimiter(self.options.delimiter);
+        builder = builder.with_header(self.options.include_header);
+        let mut csv_writer = builder.build(writer);
+
+        let mut write_error: Option<Error> = None;
+        let scan_options = ScanStreamOptions {
+            include_nulls: self.options.include_nulls,
+            order: None,
+        };
+
+        // Stream batches and rename their schema fields to header_names
+        self.table
+            .scan_stream_with_exprs(&projections, filter_expr, scan_options, |batch| {
+                if write_error.is_some() {
+                    return;
+                }
+
+                // Build new schema with desired header names but same data types/nullability
+                let schema = batch.schema();
+                let fields = schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let name = header_names
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| f.name().clone());
+                        arrow::datatypes::Field::new(&name, f.data_type().clone(), f.is_nullable())
+                    })
+                    .collect::<Vec<_>>();
+                let new_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+
+                let new_batch = RecordBatch::try_new(new_schema, batch.columns().to_vec());
+                match new_batch {
+                    Ok(b) => {
+                        if let Err(err) = csv_writer.write(&b) {
+                            write_error =
+                                Some(Error::Internal(format!("failed to write CSV batch: {err}")));
+                        }
+                    }
+                    Err(err) => {
+                        write_error = Some(Error::Internal(format!(
+                            "failed to construct CSV batch: {err}"
+                        )));
+                    }
+                }
+            })?;
+
+        if let Some(err) = write_error {
+            return Err(err);
+        }
+
+        let mut inner_writer = csv_writer.into_inner();
+        inner_writer
+            .flush()
+            .map_err(|err| Error::Internal(format!("failed to flush CSV writer: {err}")))?;
+
+        Ok(())
+    }
 }
 
 fn build_column_projections<P>(
@@ -242,22 +388,10 @@ where
     let column_meta = table.get_cols_meta(&field_ids);
 
     let mut projections: Vec<ScanProjection> = Vec::with_capacity(columns.len());
-    for (idx, column) in columns.iter().enumerate() {
+    for column in columns.iter() {
         let lfid = LogicalFieldId::for_user(table.table_id(), column.field_id);
         table.store().data_type(lfid)?;
-
-        let resolved_name = column
-            .alias
-            .clone()
-            .or_else(|| {
-                column_meta
-                    .get(idx)
-                    .and_then(|meta| meta.as_ref().and_then(|m| m.name.clone()))
-            })
-            .unwrap_or_else(|| format!("col_{}", column.field_id));
-
-        let projection = Projection::with_alias(lfid, resolved_name);
-        projections.push(ScanProjection::from(projection));
+        projections.push(ScanProjection::from(Projection::from(lfid)));
     }
 
     Ok(projections)

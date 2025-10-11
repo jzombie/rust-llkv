@@ -210,14 +210,18 @@ where
             if let Some(field_id) = spec.kind.field_id() {
                 let proj_idx = projections.len();
                 spec_to_projection.push(Some(proj_idx));
-                projections.push(ScanProjection::from(StoreProjection::with_alias(
-                    LogicalFieldId::for_user(table.table.table_id(), field_id),
+                let mut p = StoreProjection::from(LogicalFieldId::for_user(
+                    table.table.table_id(),
+                    field_id,
+                ));
+                p.alias = Some(
                     table
                         .schema
                         .column_by_field_id(field_id)
                         .map(|c| c.name.clone())
                         .unwrap_or_else(|| format!("col{field_id}")),
-                )));
+                );
+                projections.push(ScanProjection::from(p));
             } else {
                 spec_to_projection.push(None);
             }
@@ -229,14 +233,16 @@ where
                     "table has no columns; cannot perform aggregate scan".into(),
                 )
             })?;
-            projections.push(ScanProjection::from(StoreProjection::with_alias(
-                LogicalFieldId::for_user(table.table.table_id(), field_id),
+            let mut p =
+                StoreProjection::from(LogicalFieldId::for_user(table.table.table_id(), field_id));
+            p.alias = Some(
                 table
                     .schema
                     .column_by_field_id(field_id)
                     .map(|c| c.name.clone())
                     .unwrap_or_else(|| format!("col{field_id}")),
-            )));
+            );
+            projections.push(ScanProjection::from(p));
         }
 
         let options = ScanStreamOptions {

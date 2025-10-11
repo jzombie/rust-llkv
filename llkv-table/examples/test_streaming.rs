@@ -61,7 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Now test the streaming scan
     let lfid = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
-    let projection = Projection::with_alias(lfid, "test_col");
+    let mut projection = Projection::from(lfid);
+    projection.alias = Some("test_col".to_string());
 
     // Create unbounded filter (should trigger streaming optimization)
     let filter_expr = Expr::Pred(Filter {
@@ -135,10 +136,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Testing slow path with multiple projections ---");
 
     let lfid2 = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
-    let projections = vec![
-        Projection::with_alias(lfid, "col1"),
-        Projection::with_alias(lfid2, "col2"), // Same field but different alias to trigger slow path
-    ];
+    let mut p1 = Projection::from(lfid);
+    p1.alias = Some("col1".to_string());
+    let mut p2 = Projection::from(lfid2);
+    p2.alias = Some("col2".to_string()); // Same field but different alias to trigger slow path
+    let projections = vec![p1, p2];
 
     let mut batch_count = 0;
     let mut total_rows = 0;
