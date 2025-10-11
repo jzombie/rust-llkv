@@ -136,9 +136,7 @@ where
         if std::path::MAIN_SEPARATOR != '/' {
             name = name.replace(std::path::MAIN_SEPARATOR, "/");
         }
-        let name = name
-            .trim_start_matches(|ch| ch == '/' || ch == '\\')
-            .to_string();
+        let name = name.trim_start_matches(&['/', '\\'][..]).to_string();
         let path_clone = f.clone();
         let factory_factory_clone = factory_factory.clone();
         trials.push(Trial::test(name, move || {
