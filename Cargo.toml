@@ -10,7 +10,6 @@ publish = true
 llkv-aggregate = { path = "./llkv-aggregate", version = "0.2.0-alpha" }
 llkv-column-map = { path = "./llkv-column-map", version = "0.2.0-alpha" }
 llkv-csv = { path = "./llkv-csv", version = "0.2.0-alpha" }
-llkv-dsl = { path = "./llkv-dsl", version = "0.2.0-alpha" }
 llkv-executor = { path = "./llkv-executor", version = "0.2.0-alpha" }
 llkv-expr = { path = "./llkv-expr", version = "0.2.0-alpha" }
 llkv-join = { path = "./llkv-join", version = "0.2.0-alpha" }
@@ -58,7 +57,6 @@ members = [
     "llkv-aggregate",
     "llkv-column-map",
     "llkv-csv",
-    "llkv-dsl",
     "llkv-runtime",
     "llkv-executor",
     "llkv-expr",

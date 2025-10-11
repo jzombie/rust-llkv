@@ -1178,6 +1178,7 @@ name = "llkv-aggregate"
 version = "0.2.0-alpha"
 dependencies = [
  "arrow",
+ "llkv-plan",
  "llkv-result",
  "llkv-table",
 ]
@@ -1218,15 +1219,6 @@ dependencies = [
  "simd-r-drive-entry-handle",
  "tempfile",
  "tracing",
-]
-
-[[package]]
-name = "llkv-dsl"
-version = "0.2.0-alpha"
-dependencies = [
- "arrow",
- "llkv-runtime",
- "llkv-storage",
 ]
 
 [[package]]
@@ -1322,10 +1314,10 @@ dependencies = [
  "async-trait",
  "libtest-mimic 0.6.1",
  "llkv-column-map",
- "llkv-dsl",
  "llkv-expr",
  "llkv-plan",
  "llkv-result",
+ "llkv-runtime",
  "llkv-storage",
  "llkv-table",
  "llkv-test-utils",

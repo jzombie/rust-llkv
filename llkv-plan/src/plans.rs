@@ -455,9 +455,9 @@ pub enum OrderTarget {
 // Operation Enum for Transaction Replay
 // ============================================================================
 
-/// Recordable DSL operation for transaction replay.
+/// Recordable plan operation for transaction replay.
 #[derive(Clone, Debug)]
-pub enum DslOperation {
+pub enum PlanOperation {
     CreateTable(CreateTablePlan),
     Insert(InsertPlan),
     Update(UpdatePlan),
@@ -465,9 +465,9 @@ pub enum DslOperation {
     Select(SelectPlan),
 }
 
-/// Top-level DSL statements that can be executed against a `Session`.
+/// Top-level plan statements that can be executed against a `Session`.
 #[derive(Clone, Debug)]
-pub enum DslStatement {
+pub enum PlanStatement {
     BeginTransaction,
     CommitTransaction,
     RollbackTransaction,

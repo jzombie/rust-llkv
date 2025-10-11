@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::Array as ArrowArray;
-use llkv_dsl::{Context, StatementResult};
+use llkv_runtime::{Context, StatementResult};
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};

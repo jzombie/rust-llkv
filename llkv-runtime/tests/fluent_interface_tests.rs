@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
-use llkv_dsl::{
+use llkv_runtime::{
     AggregateExpr, Context, InsertPlan, InsertSource, PlanValue, StatementResult, TransactionKind,
     row,
 };

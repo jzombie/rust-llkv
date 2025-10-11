@@ -1060,8 +1060,6 @@ fn synthesize_null_scan(schema: Arc<Schema>, total_rows: u64) -> ExecutorResult<
     Ok(vec![batch])
 }
 
-// DSL-specific array -> value conversion is provided by llkv-plan::dsl_value_from_array
-
 // Translate predicate from column names to field IDs
 fn translate_predicate(
     expr: llkv_expr::expr::Expr<'static, String>,

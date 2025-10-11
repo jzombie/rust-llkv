@@ -7,8 +7,8 @@ use arrow::datatypes::{Field, Schema};
 
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
-    AggregateExpr, AggregateFunction, ColumnSpec, CreateTablePlan, DeletePlan, DslOperation,
-    InsertPlan, InsertSource, OrderByPlan, OrderTarget, PlanValue, SelectPlan, UpdatePlan,
+    AggregateExpr, AggregateFunction, ColumnSpec, CreateTablePlan, DeletePlan, InsertPlan,
+    InsertSource, OrderByPlan, OrderTarget, PlanOperation, PlanValue, SelectPlan, UpdatePlan,
 };
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::{MemPager, Pager};
@@ -182,7 +182,7 @@ where
     /// Staging context with MemPager for isolation.
     staging: Arc<StagingCtx>,
     /// Operations to replay on commit.
-    operations: Vec<DslOperation>,
+    operations: Vec<PlanOperation>,
     /// Tables that have been staged (created/snapshotted in staging).
     staged_tables: HashSet<String>,
     /// Per-table delta tracking for merging reads.
@@ -709,15 +709,15 @@ where
     /// Execute an operation in the transaction staging context
     pub fn execute_operation(
         &mut self,
-        operation: DslOperation,
+        operation: PlanOperation,
     ) -> LlkvResult<TransactionResult<BaseCtx::Pager>> {
         tracing::trace!(
             "[TX] DslTransaction::execute_operation called, operation={:?}",
             match &operation {
-                DslOperation::Insert(p) => format!("INSERT({})", p.table),
-                DslOperation::Update(p) => format!("UPDATE({})", p.table),
-                DslOperation::Delete(p) => format!("DELETE({})", p.table),
-                DslOperation::CreateTable(p) => format!("CREATE_TABLE({})", p.name),
+                PlanOperation::Insert(p) => format!("INSERT({})", p.table),
+                PlanOperation::Update(p) => format!("UPDATE({})", p.table),
+                PlanOperation::Delete(p) => format!("DELETE({})", p.table),
+                PlanOperation::CreateTable(p) => format!("CREATE_TABLE({})", p.name),
                 _ => "OTHER".to_string(),
             }
         );
@@ -730,7 +730,7 @@ where
 
         // Execute operation and catch errors to mark transaction as aborted
         let result = match operation {
-            DslOperation::CreateTable(ref plan) => {
+            PlanOperation::CreateTable(ref plan) => {
                 match self.staging.create_table_plan(plan.clone()) {
                     Ok(result) => {
                         // Track new table so it's visible to subsequent operations in this transaction
@@ -739,7 +739,7 @@ where
                         self.staged_tables.insert(plan.name.clone());
                         // Track for commit replay
                         self.operations
-                            .push(DslOperation::CreateTable(plan.clone()));
+                            .push(PlanOperation::CreateTable(plan.clone()));
                         result.convert_pager_type()?
                     }
                     Err(e) => {
@@ -748,7 +748,7 @@ where
                     }
                 }
             }
-            DslOperation::Insert(ref plan) => {
+            PlanOperation::Insert(ref plan) => {
                 tracing::trace!(
                     "[TX] DslTransaction::execute_operation INSERT for table='{}'",
                     plan.table
@@ -763,7 +763,7 @@ where
                     Ok(result) => {
                         tracing::trace!("[TX] INSERT succeeded, pushing operation to replay queue");
                         // Track for commit replay
-                        self.operations.push(DslOperation::Insert(plan.clone()));
+                        self.operations.push(PlanOperation::Insert(plan.clone()));
                         result.convert_pager_type()?
                     }
                     Err(e) => {
@@ -777,7 +777,7 @@ where
                     }
                 }
             }
-            DslOperation::Update(ref plan) => {
+            PlanOperation::Update(ref plan) => {
                 if let Err(e) = self.ensure_table_in_delta(&plan.table) {
                     self.is_aborted = true;
                     return Err(e);
@@ -785,7 +785,7 @@ where
                 match self.staging.update(plan.clone()) {
                     Ok(result) => {
                         // Track for commit replay
-                        self.operations.push(DslOperation::Update(plan.clone()));
+                        self.operations.push(PlanOperation::Update(plan.clone()));
                         result.convert_pager_type()?
                     }
                     Err(e) => {
@@ -794,7 +794,7 @@ where
                     }
                 }
             }
-            DslOperation::Delete(ref plan) => {
+            PlanOperation::Delete(ref plan) => {
                 if let Err(e) = self.ensure_table_in_delta(&plan.table) {
                     self.is_aborted = true;
                     return Err(e);
@@ -802,7 +802,7 @@ where
                 match self.staging.delete(plan.clone()) {
                     Ok(result) => {
                         // Track for commit replay
-                        self.operations.push(DslOperation::Delete(plan.clone()));
+                        self.operations.push(PlanOperation::Delete(plan.clone()));
                         result.convert_pager_type()?
                     }
                     Err(e) => {
@@ -811,7 +811,7 @@ where
                     }
                 }
             }
-            DslOperation::Select(ref plan) => {
+            PlanOperation::Select(ref plan) => {
                 // SELECT is read-only, not tracked for replay
                 // But still fails if transaction is aborted (already checked above)
                 let table_name = plan.table.clone();
@@ -837,7 +837,7 @@ where
     }
 
     /// Get the operations queued for commit
-    pub fn operations(&self) -> &[DslOperation] {
+    pub fn operations(&self) -> &[PlanOperation] {
         &self.operations
     }
 }
@@ -938,7 +938,7 @@ where
     /// If the transaction is aborted, this acts as a ROLLBACK instead.
     pub fn commit_transaction(
         &self,
-    ) -> LlkvResult<(TransactionResult<BaseCtx::Pager>, Vec<DslOperation>)> {
+    ) -> LlkvResult<(TransactionResult<BaseCtx::Pager>, Vec<PlanOperation>)> {
         tracing::trace!(
             "[COMMIT] commit_transaction called for session {:?}",
             self.session_id
@@ -1005,7 +1005,7 @@ where
     /// Execute an operation in this session's transaction, or directly if no transaction is active.
     pub fn execute_operation(
         &self,
-        operation: DslOperation,
+        operation: PlanOperation,
     ) -> LlkvResult<TransactionResult<BaseCtx::Pager>> {
         if !self.has_active_transaction() {
             // No transaction - caller must handle direct execution

@@ -5,14 +5,14 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use crate::SqlResult;
 use crate::SqlValue;
 
-use llkv_dsl::{
-    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, Context, CreateTablePlan,
-    CreateTableSource, DeletePlan, DslStatement, Engine, InsertPlan, InsertSource, OrderByPlan,
-    OrderSortType, OrderTarget, PlanValue, SelectPlan, SelectProjection, Session, StatementResult,
-    UpdatePlan, extract_rows_from_range,
-};
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
+use llkv_runtime::{
+    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, Context, CreateTablePlan,
+    CreateTableSource, DeletePlan, Engine, InsertPlan, InsertSource, OrderByPlan, OrderSortType,
+    OrderTarget, PlanStatement, PlanValue, SelectPlan, SelectProjection, Session, StatementResult,
+    UpdatePlan, extract_rows_from_range,
+};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -87,8 +87,8 @@ where
     // `statement_table_name` is provided by the DSL crate; use it to avoid
     // duplicating plan-level logic here.
 
-    fn execute_dsl_statement(&self, statement: DslStatement) -> SqlResult<StatementResult<P>> {
-        let table = llkv_dsl::statement_table_name(&statement).map(str::to_string);
+    fn execute_dsl_statement(&self, statement: PlanStatement) -> SqlResult<StatementResult<P>> {
+        let table = llkv_runtime::statement_table_name(&statement).map(str::to_string);
         self.dsl.execute_statement(statement).map_err(|err| {
             if let Some(table_name) = table {
                 Self::map_table_error(&table_name, err)
@@ -413,7 +413,7 @@ where
             columns,
             source: None,
         };
-        self.execute_dsl_statement(DslStatement::CreateTable(plan))
+        self.execute_dsl_statement(PlanStatement::CreateTable(plan))
     }
 
     fn handle_create_table_as(
@@ -439,7 +439,7 @@ where
                 plan: Box::new(select_plan),
             }),
         };
-        self.execute_dsl_statement(DslStatement::CreateTable(plan))
+        self.execute_dsl_statement(PlanStatement::CreateTable(plan))
     }
 
     fn handle_insert(&self, stmt: sqlparser::ast::Insert) -> SqlResult<StatementResult<P>> {
@@ -549,7 +549,7 @@ where
             "DEBUG SQL handle_insert: about to execute insert for table={}",
             display_name
         );
-        self.execute_dsl_statement(DslStatement::Insert(plan))
+        self.execute_dsl_statement(PlanStatement::Insert(plan))
     }
 
     fn handle_update(
@@ -615,7 +615,7 @@ where
             assignments: column_assignments,
             filter,
         };
-        self.execute_dsl_statement(DslStatement::Update(plan))
+        self.execute_dsl_statement(PlanStatement::Update(plan))
     }
 
     #[allow(clippy::collapsible_if)]
@@ -671,12 +671,12 @@ where
             table: display_name.clone(),
             filter,
         };
-        self.execute_dsl_statement(DslStatement::Delete(plan))
+        self.execute_dsl_statement(PlanStatement::Delete(plan))
     }
 
     fn handle_query(&self, query: Query) -> SqlResult<StatementResult<P>> {
         let select_plan = self.build_select_plan(query)?;
-        self.execute_dsl_statement(DslStatement::Select(select_plan))
+        self.execute_dsl_statement(PlanStatement::Select(select_plan))
     }
 
     fn build_select_plan(&self, query: Query) -> SqlResult<SelectPlan> {
@@ -1109,7 +1109,7 @@ where
             tracing::warn!("Currently treat `START TRANSACTION` same as `BEGIN`")
         }
 
-        self.execute_dsl_statement(DslStatement::BeginTransaction)
+        self.execute_dsl_statement(PlanStatement::BeginTransaction)
     }
 
     fn handle_commit(
@@ -1134,7 +1134,7 @@ where
             ));
         }
 
-        self.execute_dsl_statement(DslStatement::CommitTransaction)
+        self.execute_dsl_statement(PlanStatement::CommitTransaction)
     }
 
     fn handle_rollback(
@@ -1153,7 +1153,7 @@ where
             ));
         }
 
-        self.execute_dsl_statement(DslStatement::RollbackTransaction)
+        self.execute_dsl_statement(PlanStatement::RollbackTransaction)
     }
 
     fn handle_set(&self, set_stmt: Set) -> SqlResult<StatementResult<P>> {

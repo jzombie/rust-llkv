@@ -37,21 +37,16 @@ pub type Result<T> = llkv_result::Result<T>;
 // Re-export plan structures from llkv-plan
 pub use llkv_plan::{
     AggregateExpr, AggregateFunction, AssignmentValue, ColumnAssignment, ColumnNullability,
-    ColumnSpec, CreateTablePlan, CreateTableSource, DeletePlan, DslOperation, DslStatement,
-    InsertPlan, InsertSource, IntoColumnSpec, NotNull, Nullable, OrderByPlan, OrderSortType,
-    OrderTarget, PlanValue, SelectPlan, SelectProjection, UpdatePlan,
+    ColumnSpec, CreateTablePlan, CreateTableSource, DeletePlan, InsertPlan, InsertSource,
+    IntoColumnSpec, NotNull, Nullable, OrderByPlan, OrderSortType, OrderTarget, PlanOperation,
+    PlanStatement, PlanValue, SelectPlan, SelectProjection, UpdatePlan,
 };
 
 // Execution structures from llkv-executor
-// Keep DSL-prefixed types private to this crate so they are not exposed as
-// part of the llkv-dsl public API. Publicly re-export only the generic
-// execution APIs that are not DSL-prefixed.
 use llkv_executor::{ExecutorColumn, ExecutorSchema, ExecutorTable};
 pub use llkv_executor::{QueryExecutor, RowBatch, SelectExecution, TableProvider};
 
 // Import transaction structures from llkv-transaction for internal use.
-// NOTE: we intentionally do NOT re-export these types from the DSL crate so
-// non-DSL crates do not get `Dsl*` symbols pulled into their public API.
 pub use llkv_transaction::TransactionKind;
 use llkv_transaction::{TransactionContext, TransactionManager, TransactionResult};
 
@@ -192,16 +187,16 @@ where
 /// SQL front-end) to provide better error messages when a statement fails
 /// with a table-related error. It intentionally returns an `Option<&str>` so
 /// callers can decide how to report missing table context.
-pub fn statement_table_name(statement: &DslStatement) -> Option<&str> {
+pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
     match statement {
-        DslStatement::CreateTable(plan) => Some(&plan.name),
-        DslStatement::Insert(plan) => Some(&plan.table),
-        DslStatement::Update(plan) => Some(&plan.table),
-        DslStatement::Delete(plan) => Some(&plan.table),
-        DslStatement::Select(plan) => Some(&plan.table),
-        DslStatement::BeginTransaction
-        | DslStatement::CommitTransaction
-        | DslStatement::RollbackTransaction => None,
+        PlanStatement::CreateTable(plan) => Some(&plan.name),
+        PlanStatement::Insert(plan) => Some(&plan.table),
+        PlanStatement::Update(plan) => Some(&plan.table),
+        PlanStatement::Delete(plan) => Some(&plan.table),
+        PlanStatement::Select(plan) => Some(&plan.table),
+        PlanStatement::BeginTransaction
+        | PlanStatement::CommitTransaction
+        | PlanStatement::RollbackTransaction => None,
     }
 }
 
@@ -214,7 +209,7 @@ pub fn statement_table_name(statement: &DslStatement) -> Option<&str> {
 // - InsertPlan, InsertSource, UpdatePlan, DeletePlan
 // - SelectPlan, SelectProjection, AggregateExpr, AggregateFunction
 // - OrderByPlan, OrderSortType, OrderTarget
-// - DslOperation
+// - PlanOperation
 //
 // This separation allows plans to be used independently of execution logic.
 // ============================================================================
@@ -319,16 +314,16 @@ where
         // Only replay operations if there are any (empty if transaction was aborted)
         for operation in operations {
             match operation {
-                DslOperation::CreateTable(plan) => {
+                PlanOperation::CreateTable(plan) => {
                     TransactionContext::create_table_plan(&**self.inner.context(), plan)?;
                 }
-                DslOperation::Insert(plan) => {
+                PlanOperation::Insert(plan) => {
                     TransactionContext::insert(&**self.inner.context(), plan)?;
                 }
-                DslOperation::Update(plan) => {
+                PlanOperation::Update(plan) => {
                     TransactionContext::update(&**self.inner.context(), plan)?;
                 }
-                DslOperation::Delete(plan) => {
+                PlanOperation::Delete(plan) => {
                     TransactionContext::delete(&**self.inner.context(), plan)?;
                 }
                 _ => {}
@@ -375,7 +370,7 @@ where
             let table_name = plan.name.clone();
             match self
                 .inner
-                .execute_operation(DslOperation::CreateTable(plan))
+                .execute_operation(PlanOperation::CreateTable(plan))
             {
                 Ok(_) => Ok(StatementResult::CreateTable { table_name }),
                 Err(e) => {
@@ -452,7 +447,7 @@ where
         let table_name = plan.table.clone();
 
         if self.has_active_transaction() {
-            match self.inner.execute_operation(DslOperation::Insert(plan)) {
+            match self.inner.execute_operation(PlanOperation::Insert(plan)) {
                 Ok(_) => {
                     tracing::trace!("Session::insert succeeded for table={}", table_name);
                     Ok(StatementResult::Insert {
@@ -489,7 +484,7 @@ where
         if self.has_active_transaction() {
             let tx_result = match self
                 .inner
-                .execute_operation(DslOperation::Select(plan.clone()))
+                .execute_operation(PlanOperation::Select(plan.clone()))
             {
                 Ok(result) => result,
                 Err(e) => {
@@ -543,7 +538,7 @@ where
     pub fn update(&self, plan: UpdatePlan) -> Result<StatementResult<P>> {
         if self.has_active_transaction() {
             let table_name = plan.table.clone();
-            let result = match self.inner.execute_operation(DslOperation::Update(plan)) {
+            let result = match self.inner.execute_operation(PlanOperation::Update(plan)) {
                 Ok(result) => result,
                 Err(e) => {
                     // If an error occurs during a transaction, abort it
@@ -582,7 +577,7 @@ where
     pub fn delete(&self, plan: DeletePlan) -> Result<StatementResult<P>> {
         if self.has_active_transaction() {
             let table_name = plan.table.clone();
-            let result = match self.inner.execute_operation(DslOperation::Delete(plan)) {
+            let result = match self.inner.execute_operation(PlanOperation::Delete(plan)) {
                 Ok(result) => result,
                 Err(e) => {
                     // If an error occurs during a transaction, abort it
@@ -654,22 +649,22 @@ where
         &self.session
     }
 
-    pub fn execute_statement(&self, statement: DslStatement) -> Result<StatementResult<P>> {
+    pub fn execute_statement(&self, statement: PlanStatement) -> Result<StatementResult<P>> {
         match statement {
-            DslStatement::BeginTransaction => self.session.begin_transaction(),
-            DslStatement::CommitTransaction => self.session.commit_transaction(),
-            DslStatement::RollbackTransaction => self.session.rollback_transaction(),
-            DslStatement::CreateTable(plan) => self.session.create_table_plan(plan),
-            DslStatement::Insert(plan) => self.session.insert(plan),
-            DslStatement::Update(plan) => self.session.update(plan),
-            DslStatement::Delete(plan) => self.session.delete(plan),
-            DslStatement::Select(plan) => self.session.select(plan),
+            PlanStatement::BeginTransaction => self.session.begin_transaction(),
+            PlanStatement::CommitTransaction => self.session.commit_transaction(),
+            PlanStatement::RollbackTransaction => self.session.rollback_transaction(),
+            PlanStatement::CreateTable(plan) => self.session.create_table_plan(plan),
+            PlanStatement::Insert(plan) => self.session.insert(plan),
+            PlanStatement::Update(plan) => self.session.update(plan),
+            PlanStatement::Delete(plan) => self.session.delete(plan),
+            PlanStatement::Select(plan) => self.session.select(plan),
         }
     }
 
     pub fn execute_all<I>(&self, statements: I) -> Result<Vec<StatementResult<P>>>
     where
-        I: IntoIterator<Item = DslStatement>,
+        I: IntoIterator<Item = PlanStatement>,
     {
         let mut results = Vec::new();
         for statement in statements {
