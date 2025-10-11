@@ -300,6 +300,36 @@ where
             operations.len()
         );
 
+        if !operations.is_empty() {
+            let dropped_tables = self
+                .inner
+                .context()
+                .0
+                .dropped_tables
+                .read()
+                .unwrap()
+                .clone();
+            if !dropped_tables.is_empty() {
+                for operation in &operations {
+                    let table_name_opt = match operation {
+                        PlanOperation::Insert(plan) => Some(plan.table.as_str()),
+                        PlanOperation::Update(plan) => Some(plan.table.as_str()),
+                        PlanOperation::Delete(plan) => Some(plan.table.as_str()),
+                        _ => None,
+                    };
+                    if let Some(table_name) = table_name_opt {
+                        let (_, canonical) = canonical_table_name(table_name)?;
+                        if dropped_tables.contains(&canonical) {
+                            self.abort_transaction();
+                            return Err(Error::InvalidArgumentError(
+                                "another transaction has dropped this table".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // Extract the transaction kind from the transaction module's result
         let kind = match tx_result {
             TransactionResult::Transaction { kind } => kind,
@@ -681,6 +711,7 @@ where
 {
     pager: Arc<P>,
     tables: RwLock<HashMap<String, Arc<ExecutorTable<P>>>>,
+    dropped_tables: RwLock<HashSet<String>>,
     // Transaction manager for session-based transactions
     transaction_manager: TransactionManager<ContextWrapper<P>, ContextWrapper<MemPager>>,
 }
@@ -694,6 +725,7 @@ where
         Self {
             pager,
             tables: RwLock::new(HashMap::new()),
+            dropped_tables: RwLock::new(HashSet::new()),
             transaction_manager: TransactionManager::new(),
         }
     }
@@ -768,7 +800,13 @@ where
         };
         tracing::trace!("DEBUG create_table_plan: exists={}", exists);
         if exists {
-            if plan.if_not_exists {
+            if plan.or_replace {
+                tracing::trace!(
+                    "DEBUG create_table_plan: table '{}' exists and or_replace=true, removing existing table before recreation",
+                    display_name
+                );
+                self.remove_table_entry(&canonical_name);
+            } else if plan.if_not_exists {
                 tracing::trace!(
                     "DEBUG create_table_plan: table '{}' exists and if_not_exists=true, returning early WITHOUT creating",
                     display_name
@@ -776,12 +814,15 @@ where
                 return Ok(StatementResult::CreateTable {
                     table_name: display_name,
                 });
+            } else {
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: Table '{}' already exists",
+                    display_name
+                )));
             }
-            return Err(Error::CatalogError(format!(
-                "Catalog Error: Table '{}' already exists",
-                display_name
-            )));
         }
+
+        self.dropped_tables.write().unwrap().remove(&canonical_name);
 
         match plan.source {
             Some(CreateTableSource::Batches { schema, batches }) => self.create_table_from_batches(
@@ -2075,6 +2116,38 @@ where
         Ok(table)
     }
 
+    fn remove_table_entry(&self, canonical_name: &str) {
+        let mut tables = self.tables.write().unwrap();
+        if tables.remove(canonical_name).is_some() {
+            tracing::trace!(
+                "remove_table_entry: removed table '{}' from context cache",
+                canonical_name
+            );
+        }
+    }
+
+    pub fn drop_table_immediate(&self, name: &str, if_exists: bool) -> Result<()> {
+        let (display_name, canonical_name) = canonical_table_name(name)?;
+        let tables = self.tables.read().unwrap();
+        if !tables.contains_key(&canonical_name) {
+            if if_exists {
+                return Ok(());
+            } else {
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: Table '{}' does not exist",
+                    display_name
+                )));
+            }
+        }
+        drop(tables);
+        self.dropped_tables.write().unwrap().insert(canonical_name);
+        Ok(())
+    }
+
+    pub fn is_table_marked_dropped(&self, canonical_name: &str) -> bool {
+        self.dropped_tables.read().unwrap().contains(canonical_name)
+    }
+
     fn reserve_table_id(&self) -> Result<TableId> {
         let store = ColumnStore::open(Arc::clone(&self.pager))?;
         let catalog = SysCatalog::new(&store);
@@ -2934,6 +3007,11 @@ where
 {
     pub fn if_not_exists(mut self) -> Self {
         self.plan.if_not_exists = true;
+        self
+    }
+
+    pub fn or_replace(mut self) -> Self {
+        self.plan.or_replace = true;
         self
     }
 

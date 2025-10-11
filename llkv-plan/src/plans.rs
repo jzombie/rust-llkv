@@ -76,6 +76,7 @@ impl From<i32> for PlanValue {
 pub struct CreateTablePlan {
     pub name: String,
     pub if_not_exists: bool,
+    pub or_replace: bool,
     pub columns: Vec<ColumnSpec>,
     pub source: Option<CreateTableSource>,
 }
@@ -85,6 +86,7 @@ impl CreateTablePlan {
         Self {
             name: name.into(),
             if_not_exists: false,
+            or_replace: false,
             columns: Vec::new(),
             source: None,
         }

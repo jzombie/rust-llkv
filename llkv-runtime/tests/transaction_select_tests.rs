@@ -20,6 +20,7 @@ fn test_transaction_select() {
             ColumnSpec::new("name", arrow::datatypes::DataType::Utf8, true),
         ],
         if_not_exists: false,
+        or_replace: false,
         source: None,
     };
     session.create_table_plan(create_plan).unwrap();
@@ -92,6 +93,7 @@ fn test_transaction_select_with_aggregates() {
             ColumnSpec::new("price", arrow::datatypes::DataType::Int64, true),
         ],
         if_not_exists: false,
+        or_replace: false,
         source: None,
     };
     session.create_table_plan(create_plan).unwrap();

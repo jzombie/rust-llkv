@@ -19,7 +19,7 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
     ColumnOptionDef, DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName,
-    ObjectNamePart, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem,
+    ObjectNamePart, ObjectType, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, Set, SetExpr, Statement, TableFactor, TableObject,
     TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator, UpdateTableFromKind,
     Value, ValueWithSpan,
@@ -230,6 +230,27 @@ where
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: Delete");
                 self.handle_delete(delete)
             }
+            Statement::Drop {
+                object_type,
+                if_exists,
+                names,
+                cascade,
+                restrict,
+                purge,
+                temporary,
+                ..
+            } => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: Drop");
+                self.handle_drop(
+                    object_type,
+                    if_exists,
+                    names,
+                    cascade,
+                    restrict,
+                    purge,
+                    temporary,
+                )
+            }
             Statement::Set(set_stmt) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: Set");
                 self.handle_set(set_stmt)
@@ -320,6 +341,11 @@ where
         Ok(tables)
     }
 
+    fn is_table_marked_dropped(&self, table_name: &str) -> SqlResult<bool> {
+        let canonical = table_name.to_ascii_lowercase();
+        Ok(self.engine.context().is_table_marked_dropped(&canonical))
+    }
+
     fn handle_create_table(
         &self,
         mut stmt: sqlparser::ast::CreateTable,
@@ -340,11 +366,21 @@ where
 
         if let Some(query) = stmt.query.take() {
             validate_create_table_as(&stmt)?;
+            if let Some(result) = self.try_handle_range_ctas(
+                &display_name,
+                &canonical_name,
+                &query,
+                stmt.if_not_exists,
+                stmt.or_replace,
+            )? {
+                return Ok(result);
+            }
             return self.handle_create_table_as(
                 display_name,
                 canonical_name,
                 *query,
                 stmt.if_not_exists,
+                stmt.or_replace,
             );
         }
 
@@ -410,10 +446,181 @@ where
         let plan = CreateTablePlan {
             name: display_name,
             if_not_exists: stmt.if_not_exists,
+            or_replace: stmt.or_replace,
             columns,
             source: None,
         };
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
+    }
+
+    fn try_handle_range_ctas(
+        &self,
+        display_name: &str,
+        _canonical_name: &str,
+        query: &Query,
+        if_not_exists: bool,
+        or_replace: bool,
+    ) -> SqlResult<Option<StatementResult<P>>> {
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select,
+            _ => return Ok(None),
+        };
+        if select.from.len() != 1 {
+            return Ok(None);
+        }
+        let table_with_joins = &select.from[0];
+        if !table_with_joins.joins.is_empty() {
+            return Ok(None);
+        }
+        let (range_size, range_alias) = match &table_with_joins.relation {
+            TableFactor::Table {
+                name,
+                args: Some(args),
+                alias,
+                ..
+            } => {
+                let func_name = name.to_string().to_ascii_lowercase();
+                if func_name != "range" {
+                    return Ok(None);
+                }
+                if args.args.len() != 1 {
+                    return Err(Error::InvalidArgumentError(
+                        "range table function expects a single argument".into(),
+                    ));
+                }
+                let size_expr = &args.args[0];
+                let range_size = match size_expr {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value))) => {
+                        match &value.value {
+                            Value::Number(raw, _) => raw.parse::<i64>().map_err(|e| {
+                                Error::InvalidArgumentError(format!(
+                                    "invalid range size literal {}: {}",
+                                    raw, e
+                                ))
+                            })?,
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "unsupported range size value: {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "unsupported range argument".into(),
+                        ));
+                    }
+                };
+                (range_size, alias.as_ref().map(|a| a.name.value.clone()))
+            }
+            _ => return Ok(None),
+        };
+
+        if range_size < 0 {
+            return Err(Error::InvalidArgumentError(
+                "range size must be non-negative".into(),
+            ));
+        }
+
+        if select.projection.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TABLE AS SELECT requires at least one projected column".into(),
+            ));
+        }
+
+        let mut column_specs = Vec::with_capacity(select.projection.len());
+        let mut column_names = Vec::with_capacity(select.projection.len());
+        let mut row_template = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            match item {
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    let (value, data_type) = match expr {
+                        SqlExpr::Value(value_with_span) => match &value_with_span.value {
+                            Value::Number(raw, _) => {
+                                let parsed = raw.parse::<i64>().map_err(|e| {
+                                    Error::InvalidArgumentError(format!(
+                                        "invalid numeric literal {}: {}",
+                                        raw, e
+                                    ))
+                                })?;
+                                (
+                                    PlanValue::Integer(parsed),
+                                    arrow::datatypes::DataType::Int64,
+                                )
+                            }
+                            Value::SingleQuotedString(s) => (
+                                PlanValue::String(s.clone()),
+                                arrow::datatypes::DataType::Utf8,
+                            ),
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "unsupported SELECT expression in range CTAS: {:?}",
+                                    other
+                                )));
+                            }
+                        },
+                        SqlExpr::Identifier(ident) => {
+                            let ident_lower = ident.value.to_ascii_lowercase();
+                            if range_alias
+                                .as_ref()
+                                .map(|a| a.eq_ignore_ascii_case(&ident_lower))
+                                .unwrap_or(false)
+                                || ident_lower == "range"
+                            {
+                                return Err(Error::InvalidArgumentError(
+                                    "range() table function columns are not supported yet".into(),
+                                ));
+                            }
+                            return Err(Error::InvalidArgumentError(format!(
+                                "unsupported identifier '{}' in range CTAS projection",
+                                ident.value
+                            )));
+                        }
+                        other => {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "unsupported SELECT expression in range CTAS: {:?}",
+                                other
+                            )));
+                        }
+                    };
+                    let column_name = alias.value.clone();
+                    column_specs.push(ColumnSpec::new(column_name.clone(), data_type, true));
+                    column_names.push(column_name);
+                    row_template.push(value);
+                }
+                other => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported projection {:?} in range CTAS",
+                        other
+                    )));
+                }
+            }
+        }
+
+        let plan = CreateTablePlan {
+            name: display_name.to_string(),
+            if_not_exists,
+            or_replace,
+            columns: column_specs,
+            source: None,
+        };
+        let create_result = self.execute_plan_statement(PlanStatement::CreateTable(plan))?;
+
+        let row_count = range_size
+            .try_into()
+            .map_err(|_| Error::InvalidArgumentError("range size exceeds usize".into()))?;
+        if row_count > 0 {
+            let rows = vec![row_template; row_count];
+            let insert_plan = InsertPlan {
+                table: display_name.to_string(),
+                columns: column_names,
+                source: InsertSource::Rows(rows),
+            };
+            self.execute_plan_statement(PlanStatement::Insert(insert_plan))?;
+        }
+
+        Ok(Some(create_result))
     }
 
     fn handle_create_table_as(
@@ -422,6 +629,7 @@ where
         _canonical_name: String,
         query: Query,
         if_not_exists: bool,
+        or_replace: bool,
     ) -> SqlResult<StatementResult<P>> {
         let select_plan = self.build_select_plan(query)?;
 
@@ -434,6 +642,7 @@ where
         let plan = CreateTablePlan {
             name: display_name,
             if_not_exists,
+            or_replace,
             columns: Vec::new(),
             source: Some(CreateTableSource::Select {
                 plan: Box::new(select_plan),
@@ -449,6 +658,13 @@ where
             "DEBUG SQL handle_insert called for table={}",
             table_name_debug
         );
+        if !self.engine.session().has_active_transaction()
+            && self.is_table_marked_dropped(&table_name_debug)?
+        {
+            return Err(Error::InvalidArgumentError(
+                "another transaction has dropped this table".into(),
+            ));
+        }
         if stmt.replace_into || stmt.ignore || stmt.or.is_some() {
             return Err(Error::InvalidArgumentError(
                 "non-standard INSERT forms are not supported".into(),
@@ -576,7 +792,18 @@ where
             ));
         }
 
-        let (display_name, _) = extract_single_table(std::slice::from_ref(&table))?;
+        let (display_name, canonical_name) = extract_single_table(std::slice::from_ref(&table))?;
+
+        if !self.engine.session().has_active_transaction()
+            && self
+                .engine
+                .context()
+                .is_table_marked_dropped(&canonical_name)
+        {
+            return Err(Error::InvalidArgumentError(
+                "another transaction has dropped this table".into(),
+            ));
+        }
 
         let mut column_assignments = Vec::with_capacity(assignments.len());
         let mut seen: HashMap<String, ()> = HashMap::new();
@@ -661,7 +888,18 @@ where
         let from_tables = match from {
             FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
         };
-        let (display_name, _) = extract_single_table(&from_tables)?;
+        let (display_name, canonical_name) = extract_single_table(&from_tables)?;
+
+        if !self.engine.session().has_active_transaction()
+            && self
+                .engine
+                .context()
+                .is_table_marked_dropped(&canonical_name)
+        {
+            return Err(Error::InvalidArgumentError(
+                "another transaction has dropped this table".into(),
+            ));
+        }
 
         let filter = selection
             .map(|expr| translate_condition(&expr))
@@ -672,6 +910,38 @@ where
             filter,
         };
         self.execute_plan_statement(PlanStatement::Delete(plan))
+    }
+
+    fn handle_drop(
+        &self,
+        object_type: ObjectType,
+        if_exists: bool,
+        names: Vec<ObjectName>,
+        cascade: bool,
+        restrict: bool,
+        purge: bool,
+        temporary: bool,
+    ) -> SqlResult<StatementResult<P>> {
+        if cascade || restrict || purge || temporary {
+            return Err(Error::InvalidArgumentError(
+                "DROP TABLE cascade/restrict/purge/temporary options are not supported".into(),
+            ));
+        }
+
+        if object_type != ObjectType::Table {
+            return Err(Error::InvalidArgumentError(
+                "only DROP TABLE is supported".into(),
+            ));
+        }
+
+        let ctx = self.engine.context();
+        for name in names {
+            let table_name = Self::object_name_to_string(&name)?;
+            ctx.drop_table_immediate(&table_name, if_exists)
+                .map_err(|err| Self::map_table_error(&table_name, err))?;
+        }
+
+        Ok(StatementResult::NoOp)
     }
 
     fn handle_query(&self, query: Query) -> SqlResult<StatementResult<P>> {
@@ -1170,41 +1440,68 @@ where
                     ));
                 }
 
-                let variable_name = variable.to_string();
-                if !variable_name.eq_ignore_ascii_case("default_null_order") {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "unsupported SET variable: {variable_name}"
-                    )));
+                let variable_name_raw = variable.to_string();
+                let variable_name = variable_name_raw.to_ascii_lowercase();
+
+                match variable_name.as_str() {
+                    "default_null_order" => {
+                        if values.len() != 1 {
+                            return Err(Error::InvalidArgumentError(
+                                "SET default_null_order expects exactly one value".into(),
+                            ));
+                        }
+
+                        let value_expr = &values[0];
+                        let normalized = match value_expr {
+                            SqlExpr::Value(value_with_span) => value_with_span
+                                .value
+                                .clone()
+                                .into_string()
+                                .map(|s| s.to_ascii_lowercase()),
+                            SqlExpr::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
+                            _ => None,
+                        };
+
+                        if !matches!(normalized.as_deref(), Some("nulls_first" | "nulls_last")) {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "unsupported value for SET default_null_order: {value_expr:?}"
+                            )));
+                        }
+
+                        let use_nulls_first = matches!(normalized.as_deref(), Some("nulls_first"));
+                        self.default_nulls_first
+                            .store(use_nulls_first, AtomicOrdering::Relaxed);
+
+                        Ok(StatementResult::NoOp)
+                    }
+                    "immediate_transaction_mode" => {
+                        if values.len() != 1 {
+                            return Err(Error::InvalidArgumentError(
+                                "SET immediate_transaction_mode expects exactly one value".into(),
+                            ));
+                        }
+                        let normalized = values[0].to_string().to_ascii_lowercase();
+                        let enabled = match normalized.as_str() {
+                            "true" | "on" | "1" => true,
+                            "false" | "off" | "0" => false,
+                            _ => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "unsupported value for SET immediate_transaction_mode: {}",
+                                    values[0]
+                                )));
+                            }
+                        };
+                        if !enabled {
+                            tracing::warn!(
+                                "SET immediate_transaction_mode=false has no effect; continuing with auto mode"
+                            );
+                        }
+                        Ok(StatementResult::NoOp)
+                    }
+                    _ => Err(Error::InvalidArgumentError(format!(
+                        "unsupported SET variable: {variable_name_raw}"
+                    ))),
                 }
-
-                if values.len() != 1 {
-                    return Err(Error::InvalidArgumentError(
-                        "SET default_null_order expects exactly one value".into(),
-                    ));
-                }
-
-                let value_expr = &values[0];
-                let normalized = match value_expr {
-                    SqlExpr::Value(value_with_span) => value_with_span
-                        .value
-                        .clone()
-                        .into_string()
-                        .map(|s| s.to_ascii_lowercase()),
-                    SqlExpr::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
-                    _ => None,
-                };
-
-                if !matches!(normalized.as_deref(), Some("nulls_first" | "nulls_last")) {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "unsupported value for SET default_null_order: {value_expr:?}"
-                    )));
-                }
-
-                let use_nulls_first = matches!(normalized.as_deref(), Some("nulls_first"));
-                self.default_nulls_first
-                    .store(use_nulls_first, AtomicOrdering::Relaxed);
-
-                Ok(StatementResult::NoOp)
             }
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported SQL SET statement: {other:?}",
@@ -1264,9 +1561,9 @@ fn validate_create_table_common(stmt: &sqlparser::ast::CreateTable) -> SqlResult
             "CREATE TABLE LIKE/CLONE is not supported".into(),
         ));
     }
-    if stmt.or_replace {
+    if stmt.or_replace && stmt.if_not_exists {
         return Err(Error::InvalidArgumentError(
-            "CREATE OR REPLACE TABLE is not supported".into(),
+            "CREATE TABLE cannot combine OR REPLACE with IF NOT EXISTS".into(),
         ));
     }
     if !stmt.constraints.is_empty() {

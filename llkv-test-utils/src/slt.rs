@@ -19,7 +19,29 @@ where
         .map_err(|e| llkv_result::Error::Internal(format!("failed to read slt file: {}", e)))?;
     let raw_lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let (expanded_lines, mapping) = expand_loops_with_mapping(&raw_lines, 0)?;
+    let (expanded_lines, mapping) = {
+        let mut filtered_lines = Vec::with_capacity(expanded_lines.len());
+        let mut filtered_mapping = Vec::with_capacity(mapping.len());
+        for (line, orig_line) in expanded_lines.into_iter().zip(mapping.into_iter()) {
+            if line.trim_start().starts_with("load ") {
+                tracing::warn!(
+                    "Ignoring unsupported SLT directive `load`: {}:{} -> {}",
+                    path.display(),
+                    orig_line,
+                    line.trim()
+                );
+                continue;
+            }
+            filtered_lines.push(line);
+            filtered_mapping.push(orig_line);
+        }
+        (filtered_lines, filtered_mapping)
+    };
     let (normalized_lines, mapping) = normalize_inline_connections(expanded_lines, mapping);
+    let normalized_lines: Vec<String> = normalized_lines
+        .into_iter()
+        .map(|line| rewrite_rowid_alias(&line))
+        .collect();
 
     let expanded_text = normalized_lines.join("\n");
     let mut named = tempfile::NamedTempFile::new().map_err(|e| {
@@ -29,6 +51,15 @@ where
     named.write_all(expanded_text.as_bytes()).map_err(|e| {
         llkv_result::Error::Internal(format!("failed to write temp slt file: {}", e))
     })?;
+    if std::env::var("LLKV_DUMP_SLT").is_ok() {
+        let dump_path = std::path::Path::new("target/normalized.slt");
+        if let Some(parent) = dump_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(dump_path, &expanded_text) {
+            tracing::warn!("failed to dump normalized slt file: {}", e);
+        }
+    }
     let tmp = named.path().to_path_buf();
 
     let mut runner = Runner::new(|| async {
@@ -223,6 +254,60 @@ fn normalize_inline_connections(
     lines: Vec<String>,
     mapping: Vec<usize>,
 ) -> (Vec<String>, Vec<usize>) {
+    fn collect_statement_error_block(
+        lines: &[String],
+        mapping: &[usize],
+        start: usize,
+    ) -> (
+        Vec<(String, usize)>,
+        Option<String>,
+        Vec<(String, usize)>,
+        bool,
+        usize,
+    ) {
+        let mut sql_lines = Vec::new();
+        let mut message_lines = Vec::new();
+        let mut regex_pattern = None;
+        let mut idx = start;
+        let mut saw_separator = false;
+
+        while idx < lines.len() {
+            let line = &lines[idx];
+            let trimmed = line.trim_start();
+            if trimmed == "----" {
+                saw_separator = true;
+                idx += 1;
+                break;
+            }
+            sql_lines.push((line.clone(), mapping[idx]));
+            idx += 1;
+        }
+
+        if saw_separator {
+            while idx < lines.len() {
+                let line = &lines[idx];
+                let trimmed_full = line.trim();
+                if trimmed_full.is_empty() {
+                    idx += 1;
+                    break;
+                }
+                if let Some(pattern) = trimmed_full.strip_prefix("<REGEX>:") {
+                    regex_pattern = Some(pattern.to_string());
+                    idx += 1;
+                    while idx < lines.len() && lines[idx].trim().is_empty() {
+                        idx += 1;
+                    }
+                    message_lines.clear();
+                    break;
+                }
+                message_lines.push((line.clone(), mapping[idx]));
+                idx += 1;
+            }
+        }
+
+        (sql_lines, regex_pattern, message_lines, saw_separator, idx)
+    }
+
     fn is_connection_token(token: &str) -> bool {
         token
             .strip_prefix("con")
@@ -252,68 +337,34 @@ fn normalize_inline_connections(
 
                 let normalized = format!("{indent}{}", tokens.join(" "));
                 let normalized_trimmed = normalized.trim_start();
-
-                // Check if this is a statement error that needs special handling
                 if normalized_trimmed.starts_with("statement error") {
-                    // First, collect the SQL and check for regex pattern
-                    i += 1;
-                    let mut sql_lines = Vec::new();
-                    let mut regex_pattern = None;
+                    let (sql_lines, regex_pattern, message_lines, saw_separator, new_idx) =
+                        collect_statement_error_block(&lines, &mapping, i + 1);
+                    i = new_idx;
 
-                    while i < lines.len() {
-                        let next_line = &lines[i];
-                        let next_trimmed = next_line.trim_start();
-
-                        if next_trimmed == "----" {
-                            // Found the delimiter - check what follows
-                            i += 1;
-                            if i < lines.len() {
-                                let following = lines[i].trim();
-                                if !following.is_empty() && following.starts_with("<REGEX>:") {
-                                    regex_pattern = Some(
-                                        following.strip_prefix("<REGEX>:").unwrap().to_string(),
-                                    );
-                                    i += 1; // Move past pattern line
-                                    // Skip blank line if present
-                                    if i < lines.len() && lines[i].trim().is_empty() {
-                                        i += 1;
-                                    }
-                                }
-                            }
-                            break;
-                        } else {
-                            sql_lines.push(next_line.clone());
-                            i += 1;
-                        }
-                    }
-
-                    // Now output in correct format
                     if let Some(pattern) = regex_pattern {
-                        // Connection FIRST
                         out_lines.push(format!("{indent}connection {conn}"));
                         out_map.push(orig);
-                        // Then inline format: statement error pattern
                         out_lines.push(format!("{indent}statement error {}", pattern));
                         out_map.push(orig);
-                        // Then SQL
-                        for sql_line in sql_lines {
-                            out_lines.push(sql_line);
-                            out_map.push(orig);
-                        }
-                        // Add blank line to separate from next statement
-                        out_lines.push(String::new());
-                        out_map.push(orig);
                     } else {
-                        // No pattern - output as before
                         out_lines.push(normalized.clone());
                         out_map.push(orig);
-                        for sql_line in sql_lines {
-                            out_lines.push(sql_line);
-                            out_map.push(orig);
-                        }
-                        out_lines.push(String::new());
-                        out_map.push(orig);
                     }
+                    for (sql_line, sql_map) in sql_lines {
+                        out_lines.push(sql_line);
+                        out_map.push(sql_map);
+                    }
+                    if saw_separator && !message_lines.is_empty() {
+                        out_lines.push(format!("{indent}----"));
+                        out_map.push(orig);
+                        for (msg_line, msg_map) in message_lines {
+                            out_lines.push(msg_line);
+                            out_map.push(msg_map);
+                        }
+                    }
+                    out_lines.push(String::new());
+                    out_map.push(orig);
                     continue;
                 } else {
                     // Not a statement error, just output the normalized line
@@ -327,62 +378,32 @@ fn normalize_inline_connections(
 
         // Check if this is a statement error (without inline connection) followed by ----
         if trimmed.starts_with("statement error") {
-            // First, collect the SQL and check for regex pattern
-            i += 1;
-            let mut sql_lines = Vec::new();
-            let mut regex_pattern = None;
+            let indent = &line[..line.len() - trimmed.len()];
+            let (sql_lines, regex_pattern, message_lines, saw_separator, new_idx) =
+                collect_statement_error_block(&lines, &mapping, i + 1);
+            i = new_idx;
 
-            while i < lines.len() {
-                let next_line = &lines[i];
-                let next_trimmed = next_line.trim_start();
-
-                if next_trimmed == "----" {
-                    // Found the delimiter - check what follows
-                    i += 1;
-                    if i < lines.len() {
-                        let following = lines[i].trim();
-                        if !following.is_empty() && following.starts_with("<REGEX>:") {
-                            regex_pattern =
-                                Some(following.strip_prefix("<REGEX>:").unwrap().to_string());
-                            i += 1; // Move past pattern line
-                            // Skip blank line if present
-                            if i < lines.len() && lines[i].trim().is_empty() {
-                                i += 1;
-                            }
-                        }
-                    }
-                    break;
-                } else {
-                    // Part of the SQL statement
-                    sql_lines.push(next_line.clone());
-                    i += 1;
-                }
-            }
-
-            // Now output in correct format
             if let Some(pattern) = regex_pattern {
-                // Inline format: statement error pattern
-                out_lines.push(format!("statement error {}", pattern));
-                out_map.push(orig);
-                // Then SQL
-                for sql_line in sql_lines {
-                    out_lines.push(sql_line);
-                    out_map.push(orig);
-                }
-                // Add blank line to separate from next statement
-                out_lines.push(String::new());
+                out_lines.push(format!("{indent}statement error {}", pattern));
                 out_map.push(orig);
             } else {
-                // No pattern - output as before
                 out_lines.push(line.clone());
                 out_map.push(orig);
-                for sql_line in sql_lines {
-                    out_lines.push(sql_line);
-                    out_map.push(orig);
-                }
-                out_lines.push(String::new());
-                out_map.push(orig);
             }
+            for (sql_line, sql_map) in sql_lines {
+                out_lines.push(sql_line);
+                out_map.push(sql_map);
+            }
+            if saw_separator && !message_lines.is_empty() {
+                out_lines.push(format!("{indent}----"));
+                out_map.push(orig);
+                for (msg_line, msg_map) in message_lines {
+                    out_lines.push(msg_line);
+                    out_map.push(msg_map);
+                }
+            }
+            out_lines.push(String::new());
+            out_map.push(orig);
             continue;
         }
 
@@ -392,6 +413,58 @@ fn normalize_inline_connections(
     }
 
     (out_lines, out_map)
+}
+
+/// Convert DuckDB's `rowid` alias to the canonical row-id column the runtime exposes.
+/// The engine surfaces the synthetic row id as `"rowid"`, so we rewrite here to avoid
+/// special cases deeper in the stack.
+fn rewrite_rowid_alias(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double && i + 5 <= bytes.len() {
+            let slice = &bytes[i..i + 5];
+            if slice
+                .iter()
+                .zip(b"rowid".iter())
+                .all(|(a, b)| a.to_ascii_lowercase() == *b)
+            {
+                let prev_ok = i == 0
+                    || !out
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+                let next_ok = i + 5 == bytes.len() || {
+                    let next = bytes[i + 5] as char;
+                    !(next.is_ascii_alphanumeric() || next == '_')
+                };
+                if prev_ok && next_ok {
+                    out.push_str("rowid");
+                    i += 5;
+                    continue;
+                }
+            }
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
 }
 
 /// Map a temporary expanded-file error message back to the original file path

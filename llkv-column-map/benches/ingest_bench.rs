@@ -6,7 +6,7 @@
 //! - Varies the number of append batches (1, 4, 16, 64) to expose batching
 //!   overhead vs. throughput.
 //! - Uses the current `append(&RecordBatch)` API; every batch contains
-//!   `row_id` plus all data columns.
+//!   `rowid` plus all data columns.
 //!
 //! Run:
 //!   cargo bench --bench ingest_bench
