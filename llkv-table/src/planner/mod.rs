@@ -1,5 +1,6 @@
 pub mod plan_graph;
 
+use std::cell::RefCell;
 use std::cmp::{self, Ordering};
 use std::convert::TryFrom;
 use std::ops::Bound;
@@ -7,17 +8,17 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, Float64Array, Int64Array, OffsetSizeTrait, RecordBatch, StringArray,
-    new_null_array,
+    UInt64Array, new_null_array,
 };
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
 use llkv_column_map::ScanBuilder;
-use llkv_column_map::llkv_for_each_arrow_numeric;
 use llkv_column_map::parallel;
 use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::{llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric};
 use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
@@ -35,7 +36,7 @@ use crate::scalar_eval::{NumericArrayMap, NumericKernels};
 use crate::table::{
     ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
 };
-use crate::types::FieldId;
+use crate::types::{FieldId, ROW_ID_FIELD_ID};
 
 use self::plan_graph::{
     PlanEdge, PlanExpression, PlanField, PlanGraph, PlanGraphBuilder, PlanGraphError, PlanNode,
@@ -324,6 +325,84 @@ macro_rules! impl_affine_reject_sorted_run_with_rids {
     };
 }
 
+macro_rules! impl_row_id_ignore_chunk {
+    (
+        $_base:ident,
+        $chunk:ident,
+        $_chunk_with_rids:ident,
+        $_run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $chunk(&mut self, _values: &$array_ty) {}
+    };
+}
+
+macro_rules! impl_row_id_ignore_sorted_run {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $_chunk_with_rids:ident,
+        $run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $run(&mut self, _values: &$array_ty, _start: usize, _len: usize) {}
+    };
+}
+
+macro_rules! impl_row_id_collect_chunk_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $chunk_with_rids:ident,
+        $_run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $chunk_with_rids(&mut self, _values: &$array_ty, row_ids: &UInt64Array) {
+            self.extend_from_array(row_ids);
+        }
+    };
+}
+
+macro_rules! impl_row_id_collect_sorted_run_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $_chunk_with_rids:ident,
+        $_run:ident,
+        $run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $run_with_rids(
+            &mut self,
+            _values: &$array_ty,
+            row_ids: &UInt64Array,
+            start: usize,
+            len: usize,
+        ) {
+            self.extend_from_slice(row_ids, start, len);
+        }
+    };
+}
+
 #[derive(Clone)]
 struct ColumnProjectionInfo {
     logical_field_id: LogicalFieldId,
@@ -404,6 +483,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     table: &'a Table<P>,
+    row_id_cache: RefCell<Option<Vec<u64>>>,
 }
 
 pub(crate) struct TablePlanner<'a, P>
@@ -554,7 +634,70 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub(crate) fn new(table: &'a Table<P>) -> Self {
-        Self { table }
+        Self {
+            table,
+            row_id_cache: RefCell::new(None),
+        }
+    }
+
+    fn table_row_ids(&self) -> LlkvResult<Vec<u64>> {
+        if let Some(cached) = self.row_id_cache.borrow().as_ref() {
+            return Ok(cached.clone());
+        }
+        let computed = self.compute_table_row_ids()?;
+        *self.row_id_cache.borrow_mut() = Some(computed.clone());
+        Ok(computed)
+    }
+
+    fn compute_table_row_ids(&self) -> LlkvResult<Vec<u64>> {
+        let fields = self
+            .table
+            .store()
+            .user_field_ids_for_table(self.table.table_id());
+        if fields.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let expected = match self
+            .table
+            .store()
+            .total_rows_for_table(self.table.table_id())
+        {
+            Ok(count) => count,
+            Err(_) => 0,
+        };
+
+        let mut seen: FxHashSet<u64> = FxHashSet::default();
+        let mut collected: Vec<u64> = Vec::new();
+
+        for lfid in fields {
+            let mut collector = RowIdScanCollector::default();
+            ScanBuilder::new(self.table.store(), lfid)
+                .options(ScanOptions {
+                    with_row_ids: true,
+                    ..Default::default()
+                })
+                .run(&mut collector)?;
+            for rid in collector.into_inner() {
+                if seen.insert(rid) {
+                    collected.push(rid);
+                }
+            }
+            if expected > 0 && (seen.len() as u64) >= expected {
+                break;
+            }
+        }
+
+        collected.sort_unstable();
+        Ok(collected)
+    }
+
+    fn collect_row_ids_for_rowid_filter(&self, op: &Operator<'_>) -> LlkvResult<Vec<u64>> {
+        let all_row_ids = self.table_row_ids()?;
+        if all_row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        filter_row_ids_by_operator(&all_row_ids, op)
     }
 
     fn execute<'expr, F>(&self, plan: PlannedScan<'expr>, mut on_batch: F) -> LlkvResult<()>
@@ -1177,6 +1320,16 @@ where
     }
 
     fn collect_row_ids_for_filter(&self, filter: &Filter<'_, FieldId>) -> LlkvResult<Vec<u64>> {
+        if filter.field_id == ROW_ID_FIELD_ID {
+            let row_ids = self.collect_row_ids_for_rowid_filter(&filter.op)?;
+            tracing::debug!(
+                field = "rowid",
+                row_count = row_ids.len(),
+                "collect_row_ids_for_filter rowid"
+            );
+            return Ok(row_ids);
+        }
+
         let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), filter.field_id);
         let dtype = self.table.store().data_type(filter_lfid)?;
 
@@ -1267,27 +1420,38 @@ where
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
+        let mut numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
+        let has_row_id = numeric_fields.remove(&ROW_ID_FIELD_ID);
         let lfids: Vec<LogicalFieldId> = fields
             .iter()
-            .map(|fid| LogicalFieldId::for_user(self.table.table_id(), *fid))
+            .copied()
+            .filter(|fid| *fid != ROW_ID_FIELD_ID)
+            .map(|fid| LogicalFieldId::for_user(self.table.table_id(), fid))
             .collect();
         let mut result = Vec::new();
-        let numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
         let mut start = 0usize;
         while start < row_ids.len() {
             let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
             let window = &row_ids[start..end];
-            let gathered =
-                self.table
-                    .store()
-                    .gather_rows(&lfids, window, GatherNullPolicy::IncludeNulls)?;
-            if gathered.num_rows() == 0 {
-                start = end;
-                continue;
+            let mut numeric_arrays: NumericArrayMap = if lfids.is_empty() {
+                NumericKernels::prepare_numeric_arrays(&[], &[], &numeric_fields)?
+            } else {
+                let gathered = self.table.store().gather_rows(
+                    &lfids,
+                    window,
+                    GatherNullPolicy::IncludeNulls,
+                )?;
+                if gathered.num_rows() == 0 {
+                    start = end;
+                    continue;
+                }
+                let arrays = gathered.columns();
+                NumericKernels::prepare_numeric_arrays(&lfids, arrays, &numeric_fields)?
+            };
+            if has_row_id {
+                let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
+                numeric_arrays.insert(ROW_ID_FIELD_ID, Arc::new(Float64Array::from(rid_values)));
             }
-            let arrays = gathered.columns();
-            let numeric_arrays: NumericArrayMap =
-                NumericKernels::prepare_numeric_arrays(&lfids, arrays, &numeric_fields)?;
             for (offset, &row_id) in window.iter().enumerate() {
                 let left_val = NumericKernels::evaluate_value(left, offset, &numeric_arrays)?;
                 let right_val = NumericKernels::evaluate_value(right, offset, &numeric_arrays)?;
@@ -2196,10 +2360,163 @@ where
     llkv_for_each_arrow_numeric!(impl_affine_reject_sorted_run_with_rids);
 }
 
+#[derive(Default)]
+struct RowIdScanCollector {
+    row_ids: Vec<u64>,
+}
+
+impl RowIdScanCollector {
+    fn extend_from_array(&mut self, row_ids: &UInt64Array) {
+        for idx in 0..row_ids.len() {
+            self.row_ids.push(row_ids.value(idx));
+        }
+    }
+
+    fn extend_from_slice(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = (start + len).min(row_ids.len());
+        for idx in start..end {
+            self.row_ids.push(row_ids.value(idx));
+        }
+    }
+
+    fn into_inner(self) -> Vec<u64> {
+        self.row_ids
+    }
+}
+
+impl llkv_column_map::scan::PrimitiveVisitor for RowIdScanCollector {
+    llkv_for_each_arrow_numeric!(impl_row_id_ignore_chunk);
+    llkv_for_each_arrow_boolean!(impl_row_id_ignore_chunk);
+}
+
+impl llkv_column_map::scan::PrimitiveSortedVisitor for RowIdScanCollector {
+    llkv_for_each_arrow_numeric!(impl_row_id_ignore_sorted_run);
+    llkv_for_each_arrow_boolean!(impl_row_id_ignore_sorted_run);
+}
+
+impl llkv_column_map::scan::PrimitiveWithRowIdsVisitor for RowIdScanCollector {
+    llkv_for_each_arrow_numeric!(impl_row_id_collect_chunk_with_rids);
+    llkv_for_each_arrow_boolean!(impl_row_id_collect_chunk_with_rids);
+}
+
+impl llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor for RowIdScanCollector {
+    llkv_for_each_arrow_numeric!(impl_row_id_collect_sorted_run_with_rids);
+    llkv_for_each_arrow_boolean!(impl_row_id_collect_sorted_run_with_rids);
+
+    fn null_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
+        self.extend_from_slice(row_ids, start, len);
+    }
+}
+
 fn normalize_row_ids(mut row_ids: Vec<u64>) -> Vec<u64> {
     row_ids.sort_unstable();
     row_ids.dedup();
     row_ids
+}
+
+fn literal_to_u64(lit: &Literal) -> LlkvResult<u64> {
+    u64::from_literal(lit).map_err(|err| {
+        Error::InvalidArgumentError(format!("rowid literal cast failed: {err}").into())
+    })
+}
+
+fn lower_bound_index(row_ids: &[u64], bound: &Bound<Literal>) -> LlkvResult<usize> {
+    Ok(match bound {
+        Bound::Unbounded => 0,
+        Bound::Included(lit) => {
+            let value = literal_to_u64(lit)?;
+            row_ids.partition_point(|&rid| rid < value)
+        }
+        Bound::Excluded(lit) => {
+            let value = literal_to_u64(lit)?;
+            row_ids.partition_point(|&rid| rid <= value)
+        }
+    })
+}
+
+fn upper_bound_index(row_ids: &[u64], bound: &Bound<Literal>) -> LlkvResult<usize> {
+    Ok(match bound {
+        Bound::Unbounded => row_ids.len(),
+        Bound::Included(lit) => {
+            let value = literal_to_u64(lit)?;
+            row_ids.partition_point(|&rid| rid <= value)
+        }
+        Bound::Excluded(lit) => {
+            let value = literal_to_u64(lit)?;
+            row_ids.partition_point(|&rid| rid < value)
+        }
+    })
+}
+
+fn filter_row_ids_by_operator(row_ids: &[u64], op: &Operator<'_>) -> LlkvResult<Vec<u64>> {
+    use Operator::*;
+
+    match op {
+        Equals(lit) => {
+            let value = literal_to_u64(lit)?;
+            match row_ids.binary_search(&value) {
+                Ok(idx) => Ok(vec![row_ids[idx]]),
+                Err(_) => Ok(Vec::new()),
+            }
+        }
+        GreaterThan(lit) => {
+            let value = literal_to_u64(lit)?;
+            let idx = row_ids.partition_point(|&rid| rid <= value);
+            Ok(row_ids[idx..].to_vec())
+        }
+        GreaterThanOrEquals(lit) => {
+            let value = literal_to_u64(lit)?;
+            let idx = row_ids.partition_point(|&rid| rid < value);
+            Ok(row_ids[idx..].to_vec())
+        }
+        LessThan(lit) => {
+            let value = literal_to_u64(lit)?;
+            let idx = row_ids.partition_point(|&rid| rid < value);
+            Ok(row_ids[..idx].to_vec())
+        }
+        LessThanOrEquals(lit) => {
+            let value = literal_to_u64(lit)?;
+            let idx = row_ids.partition_point(|&rid| rid <= value);
+            Ok(row_ids[..idx].to_vec())
+        }
+        Range { lower, upper } => {
+            let start = lower_bound_index(row_ids, lower)?;
+            let end = upper_bound_index(row_ids, upper)?;
+            if start >= end {
+                Ok(Vec::new())
+            } else {
+                Ok(row_ids[start..end].to_vec())
+            }
+        }
+        In(literals) => {
+            if literals.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut targets = FxHashSet::default();
+            for lit in *literals {
+                targets.insert(literal_to_u64(lit)?);
+            }
+            if targets.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut matches = Vec::with_capacity(targets.len());
+            for &rid in row_ids {
+                if targets.remove(&rid) {
+                    matches.push(rid);
+                    if targets.is_empty() {
+                        break;
+                    }
+                }
+            }
+            Ok(matches)
+        }
+        StartsWith { .. } | EndsWith { .. } | Contains { .. } => Err(Error::InvalidArgumentError(
+            "rowid predicates do not support string pattern matching".into(),
+        )),
+    }
 }
 
 fn intersect_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {

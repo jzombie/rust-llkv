@@ -35,6 +35,14 @@ pub type TableId = u16;
 /// runtime identifiers can round-trip without truncation.
 pub type FieldId = u32;
 
+/// Canonical field identifier used for the table-level synthetic row id.
+///
+/// User columns are assigned field identifiers starting at `1`, so `0` is
+/// available as a sentinel for the row id shadow column. Downstream crates
+/// rely on this constant when mapping SQL `rowid` references into the storage
+/// layer.
+pub const ROW_ID_FIELD_ID: FieldId = 0;
+
 /// Row identifier for persisted data.
 ///
 /// `ColumnStore` emits row ids as Arrow `UInt64Array`s (see `core.rs`), so this

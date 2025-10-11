@@ -22,7 +22,7 @@ use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_result::Error;
 use llkv_storage::pager::{MemPager, Pager};
 use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
-use llkv_table::types::{FieldId, TableId};
+use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, TableId};
 use llkv_table::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -321,7 +321,7 @@ where
                         let (_, canonical) = canonical_table_name(table_name)?;
                         if dropped_tables.contains(&canonical) {
                             self.abort_transaction();
-                            return Err(Error::InvalidArgumentError(
+                            return Err(Error::TransactionContextError(
                                 "another transaction has dropped this table".into(),
                             ));
                         }
@@ -881,8 +881,36 @@ where
     where
         Q: Pager<Blob = EntryHandle> + Send + Sync + 'static,
     {
-        let source_tables = self.tables.read().unwrap();
-        let mut staging_tables = staging.tables.write().unwrap();
+        let base_store = ColumnStore::open(Arc::clone(&self.pager))?;
+        let base_catalog = SysCatalog::new(&base_store);
+
+        let staging_store = ColumnStore::open(Arc::clone(&staging.pager))?;
+        let staging_catalog = SysCatalog::new(&staging_store);
+
+        let mut next_table_id = match base_catalog.get_next_table_id()? {
+            Some(value) => value,
+            None => {
+                let seed = base_catalog.max_table_id()?.unwrap_or(CATALOG_TABLE_ID);
+                seed.checked_add(1).ok_or_else(|| {
+                    Error::InvalidArgumentError("exhausted available table ids".into())
+                })?
+            }
+        };
+        if next_table_id == CATALOG_TABLE_ID {
+            next_table_id = next_table_id.checked_add(1).ok_or_else(|| {
+                Error::InvalidArgumentError("exhausted available table ids".into())
+            })?;
+        }
+
+        staging_catalog.put_next_table_id(next_table_id)?;
+
+        let source_tables: Vec<(String, Arc<ExecutorTable<P>>)> = {
+            let guard = self.tables.read().unwrap();
+            guard
+                .iter()
+                .map(|(name, table)| (name.clone(), Arc::clone(table)))
+                .collect()
+        };
 
         for (table_name, source_table) in source_tables.iter() {
             tracing::trace!(
@@ -924,12 +952,41 @@ where
                 );
             }
 
-            staging_tables.insert(table_name.clone(), new_executor_table);
+            {
+                let mut staging_tables = staging.tables.write().unwrap();
+                staging_tables.insert(table_name.clone(), Arc::clone(&new_executor_table));
+            }
+
+            // Snapshot existing rows (with row_ids) into staging for transaction isolation.
+            // This provides full REPEATABLE READ isolation by copying data at BEGIN.
+            let batches = match self.get_batches_with_row_ids(table_name, None) {
+                Ok(batches) => batches,
+                Err(Error::NotFound) => {
+                    // Table exists but has no data yet (empty table)
+                    Vec::new()
+                }
+                Err(e) => return Err(e),
+            };
+            if !batches.is_empty() {
+                for batch in batches {
+                    new_executor_table.table.append(&batch)?;
+                }
+            }
+
+            let next_row_id = source_table.next_row_id.load(Ordering::SeqCst);
+            new_executor_table
+                .next_row_id
+                .store(next_row_id, Ordering::SeqCst);
+            let total_rows = source_table.total_rows.load(Ordering::SeqCst);
+            new_executor_table
+                .total_rows
+                .store(total_rows, Ordering::SeqCst);
         }
 
+        let staging_count = staging.tables.read().unwrap().len();
         tracing::trace!(
             "!!! COPY_TABLES_TO_STAGING: Copied {} tables to staging context",
-            staging_tables.len()
+            staging_count
         );
         Ok(())
     }
@@ -1961,6 +2018,11 @@ where
         let schema = table.schema.as_ref();
         let filter_expr = translate_predicate(filter, schema)?;
         let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        tracing::warn!(
+            table = %display_name,
+            rows = row_ids.len(),
+            "delete_filtered_rows collected row ids"
+        );
         self.apply_delete(table, display_name, row_ids)
     }
 
@@ -2011,6 +2073,12 @@ where
             ));
         }
 
+        tracing::warn!(
+            table = %display_name,
+            fields = logical_fields.len(),
+            rows = row_ids.len(),
+            "apply_delete invoking delete_rows"
+        );
         table.table.store().delete_rows(&logical_fields, &row_ids)?;
 
         let removed = row_ids.len();
@@ -2536,6 +2604,19 @@ fn full_table_scan_filter(field_id: FieldId) -> LlkvExpr<'static, FieldId> {
     })
 }
 
+fn resolve_field_id_from_schema(schema: &ExecutorSchema, name: &str) -> Result<FieldId> {
+    if name.eq_ignore_ascii_case(ROW_ID_COLUMN_NAME) {
+        return Ok(ROW_ID_FIELD_ID);
+    }
+
+    schema
+        .resolve(name)
+        .map(|column| column.field_id)
+        .ok_or_else(|| {
+            Error::InvalidArgumentError(format!("unknown column '{name}' in expression"))
+        })
+}
+
 fn translate_predicate(
     expr: LlkvExpr<'static, String>,
     schema: &ExecutorSchema,
@@ -2559,11 +2640,9 @@ fn translate_predicate(
             *inner, schema,
         )?))),
         LlkvExpr::Pred(Filter { field_id, op }) => {
-            let column = schema.resolve(&field_id).ok_or_else(|| {
-                Error::InvalidArgumentError(format!("unknown column '{field_id}' in filter"))
-            })?;
+            let resolved = resolve_field_id_from_schema(schema, &field_id)?;
             Ok(LlkvExpr::Pred(Filter {
-                field_id: column.field_id,
+                field_id: resolved,
                 op,
             }))
         }
@@ -2581,10 +2660,8 @@ fn translate_scalar(
 ) -> Result<ScalarExpr<FieldId>> {
     match expr {
         ScalarExpr::Column(name) => {
-            let column = schema.resolve(name).ok_or_else(|| {
-                Error::InvalidArgumentError(format!("unknown column '{name}' in expression"))
-            })?;
-            Ok(ScalarExpr::column(column.field_id))
+            let field_id = resolve_field_id_from_schema(schema, name)?;
+            Ok(ScalarExpr::column(field_id))
         }
         ScalarExpr::Literal(lit) => Ok(ScalarExpr::Literal(lit.clone())),
         ScalarExpr::Binary { left, op, right } => {
@@ -2602,34 +2679,34 @@ fn translate_scalar(
             let translated_agg = match agg {
                 AggregateCall::CountStar => AggregateCall::CountStar,
                 AggregateCall::Count(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
+                    let field_id = resolve_field_id_from_schema(schema, name).map_err(|_| {
                         Error::InvalidArgumentError(format!("unknown column '{name}' in aggregate"))
                     })?;
-                    AggregateCall::Count(column.field_id)
+                    AggregateCall::Count(field_id)
                 }
                 AggregateCall::Sum(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
+                    let field_id = resolve_field_id_from_schema(schema, name).map_err(|_| {
                         Error::InvalidArgumentError(format!("unknown column '{name}' in aggregate"))
                     })?;
-                    AggregateCall::Sum(column.field_id)
+                    AggregateCall::Sum(field_id)
                 }
                 AggregateCall::Min(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
+                    let field_id = resolve_field_id_from_schema(schema, name).map_err(|_| {
                         Error::InvalidArgumentError(format!("unknown column '{name}' in aggregate"))
                     })?;
-                    AggregateCall::Min(column.field_id)
+                    AggregateCall::Min(field_id)
                 }
                 AggregateCall::Max(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
+                    let field_id = resolve_field_id_from_schema(schema, name).map_err(|_| {
                         Error::InvalidArgumentError(format!("unknown column '{name}' in aggregate"))
                     })?;
-                    AggregateCall::Max(column.field_id)
+                    AggregateCall::Max(field_id)
                 }
                 AggregateCall::CountNulls(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
+                    let field_id = resolve_field_id_from_schema(schema, name).map_err(|_| {
                         Error::InvalidArgumentError(format!("unknown column '{name}' in aggregate"))
                     })?;
-                    AggregateCall::CountNulls(column.field_id)
+                    AggregateCall::CountNulls(field_id)
                 }
             };
             Ok(ScalarExpr::Aggregate(translated_agg))

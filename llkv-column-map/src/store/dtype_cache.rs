@@ -1,6 +1,6 @@
 use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{ColumnDescriptor, DescriptorIterator};
-use crate::types::LogicalFieldId;
+use crate::types::{LogicalFieldId, ROW_ID_FIELD_ID};
 use arrow::datatypes::DataType;
 use llkv_result::{Error, Result};
 use llkv_storage::{
@@ -73,6 +73,12 @@ where
     pub fn dtype_for_field(&self, field_id: LogicalFieldId) -> Result<DataType> {
         // Fast path: cached
         if let Some(dt) = self.cache.read().unwrap().get(&field_id).cloned() {
+            return Ok(dt);
+        }
+
+        if field_id.field_id() == ROW_ID_FIELD_ID {
+            let dt = DataType::UInt64;
+            self.cache.write().unwrap().insert(field_id, dt.clone());
             return Ok(dt);
         }
 

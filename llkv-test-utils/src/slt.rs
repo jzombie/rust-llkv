@@ -38,10 +38,13 @@ where
         (filtered_lines, filtered_mapping)
     };
     let (normalized_lines, mapping) = normalize_inline_connections(expanded_lines, mapping);
-    let normalized_lines: Vec<String> = normalized_lines
-        .into_iter()
-        .map(|line| rewrite_rowid_alias(&line))
-        .collect();
+    
+    // DuckDB-specific fix: add extra blank line after plain text error messages
+    let normalized_lines = if path.to_string_lossy().contains("/duckdb/") {
+        fix_error_message_spacing(normalized_lines)
+    } else {
+        normalized_lines
+    };
 
     let expanded_text = normalized_lines.join("\n");
     let mut named = tempfile::NamedTempFile::new().map_err(|e| {
@@ -415,57 +418,7 @@ fn normalize_inline_connections(
     (out_lines, out_map)
 }
 
-/// Convert DuckDB's `rowid` alias to the canonical row-id column the runtime exposes.
-/// The engine surfaces the synthetic row id as `"rowid"`, so we rewrite here to avoid
-/// special cases deeper in the stack.
-fn rewrite_rowid_alias(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let bytes = line.as_bytes();
-    let mut i = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    while i < bytes.len() {
-        let ch = bytes[i] as char;
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
-            out.push(ch);
-            i += 1;
-            continue;
-        }
-        if ch == '"' && !in_single {
-            in_double = !in_double;
-            out.push(ch);
-            i += 1;
-            continue;
-        }
-        if !in_single && !in_double && i + 5 <= bytes.len() {
-            let slice = &bytes[i..i + 5];
-            if slice
-                .iter()
-                .zip(b"rowid".iter())
-                .all(|(a, b)| a.to_ascii_lowercase() == *b)
-            {
-                let prev_ok = i == 0
-                    || !out
-                        .chars()
-                        .last()
-                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
-                let next_ok = i + 5 == bytes.len() || {
-                    let next = bytes[i + 5] as char;
-                    !(next.is_ascii_alphanumeric() || next == '_')
-                };
-                if prev_ok && next_ok {
-                    out.push_str("rowid");
-                    i += 5;
-                    continue;
-                }
-            }
-        }
-        out.push(ch);
-        i += 1;
-    }
-    out
-}
+
 
 /// Map a temporary expanded-file error message back to the original file path
 /// and line; returns (mapped_message, optional original line number).
@@ -514,4 +467,63 @@ pub fn map_temp_error_message(
         }
     }
     (out, None)
+}
+
+/// Fix error message spacing to prevent sqllogictest multiline interpretation.
+/// Adds an extra blank line after plain text error messages (not regex patterns).
+fn fix_error_message_spacing(lines: Vec<String>) -> Vec<String> {
+    let mut out_lines = Vec::with_capacity(lines.len() + 10);
+    
+    let mut i = 0;
+    while i < lines.len() {
+        let line = &lines[i];
+        let trimmed = line.trim();
+        
+        // Detect error block: statement error followed by SQL, ----, optional message, blank line
+        if trimmed.starts_with("statement error") && !trimmed.contains("<REGEX>:") {
+            // Output the statement error line
+            out_lines.push(line.clone());
+            i += 1;
+            
+            // Collect SQL lines until ----
+            while i < lines.len() && lines[i].trim() != "----" {
+                out_lines.push(lines[i].clone());
+                i += 1;
+            }
+            
+            // Output ----
+            if i < lines.len() && lines[i].trim() == "----" {
+                out_lines.push(lines[i].clone());
+                i += 1;
+                
+                // Check if there's an error message (non-empty line after ----)
+                if i < lines.len() && !lines[i].trim().is_empty() {
+                    // Output the error message
+                    out_lines.push(lines[i].clone());
+                    i += 1;
+                    
+                    // Output the existing blank line
+                    if i < lines.len() && lines[i].trim().is_empty() {
+                        out_lines.push(lines[i].clone());
+                        i += 1;
+                    }
+                    
+                    // Add EXTRA blank line to prevent multiline interpretation
+                    out_lines.push(String::new());
+                } else {
+                    // No message - just pass through the blank line
+                    if i < lines.len() {
+                        out_lines.push(lines[i].clone());
+                        i += 1;
+                    }
+                }
+            }
+        } else {
+            // Not an error block - pass through
+            out_lines.push(line.clone());
+            i += 1;
+        }
+    }
+    
+    out_lines
 }

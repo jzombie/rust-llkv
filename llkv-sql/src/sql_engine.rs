@@ -35,6 +35,8 @@ where
     default_nulls_first: AtomicBool,
 }
 
+const DROPPED_TABLE_TRANSACTION_ERR: &str = "another transaction has dropped this table";
+
 impl<P> Clone for SqlEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
@@ -661,8 +663,8 @@ where
         if !self.engine.session().has_active_transaction()
             && self.is_table_marked_dropped(&table_name_debug)?
         {
-            return Err(Error::InvalidArgumentError(
-                "another transaction has dropped this table".into(),
+            return Err(Error::TransactionContextError(
+                DROPPED_TABLE_TRANSACTION_ERR.into(),
             ));
         }
         if stmt.replace_into || stmt.ignore || stmt.or.is_some() {
@@ -800,8 +802,8 @@ where
                 .context()
                 .is_table_marked_dropped(&canonical_name)
         {
-            return Err(Error::InvalidArgumentError(
-                "another transaction has dropped this table".into(),
+            return Err(Error::TransactionContextError(
+                DROPPED_TABLE_TRANSACTION_ERR.into(),
             ));
         }
 
@@ -896,8 +898,8 @@ where
                 .context()
                 .is_table_marked_dropped(&canonical_name)
         {
-            return Err(Error::InvalidArgumentError(
-                "another transaction has dropped this table".into(),
+            return Err(Error::TransactionContextError(
+                DROPPED_TABLE_TRANSACTION_ERR.into(),
             ));
         }
 
