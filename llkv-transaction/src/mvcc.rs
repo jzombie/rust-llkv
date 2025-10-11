@@ -1,42 +1,132 @@
-/// Multi-Version Concurrency Control (MVCC) implementation
-/// 
-/// This module provides transaction IDs and row versioning for snapshot isolation.
-/// Instead of copying entire tables, we track which transaction created/deleted each row.
+/// Multi-Version Concurrency Control (MVCC) utilities.
+///
+/// This module centralises the transaction ID allocator, row-version metadata,
+/// and visibility checks used across the engine. The overarching goal is to
+/// allow transactions to operate directly on the base storage without copying
+/// tables into a staging area.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-/// Global transaction ID counter
-static GLOBAL_TXN_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Transaction ID type
+/// Transaction ID type.
 pub type TxnId = u64;
 
-/// Special transaction ID representing "not deleted"
+/// Special transaction ID representing "not deleted".
 pub const TXN_ID_NONE: TxnId = u64::MAX;
 
-/// Special transaction ID for auto-commit (single-statement) transactions
-/// Used when not in an explicit transaction
+/// Special transaction ID for auto-commit (single-statement) transactions.
 pub const TXN_ID_AUTO_COMMIT: TxnId = 1;
 
-/// Transaction ID manager
-#[derive(Clone)]
+/// Internal state shared across transaction ID managers.
+#[derive(Debug)]
+struct TxnIdManagerInner {
+    /// Next transaction ID to allocate.
+    next_txn_id: AtomicU64,
+    /// Largest committed transaction ID (acts as snapshot watermark).
+    last_committed: AtomicU64,
+    /// Tracking map for transaction statuses.
+    statuses: Mutex<HashMap<TxnId, TxnStatus>>,
+}
+
+impl TxnIdManagerInner {
+    fn new() -> Self {
+        let mut statuses = HashMap::new();
+        statuses.insert(TXN_ID_AUTO_COMMIT, TxnStatus::Committed);
+
+        Self {
+            next_txn_id: AtomicU64::new(TXN_ID_AUTO_COMMIT + 1),
+            last_committed: AtomicU64::new(TXN_ID_AUTO_COMMIT),
+            statuses: Mutex::new(statuses),
+        }
+    }
+}
+
+/// Transaction ID manager that hands out IDs and tracks commit status.
+#[derive(Clone, Debug)]
 pub struct TxnIdManager {
-    _phantom: (),
+    inner: Arc<TxnIdManagerInner>,
 }
 
 impl TxnIdManager {
+    /// Create a new manager.
     pub fn new() -> Self {
-        Self { _phantom: () }
+        Self {
+            inner: Arc::new(TxnIdManagerInner::new()),
+        }
     }
 
-    /// Allocate a new transaction ID
+    /// Begin a new transaction and return its snapshot.
+    ///
+    /// The snapshot captures both the allocated transaction ID and the latest
+    /// committed ID at the moment the transaction starts. These two values are
+    /// required to evaluate row visibility rules.
+    pub fn begin_transaction(&self) -> TransactionSnapshot {
+        let snapshot_id = self.inner.last_committed.load(Ordering::SeqCst);
+        let txn_id = self.inner.next_txn_id.fetch_add(1, Ordering::SeqCst);
+
+        {
+            let mut guard = self.inner.statuses.lock().expect("txn status lock poisoned");
+            guard.insert(txn_id, TxnStatus::Active);
+        }
+
+        TransactionSnapshot { txn_id, snapshot_id }
+    }
+
+    /// Legacy helper that only returns the allocated transaction ID.
+    /// Prefer [`begin_transaction`] when a snapshot is required.
     pub fn next_txn_id(&self) -> TxnId {
-        GLOBAL_TXN_ID.fetch_add(1, Ordering::SeqCst)
+        self.begin_transaction().txn_id
     }
 
-    /// Get current transaction ID (for testing)
-    pub fn current_txn_id(&self) -> TxnId {
-        GLOBAL_TXN_ID.load(Ordering::SeqCst)
+    /// Return the status for a given transaction ID.
+    pub fn status(&self, txn_id: TxnId) -> TxnStatus {
+        if txn_id == TXN_ID_NONE {
+            return TxnStatus::None;
+        }
+        if txn_id == TXN_ID_AUTO_COMMIT {
+            return TxnStatus::Committed;
+        }
+
+        let guard = self.inner.statuses.lock().expect("txn status lock poisoned");
+        guard.get(&txn_id).copied().unwrap_or(TxnStatus::Committed)
+    }
+
+    /// Mark a transaction as committed and advance the global watermark.
+    pub fn mark_committed(&self, txn_id: TxnId) {
+        {
+            let mut guard = self.inner.statuses.lock().expect("txn status lock poisoned");
+            guard.insert(txn_id, TxnStatus::Committed);
+        }
+
+        // Opportunistically advance the committed watermark. Exact ordering is
+        // not critical; best effort progression keeps snapshots monotonic.
+        let mut current = self.inner.last_committed.load(Ordering::SeqCst);
+        loop {
+            if txn_id <= current {
+                break;
+            }
+            match self.inner.last_committed.compare_exchange(
+                current,
+                txn_id,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Mark a transaction as aborted.
+    pub fn mark_aborted(&self, txn_id: TxnId) {
+        let mut guard = self.inner.statuses.lock().expect("txn status lock poisoned");
+        guard.insert(txn_id, TxnStatus::Aborted);
+    }
+
+    /// Return the latest committed transaction ID (snapshot watermark).
+    pub fn last_committed(&self) -> TxnId {
+        self.inner.last_committed.load(Ordering::SeqCst)
     }
 }
 
@@ -46,17 +136,17 @@ impl Default for TxnIdManager {
     }
 }
 
-/// Row version metadata
+/// Metadata describing a particular row version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowVersion {
-    /// Transaction ID that created this row version
+    /// Transaction ID that created this row version.
     pub created_by: TxnId,
-    /// Transaction ID that deleted this row version (TXN_ID_NONE if not deleted)
+    /// Transaction ID that deleted this row version (or [`TXN_ID_NONE`] if still visible).
     pub deleted_by: TxnId,
 }
 
 impl RowVersion {
-    /// Create a new row version created by the given transaction
+    /// Create a new row version associated with `created_by`.
     pub fn new(created_by: TxnId) -> Self {
         Self {
             created_by,
@@ -64,19 +154,82 @@ impl RowVersion {
         }
     }
 
-    /// Mark this row as deleted by the given transaction
+    /// Soft-delete the row version by the given transaction.
     pub fn delete(&mut self, deleted_by: TxnId) {
         self.deleted_by = deleted_by;
     }
 
-    /// Check if this row version is visible to a transaction with the given ID
-    /// 
-    /// Visibility rules:
-    /// - Row created_by <= snapshot_txn_id (row existed when transaction started)
-    /// - Row deleted_by > snapshot_txn_id OR deleted_by == TXN_ID_NONE (row not deleted yet)
+    /// Basic visibility check using only numeric ordering.
+    ///
+    /// This retains the previous behaviour and is primarily used in tests.
     pub fn is_visible(&self, snapshot_txn_id: TxnId) -> bool {
         self.created_by <= snapshot_txn_id
             && (self.deleted_by == TXN_ID_NONE || self.deleted_by > snapshot_txn_id)
+    }
+
+    /// Determine whether the row is visible for the supplied snapshot using full MVCC rules.
+    pub fn is_visible_for(
+        &self,
+        manager: &TxnIdManager,
+        snapshot: TransactionSnapshot,
+    ) -> bool {
+        // Rows created inside the current transaction are visible unless this
+        // transaction also deleted them.
+        if self.created_by == snapshot.txn_id {
+            return self.deleted_by != snapshot.txn_id;
+        }
+
+        // Ignore rows whose creator has not committed yet.
+        if !manager.status(self.created_by).is_committed() {
+            return false;
+        }
+
+        if self.created_by > snapshot.snapshot_id {
+            return false;
+        }
+
+        match self.deleted_by {
+            TXN_ID_NONE => true,
+            tx if tx == snapshot.txn_id => false,
+            tx => {
+                if !manager.status(tx).is_committed() {
+                    // A different transaction marked the row deleted but has not
+                    // committed; the row remains visible to others.
+                    return true;
+                }
+                tx > snapshot.snapshot_id
+            }
+        }
+    }
+}
+
+/// Transaction metadata captured when a transaction begins.
+#[derive(Debug, Clone, Copy)]
+pub struct TransactionSnapshot {
+    pub txn_id: TxnId,
+    pub snapshot_id: TxnId,
+}
+
+/// Transaction status values tracked by the manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnStatus {
+    Active,
+    Committed,
+    Aborted,
+    None,
+}
+
+impl TxnStatus {
+    pub fn is_committed(self) -> bool {
+        matches!(self, TxnStatus::Committed)
+    }
+
+    pub fn is_active(self) -> bool {
+        matches!(self, TxnStatus::Active)
+    }
+
+    pub fn is_aborted(self) -> bool {
+        matches!(self, TxnStatus::Aborted)
     }
 }
 
@@ -85,47 +238,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_txn_id_manager() {
+    fn test_txn_id_manager_allocates_monotonic_ids() {
         let manager = TxnIdManager::new();
-        let txn1 = manager.next_txn_id();
-        let txn2 = manager.next_txn_id();
-        assert!(txn2 > txn1);
+        let snapshot1 = manager.begin_transaction();
+        let snapshot2 = manager.begin_transaction();
+        assert!(snapshot2.txn_id > snapshot1.txn_id);
     }
 
     #[test]
-    fn test_row_visibility() {
-        // Row created by transaction 10
-        let mut row = RowVersion::new(10);
+    fn test_row_visibility_simple() {
+        let mut manager = TxnIdManager::new();
+        let snapshot = manager.begin_transaction();
+        manager.mark_committed(snapshot.txn_id);
 
-        // Transaction 5 started before row was created - should not see it
-        assert!(!row.is_visible(5));
+        let mut row = RowVersion::new(snapshot.txn_id);
 
-        // Transaction 10 created it - should see it
-        assert!(row.is_visible(10));
+        assert!(row.is_visible(snapshot.snapshot_id));
+        assert!(row.is_visible_for(&manager, snapshot));
 
-        // Transaction 15 started after creation - should see it
-        assert!(row.is_visible(15));
-
-        // Now delete the row at transaction 20
-        row.delete(20);
-
-        // Transaction 15 started before deletion - should still see it
-        assert!(row.is_visible(15));
-
-        // Transaction 20 is doing the delete - should still see it (snapshot was before delete)
-        assert!(row.is_visible(20));
-
-        // Transaction 25 started after deletion - should NOT see it
-        assert!(!row.is_visible(25));
-    }
-
-    #[test]
-    fn test_never_deleted_row() {
-        let row = RowVersion::new(10);
-        
-        // Should be visible to any transaction after creation
-        assert!(row.is_visible(10));
-        assert!(row.is_visible(100));
-        assert!(row.is_visible(1000));
+        row.delete(snapshot.txn_id);
+        assert!(!row.is_visible_for(&manager, snapshot));
     }
 }

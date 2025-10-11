@@ -17,6 +17,10 @@ pub enum Namespace {
     UserData = 0,
     /// Internal shadow column for row IDs.
     RowIdShadow = 1,
+    /// MVCC metadata: creator transaction id.
+    TxnCreatedBy = 2,
+    /// MVCC metadata: deleter transaction id.
+    TxnDeletedBy = 3,
     /// Highest sentinel reserved for future expansion.
     Reserved = 0xFFFF,
 }
@@ -88,5 +92,17 @@ impl LogicalFieldId {
     #[inline]
     pub fn for_user_table_0(field_id: FieldId) -> Self {
         Self::for_user(0, field_id)
+    }
+
+    /// Convenience constructor for MVCC created-by metadata columns.
+    #[inline]
+    pub fn for_mvcc_created_by(table_id: TableId) -> Self {
+        Self::from_parts(Namespace::TxnCreatedBy, table_id, u32::MAX)
+    }
+
+    /// Convenience constructor for MVCC deleted-by metadata columns.
+    #[inline]
+    pub fn for_mvcc_deleted_by(table_id: TableId) -> Self {
+        Self::from_parts(Namespace::TxnDeletedBy, table_id, u32::MAX - 1)
     }
 }

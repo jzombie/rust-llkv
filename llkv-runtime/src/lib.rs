@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::marker::PhantomData;
 use std::mem;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,19 +10,30 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
-    ArrayRef, Date32Builder, Float64Builder, Int64Builder, StringBuilder, UInt64Array,
+    Array,
+    ArrayRef,
+    Date32Builder,
+    Float64Builder,
+    Int64Builder,
+    StringBuilder,
+    UInt64Array,
     UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
-use llkv_column_map::store::{ROW_ID_COLUMN_NAME, CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME};
+use llkv_column_map::store::{
+    GatherNullPolicy,
+    ROW_ID_COLUMN_NAME,
+    CREATED_BY_COLUMN_NAME,
+    DELETED_BY_COLUMN_NAME,
+};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 // Literal is not used at top-level; keep it out to avoid unused import warnings.
 use llkv_result::Error;
 use llkv_storage::pager::{MemPager, Pager};
-use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
+use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, TableId};
 use llkv_table::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -48,7 +60,17 @@ pub use llkv_executor::{QueryExecutor, RowBatch, SelectExecution, TableProvider}
 
 // Import transaction structures from llkv-transaction for internal use.
 pub use llkv_transaction::TransactionKind;
-use llkv_transaction::{TransactionContext, TransactionManager, TransactionResult, TXN_ID_AUTO_COMMIT, TXN_ID_NONE};
+use llkv_transaction::{
+    TransactionContext,
+    TransactionManager,
+    TransactionResult,
+    TxnIdManager,
+    mvcc::TransactionSnapshot,
+    RowVersion,
+    TxnId,
+    TXN_ID_AUTO_COMMIT,
+    TXN_ID_NONE,
+};
 
 // Internal low-level transaction session type (from llkv-transaction)
 use llkv_transaction::TransactionSession;
@@ -218,16 +240,41 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
 // The SessionTransaction and TableDeltaState types are re-exported from there
 
 /// Wrapper for Context that implements TransactionContext
-pub struct ContextWrapper<P>(Arc<Context<P>>)
+pub struct ContextWrapper<P>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync;
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    ctx: Arc<Context<P>>,
+    snapshot: RwLock<TransactionSnapshot>,
+}
 
 impl<P> ContextWrapper<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     fn new(ctx: Arc<Context<P>>) -> Self {
-        Self(ctx)
+        let snapshot = ctx.default_snapshot();
+        Self {
+            ctx,
+            snapshot: RwLock::new(snapshot),
+        }
+    }
+
+    fn update_snapshot(&self, snapshot: TransactionSnapshot) {
+        let mut guard = self.snapshot.write().expect("snapshot lock poisoned");
+        *guard = snapshot;
+    }
+
+    fn current_snapshot(&self) -> TransactionSnapshot {
+        *self.snapshot.read().expect("snapshot lock poisoned")
+    }
+
+    fn context(&self) -> &Arc<Context<P>> {
+        &self.ctx
+    }
+
+    fn ctx(&self) -> &Context<P> {
+        &self.ctx
     }
 }
 
@@ -261,7 +308,7 @@ where
         // but create new Table instances that use the staging pager
         self.inner
             .context()
-            .0
+            .ctx()
             .copy_tables_to_staging(&staging_ctx)?;
 
         let staging_wrapper = Arc::new(ContextWrapper::new(staging_ctx));
@@ -304,7 +351,7 @@ where
             let dropped_tables = self
                 .inner
                 .context()
-                .0
+                .ctx()
                 .dropped_tables
                 .read()
                 .unwrap()
@@ -360,6 +407,12 @@ where
             }
         }
 
+        // Reset the base context snapshot to the default auto-commit view now that
+        // the transaction has been replayed onto the base tables.
+        let base_ctx = self.inner.context();
+        let default_snapshot = base_ctx.ctx().default_snapshot();
+        TransactionContext::set_snapshot(&**base_ctx, default_snapshot);
+
         // Return a StatementResult with the correct kind (Commit or Rollback)
         Ok(StatementResult::Transaction { kind })
     }
@@ -367,6 +420,9 @@ where
     /// Rollback the current transaction, discarding all changes.
     pub fn rollback_transaction(&self) -> Result<StatementResult<P>> {
         self.inner.rollback_transaction()?;
+        let base_ctx = self.inner.context();
+        let default_snapshot = base_ctx.ctx().default_snapshot();
+        TransactionContext::set_snapshot(&**base_ctx, default_snapshot);
         Ok(StatementResult::Transaction {
             kind: TransactionKind::Rollback,
         })
@@ -501,7 +557,10 @@ where
             }
         } else {
             // Call via TransactionContext trait
-            TransactionContext::insert(&**self.inner.context(), plan)?;
+            let context = self.inner.context();
+            let default_snapshot = context.ctx().default_snapshot();
+            TransactionContext::set_snapshot(&**context, default_snapshot);
+            TransactionContext::insert(&**context, plan)?;
             Ok(StatementResult::Insert {
                 rows_inserted,
                 table_name,
@@ -560,8 +619,11 @@ where
             }
         } else {
             // Call via TransactionContext trait
+            let context = self.inner.context();
+            let default_snapshot = context.ctx().default_snapshot();
+            TransactionContext::set_snapshot(&**context, default_snapshot);
             let table_name = plan.table.clone();
-            let execution = TransactionContext::execute_select(&**self.inner.context(), plan)?;
+            let execution = TransactionContext::execute_select(&**context, plan)?;
             let schema = execution.schema();
             Ok(StatementResult::Select {
                 execution,
@@ -608,8 +670,11 @@ where
             }
         } else {
             // Call via TransactionContext trait
+            let context = self.inner.context();
+            let default_snapshot = context.ctx().default_snapshot();
+            TransactionContext::set_snapshot(&**context, default_snapshot);
             let table_name = plan.table.clone();
-            let result = TransactionContext::update(&**self.inner.context(), plan)?;
+            let result = TransactionContext::update(&**context, plan)?;
             match result {
                 TransactionResult::Update {
                     rows_matched: _,
@@ -644,8 +709,11 @@ where
             }
         } else {
             // Call via TransactionContext trait
+            let context = self.inner.context();
+            let default_snapshot = context.ctx().default_snapshot();
+            TransactionContext::set_snapshot(&**context, default_snapshot);
             let table_name = plan.table.clone();
-            let result = TransactionContext::delete(&**self.inner.context(), plan)?;
+            let result = TransactionContext::delete(&**context, plan)?;
             match result {
                 TransactionResult::Delete { rows_deleted } => Ok(StatementResult::Delete {
                     rows_deleted,
@@ -734,6 +802,7 @@ where
     dropped_tables: RwLock<HashSet<String>>,
     // Transaction manager for session-based transactions
     transaction_manager: TransactionManager<ContextWrapper<P>, ContextWrapper<MemPager>>,
+    txn_manager: Arc<TxnIdManager>,
 }
 
 impl<P> Context<P>
@@ -742,11 +811,27 @@ where
 {
     pub fn new(pager: Arc<P>) -> Self {
         tracing::trace!("Context::new called, pager={:p}", &*pager);
+        let transaction_manager = TransactionManager::new();
+        let txn_manager = transaction_manager.txn_manager();
         Self {
             pager,
             tables: RwLock::new(HashMap::new()),
             dropped_tables: RwLock::new(HashSet::new()),
-            transaction_manager: TransactionManager::new(),
+            transaction_manager,
+            txn_manager,
+        }
+    }
+
+    /// Return the transaction ID manager shared with sessions.
+    pub fn txn_manager(&self) -> Arc<TxnIdManager> {
+        Arc::clone(&self.txn_manager)
+    }
+
+    /// Construct the default snapshot for auto-commit operations.
+    pub fn default_snapshot(&self) -> TransactionSnapshot {
+        TransactionSnapshot {
+            txn_id: TXN_ID_AUTO_COMMIT,
+            snapshot_id: self.txn_manager.last_committed(),
         }
     }
 
@@ -868,6 +953,21 @@ where
     pub fn table_names(self: &Arc<Self>) -> Vec<String> {
         let tables = self.tables.read().unwrap();
         tables.keys().cloned().collect()
+    }
+
+    fn filter_visible_row_ids(
+        &self,
+        table: &ExecutorTable<P>,
+        row_ids: Vec<u64>,
+        snapshot: TransactionSnapshot,
+    ) -> Result<Vec<u64>> {
+        filter_row_ids_for_snapshot(
+            table.table.store(),
+            table.table.table_id(),
+            row_ids,
+            &self.txn_manager,
+            snapshot,
+        )
     }
 
     pub fn create_table_builder(&self, name: &str) -> CreateTableBuilder<'_, P> {
@@ -1046,6 +1146,17 @@ where
     }
 
     pub fn insert(&self, plan: InsertPlan) -> Result<StatementResult<P>> {
+        let snapshot = self.txn_manager.begin_transaction();
+        let result = self.insert_with_snapshot(plan, snapshot)?;
+        self.txn_manager.mark_committed(snapshot.txn_id);
+        Ok(result)
+    }
+
+    pub fn insert_with_snapshot(
+        &self,
+        plan: InsertPlan,
+        snapshot: TransactionSnapshot,
+    ) -> Result<StatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
 
@@ -1071,10 +1182,10 @@ where
 
         let result = match plan.source {
             InsertSource::Rows(rows) => {
-                self.insert_rows(table.as_ref(), display_name.clone(), rows, plan.columns)
+                self.insert_rows(table.as_ref(), display_name.clone(), rows, plan.columns, snapshot.txn_id)
             }
             InsertSource::Batches(batches) => {
-                self.insert_batches(table.as_ref(), display_name.clone(), batches, plan.columns)
+                self.insert_batches(table.as_ref(), display_name.clone(), batches, plan.columns, snapshot.txn_id)
             }
             InsertSource::Select { .. } => Err(Error::Internal(
                 "InsertSource::Select should be materialized before reaching Context::insert"
@@ -1102,6 +1213,15 @@ where
         table_name: &str,
         filter: Option<LlkvExpr<'static, String>>,
     ) -> Result<Vec<RecordBatch>> {
+        self.get_batches_with_row_ids_with_snapshot(table_name, filter, self.default_snapshot())
+    }
+
+    pub fn get_batches_with_row_ids_with_snapshot(
+        &self,
+        table_name: &str,
+        filter: Option<LlkvExpr<'static, String>>,
+        snapshot: TransactionSnapshot,
+    ) -> Result<Vec<RecordBatch>> {
         let (_, canonical_name) = canonical_table_name(table_name)?;
         let table = self.lookup_table(&canonical_name)?;
 
@@ -1123,70 +1243,41 @@ where
             return Ok(Vec::new());
         }
 
-        // Scan to get the column data
-        let mut batches_without_rowid = Vec::new();
-        let table_id = table.table.table_id();
-        let projections: Vec<ScanProjection> = table
-            .schema
-            .columns
-            .iter()
-            .map(|col| {
-                let logical_field_id = LogicalFieldId::for_user(table_id, col.field_id);
-                ScanProjection::column((logical_field_id, col.name.clone()))
-            })
-            .collect();
-
-        let options = ScanStreamOptions {
-            include_nulls: true,
-            order: None,
-        };
-
-        table
-            .table
-            .scan_stream_with_exprs(&projections, &filter_expr, options, |batch| {
-                batches_without_rowid.push(batch.clone());
-            })?;
-
-        // Now add row_id column to each batch
-        let mut batches_with_rowid = Vec::new();
-        let mut row_id_offset = 0usize;
-
-        for batch in batches_without_rowid {
-            let batch_size = batch.num_rows();
-            let batch_row_ids: Vec<u64> =
-                row_ids[row_id_offset..row_id_offset + batch_size].to_vec();
-            row_id_offset += batch_size;
-
-            // Create a new batch with row_id as the first column
-            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns() + 1);
-            arrays.push(Arc::new(UInt64Array::from(batch_row_ids)));
-            for i in 0..batch.num_columns() {
-                arrays.push(batch.column(i).clone());
-            }
-
-            let mut fields: Vec<Field> = Vec::with_capacity(batch.schema().fields().len() + 1);
-            fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
-
-            // Reconstruct fields with proper field_id metadata
-            for (idx, _field) in batch.schema().fields().iter().enumerate() {
-                let col = &table.schema.columns[idx];
-                let mut metadata = HashMap::new();
-                metadata.insert(
-                    llkv_table::constants::FIELD_ID_META_KEY.to_string(),
-                    col.field_id.to_string(),
-                );
-                let field_with_metadata =
-                    Field::new(&col.name, col.data_type.clone(), col.nullable)
-                        .with_metadata(metadata);
-                fields.push(field_with_metadata);
-            }
-
-            let schema_with_rowid = Arc::new(Schema::new(fields));
-            let batch_with_rowid = RecordBatch::try_new(schema_with_rowid, arrays)?;
-            batches_with_rowid.push(batch_with_rowid);
+        let visible_row_ids = self.filter_visible_row_ids(table.as_ref(), row_ids, snapshot)?;
+        if visible_row_ids.is_empty() {
+            return Ok(Vec::new());
         }
 
-        Ok(batches_with_rowid)
+        // Scan to get the column data
+        let table_id = table.table.table_id();
+
+        let mut fields: Vec<Field> = Vec::with_capacity(table.schema.columns.len() + 1);
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(table.schema.columns.len() + 1);
+
+        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+        arrays.push(Arc::new(UInt64Array::from(visible_row_ids.clone())));
+
+        for column in &table.schema.columns {
+            let logical_field_id = LogicalFieldId::for_user(table_id, column.field_id);
+            let gathered = table.table.store().gather_rows(
+                &[logical_field_id],
+                &visible_row_ids,
+                GatherNullPolicy::IncludeNulls,
+            )?;
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+                column.field_id.to_string(),
+            );
+            fields.push(
+                Field::new(&column.name, column.data_type.clone(), column.nullable)
+                    .with_metadata(metadata),
+            );
+            arrays.push(gathered.column(0).clone());
+        }
+
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
+        Ok(vec![batch])
     }
 
     /// Append batches directly to a table, preserving row_ids from the batches.
@@ -1221,22 +1312,51 @@ where
     }
 
     pub fn update(&self, plan: UpdatePlan) -> Result<StatementResult<P>> {
+        let snapshot = self.txn_manager.begin_transaction();
+        let result = self.update_with_snapshot(plan, snapshot)?;
+        self.txn_manager.mark_committed(snapshot.txn_id);
+        Ok(result)
+    }
+
+    pub fn update_with_snapshot(
+        &self,
+        plan: UpdatePlan,
+        snapshot: TransactionSnapshot,
+    ) -> Result<StatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
         match plan.filter {
             Some(filter) => {
-                self.update_filtered_rows(table.as_ref(), display_name, plan.assignments, filter)
+                self.update_filtered_rows(
+                    table.as_ref(),
+                    display_name,
+                    plan.assignments,
+                    filter,
+                    snapshot,
+                )
             }
-            None => self.update_all_rows(table.as_ref(), display_name, plan.assignments),
+            None => self.update_all_rows(table.as_ref(), display_name, plan.assignments, snapshot),
         }
     }
 
     pub fn delete(&self, plan: DeletePlan) -> Result<StatementResult<P>> {
+        let snapshot = self.txn_manager.begin_transaction();
+        let result = self.delete_with_snapshot(plan, snapshot)?;
+        self.txn_manager.mark_committed(snapshot.txn_id);
+        Ok(result)
+    }
+
+    pub fn delete_with_snapshot(
+        &self,
+        plan: DeletePlan,
+        snapshot: TransactionSnapshot,
+    ) -> Result<StatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
         match plan.filter {
-            Some(filter) => self.delete_filtered_rows(table.as_ref(), display_name, filter),
-            None => self.delete_all_rows(table.as_ref(), display_name),
+            Some(filter) =>
+                self.delete_filtered_rows(table.as_ref(), display_name, filter, snapshot, snapshot.txn_id),
+            None => self.delete_all_rows(table.as_ref(), display_name, snapshot, snapshot.txn_id),
         }
     }
 
@@ -1259,6 +1379,28 @@ where
         });
         let executor = QueryExecutor::new(provider);
         executor.execute_select(canonical_plan)
+    }
+
+    pub fn execute_select_with_snapshot(
+        self: &Arc<Self>,
+        plan: SelectPlan,
+        snapshot: TransactionSnapshot,
+    ) -> Result<SelectExecution<P>> {
+        let (_display_name, canonical_name) = canonical_table_name(&plan.table)?;
+        self.lookup_table(&canonical_name)?;
+
+        let mut canonical_plan = plan.clone();
+        canonical_plan.table = canonical_name;
+
+        let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
+            context: Arc::clone(self),
+        });
+        let executor = QueryExecutor::new(provider);
+        let row_filter: Arc<dyn RowIdFilter<P>> = Arc::new(MvccRowIdFilter::new(
+            Arc::clone(&self.txn_manager),
+            snapshot,
+        ));
+        executor.execute_select_with_filter(canonical_plan, Some(row_filter))
     }
 
     fn create_table_from_columns(
@@ -1641,6 +1783,7 @@ where
         display_name: String,
         rows: Vec<Vec<PlanValue>>,
         columns: Vec<String>,
+        txn_id: TxnId,
     ) -> Result<StatementResult<P>> {
         if rows.is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -1702,17 +1845,22 @@ where
         let mut created_by_builder = UInt64Builder::with_capacity(row_count);
         let mut deleted_by_builder = UInt64Builder::with_capacity(row_count);
         for _ in 0..row_count {
-            created_by_builder.append_value(TXN_ID_AUTO_COMMIT); // TODO: Use actual txn_id
+            created_by_builder.append_value(txn_id);
             deleted_by_builder.append_value(TXN_ID_NONE);
         }
 
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_values.len() + 3); // +3 for row_id, created_by, deleted_by
-        arrays.push(Arc::new(row_id_builder.finish()));
-        arrays.push(Arc::new(created_by_builder.finish()));
-        arrays.push(Arc::new(deleted_by_builder.finish()));
+        let row_id_array: ArrayRef = Arc::new(row_id_builder.finish());
+        let created_by_array: ArrayRef = Arc::new(created_by_builder.finish());
+        let deleted_by_array: ArrayRef = Arc::new(deleted_by_builder.finish());
 
-        let mut fields: Vec<Field> = Vec::with_capacity(column_values.len() + 3);
-        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+        arrays.push(Arc::clone(&row_id_array));
+        arrays.push(Arc::clone(&created_by_array));
+        arrays.push(Arc::clone(&deleted_by_array));
+
+    let mut fields: Vec<Field> = Vec::with_capacity(column_values.len() + 3);
+    fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+
         fields.push(Field::new(CREATED_BY_COLUMN_NAME, DataType::UInt64, false));
         fields.push(Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false));
 
@@ -1750,6 +1898,7 @@ where
         display_name: String,
         batches: Vec<RecordBatch>,
         columns: Vec<String>,
+        txn_id: TxnId,
     ) -> Result<StatementResult<P>> {
         if batches.is_empty() {
             return Ok(StatementResult::Insert {
@@ -1787,7 +1936,7 @@ where
                 rows.push(row);
             }
 
-            match self.insert_rows(table, display_name.clone(), rows, columns.clone())? {
+            match self.insert_rows(table, display_name.clone(), rows, columns.clone(), txn_id)? {
                 StatementResult::Insert { rows_inserted, .. } => {
                     total_rows_inserted += rows_inserted;
                 }
@@ -1807,6 +1956,7 @@ where
         display_name: String,
         assignments: Vec<ColumnAssignment>,
         filter: LlkvExpr<'static, String>,
+        snapshot: TransactionSnapshot,
     ) -> Result<StatementResult<P>> {
         if assignments.is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -1857,7 +2007,7 @@ where
         }
 
         let (row_ids, mut expr_values) =
-            self.collect_update_rows(table, &filter_expr, &scalar_exprs)?;
+            self.collect_update_rows(table, &filter_expr, &scalar_exprs, snapshot)?;
 
         if row_ids.is_empty() {
             return Ok(StatementResult::Update {
@@ -1867,13 +2017,49 @@ where
         }
 
         let row_count = row_ids.len();
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(prepared.len() + 1);
-        arrays.push(Arc::new(UInt64Array::from(row_ids.clone())));
+        let table_id = table.table.table_id();
+        let logical_fields: Vec<LogicalFieldId> = table
+            .schema
+            .columns
+            .iter()
+            .map(|column| LogicalFieldId::for_user(table_id, column.field_id))
+            .collect();
 
-        let mut fields: Vec<Field> = Vec::with_capacity(prepared.len() + 1);
-        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+        let gathered = table.table.store().gather_rows(
+            &logical_fields,
+            &row_ids,
+            GatherNullPolicy::IncludeNulls,
+        )?;
+
+        let mut new_rows: Vec<Vec<PlanValue>> =
+            vec![Vec::with_capacity(table.schema.columns.len()); row_count];
+        for (col_idx, _column) in table.schema.columns.iter().enumerate() {
+            let array = gathered.column(col_idx);
+            for row_idx in 0..row_count {
+                let value = llkv_plan::plan_value_from_array(array, row_idx)?;
+                new_rows[row_idx].push(value);
+            }
+        }
+
+        let column_positions: HashMap<FieldId, usize> = table
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| (column.field_id, idx))
+            .collect();
 
         for (column, value) in prepared {
+            let column_index = column_positions
+                .get(&column.field_id)
+                .copied()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "column '{}' missing in table schema during UPDATE",
+                        column.name
+                    ))
+                })?;
+
             let values = match value {
                 PreparedValue::Literal(lit) => vec![lit; row_count],
                 PreparedValue::Expression { expr_index } => {
@@ -1890,21 +2076,30 @@ where
                     mem::take(column_values)
                 }
             };
-            let array = build_array_for_column(&column.data_type, &values)?;
-            arrays.push(array);
 
-            let mut metadata = HashMap::new();
-            metadata.insert(
-                llkv_table::constants::FIELD_ID_META_KEY.to_string(),
-                column.field_id.to_string(),
-            );
-            let field = Field::new(&column.name, column.data_type.clone(), column.nullable)
-                .with_metadata(metadata);
-            fields.push(field);
+            for (row_idx, new_value) in values.into_iter().enumerate() {
+                if let Some(row) = new_rows.get_mut(row_idx) {
+                    row[column_index] = new_value;
+                }
+            }
         }
 
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
-        table.table.append(&batch)?;
+        let _ = self.apply_delete(table, display_name.clone(), row_ids.clone(), snapshot.txn_id)?;
+
+        let column_names: Vec<String> = table
+            .schema
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+
+        let _ = self.insert_rows(
+            table,
+            display_name.clone(),
+            new_rows,
+            column_names,
+            snapshot.txn_id,
+        )?;
 
         Ok(StatementResult::Update {
             table_name: display_name,
@@ -1917,6 +2112,7 @@ where
         table: &ExecutorTable<P>,
         display_name: String,
         assignments: Vec<ColumnAssignment>,
+        snapshot: TransactionSnapshot,
     ) -> Result<StatementResult<P>> {
         if assignments.is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -1986,7 +2182,7 @@ where
 
         let filter_expr = full_table_scan_filter(anchor_field);
         let (row_ids, mut expr_values) =
-            self.collect_update_rows(table, &filter_expr, &scalar_exprs)?;
+            self.collect_update_rows(table, &filter_expr, &scalar_exprs, snapshot)?;
 
         if row_ids.is_empty() {
             return Ok(StatementResult::Update {
@@ -1996,13 +2192,49 @@ where
         }
 
         let row_count = row_ids.len();
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(prepared.len() + 1);
-        arrays.push(Arc::new(UInt64Array::from(row_ids.clone())));
+        let table_id = table.table.table_id();
+        let logical_fields: Vec<LogicalFieldId> = table
+            .schema
+            .columns
+            .iter()
+            .map(|column| LogicalFieldId::for_user(table_id, column.field_id))
+            .collect();
 
-        let mut fields: Vec<Field> = Vec::with_capacity(prepared.len() + 1);
-        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+        let gathered = table.table.store().gather_rows(
+            &logical_fields,
+            &row_ids,
+            GatherNullPolicy::IncludeNulls,
+        )?;
+
+        let mut new_rows: Vec<Vec<PlanValue>> =
+            vec![Vec::with_capacity(table.schema.columns.len()); row_count];
+        for (col_idx, _column) in table.schema.columns.iter().enumerate() {
+            let array = gathered.column(col_idx);
+            for row_idx in 0..row_count {
+                let value = llkv_plan::plan_value_from_array(array, row_idx)?;
+                new_rows[row_idx].push(value);
+            }
+        }
+
+        let column_positions: HashMap<FieldId, usize> = table
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| (column.field_id, idx))
+            .collect();
 
         for (column, value) in prepared {
+            let column_index = column_positions
+                .get(&column.field_id)
+                .copied()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "column '{}' missing in table schema during UPDATE",
+                        column.name
+                    ))
+                })?;
+
             let values = match value {
                 PreparedValue::Literal(lit) => vec![lit; row_count],
                 PreparedValue::Expression { expr_index } => {
@@ -2019,21 +2251,30 @@ where
                     mem::take(column_values)
                 }
             };
-            let array = build_array_for_column(&column.data_type, &values)?;
-            arrays.push(array);
 
-            let mut metadata = HashMap::new();
-            metadata.insert(
-                llkv_table::constants::FIELD_ID_META_KEY.to_string(),
-                column.field_id.to_string(),
-            );
-            let field = Field::new(&column.name, column.data_type.clone(), column.nullable)
-                .with_metadata(metadata);
-            fields.push(field);
+            for (row_idx, new_value) in values.into_iter().enumerate() {
+                if let Some(row) = new_rows.get_mut(row_idx) {
+                    row[column_index] = new_value;
+                }
+            }
         }
 
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
-        table.table.append(&batch)?;
+        let _ = self.apply_delete(table, display_name.clone(), row_ids.clone(), snapshot.txn_id)?;
+
+        let column_names: Vec<String> = table
+            .schema
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+
+        let _ = self.insert_rows(
+            table,
+            display_name.clone(),
+            new_rows,
+            column_names,
+            snapshot.txn_id,
+        )?;
 
         Ok(StatementResult::Update {
             table_name: display_name,
@@ -2046,22 +2287,27 @@ where
         table: &ExecutorTable<P>,
         display_name: String,
         filter: LlkvExpr<'static, String>,
+        snapshot: TransactionSnapshot,
+        txn_id: TxnId,
     ) -> Result<StatementResult<P>> {
         let schema = table.schema.as_ref();
         let filter_expr = translate_predicate(filter, schema)?;
         let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         tracing::warn!(
             table = %display_name,
             rows = row_ids.len(),
             "delete_filtered_rows collected row ids"
         );
-        self.apply_delete(table, display_name, row_ids)
+        self.apply_delete(table, display_name, row_ids, txn_id)
     }
 
     fn delete_all_rows(
         &self,
         table: &ExecutorTable<P>,
         display_name: String,
+        snapshot: TransactionSnapshot,
+        txn_id: TxnId,
     ) -> Result<StatementResult<P>> {
         let total_rows = table.total_rows.load(Ordering::SeqCst);
         if total_rows == 0 {
@@ -2076,7 +2322,8 @@ where
         })?;
         let filter_expr = full_table_scan_filter(anchor_field);
         let row_ids = table.table.filter_row_ids(&filter_expr)?;
-        self.apply_delete(table, display_name, row_ids)
+        let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
+        self.apply_delete(table, display_name, row_ids, txn_id)
     }
 
     fn apply_delete(
@@ -2084,6 +2331,7 @@ where
         table: &ExecutorTable<P>,
         display_name: String,
         row_ids: Vec<u64>,
+        txn_id: TxnId,
     ) -> Result<StatementResult<P>> {
         if row_ids.is_empty() {
             return Ok(StatementResult::Delete {
@@ -2092,28 +2340,22 @@ where
             });
         }
 
-        let logical_fields: Vec<LogicalFieldId> = table
-            .schema
-            .columns
-            .iter()
-            .map(|column| LogicalFieldId::for_user(table.table.table_id(), column.field_id))
-            .collect();
-
-        if logical_fields.is_empty() {
-            return Err(Error::InvalidArgumentError(
-                "DELETE requires a table with at least one column".into(),
-            ));
-        }
-
-        tracing::warn!(
-            table = %display_name,
-            fields = logical_fields.len(),
-            rows = row_ids.len(),
-            "apply_delete invoking delete_rows"
-        );
-        table.table.store().delete_rows(&logical_fields, &row_ids)?;
-
         let removed = row_ids.len();
+
+        let mut fields = Vec::with_capacity(2);
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(2);
+
+        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+        let row_id_array: ArrayRef = Arc::new(UInt64Array::from(row_ids.clone()));
+        arrays.push(row_id_array);
+
+        fields.push(Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false));
+        let deleted_array: ArrayRef = Arc::new(UInt64Array::from(vec![txn_id; removed]));
+        arrays.push(deleted_array);
+
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
+        table.table.append(&batch)?;
+
         let removed_u64 = u64::try_from(removed)
             .map_err(|_| Error::InvalidArgumentError("row count exceeds supported range".into()))?;
         table.total_rows.fetch_sub(removed_u64, Ordering::SeqCst);
@@ -2129,8 +2371,10 @@ where
         table: &ExecutorTable<P>,
         filter_expr: &LlkvExpr<'static, FieldId>,
         expressions: &[ScalarExpr<FieldId>],
+        snapshot: TransactionSnapshot,
     ) -> Result<(Vec<u64>, Vec<Vec<PlanValue>>)> {
         let row_ids = table.table.filter_row_ids(filter_expr)?;
+        let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         if row_ids.is_empty() {
             return Ok((row_ids, vec![Vec::new(); expressions.len()]));
         }
@@ -2148,9 +2392,14 @@ where
         let mut expr_values: Vec<Vec<PlanValue>> =
             vec![Vec::with_capacity(row_ids.len()); expressions.len()];
         let mut error: Option<Error> = None;
+        let row_filter: Arc<dyn RowIdFilter<P>> = Arc::new(MvccRowIdFilter::new(
+            Arc::clone(&self.txn_manager),
+            snapshot,
+        ));
         let options = ScanStreamOptions {
             include_nulls: true,
             order: None,
+            row_id_filter: Some(row_filter),
         };
 
         table
@@ -2290,15 +2539,23 @@ where
 {
     type Pager = P;
 
+    fn set_snapshot(&self, snapshot: TransactionSnapshot) {
+        self.update_snapshot(snapshot);
+    }
+
+    fn snapshot(&self) -> TransactionSnapshot {
+        self.current_snapshot()
+    }
+
     fn table_column_specs(&self, table_name: &str) -> llkv_result::Result<Vec<ColumnSpec>> {
-        Context::table_column_specs(&self.0, table_name)
+        Context::table_column_specs(self.context(), table_name)
     }
 
     fn export_table_rows(
         &self,
         table_name: &str,
     ) -> llkv_result::Result<llkv_transaction::RowBatch> {
-        let batch = Context::export_table_rows(&self.0, table_name)?;
+        let batch = Context::export_table_rows(self.context(), table_name)?;
         // Convert from llkv_executor::RowBatch to llkv_transaction::RowBatch
         Ok(llkv_transaction::RowBatch {
             columns: batch.columns,
@@ -2311,41 +2568,61 @@ where
         table_name: &str,
         filter: Option<LlkvExpr<'static, String>>,
     ) -> llkv_result::Result<Vec<RecordBatch>> {
-        Context::get_batches_with_row_ids(&self.0, table_name, filter)
+        Context::get_batches_with_row_ids_with_snapshot(
+            self.context(),
+            table_name,
+            filter,
+            self.snapshot(),
+        )
     }
 
     fn execute_select(
         &self,
         plan: SelectPlan,
     ) -> llkv_result::Result<SelectExecution<Self::Pager>> {
-        Context::execute_select(&self.0, plan)
+        Context::execute_select_with_snapshot(self.context(), plan, self.snapshot())
     }
 
     fn create_table_plan(
         &self,
         plan: CreateTablePlan,
-    ) -> llkv_result::Result<TransactionResult<MemPager>> {
-        let result = Context::create_table_plan(&self.0, plan)?;
+    ) -> llkv_result::Result<TransactionResult<P>> {
+        let result = Context::create_table_plan(self.context(), plan)?;
         Ok(convert_statement_result(result))
     }
 
-    fn insert(&self, plan: InsertPlan) -> llkv_result::Result<TransactionResult<MemPager>> {
+    fn insert(&self, plan: InsertPlan) -> llkv_result::Result<TransactionResult<P>> {
         tracing::trace!(
             "[WRAPPER] TransactionContext::insert called - plan.table='{}', wrapper_context_pager={:p}",
             plan.table,
-            &*self.0.pager
+            &*self.ctx.pager
         );
-        let result = Context::insert(&self.0, plan)?;
+        let snapshot = self.current_snapshot();
+        let result = if snapshot.txn_id == TXN_ID_AUTO_COMMIT {
+            self.ctx().insert(plan)?
+        } else {
+            Context::insert_with_snapshot(self.context(), plan, snapshot)?
+        };
         Ok(convert_statement_result(result))
     }
 
-    fn update(&self, plan: UpdatePlan) -> llkv_result::Result<TransactionResult<MemPager>> {
-        let result = Context::update(&self.0, plan)?;
+    fn update(&self, plan: UpdatePlan) -> llkv_result::Result<TransactionResult<P>> {
+        let snapshot = self.current_snapshot();
+        let result = if snapshot.txn_id == TXN_ID_AUTO_COMMIT {
+            self.ctx().update(plan)?
+        } else {
+            Context::update_with_snapshot(self.context(), plan, snapshot)?
+        };
         Ok(convert_statement_result(result))
     }
 
-    fn delete(&self, plan: DeletePlan) -> llkv_result::Result<TransactionResult<MemPager>> {
-        let result = Context::delete(&self.0, plan)?;
+    fn delete(&self, plan: DeletePlan) -> llkv_result::Result<TransactionResult<P>> {
+        let snapshot = self.current_snapshot();
+        let result = if snapshot.txn_id == TXN_ID_AUTO_COMMIT {
+            self.ctx().delete(plan)?
+        } else {
+            Context::delete_with_snapshot(self.context(), plan, snapshot)?
+        };
         Ok(convert_statement_result(result))
     }
 
@@ -2354,16 +2631,16 @@ where
         table_name: &str,
         batches: Vec<RecordBatch>,
     ) -> llkv_result::Result<usize> {
-        Context::append_batches_with_row_ids(&self.0, table_name, batches)
+        Context::append_batches_with_row_ids(self.context(), table_name, batches)
     }
 
     fn table_names(&self) -> Vec<String> {
-        Context::table_names(&self.0)
+        Context::table_names(self.context())
     }
 }
 
 // Helper to convert StatementResult between types (legacy)
-fn convert_statement_result<P>(result: StatementResult<P>) -> TransactionResult<MemPager>
+fn convert_statement_result<P>(result: StatementResult<P>) -> TransactionResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
@@ -2378,6 +2655,115 @@ where
         StatementResult::Delete { rows_deleted, .. } => TxResult::Delete { rows_deleted },
         StatementResult::Transaction { kind } => TxResult::Transaction { kind },
         _ => panic!("unsupported StatementResult conversion"),
+    }
+}
+
+fn filter_row_ids_for_snapshot<P>(
+    store: &ColumnStore<P>,
+    table_id: TableId,
+    row_ids: Vec<u64>,
+    txn_manager: &TxnIdManager,
+    snapshot: TransactionSnapshot,
+) -> Result<Vec<u64>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    if row_ids.is_empty() {
+        return Ok(row_ids);
+    }
+
+    let created_lfid = LogicalFieldId::for_mvcc_created_by(table_id);
+    let deleted_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
+
+    let version_batch = match store.gather_rows(
+        &[created_lfid, deleted_lfid],
+        &row_ids,
+        GatherNullPolicy::IncludeNulls,
+    ) {
+        Ok(batch) => batch,
+        Err(Error::NotFound) => return Ok(row_ids),
+        Err(err) => return Err(err),
+    };
+
+    if version_batch.num_columns() < 2 {
+        return Ok(row_ids);
+    }
+
+    let created_column = version_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>();
+    let deleted_column = version_batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>();
+
+    if created_column.is_none() || deleted_column.is_none() {
+        return Ok(row_ids);
+    }
+
+    let created_column = created_column.unwrap();
+    let deleted_column = deleted_column.unwrap();
+
+    let mut visible = Vec::with_capacity(row_ids.len());
+    for (idx, row_id) in row_ids.iter().enumerate() {
+        let created_by = if created_column.is_null(idx) {
+            TXN_ID_AUTO_COMMIT
+        } else {
+            created_column.value(idx)
+        };
+        let deleted_by = if deleted_column.is_null(idx) {
+            TXN_ID_NONE
+        } else {
+            deleted_column.value(idx)
+        };
+
+        let version = RowVersion {
+            created_by,
+            deleted_by,
+        };
+        if version.is_visible_for(txn_manager, snapshot) {
+            visible.push(*row_id);
+        }
+    }
+
+    Ok(visible)
+}
+
+struct MvccRowIdFilter<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    txn_manager: Arc<TxnIdManager>,
+    snapshot: TransactionSnapshot,
+    _marker: PhantomData<fn(P)>,
+}
+
+impl<P> MvccRowIdFilter<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn new(txn_manager: Arc<TxnIdManager>, snapshot: TransactionSnapshot) -> Self {
+        Self {
+            txn_manager,
+            snapshot,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<P> RowIdFilter<P> for MvccRowIdFilter<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn filter(&self, table: &Table<P>, row_ids: Vec<u64>) -> Result<Vec<u64>> {
+        filter_row_ids_for_snapshot(
+            table.store(),
+            table.table_id(),
+            row_ids,
+            &self.txn_manager,
+            self.snapshot,
+        )
     }
 }
 

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 
 use crate::planner::{TablePlanner, collect_row_ids_for_table};
@@ -25,8 +26,20 @@ where
     table_id: TableId,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ScanStreamOptions {
+/// Trait that allows callers to filter row ids before they are gathered into
+/// Arrow batches. Implementations can enforce MVCC visibility or other
+/// contextual policies.
+pub trait RowIdFilter<P>: Send + Sync
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn filter(&self, table: &Table<P>, row_ids: Vec<u64>) -> LlkvResult<Vec<u64>>;
+}
+
+pub struct ScanStreamOptions<P = MemPager>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
     /// Preserve null rows emitted by the projected columns when `true`.
     /// When `false`, the scan gatherer drops rows where all projected
     /// columns are null or missing before yielding batches. This keeps
@@ -36,6 +49,51 @@ pub struct ScanStreamOptions {
     /// Optional ordering specification applied to the gathered row ids
     /// before projection results are materialized.
     pub order: Option<ScanOrderSpec>,
+    /// Optional row-id filter that can remove invisible rows (for example,
+    /// enforcing MVCC visibility) before batches are materialized.
+    pub row_id_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+}
+
+impl<P> fmt::Debug for ScanStreamOptions<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScanStreamOptions")
+            .field("include_nulls", &self.include_nulls)
+            .field("order", &self.order)
+            .field(
+                "row_id_filter",
+                &self.row_id_filter.as_ref().map(|_| "<RowIdFilter>")
+            )
+            .finish()
+    }
+}
+
+impl<P> Clone for ScanStreamOptions<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            include_nulls: self.include_nulls,
+            order: self.order,
+            row_id_filter: self.row_id_filter.clone(),
+        }
+    }
+}
+
+impl<P> Default for ScanStreamOptions<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn default() -> Self {
+        Self {
+            include_nulls: false,
+            order: None,
+            row_id_filter: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -127,7 +185,30 @@ where
                 field.name() == llkv_column_map::store::CREATED_BY_COLUMN_NAME ||
                 field.name() == llkv_column_map::store::DELETED_BY_COLUMN_NAME
             ) {
-                new_fields.push(field.as_ref().clone());
+                if field.name() == ROW_ID_COLUMN_NAME {
+                    new_fields.push(field.as_ref().clone());
+                } else {
+                    let lfid = if field.name() == llkv_column_map::store::CREATED_BY_COLUMN_NAME {
+                        LogicalFieldId::for_mvcc_created_by(self.table_id)
+                    } else {
+                        LogicalFieldId::for_mvcc_deleted_by(self.table_id)
+                    };
+
+                    let mut metadata = field.metadata().clone();
+                    let lfid_val: u64 = lfid.into();
+                    metadata.insert(
+                        crate::constants::FIELD_ID_META_KEY.to_string(),
+                        lfid_val.to_string(),
+                    );
+
+                    let new_field = Field::new(
+                        field.name(),
+                        field.data_type().clone(),
+                        field.is_nullable(),
+                    )
+                    .with_metadata(metadata);
+                    new_fields.push(new_field);
+                }
                 continue;
             }
 
@@ -216,7 +297,7 @@ where
         &self,
         projections: I,
         filter_expr: &Expr<'a, FieldId>,
-        options: ScanStreamOptions,
+        options: ScanStreamOptions<P>,
         on_batch: F,
     ) -> LlkvResult<()>
     where
@@ -234,7 +315,7 @@ where
         &self,
         projections: &[ScanProjection],
         filter_expr: &Expr<'a, FieldId>,
-        options: ScanStreamOptions,
+        options: ScanStreamOptions<P>,
         on_batch: F,
     ) -> LlkvResult<()>
     where
@@ -1272,6 +1353,7 @@ mod tests {
                 ScanStreamOptions {
                     include_nulls: true,
                     order: None,
+                    row_id_filter: None,
                 },
                 |b| {
                     let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();

@@ -422,10 +422,13 @@ enum ProjectionEval {
     Computed(ComputedProjectionInfo),
 }
 
-struct PlannedScan<'expr> {
+struct PlannedScan<'expr, P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
     projections: Vec<ScanProjection>,
     filter_expr: Expr<'expr, FieldId>,
-    options: ScanStreamOptions,
+    options: ScanStreamOptions<P>,
     plan_graph: PlanGraph,
 }
 
@@ -505,13 +508,13 @@ where
         &self,
         projections: &[ScanProjection],
         filter_expr: &Expr<'expr, FieldId>,
-        options: ScanStreamOptions,
+        options: ScanStreamOptions<P>,
         on_batch: F,
     ) -> LlkvResult<()>
     where
         F: FnMut(RecordBatch),
     {
-        let plan = self.plan_scan(projections, filter_expr, options)?;
+    let plan = self.plan_scan(projections, filter_expr, options)?;
         TableExecutor::new(self.table).execute(plan, on_batch)
     }
 
@@ -520,8 +523,8 @@ where
         &self,
         projections: &[ScanProjection],
         filter_expr: &Expr<'expr, FieldId>,
-        options: ScanStreamOptions,
-    ) -> LlkvResult<PlannedScan<'expr>> {
+        options: ScanStreamOptions<P>,
+    ) -> LlkvResult<PlannedScan<'expr, P>> {
         if projections.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "scan_stream requires at least one projection".into(),
@@ -530,7 +533,7 @@ where
 
         let projections_vec = projections.to_vec();
         let filter_clone = filter_expr.clone();
-        let plan_graph = self.build_plan_graph(&projections_vec, &filter_clone, options)?;
+        let plan_graph = self.build_plan_graph(&projections_vec, &filter_clone, options.clone())?;
 
         Ok(PlannedScan {
             projections: projections_vec,
@@ -544,7 +547,7 @@ where
         &self,
         projections: &[ScanProjection],
         filter_expr: &Expr<'_, FieldId>,
-        options: ScanStreamOptions,
+        options: ScanStreamOptions<P>,
     ) -> LlkvResult<PlanGraph> {
         let mut builder = PlanGraphBuilder::new();
 
@@ -700,7 +703,7 @@ where
         filter_row_ids_by_operator(&all_row_ids, op)
     }
 
-    fn execute<'expr, F>(&self, plan: PlannedScan<'expr>, mut on_batch: F) -> LlkvResult<()>
+    fn execute<'expr, F>(&self, plan: PlannedScan<'expr, P>, mut on_batch: F) -> LlkvResult<()>
     where
         F: FnMut(RecordBatch),
     {
@@ -711,7 +714,12 @@ where
             plan_graph: _plan_graph,
         } = plan;
 
-        if self.try_single_column_direct_scan(&projections, &filter_expr, options, &mut on_batch)? {
+        if self.try_single_column_direct_scan(
+            &projections,
+            &filter_expr,
+            options.clone(),
+            &mut on_batch,
+        )? {
             return Ok(());
         }
 
@@ -844,6 +852,9 @@ where
         let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
         let mut row_ids =
             self.collect_row_ids_for_expr(&filter_expr, &fusion_cache, &mut all_rows_cache)?;
+        if let Some(filter) = options.row_id_filter.as_ref() {
+            row_ids = filter.filter(self.table, row_ids)?;
+        }
         if row_ids.is_empty() {
             if is_trivial_filter(&filter_expr) {
                 let total_rows = self.table.total_rows()?;
@@ -1054,7 +1065,7 @@ where
         &self,
         projections: &[ScanProjection],
         filter_expr: &Expr<'expr, FieldId>,
-        options: ScanStreamOptions,
+        options: ScanStreamOptions<P>,
         on_batch: &mut F,
     ) -> LlkvResult<bool>
     where

@@ -11,7 +11,8 @@ use llkv_plan::{
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
 use llkv_table::table::{
-    ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions,
+    RowIdFilter, ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection,
+    ScanStreamOptions,
 };
 use llkv_table::types::FieldId;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -53,16 +54,24 @@ where
     }
 
     pub fn execute_select(&self, plan: SelectPlan) -> ExecutorResult<SelectExecution<P>> {
+        self.execute_select_with_filter(plan, None)
+    }
+
+    pub fn execute_select_with_filter(
+        &self,
+        plan: SelectPlan,
+        row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+    ) -> ExecutorResult<SelectExecution<P>> {
         let table = self.provider.get_table(&plan.table)?;
         let display_name = plan.table.clone();
 
         if !plan.aggregates.is_empty() {
-            self.execute_aggregates(table, display_name, plan)
+            self.execute_aggregates(table, display_name, plan, row_filter)
         } else if self.has_computed_aggregates(&plan) {
             // Handle computed projections that contain embedded aggregates
-            self.execute_computed_aggregates(table, display_name, plan)
+            self.execute_computed_aggregates(table, display_name, plan, row_filter)
         } else {
-            self.execute_projection(table, display_name, plan)
+            self.execute_projection(table, display_name, plan, row_filter)
         }
     }
 
@@ -93,6 +102,7 @@ where
         table: Arc<ExecutorTable<P>>,
         display_name: String,
         plan: SelectPlan,
+        row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
         let table_ref = table.as_ref();
         let projections = if plan.projections.is_empty() {
@@ -116,14 +126,22 @@ where
 
         let options = if let Some(order_plan) = &plan.order_by {
             let order_spec = resolve_scan_order(table_ref, &projections, order_plan)?;
+            if row_filter.is_some() {
+                println!("executor: applying row filter with order_by");
+            }
             ScanStreamOptions {
                 include_nulls: true,
                 order: Some(order_spec),
+                row_id_filter: row_filter.clone(),
             }
         } else {
+            if row_filter.is_some() {
+                println!("executor: applying row filter");
+            }
             ScanStreamOptions {
                 include_nulls: true,
                 order: None,
+                row_id_filter: row_filter.clone(),
             }
         };
 
@@ -143,6 +161,7 @@ where
         table: Arc<ExecutorTable<P>>,
         display_name: String,
         plan: SelectPlan,
+        row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
         let table_ref = table.as_ref();
         let mut specs: Vec<AggregateSpec> = Vec::with_capacity(plan.aggregates.len());
@@ -266,7 +285,8 @@ where
 
         let options = ScanStreamOptions {
             include_nulls: true,
-            ..Default::default()
+            order: None,
+            row_id_filter: None,
         };
 
         let mut states: Vec<AggregateState> = Vec::with_capacity(specs.len());
@@ -299,7 +319,14 @@ where
         let mut error: Option<Error> = None;
         match table
             .table
-            .scan_stream(projections, &filter_expr, options, |batch| {
+            .scan_stream(
+                projections,
+                &filter_expr,
+                ScanStreamOptions {
+                    row_id_filter: row_filter.clone(),
+                    ..options
+                },
+                |batch| {
                 if error.is_some() {
                     return;
                 }
@@ -345,6 +372,7 @@ where
         table: Arc<ExecutorTable<P>>,
         display_name: String,
         plan: SelectPlan,
+        row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
         use arrow::array::Int64Array;
         use llkv_expr::expr::AggregateCall;
@@ -360,8 +388,12 @@ where
         }
 
         // Compute the aggregates using the existing aggregate execution infrastructure
-        let computed_aggregates =
-            self.compute_aggregate_values(table.clone(), &plan.filter, &aggregate_specs)?;
+        let computed_aggregates = self.compute_aggregate_values(
+            table.clone(),
+            &plan.filter,
+            &aggregate_specs,
+            row_filter.clone(),
+        )?;
 
         // Now build the final projections by evaluating expressions with aggregates substituted
         let mut fields = Vec::with_capacity(plan.projections.len());
@@ -439,6 +471,7 @@ where
         table: Arc<ExecutorTable<P>>,
         filter: &Option<llkv_expr::expr::Expr<'static, String>>,
         aggregate_specs: &[(String, llkv_expr::expr::AggregateCall<String>)],
+        row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<HashMap<String, i64>> {
         use llkv_expr::expr::AggregateCall;
 
@@ -546,9 +579,10 @@ where
             )));
         }
 
-        let options = ScanStreamOptions {
+        let base_options = ScanStreamOptions {
             include_nulls: true,
             order: None,
+            row_id_filter: None,
         };
 
         let mut states: Vec<AggregateState> = Vec::with_capacity(specs.len());
@@ -568,9 +602,14 @@ where
         }
 
         let mut error: Option<Error> = None;
-        match table
-            .table
-            .scan_stream(projections, &filter_expr, options, |batch| {
+        match table.table.scan_stream(
+            projections,
+            &filter_expr,
+            ScanStreamOptions {
+                row_id_filter: row_filter.clone(),
+                ..base_options
+            },
+            |batch| {
                 if error.is_some() {
                     return;
                 }
@@ -580,7 +619,8 @@ where
                         return;
                     }
                 }
-            }) {
+            },
+        ) {
             Ok(()) => {}
             Err(llkv_result::Error::NotFound) => {}
             Err(err) => return Err(err),
@@ -692,7 +732,7 @@ where
         table: Arc<ExecutorTable<P>>,
         projections: Vec<ScanProjection>,
         filter_expr: LlkvExpr<'static, FieldId>,
-        options: ScanStreamOptions,
+        options: ScanStreamOptions<P>,
         full_table_scan: bool,
     },
     Aggregation {
@@ -710,7 +750,7 @@ where
         table: Arc<ExecutorTable<P>>,
         projections: Vec<ScanProjection>,
         filter_expr: LlkvExpr<'static, FieldId>,
-        options: ScanStreamOptions,
+        options: ScanStreamOptions<P>,
         full_table_scan: bool,
     ) -> Self {
         Self {
@@ -770,10 +810,12 @@ where
                 let mut produced = false;
                 let mut produced_rows: u64 = 0;
                 let capture_nulls_first = matches!(options.order, Some(spec) if spec.nulls_first);
+                let include_nulls = options.include_nulls;
+                let scan_options = options;
                 let mut buffered_batches: Vec<RecordBatch> = Vec::new();
                 table
                     .table
-                    .scan_stream(projections, &filter_expr, options, |batch| {
+                    .scan_stream(projections, &filter_expr, scan_options, |batch| {
                         if error.is_some() {
                             return;
                         }
@@ -797,7 +839,7 @@ where
                     return Ok(());
                 }
                 let mut null_batches: Vec<RecordBatch> = Vec::new();
-                if options.include_nulls && full_table_scan && produced_rows < total_rows {
+                if include_nulls && full_table_scan && produced_rows < total_rows {
                     let missing = total_rows - produced_rows;
                     if missing > 0 {
                         null_batches = synthesize_null_scan(Arc::clone(&schema), missing)?;

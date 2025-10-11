@@ -112,6 +112,12 @@ pub trait TransactionContext: Send + Sync {
     /// The pager type used by this context
     type Pager: Pager<Blob = EntryHandle> + Send + Sync + 'static;
 
+    /// Update the snapshot used for MVCC visibility decisions.
+    fn set_snapshot(&self, snapshot: mvcc::TransactionSnapshot);
+
+    /// Get the snapshot currently associated with this context.
+    fn snapshot(&self) -> mvcc::TransactionSnapshot;
+
     /// Get table column specifications
     fn table_column_specs(&self, table_name: &str) -> LlkvResult<Vec<ColumnSpec>>;
 
@@ -129,16 +135,17 @@ pub trait TransactionContext: Send + Sync {
     fn execute_select(&self, plan: SelectPlan) -> LlkvResult<SelectExecution<Self::Pager>>;
 
     /// Create a table from plan
-    fn create_table_plan(&self, plan: CreateTablePlan) -> LlkvResult<TransactionResult<MemPager>>;
+    fn create_table_plan(&self, plan: CreateTablePlan)
+        -> LlkvResult<TransactionResult<Self::Pager>>;
 
     /// Insert rows
-    fn insert(&self, plan: InsertPlan) -> LlkvResult<TransactionResult<MemPager>>;
+    fn insert(&self, plan: InsertPlan) -> LlkvResult<TransactionResult<Self::Pager>>;
 
     /// Update rows
-    fn update(&self, plan: UpdatePlan) -> LlkvResult<TransactionResult<MemPager>>;
+    fn update(&self, plan: UpdatePlan) -> LlkvResult<TransactionResult<Self::Pager>>;
 
     /// Delete rows
-    fn delete(&self, plan: DeletePlan) -> LlkvResult<TransactionResult<MemPager>>;
+    fn delete(&self, plan: DeletePlan) -> LlkvResult<TransactionResult<Self::Pager>>;
 
     /// Append batches with row IDs
     fn append_batches_with_row_ids(
@@ -157,8 +164,8 @@ where
     BaseCtx: TransactionContext + 'static,
     StagingCtx: TransactionContext + 'static,
 {
-    /// Transaction ID for MVCC snapshot isolation
-    txn_id: TxnId,
+    /// Transaction snapshot (contains txn id + snapshot watermark)
+    snapshot: mvcc::TransactionSnapshot,
     /// Staging context with MemPager for isolation.
     staging: Arc<StagingCtx>,
     /// Operations to replay on commit.
@@ -193,7 +200,9 @@ where
     ) -> Self {
         let catalog_snapshot = base_context.table_names().into_iter().collect();
         let staged_tables: HashSet<String> = staging.table_names().into_iter().collect();
-        let txn_id = txn_manager.next_txn_id();
+        let snapshot = txn_manager.begin_transaction();
+        TransactionContext::set_snapshot(&*base_context, snapshot);
+        TransactionContext::set_snapshot(&*staging, snapshot);
 
         Self {
             staging,
@@ -205,7 +214,7 @@ where
             catalog_snapshot,
             base_context,
             is_aborted: false,
-            txn_id,
+            snapshot,
             txn_manager,
         }
     }
@@ -632,6 +641,8 @@ where
 
         // If transaction is aborted, commit becomes a rollback (no operations to replay)
         if tx.is_aborted {
+            tx.txn_manager
+                .mark_aborted(tx.snapshot.txn_id);
             tracing::trace!("DEBUG commit_transaction: returning Rollback with 0 operations");
             return Ok((
                 TransactionResult::Transaction {
@@ -647,6 +658,10 @@ where
             operations.len()
         );
 
+        tx.txn_manager
+            .mark_committed(tx.snapshot.txn_id);
+        TransactionContext::set_snapshot(&*self.context, tx.snapshot);
+
         Ok((
             TransactionResult::Transaction {
                 kind: TransactionKind::Commit,
@@ -661,7 +676,10 @@ where
             .transactions
             .lock()
             .expect("transactions lock poisoned");
-        if guard.remove(&self.session_id).is_none() {
+        if let Some(tx) = guard.remove(&self.session_id) {
+            tx.txn_manager
+                .mark_aborted(tx.snapshot.txn_id);
+        } else {
             return Err(Error::InvalidArgumentError(
                 "no transaction is currently in progress in this session".into(),
             ));
@@ -761,6 +779,11 @@ where
             Arc::clone(&self.transactions),
             Arc::clone(&self.txn_manager),
         )
+    }
+
+    /// Obtain the shared transaction ID manager.
+    pub fn txn_manager(&self) -> Arc<TxnIdManager> {
+        Arc::clone(&self.txn_manager)
     }
 
     /// Check if there's an active transaction (checks if ANY session has a transaction).
