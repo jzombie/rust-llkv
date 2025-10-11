@@ -913,7 +913,7 @@ pub struct ExecutorColumn {
 }
 
 // Re-export from llkv-plan
-// PlanValue is the plan-level value type; do not re-export DSL-prefixed symbols.
+// PlanValue is the plan-level value type; do not re-export higher-level prefixed symbols.
 
 // Export executor-local types with explicit Exec-prefixed names to avoid
 // colliding with Arrow / storage types imported above.

@@ -128,7 +128,7 @@ impl TableDeltaState {
 }
 
 /// A trait for transaction context operations.
-/// This allows DslTransaction to work with any context that implements these operations.
+/// This allows SessionTransaction to work with any context that implements these operations.
 /// The associated type P specifies the pager type this context uses.
 pub trait TransactionContext: Send + Sync {
     /// The pager type used by this context
@@ -173,8 +173,8 @@ pub trait TransactionContext: Send + Sync {
     fn table_names(&self) -> Vec<String>;
 }
 
-/// Transaction state for the DSL context.
-pub struct DslTransaction<BaseCtx, StagingCtx>
+/// Transaction state for the runtime context.
+pub struct SessionTransaction<BaseCtx, StagingCtx>
 where
     BaseCtx: TransactionContext + 'static,
     StagingCtx: TransactionContext + 'static,
@@ -201,7 +201,7 @@ where
     is_aborted: bool,
 }
 
-impl<BaseCtx, StagingCtx> DslTransaction<BaseCtx, StagingCtx>
+impl<BaseCtx, StagingCtx> SessionTransaction<BaseCtx, StagingCtx>
 where
     BaseCtx: TransactionContext + 'static,
     StagingCtx: TransactionContext + 'static,
@@ -712,7 +712,7 @@ where
         operation: PlanOperation,
     ) -> LlkvResult<TransactionResult<BaseCtx::Pager>> {
         tracing::trace!(
-            "[TX] DslTransaction::execute_operation called, operation={:?}",
+            "[TX] SessionTransaction::execute_operation called, operation={:?}",
             match &operation {
                 PlanOperation::Insert(p) => format!("INSERT({})", p.table),
                 PlanOperation::Update(p) => format!("UPDATE({})", p.table),
@@ -750,7 +750,7 @@ where
             }
             PlanOperation::Insert(ref plan) => {
                 tracing::trace!(
-                    "[TX] DslTransaction::execute_operation INSERT for table='{}'",
+                    "[TX] SessionTransaction::execute_operation INSERT for table='{}'",
                     plan.table
                 );
                 // First ensure table exists
@@ -768,7 +768,7 @@ where
                     }
                     Err(e) => {
                         tracing::trace!(
-                            "DEBUG DslTransaction::execute_operation INSERT failed: {:?}",
+                            "DEBUG SessionTransaction::execute_operation INSERT failed: {:?}",
                             e
                         );
                         tracing::trace!("DEBUG setting is_aborted=true");
@@ -851,7 +851,7 @@ where
 {
     context: Arc<BaseCtx>,
     session_id: u64,
-    transactions: Arc<Mutex<HashMap<u64, DslTransaction<BaseCtx, StagingCtx>>>>,
+    transactions: Arc<Mutex<HashMap<u64, SessionTransaction<BaseCtx, StagingCtx>>>>,
 }
 
 impl<BaseCtx, StagingCtx> TransactionSession<BaseCtx, StagingCtx>
@@ -862,7 +862,7 @@ where
     pub fn new(
         context: Arc<BaseCtx>,
         session_id: u64,
-        transactions: Arc<Mutex<HashMap<u64, DslTransaction<BaseCtx, StagingCtx>>>>,
+        transactions: Arc<Mutex<HashMap<u64, SessionTransaction<BaseCtx, StagingCtx>>>>,
     ) -> Self {
         Self {
             context,
@@ -927,7 +927,7 @@ where
         }
         guard.insert(
             self.session_id,
-            DslTransaction::new(Arc::clone(&self.context), staging),
+            SessionTransaction::new(Arc::clone(&self.context), staging),
         );
         Ok(TransactionResult::Transaction {
             kind: TransactionKind::Begin,
@@ -1065,7 +1065,7 @@ where
     BaseCtx: TransactionContext + 'static,
     StagingCtx: TransactionContext + 'static,
 {
-    transactions: Arc<Mutex<HashMap<u64, DslTransaction<BaseCtx, StagingCtx>>>>,
+    transactions: Arc<Mutex<HashMap<u64, SessionTransaction<BaseCtx, StagingCtx>>>>,
     next_session_id: AtomicU64,
 }
 

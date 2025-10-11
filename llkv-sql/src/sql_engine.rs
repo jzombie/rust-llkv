@@ -31,7 +31,7 @@ pub struct SqlEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    dsl: Engine<P>,
+    engine: Engine<P>,
     default_nulls_first: AtomicBool,
 }
 
@@ -42,7 +42,7 @@ where
     fn clone(&self) -> Self {
         // Create a new session from the same context
         Self {
-            dsl: self.dsl.clone(),
+            engine: self.engine.clone(),
             default_nulls_first: AtomicBool::new(
                 self.default_nulls_first.load(AtomicOrdering::Relaxed),
             ),
@@ -84,12 +84,12 @@ where
         }
     }
 
-    // `statement_table_name` is provided by the DSL crate; use it to avoid
+    // `statement_table_name` is provided by llkv-runtime; use it to avoid
     // duplicating plan-level logic here.
 
-    fn execute_dsl_statement(&self, statement: PlanStatement) -> SqlResult<StatementResult<P>> {
+    fn execute_plan_statement(&self, statement: PlanStatement) -> SqlResult<StatementResult<P>> {
         let table = llkv_runtime::statement_table_name(&statement).map(str::to_string);
-        self.dsl.execute_statement(statement).map_err(|err| {
+        self.engine.execute_statement(statement).map_err(|err| {
             if let Some(table_name) = table {
                 Self::map_table_error(&table_name, err)
             } else {
@@ -99,20 +99,20 @@ where
     }
 
     pub fn new(pager: Arc<P>) -> Self {
-        let dsl = Engine::new(pager);
+        let engine = Engine::new(pager);
         Self {
-            dsl,
+            engine,
             default_nulls_first: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn context_arc(&self) -> Arc<Context<P>> {
-        self.dsl.context()
+        self.engine.context()
     }
 
     pub fn with_context(context: Arc<Context<P>>, default_nulls_first: bool) -> Self {
         Self {
-            dsl: Engine::from_context(context),
+            engine: Engine::from_context(context),
             default_nulls_first: AtomicBool::new(default_nulls_first),
         }
     }
@@ -123,12 +123,12 @@ where
     }
 
     fn has_active_transaction(&self) -> bool {
-        self.dsl.session().has_active_transaction()
+        self.engine.session().has_active_transaction()
     }
 
     /// Get a reference to the underlying session (for advanced use like error handling in test harnesses).
     pub fn session(&self) -> &Session<P> {
-        self.dsl.session()
+        self.engine.session()
     }
 
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<StatementResult<P>>> {
@@ -413,7 +413,7 @@ where
             columns,
             source: None,
         };
-        self.execute_dsl_statement(PlanStatement::CreateTable(plan))
+        self.execute_plan_statement(PlanStatement::CreateTable(plan))
     }
 
     fn handle_create_table_as(
@@ -439,7 +439,7 @@ where
                 plan: Box::new(select_plan),
             }),
         };
-        self.execute_dsl_statement(PlanStatement::CreateTable(plan))
+        self.execute_plan_statement(PlanStatement::CreateTable(plan))
     }
 
     fn handle_insert(&self, stmt: sqlparser::ast::Insert) -> SqlResult<StatementResult<P>> {
@@ -549,7 +549,7 @@ where
             "DEBUG SQL handle_insert: about to execute insert for table={}",
             display_name
         );
-        self.execute_dsl_statement(PlanStatement::Insert(plan))
+        self.execute_plan_statement(PlanStatement::Insert(plan))
     }
 
     fn handle_update(
@@ -615,7 +615,7 @@ where
             assignments: column_assignments,
             filter,
         };
-        self.execute_dsl_statement(PlanStatement::Update(plan))
+        self.execute_plan_statement(PlanStatement::Update(plan))
     }
 
     #[allow(clippy::collapsible_if)]
@@ -671,16 +671,16 @@ where
             table: display_name.clone(),
             filter,
         };
-        self.execute_dsl_statement(PlanStatement::Delete(plan))
+        self.execute_plan_statement(PlanStatement::Delete(plan))
     }
 
     fn handle_query(&self, query: Query) -> SqlResult<StatementResult<P>> {
         let select_plan = self.build_select_plan(query)?;
-        self.execute_dsl_statement(PlanStatement::Select(select_plan))
+        self.execute_plan_statement(PlanStatement::Select(select_plan))
     }
 
     fn build_select_plan(&self, query: Query) -> SqlResult<SelectPlan> {
-        if self.dsl.session().has_active_transaction() && self.dsl.session().is_aborted() {
+        if self.engine.session().has_active_transaction() && self.engine.session().is_aborted() {
             return Err(Error::TransactionContextError(
                 "TransactionContext Error: transaction is aborted".into(),
             ));
@@ -1109,7 +1109,7 @@ where
             tracing::warn!("Currently treat `START TRANSACTION` same as `BEGIN`")
         }
 
-        self.execute_dsl_statement(PlanStatement::BeginTransaction)
+        self.execute_plan_statement(PlanStatement::BeginTransaction)
     }
 
     fn handle_commit(
@@ -1134,7 +1134,7 @@ where
             ));
         }
 
-        self.execute_dsl_statement(PlanStatement::CommitTransaction)
+        self.execute_plan_statement(PlanStatement::CommitTransaction)
     }
 
     fn handle_rollback(
@@ -1153,7 +1153,7 @@ where
             ));
         }
 
-        self.execute_dsl_statement(PlanStatement::RollbackTransaction)
+        self.execute_plan_statement(PlanStatement::RollbackTransaction)
     }
 
     fn handle_set(&self, set_stmt: Set) -> SqlResult<StatementResult<P>> {

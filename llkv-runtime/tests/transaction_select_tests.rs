@@ -7,7 +7,7 @@ use llkv_storage::pager::MemPager;
 use std::sync::Arc;
 
 #[test]
-fn test_dsl_transaction_select() {
+fn test_transaction_select() {
     let pager = Arc::new(MemPager::default());
     let ctx = Arc::new(Context::new(pager));
     let session = ctx.create_session();
@@ -79,7 +79,7 @@ fn test_dsl_transaction_select() {
 }
 
 #[test]
-fn test_dsl_transaction_select_with_aggregates() {
+fn test_transaction_select_with_aggregates() {
     let pager = Arc::new(MemPager::default());
     let ctx = Arc::new(Context::new(pager));
     let session = ctx.create_session();

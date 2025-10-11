@@ -53,9 +53,9 @@ use llkv_transaction::{TransactionContext, TransactionManager, TransactionResult
 // Internal low-level transaction session type (from llkv-transaction)
 use llkv_transaction::TransactionSession;
 
-// Note: Session is the high-level wrapper that users should use instead of raw DslSession
+// Note: Session is the high-level wrapper that users should use instead of the lower-level session API
 
-/// Result of running a DSL statement.
+/// Result of running a plan statement.
 #[derive(Clone)]
 pub enum StatementResult<P>
 where
@@ -181,7 +181,7 @@ where
     }
 }
 
-/// Return the table name referenced by a DSL statement, if any.
+/// Return the table name referenced by a plan statement, if any.
 ///
 /// This is a small helper used by higher-level engines (for example the
 /// SQL front-end) to provide better error messages when a statement fails
@@ -205,7 +205,7 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
 // ============================================================================
 //
 // The following types are defined in llkv-plan and re-exported:
-// - DslValue, CreateTablePlan, ColumnSpec, IntoColumnSpec
+// - plan values, CreateTablePlan, ColumnSpec, IntoColumnSpec
 // - InsertPlan, InsertSource, UpdatePlan, DeletePlan
 // - SelectPlan, SelectProjection, AggregateExpr, AggregateFunction
 // - OrderByPlan, OrderSortType, OrderTarget
@@ -215,7 +215,7 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
 // ============================================================================
 
 // Transaction management is now handled by llkv-transaction crate
-// The DslTransaction and TableDeltaState types are re-exported from there
+// The SessionTransaction and TableDeltaState types are re-exported from there
 
 /// Wrapper for Context that implements TransactionContext
 pub struct ContextWrapper<P>(Arc<Context<P>>)
@@ -330,7 +330,7 @@ where
             }
         }
 
-        // Return the DSL's StatementResult with the correct kind (Commit or Rollback)
+        // Return a StatementResult with the correct kind (Commit or Rollback)
         Ok(StatementResult::Transaction { kind })
     }
 
@@ -674,7 +674,7 @@ where
     }
 }
 
-/// In-memory execution context shared by DSL queries.
+/// In-memory execution context shared by plan-based queries.
 pub struct Context<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -2564,13 +2564,13 @@ fn translate_scalar(
     }
 }
 
-fn dsl_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
+fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
     match expr {
-        SqlExpr::Value(value) => dsl_value_from_sql_value(value),
+        SqlExpr::Value(value) => plan_value_from_sql_value(value),
         SqlExpr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
-        } => match dsl_value_from_sql_expr(expr)? {
+        } => match plan_value_from_sql_expr(expr)? {
             PlanValue::Integer(v) => Ok(PlanValue::Integer(-v)),
             PlanValue::Float(v) => Ok(PlanValue::Float(-v)),
             PlanValue::Null | PlanValue::String(_) => Err(Error::InvalidArgumentError(
@@ -2580,15 +2580,15 @@ fn dsl_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
         SqlExpr::UnaryOp {
             op: UnaryOperator::Plus,
             expr,
-        } => dsl_value_from_sql_expr(expr),
-        SqlExpr::Nested(inner) => dsl_value_from_sql_expr(inner),
+        } => plan_value_from_sql_expr(expr),
+        SqlExpr::Nested(inner) => plan_value_from_sql_expr(inner),
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported literal expression: {other:?}"
         ))),
     }
 }
 
-fn dsl_value_from_sql_value(value: &ValueWithSpan) -> Result<PlanValue> {
+fn plan_value_from_sql_value(value: &ValueWithSpan) -> Result<PlanValue> {
     match &value.value {
         Value::Null => Ok(PlanValue::Null),
         Value::Number(text, _) => {
@@ -2779,7 +2779,7 @@ fn build_range_projection_expr(expr: &SqlExpr, spec: &RangeSpec) -> Result<Range
             }
         }
         SqlExpr::Wildcard(_) | SqlExpr::QualifiedWildcard(_, _) => unreachable!(),
-        other => Ok(RangeProjection::Literal(dsl_value_from_sql_expr(other)?)),
+        other => Ok(RangeProjection::Literal(plan_value_from_sql_expr(other)?)),
     }
 }
 
@@ -2870,7 +2870,7 @@ fn parse_range_spec_from_args(
             }
         };
 
-        let value = dsl_value_from_sql_expr(arg_expr)?;
+        let value = plan_value_from_sql_expr(arg_expr)?;
         match value {
             PlanValue::Integer(v) => Ok(v),
             _ => Err(Error::InvalidArgumentError(

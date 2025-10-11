@@ -1,7 +1,7 @@
 //! Logical query plan structures for LLKV.
 //!
 //! This module defines the plan structures that represent logical query operations
-//! before they are executed. Plans are created by SQL parsers or DSL builders and
+//! before they are executed. Plans are created by SQL parsers or fluent builders and
 //! consumed by execution engines.
 
 use std::sync::Arc;
