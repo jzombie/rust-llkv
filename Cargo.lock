@@ -1311,6 +1311,7 @@ version = "0.2.0-alpha"
 dependencies = [
  "arrow",
  "async-trait",
+ "libtest-mimic 0.6.1",
  "llkv-column-map",
  "llkv-dsl",
  "llkv-expr",
@@ -2787,3 +2788,11 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[patch.unused]]
+name = "simd-r-drive"
+version = "0.14.0-alpha"
+
+[[patch.unused]]
+name = "simd-r-drive-entry-handle"
+version = "0.14.0-alpha"

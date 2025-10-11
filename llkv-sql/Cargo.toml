@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 arrow = { workspace = true, default-features = false }
+async-trait.workspace = true
+libtest-mimic.workspace = true
 llkv-column-map.workspace = true
 llkv-dsl.workspace = true
 llkv-result.workspace = true
@@ -16,15 +18,19 @@ llkv-storage.workspace = true
 llkv-expr.workspace = true
 llkv-table.workspace = true
 llkv-transaction.workspace = true
+llkv-test-utils = { workspace = true, features = ["auto-init"] }
 simd-r-drive-entry-handle.workspace = true
+sqllogictest.workspace = true
 sqlparser.workspace = true
 time = { workspace = true, features = ["parsing"] }
 tracing = { workspace = true }
 llkv-plan.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
-llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
-sqllogictest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[test]]
+name = "slt_harness"
+path = "tests/slt_harness.rs"
+harness = false
