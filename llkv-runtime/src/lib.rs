@@ -819,8 +819,8 @@ where
     pub fn new(pager: Arc<P>) -> Self {
         tracing::trace!("Context::new called, pager={:p}", &*pager);
         
-        // Load transaction state from catalog if it exists
-        let (next_txn_id, last_committed) = match ColumnStore::open(Arc::clone(&pager)) {
+        // Load transaction state and table registry from catalog if it exists
+        let (next_txn_id, last_committed, loaded_tables) = match ColumnStore::open(Arc::clone(&pager)) {
             Ok(store) => {
                 let catalog = SysCatalog::new(&store);
                 let next_txn_id = match catalog.get_next_txn_id() {
@@ -851,19 +851,156 @@ where
                         TXN_ID_AUTO_COMMIT
                     }
                 };
-                (next_txn_id, last_committed)
+                
+                // Load table registry from catalog
+                let loaded_tables = match catalog.all_table_metas() {
+                    Ok(metas) => {
+                        tracing::debug!("[CONTEXT] Loaded {} table(s) from catalog", metas.len());
+                        metas
+                    }
+                    Err(e) => {
+                        tracing::warn!("[CONTEXT] Failed to load table metas: {}, starting with empty registry", e);
+                        Vec::new()
+                    }
+                };
+                
+                (next_txn_id, last_committed, loaded_tables)
             }
             Err(e) => {
-                tracing::warn!("[CONTEXT] Failed to open ColumnStore: {}, using default transaction state", e);
-                (TXN_ID_AUTO_COMMIT + 1, TXN_ID_AUTO_COMMIT)
+                tracing::warn!("[CONTEXT] Failed to open ColumnStore: {}, using default state", e);
+                (TXN_ID_AUTO_COMMIT + 1, TXN_ID_AUTO_COMMIT, Vec::new())
             }
         };
         
         let transaction_manager = TransactionManager::new_with_initial_state(next_txn_id, last_committed);
         let txn_manager = transaction_manager.txn_manager();
+        
+        // Reconstruct table registry from loaded metadata
+        let mut tables = HashMap::new();
+        for (table_id, meta) in loaded_tables {
+            if let Some(ref name) = meta.name {
+                let canonical_name = name.to_ascii_lowercase();
+                
+                // Open the table and build ExecutorTable from it
+                match Table::new(table_id, Arc::clone(&pager)) {
+                    Ok(table) => {
+                        // Get schema from the table (includes row_id + user columns)
+                        match table.schema() {
+                            Ok(schema) => {
+                                // Build ExecutorSchema from Arrow schema (skip row_id field at index 0)
+                                let mut executor_columns = Vec::new();
+                                let mut lookup = HashMap::new();
+                                
+                                for (idx, field) in schema.fields().iter().enumerate().skip(1) {
+                                    // Get field_id from metadata
+                                    let field_id = field
+                                        .metadata()
+                                        .get(llkv_table::constants::FIELD_ID_META_KEY)
+                                        .and_then(|s| s.parse::<FieldId>().ok())
+                                        .unwrap_or((idx) as FieldId);
+                                    
+                                    let normalized = field.name().to_ascii_lowercase();
+                                    let col_idx = executor_columns.len();
+                                    lookup.insert(normalized, col_idx);
+                                    
+                                    executor_columns.push(ExecutorColumn {
+                                        name: field.name().to_string(),
+                                        data_type: field.data_type().clone(),
+                                        nullable: field.is_nullable(),
+                                        primary_key: false, // Not stored in schema metadata currently
+                                        field_id,
+                                    });
+                                }
+                                
+                                let exec_schema = Arc::new(ExecutorSchema {
+                                    columns: executor_columns,
+                                    lookup,
+                                });
+                                
+                                // Find the maximum row_id in the table to set next_row_id correctly
+                                let max_row_id = {
+                                    use llkv_column_map::store::scan::{
+                                        PrimitiveVisitor, PrimitiveWithRowIdsVisitor,
+                                        PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor,
+                                        ScanBuilder, ScanOptions
+                                    };
+                                    use llkv_column_map::store::rowid_fid;
+                                    use arrow::array::UInt64Array;
+                                    
+                                    struct MaxRowIdVisitor {
+                                        max: u64,
+                                    }
+                                    
+                                    impl PrimitiveVisitor for MaxRowIdVisitor {
+                                        fn u64_chunk(&mut self, values: &UInt64Array) {
+                                            for i in 0..values.len() {
+                                                let val = values.value(i);
+                                                if val > self.max {
+                                                    self.max = val;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    impl PrimitiveWithRowIdsVisitor for MaxRowIdVisitor {}
+                                    impl PrimitiveSortedVisitor for MaxRowIdVisitor {}
+                                    impl PrimitiveSortedWithRowIdsVisitor for MaxRowIdVisitor {}
+                                    
+                                    // Scan the row_id column for any user field in this table
+                                    let row_id_field = rowid_fid(LogicalFieldId::for_user(table_id, 1));
+                                    let mut visitor = MaxRowIdVisitor { max: 0 };
+                                    
+                                    match ScanBuilder::new(table.store(), row_id_field)
+                                        .options(ScanOptions::default())
+                                        .run(&mut visitor)
+                                    {
+                                        Ok(_) => visitor.max,
+                                        Err(llkv_result::Error::NotFound) => 0,
+                                        Err(e) => {
+                                            tracing::warn!("[CONTEXT] Failed to scan max row_id for table '{}': {}", name, e);
+                                            0
+                                        }
+                                    }
+                                };
+                                
+                                let next_row_id = if max_row_id > 0 {
+                                    max_row_id.saturating_add(1)
+                                } else {
+                                    0
+                                };
+                                
+                                tracing::debug!("[CONTEXT] Table '{}' max_row_id={}, next_row_id={}", 
+                                    name, max_row_id, next_row_id);
+                                
+                                let executor_table = ExecutorTable {
+                                    table: Arc::new(table),
+                                    schema: exec_schema,
+                                    next_row_id: AtomicU64::new(next_row_id),
+                                    // Set total_rows to 1 to force scanning (we don't know the actual count)
+                                    // This prevents the executor from returning empty results for loaded tables
+                                    // We use 1 instead of 0 to bypass the empty-table optimization
+                                    total_rows: AtomicU64::new(1),
+                                };
+                                
+                                tables.insert(canonical_name.clone(), Arc::new(executor_table));
+                                tracing::debug!("[CONTEXT] Registered table '{}' (id={}) with {} columns", 
+                                    name, table_id, schema.fields().len() - 1);
+                            }
+                            Err(e) => {
+                                tracing::warn!("[CONTEXT] Failed to load schema for table '{}': {}", name, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("[CONTEXT] Failed to open table '{}' (id={}): {}", name, table_id, e);
+                    }
+                }
+            }
+        }
+        
         Self {
             pager,
-            tables: RwLock::new(HashMap::new()),
+            tables: RwLock::new(tables),
             dropped_tables: RwLock::new(HashSet::new()),
             transaction_manager,
             txn_manager,

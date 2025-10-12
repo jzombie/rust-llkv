@@ -309,6 +309,77 @@ where
         Ok(Some(logical.table_id()))
     }
 
+    /// Scan all table metadata entries from the catalog.
+    /// Returns a vector of (table_id, TableMeta) pairs for all persisted tables.
+    /// 
+    /// This method first scans for all row IDs in the table metadata column,
+    /// then uses gather_rows to retrieve the actual metadata.
+    pub fn all_table_metas(&self) -> LlkvResult<Vec<(TableId, TableMeta)>> {
+        let meta_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_TABLE_META_ID);
+        let row_field = rowid_fid(meta_field);
+
+        // Collect all row IDs that have table metadata
+        struct RowIdCollector {
+            row_ids: Vec<u64>,
+        }
+        
+        impl PrimitiveVisitor for RowIdCollector {
+            fn u64_chunk(&mut self, values: &UInt64Array) {
+                for i in 0..values.len() {
+                    self.row_ids.push(values.value(i));
+                }
+            }
+        }
+        impl PrimitiveWithRowIdsVisitor for RowIdCollector {}
+        impl PrimitiveSortedVisitor for RowIdCollector {}
+        impl PrimitiveSortedWithRowIdsVisitor for RowIdCollector {}
+        
+        let mut collector = RowIdCollector { row_ids: Vec::new() };
+        match ScanBuilder::new(self.store, row_field)
+            .options(ScanOptions::default())
+            .run(&mut collector)
+        {
+            Ok(()) => {}
+            Err(llkv_result::Error::NotFound) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        }
+
+        if collector.row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Gather all table metadata using the collected row IDs
+        let batch = self.store.gather_rows(
+            &[meta_field],
+            &collector.row_ids,
+            GatherNullPolicy::IncludeNulls,
+        )?;
+
+        let meta_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal(
+                    "catalog table_meta column should be Binary".into(),
+                )
+            })?;
+
+        let mut result = Vec::new();
+        for (idx, &row_id) in collector.row_ids.iter().enumerate() {
+            if !meta_col.is_null(idx) {
+                let bytes = meta_col.value(idx);
+                if let Ok(meta) = bitcode::decode::<TableMeta>(bytes) {
+                    let logical: LogicalFieldId = row_id.into();
+                    let table_id = logical.table_id();
+                    result.push((table_id, meta));
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Persist the next transaction id to the catalog.
     pub fn put_next_txn_id(&self, next_txn_id: u64) -> LlkvResult<()> {
         let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_NEXT_TXN_ID).into();
