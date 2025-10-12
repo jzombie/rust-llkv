@@ -113,6 +113,9 @@ pub const CATALOG_NEXT_TXN_ROW_ID: RowId = 1;
 /// Row ID reserved for the catalog's last_committed_txn_id singleton.
 pub const CATALOG_LAST_COMMITTED_TXN_ROW_ID: RowId = 2;
 
+/// Row ID reserved for the catalog's catalog_state singleton.
+pub const CATALOG_STATE_ROW_ID: RowId = 3;
+
 /// Check if a row ID is reserved in the catalog table.
 /// User tables can use any row ID, but catalog table has reserved rows.
 #[inline]
@@ -120,6 +123,7 @@ pub fn is_reserved_catalog_row_id(id: RowId) -> bool {
     id == CATALOG_NEXT_TABLE_ROW_ID 
         || id == CATALOG_NEXT_TXN_ROW_ID 
         || id == CATALOG_LAST_COMMITTED_TXN_ROW_ID
+        || id == CATALOG_STATE_ROW_ID
 }
 
 /// Return the error message for attempting to use a reserved catalog row ID.
@@ -129,6 +133,7 @@ pub fn reserved_catalog_row_id_message(id: RowId) -> String {
         CATALOG_NEXT_TABLE_ROW_ID => "Row ID 0 is reserved for catalog's next_table_id".to_string(),
         CATALOG_NEXT_TXN_ROW_ID => "Row ID 1 is reserved for catalog's next_txn_id".to_string(),
         CATALOG_LAST_COMMITTED_TXN_ROW_ID => "Row ID 2 is reserved for catalog's last_committed_txn_id".to_string(),
+        CATALOG_STATE_ROW_ID => "Row ID 3 is reserved for catalog's catalog_state".to_string(),
         _ => format!("Row ID {} is reserved in catalog table", id),
     }
 }
@@ -152,6 +157,10 @@ pub const CATALOG_FIELD_NEXT_TXN_ID: u32 = 101;
 /// Catalog field for last committed transaction ID (UInt64).
 pub const CATALOG_FIELD_LAST_COMMITTED_TXN_ID: u32 = 102;
 
+/// Catalog field for complete catalog state (Binary-encoded CatalogState).
+/// Stores all table and field name→ID mappings for persistence.
+pub const CATALOG_FIELD_CATALOG_STATE: u32 = 103;
+
 /// Check if a field ID is used by the catalog's internal structure.
 #[inline]
 pub fn is_catalog_internal_field(id: u32) -> bool {
@@ -162,6 +171,7 @@ pub fn is_catalog_internal_field(id: u32) -> bool {
             | CATALOG_FIELD_NEXT_TABLE_ID
             | CATALOG_FIELD_NEXT_TXN_ID
             | CATALOG_FIELD_LAST_COMMITTED_TXN_ID
+            | CATALOG_FIELD_CATALOG_STATE
     )
 }
 
@@ -250,7 +260,8 @@ mod tests {
         assert!(is_reserved_catalog_row_id(CATALOG_NEXT_TABLE_ROW_ID));
         assert!(is_reserved_catalog_row_id(CATALOG_NEXT_TXN_ROW_ID));
         assert!(is_reserved_catalog_row_id(CATALOG_LAST_COMMITTED_TXN_ROW_ID));
-        assert!(!is_reserved_catalog_row_id(3));
+        assert!(is_reserved_catalog_row_id(CATALOG_STATE_ROW_ID));
+        assert!(!is_reserved_catalog_row_id(4));
         assert!(!is_reserved_catalog_row_id(100));
     }
 
@@ -270,6 +281,7 @@ mod tests {
         assert!(is_catalog_internal_field(CATALOG_FIELD_NEXT_TABLE_ID));
         assert!(is_catalog_internal_field(CATALOG_FIELD_NEXT_TXN_ID));
         assert!(is_catalog_internal_field(CATALOG_FIELD_LAST_COMMITTED_TXN_ID));
+        assert!(is_catalog_internal_field(CATALOG_FIELD_CATALOG_STATE));
         assert!(!is_catalog_internal_field(2));
         assert!(!is_catalog_internal_field(200));
     }

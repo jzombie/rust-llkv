@@ -331,6 +331,114 @@ impl Catalog {
             Err(_) => 0,
         }
     }
+
+    /// Export catalog state for persistence.
+    ///
+    /// Returns a serializable representation of the entire catalog state,
+    /// including all table and field mappings.
+    ///
+    /// # Returns
+    ///
+    /// `CatalogState` containing all tables, fields, and next ID counters.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let state = catalog.export_state();
+    /// // ... serialize state to disk ...
+    /// let restored_catalog = Catalog::from_state(state)?;
+    /// ```
+    pub fn export_state(&self) -> CatalogState {
+        let inner = match self.inner.read() {
+            Ok(inner) => inner,
+            Err(_) => {
+                return CatalogState {
+                    tables: Vec::new(),
+                    next_table_id: 1,
+                }
+            }
+        };
+
+        let mut tables = Vec::new();
+
+        for (&table_id, meta) in &inner.table_id_to_meta {
+            let field_state = meta.field_resolver.export_state();
+            tables.push(TableState {
+                table_id,
+                display_name: meta.display_name.clone(),
+                canonical_name: meta.canonical_name.clone(),
+                fields: field_state.fields,
+                next_field_id: field_state.next_field_id,
+            });
+        }
+
+        CatalogState {
+            tables,
+            next_table_id: inner.next_table_id,
+        }
+    }
+
+    /// Restore catalog from persisted state.
+    ///
+    /// Creates a new catalog instance with all table and field mappings
+    /// restored from the provided state.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - Previously exported catalog state
+    ///
+    /// # Returns
+    ///
+    /// A fully restored `Catalog` instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::CatalogError` if state is invalid (e.g., duplicate names/IDs).
+    pub fn from_state(state: CatalogState) -> Result<Self> {
+        let mut table_name_to_id = FxHashMap::default();
+        let mut table_id_to_meta = FxHashMap::default();
+
+        for table_state in state.tables {
+            // Check for duplicate table IDs
+            if table_id_to_meta.contains_key(&table_state.table_id) {
+                return Err(Error::CatalogError(format!(
+                    "Duplicate table_id {} in catalog state",
+                    table_state.table_id
+                )));
+            }
+
+            // Check for duplicate table names
+            if table_name_to_id.contains_key(&table_state.canonical_name) {
+                return Err(Error::CatalogError(format!(
+                    "Duplicate table name '{}' in catalog state",
+                    table_state.display_name
+                )));
+            }
+
+            // Restore field resolver
+            let field_resolver = FieldResolver::from_state(FieldResolverState {
+                fields: table_state.fields,
+                next_field_id: table_state.next_field_id,
+            })?;
+
+            let metadata = TableMetadata {
+                display_name: table_state.display_name,
+                canonical_name: table_state.canonical_name.clone(),
+                field_resolver,
+            };
+
+            table_name_to_id.insert(table_state.canonical_name, table_state.table_id);
+            table_id_to_meta.insert(table_state.table_id, metadata);
+        }
+
+        Ok(Self {
+            inner: Arc::new(RwLock::new(CatalogInner {
+                table_name_to_id,
+                table_id_to_meta,
+                next_table_id: state.next_table_id,
+            })),
+        })
+    }
 }
 
 impl Default for Catalog {
@@ -560,12 +668,131 @@ impl FieldResolver {
             Err(_) => Vec::new(),
         }
     }
+
+    /// Export field resolver state for persistence.
+    ///
+    /// Returns a serializable representation of all field mappings.
+    pub fn export_state(&self) -> FieldResolverState {
+        let inner = match self.inner.read() {
+            Ok(inner) => inner,
+            Err(_) => {
+                return FieldResolverState {
+                    fields: Vec::new(),
+                    next_field_id: 3,
+                }
+            }
+        };
+
+        let mut fields = Vec::new();
+        for (&field_id, display_name) in &inner.field_id_to_name {
+            let canonical_name = display_name.to_ascii_lowercase();
+            fields.push(FieldState {
+                field_id,
+                display_name: display_name.clone(),
+                canonical_name,
+            });
+        }
+
+        FieldResolverState {
+            fields,
+            next_field_id: inner.next_field_id,
+        }
+    }
+
+    /// Restore field resolver from persisted state.
+    ///
+    /// Creates a new field resolver instance with all field mappings
+    /// restored from the provided state.
+    pub fn from_state(state: FieldResolverState) -> Result<Self> {
+        let mut field_name_to_id = FxHashMap::default();
+        let mut field_id_to_name = FxHashMap::default();
+
+        for field_state in state.fields {
+            // Check for duplicate field IDs
+            if field_id_to_name.contains_key(&field_state.field_id) {
+                return Err(Error::CatalogError(format!(
+                    "Duplicate field_id {} in field resolver state",
+                    field_state.field_id
+                )));
+            }
+
+            // Check for duplicate field names
+            if field_name_to_id.contains_key(&field_state.canonical_name) {
+                return Err(Error::CatalogError(format!(
+                    "Duplicate field name '{}' in field resolver state",
+                    field_state.display_name
+                )));
+            }
+
+            field_name_to_id.insert(field_state.canonical_name, field_state.field_id);
+            field_id_to_name.insert(field_state.field_id, field_state.display_name);
+        }
+
+        Ok(Self {
+            inner: Arc::new(RwLock::new(FieldResolverInner {
+                field_name_to_id,
+                field_id_to_name,
+                next_field_id: state.next_field_id,
+            })),
+        })
+    }
 }
 
 impl Default for FieldResolver {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ============================================================================
+// Persistence Types
+// ============================================================================
+
+/// Serializable catalog state for persistence.
+///
+/// This structure contains all information needed to restore a catalog
+/// from disk, including all table and field mappings.
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
+pub struct CatalogState {
+    /// All registered tables with their field resolvers
+    pub tables: Vec<TableState>,
+    /// Next table ID to assign
+    pub next_table_id: TableId,
+}
+
+/// Serializable table state.
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
+pub struct TableState {
+    /// The table's unique ID
+    pub table_id: TableId,
+    /// Display name (preserves original case)
+    pub display_name: String,
+    /// Canonical name (lowercase)
+    pub canonical_name: String,
+    /// All fields in this table
+    pub fields: Vec<FieldState>,
+    /// Next field ID to assign
+    pub next_field_id: FieldId,
+}
+
+/// Serializable field resolver state.
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
+pub struct FieldResolverState {
+    /// All fields in this resolver
+    pub fields: Vec<FieldState>,
+    /// Next field ID to assign
+    pub next_field_id: FieldId,
+}
+
+/// Serializable field state.
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
+pub struct FieldState {
+    /// The field's unique ID
+    pub field_id: FieldId,
+    /// Display name (preserves original case)
+    pub display_name: String,
+    /// Canonical name (lowercase)
+    pub canonical_name: String,
 }
 
 #[cfg(test)]
@@ -755,5 +982,164 @@ mod tests {
         assert!(!resolver.field_exists("email"));
 
         assert_eq!(resolver.field_count(), 1);
+    }
+
+    #[test]
+    fn test_catalog_persistence_export_import() {
+        let catalog = Catalog::new();
+
+        // Register tables with fields
+        let users_id = catalog.register_table("Users").unwrap();
+        let orders_id = catalog.register_table("Orders").unwrap();
+
+        let users_resolver = catalog.field_resolver(users_id).unwrap();
+        let name_fid = users_resolver.register_field("name").unwrap();
+        let email_fid = users_resolver.register_field("Email").unwrap();
+
+        let orders_resolver = catalog.field_resolver(orders_id).unwrap();
+        let product_fid = orders_resolver.register_field("product").unwrap();
+        let qty_fid = orders_resolver.register_field("quantity").unwrap();
+
+        // Export state
+        let state = catalog.export_state();
+        assert_eq!(state.tables.len(), 2);
+        assert!(state.next_table_id > orders_id);
+
+        // Restore from state
+        let restored_catalog = Catalog::from_state(state).unwrap();
+
+        // Verify tables
+        assert_eq!(restored_catalog.table_id("users"), Some(users_id));
+        assert_eq!(restored_catalog.table_id("orders"), Some(orders_id));
+        assert_eq!(
+            restored_catalog.table_name(users_id),
+            Some("Users".to_string())
+        );
+        assert_eq!(
+            restored_catalog.table_name(orders_id),
+            Some("Orders".to_string())
+        );
+
+        // Verify fields
+        let restored_users_resolver = restored_catalog.field_resolver(users_id).unwrap();
+        assert_eq!(restored_users_resolver.field_id("name"), Some(name_fid));
+        assert_eq!(restored_users_resolver.field_id("email"), Some(email_fid));
+        assert_eq!(
+            restored_users_resolver.field_name(name_fid),
+            Some("name".to_string())
+        );
+        assert_eq!(
+            restored_users_resolver.field_name(email_fid),
+            Some("Email".to_string())
+        );
+
+        let restored_orders_resolver = restored_catalog.field_resolver(orders_id).unwrap();
+        assert_eq!(restored_orders_resolver.field_id("product"), Some(product_fid));
+        assert_eq!(
+            restored_orders_resolver.field_id("quantity"),
+            Some(qty_fid)
+        );
+    }
+
+    #[test]
+    fn test_catalog_persistence_id_stability() {
+        let catalog = Catalog::new();
+
+        // Register tables
+        let table1_id = catalog.register_table("Table1").unwrap();
+        let table2_id = catalog.register_table("Table2").unwrap();
+
+        // Export and restore
+        let state = catalog.export_state();
+        let restored = Catalog::from_state(state).unwrap();
+
+        // IDs should be stable
+        assert_eq!(restored.table_id("table1"), Some(table1_id));
+        assert_eq!(restored.table_id("table2"), Some(table2_id));
+
+        // New registrations should continue from saved counter
+        let table3_id = restored.register_table("Table3").unwrap();
+        assert!(table3_id > table2_id);
+    }
+
+    #[test]
+    fn test_field_resolver_persistence() {
+        let resolver = FieldResolver::new();
+
+        let fid1 = resolver.register_field("field1").unwrap();
+        let fid2 = resolver.register_field("Field2").unwrap();
+        let fid3 = resolver.register_field("FIELD3").unwrap();
+
+        // Export state
+        let state = resolver.export_state();
+        assert_eq!(state.fields.len(), 3);
+
+        // Restore from state
+        let restored = FieldResolver::from_state(state).unwrap();
+
+        // Verify case-insensitive lookups work
+        assert_eq!(restored.field_id("field1"), Some(fid1));
+        assert_eq!(restored.field_id("FIELD1"), Some(fid1));
+        assert_eq!(restored.field_id("field2"), Some(fid2));
+        assert_eq!(restored.field_id("field3"), Some(fid3));
+
+        // Verify display names preserved
+        assert_eq!(restored.field_name(fid1), Some("field1".to_string()));
+        assert_eq!(restored.field_name(fid2), Some("Field2".to_string()));
+        assert_eq!(restored.field_name(fid3), Some("FIELD3".to_string()));
+
+        // New registrations should continue from saved counter
+        let fid4 = restored.register_field("field4").unwrap();
+        assert!(fid4 > fid3);
+    }
+
+    #[test]
+    fn test_catalog_persistence_error_duplicate_table_id() {
+        let state = CatalogState {
+            tables: vec![
+                TableState {
+                    table_id: 1,
+                    display_name: "Table1".to_string(),
+                    canonical_name: "table1".to_string(),
+                    fields: Vec::new(),
+                    next_field_id: 3,
+                },
+                TableState {
+                    table_id: 1, // Duplicate!
+                    display_name: "Table2".to_string(),
+                    canonical_name: "table2".to_string(),
+                    fields: Vec::new(),
+                    next_field_id: 3,
+                },
+            ],
+            next_table_id: 3,
+        };
+
+        assert!(Catalog::from_state(state).is_err());
+    }
+
+    #[test]
+    fn test_catalog_persistence_error_duplicate_table_name() {
+        let state = CatalogState {
+            tables: vec![
+                TableState {
+                    table_id: 1,
+                    display_name: "Table1".to_string(),
+                    canonical_name: "table1".to_string(),
+                    fields: Vec::new(),
+                    next_field_id: 3,
+                },
+                TableState {
+                    table_id: 2,
+                    display_name: "TABLE1".to_string(), // Duplicate (case-insensitive)
+                    canonical_name: "table1".to_string(),
+                    fields: Vec::new(),
+                    next_field_id: 3,
+                },
+            ],
+            next_table_id: 3,
+        };
+
+        assert!(Catalog::from_state(state).is_err());
     }
 }
