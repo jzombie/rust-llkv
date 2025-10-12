@@ -28,7 +28,7 @@
 //! - No manual MVCC layer manipulation required
 
 use arrow::array::{Array, Int64Array, StringArray};
-use llkv_runtime::{Context, StatementResult};
+use llkv_runtime::{RuntimeContext, RuntimeStatementResult};
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::simd_r_drive_pager::SimdRDrivePager;
 use std::sync::Arc;
@@ -40,7 +40,7 @@ fn create_engine_with_file(path: &std::path::Path) -> SqlEngine<SimdRDrivePager>
         SimdRDrivePager::open(path)
             .expect("Failed to open SimdRDrivePager"),
     );
-    let context = Arc::new(Context::new(pager));
+    let context = Arc::new(RuntimeContext::new(pager));
     SqlEngine::with_context(context, false)
 }
 
@@ -49,7 +49,7 @@ fn select_int64_values(engine: &SqlEngine<SimdRDrivePager>, sql: &str) -> Vec<Op
     let mut results = engine.execute(sql).expect("SELECT failed");
     assert_eq!(results.len(), 1, "Expected exactly one result");
     
-    if let StatementResult::Select { execution, .. } = results.remove(0) {
+    if let RuntimeStatementResult::Select { execution, .. } = results.remove(0) {
         let batches = execution.collect().expect("Failed to collect batches");
         let mut values = Vec::new();
         
@@ -80,7 +80,7 @@ fn select_string_values(engine: &SqlEngine<SimdRDrivePager>, sql: &str) -> Vec<O
     let mut results = engine.execute(sql).expect("SELECT failed");
     assert_eq!(results.len(), 1, "Expected exactly one result");
     
-    if let StatementResult::Select { execution, .. } = results.remove(0) {
+    if let RuntimeStatementResult::Select { execution, .. } = results.remove(0) {
         let batches = execution.collect().expect("Failed to collect batches");
         let mut values = Vec::new();
         
