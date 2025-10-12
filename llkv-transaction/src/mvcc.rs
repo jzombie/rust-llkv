@@ -30,12 +30,20 @@ struct TxnIdManagerInner {
 
 impl TxnIdManagerInner {
     fn new() -> Self {
+        Self::new_with_initial_txn_id(TXN_ID_AUTO_COMMIT + 1)
+    }
+
+    fn new_with_initial_txn_id(next_txn_id: TxnId) -> Self {
+        Self::new_with_initial_state(next_txn_id, TXN_ID_AUTO_COMMIT)
+    }
+
+    fn new_with_initial_state(next_txn_id: TxnId, last_committed: TxnId) -> Self {
         let mut statuses = HashMap::new();
         statuses.insert(TXN_ID_AUTO_COMMIT, TxnStatus::Committed);
 
         Self {
-            next_txn_id: AtomicU64::new(TXN_ID_AUTO_COMMIT + 1),
-            last_committed: AtomicU64::new(TXN_ID_AUTO_COMMIT),
+            next_txn_id: AtomicU64::new(next_txn_id),
+            last_committed: AtomicU64::new(last_committed),
             statuses: Mutex::new(statuses),
         }
     }
@@ -53,6 +61,27 @@ impl TxnIdManager {
         Self {
             inner: Arc::new(TxnIdManagerInner::new()),
         }
+    }
+
+    /// Create a new manager with a custom initial transaction ID.
+    /// Used when loading persisted state from the catalog.
+    pub fn new_with_initial_txn_id(next_txn_id: TxnId) -> Self {
+        Self {
+            inner: Arc::new(TxnIdManagerInner::new_with_initial_txn_id(next_txn_id)),
+        }
+    }
+
+    /// Create a new manager with custom initial state.
+    /// Used when loading persisted state from the catalog.
+    pub fn new_with_initial_state(next_txn_id: TxnId, last_committed: TxnId) -> Self {
+        Self {
+            inner: Arc::new(TxnIdManagerInner::new_with_initial_state(next_txn_id, last_committed)),
+        }
+    }
+
+    /// Get the current next_txn_id value (for persistence).
+    pub fn current_next_txn_id(&self) -> TxnId {
+        self.inner.next_txn_id.load(Ordering::SeqCst)
     }
 
     /// Begin a new transaction and return its snapshot.

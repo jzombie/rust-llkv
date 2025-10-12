@@ -964,6 +964,24 @@ where
         }
     }
 
+    /// Create a new TransactionManager with a custom initial transaction ID.
+    pub fn new_with_initial_txn_id(next_txn_id: TxnId) -> Self {
+        Self {
+            transactions: Arc::new(Mutex::new(HashMap::new())),
+            next_session_id: AtomicU64::new(1),
+            txn_manager: Arc::new(TxnIdManager::new_with_initial_txn_id(next_txn_id)),
+        }
+    }
+
+    /// Create a new TransactionManager with custom initial state.
+    pub fn new_with_initial_state(next_txn_id: TxnId, last_committed: TxnId) -> Self {
+        Self {
+            transactions: Arc::new(Mutex::new(HashMap::new())),
+            next_session_id: AtomicU64::new(1),
+            txn_manager: Arc::new(TxnIdManager::new_with_initial_state(next_txn_id, last_committed)),
+        }
+    }
+
     /// Create a new session for transaction management.
     pub fn create_session(&self, context: Arc<BaseCtx>) -> TransactionSession<BaseCtx, StagingCtx> {
         let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);

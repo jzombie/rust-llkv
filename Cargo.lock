@@ -1400,6 +1400,7 @@ dependencies = [
  "llkv-test-utils",
  "rustc-hash",
  "simd-r-drive-entry-handle",
+ "tempfile",
  "tracing",
 ]
 

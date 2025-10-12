@@ -38,6 +38,14 @@ const CATALOG_FIELD_COL_META_ID: u32 = 10;
 const CATALOG_FIELD_NEXT_TABLE_ID: u32 = 100;
 /// Row id reserved for the singleton next-table-id value.
 const CATALOG_NEXT_TABLE_ROW_ID: u64 = 0;
+/// Field id for the next transaction id (the cell value is persisted as `UInt64`).
+const CATALOG_FIELD_NEXT_TXN_ID: u32 = 101;
+/// Row id reserved for the singleton next-txn-id value.
+const CATALOG_NEXT_TXN_ROW_ID: u64 = 1;
+/// Field id for the last committed transaction id (the cell value is persisted as `UInt64`).
+const CATALOG_FIELD_LAST_COMMITTED_TXN_ID: u32 = 102;
+/// Row id reserved for the singleton last-committed-txn-id value.
+const CATALOG_LAST_COMMITTED_TXN_ROW_ID: u64 = 2;
 
 // ----- Namespacing helpers -----
 
@@ -299,6 +307,110 @@ where
 
         let logical: LogicalFieldId = max_value.into();
         Ok(Some(logical.table_id()))
+    }
+
+    /// Persist the next transaction id to the catalog.
+    pub fn put_next_txn_id(&self, next_txn_id: u64) -> LlkvResult<()> {
+        let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_NEXT_TXN_ID).into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("next_txn_id", DataType::UInt64, false).with_metadata(HashMap::from([(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            )])),
+        ]));
+
+        let row_id = Arc::new(UInt64Array::from(vec![CATALOG_NEXT_TXN_ROW_ID]));
+        let value_array = Arc::new(UInt64Array::from(vec![next_txn_id]));
+        let batch = RecordBatch::try_new(schema, vec![row_id, value_array])?;
+        self.store.append(&batch)?;
+        Ok(())
+    }
+
+    /// Load the next transaction id from the catalog.
+    pub fn get_next_txn_id(&self) -> LlkvResult<Option<u64>> {
+        let lfid = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_NEXT_TXN_ID);
+        let batch = match self.store.gather_rows(
+            &[lfid],
+            &[CATALOG_NEXT_TXN_ROW_ID],
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(batch) => batch,
+            Err(llkv_result::Error::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        if batch.num_columns() == 0 || batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal(
+                    "catalog next_txn_id column stored unexpected type".into(),
+                )
+            })?;
+        if array.is_empty() || array.is_null(0) {
+            return Ok(None);
+        }
+
+        let value = array.value(0);
+        Ok(Some(value))
+    }
+
+    /// Persist the last committed transaction id to the catalog.
+    pub fn put_last_committed_txn_id(&self, last_committed: u64) -> LlkvResult<()> {
+        let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_LAST_COMMITTED_TXN_ID).into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("last_committed_txn_id", DataType::UInt64, false).with_metadata(HashMap::from([(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            )])),
+        ]));
+
+        let row_id = Arc::new(UInt64Array::from(vec![CATALOG_LAST_COMMITTED_TXN_ROW_ID]));
+        let value_array = Arc::new(UInt64Array::from(vec![last_committed]));
+        let batch = RecordBatch::try_new(schema, vec![row_id, value_array])?;
+        self.store.append(&batch)?;
+        Ok(())
+    }
+
+    /// Load the last committed transaction id from the catalog.
+    pub fn get_last_committed_txn_id(&self) -> LlkvResult<Option<u64>> {
+        let lfid = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_LAST_COMMITTED_TXN_ID);
+        let batch = match self.store.gather_rows(
+            &[lfid],
+            &[CATALOG_LAST_COMMITTED_TXN_ROW_ID],
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(batch) => batch,
+            Err(llkv_result::Error::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        if batch.num_columns() == 0 || batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal(
+                    "catalog last_committed_txn_id column stored unexpected type".into(),
+                )
+            })?;
+        if array.is_empty() || array.is_null(0) {
+            return Ok(None);
+        }
+
+        let value = array.value(0);
+        Ok(Some(value))
     }
 }
 

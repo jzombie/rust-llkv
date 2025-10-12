@@ -406,6 +406,15 @@ where
         let default_snapshot = base_ctx.ctx().default_snapshot();
         TransactionContext::set_snapshot(&**base_ctx, default_snapshot);
 
+        // Persist the next_txn_id to the catalog after a successful commit
+        if matches!(kind, TransactionKind::Commit) {
+            let ctx = base_ctx.ctx();
+            let next_txn_id = ctx.txn_manager().current_next_txn_id();
+            if let Err(e) = ctx.persist_next_txn_id(next_txn_id) {
+                tracing::warn!("[COMMIT] Failed to persist next_txn_id: {}", e);
+            }
+        }
+
         // Return a StatementResult with the correct kind (Commit or Rollback)
         Ok(StatementResult::Transaction { kind })
     }
@@ -809,7 +818,48 @@ where
 {
     pub fn new(pager: Arc<P>) -> Self {
         tracing::trace!("Context::new called, pager={:p}", &*pager);
-        let transaction_manager = TransactionManager::new();
+        
+        // Load transaction state from catalog if it exists
+        let (next_txn_id, last_committed) = match ColumnStore::open(Arc::clone(&pager)) {
+            Ok(store) => {
+                let catalog = SysCatalog::new(&store);
+                let next_txn_id = match catalog.get_next_txn_id() {
+                    Ok(Some(id)) => {
+                        tracing::debug!("[CONTEXT] Loaded next_txn_id={} from catalog", id);
+                        id
+                    }
+                    Ok(None) => {
+                        tracing::debug!("[CONTEXT] No persisted next_txn_id found, starting from default");
+                        TXN_ID_AUTO_COMMIT + 1
+                    }
+                    Err(e) => {
+                        tracing::warn!("[CONTEXT] Failed to load next_txn_id: {}, using default", e);
+                        TXN_ID_AUTO_COMMIT + 1
+                    }
+                };
+                let last_committed = match catalog.get_last_committed_txn_id() {
+                    Ok(Some(id)) => {
+                        tracing::debug!("[CONTEXT] Loaded last_committed={} from catalog", id);
+                        id
+                    }
+                    Ok(None) => {
+                        tracing::debug!("[CONTEXT] No persisted last_committed found, starting from default");
+                        TXN_ID_AUTO_COMMIT
+                    }
+                    Err(e) => {
+                        tracing::warn!("[CONTEXT] Failed to load last_committed: {}, using default", e);
+                        TXN_ID_AUTO_COMMIT
+                    }
+                };
+                (next_txn_id, last_committed)
+            }
+            Err(e) => {
+                tracing::warn!("[CONTEXT] Failed to open ColumnStore: {}, using default transaction state", e);
+                (TXN_ID_AUTO_COMMIT + 1, TXN_ID_AUTO_COMMIT)
+            }
+        };
+        
+        let transaction_manager = TransactionManager::new_with_initial_state(next_txn_id, last_committed);
         let txn_manager = transaction_manager.txn_manager();
         Self {
             pager,
@@ -823,6 +873,17 @@ where
     /// Return the transaction ID manager shared with sessions.
     pub fn txn_manager(&self) -> Arc<TxnIdManager> {
         Arc::clone(&self.txn_manager)
+    }
+
+    /// Persist the next_txn_id to the catalog.
+    pub fn persist_next_txn_id(&self, next_txn_id: TxnId) -> Result<()> {
+        let store = ColumnStore::open(Arc::clone(&self.pager))?;
+        let catalog = SysCatalog::new(&store);
+        catalog.put_next_txn_id(next_txn_id)?;
+        let last_committed = self.txn_manager.last_committed();
+        catalog.put_last_committed_txn_id(last_committed)?;
+        tracing::debug!("[CONTEXT] Persisted next_txn_id={}, last_committed={}", next_txn_id, last_committed);
+        Ok(())
     }
 
     /// Construct the default snapshot for auto-commit operations.
