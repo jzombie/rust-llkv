@@ -2743,14 +2743,16 @@ where
             0
         };
         
+        // Get the actual persisted row count from table metadata
+        // This is an O(1) catalog lookup that reads ColumnDescriptor.total_row_count
+        // Fallback to 0 for truly empty tables
+        let total_rows = table.total_rows().unwrap_or(0);
+        
         let executor_table = Arc::new(ExecutorTable {
             table: Arc::new(table),
             schema: exec_schema,
             next_row_id: AtomicU64::new(next_row_id),
-            // Set total_rows to 1 to force scanning (we don't know the actual count)
-            // This prevents the executor from returning empty results for loaded tables
-            // We use 1 instead of 0 to bypass the empty-table optimization
-            total_rows: AtomicU64::new(1),
+            total_rows: AtomicU64::new(total_rows),
         });
         
         // Cache the loaded table
