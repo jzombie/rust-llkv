@@ -80,7 +80,7 @@ impl TxnIdManager {
     }
 
     /// Legacy helper that only returns the allocated transaction ID.
-    /// Prefer [`begin_transaction`] when a snapshot is required.
+    /// Prefer [`TxnIdManager::begin_transaction`] when a snapshot is required.
     pub fn next_txn_id(&self) -> TxnId {
         self.begin_transaction().txn_id
     }
