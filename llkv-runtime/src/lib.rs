@@ -62,6 +62,92 @@ use llkv_transaction::TransactionSession;
 
 // Note: Session is the high-level wrapper that users should use instead of the lower-level session API
 
+/// Helper functions for MVCC column injection.
+///
+/// These functions consolidate the repeated logic for adding MVCC metadata columns
+/// (row_id, created_by, deleted_by) to RecordBatches.
+mod mvcc_columns {
+    use super::*;
+    use std::collections::HashMap;
+    
+    /// Build MVCC columns (row_id, created_by, deleted_by) for INSERT operations.
+    ///
+    /// Returns (row_id_array, created_by_array, deleted_by_array) and updates next_row_id.
+    pub(crate) fn build_insert_mvcc_columns(
+        row_count: usize,
+        start_row_id: u64,
+        creator_txn_id: TxnId,
+    ) -> (ArrayRef, ArrayRef, ArrayRef) {
+        let mut row_builder = UInt64Builder::with_capacity(row_count);
+        for offset in 0..row_count {
+            row_builder.append_value(start_row_id + offset as u64);
+        }
+        
+        let mut created_builder = UInt64Builder::with_capacity(row_count);
+        let mut deleted_builder = UInt64Builder::with_capacity(row_count);
+        for _ in 0..row_count {
+            created_builder.append_value(creator_txn_id);
+            deleted_builder.append_value(TXN_ID_NONE);
+        }
+        
+        (
+            Arc::new(row_builder.finish()) as ArrayRef,
+            Arc::new(created_builder.finish()) as ArrayRef,
+            Arc::new(deleted_builder.finish()) as ArrayRef,
+        )
+    }
+    
+    /// Build MVCC field definitions (row_id, created_by, deleted_by).
+    ///
+    /// Returns the three Field definitions that should be prepended to user columns.
+    pub(crate) fn build_mvcc_fields() -> Vec<Field> {
+        vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new(CREATED_BY_COLUMN_NAME, DataType::UInt64, false),
+            Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false),
+        ]
+    }
+    
+    /// Build field with field_id metadata for a user column.
+    pub(crate) fn build_field_with_metadata(
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        field_id: FieldId,
+    ) -> Field {
+        let mut metadata = FxHashMap::with_capacity_and_hasher(1, Default::default());
+        metadata.insert(
+            llkv_table::constants::FIELD_ID_META_KEY.to_string(),
+            field_id.to_string(),
+        );
+        Field::new(name, data_type, nullable)
+            .with_metadata(metadata.into_iter().collect::<HashMap<String, String>>())
+    }
+    
+    /// Build DELETE batch with row_id and deleted_by columns.
+    ///
+    /// This creates a minimal RecordBatch for marking rows as deleted.
+    pub(crate) fn build_delete_batch(
+        row_ids: Vec<u64>,
+        deleted_by_txn_id: TxnId,
+    ) -> llkv_result::Result<RecordBatch> {
+        let row_count = row_ids.len();
+        
+        let fields = vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false),
+        ];
+        
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(row_ids)),
+            Arc::new(UInt64Array::from(vec![deleted_by_txn_id; row_count])),
+        ];
+        
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(Error::Arrow)
+    }
+}
+
 /// Result of running a plan statement.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
@@ -1388,15 +1474,13 @@ where
                 &visible_row_ids,
                 GatherNullPolicy::IncludeNulls,
             )?;
-            let mut metadata = FxHashMap::with_capacity_and_hasher(1, Default::default());
-            metadata.insert(
-                llkv_table::constants::FIELD_ID_META_KEY.to_string(),
-                column.field_id.to_string(),
+            let field = mvcc_columns::build_field_with_metadata(
+                &column.name,
+                column.data_type.clone(),
+                column.nullable,
+                column.field_id,
             );
-            fields.push(
-                Field::new(&column.name, column.data_type.clone(), column.nullable)
-                    .with_metadata(metadata.into_iter().collect()),
-            );
+            fields.push(field);
             arrays.push(gathered.column(0).clone());
         }
 
@@ -1734,36 +1818,26 @@ where
             next_row_id += row_count as u64;
             total_rows += row_count as u64;
 
-            let mut row_builder = UInt64Builder::with_capacity(row_count);
-            for offset in 0..row_count {
-                row_builder.append_value(start_row + offset as u64);
-            }
+            // Build MVCC columns using helper
+            let (row_id_array, created_by_array, deleted_by_array) = 
+                mvcc_columns::build_insert_mvcc_columns(row_count, start_row, creator_txn_id);
 
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_defs.len() + 3);
-            arrays.push(Arc::new(row_builder.finish()) as ArrayRef);
+            arrays.push(row_id_array);
+            arrays.push(created_by_array);
+            arrays.push(deleted_by_array);
 
-            let mut created_builder = UInt64Builder::with_capacity(row_count);
-            let mut deleted_builder = UInt64Builder::with_capacity(row_count);
-            for _ in 0..row_count {
-                created_builder.append_value(creator_txn_id);
-                deleted_builder.append_value(TXN_ID_NONE);
-            }
-            arrays.push(Arc::new(created_builder.finish()) as ArrayRef);
-            arrays.push(Arc::new(deleted_builder.finish()) as ArrayRef);
-
+            // Build schema fields
             let mut fields: Vec<Field> = Vec::with_capacity(column_defs.len() + 3);
-            fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
-            fields.push(Field::new(CREATED_BY_COLUMN_NAME, DataType::UInt64, false));
-            fields.push(Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false));
+            fields.extend(mvcc_columns::build_mvcc_fields());
 
             for (idx, column) in column_defs.iter().enumerate() {
-                let mut metadata = FxHashMap::with_capacity_and_hasher(1, Default::default());
-                metadata.insert(
-                    llkv_table::constants::FIELD_ID_META_KEY.to_string(),
-                    column.field_id.to_string(),
+                let field = mvcc_columns::build_field_with_metadata(
+                    &column.name,
+                    column.data_type.clone(),
+                    column.nullable,
+                    column.field_id,
                 );
-                let field = Field::new(&column.name, column.data_type.clone(), column.nullable)
-                    .with_metadata(metadata.into_iter().collect());
                 fields.push(field);
                 arrays.push(batch.column(idx).clone());
             }
@@ -2000,44 +2074,28 @@ where
             }
         }
 
-        let mut row_id_builder = UInt64Builder::with_capacity(row_count);
         let start_row = table.next_row_id.load(Ordering::SeqCst);
-        for offset in 0..row_count {
-            row_id_builder.append_value(start_row + offset as u64);
-        }
+        
+        // Build MVCC columns using helper
+        let (row_id_array, created_by_array, deleted_by_array) = 
+            mvcc_columns::build_insert_mvcc_columns(row_count, start_row, snapshot.txn_id);
 
-        // MVCC: Build transaction ID columns
-        let mut created_by_builder = UInt64Builder::with_capacity(row_count);
-        let mut deleted_by_builder = UInt64Builder::with_capacity(row_count);
-        for _ in 0..row_count {
-            created_by_builder.append_value(snapshot.txn_id);
-            deleted_by_builder.append_value(TXN_ID_NONE);
-        }
-
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_values.len() + 3); // +3 for row_id, created_by, deleted_by
-        let row_id_array: ArrayRef = Arc::new(row_id_builder.finish());
-        let created_by_array: ArrayRef = Arc::new(created_by_builder.finish());
-        let deleted_by_array: ArrayRef = Arc::new(deleted_by_builder.finish());
-
-        arrays.push(Arc::clone(&row_id_array));
-        arrays.push(Arc::clone(&created_by_array));
-        arrays.push(Arc::clone(&deleted_by_array));
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_values.len() + 3);
+        arrays.push(row_id_array);
+        arrays.push(created_by_array);
+        arrays.push(deleted_by_array);
 
         let mut fields: Vec<Field> = Vec::with_capacity(column_values.len() + 3);
-        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
-
-        fields.push(Field::new(CREATED_BY_COLUMN_NAME, DataType::UInt64, false));
-        fields.push(Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false));
+        fields.extend(mvcc_columns::build_mvcc_fields());
 
         for (column, values) in table.schema.columns.iter().zip(column_values.into_iter()) {
             let array = build_array_for_column(&column.data_type, &values)?;
-            let mut metadata = FxHashMap::with_capacity_and_hasher(1, Default::default());
-            metadata.insert(
-                llkv_table::constants::FIELD_ID_META_KEY.to_string(),
-                column.field_id.to_string(),
+            let field = mvcc_columns::build_field_with_metadata(
+                &column.name,
+                column.data_type.clone(),
+                column.nullable,
+                column.field_id,
             );
-            let field = Field::new(&column.name, column.data_type.clone(), column.nullable)
-                .with_metadata(metadata.into_iter().collect());
             arrays.push(array);
             fields.push(field);
         }
@@ -2521,18 +2579,8 @@ where
 
         let removed = row_ids.len();
 
-        let mut fields = Vec::with_capacity(2);
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(2);
-
-        fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
-        let row_id_array: ArrayRef = Arc::new(UInt64Array::from(row_ids.clone()));
-        arrays.push(row_id_array);
-
-        fields.push(Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false));
-        let deleted_array: ArrayRef = Arc::new(UInt64Array::from(vec![txn_id; removed]));
-        arrays.push(deleted_array);
-
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
+        // Build DELETE batch using helper
+        let batch = mvcc_columns::build_delete_batch(row_ids.clone(), txn_id)?;
         table.table.append(&batch)?;
 
         let removed_u64 = u64::try_from(removed)
