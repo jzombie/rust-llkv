@@ -189,7 +189,10 @@ impl RowVersion {
     pub fn is_visible_for(&self, manager: &TxnIdManager, snapshot: TransactionSnapshot) -> bool {
         tracing::trace!(
             "[MVCC] is_visible_for: created_by={}, deleted_by={}, snapshot.txn_id={}, snapshot.snapshot_id={}",
-            self.created_by, self.deleted_by, snapshot.txn_id, snapshot.snapshot_id
+            self.created_by,
+            self.deleted_by,
+            snapshot.txn_id,
+            snapshot.snapshot_id
         );
 
         // Rows created inside the current transaction are visible unless this

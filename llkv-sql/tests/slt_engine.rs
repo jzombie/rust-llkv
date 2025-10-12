@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::Array as ArrowArray;
 use llkv_runtime::{Context, StatementResult};
@@ -51,11 +51,7 @@ impl AsyncDB for EngineHarness {
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
         // Log which SQL is being executed by this harness
-        tracing::debug!(
-            "[HARNESS {:p}] run() called, sql=\"{}\"",
-            self,
-            sql.trim()
-        );
+        tracing::debug!("[HARNESS {:p}] run() called, sql=\"{}\"", self, sql.trim());
         match self.engine.execute(sql) {
             Ok(mut results) => {
                 tracing::trace!(
@@ -194,11 +190,17 @@ pub fn make_factory_factory() -> impl Fn() -> HarnessFactory + Clone {
         let counter = Arc::new(AtomicUsize::new(0));
         let factory: HarnessFactory = Box::new(move || {
             let n = counter.fetch_add(1, Ordering::SeqCst);
-            tracing::debug!("[FACTORY] Factory called #{}: Creating new EngineHarness", n);
+            tracing::debug!(
+                "[FACTORY] Factory called #{}: Creating new EngineHarness",
+                n
+            );
             let shared_clone = shared.clone();
             Box::pin(async move {
                 let engine = shared_clone.make_engine();
-                tracing::debug!("[FACTORY] Factory #{}: Created SqlEngine with new Session", n);
+                tracing::debug!(
+                    "[FACTORY] Factory #{}: Created SqlEngine with new Session",
+                    n
+                );
                 Ok::<_, ()>(EngineHarness::new(engine))
             })
         });

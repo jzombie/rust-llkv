@@ -104,7 +104,10 @@ where
     where
         C: AsRef<Path>,
     {
-        tracing::trace!("[CSV_EXPORT] write_columns_to_path called with {} columns", columns.len());
+        tracing::trace!(
+            "[CSV_EXPORT] write_columns_to_path called with {} columns",
+            columns.len()
+        );
         if columns.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "at least one column must be provided for CSV export".into(),
@@ -121,7 +124,10 @@ where
 
         tracing::trace!("[CSV_EXPORT] Calling write_columns_to_path_with_filter");
         let result = self.write_columns_to_path_with_filter(csv_path, columns, &filter_expr);
-        tracing::trace!("[CSV_EXPORT] write_columns_to_path_with_filter returned: {:?}", result);
+        tracing::trace!(
+            "[CSV_EXPORT] write_columns_to_path_with_filter returned: {:?}",
+            result
+        );
         result
     }
 
@@ -175,7 +181,10 @@ where
         let writer = BufWriter::new(file);
         tracing::trace!("[CSV_EXPORT] About to call write_projections_to_writer");
         let result = self.write_projections_to_writer(writer, projections, filter_expr);
-        tracing::trace!("[CSV_EXPORT] write_projections_to_writer returned: {:?}", result);
+        tracing::trace!(
+            "[CSV_EXPORT] write_projections_to_writer returned: {:?}",
+            result
+        );
         result
     }
 
@@ -220,17 +229,21 @@ where
 
         tracing::trace!("[CSV_EXPORT] About to call scan_stream_with_exprs");
         tracing::trace!("[CSV_EXPORT] filter_expr: {:?}", filter_expr);
-        let scan_result = self.table
-            .scan_stream_with_exprs(&projections, filter_expr, scan_options, |batch| {
-                if write_error.is_some() {
-                    return;
-                }
-                if let Err(err) = csv_writer.write(&batch) {
-                    write_error =
-                        Some(Error::Internal(format!("failed to write CSV batch: {err}")));
-                }
-            });
-        tracing::trace!("[CSV_EXPORT] scan_stream_with_exprs returned: {:?}", scan_result);
+        let scan_result =
+            self.table
+                .scan_stream_with_exprs(&projections, filter_expr, scan_options, |batch| {
+                    if write_error.is_some() {
+                        return;
+                    }
+                    if let Err(err) = csv_writer.write(&batch) {
+                        write_error =
+                            Some(Error::Internal(format!("failed to write CSV batch: {err}")));
+                    }
+                });
+        tracing::trace!(
+            "[CSV_EXPORT] scan_stream_with_exprs returned: {:?}",
+            scan_result
+        );
         scan_result?;
 
         if let Some(err) = write_error {

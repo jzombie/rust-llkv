@@ -839,7 +839,9 @@ where
         tracing::debug!("[SESSION] Context::create_session called");
         let wrapper = ContextWrapper::new(Arc::clone(self));
         let inner = self.transaction_manager.create_session(Arc::new(wrapper));
-        tracing::debug!("[SESSION] Created TransactionSession with session_id (will be logged by transaction manager)");
+        tracing::debug!(
+            "[SESSION] Created TransactionSession with session_id (will be logged by transaction manager)"
+        );
         Session { inner }
     }
 
@@ -1784,7 +1786,7 @@ where
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
-        
+
         // Apply MVCC filtering manually using filter_row_ids_for_snapshot
         let row_ids = filter_row_ids_for_snapshot(
             table.table.store(),
@@ -1849,7 +1851,7 @@ where
             }
         }
 
-        // Check PRIMARY KEY constraints  
+        // Check PRIMARY KEY constraints
         self.check_primary_key_constraints(table, &rows, &column_order, snapshot)?;
 
         if display_name == "keys" {
@@ -1862,7 +1864,8 @@ where
             }
         }
 
-        let constraint_result = self.check_primary_key_constraints(table, &rows, &column_order, snapshot);
+        let constraint_result =
+            self.check_primary_key_constraints(table, &rows, &column_order, snapshot);
 
         if display_name == "keys" {
             match &constraint_result {
@@ -2708,7 +2711,7 @@ where
                 table_name
             )));
         }
-        
+
         let table = ctx.lookup_table(table_name)?;
         Ok(table.table.table_id())
     }
@@ -2743,9 +2746,13 @@ fn filter_row_ids_for_snapshot<P>(
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    tracing::debug!("[FILTER_ROWS] Filtering {} row IDs for snapshot txn_id={}, snapshot_id={}", 
-        row_ids.len(), snapshot.txn_id, snapshot.snapshot_id);
-    
+    tracing::debug!(
+        "[FILTER_ROWS] Filtering {} row IDs for snapshot txn_id={}, snapshot_id={}",
+        row_ids.len(),
+        snapshot.txn_id,
+        snapshot.snapshot_id
+    );
+
     if row_ids.is_empty() {
         return Ok(row_ids);
     }
@@ -2760,7 +2767,10 @@ where
     ) {
         Ok(batch) => batch,
         Err(Error::NotFound) => {
-            tracing::trace!("[FILTER_ROWS] gather_rows returned NotFound for MVCC columns, treating all {} rows as visible (committed)", row_ids.len());
+            tracing::trace!(
+                "[FILTER_ROWS] gather_rows returned NotFound for MVCC columns, treating all {} rows as visible (committed)",
+                row_ids.len()
+            );
             return Ok(row_ids);
         }
         Err(err) => {
@@ -2770,7 +2780,10 @@ where
     };
 
     if version_batch.num_columns() < 2 {
-        tracing::debug!("[FILTER_ROWS] version_batch has < 2 columns, returning all {} rows", row_ids.len());
+        tracing::debug!(
+            "[FILTER_ROWS] version_batch has < 2 columns, returning all {} rows",
+            row_ids.len()
+        );
         return Ok(row_ids);
     }
 
@@ -2784,7 +2797,10 @@ where
         .downcast_ref::<UInt64Array>();
 
     if created_column.is_none() || deleted_column.is_none() {
-        tracing::debug!("[FILTER_ROWS] Failed to downcast columns, returning all {} rows", row_ids.len());
+        tracing::debug!(
+            "[FILTER_ROWS] Failed to downcast columns, returning all {} rows",
+            row_ids.len()
+        );
         return Ok(row_ids);
     }
 
@@ -2821,7 +2837,11 @@ where
         }
     }
 
-    tracing::debug!("[FILTER_ROWS] Filtered from {} to {} visible rows", row_ids.len(), visible.len());
+    tracing::debug!(
+        "[FILTER_ROWS] Filtered from {} to {} visible rows",
+        row_ids.len(),
+        visible.len()
+    );
     Ok(visible)
 }
 
@@ -2866,7 +2886,10 @@ where
             self.snapshot,
         );
         if let Ok(ref visible) = result {
-            tracing::trace!("[MVCC_FILTER] filter() returning visible row_ids: {:?}", visible);
+            tracing::trace!(
+                "[MVCC_FILTER] filter() returning visible row_ids: {:?}",
+                visible
+            );
         }
         result
     }

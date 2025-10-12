@@ -297,7 +297,10 @@ where
         if !had_filter && row_filter.is_none() {
             // Only use shortcut if no filter AND no MVCC row filtering
             let total_rows = table.total_rows.load(Ordering::SeqCst);
-            tracing::debug!("[AGGREGATE] Using COUNT(*) shortcut: total_rows={}", total_rows);
+            tracing::debug!(
+                "[AGGREGATE] Using COUNT(*) shortcut: total_rows={}",
+                total_rows
+            );
             if total_rows > i64::MAX as u64 {
                 return Err(Error::InvalidArgumentError(
                     "COUNT(*) result exceeds supported range".into(),
@@ -305,7 +308,11 @@ where
             }
             count_star_override = Some(total_rows as i64);
         } else {
-            tracing::debug!("[AGGREGATE] NOT using COUNT(*) shortcut: had_filter={}, has_row_filter={}", had_filter, row_filter.is_some());
+            tracing::debug!(
+                "[AGGREGATE] NOT using COUNT(*) shortcut: had_filter={}, has_row_filter={}",
+                had_filter,
+                row_filter.is_some()
+            );
         }
 
         for (idx, spec) in specs.iter().enumerate() {
@@ -318,9 +325,12 @@ where
                 )?,
                 override_value: match spec.kind {
                     AggregateKind::CountStar => {
-                        tracing::debug!("[AGGREGATE] CountStar override_value={:?}", count_star_override);
+                        tracing::debug!(
+                            "[AGGREGATE] CountStar override_value={:?}",
+                            count_star_override
+                        );
                         count_star_override
-                    },
+                    }
                     _ => None,
                 },
             });
@@ -854,7 +864,11 @@ where
                 // 2. This is a full table scan
                 // 3. We produced fewer rows than the total
                 // 4. We DON'T have a row_id_filter (e.g., MVCC filter) that intentionally filtered rows
-                if include_nulls && full_table_scan && produced_rows < total_rows && !has_row_id_filter {
+                if include_nulls
+                    && full_table_scan
+                    && produced_rows < total_rows
+                    && !has_row_id_filter
+                {
                     let missing = total_rows - produced_rows;
                     if missing > 0 {
                         null_batches = synthesize_null_scan(Arc::clone(&schema), missing)?;

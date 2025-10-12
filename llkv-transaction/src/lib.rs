@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 
-pub use mvcc::{RowVersion, TransactionSnapshot, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TxnId, TxnIdManager};
+pub use mvcc::{
+    RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TransactionSnapshot, TxnId, TxnIdManager,
+};
 
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
@@ -208,7 +210,7 @@ where
     ) -> Self {
         let table_names: Vec<String> = base_context.table_names();
         let catalog_snapshot: HashSet<String> = table_names.iter().cloned().collect();
-        
+
         // Capture (table_name, table_id) pairs at transaction start for conflict detection
         let mut catalog_table_ids = HashMap::new();
         for table_name in &table_names {
@@ -216,7 +218,7 @@ where
                 catalog_table_ids.insert(table_name.clone(), table_id);
             }
         }
-        
+
         let snapshot = txn_manager.begin_transaction();
         tracing::debug!(
             "[SESSION_TX] new() created transaction with txn_id={}, snapshot_id={}",
@@ -291,7 +293,9 @@ where
         }
 
         // Table exists in base - mark as verified
-        tracing::trace!("[ENSURE] Table exists in base, no copying needed (MVCC will handle visibility)");
+        tracing::trace!(
+            "[ENSURE] Table exists in base, no copying needed (MVCC will handle visibility)"
+        );
         self.staged_tables.insert(table_name.to_string());
         Ok(())
     }
@@ -308,7 +312,10 @@ where
 
         // If table was created in this transaction, read from staging
         if self.new_tables.contains(&plan.table) {
-            tracing::trace!("[SELECT] Reading from staging for new table '{}'", plan.table);
+            tracing::trace!(
+                "[SELECT] Reading from staging for new table '{}'",
+                plan.table
+            );
             return self.staging.execute_select(plan);
         }
 
@@ -317,30 +324,33 @@ where
 
         // Otherwise read from BASE with MVCC visibility
         // The base context already has the snapshot set in SessionTransaction::new()
-        tracing::trace!("[SELECT] Reading from BASE with MVCC for existing table '{}'", plan.table);
+        tracing::trace!(
+            "[SELECT] Reading from BASE with MVCC for existing table '{}'",
+            plan.table
+        );
         let table_name = plan.table.clone();
-        self.base_context.execute_select(plan)
-            .and_then(|exec| {
-                // Convert pager type from BaseCtx to StagingCtx
-                // This is a limitation of the current type system
-                // In practice, we're just collecting and re-packaging
-                let schema = exec.schema();
-                let batches = exec.collect().unwrap_or_default();
-                let combined = if batches.is_empty() {
-                    RecordBatch::new_empty(Arc::clone(&schema))
-                } else if batches.len() == 1 {
-                    batches.into_iter().next().unwrap()
-                } else {
-                    let refs: Vec<&RecordBatch> = batches.iter().collect();
-                    arrow::compute::concat_batches(&schema, refs)
-                        .map_err(|err| Error::Internal(format!("failed to concatenate batches: {err}")))?
-                };
-                Ok(SelectExecution::from_batch(
-                    table_name,
-                    Arc::clone(&schema),
-                    combined,
-                ))
-            })
+        self.base_context.execute_select(plan).and_then(|exec| {
+            // Convert pager type from BaseCtx to StagingCtx
+            // This is a limitation of the current type system
+            // In practice, we're just collecting and re-packaging
+            let schema = exec.schema();
+            let batches = exec.collect().unwrap_or_default();
+            let combined = if batches.is_empty() {
+                RecordBatch::new_empty(Arc::clone(&schema))
+            } else if batches.len() == 1 {
+                batches.into_iter().next().unwrap()
+            } else {
+                let refs: Vec<&RecordBatch> = batches.iter().collect();
+                arrow::compute::concat_batches(&schema, refs).map_err(|err| {
+                    Error::Internal(format!("failed to concatenate batches: {err}"))
+                })?
+            };
+            Ok(SelectExecution::from_batch(
+                table_name,
+                Arc::clone(&schema),
+                combined,
+            ))
+        })
     }
 
     /// Execute an operation in the transaction staging context
@@ -407,9 +417,13 @@ where
                     tracing::trace!("[TX] INSERT into staging for new table");
                     self.staging.insert(plan.clone())
                 } else {
-                    tracing::trace!("[TX] INSERT directly into BASE with txn_id={}", self.snapshot.txn_id);
+                    tracing::trace!(
+                        "[TX] INSERT directly into BASE with txn_id={}",
+                        self.snapshot.txn_id
+                    );
                     // Insert into base - MVCC tagging happens automatically in insert_rows()
-                    self.base_context.insert(plan.clone())
+                    self.base_context
+                        .insert(plan.clone())
                         .and_then(|r| r.convert_pager_type())
                 };
 
@@ -418,10 +432,14 @@ where
                         // Only track operations for NEW tables - they need replay on commit
                         // For existing tables, changes are already in BASE with MVCC tags
                         if is_new_table {
-                            tracing::trace!("[TX] INSERT to new table - tracking for commit replay");
+                            tracing::trace!(
+                                "[TX] INSERT to new table - tracking for commit replay"
+                            );
                             self.operations.push(PlanOperation::Insert(plan.clone()));
                         } else {
-                            tracing::trace!("[TX] INSERT to existing table - already in BASE, no replay needed");
+                            tracing::trace!(
+                                "[TX] INSERT to existing table - already in BASE, no replay needed"
+                            );
                         }
                         result
                     }
@@ -453,8 +471,12 @@ where
                     tracing::trace!("[TX] UPDATE in staging for new table");
                     self.staging.update(plan.clone())
                 } else {
-                    tracing::trace!("[TX] UPDATE directly in BASE with txn_id={}", self.snapshot.txn_id);
-                    self.base_context.update(plan.clone())
+                    tracing::trace!(
+                        "[TX] UPDATE directly in BASE with txn_id={}",
+                        self.snapshot.txn_id
+                    );
+                    self.base_context
+                        .update(plan.clone())
                         .and_then(|r| r.convert_pager_type())
                 };
 
@@ -462,10 +484,14 @@ where
                     Ok(result) => {
                         // Only track operations for NEW tables - they need replay on commit
                         if is_new_table {
-                            tracing::trace!("[TX] UPDATE to new table - tracking for commit replay");
+                            tracing::trace!(
+                                "[TX] UPDATE to new table - tracking for commit replay"
+                            );
                             self.operations.push(PlanOperation::Update(plan.clone()));
                         } else {
-                            tracing::trace!("[TX] UPDATE to existing table - already in BASE, no replay needed");
+                            tracing::trace!(
+                                "[TX] UPDATE to existing table - already in BASE, no replay needed"
+                            );
                         }
                         result
                     }
@@ -489,27 +515,41 @@ where
                 tracing::debug!("[DELETE] is_new_table={}", is_new_table);
                 // Track access to existing table for conflict detection
                 if !is_new_table {
-                    tracing::debug!("[DELETE] Tracking access to existing table '{}'", plan.table);
+                    tracing::debug!(
+                        "[DELETE] Tracking access to existing table '{}'",
+                        plan.table
+                    );
                     self.accessed_tables.insert(plan.table.clone());
                 }
                 let result = if is_new_table {
                     tracing::debug!("[DELETE] Deleting from staging for new table");
                     self.staging.delete(plan.clone())
                 } else {
-                    tracing::debug!("[DELETE] Deleting from BASE with txn_id={}", self.snapshot.txn_id);
-                    self.base_context.delete(plan.clone())
+                    tracing::debug!(
+                        "[DELETE] Deleting from BASE with txn_id={}",
+                        self.snapshot.txn_id
+                    );
+                    self.base_context
+                        .delete(plan.clone())
                         .and_then(|r| r.convert_pager_type())
                 };
 
-                tracing::debug!("[DELETE] Result: {:?}", result.as_ref().map(|_| "Ok").map_err(|e| format!("{}", e)));
+                tracing::debug!(
+                    "[DELETE] Result: {:?}",
+                    result.as_ref().map(|_| "Ok").map_err(|e| format!("{}", e))
+                );
                 match result {
                     Ok(result) => {
                         // Only track operations for NEW tables - they need replay on commit
                         if is_new_table {
-                            tracing::trace!("[TX] DELETE from new table - tracking for commit replay");
+                            tracing::trace!(
+                                "[TX] DELETE from new table - tracking for commit replay"
+                            );
                             self.operations.push(PlanOperation::Delete(plan.clone()));
                         } else {
-                            tracing::trace!("[TX] DELETE from existing table - already in BASE, no replay needed");
+                            tracing::trace!(
+                                "[TX] DELETE from existing table - already in BASE, no replay needed"
+                            );
                         }
                         result
                     }
@@ -767,7 +807,7 @@ where
                             };
                             TransactionContext::set_snapshot(&*self.context, auto_commit_snapshot);
                             return Err(Error::TransactionContextError(
-                                "another transaction has dropped this table".into()
+                                "another transaction has dropped this table".into(),
                             ));
                         }
                     }
@@ -780,7 +820,7 @@ where
                         };
                         TransactionContext::set_snapshot(&*self.context, auto_commit_snapshot);
                         return Err(Error::TransactionContextError(
-                            "another transaction has dropped this table".into()
+                            "another transaction has dropped this table".into(),
                         ));
                     }
                 }

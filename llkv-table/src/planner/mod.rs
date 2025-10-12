@@ -847,7 +847,7 @@ where
 
         let fusion_cache = PredicateFusionCache::from_expr(&filter_expr);
         let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
-        
+
         // When we have a trivial filter (no predicates), enumerate ALL row IDs.
         // This is necessary for:
         // 1. MVCC filtering to check visibility of all rows including NULL rows
@@ -861,14 +861,13 @@ where
                 "[SCAN_STREAM] MVCC + trivial filter: scanning created_by column for all row IDs"
             );
             // Get all rows where created_by exists (which is all rows that have been written)
-            self.table.store().filter_row_ids::<UInt64Type>(
-                created_lfid,
-                &Predicate::All,
-            )?
+            self.table
+                .store()
+                .filter_row_ids::<UInt64Type>(created_lfid, &Predicate::All)?
         } else {
             self.collect_row_ids_for_expr(&filter_expr, &fusion_cache, &mut all_rows_cache)?
         };
-        
+
         tracing::trace!(
             "[SCAN_STREAM] collected {} row_ids, has_row_filter={}",
             row_ids.len(),

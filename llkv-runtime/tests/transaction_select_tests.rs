@@ -50,7 +50,7 @@ fn test_transaction_select() {
     };
     session.insert(insert_plan2).unwrap();
 
-        // Select all rows (should see 3)
+    // Select all rows (should see 3)
     let select_plan = SelectPlan::new("users");
     let result1 = session.select(select_plan).unwrap();
 

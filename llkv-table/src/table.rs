@@ -177,7 +177,7 @@ where
 
     pub fn append(&self, batch: &RecordBatch) -> LlkvResult<()> {
         use arrow::array::UInt64Builder;
-        
+
         // Check if MVCC columns already exist in the batch
         let has_created_by = batch
             .schema()
@@ -189,10 +189,10 @@ where
             .fields()
             .iter()
             .any(|f| f.name() == llkv_column_map::store::DELETED_BY_COLUMN_NAME);
-        
+
         let mut new_fields = Vec::with_capacity(batch.schema().fields().len() + 2);
         let mut new_columns: Vec<Arc<dyn Array>> = Vec::with_capacity(batch.columns().len() + 2);
-        
+
         for (idx, field) in batch.schema().fields().iter().enumerate() {
             let maybe_field_id = field.metadata().get(crate::constants::FIELD_ID_META_KEY);
             // System columns (row_id, MVCC columns) don't need field_id metadata
@@ -304,7 +304,7 @@ where
         const TXN_ID_AUTO_COMMIT: u64 = 1;
         const TXN_ID_NONE: u64 = 0;
         let row_count = batch.num_rows();
-        
+
         if !has_created_by {
             let mut created_by_builder = UInt64Builder::with_capacity(row_count);
             for _ in 0..row_count {
@@ -318,12 +318,16 @@ where
                 lfid_val.to_string(),
             );
             new_fields.push(
-                Field::new(llkv_column_map::store::CREATED_BY_COLUMN_NAME, DataType::UInt64, false)
-                    .with_metadata(metadata),
+                Field::new(
+                    llkv_column_map::store::CREATED_BY_COLUMN_NAME,
+                    DataType::UInt64,
+                    false,
+                )
+                .with_metadata(metadata),
             );
             new_columns.push(Arc::new(created_by_builder.finish()));
         }
-        
+
         if !has_deleted_by {
             let mut deleted_by_builder = UInt64Builder::with_capacity(row_count);
             for _ in 0..row_count {
@@ -337,8 +341,12 @@ where
                 lfid_val.to_string(),
             );
             new_fields.push(
-                Field::new(llkv_column_map::store::DELETED_BY_COLUMN_NAME, DataType::UInt64, false)
-                    .with_metadata(metadata),
+                Field::new(
+                    llkv_column_map::store::DELETED_BY_COLUMN_NAME,
+                    DataType::UInt64,
+                    false,
+                )
+                .with_metadata(metadata),
             );
             new_columns.push(Arc::new(deleted_by_builder.finish()));
         }
