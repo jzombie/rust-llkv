@@ -906,6 +906,8 @@ where
     pager: Arc<P>,
     tables: RwLock<FxHashMap<String, Arc<ExecutorTable<P>>>>,
     dropped_tables: RwLock<FxHashSet<String>>,
+    // Centralized catalog for table/field name resolution
+    catalog: Arc<llkv_table::catalog::Catalog>,
     // Transaction manager for session-based transactions
     transaction_manager: TransactionManager<ContextWrapper<P>, ContextWrapper<MemPager>>,
     txn_manager: Arc<TxnIdManager>,
@@ -1000,10 +1002,29 @@ where
             loaded_tables.len()
         );
         
+        // Initialize catalog and populate with existing tables
+        let catalog = Arc::new(llkv_table::catalog::Catalog::new());
+        for (_table_id, table_meta) in &loaded_tables {
+            if let Some(ref table_name) = table_meta.name {
+                if let Err(e) = catalog.register_table(table_name) {
+                    tracing::warn!(
+                        "[CONTEXT] Failed to register table '{}' in catalog: {}",
+                        table_name,
+                        e
+                    );
+                }
+            }
+        }
+        tracing::debug!(
+            "[CONTEXT] Catalog initialized with {} table(s)",
+            catalog.table_count()
+        );
+        
         Self {
             pager,
             tables: RwLock::new(FxHashMap::default()), // Start with empty table cache
             dropped_tables: RwLock::new(FxHashSet::default()),
+            catalog,
             transaction_manager,
             txn_manager,
         }
@@ -1150,8 +1171,8 @@ where
     }
 
     pub fn table_names(self: &Arc<Self>) -> Vec<String> {
-        let tables = self.tables.read().unwrap();
-        tables.keys().cloned().collect()
+        // Use catalog for table names (single source of truth)
+        self.catalog.table_names()
     }
 
     fn filter_visible_row_ids(
@@ -1700,7 +1721,7 @@ where
         }
 
         let schema = Arc::new(ExecutorSchema {
-            columns: column_defs,
+            columns: column_defs.clone(), // Clone for catalog registration below
             lookup,
         });
         let table_entry = Arc::new(ExecutorTable {
@@ -1722,7 +1743,36 @@ where
                 display_name
             )));
         }
-        tables.insert(canonical_name, table_entry);
+        tables.insert(canonical_name.clone(), table_entry);
+        drop(tables); // Release write lock before catalog operations
+        
+        // Register table in catalog
+        let registered_table_id = self.catalog.register_table(&display_name)?;
+        tracing::debug!(
+            "[CATALOG] Registered table '{}' with catalog_id={}",
+            display_name,
+            registered_table_id
+        );
+        
+        // Register fields in catalog
+        if let Some(field_resolver) = self.catalog.field_resolver(registered_table_id) {
+            for column in &column_defs {
+                if let Err(e) = field_resolver.register_field(&column.name) {
+                    tracing::warn!(
+                        "[CATALOG] Failed to register field '{}' in table '{}': {}",
+                        column.name,
+                        display_name,
+                        e
+                    );
+                }
+            }
+            tracing::debug!(
+                "[CATALOG] Registered {} field(s) for table '{}'",
+                column_defs.len(),
+                display_name
+            );
+        }
+        
         Ok(StatementResult::CreateTable {
             table_name: display_name,
         })
@@ -1878,6 +1928,35 @@ where
             );
         }
         tables.insert(canonical_name.clone(), table_entry);
+        drop(tables); // Release write lock before catalog operations
+        
+        // Register table in catalog
+        let registered_table_id = self.catalog.register_table(&display_name)?;
+        tracing::debug!(
+            "[CATALOG] Registered table '{}' (CTAS) with catalog_id={}",
+            display_name,
+            registered_table_id
+        );
+        
+        // Register fields in catalog
+        if let Some(field_resolver) = self.catalog.field_resolver(registered_table_id) {
+            for column in &column_defs {
+                if let Err(e) = field_resolver.register_field(&column.name) {
+                    tracing::warn!(
+                        "[CATALOG] Failed to register field '{}' in table '{}': {}",
+                        column.name,
+                        display_name,
+                        e
+                    );
+                }
+            }
+            tracing::debug!(
+                "[CATALOG] Registered {} field(s) for table '{}' (CTAS)",
+                column_defs.len(),
+                display_name
+            );
+        }
+        
         Ok(StatementResult::CreateTable {
             table_name: display_name,
         })
@@ -2688,6 +2767,10 @@ where
         // Slow path: load table from catalog (happens once per table)
         tracing::debug!("[LAZY_LOAD] Loading table '{}' from catalog", canonical_name);
         
+        // Check catalog first for table existence
+        let _catalog_table_id = self.catalog.table_id(canonical_name)
+            .ok_or_else(|| Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name)))?;
+        
         let store = ColumnStore::open(Arc::clone(&self.pager))?;
         let catalog = SysCatalog::new(&store);
         
@@ -2809,6 +2892,14 @@ where
             tables.insert(canonical_name.to_string(), Arc::clone(&executor_table));
         }
         
+        // Register fields in catalog (may already be registered from Context::new())
+        if let Some(field_resolver) = self.catalog.field_resolver(_catalog_table_id) {
+            for col in &executor_table.schema.columns {
+                let _ = field_resolver.register_field(&col.name); // Ignore "already exists" errors
+            }
+            tracing::debug!("[CATALOG] Registered {} field(s) for lazy-loaded table '{}'", executor_table.schema.columns.len(), canonical_name);
+        }
+        
         tracing::debug!(
             "[LAZY_LOAD] Loaded table '{}' (id={}) with {} columns, next_row_id={}",
             canonical_name,
@@ -2844,6 +2935,11 @@ where
             }
         }
         drop(tables);
+        
+        // Unregister from catalog
+        self.catalog.unregister_table(&canonical_name);
+        tracing::debug!("[CATALOG] Unregistered table '{}' from catalog", canonical_name);
+        
         self.dropped_tables.write().unwrap().insert(canonical_name);
         Ok(())
     }

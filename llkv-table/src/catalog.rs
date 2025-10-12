@@ -165,6 +165,43 @@ impl Catalog {
         Ok(table_id)
     }
 
+    /// Unregister a table from the catalog.
+    ///
+    /// Removes the table and its associated field resolver from the catalog.
+    /// This is typically called when a table is dropped.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Table name (any casing)
+    ///
+    /// # Returns
+    ///
+    /// `true` if the table was found and removed, `false` if it didn't exist.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let id = catalog.register_table("Users")?;
+    /// assert!(catalog.unregister_table("users"));
+    /// assert_eq!(catalog.table_id("users"), None);
+    /// ```
+    pub fn unregister_table(&self, name: &str) -> bool {
+        let canonical = name.to_ascii_lowercase();
+        let mut inner = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(_) => return false,
+        };
+
+        // Remove from name → id map and get the table_id
+        if let Some(table_id) = inner.table_name_to_id.remove(&canonical) {
+            // Remove from id → metadata map
+            inner.table_id_to_meta.remove(&table_id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Get TableId by table name (case-insensitive lookup).
     ///
     /// # Arguments
