@@ -907,7 +907,7 @@ where
     tables: RwLock<FxHashMap<String, Arc<ExecutorTable<P>>>>,
     dropped_tables: RwLock<FxHashSet<String>>,
     // Centralized catalog for table/field name resolution
-    catalog: Arc<llkv_table::catalog::Catalog>,
+    catalog: Arc<llkv_table::catalog::TableCatalog>,
     // Transaction manager for session-based transactions
     transaction_manager: TransactionManager<ContextWrapper<P>, ContextWrapper<MemPager>>,
     txn_manager: Arc<TxnIdManager>,
@@ -1003,7 +1003,7 @@ where
         );
         
         // Initialize catalog and populate with existing tables
-        let catalog = Arc::new(llkv_table::catalog::Catalog::new());
+        let catalog = Arc::new(llkv_table::catalog::TableCatalog::new());
         for (_table_id, table_meta) in &loaded_tables {
             if let Some(ref table_name) = table_meta.name {
                 if let Err(e) = catalog.register_table(table_name) {
@@ -3108,7 +3108,7 @@ where
         Ok(table.table.table_id())
     }
 
-    fn catalog_snapshot(&self) -> llkv_table::catalog::CatalogSnapshot {
+    fn catalog_snapshot(&self) -> llkv_table::catalog::TableCatalogSnapshot {
         let ctx = self.context();
         ctx.catalog.snapshot()
     }

@@ -172,7 +172,7 @@ pub trait TransactionContext: Send + Sync {
     fn table_id(&self, table_name: &str) -> LlkvResult<llkv_table::types::TableId>;
 
     /// Get an immutable catalog snapshot for transaction isolation
-    fn catalog_snapshot(&self) -> llkv_table::catalog::CatalogSnapshot;
+    fn catalog_snapshot(&self) -> llkv_table::catalog::TableCatalogSnapshot;
 }
 
 /// Transaction state for the runtime context.
@@ -195,7 +195,7 @@ where
     missing_tables: HashSet<String>,
     /// Immutable catalog snapshot at transaction start (for isolation).
     /// Contains table name→ID mappings. Replaces separate HashSet and HashMap.
-    catalog_snapshot: llkv_table::catalog::CatalogSnapshot,
+    catalog_snapshot: llkv_table::catalog::TableCatalogSnapshot,
     /// Base context for reading existing tables with MVCC visibility.
     base_context: Arc<BaseCtx>,
     /// Whether this transaction has been aborted due to an error.

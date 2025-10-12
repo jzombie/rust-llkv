@@ -1,4 +1,4 @@
-//! Centralized catalog for table and field name resolution.
+//! Centralized table catalog for table and field name resolution.
 //!
 //! This module provides thread-safe, performant bidirectional mappings between:
 //! - Table names ↔ TableId
@@ -15,10 +15,10 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! use llkv_table::catalog::{Catalog, FieldResolver};
+//! use llkv_table::catalog::{TableCatalog, FieldResolver};
 //!
 //! // Create catalog
-//! let catalog = Catalog::new();
+//! let catalog = TableCatalog::new();
 //!
 //! // Register table
 //! let table_id = catalog.register_table("Users").unwrap();
@@ -42,10 +42,10 @@ use rustc_hash::FxHashMap;
 use std::sync::{Arc, RwLock};
 
 // ============================================================================
-// Catalog - Table-level resolver
+// TableCatalog - Table-level resolver
 // ============================================================================
 
-/// Centralized catalog for table name resolution and field resolver management.
+/// Centralized table catalog for table name resolution and field resolver management.
 ///
 /// The catalog maintains bidirectional mappings between table names and TableIds,
 /// and provides access to per-table field resolvers.
@@ -60,12 +60,12 @@ use std::sync::{Arc, RwLock};
 /// Table lookups are case-insensitive (SQL standard), but display names preserve
 /// original casing for error messages and schema display.
 #[derive(Debug, Clone)]
-pub struct Catalog {
-    inner: Arc<RwLock<CatalogInner>>,
+pub struct TableCatalog {
+    inner: Arc<RwLock<TableCatalogInner>>,
 }
 
 #[derive(Debug)]
-struct CatalogInner {
+struct TableCatalogInner {
     /// Canonical table name (lowercase) -> TableId
     table_name_to_id: FxHashMap<String, TableId>,
     /// TableId -> TableMetadata
@@ -85,14 +85,14 @@ struct TableMetadata {
     field_resolver: FieldResolver,
 }
 
-impl Catalog {
+impl TableCatalog {
     /// Create a new empty catalog.
     ///
     /// The catalog starts with no registered tables. The first assigned TableId will be 1.
     /// TableId 0 is reserved for special purposes (e.g., system tables).
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(CatalogInner {
+            inner: Arc::new(RwLock::new(TableCatalogInner {
                 table_name_to_id: FxHashMap::default(),
                 table_id_to_meta: FxHashMap::default(),
                 next_table_id: 1, // Start at 1, reserve 0 for system
@@ -119,7 +119,7 @@ impl Catalog {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let catalog = Catalog::new();
+    /// let catalog = TableCatalog::new();
     /// let users_id = catalog.register_table("Users")?;
     /// let orders_id = catalog.register_table("Orders")?;
     ///
@@ -285,7 +285,7 @@ impl Catalog {
 
     /// Create an immutable snapshot of the catalog for transaction isolation.
     ///
-    /// Returns a `CatalogSnapshot` containing all current table name→ID mappings.
+    /// Returns a `TableCatalogSnapshot` containing all current table name→ID mappings.
     /// Snapshots are cheap to create (uses Arc internally).
     ///
     /// # Example
@@ -295,11 +295,11 @@ impl Catalog {
     /// // Transaction sees this snapshot even if catalog changes
     /// let table_id = snapshot.table_id("users");
     /// ```
-    pub fn snapshot(&self) -> CatalogSnapshot {
+    pub fn snapshot(&self) -> TableCatalogSnapshot {
         let inner = match self.inner.read() {
             Ok(inner) => inner,
             Err(_) => {
-                return CatalogSnapshot {
+                return TableCatalogSnapshot {
                     table_ids: Arc::new(FxHashMap::default()),
                 }
             }
@@ -308,7 +308,7 @@ impl Catalog {
         // Clone the mapping into an Arc for cheap snapshot sharing
         let table_ids = Arc::new(inner.table_name_to_id.clone());
 
-        CatalogSnapshot { table_ids }
+        TableCatalogSnapshot { table_ids }
     }
 
     /// Check if a table exists (case-insensitive).
@@ -339,20 +339,20 @@ impl Catalog {
     ///
     /// # Returns
     ///
-    /// `CatalogState` containing all tables, fields, and next ID counters.
+    /// `TableCatalogState` containing all tables, fields, and next ID counters.
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// let state = catalog.export_state();
     /// // ... serialize state to disk ...
-    /// let restored_catalog = Catalog::from_state(state)?;
+    /// let restored_catalog = TableCatalog::from_state(state)?;
     /// ```
-    pub fn export_state(&self) -> CatalogState {
+    pub fn export_state(&self) -> TableCatalogState {
         let inner = match self.inner.read() {
             Ok(inner) => inner,
             Err(_) => {
-                return CatalogState {
+                return TableCatalogState {
                     tables: Vec::new(),
                     next_table_id: 1,
                 }
@@ -372,7 +372,7 @@ impl Catalog {
             });
         }
 
-        CatalogState {
+        TableCatalogState {
             tables,
             next_table_id: inner.next_table_id,
         }
@@ -389,12 +389,12 @@ impl Catalog {
     ///
     /// # Returns
     ///
-    /// A fully restored `Catalog` instance.
+    /// A fully restored `TableCatalog` instance.
     ///
     /// # Errors
     ///
     /// Returns `Error::CatalogError` if state is invalid (e.g., duplicate names/IDs).
-    pub fn from_state(state: CatalogState) -> Result<Self> {
+    pub fn from_state(state: TableCatalogState) -> Result<Self> {
         let mut table_name_to_id = FxHashMap::default();
         let mut table_id_to_meta = FxHashMap::default();
 
@@ -432,7 +432,7 @@ impl Catalog {
         }
 
         Ok(Self {
-            inner: Arc::new(RwLock::new(CatalogInner {
+            inner: Arc::new(RwLock::new(TableCatalogInner {
                 table_name_to_id,
                 table_id_to_meta,
                 next_table_id: state.next_table_id,
@@ -441,28 +441,28 @@ impl Catalog {
     }
 }
 
-impl Default for Catalog {
+impl Default for TableCatalog {
     fn default() -> Self {
         Self::new()
     }
 }
 
 // ============================================================================
-// CatalogSnapshot - Immutable view for transaction isolation
+// TableCatalogSnapshot - Immutable view for transaction isolation
 // ============================================================================
 
-/// Immutable snapshot of catalog state for transaction isolation.
+/// Immutable snapshot of table catalog state for transaction isolation.
 ///
 /// Snapshots capture the table name→ID mappings at a point in time.
 /// Transactions use snapshots to ensure consistent view of the catalog
 /// throughout their execution, even if new tables are created concurrently.
 #[derive(Debug, Clone)]
-pub struct CatalogSnapshot {
+pub struct TableCatalogSnapshot {
     /// Canonical table name -> TableId (immutable)
     table_ids: Arc<FxHashMap<String, TableId>>,
 }
 
-impl CatalogSnapshot {
+impl TableCatalogSnapshot {
     /// Get TableId by name from this snapshot (case-insensitive).
     ///
     /// # Arguments
@@ -748,12 +748,12 @@ impl Default for FieldResolver {
 // Persistence Types
 // ============================================================================
 
-/// Serializable catalog state for persistence.
+/// Serializable table catalog state for persistence.
 ///
-/// This structure contains all information needed to restore a catalog
+/// This structure contains all information needed to restore a table catalog
 /// from disk, including all table and field mappings.
 #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
-pub struct CatalogState {
+pub struct TableCatalogState {
     /// All registered tables with their field resolvers
     pub tables: Vec<TableState>,
     /// Next table ID to assign
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn test_catalog_basic_operations() {
-        let catalog = Catalog::new();
+        let catalog = TableCatalog::new();
 
         // Register tables
         let users_id = catalog.register_table("Users").unwrap();
@@ -825,7 +825,7 @@ mod tests {
 
     #[test]
     fn test_catalog_duplicate_detection() {
-        let catalog = Catalog::new();
+        let catalog = TableCatalog::new();
 
         catalog.register_table("Users").unwrap();
 
@@ -837,7 +837,7 @@ mod tests {
 
     #[test]
     fn test_catalog_table_names() {
-        let catalog = Catalog::new();
+        let catalog = TableCatalog::new();
 
         catalog.register_table("Users").unwrap();
         catalog.register_table("Orders").unwrap();
@@ -852,7 +852,7 @@ mod tests {
 
     #[test]
     fn test_catalog_snapshot() {
-        let catalog = Catalog::new();
+        let catalog = TableCatalog::new();
 
         let users_id = catalog.register_table("Users").unwrap();
         let snapshot = catalog.snapshot();
@@ -938,7 +938,7 @@ mod tests {
 
     #[test]
     fn test_catalog_with_field_resolver() {
-        let catalog = Catalog::new();
+        let catalog = TableCatalog::new();
 
         // Register table
         let table_id = catalog.register_table("Users").unwrap();
@@ -962,7 +962,7 @@ mod tests {
 
     #[test]
     fn test_catalog_exists_helpers() {
-        let catalog = Catalog::new();
+        let catalog = TableCatalog::new();
         catalog.register_table("Users").unwrap();
 
         assert!(catalog.table_exists("users"));
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn test_catalog_persistence_export_import() {
-        let catalog = Catalog::new();
+        let catalog = TableCatalog::new();
 
         // Register tables with fields
         let users_id = catalog.register_table("Users").unwrap();
@@ -1006,7 +1006,7 @@ mod tests {
         assert!(state.next_table_id > orders_id);
 
         // Restore from state
-        let restored_catalog = Catalog::from_state(state).unwrap();
+        let restored_catalog = TableCatalog::from_state(state).unwrap();
 
         // Verify tables
         assert_eq!(restored_catalog.table_id("users"), Some(users_id));
@@ -1043,7 +1043,7 @@ mod tests {
 
     #[test]
     fn test_catalog_persistence_id_stability() {
-        let catalog = Catalog::new();
+        let catalog = TableCatalog::new();
 
         // Register tables
         let table1_id = catalog.register_table("Table1").unwrap();
@@ -1051,7 +1051,7 @@ mod tests {
 
         // Export and restore
         let state = catalog.export_state();
-        let restored = Catalog::from_state(state).unwrap();
+        let restored = TableCatalog::from_state(state).unwrap();
 
         // IDs should be stable
         assert_eq!(restored.table_id("table1"), Some(table1_id));
@@ -1095,7 +1095,7 @@ mod tests {
 
     #[test]
     fn test_catalog_persistence_error_duplicate_table_id() {
-        let state = CatalogState {
+        let state = TableCatalogState {
             tables: vec![
                 TableState {
                     table_id: 1,
@@ -1115,12 +1115,12 @@ mod tests {
             next_table_id: 3,
         };
 
-        assert!(Catalog::from_state(state).is_err());
+        assert!(TableCatalog::from_state(state).is_err());
     }
 
     #[test]
     fn test_catalog_persistence_error_duplicate_table_name() {
-        let state = CatalogState {
+        let state = TableCatalogState {
             tables: vec![
                 TableState {
                     table_id: 1,
@@ -1140,6 +1140,6 @@ mod tests {
             next_table_id: 3,
         };
 
-        assert!(Catalog::from_state(state).is_err());
+        assert!(TableCatalog::from_state(state).is_err());
     }
 }

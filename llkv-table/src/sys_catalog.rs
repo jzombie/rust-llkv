@@ -468,7 +468,7 @@ where
     ///
     /// Stores the complete catalog state (all tables and fields) as a binary blob
     /// using bitcode serialization.
-    pub fn put_catalog_state(&self, state: &crate::catalog::CatalogState) -> LlkvResult<()> {
+    pub fn put_catalog_state(&self, state: &crate::catalog::TableCatalogState) -> LlkvResult<()> {
         let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_CATALOG_STATE).into();
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
@@ -490,7 +490,7 @@ where
     /// Load the catalog state from the system catalog.
     ///
     /// Retrieves the complete catalog state including all table and field mappings.
-    pub fn get_catalog_state(&self) -> LlkvResult<Option<crate::catalog::CatalogState>> {
+    pub fn get_catalog_state(&self) -> LlkvResult<Option<crate::catalog::TableCatalogState>> {
         let lfid = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_CATALOG_STATE);
         let batch = match self.store.gather_rows(
             &[lfid],
