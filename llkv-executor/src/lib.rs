@@ -15,8 +15,8 @@ use llkv_table::table::{
     ScanStreamOptions,
 };
 use llkv_table::types::FieldId;
+use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
-use std::collections::HashMap;
 use std::fmt;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -491,11 +491,11 @@ where
         filter: &Option<llkv_expr::expr::Expr<'static, String>>,
         aggregate_specs: &[(String, llkv_expr::expr::AggregateCall<String>)],
         row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
-    ) -> ExecutorResult<HashMap<String, i64>> {
+    ) -> ExecutorResult<FxHashMap<String, i64>> {
         use llkv_expr::expr::AggregateCall;
 
         let table_ref = table.as_ref();
-        let mut results = HashMap::new();
+        let mut results = FxHashMap::with_capacity_and_hasher(aggregate_specs.len(), Default::default());
 
         // Build aggregate specs for the aggregator
         let mut specs: Vec<AggregateSpec> = Vec::new();
@@ -681,7 +681,7 @@ where
     /// Evaluate an expression by substituting aggregate values
     fn evaluate_expr_with_aggregates(
         expr: &ScalarExpr<String>,
-        aggregates: &HashMap<String, i64>,
+        aggregates: &FxHashMap<String, i64>,
     ) -> ExecutorResult<i64> {
         use llkv_expr::expr::BinaryOp;
         use llkv_expr::literal::Literal;
@@ -954,7 +954,7 @@ where
 
 pub struct ExecutorSchema {
     pub columns: Vec<ExecutorColumn>,
-    pub lookup: HashMap<String, usize>,
+    pub lookup: FxHashMap<String, usize>,
 }
 
 impl ExecutorSchema {

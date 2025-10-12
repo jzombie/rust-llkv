@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
@@ -8,6 +7,8 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use arrow::array::{
     Array, ArrayRef, Date32Builder, Float64Builder, Int64Builder, StringBuilder, UInt64Array,
@@ -817,8 +818,8 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pager: Arc<P>,
-    tables: RwLock<HashMap<String, Arc<ExecutorTable<P>>>>,
-    dropped_tables: RwLock<HashSet<String>>,
+    tables: RwLock<FxHashMap<String, Arc<ExecutorTable<P>>>>,
+    dropped_tables: RwLock<FxHashSet<String>>,
     // Transaction manager for session-based transactions
     transaction_manager: TransactionManager<ContextWrapper<P>, ContextWrapper<MemPager>>,
     txn_manager: Arc<TxnIdManager>,
@@ -915,8 +916,8 @@ where
         
         Self {
             pager,
-            tables: RwLock::new(HashMap::new()), // Start with empty table cache
-            dropped_tables: RwLock::new(HashSet::new()),
+            tables: RwLock::new(FxHashMap::default()), // Start with empty table cache
+            dropped_tables: RwLock::new(FxHashSet::default()),
             transaction_manager,
             txn_manager,
         }
@@ -1387,14 +1388,14 @@ where
                 &visible_row_ids,
                 GatherNullPolicy::IncludeNulls,
             )?;
-            let mut metadata = HashMap::new();
+            let mut metadata = FxHashMap::with_capacity_and_hasher(1, Default::default());
             metadata.insert(
                 llkv_table::constants::FIELD_ID_META_KEY.to_string(),
                 column.field_id.to_string(),
             );
             fields.push(
                 Field::new(&column.name, column.data_type.clone(), column.nullable)
-                    .with_metadata(metadata),
+                    .with_metadata(metadata.into_iter().collect()),
             );
             arrays.push(gathered.column(0).clone());
         }
@@ -1556,7 +1557,7 @@ where
         }
 
         let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(columns.len());
-        let mut lookup: HashMap<String, usize> = HashMap::new();
+        let mut lookup = FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
         for (idx, column) in columns.iter().enumerate() {
             let normalized = column.name.to_ascii_lowercase();
             if lookup.insert(normalized.clone(), idx).is_some() {
@@ -1657,7 +1658,7 @@ where
             ));
         }
         let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(schema.fields().len());
-        let mut lookup: HashMap<String, usize> = HashMap::new();
+        let mut lookup = FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
         for (idx, field) in schema.fields().iter().enumerate() {
             let data_type = match field.data_type() {
                 DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Date32 => {
@@ -1756,13 +1757,13 @@ where
             fields.push(Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false));
 
             for (idx, column) in column_defs.iter().enumerate() {
-                let mut metadata = HashMap::new();
+                let mut metadata = FxHashMap::with_capacity_and_hasher(1, Default::default());
                 metadata.insert(
                     llkv_table::constants::FIELD_ID_META_KEY.to_string(),
                     column.field_id.to_string(),
                 );
                 let field = Field::new(&column.name, column.data_type.clone(), column.nullable)
-                    .with_metadata(metadata);
+                    .with_metadata(metadata.into_iter().collect());
                 fields.push(field);
                 arrays.push(batch.column(idx).clone());
             }
@@ -2030,13 +2031,13 @@ where
 
         for (column, values) in table.schema.columns.iter().zip(column_values.into_iter()) {
             let array = build_array_for_column(&column.data_type, &values)?;
-            let mut metadata = HashMap::new();
+            let mut metadata = FxHashMap::with_capacity_and_hasher(1, Default::default());
             metadata.insert(
                 llkv_table::constants::FIELD_ID_META_KEY.to_string(),
                 column.field_id.to_string(),
             );
             let field = Field::new(&column.name, column.data_type.clone(), column.nullable)
-                .with_metadata(metadata);
+                .with_metadata(metadata.into_iter().collect());
             arrays.push(array);
             fields.push(field);
         }
@@ -2137,7 +2138,7 @@ where
             Expression { expr_index: usize },
         }
 
-        let mut seen_columns: HashSet<String> = HashSet::new();
+        let mut seen_columns: FxHashSet<String> = FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
         let mut prepared: Vec<(ExecutorColumn, PreparedValue)> =
             Vec::with_capacity(assignments.len());
         let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
@@ -2205,13 +2206,14 @@ where
             }
         }
 
-        let column_positions: HashMap<FieldId, usize> = table
-            .schema
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(idx, column)| (column.field_id, idx))
-            .collect();
+        let column_positions: FxHashMap<FieldId, usize> = FxHashMap::from_iter(
+            table
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(idx, column)| (column.field_id, idx))
+        );
 
         for (column, value) in prepared {
             let column_index =
@@ -2309,7 +2311,7 @@ where
             Expression { expr_index: usize },
         }
 
-        let mut seen_columns: HashSet<String> = HashSet::new();
+        let mut seen_columns: FxHashSet<String> = FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
         let mut prepared: Vec<(ExecutorColumn, PreparedValue)> =
             Vec::with_capacity(assignments.len());
         let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
@@ -2386,13 +2388,14 @@ where
             }
         }
 
-        let column_positions: HashMap<FieldId, usize> = table
-            .schema
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(idx, column)| (column.field_id, idx))
-            .collect();
+        let column_positions: FxHashMap<FieldId, usize> = FxHashMap::from_iter(
+            table
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(idx, column)| (column.field_id, idx))
+        );
 
         for (column, value) in prepared {
             let column_index =
@@ -2660,7 +2663,7 @@ where
         
         // Build ExecutorSchema from Arrow schema (skip row_id field at index 0)
         let mut executor_columns = Vec::new();
-        let mut lookup = HashMap::new();
+        let mut lookup = FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
         
         for (idx, field) in schema.fields().iter().enumerate().skip(1) {
             // Get field_id from metadata
@@ -4118,7 +4121,7 @@ where
                         }
                     } else {
                         mode = Some(InsertMode::Named);
-                        let mut seen = HashSet::new();
+                        let mut seen = FxHashSet::with_capacity_and_hasher(columns.len(), Default::default());
                         for column in &columns {
                             if !seen.insert(column.clone()) {
                                 return Err(Error::InvalidArgumentError(format!(

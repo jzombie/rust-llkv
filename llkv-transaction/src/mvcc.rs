@@ -4,7 +4,7 @@
 /// and visibility checks used across the engine. The overarching goal is to
 /// allow transactions to operate directly on the base storage without copying
 /// tables into a staging area.
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -25,7 +25,7 @@ struct TxnIdManagerInner {
     /// Largest committed transaction ID (acts as snapshot watermark).
     last_committed: AtomicU64,
     /// Tracking map for transaction statuses.
-    statuses: Mutex<HashMap<TxnId, TxnStatus>>,
+    statuses: Mutex<FxHashMap<TxnId, TxnStatus>>,
 }
 
 impl TxnIdManagerInner {
@@ -38,7 +38,7 @@ impl TxnIdManagerInner {
     }
 
     fn new_with_initial_state(next_txn_id: TxnId, last_committed: TxnId) -> Self {
-        let mut statuses = HashMap::new();
+        let mut statuses = FxHashMap::with_capacity_and_hasher(1, Default::default());
         statuses.insert(TXN_ID_AUTO_COMMIT, TxnStatus::Committed);
 
         Self {
