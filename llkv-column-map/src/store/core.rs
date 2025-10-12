@@ -86,12 +86,12 @@ where
     where
         T: FilterDispatch,
     {
-        tracing::warn!(field=?field_id, "filter_row_ids start");
+        tracing::trace!(field=?field_id, "filter_row_ids start");
         let res = T::run_filter(self, field_id, predicate);
         if let Err(ref err) = res {
-            tracing::warn!(field=?field_id, error=?err, "filter_row_ids error");
+            tracing::trace!(field=?field_id, error=?err, "filter_row_ids error");
         } else {
-            tracing::warn!(field=?field_id, "filter_row_ids ok");
+            tracing::trace!(field=?field_id, "filter_row_ids ok");
         }
         res
     }

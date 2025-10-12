@@ -279,6 +279,14 @@ impl<P> Session<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
+    /// Clone this session (reuses the same underlying TransactionSession).
+    /// This is necessary to maintain transaction state across Engine clones.
+    pub(crate) fn clone_session(&self) -> Self {
+        Self {
+            inner: self.inner.clone_session(),
+        }
+    }
+
     /// Begin a transaction in this session.
     /// Creates an isolated staging context automatically.
     pub fn begin_transaction(&self) -> Result<StatementResult<P>> {
@@ -723,9 +731,12 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
+        // IMPORTANT: Reuse the same session to maintain transaction state!
+        // Creating a new session would break multi-statement transactions.
+        tracing::debug!("[ENGINE] Engine::clone() called - reusing same session");
         Self {
             context: Arc::clone(&self.context),
-            session: self.context.create_session(),
+            session: self.session.clone_session(),
         }
     }
 }
@@ -740,7 +751,9 @@ where
     }
 
     pub fn from_context(context: Arc<Context<P>>) -> Self {
+        tracing::debug!("[ENGINE] Engine::from_context - creating new session");
         let session = context.create_session();
+        tracing::debug!("[ENGINE] Engine::from_context - created session");
         Self { context, session }
     }
 
@@ -823,11 +836,10 @@ where
     /// Create a new session for transaction management.
     /// Each session can have its own independent transaction.
     pub fn create_session(self: &Arc<Self>) -> Session<P> {
-        tracing::trace!("Context::create_session called, pager={:p}", &*self.pager);
+        tracing::debug!("[SESSION] Context::create_session called");
         let wrapper = ContextWrapper::new(Arc::clone(self));
-        tracing::trace!("Created ContextWrapper, wrapper pager={:p}", &*self.pager);
         let inner = self.transaction_manager.create_session(Arc::new(wrapper));
-        tracing::trace!("Created TransactionSession");
+        tracing::debug!("[SESSION] Created TransactionSession with session_id (will be logged by transaction manager)");
         Session { inner }
     }
 
@@ -1171,14 +1183,14 @@ where
                 display_name.clone(),
                 rows,
                 plan.columns,
-                snapshot.txn_id,
+                snapshot,
             ),
             InsertSource::Batches(batches) => self.insert_batches(
                 table.as_ref(),
                 display_name.clone(),
                 batches,
                 plan.columns,
-                snapshot.txn_id,
+                snapshot,
             ),
             InsertSource::Select { .. } => Err(Error::Internal(
                 "InsertSource::Select should be materialized before reaching Context::insert"
@@ -1683,6 +1695,7 @@ where
         table: &ExecutorTable<P>,
         rows: &[Vec<PlanValue>],
         column_order: &[usize],
+        snapshot: TransactionSnapshot,
     ) -> Result<()> {
         let _table_id = table.table.table_id();
         // Find columns with PRIMARY KEY constraint
@@ -1702,10 +1715,12 @@ where
         for (col_idx, column) in primary_key_columns {
             // Get existing values for this column from the table
             let field_id = column.field_id;
-            let existing_values = self.scan_column_values(table, field_id)?;
+            let existing_values = self.scan_column_values(table, field_id, snapshot)?;
 
             tracing::trace!(
-                "[DEBUG] PK check on column '{}': found {} existing values: {:?}",
+                "[PK_CHECK] snapshot(txn={}, snap_id={}) column '{}': found {} existing VISIBLE values: {:?}",
+                snapshot.txn_id,
+                snapshot.snapshot_id,
                 column.name,
                 existing_values.len(),
                 existing_values
@@ -1744,15 +1759,11 @@ where
         &self,
         table: &ExecutorTable<P>,
         field_id: FieldId,
+        snapshot: TransactionSnapshot,
     ) -> Result<Vec<PlanValue>> {
         let table_id = table.table.table_id();
         use llkv_expr::{Expr, Filter, Operator};
         use std::ops::Bound;
-
-        let mut values = Vec::new();
-
-        let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
-        let projection = ScanProjection::column((logical_field_id, "value".to_string()));
 
         // Create a filter that matches all rows (unbounded range)
         let match_all_filter = Filter {
@@ -1764,28 +1775,49 @@ where
         };
         let filter_expr = Expr::Pred(match_all_filter);
 
-        let scan_result = table.table.scan_stream(
-            &[projection],
-            &filter_expr,
-            ScanStreamOptions::default(),
-            |batch| {
-                if batch.num_columns() > 0 {
-                    let array = batch.column(0);
-                    for row_idx in 0..batch.num_rows() {
-                        if let Ok(value) = llkv_plan::plan_value_from_array(array, row_idx) {
-                            values.push(value);
-                        }
-                    }
-                }
-            },
-        );
+        // Get all matching row_ids first
+        let row_ids = match table.table.filter_row_ids(&filter_expr) {
+            Ok(ids) => ids,
+            Err(Error::NotFound) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        
+        // Apply MVCC filtering manually using filter_row_ids_for_snapshot
+        let row_ids = filter_row_ids_for_snapshot(
+            table.table.store(),
+            table_id,
+            row_ids,
+            &self.txn_manager,
+            snapshot,
+        )?;
 
-        // Handle NotFound error - return empty (table has no data yet)
-        match scan_result {
-            Ok(_) => Ok(values),
-            Err(Error::NotFound) => Ok(Vec::new()),
-            Err(e) => Err(e),
+        if row_ids.is_empty() {
+            return Ok(Vec::new());
         }
+
+        // Gather the column values for visible rows
+        let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
+        let batch = match table.table.store().gather_rows(
+            &[logical_field_id],
+            &row_ids,
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(b) => b,
+            Err(Error::NotFound) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let mut values = Vec::with_capacity(row_ids.len());
+        if batch.num_columns() > 0 {
+            let array = batch.column(0);
+            for row_idx in 0..batch.num_rows() {
+                if let Ok(value) = llkv_plan::plan_value_from_array(array, row_idx) {
+                    values.push(value);
+                }
+            }
+        }
+
+        Ok(values)
     }
 
     fn insert_rows(
@@ -1794,7 +1826,7 @@ where
         display_name: String,
         rows: Vec<Vec<PlanValue>>,
         columns: Vec<String>,
-        txn_id: TxnId,
+        snapshot: TransactionSnapshot,
     ) -> Result<StatementResult<P>> {
         if rows.is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -1814,7 +1846,9 @@ where
             }
         }
 
-        // Check PRIMARY KEY constraints
+        // Check PRIMARY KEY constraints  
+        self.check_primary_key_constraints(table, &rows, &column_order, snapshot)?;
+
         if display_name == "keys" {
             tracing::trace!(
                 "[KEYS] Checking PRIMARY KEY constraints - {} rows to insert",
@@ -1825,7 +1859,7 @@ where
             }
         }
 
-        let constraint_result = self.check_primary_key_constraints(table, &rows, &column_order);
+        let constraint_result = self.check_primary_key_constraints(table, &rows, &column_order, snapshot);
 
         if display_name == "keys" {
             match &constraint_result {
@@ -1856,7 +1890,7 @@ where
         let mut created_by_builder = UInt64Builder::with_capacity(row_count);
         let mut deleted_by_builder = UInt64Builder::with_capacity(row_count);
         for _ in 0..row_count {
-            created_by_builder.append_value(txn_id);
+            created_by_builder.append_value(snapshot.txn_id);
             deleted_by_builder.append_value(TXN_ID_NONE);
         }
 
@@ -1909,7 +1943,7 @@ where
         display_name: String,
         batches: Vec<RecordBatch>,
         columns: Vec<String>,
-        txn_id: TxnId,
+        snapshot: TransactionSnapshot,
     ) -> Result<StatementResult<P>> {
         if batches.is_empty() {
             return Ok(StatementResult::Insert {
@@ -1947,7 +1981,7 @@ where
                 rows.push(row);
             }
 
-            match self.insert_rows(table, display_name.clone(), rows, columns.clone(), txn_id)? {
+            match self.insert_rows(table, display_name.clone(), rows, columns.clone(), snapshot)? {
                 StatementResult::Insert { rows_inserted, .. } => {
                     total_rows_inserted += rows_inserted;
                 }
@@ -2115,7 +2149,7 @@ where
             display_name.clone(),
             new_rows,
             column_names,
-            snapshot.txn_id,
+            snapshot,
         )?;
 
         Ok(StatementResult::Update {
@@ -2296,7 +2330,7 @@ where
             display_name.clone(),
             new_rows,
             column_names,
-            snapshot.txn_id,
+            snapshot,
         )?;
 
         Ok(StatementResult::Update {
@@ -2317,7 +2351,7 @@ where
         let filter_expr = translate_predicate(filter, schema)?;
         let row_ids = table.table.filter_row_ids(&filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
-        tracing::warn!(
+        tracing::trace!(
             table = %display_name,
             rows = row_ids.len(),
             "delete_filtered_rows collected row ids"
@@ -2660,6 +2694,21 @@ where
     fn table_names(&self) -> Vec<String> {
         Context::table_names(self.context())
     }
+
+    fn table_id(&self, table_name: &str) -> llkv_result::Result<llkv_table::types::TableId> {
+        // Check CURRENT state: if table is marked as dropped, return error
+        // This is used by conflict detection to detect if a table was dropped
+        let ctx = self.context();
+        if ctx.is_table_marked_dropped(table_name) {
+            return Err(Error::InvalidArgumentError(format!(
+                "table '{}' has been dropped",
+                table_name
+            )));
+        }
+        
+        let table = ctx.lookup_table(table_name)?;
+        Ok(table.table.table_id())
+    }
 }
 
 // Helper to convert StatementResult between types (legacy)
@@ -2691,6 +2740,9 @@ fn filter_row_ids_for_snapshot<P>(
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    tracing::debug!("[FILTER_ROWS] Filtering {} row IDs for snapshot txn_id={}, snapshot_id={}", 
+        row_ids.len(), snapshot.txn_id, snapshot.snapshot_id);
+    
     if row_ids.is_empty() {
         return Ok(row_ids);
     }
@@ -2704,11 +2756,18 @@ where
         GatherNullPolicy::IncludeNulls,
     ) {
         Ok(batch) => batch,
-        Err(Error::NotFound) => return Ok(row_ids),
-        Err(err) => return Err(err),
+        Err(Error::NotFound) => {
+            tracing::trace!("[FILTER_ROWS] gather_rows returned NotFound for MVCC columns, treating all {} rows as visible (committed)", row_ids.len());
+            return Ok(row_ids);
+        }
+        Err(err) => {
+            tracing::error!("[FILTER_ROWS] gather_rows error: {:?}", err);
+            return Err(err);
+        }
     };
 
     if version_batch.num_columns() < 2 {
+        tracing::debug!("[FILTER_ROWS] version_batch has < 2 columns, returning all {} rows", row_ids.len());
         return Ok(row_ids);
     }
 
@@ -2722,6 +2781,7 @@ where
         .downcast_ref::<UInt64Array>();
 
     if created_column.is_none() || deleted_column.is_none() {
+        tracing::debug!("[FILTER_ROWS] Failed to downcast columns, returning all {} rows", row_ids.len());
         return Ok(row_ids);
     }
 
@@ -2745,11 +2805,20 @@ where
             created_by,
             deleted_by,
         };
-        if version.is_visible_for(txn_manager, snapshot) {
+        let is_visible = version.is_visible_for(txn_manager, snapshot);
+        tracing::trace!(
+            "[FILTER_ROWS] row_id={}: created_by={}, deleted_by={}, is_visible={}",
+            row_id,
+            created_by,
+            deleted_by,
+            is_visible
+        );
+        if is_visible {
             visible.push(*row_id);
         }
     }
 
+    tracing::debug!("[FILTER_ROWS] Filtered from {} to {} visible rows", row_ids.len(), visible.len());
     Ok(visible)
 }
 
@@ -2780,6 +2849,12 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     fn filter(&self, table: &Table<P>, row_ids: Vec<u64>) -> Result<Vec<u64>> {
+        tracing::trace!(
+            "[MVCC_FILTER] filter() called with {} row_ids, snapshot txn={}, snapshot_id={}",
+            row_ids.len(),
+            self.snapshot.txn_id,
+            self.snapshot.snapshot_id
+        );
         filter_row_ids_for_snapshot(
             table.store(),
             table.table_id(),

@@ -187,31 +187,51 @@ impl RowVersion {
 
     /// Determine whether the row is visible for the supplied snapshot using full MVCC rules.
     pub fn is_visible_for(&self, manager: &TxnIdManager, snapshot: TransactionSnapshot) -> bool {
+        tracing::trace!(
+            "[MVCC] is_visible_for: created_by={}, deleted_by={}, snapshot.txn_id={}, snapshot.snapshot_id={}",
+            self.created_by, self.deleted_by, snapshot.txn_id, snapshot.snapshot_id
+        );
+
         // Rows created inside the current transaction are visible unless this
         // transaction also deleted them.
         if self.created_by == snapshot.txn_id {
-            return self.deleted_by != snapshot.txn_id;
+            let visible = self.deleted_by != snapshot.txn_id;
+            tracing::trace!("[MVCC] created by current txn, visible={}", visible);
+            return visible;
         }
 
         // Ignore rows whose creator has not committed yet.
-        if !manager.status(self.created_by).is_committed() {
+        let creator_status = manager.status(self.created_by);
+        tracing::trace!("[MVCC] creator_status={:?}", creator_status);
+        if !creator_status.is_committed() {
+            tracing::trace!("[MVCC] creator not committed, invisible");
             return false;
         }
 
         if self.created_by > snapshot.snapshot_id {
+            tracing::trace!("[MVCC] created_by > snapshot_id, invisible");
             return false;
         }
 
         match self.deleted_by {
-            TXN_ID_NONE => true,
-            tx if tx == snapshot.txn_id => false,
+            TXN_ID_NONE => {
+                tracing::trace!("[MVCC] not deleted, visible");
+                true
+            }
+            tx if tx == snapshot.txn_id => {
+                tracing::trace!("[MVCC] deleted by current txn, invisible");
+                false
+            }
             tx => {
                 if !manager.status(tx).is_committed() {
                     // A different transaction marked the row deleted but has not
                     // committed; the row remains visible to others.
+                    tracing::trace!("[MVCC] deleter not committed, visible");
                     return true;
                 }
-                tx > snapshot.snapshot_id
+                let visible = tx > snapshot.snapshot_id;
+                tracing::trace!("[MVCC] deleter committed, visible={}", visible);
+                visible
             }
         }
     }

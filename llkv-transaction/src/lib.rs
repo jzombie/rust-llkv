@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 
-pub use mvcc::{RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TxnId, TxnIdManager};
+pub use mvcc::{RowVersion, TransactionSnapshot, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TxnId, TxnIdManager};
 
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
@@ -159,6 +159,9 @@ pub trait TransactionContext: Send + Sync {
 
     /// Get table names for catalog snapshot
     fn table_names(&self) -> Vec<String>;
+
+    /// Get table ID for a given table name (for conflict detection)
+    fn table_id(&self, table_name: &str) -> LlkvResult<llkv_table::types::TableId>;
 }
 
 /// Transaction state for the runtime context.
@@ -169,26 +172,28 @@ where
 {
     /// Transaction snapshot (contains txn id + snapshot watermark)
     snapshot: mvcc::TransactionSnapshot,
-    /// Staging context with MemPager for isolation.
+    /// Staging context with MemPager for isolation (only used for tables created in this txn).
     staging: Arc<StagingCtx>,
     /// Operations to replay on commit.
     operations: Vec<PlanOperation>,
-    /// Tables that have been staged (created/snapshotted in staging).
+    /// Tables that have been verified to exist (either in base or staging).
     staged_tables: HashSet<String>,
-    /// Tables created within this transaction.
+    /// Tables created within this transaction (live in staging until commit).
     new_tables: HashSet<String>,
-    /// Tables that have been snapshotted into staging.
-    snapshotted_tables: HashSet<String>,
     /// Tables known to be missing.
     missing_tables: HashSet<String>,
     /// Snapshot of catalog at transaction start.
     catalog_snapshot: HashSet<String>,
-    /// Base context for table snapshotting.
+    /// Base context for reading existing tables with MVCC visibility.
     base_context: Arc<BaseCtx>,
     /// Whether this transaction has been aborted due to an error.
     is_aborted: bool,
     /// Transaction ID manager (shared across all transactions)
     txn_manager: Arc<TxnIdManager>,
+    /// Snapshot of (table_name, table_id) pairs at transaction start
+    catalog_table_ids: HashMap<String, llkv_table::types::TableId>,
+    /// Tables accessed (names only) by this transaction
+    accessed_tables: HashSet<String>,
 }
 
 impl<BaseCtx, StagingCtx> SessionTransaction<BaseCtx, StagingCtx>
@@ -201,44 +206,59 @@ where
         staging: Arc<StagingCtx>,
         txn_manager: Arc<TxnIdManager>,
     ) -> Self {
-        let catalog_snapshot = base_context.table_names().into_iter().collect();
-        let staged_tables: HashSet<String> = staging.table_names().into_iter().collect();
+        let table_names: Vec<String> = base_context.table_names();
+        let catalog_snapshot: HashSet<String> = table_names.iter().cloned().collect();
+        
+        // Capture (table_name, table_id) pairs at transaction start for conflict detection
+        let mut catalog_table_ids = HashMap::new();
+        for table_name in &table_names {
+            if let Ok(table_id) = base_context.table_id(table_name) {
+                catalog_table_ids.insert(table_name.clone(), table_id);
+            }
+        }
+        
         let snapshot = txn_manager.begin_transaction();
+        tracing::debug!(
+            "[SESSION_TX] new() created transaction with txn_id={}, snapshot_id={}",
+            snapshot.txn_id,
+            snapshot.snapshot_id
+        );
         TransactionContext::set_snapshot(&*base_context, snapshot);
         TransactionContext::set_snapshot(&*staging, snapshot);
 
         Self {
             staging,
             operations: Vec::new(),
-            staged_tables: staged_tables.clone(),
+            staged_tables: HashSet::new(),
             new_tables: HashSet::new(),
-            snapshotted_tables: staged_tables,
             missing_tables: HashSet::new(),
             catalog_snapshot,
+            catalog_table_ids,
             base_context,
             is_aborted: false,
+            accessed_tables: HashSet::new(),
             snapshot,
             txn_manager,
         }
     }
 
-    /// Ensure a table exists in the staging context, snapshotting from base if needed.
-    fn ensure_table_in_delta(&mut self, table_name: &str) -> LlkvResult<()> {
+    /// Ensure a table exists and is visible to this transaction.
+    /// NO COPYING - just check if table exists in base or was created in this transaction.
+    fn ensure_table_exists(&mut self, table_name: &str) -> LlkvResult<()> {
         tracing::trace!(
-            "[ENSURE] ensure_table_in_delta called for table='{}'",
+            "[ENSURE] ensure_table_exists called for table='{}'",
             table_name
         );
-        tracing::trace!(
-            "[ENSURE]   staged_tables.contains={}",
-            self.staged_tables.contains(table_name)
-        );
+
+        // If we already checked this table, return early
         if self.staged_tables.contains(table_name) {
-            tracing::trace!("[ENSURE]   returning early - table already staged");
+            tracing::trace!("[ENSURE] table already verified to exist");
             return Ok(());
         }
 
         let canonical_name = table_name.to_ascii_lowercase();
 
+        // Check if table exists in catalog snapshot OR was created in this transaction
         if !self.catalog_snapshot.contains(&canonical_name) && !self.new_tables.contains(table_name)
         {
             self.missing_tables.insert(table_name.to_string());
@@ -253,109 +273,74 @@ where
             )));
         }
 
-        // Try to get specs from base context
-        tracing::trace!("[ENSURE] About to check base_context.table_column_specs");
-        match self.base_context.table_column_specs(table_name) {
-            Ok(specs) => {
-                tracing::trace!(
-                    "[ENSURE] Got {} specs from BASE context for table '{}'",
-                    specs.len(),
-                    table_name
-                );
-                for spec in &specs {
-                    tracing::trace!(
-                        "[ENSURE]   spec: name='{}' primary_key={}",
-                        spec.name,
-                        spec.primary_key
-                    );
+        // For tables created in this transaction, also create in staging for isolation
+        if self.new_tables.contains(table_name) {
+            tracing::trace!("[ENSURE] Table was created in this transaction");
+            // Check if it exists in staging
+            match self.staging.table_column_specs(table_name) {
+                Ok(_) => {
+                    self.staged_tables.insert(table_name.to_string());
+                    return Ok(());
                 }
-                self.missing_tables.remove(table_name);
-                let mut plan = CreateTablePlan::new(table_name.to_string());
-                plan.if_not_exists = true;
-                plan.columns = specs;
-                tracing::trace!(
-                    "[ENSURE] About to create table in staging with {} columns",
-                    plan.columns.len()
-                );
-                self.staging.create_table_plan(plan)?;
-                tracing::trace!("[ENSURE] Created table in staging successfully");
-
-                // Snapshot rows from base for transaction isolation (REPEATABLE READ)
-                tracing::trace!("[ENSURE] About to snapshot rows from base context");
-                match self.base_context.get_batches_with_row_ids(table_name, None) {
-                    Ok(batches) => {
-                        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-                        tracing::trace!("[ENSURE] Got {} rows from base", total_rows);
-                        if total_rows > 0 {
-                            tracing::trace!(
-                                "[ENSURE] About to APPEND {} rows into staging with preserved row_ids",
-                                total_rows
-                            );
-                            let appended = self
-                                .staging
-                                .append_batches_with_row_ids(table_name, batches)?;
-                            tracing::trace!(
-                                "[ENSURE] Successfully appended {} snapshot rows into staging",
-                                appended
-                            );
-                        }
-                        self.snapshotted_tables.insert(table_name.to_string());
-                        tracing::trace!("[ENSURE] Marked table as snapshotted");
-                    }
-                    Err(Error::NotFound) => {
-                        tracing::trace!(
-                            "[ENSURE] No rows found in base, marking as snapshotted anyway"
-                        );
-                        self.snapshotted_tables.insert(table_name.to_string());
-                    }
-                    Err(other) => return Err(other),
+                Err(_) => {
+                    return Err(Error::CatalogError(format!(
+                        "Catalog Error: Table '{table_name}' was created but not found in staging"
+                    )));
                 }
-            }
-            Err(Error::NotFound) => {
-                tracing::trace!("[ENSURE] Table not found in BASE context, checking STAGING");
-                // Check if it exists in staging only
-                match self.staging.table_column_specs(table_name) {
-                    Ok(_) => {
-                        tracing::trace!("[ENSURE] Found in STAGING only, marking as staged");
-                        self.staged_tables.insert(table_name.to_string());
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        tracing::trace!("[ENSURE] Not found in STAGING either, returning error");
-                        self.missing_tables.insert(table_name.to_string());
-                        return Err(Error::CatalogError(format!(
-                            "Catalog Error: Table '{table_name}' does not exist"
-                        )));
-                    }
-                }
-            }
-            Err(other) => {
-                tracing::trace!(
-                    "[ENSURE] base_context.table_column_specs returned error: {:?}",
-                    other
-                );
-                return Err(other);
             }
         }
 
+        // Table exists in base - mark as verified
+        tracing::trace!("[ENSURE] Table exists in base, no copying needed (MVCC will handle visibility)");
         self.staged_tables.insert(table_name.to_string());
         Ok(())
     }
 
     /// Execute a SELECT query within transaction isolation.
-    /// If table is snapshotted, all data is in staging (snapshot + changes).
-    /// Otherwise query staging only (for new tables).
+    /// For tables created in this transaction: read from staging.
+    /// For existing tables: read from BASE with MVCC visibility filtering.
     pub fn execute_select(
         &mut self,
         plan: SelectPlan,
     ) -> LlkvResult<SelectExecution<StagingCtx::Pager>> {
-        // Ensure table exists in staging
-        self.ensure_table_in_delta(&plan.table)?;
+        // Ensure table exists
+        self.ensure_table_exists(&plan.table)?;
 
-        // Query staging - it contains either:
-        // 1. Snapshot + modifications (for existing tables)
-        // 2. Just the new rows (for tables created in this transaction)
-        self.staging.execute_select(plan)
+        // If table was created in this transaction, read from staging
+        if self.new_tables.contains(&plan.table) {
+            tracing::trace!("[SELECT] Reading from staging for new table '{}'", plan.table);
+            return self.staging.execute_select(plan);
+        }
+
+        // Track access to existing table for conflict detection
+        self.accessed_tables.insert(plan.table.clone());
+
+        // Otherwise read from BASE with MVCC visibility
+        // The base context already has the snapshot set in SessionTransaction::new()
+        tracing::trace!("[SELECT] Reading from BASE with MVCC for existing table '{}'", plan.table);
+        let table_name = plan.table.clone();
+        self.base_context.execute_select(plan)
+            .and_then(|exec| {
+                // Convert pager type from BaseCtx to StagingCtx
+                // This is a limitation of the current type system
+                // In practice, we're just collecting and re-packaging
+                let schema = exec.schema();
+                let batches = exec.collect().unwrap_or_default();
+                let combined = if batches.is_empty() {
+                    RecordBatch::new_empty(Arc::clone(&schema))
+                } else if batches.len() == 1 {
+                    batches.into_iter().next().unwrap()
+                } else {
+                    let refs: Vec<&RecordBatch> = batches.iter().collect();
+                    arrow::compute::concat_batches(&schema, refs)
+                        .map_err(|err| Error::Internal(format!("failed to concatenate batches: {err}")))?
+                };
+                Ok(SelectExecution::from_batch(
+                    table_name,
+                    Arc::clone(&schema),
+                    combined,
+                ))
+            })
     }
 
     /// Execute an operation in the transaction staging context
@@ -405,18 +390,40 @@ where
                     "[TX] SessionTransaction::execute_operation INSERT for table='{}'",
                     plan.table
                 );
-                // First ensure table exists
-                if let Err(e) = self.ensure_table_in_delta(&plan.table) {
+                // Ensure table exists
+                if let Err(e) = self.ensure_table_exists(&plan.table) {
                     self.is_aborted = true;
                     return Err(e);
                 }
-                tracing::trace!("[TX] About to call self.staging.insert...");
-                match self.staging.insert(plan.clone()) {
+
+                // If table was created in this transaction, insert into staging
+                // Otherwise insert directly into BASE (with transaction ID tagging)
+                let is_new_table = self.new_tables.contains(&plan.table);
+                // Track access to existing table for conflict detection
+                if !is_new_table {
+                    self.accessed_tables.insert(plan.table.clone());
+                }
+                let result = if is_new_table {
+                    tracing::trace!("[TX] INSERT into staging for new table");
+                    self.staging.insert(plan.clone())
+                } else {
+                    tracing::trace!("[TX] INSERT directly into BASE with txn_id={}", self.snapshot.txn_id);
+                    // Insert into base - MVCC tagging happens automatically in insert_rows()
+                    self.base_context.insert(plan.clone())
+                        .and_then(|r| r.convert_pager_type())
+                };
+
+                match result {
                     Ok(result) => {
-                        tracing::trace!("[TX] INSERT succeeded, pushing operation to replay queue");
-                        // Track for commit replay
-                        self.operations.push(PlanOperation::Insert(plan.clone()));
-                        result.convert_pager_type()?
+                        // Only track operations for NEW tables - they need replay on commit
+                        // For existing tables, changes are already in BASE with MVCC tags
+                        if is_new_table {
+                            tracing::trace!("[TX] INSERT to new table - tracking for commit replay");
+                            self.operations.push(PlanOperation::Insert(plan.clone()));
+                        } else {
+                            tracing::trace!("[TX] INSERT to existing table - already in BASE, no replay needed");
+                        }
+                        result
                     }
                     Err(e) => {
                         tracing::trace!(
@@ -430,15 +437,37 @@ where
                 }
             }
             PlanOperation::Update(ref plan) => {
-                if let Err(e) = self.ensure_table_in_delta(&plan.table) {
+                if let Err(e) = self.ensure_table_exists(&plan.table) {
                     self.is_aborted = true;
                     return Err(e);
                 }
-                match self.staging.update(plan.clone()) {
+
+                // If table was created in this transaction, update in staging
+                // Otherwise update directly in BASE (with MVCC soft-delete + insert)
+                let is_new_table = self.new_tables.contains(&plan.table);
+                // Track access to existing table for conflict detection
+                if !is_new_table {
+                    self.accessed_tables.insert(plan.table.clone());
+                }
+                let result = if is_new_table {
+                    tracing::trace!("[TX] UPDATE in staging for new table");
+                    self.staging.update(plan.clone())
+                } else {
+                    tracing::trace!("[TX] UPDATE directly in BASE with txn_id={}", self.snapshot.txn_id);
+                    self.base_context.update(plan.clone())
+                        .and_then(|r| r.convert_pager_type())
+                };
+
+                match result {
                     Ok(result) => {
-                        // Track for commit replay
-                        self.operations.push(PlanOperation::Update(plan.clone()));
-                        result.convert_pager_type()?
+                        // Only track operations for NEW tables - they need replay on commit
+                        if is_new_table {
+                            tracing::trace!("[TX] UPDATE to new table - tracking for commit replay");
+                            self.operations.push(PlanOperation::Update(plan.clone()));
+                        } else {
+                            tracing::trace!("[TX] UPDATE to existing table - already in BASE, no replay needed");
+                        }
+                        result
                     }
                     Err(e) => {
                         self.is_aborted = true;
@@ -447,15 +476,42 @@ where
                 }
             }
             PlanOperation::Delete(ref plan) => {
-                if let Err(e) = self.ensure_table_in_delta(&plan.table) {
+                tracing::debug!("[DELETE] Starting delete for table '{}'", plan.table);
+                if let Err(e) = self.ensure_table_exists(&plan.table) {
+                    tracing::debug!("[DELETE] ensure_table_exists failed: {}", e);
                     self.is_aborted = true;
                     return Err(e);
                 }
-                match self.staging.delete(plan.clone()) {
+
+                // If table was created in this transaction, delete from staging
+                // Otherwise delete directly in BASE (with MVCC soft-delete)
+                let is_new_table = self.new_tables.contains(&plan.table);
+                tracing::debug!("[DELETE] is_new_table={}", is_new_table);
+                // Track access to existing table for conflict detection
+                if !is_new_table {
+                    tracing::debug!("[DELETE] Tracking access to existing table '{}'", plan.table);
+                    self.accessed_tables.insert(plan.table.clone());
+                }
+                let result = if is_new_table {
+                    tracing::debug!("[DELETE] Deleting from staging for new table");
+                    self.staging.delete(plan.clone())
+                } else {
+                    tracing::debug!("[DELETE] Deleting from BASE with txn_id={}", self.snapshot.txn_id);
+                    self.base_context.delete(plan.clone())
+                        .and_then(|r| r.convert_pager_type())
+                };
+
+                tracing::debug!("[DELETE] Result: {:?}", result.as_ref().map(|_| "Ok").map_err(|e| format!("{}", e)));
+                match result {
                     Ok(result) => {
-                        // Track for commit replay
-                        self.operations.push(PlanOperation::Delete(plan.clone()));
-                        result.convert_pager_type()?
+                        // Only track operations for NEW tables - they need replay on commit
+                        if is_new_table {
+                            tracing::trace!("[TX] DELETE from new table - tracking for commit replay");
+                            self.operations.push(PlanOperation::Delete(plan.clone()));
+                        } else {
+                            tracing::trace!("[TX] DELETE from existing table - already in BASE, no replay needed");
+                        }
+                        result
                     }
                     Err(e) => {
                         self.is_aborted = true;
@@ -548,6 +604,17 @@ where
         }
     }
 
+    /// Clone this session (reuses the same session_id and shared transaction map).
+    /// This is necessary to maintain transaction state across Engine clones.
+    pub fn clone_session(&self) -> Self {
+        Self {
+            context: Arc::clone(&self.context),
+            session_id: self.session_id,
+            transactions: Arc::clone(&self.transactions),
+            txn_manager: Arc::clone(&self.txn_manager),
+        }
+    }
+
     /// Get the session ID.
     pub fn session_id(&self) -> u64 {
         self.session_id
@@ -593,10 +660,19 @@ where
         &self,
         staging: Arc<StagingCtx>,
     ) -> LlkvResult<TransactionResult<BaseCtx::Pager>> {
+        tracing::debug!(
+            "[BEGIN] begin_transaction called for session_id={}",
+            self.session_id
+        );
         let mut guard = self
             .transactions
             .lock()
             .expect("transactions lock poisoned");
+        tracing::debug!(
+            "[BEGIN] session_id={}, transactions map has {} entries",
+            self.session_id,
+            guard.len()
+        );
         if guard.contains_key(&self.session_id) {
             return Err(Error::InvalidArgumentError(
                 "a transaction is already in progress in this session".into(),
@@ -609,6 +685,11 @@ where
                 staging,
                 Arc::clone(&self.txn_manager),
             ),
+        );
+        tracing::debug!(
+            "[BEGIN] session_id={}, inserted transaction, map now has {} entries",
+            self.session_id,
+            guard.len()
         );
         Ok(TransactionResult::Transaction {
             kind: TransactionKind::Begin,
@@ -645,6 +726,12 @@ where
         // If transaction is aborted, commit becomes a rollback (no operations to replay)
         if tx.is_aborted {
             tx.txn_manager.mark_aborted(tx.snapshot.txn_id);
+            // Reset context snapshot to auto-commit view (aborted txn's writes should be invisible)
+            let auto_commit_snapshot = TransactionSnapshot {
+                txn_id: TXN_ID_AUTO_COMMIT,
+                snapshot_id: tx.txn_manager.last_committed(),
+            };
+            TransactionContext::set_snapshot(&*self.context, auto_commit_snapshot);
             tracing::trace!("DEBUG commit_transaction: returning Rollback with 0 operations");
             return Ok((
                 TransactionResult::Transaction {
@@ -652,6 +739,52 @@ where
                 },
                 Vec::new(),
             ));
+        }
+
+        // Check for write-write conflicts: detect if any accessed tables have been dropped or replaced
+        // We captured (table_name, table_id) pairs at transaction start
+        tracing::debug!(
+            "[COMMIT CONFLICT CHECK] Transaction {} accessed {} tables",
+            tx.snapshot.txn_id,
+            tx.accessed_tables.len()
+        );
+        for accessed_table_name in &tx.accessed_tables {
+            tracing::debug!(
+                "[COMMIT CONFLICT CHECK] Checking table '{}'",
+                accessed_table_name
+            );
+            // Get the table ID from our snapshot at transaction start
+            if let Some(snapshot_table_id) = tx.catalog_table_ids.get(accessed_table_name) {
+                // Check current table state
+                match self.context.table_id(accessed_table_name) {
+                    Ok(current_table_id) => {
+                        // If table ID changed, it was dropped and recreated
+                        if current_table_id != *snapshot_table_id {
+                            tx.txn_manager.mark_aborted(tx.snapshot.txn_id);
+                            let auto_commit_snapshot = TransactionSnapshot {
+                                txn_id: TXN_ID_AUTO_COMMIT,
+                                snapshot_id: tx.txn_manager.last_committed(),
+                            };
+                            TransactionContext::set_snapshot(&*self.context, auto_commit_snapshot);
+                            return Err(Error::TransactionContextError(
+                                "another transaction has dropped this table".into()
+                            ));
+                        }
+                    }
+                    Err(_) => {
+                        // Table no longer exists - it was dropped
+                        tx.txn_manager.mark_aborted(tx.snapshot.txn_id);
+                        let auto_commit_snapshot = TransactionSnapshot {
+                            txn_id: TXN_ID_AUTO_COMMIT,
+                            snapshot_id: tx.txn_manager.last_committed(),
+                        };
+                        TransactionContext::set_snapshot(&*self.context, auto_commit_snapshot);
+                        return Err(Error::TransactionContextError(
+                            "another transaction has dropped this table".into()
+                        ));
+                    }
+                }
+            }
         }
 
         let operations = tx.operations;
@@ -679,6 +812,12 @@ where
             .expect("transactions lock poisoned");
         if let Some(tx) = guard.remove(&self.session_id) {
             tx.txn_manager.mark_aborted(tx.snapshot.txn_id);
+            // Reset context snapshot to auto-commit view (rolled-back txn's writes should be invisible)
+            let auto_commit_snapshot = TransactionSnapshot {
+                txn_id: TXN_ID_AUTO_COMMIT,
+                snapshot_id: tx.txn_manager.last_committed(),
+            };
+            TransactionContext::set_snapshot(&*self.context, auto_commit_snapshot);
         } else {
             return Err(Error::InvalidArgumentError(
                 "no transaction is currently in progress in this session".into(),
@@ -694,6 +833,10 @@ where
         &self,
         operation: PlanOperation,
     ) -> LlkvResult<TransactionResult<StagingCtx::Pager>> {
+        tracing::debug!(
+            "[EXECUTE_OP] execute_operation called for session_id={}",
+            self.session_id
+        );
         if !self.has_active_transaction() {
             // No transaction - caller must handle direct execution
             return Err(Error::InvalidArgumentError(
@@ -706,9 +849,20 @@ where
             .transactions
             .lock()
             .expect("transactions lock poisoned");
+        tracing::debug!(
+            "[EXECUTE_OP] session_id={}, transactions map has {} entries",
+            self.session_id,
+            guard.len()
+        );
         let tx = guard
             .get_mut(&self.session_id)
             .ok_or_else(|| Error::Internal("transaction disappeared during execution".into()))?;
+        tracing::debug!(
+            "[EXECUTE_OP] session_id={}, found transaction with txn_id={}, accessed_tables={}",
+            self.session_id,
+            tx.snapshot.txn_id,
+            tx.accessed_tables.len()
+        );
 
         let result = tx.execute_operation(operation);
         if let Err(ref e) = result {
@@ -773,6 +927,10 @@ where
     /// Create a new session for transaction management.
     pub fn create_session(&self, context: Arc<BaseCtx>) -> TransactionSession<BaseCtx, StagingCtx> {
         let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
+        tracing::debug!(
+            "[TX_MANAGER] create_session: allocated session_id={}",
+            session_id
+        );
         TransactionSession::new(
             context,
             session_id,

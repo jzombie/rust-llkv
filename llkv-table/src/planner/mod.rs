@@ -847,13 +847,52 @@ where
 
         let fusion_cache = PredicateFusionCache::from_expr(&filter_expr);
         let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
-        let mut row_ids =
-            self.collect_row_ids_for_expr(&filter_expr, &fusion_cache, &mut all_rows_cache)?;
+        
+        // When we have a trivial filter (no predicates), enumerate ALL row IDs.
+        // This is necessary for:
+        // 1. MVCC filtering to check visibility of all rows including NULL rows
+        // 2. Aggregates like COUNT_NULLS that need to count NULL rows
+        // We scan the MVCC created_by column which exists for every row.
+        let mut row_ids = if is_trivial_filter(&filter_expr) {
+            use arrow::datatypes::UInt64Type;
+            use llkv_expr::typed_predicate::Predicate;
+            let created_lfid = LogicalFieldId::for_mvcc_created_by(self.table.table_id());
+            tracing::trace!(
+                "[SCAN_STREAM] MVCC + trivial filter: scanning created_by column for all row IDs"
+            );
+            // Get all rows where created_by exists (which is all rows that have been written)
+            self.table.store().filter_row_ids::<UInt64Type>(
+                created_lfid,
+                &Predicate::All,
+            )?
+        } else {
+            self.collect_row_ids_for_expr(&filter_expr, &fusion_cache, &mut all_rows_cache)?
+        };
+        
+        tracing::trace!(
+            "[SCAN_STREAM] collected {} row_ids, has_row_filter={}",
+            row_ids.len(),
+            options.row_id_filter.is_some()
+        );
         if let Some(filter) = options.row_id_filter.as_ref() {
+            let before_len = row_ids.len();
             row_ids = filter.filter(self.table, row_ids)?;
+            tracing::trace!(
+                "[SCAN_STREAM] after MVCC filter: {} -> {} row_ids",
+                before_len,
+                row_ids.len()
+            );
         }
         if row_ids.is_empty() {
-            if is_trivial_filter(&filter_expr) {
+            tracing::trace!(
+                "[SCAN_STREAM] row_ids is empty after filtering, returning early (no synthetic batch)"
+            );
+            // MVCC Note: If row_ids is empty after MVCC filtering, don't create synthetic batches!
+            // The old optimization of creating NULL rows for trivial filters breaks MVCC visibility.
+            // An empty row_ids list means NO visible rows, so we should return empty results.
+            if options.row_id_filter.is_none() && is_trivial_filter(&filter_expr) {
+                tracing::trace!("[SCAN_STREAM] would create synthetic batch but skipping");
+                // Only use the synthetic batch optimization when there's NO MVCC filtering
                 let total_rows = self.table.total_rows()?;
                 let row_count = usize::try_from(total_rows).map_err(|_| {
                     Error::InvalidArgumentError("table row count exceeds supported range".into())

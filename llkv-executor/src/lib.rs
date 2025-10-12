@@ -286,19 +286,26 @@ where
         let options = ScanStreamOptions {
             include_nulls: true,
             order: None,
-            row_id_filter: None,
+            row_id_filter: row_filter.clone(),
         };
 
         let mut states: Vec<AggregateState> = Vec::with_capacity(specs.len());
+        // MVCC Note: We cannot use the total_rows shortcut when MVCC visibility filtering
+        // is enabled, because some rows may be invisible due to uncommitted or aborted transactions.
+        // Always scan to apply proper visibility rules.
         let mut count_star_override: Option<i64> = None;
-        let total_rows = table.total_rows.load(Ordering::SeqCst);
-        if !had_filter {
+        if !had_filter && row_filter.is_none() {
+            // Only use shortcut if no filter AND no MVCC row filtering
+            let total_rows = table.total_rows.load(Ordering::SeqCst);
+            tracing::debug!("[AGGREGATE] Using COUNT(*) shortcut: total_rows={}", total_rows);
             if total_rows > i64::MAX as u64 {
                 return Err(Error::InvalidArgumentError(
                     "COUNT(*) result exceeds supported range".into(),
                 ));
             }
             count_star_override = Some(total_rows as i64);
+        } else {
+            tracing::debug!("[AGGREGATE] NOT using COUNT(*) shortcut: had_filter={}, has_row_filter={}", had_filter, row_filter.is_some());
         }
 
         for (idx, spec) in specs.iter().enumerate() {
@@ -310,7 +317,10 @@ where
                     count_star_override,
                 )?,
                 override_value: match spec.kind {
-                    AggregateKind::CountStar => count_star_override,
+                    AggregateKind::CountStar => {
+                        tracing::debug!("[AGGREGATE] CountStar override_value={:?}", count_star_override);
+                        count_star_override
+                    },
                     _ => None,
                 },
             });

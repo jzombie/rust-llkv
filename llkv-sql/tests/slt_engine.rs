@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use arrow::array::Array as ArrowArray;
@@ -14,7 +15,9 @@ pub struct EngineHarness {
 
 impl EngineHarness {
     pub fn new(engine: SqlEngine<MemPager>) -> Self {
-        Self { engine }
+        let harness = Self { engine };
+        tracing::debug!("[HARNESS] new() created harness at {:p}", &harness);
+        harness
     }
 }
 
@@ -47,14 +50,12 @@ impl AsyncDB for EngineHarness {
     type ColumnType = DefaultColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
-        tracing::trace!(
-            "[HARNESS] run() called with sql (length={}, lines={}):",
-            sql.len(),
-            sql.lines().count()
+        // Log which SQL is being executed by this harness
+        tracing::debug!(
+            "[HARNESS {:p}] run() called, sql=\"{}\"",
+            self,
+            sql.trim()
         );
-        for (i, line) in sql.lines().enumerate() {
-            tracing::trace!("[HARNESS]   line {}: {:?}", i, line);
-        }
         match self.engine.execute(sql) {
             Ok(mut results) => {
                 tracing::trace!(
@@ -190,12 +191,14 @@ pub fn make_factory_factory() -> impl Fn() -> HarnessFactory + Clone {
     || {
         tracing::trace!("[FACTORY] make_factory_factory: Creating SharedContext");
         let shared = SharedContext::new();
+        let counter = Arc::new(AtomicUsize::new(0));
         let factory: HarnessFactory = Box::new(move || {
-            tracing::trace!("[FACTORY] Factory called: Creating new EngineHarness");
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            tracing::debug!("[FACTORY] Factory called #{}: Creating new EngineHarness", n);
             let shared_clone = shared.clone();
             Box::pin(async move {
                 let engine = shared_clone.make_engine();
-                tracing::trace!("[FACTORY] Created SqlEngine with new Session");
+                tracing::debug!("[FACTORY] Factory #{}: Created SqlEngine with new Session", n);
                 Ok::<_, ()>(EngineHarness::new(engine))
             })
         });

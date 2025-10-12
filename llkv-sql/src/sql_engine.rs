@@ -42,6 +42,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
+        tracing::warn!("[SQL_ENGINE] SqlEngine::clone() called - will create new Engine with new session!");
         // Create a new session from the same context
         Self {
             engine: self.engine.clone(),
