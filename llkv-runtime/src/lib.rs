@@ -800,6 +800,18 @@ where
 }
 
 /// In-memory execution context shared by plan-based queries.
+///
+/// Important: "lazy loading" here refers to *table metadata only* (schema,
+/// executor-side column descriptors, and a small next-row-id counter). We do
+/// NOT eagerly load or materialize the table's row data into memory. All
+/// row/column data remains on the ColumnStore and is streamed in chunks during
+/// query execution. This keeps the memory footprint low even for very large
+/// tables.
+///
+/// Typical resource usage:
+/// - Metadata per table: ~100s of bytes to a few KB (schema + field ids)
+/// - ExecutorTable struct: small (handles + counters)
+/// - Actual table rows: streamed from disk in chunks (never fully resident)
 pub struct Context<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -875,132 +887,35 @@ where
         let transaction_manager = TransactionManager::new_with_initial_state(next_txn_id, last_committed);
         let txn_manager = transaction_manager.txn_manager();
         
-        // Reconstruct table registry from loaded metadata
-        let mut tables = HashMap::new();
-        for (table_id, meta) in loaded_tables {
-            if let Some(ref name) = meta.name {
-                let canonical_name = name.to_ascii_lowercase();
-                
-                // Open the table and build ExecutorTable from it
-                match Table::new(table_id, Arc::clone(&pager)) {
-                    Ok(table) => {
-                        // Get schema from the table (includes row_id + user columns)
-                        match table.schema() {
-                            Ok(schema) => {
-                                // Build ExecutorSchema from Arrow schema (skip row_id field at index 0)
-                                let mut executor_columns = Vec::new();
-                                let mut lookup = HashMap::new();
-                                
-                                for (idx, field) in schema.fields().iter().enumerate().skip(1) {
-                                    // Get field_id from metadata
-                                    let field_id = field
-                                        .metadata()
-                                        .get(llkv_table::constants::FIELD_ID_META_KEY)
-                                        .and_then(|s| s.parse::<FieldId>().ok())
-                                        .unwrap_or((idx) as FieldId);
-                                    
-                                    let normalized = field.name().to_ascii_lowercase();
-                                    let col_idx = executor_columns.len();
-                                    lookup.insert(normalized, col_idx);
-                                    
-                                    executor_columns.push(ExecutorColumn {
-                                        name: field.name().to_string(),
-                                        data_type: field.data_type().clone(),
-                                        nullable: field.is_nullable(),
-                                        primary_key: false, // Not stored in schema metadata currently
-                                        field_id,
-                                    });
-                                }
-                                
-                                let exec_schema = Arc::new(ExecutorSchema {
-                                    columns: executor_columns,
-                                    lookup,
-                                });
-                                
-                                // Find the maximum row_id in the table to set next_row_id correctly
-                                let max_row_id = {
-                                    use llkv_column_map::store::scan::{
-                                        PrimitiveVisitor, PrimitiveWithRowIdsVisitor,
-                                        PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor,
-                                        ScanBuilder, ScanOptions
-                                    };
-                                    use llkv_column_map::store::rowid_fid;
-                                    use arrow::array::UInt64Array;
-                                    
-                                    struct MaxRowIdVisitor {
-                                        max: u64,
-                                    }
-                                    
-                                    impl PrimitiveVisitor for MaxRowIdVisitor {
-                                        fn u64_chunk(&mut self, values: &UInt64Array) {
-                                            for i in 0..values.len() {
-                                                let val = values.value(i);
-                                                if val > self.max {
-                                                    self.max = val;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    
-                                    impl PrimitiveWithRowIdsVisitor for MaxRowIdVisitor {}
-                                    impl PrimitiveSortedVisitor for MaxRowIdVisitor {}
-                                    impl PrimitiveSortedWithRowIdsVisitor for MaxRowIdVisitor {}
-                                    
-                                    // Scan the row_id column for any user field in this table
-                                    let row_id_field = rowid_fid(LogicalFieldId::for_user(table_id, 1));
-                                    let mut visitor = MaxRowIdVisitor { max: 0 };
-                                    
-                                    match ScanBuilder::new(table.store(), row_id_field)
-                                        .options(ScanOptions::default())
-                                        .run(&mut visitor)
-                                    {
-                                        Ok(_) => visitor.max,
-                                        Err(llkv_result::Error::NotFound) => 0,
-                                        Err(e) => {
-                                            tracing::warn!("[CONTEXT] Failed to scan max row_id for table '{}': {}", name, e);
-                                            0
-                                        }
-                                    }
-                                };
-                                
-                                let next_row_id = if max_row_id > 0 {
-                                    max_row_id.saturating_add(1)
-                                } else {
-                                    0
-                                };
-                                
-                                tracing::debug!("[CONTEXT] Table '{}' max_row_id={}, next_row_id={}", 
-                                    name, max_row_id, next_row_id);
-                                
-                                let executor_table = ExecutorTable {
-                                    table: Arc::new(table),
-                                    schema: exec_schema,
-                                    next_row_id: AtomicU64::new(next_row_id),
-                                    // Set total_rows to 1 to force scanning (we don't know the actual count)
-                                    // This prevents the executor from returning empty results for loaded tables
-                                    // We use 1 instead of 0 to bypass the empty-table optimization
-                                    total_rows: AtomicU64::new(1),
-                                };
-                                
-                                tables.insert(canonical_name.clone(), Arc::new(executor_table));
-                                tracing::debug!("[CONTEXT] Registered table '{}' (id={}) with {} columns", 
-                                    name, table_id, schema.fields().len() - 1);
-                            }
-                            Err(e) => {
-                                tracing::warn!("[CONTEXT] Failed to load schema for table '{}': {}", name, e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("[CONTEXT] Failed to open table '{}' (id={}): {}", name, table_id, e);
-                    }
-                }
-            }
-        }
+        // LAZY LOADING: Only load table metadata at first access. We intentionally
+        // avoid loading any row/column data into memory here. The executor
+        // performs streaming reads from the ColumnStore when a query runs, so
+        // large tables are never fully materialized.
+        //
+        // Benefits of this approach:
+        // - Instant database open (no upfront I/O for table data)
+        // - Lower memory footprint (only metadata cached)
+        // - Natural parallelism: if multiple threads request different tables
+        //   concurrently, those tables will be loaded concurrently by the
+        //   caller threads (no global preload required).
+        //
+        // Future Optimizations (if profiling shows need):
+        // 1. Eager parallel preload of a short "hot" list of tables (rayon)
+        // 2. Background preload of catalog entries after startup
+        // 3. LRU-based eviction for extremely large deployments
+        // 4. Cache compact representations of schemas to reduce per-table RAM
+        //
+        // Note: `loaded_tables` holds catalog metadata that helped us discover
+        // which tables exist; we discard it here because metadata will be
+        // fetched on-demand during lazy loads.
+        tracing::debug!(
+            "[CONTEXT] Initialized with lazy loading for {} table(s)",
+            loaded_tables.len()
+        );
         
         Self {
             pager,
-            tables: RwLock::new(tables),
+            tables: RwLock::new(HashMap::new()), // Start with empty table cache
             dropped_tables: RwLock::new(HashSet::new()),
             transaction_manager,
             txn_manager,
@@ -2704,26 +2619,152 @@ where
     }
 
     fn lookup_table(&self, canonical_name: &str) -> Result<Arc<ExecutorTable<P>>> {
-        let tables = self.tables.read().unwrap();
-        let table = tables.get(canonical_name).cloned().ok_or_else(|| {
-            Error::InvalidArgumentError(format!("unknown table '{canonical_name}'"))
-        })?;
-        tracing::trace!(
-            "=== LOOKUP_TABLE '{}' table_id={} columns={} context_pager={:p} ===",
-            canonical_name,
-            table.table.table_id(),
-            table.schema.columns.len(),
-            &*self.pager
-        );
-        for (idx, col) in table.schema.columns.iter().enumerate() {
-            tracing::trace!(
-                "  column[{}]: name='{}' primary_key={}",
-                idx,
-                col.name,
-                col.primary_key
-            );
+        // Fast path: check if table is already loaded
+        {
+            let tables = self.tables.read().unwrap();
+            if let Some(table) = tables.get(canonical_name) {
+                tracing::trace!(
+                    "=== LOOKUP_TABLE '{}' (cached) table_id={} columns={} context_pager={:p} ===",
+                    canonical_name,
+                    table.table.table_id(),
+                    table.schema.columns.len(),
+                    &*self.pager
+                );
+                return Ok(Arc::clone(table));
+            }
+        } // Release read lock
+        
+        // Slow path: load table from catalog (happens once per table)
+        tracing::debug!("[LAZY_LOAD] Loading table '{}' from catalog", canonical_name);
+        
+        let store = ColumnStore::open(Arc::clone(&self.pager))?;
+        let catalog = SysCatalog::new(&store);
+        
+        // Find the table metadata in the catalog
+        let all_metas = catalog.all_table_metas()?;
+        let (table_id, _meta) = all_metas
+            .iter()
+            .find(|(_, meta)| {
+                meta.name
+                    .as_ref()
+                    .map(|n| n.to_ascii_lowercase() == canonical_name)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
+            })?;
+        
+        // Open the table and build ExecutorTable
+        let table = Table::new(*table_id, Arc::clone(&self.pager))?;
+        let schema = table.schema()?;
+        
+        // Build ExecutorSchema from Arrow schema (skip row_id field at index 0)
+        let mut executor_columns = Vec::new();
+        let mut lookup = HashMap::new();
+        
+        for (idx, field) in schema.fields().iter().enumerate().skip(1) {
+            // Get field_id from metadata
+            let field_id = field
+                .metadata()
+                .get(llkv_table::constants::FIELD_ID_META_KEY)
+                .and_then(|s| s.parse::<FieldId>().ok())
+                .unwrap_or(idx as FieldId);
+            
+            let normalized = field.name().to_ascii_lowercase();
+            let col_idx = executor_columns.len();
+            lookup.insert(normalized, col_idx);
+            
+            executor_columns.push(ExecutorColumn {
+                name: field.name().to_string(),
+                data_type: field.data_type().clone(),
+                nullable: field.is_nullable(),
+                primary_key: false, // Not stored in schema metadata currently
+                field_id,
+            });
         }
-        Ok(table)
+        
+        let exec_schema = Arc::new(ExecutorSchema {
+            columns: executor_columns,
+            lookup,
+        });
+        
+        // Find the maximum row_id in the table to set next_row_id correctly
+        let max_row_id = {
+            use llkv_column_map::store::scan::{
+                PrimitiveVisitor, PrimitiveWithRowIdsVisitor,
+                PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor,
+                ScanBuilder, ScanOptions
+            };
+            use llkv_column_map::store::rowid_fid;
+            use arrow::array::UInt64Array;
+            
+            struct MaxRowIdVisitor {
+                max: u64,
+            }
+            
+            impl PrimitiveVisitor for MaxRowIdVisitor {
+                fn u64_chunk(&mut self, values: &UInt64Array) {
+                    for i in 0..values.len() {
+                        let val = values.value(i);
+                        if val > self.max {
+                            self.max = val;
+                        }
+                    }
+                }
+            }
+            
+            impl PrimitiveWithRowIdsVisitor for MaxRowIdVisitor {}
+            impl PrimitiveSortedVisitor for MaxRowIdVisitor {}
+            impl PrimitiveSortedWithRowIdsVisitor for MaxRowIdVisitor {}
+            
+            // Scan the row_id column for any user field in this table
+            let row_id_field = rowid_fid(LogicalFieldId::for_user(*table_id, 1));
+            let mut visitor = MaxRowIdVisitor { max: 0 };
+            
+            match ScanBuilder::new(table.store(), row_id_field)
+                .options(ScanOptions::default())
+                .run(&mut visitor)
+            {
+                Ok(_) => visitor.max,
+                Err(llkv_result::Error::NotFound) => 0,
+                Err(e) => {
+                    tracing::warn!("[LAZY_LOAD] Failed to scan max row_id for table '{}': {}", canonical_name, e);
+                    0
+                }
+            }
+        };
+        
+        let next_row_id = if max_row_id > 0 {
+            max_row_id.saturating_add(1)
+        } else {
+            0
+        };
+        
+        let executor_table = Arc::new(ExecutorTable {
+            table: Arc::new(table),
+            schema: exec_schema,
+            next_row_id: AtomicU64::new(next_row_id),
+            // Set total_rows to 1 to force scanning (we don't know the actual count)
+            // This prevents the executor from returning empty results for loaded tables
+            // We use 1 instead of 0 to bypass the empty-table optimization
+            total_rows: AtomicU64::new(1),
+        });
+        
+        // Cache the loaded table
+        {
+            let mut tables = self.tables.write().unwrap();
+            tables.insert(canonical_name.to_string(), Arc::clone(&executor_table));
+        }
+        
+        tracing::debug!(
+            "[LAZY_LOAD] Loaded table '{}' (id={}) with {} columns, next_row_id={}",
+            canonical_name,
+            table_id,
+            schema.fields().len() - 1,
+            next_row_id
+        );
+        
+        Ok(executor_table)
     }
 
     fn remove_table_entry(&self, canonical_name: &str) {
