@@ -11,6 +11,12 @@ pub use mvcc::{
     RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TransactionSnapshot, TxnId, TxnIdManager,
 };
 
+/// Session identifier type.
+///
+/// Session IDs track client sessions that may spawn multiple transactions.
+/// They are distinct from transaction IDs and managed separately.
+pub type SessionId = u64;
+
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
     ColumnSpec, CreateTablePlan, DeletePlan, InsertPlan, PlanOperation, PlanValue, SelectPlan,
@@ -620,8 +626,8 @@ where
     StagingCtx: TransactionContext + 'static,
 {
     context: Arc<BaseCtx>,
-    session_id: u64,
-    transactions: Arc<Mutex<HashMap<u64, SessionTransaction<BaseCtx, StagingCtx>>>>,
+    session_id: SessionId,
+    transactions: Arc<Mutex<HashMap<SessionId, SessionTransaction<BaseCtx, StagingCtx>>>>,
     txn_manager: Arc<TxnIdManager>,
 }
 
@@ -632,8 +638,8 @@ where
 {
     pub fn new(
         context: Arc<BaseCtx>,
-        session_id: u64,
-        transactions: Arc<Mutex<HashMap<u64, SessionTransaction<BaseCtx, StagingCtx>>>>,
+        session_id: SessionId,
+        transactions: Arc<Mutex<HashMap<SessionId, SessionTransaction<BaseCtx, StagingCtx>>>>,
         txn_manager: Arc<TxnIdManager>,
     ) -> Self {
         Self {
@@ -656,7 +662,7 @@ where
     }
 
     /// Get the session ID.
-    pub fn session_id(&self) -> u64 {
+    pub fn session_id(&self) -> SessionId {
         self.session_id
     }
 
@@ -946,7 +952,7 @@ where
     BaseCtx: TransactionContext + 'static,
     StagingCtx: TransactionContext + 'static,
 {
-    transactions: Arc<Mutex<HashMap<u64, SessionTransaction<BaseCtx, StagingCtx>>>>,
+    transactions: Arc<Mutex<HashMap<SessionId, SessionTransaction<BaseCtx, StagingCtx>>>>,
     next_session_id: AtomicU64,
     txn_manager: Arc<TxnIdManager>,
 }
