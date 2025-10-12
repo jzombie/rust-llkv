@@ -2774,7 +2774,8 @@ where
             }
         };
 
-        if next == CATALOG_TABLE_ID {
+        // Skip any reserved table IDs
+        while llkv_table::reserved::is_reserved_table_id(next) {
             next = next.checked_add(1).ok_or_else(|| {
                 Error::InvalidArgumentError("exhausted available table ids".into())
             })?;
@@ -2783,11 +2784,14 @@ where
         let mut following = next
             .checked_add(1)
             .ok_or_else(|| Error::InvalidArgumentError("exhausted available table ids".into()))?;
-        if following == CATALOG_TABLE_ID {
+        
+        // Skip any reserved table IDs for the next allocation
+        while llkv_table::reserved::is_reserved_table_id(following) {
             following = following.checked_add(1).ok_or_else(|| {
                 Error::InvalidArgumentError("exhausted available table ids".into())
             })?;
         }
+        
         catalog.put_next_table_id(following)?;
         Ok(next)
     }

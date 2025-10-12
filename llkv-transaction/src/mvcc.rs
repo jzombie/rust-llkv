@@ -11,11 +11,11 @@ use std::sync::{Arc, Mutex};
 /// Transaction ID type.
 pub type TxnId = u64;
 
-/// Special transaction ID representing "not deleted".
-pub const TXN_ID_NONE: TxnId = u64::MAX;
-
-/// Special transaction ID for auto-commit (single-statement) transactions.
-pub const TXN_ID_AUTO_COMMIT: TxnId = 1;
+// Re-export reserved constants from llkv-table
+pub use llkv_table::reserved::{
+    TXN_ID_NONE, TXN_ID_AUTO_COMMIT, TXN_ID_MIN_MULTI_STATEMENT,
+    is_reserved_txn_id, reserved_txn_id_message,
+};
 
 /// Internal state shared across transaction ID managers.
 #[derive(Debug)]

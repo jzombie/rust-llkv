@@ -13,7 +13,8 @@ use llkv_column_map::{ColumnStore, types::LogicalFieldId};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::sys_catalog::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
+use crate::reserved::is_reserved_table_id;
+use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
 use llkv_expr::{Expr, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
@@ -162,8 +163,8 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub fn new(table_id: TableId, pager: Arc<P>) -> LlkvResult<Self> {
-        if table_id == CATALOG_TABLE_ID {
-            return Err(Error::reserved_table_id(table_id));
+        if is_reserved_table_id(table_id) {
+            return Err(Error::ReservedTableId(table_id));
         }
 
         tracing::trace!(
@@ -539,7 +540,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sys_catalog::CATALOG_TABLE_ID;
+    use crate::reserved::CATALOG_TABLE_ID;
     use crate::types::RowId;
     use arrow::array::Array;
     use arrow::array::ArrayRef;

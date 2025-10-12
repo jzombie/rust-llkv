@@ -24,28 +24,8 @@ use llkv_result::{self, Result as LlkvResult};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
-// ----- Catalog constants -----
-
-/// Reserved table id used for the system catalog itself.
-pub const CATALOG_TABLE_ID: TableId = 0;
-
-/// Column id storing serialized `TableMeta` entries (bitcode-encoded).
-/// Field id for serialized `TableMeta` entries (bitcode-encoded).
-const CATALOG_FIELD_TABLE_META_ID: u32 = 1;
-/// Field id for serialized `ColMeta` entries (bitcode-encoded).
-const CATALOG_FIELD_COL_META_ID: u32 = 10;
-/// Field id for the next available user table id (the cell value is persisted as `UInt64`).
-const CATALOG_FIELD_NEXT_TABLE_ID: u32 = 100;
-/// Row id reserved for the singleton next-table-id value.
-const CATALOG_NEXT_TABLE_ROW_ID: u64 = 0;
-/// Field id for the next transaction id (the cell value is persisted as `UInt64`).
-const CATALOG_FIELD_NEXT_TXN_ID: u32 = 101;
-/// Row id reserved for the singleton next-txn-id value.
-const CATALOG_NEXT_TXN_ROW_ID: u64 = 1;
-/// Field id for the last committed transaction id (the cell value is persisted as `UInt64`).
-const CATALOG_FIELD_LAST_COMMITTED_TXN_ID: u32 = 102;
-/// Row id reserved for the singleton last-committed-txn-id value.
-const CATALOG_LAST_COMMITTED_TXN_ROW_ID: u64 = 2;
+// Import all reserved constants and validation functions
+use crate::reserved::*;
 
 // ----- Namespacing helpers -----
 

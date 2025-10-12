@@ -2,6 +2,7 @@
 
 pub mod constants;
 mod planner;
+pub mod reserved;
 mod scalar_eval;
 mod sys_catalog;
 pub mod expr {
@@ -11,7 +12,8 @@ pub mod expr {
 pub mod table;
 pub mod types;
 
-pub use sys_catalog::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
+pub use sys_catalog::{ColMeta, SysCatalog, TableMeta};
+pub use reserved::CATALOG_TABLE_ID;
 pub use table::Table;
 pub use types::{FieldId, RowId};
 
