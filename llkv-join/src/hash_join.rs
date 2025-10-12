@@ -25,11 +25,6 @@
 //! - Both left and right key columns have matching data types
 //! - Data type is one of: Int32, Int64, UInt32, UInt64
 //!
-//! **Performance improvements:**
-//! - Int32/Int64/UInt32/UInt64: 1.2-3.6× faster (20-72% speedup)
-//! - Largest gains on Semi/Anti joins (3-3.5× faster)
-//! - Moderate gains on Inner/Left joins (1.2-1.8× faster)
-//!
 //! **Fallback behavior:**
 //! - Multi-column joins use generic path
 //! - Non-primitive types (Utf8, Binary, Float) use generic path
@@ -795,9 +790,9 @@ fn extract_right_key_indices(keys: &[JoinKey], schema: &Arc<Schema>) -> LlkvResu
 }
 
 fn find_field_index(schema: &Schema, target_field_id: FieldId) -> LlkvResult<usize> {
-    // Phase 5 optimization: Use CachedSchema for O(1) field ID lookup
+    // Use cached schema for O(1) field ID lookup.
     // NOTE: We need the index among USER fields only (excluding system fields like rowid)
-    // because the projected batch only contains user fields
+    // because the projected batch only contains user fields.
     let cached = CachedSchema::new(Arc::new(schema.clone()));
     
     // Find the schema index of the target field
@@ -824,8 +819,7 @@ fn find_field_index(schema: &Schema, target_field_id: FieldId) -> LlkvResult<usi
 
 /// Get the DataType of a join key field from schema.
 fn get_key_datatype(schema: &Schema, field_id: FieldId) -> LlkvResult<DataType> {
-    // Phase 5 optimization: Use CachedSchema for O(1) field ID lookup
-    // This eliminates the O(n) loop with metadata extraction + string parsing
+    // Use cached schema for O(1) field ID lookup.
     let cached = CachedSchema::new(Arc::new(schema.clone()));
     
     let index = cached
