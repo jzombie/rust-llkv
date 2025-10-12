@@ -1,6 +1,6 @@
 /// Multi-Version Concurrency Control (MVCC) utilities.
 ///
-/// This module centralises the transaction ID allocator, row-version metadata,
+/// This module centralizes the transaction ID allocator, row-version metadata,
 /// and visibility checks used across the engine. The overarching goal is to
 /// allow transactions to operate directly on the base storage without copying
 /// tables into a staging area.
