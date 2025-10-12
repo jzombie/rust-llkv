@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::planner::{TablePlanner, collect_row_ids_for_table};
 use crate::types::TableId;
 
-use arrow::array::{ArrayRef, RecordBatch, StringArray, UInt32Array};
+use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 
@@ -176,8 +176,24 @@ where
     }
 
     pub fn append(&self, batch: &RecordBatch) -> LlkvResult<()> {
-        let mut new_fields = Vec::with_capacity(batch.schema().fields().len());
-        for field in batch.schema().fields() {
+        use arrow::array::UInt64Builder;
+        
+        // Check if MVCC columns already exist in the batch
+        let has_created_by = batch
+            .schema()
+            .fields()
+            .iter()
+            .any(|f| f.name() == llkv_column_map::store::CREATED_BY_COLUMN_NAME);
+        let has_deleted_by = batch
+            .schema()
+            .fields()
+            .iter()
+            .any(|f| f.name() == llkv_column_map::store::DELETED_BY_COLUMN_NAME);
+        
+        let mut new_fields = Vec::with_capacity(batch.schema().fields().len() + 2);
+        let mut new_columns: Vec<Arc<dyn Array>> = Vec::with_capacity(batch.columns().len() + 2);
+        
+        for (idx, field) in batch.schema().fields().iter().enumerate() {
             let maybe_field_id = field.metadata().get(crate::constants::FIELD_ID_META_KEY);
             // System columns (row_id, MVCC columns) don't need field_id metadata
             if maybe_field_id.is_none()
@@ -187,6 +203,7 @@ where
             {
                 if field.name() == ROW_ID_COLUMN_NAME {
                     new_fields.push(field.as_ref().clone());
+                    new_columns.push(batch.column(idx).clone());
                 } else {
                     let lfid = if field.name() == llkv_column_map::store::CREATED_BY_COLUMN_NAME {
                         LogicalFieldId::for_mvcc_created_by(self.table_id)
@@ -205,6 +222,7 @@ where
                         Field::new(field.name(), field.data_type().clone(), field.is_nullable())
                             .with_metadata(metadata);
                     new_fields.push(new_field);
+                    new_columns.push(batch.column(idx).clone());
                 }
                 continue;
             }
@@ -253,6 +271,7 @@ where
                 Field::new(field.name(), field.data_type().clone(), field.is_nullable())
                     .with_metadata(new_metadata);
             new_fields.push(new_field);
+            new_columns.push(batch.column(idx).clone());
 
             // Ensure the catalog remembers the human-friendly column name for
             // this field so callers of `Table::schema()` (and other metadata
@@ -278,8 +297,54 @@ where
             }
         }
 
+        // Inject MVCC columns if they don't exist
+        // For non-transactional appends (e.g., CSV ingest), we use TXN_ID_AUTO_COMMIT (1)
+        // which is treated as "committed by system" and always visible.
+        // Use TXN_ID_NONE (0) for deleted_by to indicate "not deleted".
+        const TXN_ID_AUTO_COMMIT: u64 = 1;
+        const TXN_ID_NONE: u64 = 0;
+        let row_count = batch.num_rows();
+        
+        if !has_created_by {
+            let mut created_by_builder = UInt64Builder::with_capacity(row_count);
+            for _ in 0..row_count {
+                created_by_builder.append_value(TXN_ID_AUTO_COMMIT);
+            }
+            let created_by_lfid = LogicalFieldId::for_mvcc_created_by(self.table_id);
+            let mut metadata = HashMap::new();
+            let lfid_val: u64 = created_by_lfid.into();
+            metadata.insert(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            );
+            new_fields.push(
+                Field::new(llkv_column_map::store::CREATED_BY_COLUMN_NAME, DataType::UInt64, false)
+                    .with_metadata(metadata),
+            );
+            new_columns.push(Arc::new(created_by_builder.finish()));
+        }
+        
+        if !has_deleted_by {
+            let mut deleted_by_builder = UInt64Builder::with_capacity(row_count);
+            for _ in 0..row_count {
+                deleted_by_builder.append_value(TXN_ID_NONE);
+            }
+            let deleted_by_lfid = LogicalFieldId::for_mvcc_deleted_by(self.table_id);
+            let mut metadata = HashMap::new();
+            let lfid_val: u64 = deleted_by_lfid.into();
+            metadata.insert(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            );
+            new_fields.push(
+                Field::new(llkv_column_map::store::DELETED_BY_COLUMN_NAME, DataType::UInt64, false)
+                    .with_metadata(metadata),
+            );
+            new_columns.push(Arc::new(deleted_by_builder.finish()));
+        }
+
         let new_schema = Arc::new(Schema::new(new_fields));
-        let namespaced_batch = RecordBatch::try_new(new_schema, batch.columns().to_vec())?;
+        let namespaced_batch = RecordBatch::try_new(new_schema, new_columns)?;
         self.store.append(&namespaced_batch)
     }
 

@@ -820,6 +820,7 @@ where
                 let mut produced_rows: u64 = 0;
                 let capture_nulls_first = matches!(options.order, Some(spec) if spec.nulls_first);
                 let include_nulls = options.include_nulls;
+                let has_row_id_filter = options.row_id_filter.is_some();
                 let scan_options = options;
                 let mut buffered_batches: Vec<RecordBatch> = Vec::new();
                 table
@@ -848,7 +849,12 @@ where
                     return Ok(());
                 }
                 let mut null_batches: Vec<RecordBatch> = Vec::new();
-                if include_nulls && full_table_scan && produced_rows < total_rows {
+                // Only synthesize null rows if:
+                // 1. include_nulls is true
+                // 2. This is a full table scan
+                // 3. We produced fewer rows than the total
+                // 4. We DON'T have a row_id_filter (e.g., MVCC filter) that intentionally filtered rows
+                if include_nulls && full_table_scan && produced_rows < total_rows && !has_row_id_filter {
                     let missing = total_rows - produced_rows;
                     if missing > 0 {
                         null_batches = synthesize_null_scan(Arc::clone(&schema), missing)?;

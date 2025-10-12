@@ -194,7 +194,8 @@ impl RowVersion {
 
         // Rows created inside the current transaction are visible unless this
         // transaction also deleted them.
-        if self.created_by == snapshot.txn_id {
+        // IMPORTANT: TXN_ID_AUTO_COMMIT is never treated as "current transaction"
+        if self.created_by == snapshot.txn_id && snapshot.txn_id != TXN_ID_AUTO_COMMIT {
             let visible = self.deleted_by != snapshot.txn_id;
             tracing::trace!("[MVCC] created by current txn, visible={}", visible);
             return visible;
@@ -218,7 +219,7 @@ impl RowVersion {
                 tracing::trace!("[MVCC] not deleted, visible");
                 true
             }
-            tx if tx == snapshot.txn_id => {
+            tx if tx == snapshot.txn_id && snapshot.txn_id != TXN_ID_AUTO_COMMIT => {
                 tracing::trace!("[MVCC] deleted by current txn, invisible");
                 false
             }

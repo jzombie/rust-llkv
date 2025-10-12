@@ -1,7 +1,7 @@
 use llkv_plan::PlanValue;
 use llkv_runtime::{
     AggregateExpr, ColumnSpec, Context, CreateTablePlan, InsertPlan, InsertSource, SelectPlan,
-    SelectProjection, StatementResult,
+    StatementResult,
 };
 use llkv_storage::pager::MemPager;
 use std::sync::Arc;
@@ -50,14 +50,14 @@ fn test_transaction_select() {
     };
     session.insert(insert_plan2).unwrap();
 
-    // SELECT within transaction should see all 3 rows
-    let select_plan = SelectPlan::new("users").with_projections(vec![SelectProjection::AllColumns]);
-    let result = session.select(select_plan).unwrap();
+        // Select all rows (should see 3)
+    let select_plan = SelectPlan::new("users");
+    let result1 = session.select(select_plan).unwrap();
 
-    if let StatementResult::Select { execution, .. } = result {
+    if let StatementResult::Select { execution, .. } = result1 {
         let batches = execution.collect().unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 3, "Should see 3 rows in transaction");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 3);
     } else {
         panic!("Expected SELECT result");
     }
@@ -65,15 +65,14 @@ fn test_transaction_select() {
     // Rollback
     session.rollback_transaction().unwrap();
 
-    // SELECT after rollback should only see 2 rows
-    let select_plan2 =
-        SelectPlan::new("users").with_projections(vec![SelectProjection::AllColumns]);
+    // Select again (should see only 2 - Charlie should be gone)
+    let select_plan2 = SelectPlan::new("users");
     let result2 = session.select(select_plan2).unwrap();
 
     if let StatementResult::Select { execution, .. } = result2 {
         let batches = execution.collect().unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 2, "Should see only 2 rows after rollback");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
     } else {
         panic!("Expected SELECT result");
     }

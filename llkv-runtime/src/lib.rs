@@ -1143,10 +1143,13 @@ where
     }
 
     pub fn insert(&self, plan: InsertPlan) -> Result<StatementResult<P>> {
-        let snapshot = self.txn_manager.begin_transaction();
-        let result = self.insert_with_snapshot(plan, snapshot)?;
-        self.txn_manager.mark_committed(snapshot.txn_id);
-        Ok(result)
+        // For non-transactional inserts, use TXN_ID_AUTO_COMMIT directly
+        // instead of creating a temporary transaction
+        let snapshot = TransactionSnapshot {
+            txn_id: TXN_ID_AUTO_COMMIT,
+            snapshot_id: self.txn_manager.last_committed(),
+        };
+        self.insert_with_snapshot(plan, snapshot)
     }
 
     pub fn insert_with_snapshot(
@@ -2850,18 +2853,22 @@ where
 {
     fn filter(&self, table: &Table<P>, row_ids: Vec<u64>) -> Result<Vec<u64>> {
         tracing::trace!(
-            "[MVCC_FILTER] filter() called with {} row_ids, snapshot txn={}, snapshot_id={}",
-            row_ids.len(),
+            "[MVCC_FILTER] filter() called with row_ids {:?}, snapshot txn={}, snapshot_id={}",
+            row_ids,
             self.snapshot.txn_id,
             self.snapshot.snapshot_id
         );
-        filter_row_ids_for_snapshot(
+        let result = filter_row_ids_for_snapshot(
             table.store(),
             table.table_id(),
             row_ids,
             &self.txn_manager,
             self.snapshot,
-        )
+        );
+        if let Ok(ref visible) = result {
+            tracing::trace!("[MVCC_FILTER] filter() returning visible row_ids: {:?}", visible);
+        }
+        result
     }
 }
 
