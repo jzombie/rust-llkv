@@ -1,6 +1,6 @@
 use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
 use sqllogictest::{AsyncDB, DefaultColumnType, Runner};
-use std::path::Path;
+use std::path::{Component, Path};
 
 /// Run a single slt file using the provided AsyncDB factory. The factory is
 /// a closure that returns a future resolving to a new DB instance for the
@@ -39,8 +39,12 @@ where
     };
     let (normalized_lines, mapping) = normalize_inline_connections(expanded_lines, mapping);
 
+    // TODO: Remove this check once the harness implements dialects (https://github.com/jzombie/rust-llkv/issues/111)
     // DuckDB-specific fix: add extra blank line after plain text error messages
-    let normalized_lines = if path.to_string_lossy().contains("/duckdb/") {
+    let is_duckdb_suite = path
+        .components()
+        .any(|component| matches!(component, Component::Normal(name) if name == "duckdb"));
+    let normalized_lines = if is_duckdb_suite {
         fix_error_message_spacing(normalized_lines)
     } else {
         normalized_lines
