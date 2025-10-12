@@ -10,12 +10,13 @@ use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
 use llkv_table::table::{ScanProjection, ScanStreamOptions};
+use llkv_table::types::TableId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Helper to create a test table with row-id, user_id, and name columns.
 fn create_test_table(
-    table_id: u16,
+    table_id: TableId,
     pager: &Arc<MemPager>,
     data: Vec<(u64, i32, &str)>,
 ) -> Table<MemPager> {
@@ -297,8 +298,8 @@ fn proj(table: &Table<MemPager>, field_id: llkv_table::types::FieldId) -> Projec
 
 #[test]
 fn test_join_with_expression_filters() {
-    const LEFT_TABLE_ID: u16 = 41;
-    const RIGHT_TABLE_ID: u16 = 84;
+    const LEFT_TABLE_ID: TableId = 41;
+    const RIGHT_TABLE_ID: TableId = 84;
 
     const LEFT_CUSTOMER_ID: llkv_table::types::FieldId = 11;
     const LEFT_SEGMENT: llkv_table::types::FieldId = 12;

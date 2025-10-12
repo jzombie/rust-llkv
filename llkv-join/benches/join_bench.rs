@@ -22,6 +22,7 @@ use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
+use llkv_table::types::TableId;
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -29,7 +30,7 @@ use std::sync::Arc;
 /// Create a table with specified number of rows.
 /// Schema: row_id (UInt64), id (Int32), value (Utf8)
 fn create_table_with_rows(
-    table_id: u16,
+    table_id: TableId,
     pager: &Arc<MemPager>,
     num_rows: usize,
     id_offset: i32,
