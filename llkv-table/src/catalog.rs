@@ -130,9 +130,10 @@ impl TableCatalog {
         let display_name = display_name.into();
         let canonical_name = display_name.to_ascii_lowercase();
 
-        let mut inner = self.inner.write().map_err(|_| {
-            Error::Internal("Failed to acquire catalog write lock".to_string())
-        })?;
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| Error::Internal("Failed to acquire catalog write lock".to_string()))?;
 
         // Check for duplicate (case-insensitive)
         if inner.table_name_to_id.contains_key(&canonical_name) {
@@ -301,7 +302,7 @@ impl TableCatalog {
             Err(_) => {
                 return TableCatalogSnapshot {
                     table_ids: Arc::new(FxHashMap::default()),
-                }
+                };
             }
         };
 
@@ -355,7 +356,7 @@ impl TableCatalog {
                 return TableCatalogState {
                     tables: Vec::new(),
                     next_table_id: 1,
-                }
+                };
             }
         };
 
@@ -592,9 +593,7 @@ impl FieldResolver {
             .ok_or_else(|| Error::Internal("FieldId overflow".to_string()))?;
 
         // Store mappings
-        inner
-            .field_name_to_id
-            .insert(canonical_name, field_id);
+        inner.field_name_to_id.insert(canonical_name, field_id);
         inner.field_id_to_name.insert(field_id, display_name);
 
         Ok(field_id)
@@ -679,7 +678,7 @@ impl FieldResolver {
                 return FieldResolverState {
                     fields: Vec::new(),
                     next_field_id: 3,
-                }
+                };
             }
         };
 
@@ -1034,11 +1033,11 @@ mod tests {
         );
 
         let restored_orders_resolver = restored_catalog.field_resolver(orders_id).unwrap();
-        assert_eq!(restored_orders_resolver.field_id("product"), Some(product_fid));
         assert_eq!(
-            restored_orders_resolver.field_id("quantity"),
-            Some(qty_fid)
+            restored_orders_resolver.field_id("product"),
+            Some(product_fid)
         );
+        assert_eq!(restored_orders_resolver.field_id("quantity"), Some(qty_fid));
     }
 
     #[test]

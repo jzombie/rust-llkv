@@ -14,8 +14,8 @@ pub mod expr {
 pub mod table;
 pub mod types;
 
-pub use sys_catalog::{ColMeta, SysCatalog, TableMeta};
 pub use reserved::CATALOG_TABLE_ID;
+pub use sys_catalog::{ColMeta, SysCatalog, TableMeta};
 pub use table::Table;
 pub use types::{FieldId, RowId};
 

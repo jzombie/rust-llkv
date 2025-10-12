@@ -794,17 +794,12 @@ fn find_field_index(schema: &Schema, target_field_id: FieldId) -> LlkvResult<usi
     // NOTE: We need the index among USER fields only (excluding system fields like rowid)
     // because the projected batch only contains user fields.
     let cached = CachedSchema::new(Arc::new(schema.clone()));
-    
+
     // Find the schema index of the target field
-    let schema_index = cached
-        .index_of_field_id(target_field_id)
-        .ok_or_else(|| {
-            Error::Internal(format!(
-                "field_id {} not found in schema",
-                target_field_id
-            ))
-        })?;
-    
+    let schema_index = cached.index_of_field_id(target_field_id).ok_or_else(|| {
+        Error::Internal(format!("field_id {} not found in schema", target_field_id))
+    })?;
+
     // Count how many user fields come BEFORE this field
     // (this gives us the index in the projected batch which only has user fields)
     let mut user_col_idx = 0;
@@ -813,7 +808,7 @@ fn find_field_index(schema: &Schema, target_field_id: FieldId) -> LlkvResult<usi
             user_col_idx += 1;
         }
     }
-    
+
     Ok(user_col_idx)
 }
 
@@ -821,16 +816,11 @@ fn find_field_index(schema: &Schema, target_field_id: FieldId) -> LlkvResult<usi
 fn get_key_datatype(schema: &Schema, field_id: FieldId) -> LlkvResult<DataType> {
     // Use cached schema for O(1) field ID lookup.
     let cached = CachedSchema::new(Arc::new(schema.clone()));
-    
+
     let index = cached
         .index_of_field_id(field_id)
-        .ok_or_else(|| {
-            Error::Internal(format!(
-                "field_id {} not found in schema",
-                field_id
-            ))
-        })?;
-    
+        .ok_or_else(|| Error::Internal(format!("field_id {} not found in schema", field_id)))?;
+
     Ok(schema.field(index).data_type().clone())
 }
 

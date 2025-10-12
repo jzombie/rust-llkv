@@ -38,13 +38,13 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use tempfile::TempDir;
 
+use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
-use llkv_column_map::ColumnStore;
 use llkv_result::Result;
 use llkv_storage::pager::simd_r_drive_pager::SimdRDrivePager;
-use llkv_table::types::{FieldId, TableId};
 use llkv_table::Table;
+use llkv_table::types::{FieldId, TableId};
 use llkv_transaction::mvcc::{RowVersion, TransactionSnapshot, TxnIdManager};
 
 /// Helper to create a logical field ID for a user data column.
@@ -84,7 +84,7 @@ fn insert_batch_with_mvcc(
     deleted_by: Vec<u64>,
 ) -> Result<()> {
     use llkv_column_map::store::{CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME};
-    
+
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         field_with_fid("id", DataType::Int64, 1, false),
@@ -146,7 +146,8 @@ fn verify_mvcc_visibility(
         };
         let visible = row_version.is_visible_for(txn_manager, snapshot);
         assert_eq!(
-            visible, expected,
+            visible,
+            expected,
             "Row {} visibility mismatch: expected {}, got {} (created_by={}, deleted_by={}, snapshot_txn_id={}, snapshot_id={})",
             row_ids[idx],
             expected,
@@ -236,7 +237,11 @@ fn test_mvcc_committed_transaction_persists_across_reopen() -> Result<()> {
             GatherNullPolicy::ErrorOnMissing,
         )?;
 
-        let id_arr = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let id_arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         let name_arr = batch
             .column(1)
             .as_any()
@@ -300,13 +305,20 @@ fn test_mvcc_uncommitted_transaction_not_visible_after_reopen() -> Result<()> {
     {
         let pager = open_pager(&path)?;
         let table = open_table(TABLE_ID, Arc::clone(&pager))?;
-        
+
         // Load transaction state from catalog
         let catalog = llkv_table::SysCatalog::new(table.store());
-        let loaded_next_txn_id = catalog.get_next_txn_id()?.expect("next_txn_id should be persisted");
-        let loaded_last_committed = catalog.get_last_committed_txn_id()?.expect("last_committed should be persisted");
-        
-        let txn_manager = llkv_transaction::TxnIdManager::new_with_initial_state(loaded_next_txn_id, loaded_last_committed);
+        let loaded_next_txn_id = catalog
+            .get_next_txn_id()?
+            .expect("next_txn_id should be persisted");
+        let loaded_last_committed = catalog
+            .get_last_committed_txn_id()?
+            .expect("last_committed should be persisted");
+
+        let txn_manager = llkv_transaction::TxnIdManager::new_with_initial_state(
+            loaded_next_txn_id,
+            loaded_last_committed,
+        );
 
         // Create a new snapshot
         let snapshot = txn_manager.begin_transaction();
@@ -402,13 +414,20 @@ fn test_mvcc_multiple_transactions_persist_correctly() -> Result<()> {
     {
         let pager = open_pager(&path)?;
         let table = open_table(TABLE_ID, Arc::clone(&pager))?;
-        
+
         // Load transaction state from catalog
         let catalog = llkv_table::SysCatalog::new(table.store());
-        let loaded_next_txn_id = catalog.get_next_txn_id()?.expect("next_txn_id should be persisted");
-        let loaded_last_committed = catalog.get_last_committed_txn_id()?.expect("last_committed should be persisted");
-        
-        let txn_manager = llkv_transaction::TxnIdManager::new_with_initial_state(loaded_next_txn_id, loaded_last_committed);
+        let loaded_next_txn_id = catalog
+            .get_next_txn_id()?
+            .expect("next_txn_id should be persisted");
+        let loaded_last_committed = catalog
+            .get_last_committed_txn_id()?
+            .expect("last_committed should be persisted");
+
+        let txn_manager = llkv_transaction::TxnIdManager::new_with_initial_state(
+            loaded_next_txn_id,
+            loaded_last_committed,
+        );
 
         // Create a new snapshot
         let snapshot = txn_manager.begin_transaction();
@@ -433,7 +452,11 @@ fn test_mvcc_multiple_transactions_persist_correctly() -> Result<()> {
             GatherNullPolicy::ErrorOnMissing,
         )?;
 
-        let id_arr = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let id_arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(id_arr.value(0), 100);
         assert_eq!(id_arr.value(1), 200);
         assert_eq!(id_arr.value(2), 300);
@@ -480,8 +503,8 @@ fn test_mvcc_soft_delete_persists_across_reopen() -> Result<()> {
             vec![1],
             vec![100],
             vec!["alice"],
-            vec![txn1_id],    // Keep original created_by
-            vec![txn2_id],    // Mark as deleted by txn2
+            vec![txn1_id], // Keep original created_by
+            vec![txn2_id], // Mark as deleted by txn2
         )?;
         txn_manager.mark_committed(txn2_id);
 
@@ -510,13 +533,20 @@ fn test_mvcc_soft_delete_persists_across_reopen() -> Result<()> {
     {
         let pager = open_pager(&path)?;
         let table = open_table(TABLE_ID, Arc::clone(&pager))?;
-        
+
         // Load transaction state from catalog
         let catalog = llkv_table::SysCatalog::new(table.store());
-        let loaded_next_txn_id = catalog.get_next_txn_id()?.expect("next_txn_id should be persisted");
-        let loaded_last_committed = catalog.get_last_committed_txn_id()?.expect("last_committed should be persisted");
-        
-        let txn_manager = llkv_transaction::TxnIdManager::new_with_initial_state(loaded_next_txn_id, loaded_last_committed);
+        let loaded_next_txn_id = catalog
+            .get_next_txn_id()?
+            .expect("next_txn_id should be persisted");
+        let loaded_last_committed = catalog
+            .get_last_committed_txn_id()?
+            .expect("last_committed should be persisted");
+
+        let txn_manager = llkv_transaction::TxnIdManager::new_with_initial_state(
+            loaded_next_txn_id,
+            loaded_last_committed,
+        );
 
         let snapshot = txn_manager.begin_transaction();
 

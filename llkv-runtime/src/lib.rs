@@ -69,7 +69,7 @@ use llkv_transaction::TransactionSession;
 mod mvcc_columns {
     use super::*;
     use std::collections::HashMap;
-    
+
     /// Build MVCC columns (row_id, created_by, deleted_by) for INSERT operations.
     ///
     /// Returns (row_id_array, created_by_array, deleted_by_array) and updates next_row_id.
@@ -82,21 +82,21 @@ mod mvcc_columns {
         for offset in 0..row_count {
             row_builder.append_value(start_row_id + offset as u64);
         }
-        
+
         let mut created_builder = UInt64Builder::with_capacity(row_count);
         let mut deleted_builder = UInt64Builder::with_capacity(row_count);
         for _ in 0..row_count {
             created_builder.append_value(creator_txn_id);
             deleted_builder.append_value(TXN_ID_NONE);
         }
-        
+
         (
             Arc::new(row_builder.finish()) as ArrayRef,
             Arc::new(created_builder.finish()) as ArrayRef,
             Arc::new(deleted_builder.finish()) as ArrayRef,
         )
     }
-    
+
     /// Build MVCC field definitions (row_id, created_by, deleted_by).
     ///
     /// Returns the three Field definitions that should be prepended to user columns.
@@ -107,7 +107,7 @@ mod mvcc_columns {
             Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false),
         ]
     }
-    
+
     /// Build field with field_id metadata for a user column.
     pub(crate) fn build_field_with_metadata(
         name: &str,
@@ -123,7 +123,7 @@ mod mvcc_columns {
         Field::new(name, data_type, nullable)
             .with_metadata(metadata.into_iter().collect::<HashMap<String, String>>())
     }
-    
+
     /// Build DELETE batch with row_id and deleted_by columns.
     ///
     /// This creates a minimal RecordBatch for marking rows as deleted.
@@ -132,19 +132,18 @@ mod mvcc_columns {
         deleted_by_txn_id: TxnId,
     ) -> llkv_result::Result<RecordBatch> {
         let row_count = row_ids.len();
-        
+
         let fields = vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false),
         ];
-        
+
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(UInt64Array::from(row_ids)),
             Arc::new(UInt64Array::from(vec![deleted_by_txn_id; row_count])),
         ];
-        
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-            .map_err(Error::Arrow)
+
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(Error::Arrow)
     }
 }
 
@@ -267,7 +266,9 @@ where
                 table_name,
                 rows_deleted,
             }),
-            RuntimeStatementResult::Transaction { kind } => Ok(RuntimeStatementResult::Transaction { kind }),
+            RuntimeStatementResult::Transaction { kind } => {
+                Ok(RuntimeStatementResult::Transaction { kind })
+            }
             RuntimeStatementResult::Select { .. } => Err(Error::Internal(
                 "Cannot convert SELECT result between pager types in transaction".into(),
             )),
@@ -909,7 +910,8 @@ where
     // Centralized catalog for table/field name resolution
     catalog: Arc<llkv_table::catalog::TableCatalog>,
     // Transaction manager for session-based transactions
-    transaction_manager: TransactionManager<RuntimeContextWrapper<P>, RuntimeContextWrapper<MemPager>>,
+    transaction_manager:
+        TransactionManager<RuntimeContextWrapper<P>, RuntimeContextWrapper<MemPager>>,
     txn_manager: Arc<TxnIdManager>,
 }
 
@@ -919,9 +921,11 @@ where
 {
     pub fn new(pager: Arc<P>) -> Self {
         tracing::trace!("RuntimeContext::new called, pager={:p}", &*pager);
-        
+
         // Load transaction state and table registry from catalog if it exists
-        let (next_txn_id, last_committed, loaded_tables) = match ColumnStore::open(Arc::clone(&pager)) {
+        let (next_txn_id, last_committed, loaded_tables) = match ColumnStore::open(Arc::clone(
+            &pager,
+        )) {
             Ok(store) => {
                 let catalog = SysCatalog::new(&store);
                 let next_txn_id = match catalog.get_next_txn_id() {
@@ -930,11 +934,16 @@ where
                         id
                     }
                     Ok(None) => {
-                        tracing::debug!("[CONTEXT] No persisted next_txn_id found, starting from default");
+                        tracing::debug!(
+                            "[CONTEXT] No persisted next_txn_id found, starting from default"
+                        );
                         TXN_ID_AUTO_COMMIT + 1
                     }
                     Err(e) => {
-                        tracing::warn!("[CONTEXT] Failed to load next_txn_id: {}, using default", e);
+                        tracing::warn!(
+                            "[CONTEXT] Failed to load next_txn_id: {}, using default",
+                            e
+                        );
                         TXN_ID_AUTO_COMMIT + 1
                     }
                 };
@@ -944,15 +953,20 @@ where
                         id
                     }
                     Ok(None) => {
-                        tracing::debug!("[CONTEXT] No persisted last_committed found, starting from default");
+                        tracing::debug!(
+                            "[CONTEXT] No persisted last_committed found, starting from default"
+                        );
                         TXN_ID_AUTO_COMMIT
                     }
                     Err(e) => {
-                        tracing::warn!("[CONTEXT] Failed to load last_committed: {}, using default", e);
+                        tracing::warn!(
+                            "[CONTEXT] Failed to load last_committed: {}, using default",
+                            e
+                        );
                         TXN_ID_AUTO_COMMIT
                     }
                 };
-                
+
                 // Load table registry from catalog
                 let loaded_tables = match catalog.all_table_metas() {
                     Ok(metas) => {
@@ -960,22 +974,29 @@ where
                         metas
                     }
                     Err(e) => {
-                        tracing::warn!("[CONTEXT] Failed to load table metas: {}, starting with empty registry", e);
+                        tracing::warn!(
+                            "[CONTEXT] Failed to load table metas: {}, starting with empty registry",
+                            e
+                        );
                         Vec::new()
                     }
                 };
-                
+
                 (next_txn_id, last_committed, loaded_tables)
             }
             Err(e) => {
-                tracing::warn!("[CONTEXT] Failed to open ColumnStore: {}, using default state", e);
+                tracing::warn!(
+                    "[CONTEXT] Failed to open ColumnStore: {}, using default state",
+                    e
+                );
                 (TXN_ID_AUTO_COMMIT + 1, TXN_ID_AUTO_COMMIT, Vec::new())
             }
         };
-        
-        let transaction_manager = TransactionManager::new_with_initial_state(next_txn_id, last_committed);
+
+        let transaction_manager =
+            TransactionManager::new_with_initial_state(next_txn_id, last_committed);
         let txn_manager = transaction_manager.txn_manager();
-        
+
         // LAZY LOADING: Only load table metadata at first access. We intentionally
         // avoid loading any row/column data into memory here. The executor
         // performs streaming reads from the ColumnStore when a query runs, so
@@ -1001,25 +1022,25 @@ where
             "[CONTEXT] Initialized with lazy loading for {} table(s)",
             loaded_tables.len()
         );
-        
+
         // Initialize catalog and populate with existing tables
         let catalog = Arc::new(llkv_table::catalog::TableCatalog::new());
         for (_table_id, table_meta) in &loaded_tables {
-            if let Some(ref table_name) = table_meta.name {
-                if let Err(e) = catalog.register_table(table_name) {
-                    tracing::warn!(
-                        "[CONTEXT] Failed to register table '{}' in catalog: {}",
-                        table_name,
-                        e
-                    );
-                }
+            if let Some(ref table_name) = table_meta.name
+                && let Err(e) = catalog.register_table(table_name)
+            {
+                tracing::warn!(
+                    "[CONTEXT] Failed to register table '{}' in catalog: {}",
+                    table_name,
+                    e
+                );
             }
         }
         tracing::debug!(
             "[CONTEXT] Catalog initialized with {} table(s)",
             catalog.table_count()
         );
-        
+
         Self {
             pager,
             tables: RwLock::new(FxHashMap::default()), // Start with empty table cache
@@ -1042,7 +1063,11 @@ where
         catalog.put_next_txn_id(next_txn_id)?;
         let last_committed = self.txn_manager.last_committed();
         catalog.put_last_committed_txn_id(last_committed)?;
-        tracing::debug!("[CONTEXT] Persisted next_txn_id={}, last_committed={}", next_txn_id, last_committed);
+        tracing::debug!(
+            "[CONTEXT] Persisted next_txn_id={}, last_committed={}",
+            next_txn_id,
+            last_committed
+        );
         Ok(())
     }
 
@@ -1077,7 +1102,11 @@ where
         self.transaction_manager.has_active_transaction()
     }
 
-    pub fn create_table<C, I>(self: &Arc<Self>, name: &str, columns: I) -> Result<RuntimeTableHandle<P>>
+    pub fn create_table<C, I>(
+        self: &Arc<Self>,
+        name: &str,
+        columns: I,
+    ) -> Result<RuntimeTableHandle<P>>
     where
         C: IntoColumnSpec,
         I: IntoIterator<Item = C>,
@@ -1358,7 +1387,9 @@ where
             .collect();
         let result = self.create_table_plan(plan)?;
         match result {
-            RuntimeStatementResult::CreateTable { .. } => RuntimeTableHandle::new(Arc::clone(self), name),
+            RuntimeStatementResult::CreateTable { .. } => {
+                RuntimeTableHandle::new(Arc::clone(self), name)
+            }
             other => Err(Error::InvalidArgumentError(format!(
                 "unexpected statement result {other:?} when creating table"
             ))),
@@ -1745,7 +1776,7 @@ where
         }
         tables.insert(canonical_name.clone(), table_entry);
         drop(tables); // Release write lock before catalog operations
-        
+
         // Register table in catalog
         let registered_table_id = self.catalog.register_table(&display_name)?;
         tracing::debug!(
@@ -1753,7 +1784,7 @@ where
             display_name,
             registered_table_id
         );
-        
+
         // Register fields in catalog
         if let Some(field_resolver) = self.catalog.field_resolver(registered_table_id) {
             for column in &column_defs {
@@ -1772,7 +1803,7 @@ where
                 display_name
             );
         }
-        
+
         Ok(RuntimeStatementResult::CreateTable {
             table_name: display_name,
         })
@@ -1792,7 +1823,8 @@ where
             ));
         }
         let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(schema.fields().len());
-        let mut lookup = FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
+        let mut lookup =
+            FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
         for (idx, field) in schema.fields().iter().enumerate() {
             let data_type = match field.data_type() {
                 DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Date32 => {
@@ -1869,7 +1901,7 @@ where
             total_rows += row_count as u64;
 
             // Build MVCC columns using helper
-            let (row_id_array, created_by_array, deleted_by_array) = 
+            let (row_id_array, created_by_array, deleted_by_array) =
                 mvcc_columns::build_insert_mvcc_columns(row_count, start_row, creator_txn_id);
 
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_defs.len() + 3);
@@ -1929,7 +1961,7 @@ where
         }
         tables.insert(canonical_name.clone(), table_entry);
         drop(tables); // Release write lock before catalog operations
-        
+
         // Register table in catalog
         let registered_table_id = self.catalog.register_table(&display_name)?;
         tracing::debug!(
@@ -1937,7 +1969,7 @@ where
             display_name,
             registered_table_id
         );
-        
+
         // Register fields in catalog
         if let Some(field_resolver) = self.catalog.field_resolver(registered_table_id) {
             for column in &column_defs {
@@ -1956,7 +1988,7 @@ where
                 display_name
             );
         }
-        
+
         Ok(RuntimeStatementResult::CreateTable {
             table_name: display_name,
         })
@@ -2154,9 +2186,9 @@ where
         }
 
         let start_row = table.next_row_id.load(Ordering::SeqCst);
-        
+
         // Build MVCC columns using helper
-        let (row_id_array, created_by_array, deleted_by_array) = 
+        let (row_id_array, created_by_array, deleted_by_array) =
             mvcc_columns::build_insert_mvcc_columns(row_count, start_row, snapshot.txn_id);
 
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_values.len() + 3);
@@ -2275,7 +2307,8 @@ where
             Expression { expr_index: usize },
         }
 
-        let mut seen_columns: FxHashSet<String> = FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
+        let mut seen_columns: FxHashSet<String> =
+            FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
         let mut prepared: Vec<(ExecutorColumn, PreparedValue)> =
             Vec::with_capacity(assignments.len());
         let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
@@ -2349,7 +2382,7 @@ where
                 .columns
                 .iter()
                 .enumerate()
-                .map(|(idx, column)| (column.field_id, idx))
+                .map(|(idx, column)| (column.field_id, idx)),
         );
 
         for (column, value) in prepared {
@@ -2448,7 +2481,8 @@ where
             Expression { expr_index: usize },
         }
 
-        let mut seen_columns: FxHashSet<String> = FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
+        let mut seen_columns: FxHashSet<String> =
+            FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
         let mut prepared: Vec<(ExecutorColumn, PreparedValue)> =
             Vec::with_capacity(assignments.len());
         let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
@@ -2531,7 +2565,7 @@ where
                 .columns
                 .iter()
                 .enumerate()
-                .map(|(idx, column)| (column.field_id, idx))
+                .map(|(idx, column)| (column.field_id, idx)),
         );
 
         for (column, value) in prepared {
@@ -2763,17 +2797,21 @@ where
                 return Ok(Arc::clone(table));
             }
         } // Release read lock
-        
+
         // Slow path: load table from catalog (happens once per table)
-        tracing::debug!("[LAZY_LOAD] Loading table '{}' from catalog", canonical_name);
-        
+        tracing::debug!(
+            "[LAZY_LOAD] Loading table '{}' from catalog",
+            canonical_name
+        );
+
         // Check catalog first for table existence
-        let _catalog_table_id = self.catalog.table_id(canonical_name)
-            .ok_or_else(|| Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name)))?;
-        
+        let _catalog_table_id = self.catalog.table_id(canonical_name).ok_or_else(|| {
+            Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
+        })?;
+
         let store = ColumnStore::open(Arc::clone(&self.pager))?;
         let catalog = SysCatalog::new(&store);
-        
+
         // Find the table metadata in the catalog
         let all_metas = catalog.all_table_metas()?;
         let (table_id, _meta) = all_metas
@@ -2787,15 +2825,16 @@ where
             .ok_or_else(|| {
                 Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
             })?;
-        
+
         // Open the table and build ExecutorTable
         let table = Table::new(*table_id, Arc::clone(&self.pager))?;
         let schema = table.schema()?;
-        
+
         // Build ExecutorSchema from Arrow schema (skip row_id field at index 0)
         let mut executor_columns = Vec::new();
-        let mut lookup = FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
-        
+        let mut lookup =
+            FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
+
         for (idx, field) in schema.fields().iter().enumerate().skip(1) {
             // Get field_id from metadata
             let field_id = field
@@ -2803,11 +2842,11 @@ where
                 .get(llkv_table::constants::FIELD_ID_META_KEY)
                 .and_then(|s| s.parse::<FieldId>().ok())
                 .unwrap_or(idx as FieldId);
-            
+
             let normalized = field.name().to_ascii_lowercase();
             let col_idx = executor_columns.len();
             lookup.insert(normalized, col_idx);
-            
+
             executor_columns.push(ExecutorColumn {
                 name: field.name().to_string(),
                 data_type: field.data_type().clone(),
@@ -2816,26 +2855,25 @@ where
                 field_id,
             });
         }
-        
+
         let exec_schema = Arc::new(ExecutorSchema {
             columns: executor_columns,
             lookup,
         });
-        
+
         // Find the maximum row_id in the table to set next_row_id correctly
         let max_row_id = {
-            use llkv_column_map::store::scan::{
-                PrimitiveVisitor, PrimitiveWithRowIdsVisitor,
-                PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor,
-                ScanBuilder, ScanOptions
-            };
-            use llkv_column_map::store::rowid_fid;
             use arrow::array::UInt64Array;
-            
+            use llkv_column_map::store::rowid_fid;
+            use llkv_column_map::store::scan::{
+                PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+                PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
+            };
+
             struct MaxRowIdVisitor {
                 max: RowId,
             }
-            
+
             impl PrimitiveVisitor for MaxRowIdVisitor {
                 fn u64_chunk(&mut self, values: &UInt64Array) {
                     for i in 0..values.len() {
@@ -2846,15 +2884,15 @@ where
                     }
                 }
             }
-            
+
             impl PrimitiveWithRowIdsVisitor for MaxRowIdVisitor {}
             impl PrimitiveSortedVisitor for MaxRowIdVisitor {}
             impl PrimitiveSortedWithRowIdsVisitor for MaxRowIdVisitor {}
-            
+
             // Scan the row_id column for any user field in this table
             let row_id_field = rowid_fid(LogicalFieldId::for_user(*table_id, 1));
             let mut visitor = MaxRowIdVisitor { max: 0 };
-            
+
             match ScanBuilder::new(table.store(), row_id_field)
                 .options(ScanOptions::default())
                 .run(&mut visitor)
@@ -2862,44 +2900,52 @@ where
                 Ok(_) => visitor.max,
                 Err(llkv_result::Error::NotFound) => 0,
                 Err(e) => {
-                    tracing::warn!("[LAZY_LOAD] Failed to scan max row_id for table '{}': {}", canonical_name, e);
+                    tracing::warn!(
+                        "[LAZY_LOAD] Failed to scan max row_id for table '{}': {}",
+                        canonical_name,
+                        e
+                    );
                     0
                 }
             }
         };
-        
+
         let next_row_id = if max_row_id > 0 {
             max_row_id.saturating_add(1)
         } else {
             0
         };
-        
+
         // Get the actual persisted row count from table metadata
         // This is an O(1) catalog lookup that reads ColumnDescriptor.total_row_count
         // Fallback to 0 for truly empty tables
         let total_rows = table.total_rows().unwrap_or(0);
-        
+
         let executor_table = Arc::new(ExecutorTable {
             table: Arc::new(table),
             schema: exec_schema,
             next_row_id: AtomicU64::new(next_row_id),
             total_rows: AtomicU64::new(total_rows),
         });
-        
+
         // Cache the loaded table
         {
             let mut tables = self.tables.write().unwrap();
             tables.insert(canonical_name.to_string(), Arc::clone(&executor_table));
         }
-        
+
         // Register fields in catalog (may already be registered from RuntimeContext::new())
         if let Some(field_resolver) = self.catalog.field_resolver(_catalog_table_id) {
             for col in &executor_table.schema.columns {
                 let _ = field_resolver.register_field(&col.name); // Ignore "already exists" errors
             }
-            tracing::debug!("[CATALOG] Registered {} field(s) for lazy-loaded table '{}'", executor_table.schema.columns.len(), canonical_name);
+            tracing::debug!(
+                "[CATALOG] Registered {} field(s) for lazy-loaded table '{}'",
+                executor_table.schema.columns.len(),
+                canonical_name
+            );
         }
-        
+
         tracing::debug!(
             "[LAZY_LOAD] Loaded table '{}' (id={}) with {} columns, next_row_id={}",
             canonical_name,
@@ -2907,7 +2953,7 @@ where
             schema.fields().len() - 1,
             next_row_id
         );
-        
+
         Ok(executor_table)
     }
 
@@ -2935,11 +2981,14 @@ where
             }
         }
         drop(tables);
-        
+
         // Unregister from catalog
         self.catalog.unregister_table(&canonical_name);
-        tracing::debug!("[CATALOG] Unregistered table '{}' from catalog", canonical_name);
-        
+        tracing::debug!(
+            "[CATALOG] Unregistered table '{}' from catalog",
+            canonical_name
+        );
+
         self.dropped_tables.write().unwrap().insert(canonical_name);
         Ok(())
     }
@@ -2974,14 +3023,14 @@ where
         let mut following = next
             .checked_add(1)
             .ok_or_else(|| Error::InvalidArgumentError("exhausted available table ids".into()))?;
-        
+
         // Skip any reserved table IDs for the next allocation
         while llkv_table::reserved::is_reserved_table_id(following) {
             following = following.checked_add(1).ok_or_else(|| {
                 Error::InvalidArgumentError("exhausted available table ids".into())
             })?;
         }
-        
+
         catalog.put_next_table_id(following)?;
         Ok(next)
     }
@@ -4242,7 +4291,10 @@ where
         RuntimeLazyFrame::scan(Arc::clone(&self.context), &self.display_name)
     }
 
-    pub fn insert_rows<R>(&self, rows: impl IntoIterator<Item = R>) -> Result<RuntimeStatementResult<P>>
+    pub fn insert_rows<R>(
+        &self,
+        rows: impl IntoIterator<Item = R>,
+    ) -> Result<RuntimeStatementResult<P>>
     where
         R: IntoInsertRow,
     {
@@ -4272,7 +4324,8 @@ where
                         }
                     } else {
                         mode = Some(InsertMode::Named);
-                        let mut seen = FxHashSet::with_capacity_and_hasher(columns.len(), Default::default());
+                        let mut seen =
+                            FxHashSet::with_capacity_and_hasher(columns.len(), Default::default());
                         for column in &columns {
                             if !seen.insert(column.clone()) {
                                 return Err(Error::InvalidArgumentError(format!(

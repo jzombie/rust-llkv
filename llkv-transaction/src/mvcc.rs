@@ -13,8 +13,8 @@ pub type TxnId = u64;
 
 // Re-export reserved constants from llkv-table
 pub use llkv_table::reserved::{
-    TXN_ID_NONE, TXN_ID_AUTO_COMMIT, TXN_ID_MIN_MULTI_STATEMENT,
-    is_reserved_txn_id, reserved_txn_id_message,
+    TXN_ID_AUTO_COMMIT, TXN_ID_MIN_MULTI_STATEMENT, TXN_ID_NONE, is_reserved_txn_id,
+    reserved_txn_id_message,
 };
 
 /// Internal state shared across transaction ID managers.
@@ -75,7 +75,10 @@ impl TxnIdManager {
     /// Used when loading persisted state from the catalog.
     pub fn new_with_initial_state(next_txn_id: TxnId, last_committed: TxnId) -> Self {
         Self {
-            inner: Arc::new(TxnIdManagerInner::new_with_initial_state(next_txn_id, last_committed)),
+            inner: Arc::new(TxnIdManagerInner::new_with_initial_state(
+                next_txn_id,
+                last_committed,
+            )),
         }
     }
 

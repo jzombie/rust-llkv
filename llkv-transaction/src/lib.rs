@@ -976,7 +976,10 @@ where
         Self {
             transactions: Arc::new(Mutex::new(HashMap::new())),
             next_session_id: AtomicU64::new(1),
-            txn_manager: Arc::new(TxnIdManager::new_with_initial_state(next_txn_id, last_committed)),
+            txn_manager: Arc::new(TxnIdManager::new_with_initial_state(
+                next_txn_id,
+                last_committed,
+            )),
         }
     }
 

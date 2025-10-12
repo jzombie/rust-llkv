@@ -8,10 +8,10 @@ use crate::SqlValue;
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
 use llkv_runtime::{
-    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, RuntimeContext, CreateTablePlan,
-    CreateTableSource, DeletePlan, RuntimeEngine, InsertPlan, InsertSource, OrderByPlan, OrderSortType,
-    OrderTarget, PlanStatement, PlanValue, SelectPlan, SelectProjection, RuntimeSession, RuntimeStatementResult,
-    UpdatePlan, extract_rows_from_range,
+    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateTablePlan,
+    CreateTableSource, DeletePlan, InsertPlan, InsertSource, OrderByPlan, OrderSortType,
+    OrderTarget, PlanStatement, PlanValue, RuntimeContext, RuntimeEngine, RuntimeSession,
+    RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -92,7 +92,10 @@ where
     // `statement_table_name` is provided by llkv-runtime; use it to avoid
     // duplicating plan-level logic here.
 
-    fn execute_plan_statement(&self, statement: PlanStatement) -> SqlResult<RuntimeStatementResult<P>> {
+    fn execute_plan_statement(
+        &self,
+        statement: PlanStatement,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         let table = llkv_runtime::statement_table_name(&statement).map(str::to_string);
         self.engine.execute_statement(statement).map_err(|err| {
             if let Some(table_name) = table {
@@ -2222,7 +2225,10 @@ mod tests {
         let result = engine
             .execute("CREATE TABLE people (id INT NOT NULL, name TEXT NOT NULL)")
             .expect("create table");
-        assert!(matches!(result[0], RuntimeStatementResult::CreateTable { .. }));
+        assert!(matches!(
+            result[0],
+            RuntimeStatementResult::CreateTable { .. }
+        ));
 
         let result = engine
             .execute("INSERT INTO people (id, name) VALUES (1, 'alice'), (2, 'bob')")

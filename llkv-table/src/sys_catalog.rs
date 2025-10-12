@@ -291,7 +291,7 @@ where
 
     /// Scan all table metadata entries from the catalog.
     /// Returns a vector of (table_id, TableMeta) pairs for all persisted tables.
-    /// 
+    ///
     /// This method first scans for all row IDs in the table metadata column,
     /// then uses gather_rows to retrieve the actual metadata.
     pub fn all_table_metas(&self) -> LlkvResult<Vec<(TableId, TableMeta)>> {
@@ -302,7 +302,7 @@ where
         struct RowIdCollector {
             row_ids: Vec<u64>,
         }
-        
+
         impl PrimitiveVisitor for RowIdCollector {
             fn u64_chunk(&mut self, values: &UInt64Array) {
                 for i in 0..values.len() {
@@ -313,8 +313,10 @@ where
         impl PrimitiveWithRowIdsVisitor for RowIdCollector {}
         impl PrimitiveSortedVisitor for RowIdCollector {}
         impl PrimitiveSortedWithRowIdsVisitor for RowIdCollector {}
-        
-        let mut collector = RowIdCollector { row_ids: Vec::new() };
+
+        let mut collector = RowIdCollector {
+            row_ids: Vec::new(),
+        };
         match ScanBuilder::new(self.store, row_field)
             .options(ScanOptions::default())
             .run(&mut collector)
@@ -340,9 +342,7 @@ where
             .as_any()
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| {
-                llkv_result::Error::Internal(
-                    "catalog table_meta column should be Binary".into(),
-                )
+                llkv_result::Error::Internal("catalog table_meta column should be Binary".into())
             })?;
 
         let mut result = Vec::new();
@@ -417,10 +417,12 @@ where
         let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_LAST_COMMITTED_TXN_ID).into();
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
-            Field::new("last_committed_txn_id", DataType::UInt64, false).with_metadata(HashMap::from([(
-                crate::constants::FIELD_ID_META_KEY.to_string(),
-                lfid_val.to_string(),
-            )])),
+            Field::new("last_committed_txn_id", DataType::UInt64, false).with_metadata(
+                HashMap::from([(
+                    crate::constants::FIELD_ID_META_KEY.to_string(),
+                    lfid_val.to_string(),
+                )]),
+            ),
         ]));
 
         let row_id = Arc::new(UInt64Array::from(vec![CATALOG_LAST_COMMITTED_TXN_ROW_ID]));
@@ -511,9 +513,7 @@ where
             .as_any()
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| {
-                llkv_result::Error::Internal(
-                    "catalog state column stored unexpected type".into(),
-                )
+                llkv_result::Error::Internal("catalog state column stored unexpected type".into())
             })?;
         if array.is_empty() || array.is_null(0) {
             return Ok(None);

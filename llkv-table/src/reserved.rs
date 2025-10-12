@@ -68,18 +68,14 @@ pub const FIRST_USER_FIELD_ID: FieldId = 1;
 /// Check if a field ID is reserved and cannot be used for user columns.
 #[inline]
 pub fn is_reserved_field_id(id: FieldId) -> bool {
-    id == ROW_ID_FIELD_ID 
-        || id == MVCC_CREATED_BY_FIELD_ID 
-        || id == MVCC_DELETED_BY_FIELD_ID
+    id == ROW_ID_FIELD_ID || id == MVCC_CREATED_BY_FIELD_ID || id == MVCC_DELETED_BY_FIELD_ID
 }
 
 /// Check if a field ID is a system column (row_id or MVCC columns).
 /// System columns are present in all tables and have special handling.
 #[inline]
 pub fn is_system_field(id: FieldId) -> bool {
-    id == ROW_ID_FIELD_ID 
-        || id == MVCC_CREATED_BY_FIELD_ID 
-        || id == MVCC_DELETED_BY_FIELD_ID
+    id == ROW_ID_FIELD_ID || id == MVCC_CREATED_BY_FIELD_ID || id == MVCC_DELETED_BY_FIELD_ID
 }
 
 /// Check if a field ID is an MVCC column (created_by or deleted_by).
@@ -94,8 +90,13 @@ pub fn is_mvcc_field(id: FieldId) -> bool {
 pub fn reserved_field_id_message(id: FieldId) -> String {
     match id {
         ROW_ID_FIELD_ID => "Field ID 0 is reserved for row_id".to_string(),
-        MVCC_CREATED_BY_FIELD_ID => format!("Field ID {} (u32::MAX) is reserved for MVCC created_by", id),
-        MVCC_DELETED_BY_FIELD_ID => format!("Field ID {} (u32::MAX - 1) is reserved for MVCC deleted_by", id),
+        MVCC_CREATED_BY_FIELD_ID => {
+            format!("Field ID {} (u32::MAX) is reserved for MVCC created_by", id)
+        }
+        MVCC_DELETED_BY_FIELD_ID => format!(
+            "Field ID {} (u32::MAX - 1) is reserved for MVCC deleted_by",
+            id
+        ),
         _ => format!("Field ID {} is reserved for system use", id),
     }
 }
@@ -120,8 +121,8 @@ pub const CATALOG_STATE_ROW_ID: RowId = 3;
 /// User tables can use any row ID, but catalog table has reserved rows.
 #[inline]
 pub fn is_reserved_catalog_row_id(id: RowId) -> bool {
-    id == CATALOG_NEXT_TABLE_ROW_ID 
-        || id == CATALOG_NEXT_TXN_ROW_ID 
+    id == CATALOG_NEXT_TABLE_ROW_ID
+        || id == CATALOG_NEXT_TXN_ROW_ID
         || id == CATALOG_LAST_COMMITTED_TXN_ROW_ID
         || id == CATALOG_STATE_ROW_ID
 }
@@ -132,7 +133,9 @@ pub fn reserved_catalog_row_id_message(id: RowId) -> String {
     match id {
         CATALOG_NEXT_TABLE_ROW_ID => "Row ID 0 is reserved for catalog's next_table_id".to_string(),
         CATALOG_NEXT_TXN_ROW_ID => "Row ID 1 is reserved for catalog's next_txn_id".to_string(),
-        CATALOG_LAST_COMMITTED_TXN_ROW_ID => "Row ID 2 is reserved for catalog's last_committed_txn_id".to_string(),
+        CATALOG_LAST_COMMITTED_TXN_ROW_ID => {
+            "Row ID 2 is reserved for catalog's last_committed_txn_id".to_string()
+        }
         CATALOG_STATE_ROW_ID => "Row ID 3 is reserved for catalog's catalog_state".to_string(),
         _ => format!("Row ID {} is reserved in catalog table", id),
     }
@@ -200,7 +203,10 @@ pub fn is_reserved_txn_id(id: u64) -> bool {
 #[inline]
 pub fn reserved_txn_id_message(id: u64) -> String {
     match id {
-        TXN_ID_NONE => format!("Transaction ID {} (u64::MAX) is reserved for TXN_ID_NONE", id),
+        TXN_ID_NONE => format!(
+            "Transaction ID {} (u64::MAX) is reserved for TXN_ID_NONE",
+            id
+        ),
         0 => "Transaction ID 0 is invalid".to_string(),
         TXN_ID_AUTO_COMMIT => "Transaction ID 1 is reserved for TXN_ID_AUTO_COMMIT".to_string(),
         _ => format!("Transaction ID {} is reserved", id),
@@ -259,7 +265,9 @@ mod tests {
     fn test_catalog_row_id_reservations() {
         assert!(is_reserved_catalog_row_id(CATALOG_NEXT_TABLE_ROW_ID));
         assert!(is_reserved_catalog_row_id(CATALOG_NEXT_TXN_ROW_ID));
-        assert!(is_reserved_catalog_row_id(CATALOG_LAST_COMMITTED_TXN_ROW_ID));
+        assert!(is_reserved_catalog_row_id(
+            CATALOG_LAST_COMMITTED_TXN_ROW_ID
+        ));
         assert!(is_reserved_catalog_row_id(CATALOG_STATE_ROW_ID));
         assert!(!is_reserved_catalog_row_id(4));
         assert!(!is_reserved_catalog_row_id(100));
@@ -280,7 +288,9 @@ mod tests {
         assert!(is_catalog_internal_field(CATALOG_FIELD_COL_META_ID));
         assert!(is_catalog_internal_field(CATALOG_FIELD_NEXT_TABLE_ID));
         assert!(is_catalog_internal_field(CATALOG_FIELD_NEXT_TXN_ID));
-        assert!(is_catalog_internal_field(CATALOG_FIELD_LAST_COMMITTED_TXN_ID));
+        assert!(is_catalog_internal_field(
+            CATALOG_FIELD_LAST_COMMITTED_TXN_ID
+        ));
         assert!(is_catalog_internal_field(CATALOG_FIELD_CATALOG_STATE));
         assert!(!is_catalog_internal_field(2));
         assert!(!is_catalog_internal_field(200));

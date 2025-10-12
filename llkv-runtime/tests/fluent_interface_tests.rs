@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use llkv_runtime::{
-    AggregateExpr, RuntimeContext, InsertPlan, InsertSource, PlanValue, RuntimeStatementResult, TransactionKind,
-    row,
+    AggregateExpr, InsertPlan, InsertSource, PlanValue, RuntimeContext, RuntimeStatementResult,
+    TransactionKind, row,
 };
 use llkv_storage::pager::MemPager;
 
@@ -18,7 +18,10 @@ fn fluent_create_insert_select() {
         .with_column("name", DataType::Utf8)
         .finish()
         .expect("create table");
-    assert!(matches!(create_result, RuntimeStatementResult::CreateTable { .. }));
+    assert!(matches!(
+        create_result,
+        RuntimeStatementResult::CreateTable { .. }
+    ));
 
     let table = context.table("people").expect("table handle");
     let insert_result = table

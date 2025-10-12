@@ -165,8 +165,12 @@ impl AsyncDB for EngineHarness {
                             rows: vec![vec![rows_deleted.to_string()]],
                         })
                     }
-                    RuntimeStatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
-                    RuntimeStatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
+                    RuntimeStatementResult::CreateTable { .. } => {
+                        Ok(DBOutput::StatementComplete(0))
+                    }
+                    RuntimeStatementResult::Transaction { .. } => {
+                        Ok(DBOutput::StatementComplete(0))
+                    }
                     RuntimeStatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
                 }
             }

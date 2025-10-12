@@ -321,10 +321,7 @@ mod tests {
 
     #[test]
     fn test_cached_schema_no_system_columns() {
-        let fields = vec![
-            make_field("name", 1),
-            make_field("email", 2),
-        ];
+        let fields = vec![make_field("name", 1), make_field("email", 2)];
         let schema = Arc::new(Schema::new(fields));
         let cached = CachedSchema::new(schema);
 
@@ -401,9 +398,8 @@ mod tests {
         let cached2 = cached1.clone();
 
         assert_eq!(cached1.field_id(0), cached2.field_id(0));
-        assert_eq!(
+        assert!(
             Arc::ptr_eq(cached1.schema(), cached2.schema()),
-            true,
             "Schema Arc should be shared"
         );
     }
