@@ -49,7 +49,7 @@ impl Error {
     }
 
     #[inline]
-    pub fn reserved_table_id(table_id: u16) -> Self {
-        Error::ReservedTableId(table_id)
+    pub fn reserved_table_id(table_id: impl Into<u16>) -> Self {
+        Error::ReservedTableId(table_id.into())
     }
 }

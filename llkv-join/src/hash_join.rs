@@ -743,7 +743,7 @@ where
             continue;
         };
 
-        let field_id: u32 = field_id_str.parse().map_err(|_| {
+        let field_id: FieldId = field_id_str.parse().map_err(|_| {
             Error::Internal(format!("Invalid field_id in schema: {}", field_id_str))
         })?;
         let lfid = LogicalFieldId::for_user(table.table_id(), field_id);
@@ -808,7 +808,7 @@ fn find_field_index(schema: &Schema, target_field_id: FieldId) -> LlkvResult<usi
             continue;
         };
 
-        let field_id: u32 = field_id_str.parse().map_err(|_| {
+        let field_id: FieldId = field_id_str.parse().map_err(|_| {
             Error::Internal(format!("Invalid field_id in schema: {}", field_id_str))
         })?;
 

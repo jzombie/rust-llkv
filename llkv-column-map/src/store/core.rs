@@ -201,7 +201,7 @@ where
 
     /// Fast presence check using the presence index (row-id permutation) if available.
     /// Returns true if `row_id` exists in the column; false otherwise.
-    pub fn has_row_id(&self, field_id: LogicalFieldId, row_id: u64) -> Result<bool> {
+    pub fn has_row_id(&self, field_id: LogicalFieldId, row_id: RowId) -> Result<bool> {
         let rid_fid = rowid_fid(field_id);
         let catalog = self.catalog.read().unwrap();
         let rid_desc_pk = *catalog.map.get(&rid_fid).ok_or(Error::NotFound)?;

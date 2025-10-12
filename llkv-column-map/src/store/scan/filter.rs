@@ -12,7 +12,7 @@ use arrow::error::Result as ArrowResult;
 use crate::parallel;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::store::rowid_fid;
-use crate::types::LogicalFieldId;
+use crate::types::{LogicalFieldId, RowId};
 use llkv_expr::typed_predicate::{Predicate, PredicateValue};
 use llkv_result::{Error, Result};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -527,7 +527,7 @@ impl<T: ArrowPrimitiveType, F: FnMut(T::Native) -> bool> FilterVisitor<T, F> {
     }
 
     #[inline]
-    fn record_match(&mut self, row_id: u64) {
+    fn record_match(&mut self, row_id: RowId) {
         self.total_matches += 1;
 
         if let Some(rows) = self.fallback_row_ids.as_mut() {
@@ -556,7 +556,7 @@ impl<T: ArrowPrimitiveType, F: FnMut(T::Native) -> bool> FilterVisitor<T, F> {
         self.prev_row_id = Some(row_id);
     }
 
-    fn demote_to_fallback(&mut self, row_id: u64) {
+    fn demote_to_fallback(&mut self, row_id: RowId) {
         if self.fallback_row_ids.is_none() {
             let mut rows = Vec::with_capacity(self.total_matches);
             for run in &self.runs {
@@ -837,7 +837,7 @@ where
     }
 
     #[inline]
-    fn record_match(&mut self, row_id: u64) {
+    fn record_match(&mut self, row_id: RowId) {
         self.total_matches += 1;
 
         if let Some(rows) = self.fallback_row_ids.as_mut() {
@@ -864,7 +864,7 @@ where
         self.prev_row_id = Some(row_id);
     }
 
-    fn demote_to_fallback(&mut self, row_id: u64) {
+    fn demote_to_fallback(&mut self, row_id: RowId) {
         if self.fallback_row_ids.is_none() {
             let mut rows = Vec::with_capacity(self.total_matches);
             for run in &self.runs {

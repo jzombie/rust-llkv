@@ -26,7 +26,7 @@ use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_result::Error;
 use llkv_storage::pager::{MemPager, Pager};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
-use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, TableId};
+use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_table::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -75,7 +75,7 @@ mod mvcc_columns {
     /// Returns (row_id_array, created_by_array, deleted_by_array) and updates next_row_id.
     pub(crate) fn build_insert_mvcc_columns(
         row_count: usize,
-        start_row_id: u64,
+        start_row_id: RowId,
         creator_txn_id: TxnId,
     ) -> (ArrayRef, ArrayRef, ArrayRef) {
         let mut row_builder = UInt64Builder::with_capacity(row_count);
@@ -1800,7 +1800,7 @@ where
             total_rows: AtomicU64::new(0),
         });
 
-        let mut next_row_id: u64 = 0;
+        let mut next_row_id: RowId = 0;
         let mut total_rows: u64 = 0;
         let creator_snapshot = self.txn_manager.begin_transaction();
         let creator_txn_id = creator_snapshot.txn_id;
@@ -2750,7 +2750,7 @@ where
             use arrow::array::UInt64Array;
             
             struct MaxRowIdVisitor {
-                max: u64,
+                max: RowId,
             }
             
             impl PrimitiveVisitor for MaxRowIdVisitor {
