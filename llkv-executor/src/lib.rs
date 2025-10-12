@@ -127,7 +127,7 @@ where
         let options = if let Some(order_plan) = &plan.order_by {
             let order_spec = resolve_scan_order(table_ref, &projections, order_plan)?;
             if row_filter.is_some() {
-                println!("executor: applying row filter with order_by");
+                tracing::debug!("Applying MVCC row filter with ORDER BY");
             }
             ScanStreamOptions {
                 include_nulls: true,
@@ -136,7 +136,7 @@ where
             }
         } else {
             if row_filter.is_some() {
-                println!("executor: applying row filter");
+                tracing::debug!("Applying MVCC row filter");
             }
             ScanStreamOptions {
                 include_nulls: true,
