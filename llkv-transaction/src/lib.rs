@@ -170,6 +170,9 @@ pub trait TransactionContext: Send + Sync {
 
     /// Get table ID for a given table name (for conflict detection)
     fn table_id(&self, table_name: &str) -> LlkvResult<llkv_table::types::TableId>;
+
+    /// Get an immutable catalog snapshot for transaction isolation
+    fn catalog_snapshot(&self) -> llkv_table::catalog::CatalogSnapshot;
 }
 
 /// Transaction state for the runtime context.
@@ -190,16 +193,15 @@ where
     new_tables: HashSet<String>,
     /// Tables known to be missing.
     missing_tables: HashSet<String>,
-    /// Snapshot of catalog at transaction start.
-    catalog_snapshot: HashSet<String>,
+    /// Immutable catalog snapshot at transaction start (for isolation).
+    /// Contains table name→ID mappings. Replaces separate HashSet and HashMap.
+    catalog_snapshot: llkv_table::catalog::CatalogSnapshot,
     /// Base context for reading existing tables with MVCC visibility.
     base_context: Arc<BaseCtx>,
     /// Whether this transaction has been aborted due to an error.
     is_aborted: bool,
     /// Transaction ID manager (shared across all transactions)
     txn_manager: Arc<TxnIdManager>,
-    /// Snapshot of (table_name, table_id) pairs at transaction start
-    catalog_table_ids: HashMap<String, llkv_table::types::TableId>,
     /// Tables accessed (names only) by this transaction
     accessed_tables: HashSet<String>,
 }
@@ -214,16 +216,9 @@ where
         staging: Arc<StagingCtx>,
         txn_manager: Arc<TxnIdManager>,
     ) -> Self {
-        let table_names: Vec<String> = base_context.table_names();
-        let catalog_snapshot: HashSet<String> = table_names.iter().cloned().collect();
-
-        // Capture (table_name, table_id) pairs at transaction start for conflict detection
-        let mut catalog_table_ids = HashMap::new();
-        for table_name in &table_names {
-            if let Ok(table_id) = base_context.table_id(table_name) {
-                catalog_table_ids.insert(table_name.clone(), table_id);
-            }
-        }
+        // Get immutable catalog snapshot for transaction isolation
+        // This replaces the previous HashSet<String> and HashMap<String, TableId>
+        let catalog_snapshot = base_context.catalog_snapshot();
 
         let snapshot = txn_manager.begin_transaction();
         tracing::debug!(
@@ -241,7 +236,6 @@ where
             new_tables: HashSet::new(),
             missing_tables: HashSet::new(),
             catalog_snapshot,
-            catalog_table_ids,
             base_context,
             is_aborted: false,
             accessed_tables: HashSet::new(),
@@ -264,10 +258,8 @@ where
             return Ok(());
         }
 
-        let canonical_name = table_name.to_ascii_lowercase();
-
         // Check if table exists in catalog snapshot OR was created in this transaction
-        if !self.catalog_snapshot.contains(&canonical_name) && !self.new_tables.contains(table_name)
+        if !self.catalog_snapshot.table_exists(table_name) && !self.new_tables.contains(table_name)
         {
             self.missing_tables.insert(table_name.to_string());
             return Err(Error::CatalogError(format!(
@@ -799,13 +791,13 @@ where
                 "[COMMIT CONFLICT CHECK] Checking table '{}'",
                 accessed_table_name
             );
-            // Get the table ID from our snapshot at transaction start
-            if let Some(snapshot_table_id) = tx.catalog_table_ids.get(accessed_table_name) {
+            // Get the table ID from our catalog snapshot at transaction start
+            if let Some(snapshot_table_id) = tx.catalog_snapshot.table_id(accessed_table_name) {
                 // Check current table state
                 match self.context.table_id(accessed_table_name) {
                     Ok(current_table_id) => {
                         // If table ID changed, it was dropped and recreated
-                        if current_table_id != *snapshot_table_id {
+                        if current_table_id != snapshot_table_id {
                             tx.txn_manager.mark_aborted(tx.snapshot.txn_id);
                             let auto_commit_snapshot = TransactionSnapshot {
                                 txn_id: TXN_ID_AUTO_COMMIT,

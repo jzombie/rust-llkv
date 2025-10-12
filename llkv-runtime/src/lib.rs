@@ -3107,6 +3107,11 @@ where
         let table = ctx.lookup_table(table_name)?;
         Ok(table.table.table_id())
     }
+
+    fn catalog_snapshot(&self) -> llkv_table::catalog::CatalogSnapshot {
+        let ctx = self.context();
+        ctx.catalog.snapshot()
+    }
 }
 
 // Helper to convert StatementResult between types (legacy)
