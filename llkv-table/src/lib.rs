@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+pub mod catalog;
 pub mod constants;
 mod planner;
 pub mod reserved;
 mod scalar_eval;
+pub mod schema_ext;
 mod sys_catalog;
 pub mod expr {
     pub use llkv_expr::expr::*;

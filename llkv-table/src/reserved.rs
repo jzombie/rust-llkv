@@ -48,13 +48,22 @@ pub fn reserved_table_id_message(id: TableId) -> String {
 // =============================================================================
 
 /// The row_id field (reserved for internal row identifiers).
+/// Present in all tables, always at FieldId 0.
 pub const ROW_ID_FIELD_ID: FieldId = 0;
 
-/// Field ID used for MVCC created_by column (sentinel value).
+/// Sentinel FieldId for MVCC created_by column (u32::MAX).
+/// Tracks which transaction created each row.
+/// Uses sentinel value to avoid collision with user field IDs.
 pub const MVCC_CREATED_BY_FIELD_ID: FieldId = u32::MAX;
 
-/// Field ID used for MVCC deleted_by column (sentinel value).
+/// Sentinel FieldId for MVCC deleted_by column (u32::MAX - 1).
+/// Tracks which transaction deleted each row (TXN_ID_NONE if not deleted).
+/// Uses sentinel value to avoid collision with user field IDs.
 pub const MVCC_DELETED_BY_FIELD_ID: FieldId = u32::MAX - 1;
+
+/// First FieldId available for user-defined columns.
+/// System columns (row_id=0, MVCC columns=sentinels) are excluded from this range.
+pub const FIRST_USER_FIELD_ID: FieldId = 1;
 
 /// Check if a field ID is reserved and cannot be used for user columns.
 #[inline]
@@ -62,6 +71,22 @@ pub fn is_reserved_field_id(id: FieldId) -> bool {
     id == ROW_ID_FIELD_ID 
         || id == MVCC_CREATED_BY_FIELD_ID 
         || id == MVCC_DELETED_BY_FIELD_ID
+}
+
+/// Check if a field ID is a system column (row_id or MVCC columns).
+/// System columns are present in all tables and have special handling.
+#[inline]
+pub fn is_system_field(id: FieldId) -> bool {
+    id == ROW_ID_FIELD_ID 
+        || id == MVCC_CREATED_BY_FIELD_ID 
+        || id == MVCC_DELETED_BY_FIELD_ID
+}
+
+/// Check if a field ID is an MVCC column (created_by or deleted_by).
+/// MVCC columns track transaction visibility.
+#[inline]
+pub fn is_mvcc_field(id: FieldId) -> bool {
+    id == MVCC_CREATED_BY_FIELD_ID || id == MVCC_DELETED_BY_FIELD_ID
 }
 
 /// Return the error message for attempting to use a reserved field ID.
@@ -192,8 +217,32 @@ mod tests {
         assert!(is_reserved_field_id(ROW_ID_FIELD_ID));
         assert!(is_reserved_field_id(MVCC_CREATED_BY_FIELD_ID));
         assert!(is_reserved_field_id(MVCC_DELETED_BY_FIELD_ID));
-        assert!(!is_reserved_field_id(1));
+        assert!(!is_reserved_field_id(FIRST_USER_FIELD_ID));
         assert!(!is_reserved_field_id(100));
+    }
+
+    #[test]
+    fn test_system_field_helpers() {
+        // System fields: row_id (0) and MVCC sentinels (u32::MAX, u32::MAX-1)
+        assert!(is_system_field(ROW_ID_FIELD_ID));
+        assert!(is_system_field(MVCC_CREATED_BY_FIELD_ID));
+        assert!(is_system_field(MVCC_DELETED_BY_FIELD_ID));
+        assert!(!is_system_field(FIRST_USER_FIELD_ID));
+        assert!(!is_system_field(100));
+
+        // MVCC fields: sentinels only (not row_id)
+        assert!(!is_mvcc_field(ROW_ID_FIELD_ID));
+        assert!(is_mvcc_field(MVCC_CREATED_BY_FIELD_ID));
+        assert!(is_mvcc_field(MVCC_DELETED_BY_FIELD_ID));
+        assert!(!is_mvcc_field(FIRST_USER_FIELD_ID));
+    }
+
+    #[test]
+    fn test_first_user_field_id() {
+        // User fields start at 1 (0 reserved for row_id, sentinels for MVCC)
+        assert_eq!(FIRST_USER_FIELD_ID, 1);
+        assert!(!is_system_field(FIRST_USER_FIELD_ID));
+        assert!(!is_reserved_field_id(FIRST_USER_FIELD_ID));
     }
 
     #[test]
