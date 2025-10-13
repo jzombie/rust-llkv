@@ -23,6 +23,30 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{Arc, RwLock};
 
+/// Columnar storage engine for managing Arrow-based data.
+///
+/// `ColumnStore` provides the primary interface for persisting and retrieving columnar
+/// data using Apache Arrow [`RecordBatch`]es. It manages:
+///
+/// - Column descriptors and metadata (chunk locations, row counts, min/max values)
+/// - Data type caching for efficient schema queries
+/// - Index management (presence indexes, value indexes)
+/// - Integration with the [`Pager`] for persistent storage
+///
+/// # Namespaces
+///
+/// Columns are identified by [`LogicalFieldId`], which combines a namespace, table ID,
+/// and field ID. This prevents collisions between user data, row IDs, and MVCC metadata:
+///
+/// - `UserData`: Regular table columns
+/// - `RowIdShadow`: Internal row ID tracking
+/// - `TxnCreatedBy`: MVCC transaction creation timestamps
+/// - `TxnDeletedBy`: MVCC transaction deletion timestamps
+///
+/// # Thread Safety
+///
+/// `ColumnStore` is `Send + Sync` and can be safely shared across threads via `Arc`.
+/// Internal state (catalog, caches) uses `RwLock` for concurrent access.
 pub struct ColumnStore<P: Pager> {
     pub(crate) pager: Arc<P>,
     pub(crate) catalog: Arc<RwLock<ColumnCatalog>>,
@@ -35,6 +59,15 @@ impl<P> ColumnStore<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    /// Open or create a `ColumnStore` using the provided pager.
+    ///
+    /// This loads the column catalog from the pager's root catalog key, or initializes
+    /// an empty catalog if none exists. The catalog maps [`LogicalFieldId`] to the
+    /// physical keys of column descriptors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pager fails to load the catalog or if deserialization fails.
     pub fn open(pager: Arc<P>) -> Result<Self> {
         let cfg = ColumnStoreConfig::default();
         let catalog = match pager
@@ -59,17 +92,39 @@ where
         })
     }
 
-    /// Registers an index for a given column, building it for existing data atomically and with low memory usage.
+    /// Create and persist an index for a column.
+    ///
+    /// This builds the specified index type for all existing data in the column and
+    /// persists it atomically. The index will be maintained automatically on subsequent
+    /// appends and updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if index creation fails.
     pub fn register_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
         self.index_manager.register_index(self, field_id, kind)
     }
 
-    /// Unregisters a persisted index from a given column atomically.
+    /// Remove a persisted index from a column.
+    ///
+    /// This atomically removes the index and frees associated storage. The column data
+    /// itself is not affected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column or index doesn't exist.
     pub fn unregister_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
         self.index_manager.unregister_index(self, field_id, kind)
     }
 
-    /// Returns the Arrow data type of the given field, loading it if not cached.
+    /// Get the Arrow data type of a column.
+    ///
+    /// This returns the data type from cache if available, otherwise loads it from
+    /// the column descriptor and caches it for future queries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if the descriptor is corrupted.
     pub fn data_type(&self, field_id: LogicalFieldId) -> Result<DataType> {
         if let Some(dt) = self.dtype_cache.cached_data_type(field_id) {
             return Ok(dt);
@@ -77,7 +132,15 @@ where
         self.dtype_cache.dtype_for_field(field_id)
     }
 
-    /// Collects the row ids whose values satisfy the provided predicate.
+    /// Find all row IDs where a column satisfies a predicate.
+    ///
+    /// This evaluates the predicate against the column's data and returns a vector
+    /// of matching row IDs. Uses indexes and chunk metadata (min/max values) to
+    /// skip irrelevant data when possible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if chunk data is corrupted.
     pub fn filter_row_ids<T>(
         &self,
         field_id: LogicalFieldId,
@@ -96,6 +159,7 @@ where
         res
     }
 
+    // TODO: Document
     pub fn filter_matches<T, F>(
         &self,
         field_id: LogicalFieldId,
@@ -108,7 +172,14 @@ where
         T::run_filter_with_result(self, field_id, predicate)
     }
 
-    /// Lists the names of all persisted indexes for a given column.
+    /// List all indexes registered for a column.
+    ///
+    /// Returns the types of indexes (e.g., presence, value) that are currently
+    /// persisted for the specified column.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if the descriptor is corrupted.
     pub fn list_persisted_indexes(&self, field_id: LogicalFieldId) -> Result<Vec<IndexKind>> {
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
@@ -128,11 +199,14 @@ where
         Ok(kinds)
     }
 
-    /// Return the total number of rows recorded for the given logical field.
+    /// Get the total number of rows in a column.
     ///
-    /// This reads the ColumnDescriptor.total_row_count stored in the catalog and
-    /// descriptor pages and returns it as a u64. The value is updated by append
-    /// / delete code paths and represents the persisted row count for that column.
+    /// Returns the persisted row count from the column's descriptor. This value is
+    /// updated by append and delete operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if the descriptor is corrupted.
     pub fn total_rows_for_field(&self, field_id: LogicalFieldId) -> Result<u64> {
         let catalog = self.catalog.read().unwrap();
         let desc_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
@@ -152,12 +226,14 @@ where
         Ok(desc.total_row_count)
     }
 
-    /// Return the total number of rows for a table by inspecting any persisted
-    /// user-data column descriptor belonging to `table_id`.
+    /// Get the total number of rows in a table.
     ///
-    /// This method picks the first user-data column found in the in-memory
-    /// catalog for the table and returns its descriptor.total_row_count. If the
-    /// table has no persisted columns, `Ok(0)` is returned.
+    /// This returns the maximum row count across all user-data columns in the table.
+    /// If the table has no persisted columns, returns `0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if column descriptors cannot be loaded.
     pub fn total_rows_for_table(&self, table_id: crate::types::TableId) -> Result<u64> {
         use crate::types::Namespace;
         // Acquire read lock on catalog and find any matching user-data field
@@ -186,7 +262,11 @@ where
         Ok(max_rows)
     }
 
-    /// Return the logical field identifiers for all user columns in `table_id`.
+    /// Get all user-data column IDs for a table.
+    ///
+    /// This returns the [`LogicalFieldId`]s of all persisted user columns (namespace
+    /// `UserData`) belonging to the specified table. MVCC and row ID columns are not
+    /// included.
     pub fn user_field_ids_for_table(&self, table_id: crate::types::TableId) -> Vec<LogicalFieldId> {
         use crate::types::Namespace;
 
@@ -199,8 +279,15 @@ where
             .collect()
     }
 
-    /// Fast presence check using the presence index (row-id permutation) if available.
-    /// Returns true if `row_id` exists in the column; false otherwise.
+    /// Check whether a specific row ID exists in a column.
+    ///
+    /// This uses presence indexes and binary search when available for fast lookups.
+    /// If no presence index exists, it scans chunks and uses min/max metadata to
+    /// prune irrelevant data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if chunk data is corrupted.
     pub fn has_row_id(&self, field_id: LogicalFieldId, row_id: RowId) -> Result<bool> {
         let rid_fid = rowid_fid(field_id);
         let catalog = self.catalog.read().unwrap();
@@ -295,45 +382,34 @@ where
     }
 
     // TODO: Set up a way to optionally auto-increment a row ID column if not provided.
-
-    /// NOTE (logical table separation):
+    /// Append a [`RecordBatch`] to the store.
     ///
-    /// The ColumnStore stores data per logical field (a LogicalFieldId) rather
-    /// than per 'table' directly. A LogicalFieldId encodes a namespace and a
-    /// table id together (see [crate::types::LogicalFieldId]). This design lets
-    /// multiple tables share the same underlying storage layer without
-    /// collisions because every persisted column descriptor, chunk chain and
-    /// presence/permutation index is keyed by the full LogicalFieldId.
+    /// The batch must include a `rowid` column (type `UInt64`) that uniquely identifies
+    /// each row. Each other column must have `field_id` metadata mapping it to a
+    /// [`LogicalFieldId`].
     ///
-    /// Concretely:
-    /// - `catalog.map` maps each LogicalFieldId -> descriptor physical key .
-    /// - Each ColumnDescriptor contains chunk metadata and a persisted
-    ///   `total_row_count` for that logical field only.
-    /// - Row-id shadow columns (presence/permutation indices) are created per
-    ///   logical field (they are derived from the LogicalFieldId) and are used
-    ///   for fast existence checks and indexed gathers.
+    /// ## Last-Write-Wins Updates
     ///
-    /// The `append` implementation below expects incoming RecordBatches to be
-    /// namespaced: each field's metadata contains a "field_id" that, when
-    /// combined with the current table id, maps to the LogicalFieldId the
-    /// ColumnStore will append into. This ensures that appends for different
-    /// tables never overwrite each other's descriptors or chunks because the
-    /// LogicalFieldId namespace keeps them separate.
+    /// If any row IDs in the batch already exist, they are updated in-place (overwritten)
+    /// rather than creating duplicates. This happens in a separate transaction before
+    /// appending new rows.
     ///
-    /// Constraints and recommended usage:
-    /// - A single `RecordBatch` carries exactly one `ROW_ID` column which is
-    ///   shared by all other columns in that batch. Because of this, a batch
-    ///   is implicitly tied to a single table's row-id space and should not
-    ///   mix columns from different tables.
-    /// - To append data for multiple tables, create separate `RecordBatch`
-    ///   instances (one per table) and call `append` for each. These calls
-    ///   may be executed concurrently for throughput; the ColumnStore persists
-    ///   data per-logical-field so physical writes won't collide.
-    /// - If you need an atomic multi-table append, the current API does not
-    ///   provide that; you'd need a higher-level coordinator that issues the
-    ///   per-table appends within a single transaction boundary (or extend the
-    ///   API to accept per-column row-id arrays). Such a change is more
-    ///   invasive and requires reworking LWW/commit logic.
+    /// ## Row ID Ordering
+    ///
+    /// The batch is automatically sorted by `rowid` if not already sorted. This ensures
+    /// efficient metadata updates and naturally sorted shadow columns.
+    ///
+    /// ## Table Separation
+    ///
+    /// Each batch should contain columns from only one table. To append to multiple
+    /// tables, call `append` separately for each table's batch (may be concurrent).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The batch is missing the `rowid` column
+    /// - Column metadata is missing or invalid
+    /// - Storage operations fail
     #[allow(unused_variables, unused_assignments)] // TODO: Keep `presence_index_created`?
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         // --- PHASE 1: PRE-PROCESSING THE INCOMING BATCH ---

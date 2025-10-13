@@ -186,7 +186,20 @@ impl Default for TxnIdManager {
     }
 }
 
-/// Metadata describing a particular row version.
+/// Metadata tracking when a row was created and deleted.
+///
+/// Each row in a table has associated `created_by` and `deleted_by` values stored
+/// in MVCC metadata columns. These values determine which transactions can see the row.
+///
+/// # Visibility Rules
+///
+/// A row is visible to a transaction if:
+/// 1. The creating transaction committed and its ID ≤ the snapshot ID
+/// 2. The row is not deleted (`deleted_by == TXN_ID_NONE`), or the deleting
+///    transaction either hasn't committed or has ID > snapshot ID
+///
+/// Special case: Rows created by the current transaction are visible to that
+/// transaction immediately, even before commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowVersion {
     /// Transaction ID that created this row version.
@@ -274,9 +287,19 @@ impl RowVersion {
 }
 
 /// Transaction metadata captured when a transaction begins.
+///
+/// A snapshot contains two key pieces of information:
+/// - `txn_id`: The unique ID of this transaction (used for writes)
+/// - `snapshot_id`: The highest committed transaction ID at the time this transaction started
+///
+/// The `snapshot_id` determines which rows are visible: rows created by transactions
+/// with IDs ≤ `snapshot_id` are visible, while rows created by later transactions are not.
+/// This implements snapshot isolation.
 #[derive(Debug, Clone, Copy)]
 pub struct TransactionSnapshot {
+    /// The unique ID assigned to this transaction.
     pub txn_id: TxnId,
+    /// The highest committed transaction ID when this transaction began.
     pub snapshot_id: TxnId,
 }
 

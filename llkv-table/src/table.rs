@@ -28,6 +28,29 @@ struct MvccColumnCache {
     has_deleted_by: bool,
 }
 
+/// A schema-aware table built on top of columnar storage.
+///
+/// `Table` provides a higher-level interface than [`ColumnStore`], adding:
+///
+/// - **Schema management**: Validates field IDs and data types on append
+/// - **MVCC integration**: Automatically manages `created_by` and `deleted_by` columns
+/// - **Scan operations**: Supports projection, filtering, ordering, and computed columns
+/// - **Row ID filtering**: Allows transaction visibility enforcement via [`RowIdFilter`]
+///
+/// # Table IDs
+///
+/// Each table is identified by a [`TableId`]. Table 0 is reserved for the system catalog.
+/// User tables start at ID 1.
+///
+/// # Field IDs
+///
+/// Each column is assigned a [`FieldId`] stored in the Arrow field metadata. This maps
+/// to a [`LogicalFieldId`] in the underlying storage layer, combining the table ID,
+/// namespace, and field ID.
+///
+/// # Thread Safety
+///
+/// `Table` is `Send + Sync` and can be safely shared via `Arc`.
 pub struct Table<P = MemPager>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -39,31 +62,52 @@ where
     mvcc_cache: RwLock<Option<MvccColumnCache>>,
 }
 
-/// Trait that allows callers to filter row ids before they are gathered into
-/// Arrow batches. Implementations can enforce MVCC visibility or other
-/// contextual policies.
+/// Filter row IDs before they are materialized into batches.
+///
+/// This trait allows implementations to enforce transaction visibility (MVCC),
+/// access control, or other row-level filtering policies. The filter is applied
+/// after column-level predicates but before data is gathered into Arrow batches.
+///
+/// # Example Use Case
+///
+/// MVCC implementations use this to hide rows that were:
+/// - Created after the transaction's snapshot timestamp
+/// - Deleted before the transaction's snapshot timestamp
 pub trait RowIdFilter<P>: Send + Sync
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    /// Filter a list of row IDs, returning only those that should be visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if visibility metadata cannot be loaded or is corrupted.
     fn filter(&self, table: &Table<P>, row_ids: Vec<u64>) -> LlkvResult<Vec<u64>>;
 }
 
+/// Options for configuring table scans.
+///
+/// These options control how rows are filtered, ordered, and materialized during
+/// scan operations.
 pub struct ScanStreamOptions<P = MemPager>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    /// Preserve null rows emitted by the projected columns when `true`.
-    /// When `false`, the scan gatherer drops rows where all projected
-    /// columns are null or missing before yielding batches. This keeps
-    /// the table scan column-oriented while delegating row-level
-    /// filtering to the column-map layer.
+    /// Whether to include rows where all projected columns are null.
+    ///
+    /// When `false` (default), rows with all-null projections are dropped before
+    /// batches are yielded. This is useful for sparse data where many rows may not
+    /// have values for the selected columns.
     pub include_nulls: bool,
-    /// Optional ordering specification applied to the gathered row ids
-    /// before projection results are materialized.
+    /// Optional ordering to apply to results.
+    ///
+    /// If specified, row IDs are sorted according to this specification before
+    /// data is gathered into batches.
     pub order: Option<ScanOrderSpec>,
-    /// Optional row-id filter that can remove invisible rows (for example,
-    /// enforcing MVCC visibility) before batches are materialized.
+    /// Optional filter for row-level visibility (e.g., MVCC).
+    ///
+    /// Applied after column-level predicates but before data is materialized.
+    /// Used to enforce transaction isolation.
     pub row_id_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
 }
 
@@ -109,41 +153,66 @@ where
     }
 }
 
+/// Specification for ordering scan results.
+///
+/// Defines how to sort rows based on a single column's values.
 #[derive(Clone, Copy, Debug)]
 pub struct ScanOrderSpec {
+    /// The field to sort by.
     pub field_id: FieldId,
+    /// Sort direction (ascending or descending).
     pub direction: ScanOrderDirection,
+    /// Whether null values appear first or last.
     pub nulls_first: bool,
+    /// Optional transformation to apply before sorting.
     pub transform: ScanOrderTransform,
 }
 
+/// Sort direction for scan ordering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanOrderDirection {
+    /// Sort from smallest to largest.
     Ascending,
+    /// Sort from largest to smallest.
     Descending,
 }
 
+/// Value transformation to apply before sorting.
+///
+/// Used to enable sorting on columns that need type coercion or conversion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanOrderTransform {
+    /// Sort integers as-is.
     IdentityInteger,
+    /// Sort strings lexicographically.
     IdentityUtf8,
+    /// Parse strings as integers, then sort numerically.
     CastUtf8ToInteger,
 }
 
+/// A column or computed expression to include in scan results.
+///
+/// Scans can project either stored columns or expressions computed from them.
 #[derive(Clone, Debug)]
 pub enum ScanProjection {
+    /// Project a stored column directly.
     Column(Projection),
+    /// Compute a value from an expression and return it with an alias.
     Computed {
+        /// The expression to evaluate (can reference column field IDs).
         expr: ScalarExpr<FieldId>,
+        /// The name to give the computed column in results.
         alias: String,
     },
 }
 
 impl ScanProjection {
+    /// Create a projection for a stored column.
     pub fn column<P: Into<Projection>>(proj: P) -> Self {
         Self::Column(proj.into())
     }
 
+    /// Create a projection for a computed expression.
     pub fn computed<S: Into<String>>(expr: ScalarExpr<FieldId>, alias: S) -> Self {
         Self::Computed {
             expr,
@@ -174,6 +243,17 @@ impl<P> Table<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    /// Create a new `Table` instance for the given table ID.
+    ///
+    /// This opens the underlying [`ColumnStore`] and initializes table-specific state.
+    /// The table does not need to already exist; this method works for both new and
+    /// existing tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The table ID is reserved (e.g., table 0)
+    /// - The column store cannot be opened
     pub fn new(table_id: TableId, pager: Arc<P>) -> LlkvResult<Self> {
         if is_reserved_table_id(table_id) {
             return Err(Error::ReservedTableId(table_id));
@@ -224,6 +304,30 @@ where
         cache
     }
 
+    /// Append a [`RecordBatch`] to the table.
+    ///
+    /// The batch must include:
+    /// - A `row_id` column (type `UInt64`) with unique row identifiers
+    /// - `field_id` metadata for each user column, mapping to this table's field IDs
+    ///
+    /// ## MVCC Columns
+    ///
+    /// If the batch includes `created_by` or `deleted_by` columns, they are automatically
+    /// assigned the correct [`LogicalFieldId`] for this table's MVCC metadata.
+    ///
+    /// ## Field ID Mapping
+    ///
+    /// Each column's `field_id` metadata is converted to a [`LogicalFieldId`] by combining
+    /// it with this table's ID. This ensures columns from different tables don't collide
+    /// in the underlying storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The batch is missing the `row_id` column
+    /// - Any user column is missing `field_id` metadata
+    /// - Field IDs are invalid or malformed
+    /// - The underlying storage operation fails
     pub fn append(&self, batch: &RecordBatch) -> LlkvResult<()> {
         use arrow::array::UInt64Builder;
 

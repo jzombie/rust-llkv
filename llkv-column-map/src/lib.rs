@@ -1,3 +1,60 @@
+//! Columnar storage engine for LLKV.
+//!
+//! This crate provides a low-level columnar storage layer that persists Apache Arrow
+//! [`RecordBatch`]es to disk and supports efficient scans, filters, and updates.
+//! It serves as the foundation for [`llkv-table`] and higher-level query execution.
+//!
+//! # Architecture
+//!
+//! The storage engine is organized into several key components:
+//!
+//! - **[`ColumnStore`]**: Primary interface for storing and retrieving columnar data.
+//!   Manages column descriptors, metadata catalogs, and coordinates with the pager
+//!   for persistent storage.
+//!
+//! - **[`LogicalFieldId`](types::LogicalFieldId)**: Namespaced identifier for columns.
+//!   Combines a namespace (user data, row ID shadow, MVCC metadata), table ID, and
+//!   field ID into a single 64-bit value to prevent collisions.
+//!
+//! - **[`ScanBuilder`]**: Builder pattern for constructing column scans with various
+//!   options (filters, ordering, row ID inclusion).
+//!
+//! - **Visitor Pattern**: Scans emit data through visitor callbacks rather than
+//!   materializing entire columns in memory, enabling streaming and aggregation.
+//!
+//! # Storage Model
+//!
+//! Data is stored in columnar chunks:
+//! - Each column is identified by a `LogicalFieldId`
+//! - Columns are broken into chunks for incremental writes
+//! - Each chunk stores Arrow-serialized data plus metadata (row count, min/max values)
+//! - Shadow columns track row IDs separately from user data
+//! - MVCC columns (`created_by`, `deleted_by`) track transaction visibility
+//!
+//! # Namespaces
+//!
+//! Columns are organized into namespaces to prevent ID collisions:
+//! - `UserData`: Regular table columns
+//! - `RowIdShadow`: Internal row ID tracking for each column
+//! - `TxnCreatedBy`: MVCC transaction that created each row
+//! - `TxnDeletedBy`: MVCC transaction that deleted each row
+//!
+//! # Thread Safety
+//!
+//! `ColumnStore` is thread-safe (`Send + Sync`) with internal locking for
+//! catalog updates. Read operations can occur concurrently; writes are
+//! serialized through the catalog lock.
+//!
+//! [`RecordBatch`]: arrow::record_batch::RecordBatch
+//! [`llkv-table`]: https://docs.rs/llkv-table
+//! [`ColumnStore`]: store::ColumnStore
+//! [`ScanBuilder`]: scan::ScanBuilder
+//!
+//! # Macros and Type Dispatch
+//!
+//! This crate provides macros for efficient type-specific operations without runtime
+//! dispatch overhead. See [`with_integer_arrow_type!`] for details.
+
 // NOTE: rustfmt currently re-indents portions of macro_rules! blocks in this
 // file (observed when running `cargo fmt`). This produces noisy diffs and
 // churn because rustfmt will flip formatting between runs. The problematic
@@ -20,10 +77,23 @@
 // have a reproducer or additional context, please refer to this existing
 // discussion: https://github.com/rust-lang/rustfmt/issues/6629#issuecomment-3395446770
 
-/// Expands to the provided body with `$ty` bound to the concrete Arrow primitive type that
-/// matches the supplied `DataType`. Integer and floating-point primitives are supported; any
-/// other `DataType` triggers the `$unsupported` expression. This is used to avoid dynamic
-/// dispatch in hot paths like scans and row gathers.
+/// Dispatches to type-specific code based on an Arrow `DataType`.
+///
+/// This macro eliminates runtime type checking by expanding to type-specific code
+/// at compile time. It matches the provided `DataType` against supported numeric types
+/// and binds the corresponding Arrow primitive type to the specified identifier.
+///
+/// # Parameters
+///
+/// - `$dtype` - Expression evaluating to `&arrow::datatypes::DataType`
+/// - `$ty` - Identifier to bind the Arrow primitive type to (e.g., `UInt64Type`)
+/// - `$body` - Code to execute with `$ty` bound to the matched type
+/// - `$unsupported` - Fallback expression if the type is not supported
+///
+/// # Performance
+///
+/// This macro is used in hot paths to avoid runtime `match` statements and virtual
+/// dispatch. The compiler generates specialized code for each type.
 #[macro_export]
 #[rustfmt::skip]
 macro_rules! with_integer_arrow_type {
@@ -60,7 +130,24 @@ macro_rules! with_integer_arrow_type {
     }};
 }
 
-/// Invokes `$macro` with metadata for each supported Arrow numeric primitive.
+/// Invokes a macro for each supported Arrow numeric type.
+///
+/// This is a helper macro that generates repetitive type-specific code. It calls
+/// the provided macro once for each numeric Arrow type with metadata about that type.
+///
+/// # Macro Arguments Provided to Callback
+///
+/// For each type, the callback macro receives:
+/// 1. Base type name (e.g., `u64`, `i32`, `f64`)
+/// 2. Chunk visitor method name (e.g., `u64_chunk`)
+/// 3. Chunk with row IDs visitor method name (e.g., `u64_chunk_with_rids`)
+/// 4. Run visitor method name (e.g., `u64_run`)
+/// 5. Run with row IDs visitor method name (e.g., `u64_run_with_rids`)
+/// 6. Arrow array type (e.g., `arrow::array::UInt64Array`)
+/// 7. Arrow physical type (e.g., `arrow::datatypes::UInt64Type`)
+/// 8. Arrow DataType enum variant (e.g., `arrow::datatypes::DataType::UInt64`)
+/// 9. Native Rust type (e.g., `u64`)
+/// 10. Cast expression for type conversion
 #[macro_export]
 #[rustfmt::skip]
 macro_rules! llkv_for_each_arrow_numeric {

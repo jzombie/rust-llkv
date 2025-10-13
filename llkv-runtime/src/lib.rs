@@ -1,3 +1,30 @@
+//! Query execution runtime for LLKV.
+//!
+//! This crate provides the `Runtime` interface for executing SQL plans with full
+//! transaction support. It coordinates between the transaction layer, storage layer,
+//! and query executor to provide a complete database runtime.
+//!
+//! # Key Components
+//!
+//! - **[`Runtime`]**: Main execution engine for SQL operations
+//! - **[`RuntimeSession`]**: Session-level interface with transaction management
+//! - **[`TransactionContext`]**: Single-transaction execution context
+//! - **Table Provider**: Integration with the query executor for table access
+//!
+//! # Transaction Support
+//!
+//! The runtime supports both:
+//! - **Auto-commit**: Single-statement transactions (uses `TXN_ID_AUTO_COMMIT`)
+//! - **Multi-statement**: Explicit BEGIN/COMMIT/ROLLBACK transactions
+//!
+//! # MVCC Integration
+//!
+//! All data modifications automatically include MVCC metadata:
+//! - `row_id`: Unique row identifier
+//! - `created_by`: Transaction ID that created the row
+//! - `deleted_by`: Transaction ID that deleted the row (or `TXN_ID_NONE`)
+//!
+//! The runtime ensures these columns are injected and managed consistently.
 #![forbid(unsafe_code)]
 
 use std::fmt;

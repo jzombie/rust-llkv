@@ -1,3 +1,31 @@
+//! SQL interface for LLKV.
+//!
+//! This crate provides the [`SqlEngine`], which parses SQL statements and executes
+//! them using the LLKV runtime. It serves as the primary user-facing interface for
+//! interacting with LLKV databases.
+//!
+//! ```text
+//! SQL String → sqlparser → AST → Plan → Runtime → Storage
+//! ```
+//!
+//! The SQL engine:
+//! 1. Parses SQL using [`sqlparser`]
+//! 2. Converts AST to execution plans
+//! 3. Delegates to [`llkv-runtime`] for execution
+//! 4. Returns results as Arrow [`RecordBatch`]es or row counts
+//!
+//! # Transactions
+//!
+//! By default, each statement executes in its own auto-commit transaction. Use
+//! explicit transaction control for multi-statement transactions:
+//!
+//! # Type System
+//!
+//! SQL types are mapped to Arrow data types (the following is a non-exhaustive list):
+//! - `INT`, `INTEGER`, `BIGINT` → `Int64`
+//! - `FLOAT`, `DOUBLE`, `REAL` → `Float64`
+//! - `TEXT`, `VARCHAR` → `Utf8`
+//! - `DATE` → `Date32`
 pub type SqlResult<T> = llkv_result::Result<T>;
 
 mod sql_engine;
