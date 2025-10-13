@@ -8,7 +8,7 @@
 //! # Error Philosophy (still a work in progress to implement fully across all crates)
 //!
 //! LLKV uses a single error enum ([`Error`]) rather than crate-specific error types.
-//! 
+//!
 //! This approach:
 //! - Simplifies error handling across crate boundaries
 //! - Allows errors to propagate naturally with `?` operator

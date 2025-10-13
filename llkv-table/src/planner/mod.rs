@@ -654,7 +654,7 @@ where
 
     fn compute_table_row_ids(&self) -> LlkvResult<Vec<u64>> {
         use llkv_column_map::store::rowid_fid;
-        
+
         let fields = self
             .table
             .store()
@@ -673,7 +673,7 @@ where
         if let Some(&first_field) = fields.first() {
             let rid_shadow = rowid_fid(first_field);
             let mut collector = RowIdScanCollector::default();
-            
+
             // Try to scan the row_id shadow column
             match ScanBuilder::new(self.table.store(), rid_shadow)
                 .options(ScanOptions {

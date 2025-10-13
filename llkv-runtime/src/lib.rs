@@ -1,12 +1,12 @@
 //! Query execution runtime for LLKV.
 //!
-//! This crate provides the `Runtime` interface for executing SQL plans with full
+//! This crate provides the runtime API (see [`RuntimeEngine`]) for executing SQL plans with full
 //! transaction support. It coordinates between the transaction layer, storage layer,
 //! and query executor to provide a complete database runtime.
 //!
 //! # Key Components
 //!
-//! - **[`Runtime`]**: Main execution engine for SQL operations
+//! - **[`RuntimeEngine`]**: Main execution engine for SQL operations
 //! - **[`RuntimeSession`]**: Session-level interface with transaction management
 //! - **[`TransactionContext`]**: Single-transaction execution context
 //! - **Table Provider**: Integration with the query executor for table access

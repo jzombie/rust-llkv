@@ -9,8 +9,8 @@
 //! # Storage Format
 //!
 //! The catalog stores metadata as serialized [`bitcode`] blobs in special catalog
-//! columns within table 0. See [`CATALOG_TABLE_ID`](crate::CATALOG_TABLE_ID) and
-//! related constants in the [`reserved`](crate::reserved) module.
+//! columns within table 0. See [`CATALOG_TABLE_ID`] and related constants in the
+//! [`reserved`](crate::reserved) module.
 //!
 //! # Usage
 //!
