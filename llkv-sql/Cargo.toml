@@ -1,5 +1,6 @@
 [package]
 name = "llkv-sql"
+description = "SQL interface for the LLKV toolkit."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true

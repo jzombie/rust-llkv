@@ -1,5 +1,6 @@
 [package]
 name = "llkv-runtime"
+description = "Execution runtime for the LLKV toolkit."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
