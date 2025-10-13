@@ -495,7 +495,8 @@ where
         use llkv_expr::expr::AggregateCall;
 
         let table_ref = table.as_ref();
-        let mut results = FxHashMap::with_capacity_and_hasher(aggregate_specs.len(), Default::default());
+        let mut results =
+            FxHashMap::with_capacity_and_hasher(aggregate_specs.len(), Default::default());
 
         // Build aggregate specs for the aggregator
         let mut specs: Vec<AggregateSpec> = Vec::new();

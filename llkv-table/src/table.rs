@@ -1,5 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use crate::planner::{TablePlanner, collect_row_ids_for_table};
 use crate::types::TableId;
@@ -19,12 +20,23 @@ use crate::types::FieldId;
 use llkv_expr::{Expr, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 
+/// Cached information about which system columns exist in the table schema.
+/// This avoids repeated string comparisons in hot paths like append().
+#[derive(Debug, Clone, Copy)]
+struct MvccColumnCache {
+    has_created_by: bool,
+    has_deleted_by: bool,
+}
+
 pub struct Table<P = MemPager>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     store: ColumnStore<P>,
     table_id: TableId,
+    /// Cache of MVCC column presence. Initialized lazily on first schema() call.
+    /// None means not yet initialized.
+    mvcc_cache: RwLock<Option<MvccColumnCache>>,
 }
 
 /// Trait that allows callers to filter row ids before they are gathered into
@@ -173,23 +185,53 @@ where
             &*pager
         );
         let store = ColumnStore::open(pager)?;
-        Ok(Self { store, table_id })
+        Ok(Self {
+            store,
+            table_id,
+            mvcc_cache: RwLock::new(None),
+        })
+    }
+
+    /// Get or initialize the MVCC column cache from the provided schema.
+    /// This is an optimization to avoid repeated string comparisons in append().
+    fn get_mvcc_cache(&self, schema: &Arc<Schema>) -> MvccColumnCache {
+        // Fast path: check if cache is already initialized
+        {
+            let cache_read = self.mvcc_cache.read().unwrap();
+            if let Some(cache) = *cache_read {
+                return cache;
+            }
+        }
+
+        // Slow path: initialize cache from schema
+        let has_created_by = schema
+            .fields()
+            .iter()
+            .any(|f| f.name() == llkv_column_map::store::CREATED_BY_COLUMN_NAME);
+        let has_deleted_by = schema
+            .fields()
+            .iter()
+            .any(|f| f.name() == llkv_column_map::store::DELETED_BY_COLUMN_NAME);
+
+        let cache = MvccColumnCache {
+            has_created_by,
+            has_deleted_by,
+        };
+
+        // Store in cache for future calls
+        *self.mvcc_cache.write().unwrap() = Some(cache);
+
+        cache
     }
 
     pub fn append(&self, batch: &RecordBatch) -> LlkvResult<()> {
         use arrow::array::UInt64Builder;
 
-        // Check if MVCC columns already exist in the batch
-        let has_created_by = batch
-            .schema()
-            .fields()
-            .iter()
-            .any(|f| f.name() == llkv_column_map::store::CREATED_BY_COLUMN_NAME);
-        let has_deleted_by = batch
-            .schema()
-            .fields()
-            .iter()
-            .any(|f| f.name() == llkv_column_map::store::DELETED_BY_COLUMN_NAME);
+        // Check if MVCC columns already exist in the batch using cache
+        // This avoids repeated string comparisons on every append
+        let cache = self.get_mvcc_cache(&batch.schema());
+        let has_created_by = cache.has_created_by;
+        let has_deleted_by = cache.has_deleted_by;
 
         let mut new_fields = Vec::with_capacity(batch.schema().fields().len() + 2);
         let mut new_columns: Vec<Arc<dyn Array>> = Vec::with_capacity(batch.columns().len() + 2);

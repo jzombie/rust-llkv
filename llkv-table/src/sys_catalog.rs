@@ -291,7 +291,7 @@ where
 
     /// Scan all table metadata entries from the catalog.
     /// Returns a vector of (table_id, TableMeta) pairs for all persisted tables.
-    /// 
+    ///
     /// This method first scans for all row IDs in the table metadata column,
     /// then uses gather_rows to retrieve the actual metadata.
     pub fn all_table_metas(&self) -> LlkvResult<Vec<(TableId, TableMeta)>> {
@@ -302,7 +302,7 @@ where
         struct RowIdCollector {
             row_ids: Vec<u64>,
         }
-        
+
         impl PrimitiveVisitor for RowIdCollector {
             fn u64_chunk(&mut self, values: &UInt64Array) {
                 for i in 0..values.len() {
@@ -313,8 +313,10 @@ where
         impl PrimitiveWithRowIdsVisitor for RowIdCollector {}
         impl PrimitiveSortedVisitor for RowIdCollector {}
         impl PrimitiveSortedWithRowIdsVisitor for RowIdCollector {}
-        
-        let mut collector = RowIdCollector { row_ids: Vec::new() };
+
+        let mut collector = RowIdCollector {
+            row_ids: Vec::new(),
+        };
         match ScanBuilder::new(self.store, row_field)
             .options(ScanOptions::default())
             .run(&mut collector)
@@ -340,9 +342,7 @@ where
             .as_any()
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| {
-                llkv_result::Error::Internal(
-                    "catalog table_meta column should be Binary".into(),
-                )
+                llkv_result::Error::Internal("catalog table_meta column should be Binary".into())
             })?;
 
         let mut result = Vec::new();
@@ -417,10 +417,12 @@ where
         let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_LAST_COMMITTED_TXN_ID).into();
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
-            Field::new("last_committed_txn_id", DataType::UInt64, false).with_metadata(HashMap::from([(
-                crate::constants::FIELD_ID_META_KEY.to_string(),
-                lfid_val.to_string(),
-            )])),
+            Field::new("last_committed_txn_id", DataType::UInt64, false).with_metadata(
+                HashMap::from([(
+                    crate::constants::FIELD_ID_META_KEY.to_string(),
+                    lfid_val.to_string(),
+                )]),
+            ),
         ]));
 
         let row_id = Arc::new(UInt64Array::from(vec![CATALOG_LAST_COMMITTED_TXN_ROW_ID]));
@@ -462,6 +464,66 @@ where
 
         let value = array.value(0);
         Ok(Some(value))
+    }
+
+    /// Persist the catalog state to the system catalog.
+    ///
+    /// Stores the complete catalog state (all tables and fields) as a binary blob
+    /// using bitcode serialization.
+    pub fn put_catalog_state(&self, state: &crate::catalog::TableCatalogState) -> LlkvResult<()> {
+        let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_CATALOG_STATE).into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("catalog_state", DataType::Binary, false).with_metadata(HashMap::from([(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            )])),
+        ]));
+
+        let row_id = Arc::new(UInt64Array::from(vec![CATALOG_STATE_ROW_ID]));
+        let encoded = bitcode::encode(state);
+        let state_bytes = Arc::new(BinaryArray::from(vec![encoded.as_slice()]));
+
+        let batch = RecordBatch::try_new(schema, vec![row_id, state_bytes])?;
+        self.store.append(&batch)?;
+        Ok(())
+    }
+
+    /// Load the catalog state from the system catalog.
+    ///
+    /// Retrieves the complete catalog state including all table and field mappings.
+    pub fn get_catalog_state(&self) -> LlkvResult<Option<crate::catalog::TableCatalogState>> {
+        let lfid = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_CATALOG_STATE);
+        let batch = match self.store.gather_rows(
+            &[lfid],
+            &[CATALOG_STATE_ROW_ID],
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(batch) => batch,
+            Err(llkv_result::Error::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        if batch.num_columns() == 0 || batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal("catalog state column stored unexpected type".into())
+            })?;
+        if array.is_empty() || array.is_null(0) {
+            return Ok(None);
+        }
+
+        let bytes = array.value(0);
+        let state = bitcode::decode(bytes).map_err(|e| {
+            llkv_result::Error::Internal(format!("Failed to decode catalog state: {}", e))
+        })?;
+        Ok(Some(state))
     }
 }
 

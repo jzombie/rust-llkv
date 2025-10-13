@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::Array as ArrowArray;
-use llkv_runtime::{Context, StatementResult};
+use llkv_runtime::{RuntimeContext, RuntimeStatementResult};
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
@@ -23,7 +23,7 @@ impl EngineHarness {
 
 #[derive(Clone)]
 pub struct SharedContext {
-    context: Arc<Context<MemPager>>,
+    context: Arc<RuntimeContext<MemPager>>,
 }
 
 impl Default for SharedContext {
@@ -35,7 +35,7 @@ impl Default for SharedContext {
 impl SharedContext {
     pub fn new() -> Self {
         let pager = Arc::new(MemPager::default());
-        let context = Arc::new(Context::new(pager));
+        let context = Arc::new(RuntimeContext::new(pager));
         Self { context }
     }
 
@@ -63,7 +63,7 @@ impl AsyncDB for EngineHarness {
                 }
                 let result = results.remove(0);
                 match result {
-                    StatementResult::Select { execution, .. } => {
+                    RuntimeStatementResult::Select { execution, .. } => {
                         let batches = execution.collect()?;
                         let mut rows: Vec<Vec<String>> = Vec::new();
                         for batch in &batches {
@@ -144,30 +144,34 @@ impl AsyncDB for EngineHarness {
 
                         Ok(DBOutput::Rows { types, rows })
                     }
-                    StatementResult::Insert { rows_inserted, .. } => {
+                    RuntimeStatementResult::Insert { rows_inserted, .. } => {
                         // Return as a single-row result for compatibility with query directives
                         Ok(DBOutput::Rows {
                             types: vec![DefaultColumnType::Integer],
                             rows: vec![vec![rows_inserted.to_string()]],
                         })
                     }
-                    StatementResult::Update { rows_updated, .. } => {
+                    RuntimeStatementResult::Update { rows_updated, .. } => {
                         // Return as a single-row result for compatibility with query directives
                         Ok(DBOutput::Rows {
                             types: vec![DefaultColumnType::Integer],
                             rows: vec![vec![rows_updated.to_string()]],
                         })
                     }
-                    StatementResult::Delete { rows_deleted, .. } => {
+                    RuntimeStatementResult::Delete { rows_deleted, .. } => {
                         // Return as a single-row result for compatibility with query directives
                         Ok(DBOutput::Rows {
                             types: vec![DefaultColumnType::Integer],
                             rows: vec![vec![rows_deleted.to_string()]],
                         })
                     }
-                    StatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
-                    StatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
-                    StatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
+                    RuntimeStatementResult::CreateTable { .. } => {
+                        Ok(DBOutput::StatementComplete(0))
+                    }
+                    RuntimeStatementResult::Transaction { .. } => {
+                        Ok(DBOutput::StatementComplete(0))
+                    }
+                    RuntimeStatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
                 }
             }
             Err(e) => {

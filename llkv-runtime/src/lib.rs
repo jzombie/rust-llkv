@@ -60,7 +60,7 @@ use llkv_transaction::{
 // Internal low-level transaction session type (from llkv-transaction)
 use llkv_transaction::TransactionSession;
 
-// Note: Session is the high-level wrapper that users should use instead of the lower-level session API
+// Note: RuntimeSession is the high-level wrapper that users should use instead of the lower-level TransactionSession API
 
 /// Helper functions for MVCC column injection.
 ///
@@ -69,7 +69,7 @@ use llkv_transaction::TransactionSession;
 mod mvcc_columns {
     use super::*;
     use std::collections::HashMap;
-    
+
     /// Build MVCC columns (row_id, created_by, deleted_by) for INSERT operations.
     ///
     /// Returns (row_id_array, created_by_array, deleted_by_array) and updates next_row_id.
@@ -82,21 +82,21 @@ mod mvcc_columns {
         for offset in 0..row_count {
             row_builder.append_value(start_row_id + offset as u64);
         }
-        
+
         let mut created_builder = UInt64Builder::with_capacity(row_count);
         let mut deleted_builder = UInt64Builder::with_capacity(row_count);
         for _ in 0..row_count {
             created_builder.append_value(creator_txn_id);
             deleted_builder.append_value(TXN_ID_NONE);
         }
-        
+
         (
             Arc::new(row_builder.finish()) as ArrayRef,
             Arc::new(created_builder.finish()) as ArrayRef,
             Arc::new(deleted_builder.finish()) as ArrayRef,
         )
     }
-    
+
     /// Build MVCC field definitions (row_id, created_by, deleted_by).
     ///
     /// Returns the three Field definitions that should be prepended to user columns.
@@ -107,7 +107,7 @@ mod mvcc_columns {
             Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false),
         ]
     }
-    
+
     /// Build field with field_id metadata for a user column.
     pub(crate) fn build_field_with_metadata(
         name: &str,
@@ -123,7 +123,7 @@ mod mvcc_columns {
         Field::new(name, data_type, nullable)
             .with_metadata(metadata.into_iter().collect::<HashMap<String, String>>())
     }
-    
+
     /// Build DELETE batch with row_id and deleted_by columns.
     ///
     /// This creates a minimal RecordBatch for marking rows as deleted.
@@ -132,26 +132,25 @@ mod mvcc_columns {
         deleted_by_txn_id: TxnId,
     ) -> llkv_result::Result<RecordBatch> {
         let row_count = row_ids.len();
-        
+
         let fields = vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false),
         ];
-        
+
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(UInt64Array::from(row_ids)),
             Arc::new(UInt64Array::from(vec![deleted_by_txn_id; row_count])),
         ];
-        
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-            .map_err(Error::Arrow)
+
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(Error::Arrow)
     }
 }
 
 /// Result of running a plan statement.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
-pub enum StatementResult<P>
+pub enum RuntimeStatementResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -181,18 +180,18 @@ where
     },
 }
 
-impl<P> fmt::Debug for StatementResult<P>
+impl<P> fmt::Debug for RuntimeStatementResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StatementResult::CreateTable { table_name } => f
+            RuntimeStatementResult::CreateTable { table_name } => f
                 .debug_struct("CreateTable")
                 .field("table_name", table_name)
                 .finish(),
-            StatementResult::NoOp => f.debug_struct("NoOp").finish(),
-            StatementResult::Insert {
+            RuntimeStatementResult::NoOp => f.debug_struct("NoOp").finish(),
+            RuntimeStatementResult::Insert {
                 table_name,
                 rows_inserted,
             } => f
@@ -200,7 +199,7 @@ where
                 .field("table_name", table_name)
                 .field("rows_inserted", rows_inserted)
                 .finish(),
-            StatementResult::Update {
+            RuntimeStatementResult::Update {
                 table_name,
                 rows_updated,
             } => f
@@ -208,7 +207,7 @@ where
                 .field("table_name", table_name)
                 .field("rows_updated", rows_updated)
                 .finish(),
-            StatementResult::Delete {
+            RuntimeStatementResult::Delete {
                 table_name,
                 rows_deleted,
             } => f
@@ -216,59 +215,61 @@ where
                 .field("table_name", table_name)
                 .field("rows_deleted", rows_deleted)
                 .finish(),
-            StatementResult::Select {
+            RuntimeStatementResult::Select {
                 table_name, schema, ..
             } => f
                 .debug_struct("Select")
                 .field("table_name", table_name)
                 .field("schema", schema)
                 .finish(),
-            StatementResult::Transaction { kind } => {
+            RuntimeStatementResult::Transaction { kind } => {
                 f.debug_struct("Transaction").field("kind", kind).finish()
             }
         }
     }
 }
 
-impl<P> StatementResult<P>
+impl<P> RuntimeStatementResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     /// Convert a StatementResult from one pager type to another.
     /// Only works for non-SELECT results (CreateTable, Insert, Update, Delete, NoOp, Transaction).
     #[allow(dead_code)]
-    pub(crate) fn convert_pager_type<Q>(self) -> Result<StatementResult<Q>>
+    pub(crate) fn convert_pager_type<Q>(self) -> Result<RuntimeStatementResult<Q>>
     where
         Q: Pager<Blob = EntryHandle> + Send + Sync,
     {
         match self {
-            StatementResult::CreateTable { table_name } => {
-                Ok(StatementResult::CreateTable { table_name })
+            RuntimeStatementResult::CreateTable { table_name } => {
+                Ok(RuntimeStatementResult::CreateTable { table_name })
             }
-            StatementResult::NoOp => Ok(StatementResult::NoOp),
-            StatementResult::Insert {
+            RuntimeStatementResult::NoOp => Ok(RuntimeStatementResult::NoOp),
+            RuntimeStatementResult::Insert {
                 table_name,
                 rows_inserted,
-            } => Ok(StatementResult::Insert {
+            } => Ok(RuntimeStatementResult::Insert {
                 table_name,
                 rows_inserted,
             }),
-            StatementResult::Update {
+            RuntimeStatementResult::Update {
                 table_name,
                 rows_updated,
-            } => Ok(StatementResult::Update {
+            } => Ok(RuntimeStatementResult::Update {
                 table_name,
                 rows_updated,
             }),
-            StatementResult::Delete {
+            RuntimeStatementResult::Delete {
                 table_name,
                 rows_deleted,
-            } => Ok(StatementResult::Delete {
+            } => Ok(RuntimeStatementResult::Delete {
                 table_name,
                 rows_deleted,
             }),
-            StatementResult::Transaction { kind } => Ok(StatementResult::Transaction { kind }),
-            StatementResult::Select { .. } => Err(Error::Internal(
+            RuntimeStatementResult::Transaction { kind } => {
+                Ok(RuntimeStatementResult::Transaction { kind })
+            }
+            RuntimeStatementResult::Select { .. } => Err(Error::Internal(
                 "Cannot convert SELECT result between pager types in transaction".into(),
             )),
         }
@@ -312,19 +313,19 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
 // The SessionTransaction and TableDeltaState types are re-exported from there
 
 /// Wrapper for Context that implements TransactionContext
-pub struct ContextWrapper<P>
+pub struct RuntimeContextWrapper<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    ctx: Arc<Context<P>>,
+    ctx: Arc<RuntimeContext<P>>,
     snapshot: RwLock<TransactionSnapshot>,
 }
 
-impl<P> ContextWrapper<P>
+impl<P> RuntimeContextWrapper<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn new(ctx: Arc<Context<P>>) -> Self {
+    fn new(ctx: Arc<RuntimeContext<P>>) -> Self {
         let snapshot = ctx.default_snapshot();
         Self {
             ctx,
@@ -341,11 +342,11 @@ where
         *self.snapshot.read().expect("snapshot lock poisoned")
     }
 
-    fn context(&self) -> &Arc<Context<P>> {
+    fn context(&self) -> &Arc<RuntimeContext<P>> {
         &self.ctx
     }
 
-    fn ctx(&self) -> &Context<P> {
+    fn ctx(&self) -> &RuntimeContext<P> {
         &self.ctx
     }
 }
@@ -354,15 +355,15 @@ where
 ///
 /// This is a high-level wrapper around the transaction machinery that provides
 /// a clean API for users. Operations can be executed directly or within a transaction.
-pub struct Session<P>
+pub struct RuntimeSession<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     // TODO: Allow generic pager type
-    inner: TransactionSession<ContextWrapper<P>, ContextWrapper<MemPager>>,
+    inner: TransactionSession<RuntimeContextWrapper<P>, RuntimeContextWrapper<MemPager>>,
 }
 
-impl<P> Session<P>
+impl<P> RuntimeSession<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
@@ -376,13 +377,13 @@ where
 
     /// Begin a transaction in this session.
     /// Creates an isolated staging context automatically.
-    pub fn begin_transaction(&self) -> Result<StatementResult<P>> {
+    pub fn begin_transaction(&self) -> Result<RuntimeStatementResult<P>> {
         let staging_pager = Arc::new(MemPager::default());
         tracing::trace!(
             "BEGIN_TRANSACTION: Created staging pager at {:p}",
             &*staging_pager
         );
-        let staging_ctx = Arc::new(Context::new(staging_pager));
+        let staging_ctx = Arc::new(RuntimeContext::new(staging_pager));
 
         // Copy table metadata from the main context to the staging context,
         // but create new Table instances that use the staging pager
@@ -391,10 +392,10 @@ where
             .ctx()
             .copy_tables_to_staging(&staging_ctx)?;
 
-        let staging_wrapper = Arc::new(ContextWrapper::new(staging_ctx));
+        let staging_wrapper = Arc::new(RuntimeContextWrapper::new(staging_ctx));
 
         self.inner.begin_transaction(staging_wrapper)?;
-        Ok(StatementResult::Transaction {
+        Ok(RuntimeStatementResult::Transaction {
             kind: TransactionKind::Begin,
         })
     }
@@ -419,7 +420,7 @@ where
 
     /// Commit the current transaction and apply changes to the base context.
     /// If the transaction was aborted, this acts as a ROLLBACK instead.
-    pub fn commit_transaction(&self) -> Result<StatementResult<P>> {
+    pub fn commit_transaction(&self) -> Result<RuntimeStatementResult<P>> {
         tracing::trace!("Session::commit_transaction called");
         let (tx_result, operations) = self.inner.commit_transaction()?;
         tracing::trace!(
@@ -503,16 +504,16 @@ where
         }
 
         // Return a StatementResult with the correct kind (Commit or Rollback)
-        Ok(StatementResult::Transaction { kind })
+        Ok(RuntimeStatementResult::Transaction { kind })
     }
 
     /// Rollback the current transaction, discarding all changes.
-    pub fn rollback_transaction(&self) -> Result<StatementResult<P>> {
+    pub fn rollback_transaction(&self) -> Result<RuntimeStatementResult<P>> {
         self.inner.rollback_transaction()?;
         let base_ctx = self.inner.context();
         let default_snapshot = base_ctx.ctx().default_snapshot();
         TransactionContext::set_snapshot(&**base_ctx, default_snapshot);
-        Ok(StatementResult::Transaction {
+        Ok(RuntimeStatementResult::Transaction {
             kind: TransactionKind::Rollback,
         })
     }
@@ -521,7 +522,7 @@ where
         if let Some(CreateTableSource::Select { plan: select_plan }) = plan.source.take() {
             let select_result = self.select(*select_plan)?;
             let (schema, batches) = match select_result {
-                StatementResult::Select {
+                RuntimeStatementResult::Select {
                     schema, execution, ..
                 } => {
                     let batches = execution.collect()?;
@@ -539,7 +540,7 @@ where
     }
 
     /// Create a table (outside or inside transaction).
-    pub fn create_table_plan(&self, plan: CreateTablePlan) -> Result<StatementResult<P>> {
+    pub fn create_table_plan(&self, plan: CreateTablePlan) -> Result<RuntimeStatementResult<P>> {
         let plan = self.materialize_create_table_plan(plan)?;
         if self.has_active_transaction() {
             let table_name = plan.name.clone();
@@ -547,7 +548,7 @@ where
                 .inner
                 .execute_operation(PlanOperation::CreateTable(plan))
             {
-                Ok(_) => Ok(StatementResult::CreateTable { table_name }),
+                Ok(_) => Ok(RuntimeStatementResult::CreateTable { table_name }),
                 Err(e) => {
                     // If an error occurs during a transaction, abort it
                     self.abort_transaction();
@@ -558,7 +559,7 @@ where
             // Call via TransactionContext trait
             let table_name = plan.name.clone();
             TransactionContext::create_table_plan(&**self.inner.context(), plan)?;
-            Ok(StatementResult::CreateTable { table_name })
+            Ok(RuntimeStatementResult::CreateTable { table_name })
         }
     }
 
@@ -595,7 +596,7 @@ where
             InsertSource::Select { plan: select_plan } => {
                 let select_result = self.select(*select_plan)?;
                 let rows = match select_result {
-                    StatementResult::Select { execution, .. } => execution.into_rows()?,
+                    RuntimeStatementResult::Select { execution, .. } => execution.into_rows()?,
                     _ => {
                         return Err(Error::Internal(
                             "expected Select result when executing INSERT ... SELECT".into(),
@@ -616,7 +617,7 @@ where
     }
 
     /// Insert rows (outside or inside transaction).
-    pub fn insert(&self, plan: InsertPlan) -> Result<StatementResult<P>> {
+    pub fn insert(&self, plan: InsertPlan) -> Result<RuntimeStatementResult<P>> {
         tracing::trace!("Session::insert called for table={}", plan.table);
         let (plan, rows_inserted) = self.normalize_insert_plan(plan)?;
         let table_name = plan.table.clone();
@@ -625,7 +626,7 @@ where
             match self.inner.execute_operation(PlanOperation::Insert(plan)) {
                 Ok(_) => {
                     tracing::trace!("Session::insert succeeded for table={}", table_name);
-                    Ok(StatementResult::Insert {
+                    Ok(RuntimeStatementResult::Insert {
                         rows_inserted,
                         table_name,
                     })
@@ -650,7 +651,7 @@ where
             let default_snapshot = context.ctx().default_snapshot();
             TransactionContext::set_snapshot(&**context, default_snapshot);
             TransactionContext::insert(&**context, plan)?;
-            Ok(StatementResult::Insert {
+            Ok(RuntimeStatementResult::Insert {
                 rows_inserted,
                 table_name,
             })
@@ -658,7 +659,7 @@ where
     }
 
     /// Select rows (outside or inside transaction).
-    pub fn select(&self, plan: SelectPlan) -> Result<StatementResult<P>> {
+    pub fn select(&self, plan: SelectPlan) -> Result<RuntimeStatementResult<P>> {
         if self.has_active_transaction() {
             let tx_result = match self
                 .inner
@@ -698,7 +699,7 @@ where
                         combined,
                     );
 
-                    Ok(StatementResult::Select {
+                    Ok(RuntimeStatementResult::Select {
                         execution,
                         table_name,
                         schema,
@@ -714,7 +715,7 @@ where
             let table_name = plan.table.clone();
             let execution = TransactionContext::execute_select(&**context, plan)?;
             let schema = execution.schema();
-            Ok(StatementResult::Select {
+            Ok(RuntimeStatementResult::Select {
                 execution,
                 table_name,
                 schema,
@@ -727,7 +728,7 @@ where
         let plan =
             SelectPlan::new(table.to_string()).with_projections(vec![SelectProjection::AllColumns]);
         match self.select(plan)? {
-            StatementResult::Select { execution, .. } => Ok(execution.collect_rows()?.rows),
+            RuntimeStatementResult::Select { execution, .. } => Ok(execution.collect_rows()?.rows),
             other => Err(Error::Internal(format!(
                 "expected Select result when reading table '{table}', got {:?}",
                 other
@@ -736,7 +737,7 @@ where
     }
 
     /// Update rows (outside or inside transaction).
-    pub fn update(&self, plan: UpdatePlan) -> Result<StatementResult<P>> {
+    pub fn update(&self, plan: UpdatePlan) -> Result<RuntimeStatementResult<P>> {
         if self.has_active_transaction() {
             let table_name = plan.table.clone();
             let result = match self.inner.execute_operation(PlanOperation::Update(plan)) {
@@ -751,7 +752,7 @@ where
                 TransactionResult::Update {
                     rows_matched: _,
                     rows_updated,
-                } => Ok(StatementResult::Update {
+                } => Ok(RuntimeStatementResult::Update {
                     rows_updated,
                     table_name,
                 }),
@@ -768,7 +769,7 @@ where
                 TransactionResult::Update {
                     rows_matched: _,
                     rows_updated,
-                } => Ok(StatementResult::Update {
+                } => Ok(RuntimeStatementResult::Update {
                     rows_updated,
                     table_name,
                 }),
@@ -778,7 +779,7 @@ where
     }
 
     /// Delete rows (outside or inside transaction).
-    pub fn delete(&self, plan: DeletePlan) -> Result<StatementResult<P>> {
+    pub fn delete(&self, plan: DeletePlan) -> Result<RuntimeStatementResult<P>> {
         if self.has_active_transaction() {
             let table_name = plan.table.clone();
             let result = match self.inner.execute_operation(PlanOperation::Delete(plan)) {
@@ -790,7 +791,7 @@ where
                 }
             };
             match result {
-                TransactionResult::Delete { rows_deleted } => Ok(StatementResult::Delete {
+                TransactionResult::Delete { rows_deleted } => Ok(RuntimeStatementResult::Delete {
                     rows_deleted,
                     table_name,
                 }),
@@ -804,7 +805,7 @@ where
             let table_name = plan.table.clone();
             let result = TransactionContext::delete(&**context, plan)?;
             match result {
-                TransactionResult::Delete { rows_deleted } => Ok(StatementResult::Delete {
+                TransactionResult::Delete { rows_deleted } => Ok(RuntimeStatementResult::Delete {
                     rows_deleted,
                     table_name,
                 }),
@@ -814,22 +815,22 @@ where
     }
 }
 
-pub struct Engine<P>
+pub struct RuntimeEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    context: Arc<Context<P>>,
-    session: Session<P>,
+    context: Arc<RuntimeContext<P>>,
+    session: RuntimeSession<P>,
 }
 
-impl<P> Clone for Engine<P>
+impl<P> Clone for RuntimeEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         // IMPORTANT: Reuse the same session to maintain transaction state!
         // Creating a new session would break multi-statement transactions.
-        tracing::debug!("[ENGINE] Engine::clone() called - reusing same session");
+        tracing::debug!("[ENGINE] RuntimeEngine::clone() called - reusing same session");
         Self {
             context: Arc::clone(&self.context),
             session: self.session.clone_session(),
@@ -837,31 +838,31 @@ where
     }
 }
 
-impl<P> Engine<P>
+impl<P> RuntimeEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     pub fn new(pager: Arc<P>) -> Self {
-        let context = Arc::new(Context::new(pager));
+        let context = Arc::new(RuntimeContext::new(pager));
         Self::from_context(context)
     }
 
-    pub fn from_context(context: Arc<Context<P>>) -> Self {
-        tracing::debug!("[ENGINE] Engine::from_context - creating new session");
+    pub fn from_context(context: Arc<RuntimeContext<P>>) -> Self {
+        tracing::debug!("[ENGINE] RuntimeEngine::from_context - creating new session");
         let session = context.create_session();
-        tracing::debug!("[ENGINE] Engine::from_context - created session");
+        tracing::debug!("[ENGINE] RuntimeEngine::from_context - created session");
         Self { context, session }
     }
 
-    pub fn context(&self) -> Arc<Context<P>> {
+    pub fn context(&self) -> Arc<RuntimeContext<P>> {
         Arc::clone(&self.context)
     }
 
-    pub fn session(&self) -> &Session<P> {
+    pub fn session(&self) -> &RuntimeSession<P> {
         &self.session
     }
 
-    pub fn execute_statement(&self, statement: PlanStatement) -> Result<StatementResult<P>> {
+    pub fn execute_statement(&self, statement: PlanStatement) -> Result<RuntimeStatementResult<P>> {
         match statement {
             PlanStatement::BeginTransaction => self.session.begin_transaction(),
             PlanStatement::CommitTransaction => self.session.commit_transaction(),
@@ -874,7 +875,7 @@ where
         }
     }
 
-    pub fn execute_all<I>(&self, statements: I) -> Result<Vec<StatementResult<P>>>
+    pub fn execute_all<I>(&self, statements: I) -> Result<Vec<RuntimeStatementResult<P>>>
     where
         I: IntoIterator<Item = PlanStatement>,
     {
@@ -899,27 +900,32 @@ where
 /// - Metadata per table: ~100s of bytes to a few KB (schema + field ids)
 /// - ExecutorTable struct: small (handles + counters)
 /// - Actual table rows: streamed from disk in chunks (never fully resident)
-pub struct Context<P>
+pub struct RuntimeContext<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pager: Arc<P>,
     tables: RwLock<FxHashMap<String, Arc<ExecutorTable<P>>>>,
     dropped_tables: RwLock<FxHashSet<String>>,
+    // Centralized catalog for table/field name resolution
+    catalog: Arc<llkv_table::catalog::TableCatalog>,
     // Transaction manager for session-based transactions
-    transaction_manager: TransactionManager<ContextWrapper<P>, ContextWrapper<MemPager>>,
+    transaction_manager:
+        TransactionManager<RuntimeContextWrapper<P>, RuntimeContextWrapper<MemPager>>,
     txn_manager: Arc<TxnIdManager>,
 }
 
-impl<P> Context<P>
+impl<P> RuntimeContext<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     pub fn new(pager: Arc<P>) -> Self {
-        tracing::trace!("Context::new called, pager={:p}", &*pager);
-        
+        tracing::trace!("RuntimeContext::new called, pager={:p}", &*pager);
+
         // Load transaction state and table registry from catalog if it exists
-        let (next_txn_id, last_committed, loaded_tables) = match ColumnStore::open(Arc::clone(&pager)) {
+        let (next_txn_id, last_committed, loaded_tables) = match ColumnStore::open(Arc::clone(
+            &pager,
+        )) {
             Ok(store) => {
                 let catalog = SysCatalog::new(&store);
                 let next_txn_id = match catalog.get_next_txn_id() {
@@ -928,11 +934,16 @@ where
                         id
                     }
                     Ok(None) => {
-                        tracing::debug!("[CONTEXT] No persisted next_txn_id found, starting from default");
+                        tracing::debug!(
+                            "[CONTEXT] No persisted next_txn_id found, starting from default"
+                        );
                         TXN_ID_AUTO_COMMIT + 1
                     }
                     Err(e) => {
-                        tracing::warn!("[CONTEXT] Failed to load next_txn_id: {}, using default", e);
+                        tracing::warn!(
+                            "[CONTEXT] Failed to load next_txn_id: {}, using default",
+                            e
+                        );
                         TXN_ID_AUTO_COMMIT + 1
                     }
                 };
@@ -942,15 +953,20 @@ where
                         id
                     }
                     Ok(None) => {
-                        tracing::debug!("[CONTEXT] No persisted last_committed found, starting from default");
+                        tracing::debug!(
+                            "[CONTEXT] No persisted last_committed found, starting from default"
+                        );
                         TXN_ID_AUTO_COMMIT
                     }
                     Err(e) => {
-                        tracing::warn!("[CONTEXT] Failed to load last_committed: {}, using default", e);
+                        tracing::warn!(
+                            "[CONTEXT] Failed to load last_committed: {}, using default",
+                            e
+                        );
                         TXN_ID_AUTO_COMMIT
                     }
                 };
-                
+
                 // Load table registry from catalog
                 let loaded_tables = match catalog.all_table_metas() {
                     Ok(metas) => {
@@ -958,22 +974,29 @@ where
                         metas
                     }
                     Err(e) => {
-                        tracing::warn!("[CONTEXT] Failed to load table metas: {}, starting with empty registry", e);
+                        tracing::warn!(
+                            "[CONTEXT] Failed to load table metas: {}, starting with empty registry",
+                            e
+                        );
                         Vec::new()
                     }
                 };
-                
+
                 (next_txn_id, last_committed, loaded_tables)
             }
             Err(e) => {
-                tracing::warn!("[CONTEXT] Failed to open ColumnStore: {}, using default state", e);
+                tracing::warn!(
+                    "[CONTEXT] Failed to open ColumnStore: {}, using default state",
+                    e
+                );
                 (TXN_ID_AUTO_COMMIT + 1, TXN_ID_AUTO_COMMIT, Vec::new())
             }
         };
-        
-        let transaction_manager = TransactionManager::new_with_initial_state(next_txn_id, last_committed);
+
+        let transaction_manager =
+            TransactionManager::new_with_initial_state(next_txn_id, last_committed);
         let txn_manager = transaction_manager.txn_manager();
-        
+
         // LAZY LOADING: Only load table metadata at first access. We intentionally
         // avoid loading any row/column data into memory here. The executor
         // performs streaming reads from the ColumnStore when a query runs, so
@@ -999,11 +1022,30 @@ where
             "[CONTEXT] Initialized with lazy loading for {} table(s)",
             loaded_tables.len()
         );
-        
+
+        // Initialize catalog and populate with existing tables
+        let catalog = Arc::new(llkv_table::catalog::TableCatalog::new());
+        for (_table_id, table_meta) in &loaded_tables {
+            if let Some(ref table_name) = table_meta.name
+                && let Err(e) = catalog.register_table(table_name)
+            {
+                tracing::warn!(
+                    "[CONTEXT] Failed to register table '{}' in catalog: {}",
+                    table_name,
+                    e
+                );
+            }
+        }
+        tracing::debug!(
+            "[CONTEXT] Catalog initialized with {} table(s)",
+            catalog.table_count()
+        );
+
         Self {
             pager,
             tables: RwLock::new(FxHashMap::default()), // Start with empty table cache
             dropped_tables: RwLock::new(FxHashSet::default()),
+            catalog,
             transaction_manager,
             txn_manager,
         }
@@ -1021,7 +1063,11 @@ where
         catalog.put_next_txn_id(next_txn_id)?;
         let last_committed = self.txn_manager.last_committed();
         catalog.put_last_committed_txn_id(last_committed)?;
-        tracing::debug!("[CONTEXT] Persisted next_txn_id={}, last_committed={}", next_txn_id, last_committed);
+        tracing::debug!(
+            "[CONTEXT] Persisted next_txn_id={}, last_committed={}",
+            next_txn_id,
+            last_committed
+        );
         Ok(())
     }
 
@@ -1035,19 +1081,19 @@ where
 
     /// Create a new session for transaction management.
     /// Each session can have its own independent transaction.
-    pub fn create_session(self: &Arc<Self>) -> Session<P> {
-        tracing::debug!("[SESSION] Context::create_session called");
-        let wrapper = ContextWrapper::new(Arc::clone(self));
+    pub fn create_session(self: &Arc<Self>) -> RuntimeSession<P> {
+        tracing::debug!("[SESSION] RuntimeContext::create_session called");
+        let wrapper = RuntimeContextWrapper::new(Arc::clone(self));
         let inner = self.transaction_manager.create_session(Arc::new(wrapper));
         tracing::debug!(
             "[SESSION] Created TransactionSession with session_id (will be logged by transaction manager)"
         );
-        Session { inner }
+        RuntimeSession { inner }
     }
 
     /// Get a handle to an existing table by name.
-    pub fn table(self: &Arc<Self>, name: &str) -> Result<TableHandle<P>> {
-        TableHandle::new(Arc::clone(self), name)
+    pub fn table(self: &Arc<Self>, name: &str) -> Result<RuntimeTableHandle<P>> {
+        RuntimeTableHandle::new(Arc::clone(self), name)
     }
 
     /// Check if there's an active transaction (legacy - checks if ANY session has a transaction).
@@ -1056,7 +1102,11 @@ where
         self.transaction_manager.has_active_transaction()
     }
 
-    pub fn create_table<C, I>(self: &Arc<Self>, name: &str, columns: I) -> Result<TableHandle<P>>
+    pub fn create_table<C, I>(
+        self: &Arc<Self>,
+        name: &str,
+        columns: I,
+    ) -> Result<RuntimeTableHandle<P>>
     where
         C: IntoColumnSpec,
         I: IntoIterator<Item = C>,
@@ -1068,7 +1118,7 @@ where
         self: &Arc<Self>,
         name: &str,
         columns: I,
-    ) -> Result<TableHandle<P>>
+    ) -> Result<RuntimeTableHandle<P>>
     where
         C: IntoColumnSpec,
         I: IntoIterator<Item = C>,
@@ -1076,7 +1126,7 @@ where
         self.create_table_with_options(name, columns, true)
     }
 
-    pub fn create_table_plan(&self, plan: CreateTablePlan) -> Result<StatementResult<P>> {
+    pub fn create_table_plan(&self, plan: CreateTablePlan) -> Result<RuntimeStatementResult<P>> {
         if plan.columns.is_empty() && plan.source.is_none() {
             return Err(Error::InvalidArgumentError(
                 "CREATE TABLE requires explicit columns or a source".into(),
@@ -1115,7 +1165,7 @@ where
                     "DEBUG create_table_plan: table '{}' exists and if_not_exists=true, returning early WITHOUT creating",
                     display_name
                 );
-                return Ok(StatementResult::CreateTable {
+                return Ok(RuntimeStatementResult::CreateTable {
                     table_name: display_name,
                 });
             } else {
@@ -1137,7 +1187,7 @@ where
                 plan.if_not_exists,
             ),
             Some(CreateTableSource::Select { .. }) => Err(Error::Internal(
-                "CreateTableSource::Select should be materialized before reaching Context::create_table_plan"
+                "CreateTableSource::Select should be materialized before reaching RuntimeContext::create_table_plan"
                     .into(),
             )),
             None => self.create_table_from_columns(
@@ -1150,8 +1200,8 @@ where
     }
 
     pub fn table_names(self: &Arc<Self>) -> Vec<String> {
-        let tables = self.tables.read().unwrap();
-        tables.keys().cloned().collect()
+        // Use catalog for table names (single source of truth)
+        self.catalog.table_names()
     }
 
     fn filter_visible_row_ids(
@@ -1169,8 +1219,8 @@ where
         )
     }
 
-    pub fn create_table_builder(&self, name: &str) -> CreateTableBuilder<'_, P> {
-        CreateTableBuilder {
+    pub fn create_table_builder(&self, name: &str) -> RuntimeCreateTableBuilder<'_, P> {
+        RuntimeCreateTableBuilder {
             ctx: self,
             plan: CreateTablePlan::new(name),
         }
@@ -1196,7 +1246,7 @@ where
 
     /// Copy table metadata from this context to a staging context.
     /// This creates new Table instances that use the staging context's pager.
-    fn copy_tables_to_staging<Q>(&self, staging: &Context<Q>) -> Result<()>
+    fn copy_tables_to_staging<Q>(&self, staging: &RuntimeContext<Q>) -> Result<()>
     where
         Q: Pager<Blob = EntryHandle> + Send + Sync + 'static,
     {
@@ -1311,11 +1361,11 @@ where
     }
 
     pub fn export_table_rows(self: &Arc<Self>, name: &str) -> Result<RowBatch> {
-        let handle = TableHandle::new(Arc::clone(self), name)?;
+        let handle = RuntimeTableHandle::new(Arc::clone(self), name)?;
         handle.lazy()?.collect_rows()
     }
 
-    fn execute_create_table(&self, plan: CreateTablePlan) -> Result<StatementResult<P>> {
+    fn execute_create_table(&self, plan: CreateTablePlan) -> Result<RuntimeStatementResult<P>> {
         self.create_table_plan(plan)
     }
 
@@ -1324,7 +1374,7 @@ where
         name: &str,
         columns: I,
         if_not_exists: bool,
-    ) -> Result<TableHandle<P>>
+    ) -> Result<RuntimeTableHandle<P>>
     where
         C: IntoColumnSpec,
         I: IntoIterator<Item = C>,
@@ -1337,14 +1387,16 @@ where
             .collect();
         let result = self.create_table_plan(plan)?;
         match result {
-            StatementResult::CreateTable { .. } => TableHandle::new(Arc::clone(self), name),
+            RuntimeStatementResult::CreateTable { .. } => {
+                RuntimeTableHandle::new(Arc::clone(self), name)
+            }
             other => Err(Error::InvalidArgumentError(format!(
                 "unexpected statement result {other:?} when creating table"
             ))),
         }
     }
 
-    pub fn insert(&self, plan: InsertPlan) -> Result<StatementResult<P>> {
+    pub fn insert(&self, plan: InsertPlan) -> Result<RuntimeStatementResult<P>> {
         // For non-transactional inserts, use TXN_ID_AUTO_COMMIT directly
         // instead of creating a temporary transaction
         let snapshot = TransactionSnapshot {
@@ -1358,7 +1410,7 @@ where
         &self,
         plan: InsertPlan,
         snapshot: TransactionSnapshot,
-    ) -> Result<StatementResult<P>> {
+    ) -> Result<RuntimeStatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
 
@@ -1398,7 +1450,7 @@ where
                 snapshot,
             ),
             InsertSource::Select { .. } => Err(Error::Internal(
-                "InsertSource::Select should be materialized before reaching Context::insert"
+                "InsertSource::Select should be materialized before reaching RuntimeContext::insert"
                     .into(),
             )),
         };
@@ -1519,7 +1571,7 @@ where
         Ok(total_rows)
     }
 
-    pub fn update(&self, plan: UpdatePlan) -> Result<StatementResult<P>> {
+    pub fn update(&self, plan: UpdatePlan) -> Result<RuntimeStatementResult<P>> {
         let snapshot = self.txn_manager.begin_transaction();
         let result = self.update_with_snapshot(plan, snapshot)?;
         self.txn_manager.mark_committed(snapshot.txn_id);
@@ -1530,7 +1582,7 @@ where
         &self,
         plan: UpdatePlan,
         snapshot: TransactionSnapshot,
-    ) -> Result<StatementResult<P>> {
+    ) -> Result<RuntimeStatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
         match plan.filter {
@@ -1545,7 +1597,7 @@ where
         }
     }
 
-    pub fn delete(&self, plan: DeletePlan) -> Result<StatementResult<P>> {
+    pub fn delete(&self, plan: DeletePlan) -> Result<RuntimeStatementResult<P>> {
         let snapshot = self.txn_manager.begin_transaction();
         let result = self.delete_with_snapshot(plan, snapshot)?;
         self.txn_manager.mark_committed(snapshot.txn_id);
@@ -1556,7 +1608,7 @@ where
         &self,
         plan: DeletePlan,
         snapshot: TransactionSnapshot,
-    ) -> Result<StatementResult<P>> {
+    ) -> Result<RuntimeStatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
         match plan.filter {
@@ -1571,8 +1623,8 @@ where
         }
     }
 
-    pub fn table_handle(self: &Arc<Self>, name: &str) -> Result<TableHandle<P>> {
-        TableHandle::new(Arc::clone(self), name)
+    pub fn table_handle(self: &Arc<Self>, name: &str) -> Result<RuntimeTableHandle<P>> {
+        RuntimeTableHandle::new(Arc::clone(self), name)
     }
 
     pub fn execute_select(self: &Arc<Self>, plan: SelectPlan) -> Result<SelectExecution<P>> {
@@ -1620,7 +1672,7 @@ where
         canonical_name: String,
         columns: Vec<ColumnSpec>,
         if_not_exists: bool,
-    ) -> Result<StatementResult<P>> {
+    ) -> Result<RuntimeStatementResult<P>> {
         tracing::trace!(
             "\n=== CREATE_TABLE_FROM_COLUMNS: table='{}' columns={} ===",
             display_name,
@@ -1700,7 +1752,7 @@ where
         }
 
         let schema = Arc::new(ExecutorSchema {
-            columns: column_defs,
+            columns: column_defs.clone(), // Clone for catalog registration below
             lookup,
         });
         let table_entry = Arc::new(ExecutorTable {
@@ -1713,7 +1765,7 @@ where
         let mut tables = self.tables.write().unwrap();
         if tables.contains_key(&canonical_name) {
             if if_not_exists {
-                return Ok(StatementResult::CreateTable {
+                return Ok(RuntimeStatementResult::CreateTable {
                     table_name: display_name,
                 });
             }
@@ -1722,8 +1774,37 @@ where
                 display_name
             )));
         }
-        tables.insert(canonical_name, table_entry);
-        Ok(StatementResult::CreateTable {
+        tables.insert(canonical_name.clone(), table_entry);
+        drop(tables); // Release write lock before catalog operations
+
+        // Register table in catalog
+        let registered_table_id = self.catalog.register_table(&display_name)?;
+        tracing::debug!(
+            "[CATALOG] Registered table '{}' with catalog_id={}",
+            display_name,
+            registered_table_id
+        );
+
+        // Register fields in catalog
+        if let Some(field_resolver) = self.catalog.field_resolver(registered_table_id) {
+            for column in &column_defs {
+                if let Err(e) = field_resolver.register_field(&column.name) {
+                    tracing::warn!(
+                        "[CATALOG] Failed to register field '{}' in table '{}': {}",
+                        column.name,
+                        display_name,
+                        e
+                    );
+                }
+            }
+            tracing::debug!(
+                "[CATALOG] Registered {} field(s) for table '{}'",
+                column_defs.len(),
+                display_name
+            );
+        }
+
+        Ok(RuntimeStatementResult::CreateTable {
             table_name: display_name,
         })
     }
@@ -1735,14 +1816,15 @@ where
         schema: Arc<Schema>,
         batches: Vec<RecordBatch>,
         if_not_exists: bool,
-    ) -> Result<StatementResult<P>> {
+    ) -> Result<RuntimeStatementResult<P>> {
         if schema.fields().is_empty() {
             return Err(Error::InvalidArgumentError(
                 "CREATE TABLE AS SELECT requires at least one column".into(),
             ));
         }
         let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(schema.fields().len());
-        let mut lookup = FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
+        let mut lookup =
+            FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
         for (idx, field) in schema.fields().iter().enumerate() {
             let data_type = match field.data_type() {
                 DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Date32 => {
@@ -1819,7 +1901,7 @@ where
             total_rows += row_count as u64;
 
             // Build MVCC columns using helper
-            let (row_id_array, created_by_array, deleted_by_array) = 
+            let (row_id_array, created_by_array, deleted_by_array) =
                 mvcc_columns::build_insert_mvcc_columns(row_count, start_row, creator_txn_id);
 
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_defs.len() + 3);
@@ -1855,7 +1937,7 @@ where
         let mut tables = self.tables.write().unwrap();
         if tables.contains_key(&canonical_name) {
             if if_not_exists {
-                return Ok(StatementResult::CreateTable {
+                return Ok(RuntimeStatementResult::CreateTable {
                     table_name: display_name,
                 });
             }
@@ -1878,7 +1960,36 @@ where
             );
         }
         tables.insert(canonical_name.clone(), table_entry);
-        Ok(StatementResult::CreateTable {
+        drop(tables); // Release write lock before catalog operations
+
+        // Register table in catalog
+        let registered_table_id = self.catalog.register_table(&display_name)?;
+        tracing::debug!(
+            "[CATALOG] Registered table '{}' (CTAS) with catalog_id={}",
+            display_name,
+            registered_table_id
+        );
+
+        // Register fields in catalog
+        if let Some(field_resolver) = self.catalog.field_resolver(registered_table_id) {
+            for column in &column_defs {
+                if let Err(e) = field_resolver.register_field(&column.name) {
+                    tracing::warn!(
+                        "[CATALOG] Failed to register field '{}' in table '{}': {}",
+                        column.name,
+                        display_name,
+                        e
+                    );
+                }
+            }
+            tracing::debug!(
+                "[CATALOG] Registered {} field(s) for table '{}' (CTAS)",
+                column_defs.len(),
+                display_name
+            );
+        }
+
+        Ok(RuntimeStatementResult::CreateTable {
             table_name: display_name,
         })
     }
@@ -2020,7 +2131,7 @@ where
         rows: Vec<Vec<PlanValue>>,
         columns: Vec<String>,
         snapshot: TransactionSnapshot,
-    ) -> Result<StatementResult<P>> {
+    ) -> Result<RuntimeStatementResult<P>> {
         if rows.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "INSERT requires at least one row".into(),
@@ -2075,9 +2186,9 @@ where
         }
 
         let start_row = table.next_row_id.load(Ordering::SeqCst);
-        
+
         // Build MVCC columns using helper
-        let (row_id_array, created_by_array, deleted_by_array) = 
+        let (row_id_array, created_by_array, deleted_by_array) =
             mvcc_columns::build_insert_mvcc_columns(row_count, start_row, snapshot.txn_id);
 
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_values.len() + 3);
@@ -2109,7 +2220,7 @@ where
             .total_rows
             .fetch_add(row_count as u64, Ordering::SeqCst);
 
-        Ok(StatementResult::Insert {
+        Ok(RuntimeStatementResult::Insert {
             table_name: display_name,
             rows_inserted: row_count,
         })
@@ -2122,9 +2233,9 @@ where
         batches: Vec<RecordBatch>,
         columns: Vec<String>,
         snapshot: TransactionSnapshot,
-    ) -> Result<StatementResult<P>> {
+    ) -> Result<RuntimeStatementResult<P>> {
         if batches.is_empty() {
-            return Ok(StatementResult::Insert {
+            return Ok(RuntimeStatementResult::Insert {
                 table_name: display_name,
                 rows_inserted: 0,
             });
@@ -2160,14 +2271,14 @@ where
             }
 
             match self.insert_rows(table, display_name.clone(), rows, columns.clone(), snapshot)? {
-                StatementResult::Insert { rows_inserted, .. } => {
+                RuntimeStatementResult::Insert { rows_inserted, .. } => {
                     total_rows_inserted += rows_inserted;
                 }
                 _ => unreachable!("insert_rows must return Insert result"),
             }
         }
 
-        Ok(StatementResult::Insert {
+        Ok(RuntimeStatementResult::Insert {
             table_name: display_name,
             rows_inserted: total_rows_inserted,
         })
@@ -2180,7 +2291,7 @@ where
         assignments: Vec<ColumnAssignment>,
         filter: LlkvExpr<'static, String>,
         snapshot: TransactionSnapshot,
-    ) -> Result<StatementResult<P>> {
+    ) -> Result<RuntimeStatementResult<P>> {
         if assignments.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "UPDATE requires at least one assignment".into(),
@@ -2196,7 +2307,8 @@ where
             Expression { expr_index: usize },
         }
 
-        let mut seen_columns: FxHashSet<String> = FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
+        let mut seen_columns: FxHashSet<String> =
+            FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
         let mut prepared: Vec<(ExecutorColumn, PreparedValue)> =
             Vec::with_capacity(assignments.len());
         let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
@@ -2233,7 +2345,7 @@ where
             self.collect_update_rows(table, &filter_expr, &scalar_exprs, snapshot)?;
 
         if row_ids.is_empty() {
-            return Ok(StatementResult::Update {
+            return Ok(RuntimeStatementResult::Update {
                 table_name: display_name,
                 rows_updated: 0,
             });
@@ -2270,7 +2382,7 @@ where
                 .columns
                 .iter()
                 .enumerate()
-                .map(|(idx, column)| (column.field_id, idx))
+                .map(|(idx, column)| (column.field_id, idx)),
         );
 
         for (column, value) in prepared {
@@ -2331,7 +2443,7 @@ where
             snapshot,
         )?;
 
-        Ok(StatementResult::Update {
+        Ok(RuntimeStatementResult::Update {
             table_name: display_name,
             rows_updated: row_count,
         })
@@ -2343,7 +2455,7 @@ where
         display_name: String,
         assignments: Vec<ColumnAssignment>,
         snapshot: TransactionSnapshot,
-    ) -> Result<StatementResult<P>> {
+    ) -> Result<RuntimeStatementResult<P>> {
         if assignments.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "UPDATE requires at least one assignment".into(),
@@ -2355,7 +2467,7 @@ where
             Error::InvalidArgumentError("table row count exceeds supported range".into())
         })?;
         if total_rows_usize == 0 {
-            return Ok(StatementResult::Update {
+            return Ok(RuntimeStatementResult::Update {
                 table_name: display_name,
                 rows_updated: 0,
             });
@@ -2369,7 +2481,8 @@ where
             Expression { expr_index: usize },
         }
 
-        let mut seen_columns: FxHashSet<String> = FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
+        let mut seen_columns: FxHashSet<String> =
+            FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
         let mut prepared: Vec<(ExecutorColumn, PreparedValue)> =
             Vec::with_capacity(assignments.len());
         let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
@@ -2415,7 +2528,7 @@ where
             self.collect_update_rows(table, &filter_expr, &scalar_exprs, snapshot)?;
 
         if row_ids.is_empty() {
-            return Ok(StatementResult::Update {
+            return Ok(RuntimeStatementResult::Update {
                 table_name: display_name,
                 rows_updated: 0,
             });
@@ -2452,7 +2565,7 @@ where
                 .columns
                 .iter()
                 .enumerate()
-                .map(|(idx, column)| (column.field_id, idx))
+                .map(|(idx, column)| (column.field_id, idx)),
         );
 
         for (column, value) in prepared {
@@ -2513,7 +2626,7 @@ where
             snapshot,
         )?;
 
-        Ok(StatementResult::Update {
+        Ok(RuntimeStatementResult::Update {
             table_name: display_name,
             rows_updated: row_count,
         })
@@ -2526,7 +2639,7 @@ where
         filter: LlkvExpr<'static, String>,
         snapshot: TransactionSnapshot,
         txn_id: TxnId,
-    ) -> Result<StatementResult<P>> {
+    ) -> Result<RuntimeStatementResult<P>> {
         let schema = table.schema.as_ref();
         let filter_expr = translate_predicate(filter, schema)?;
         let row_ids = table.table.filter_row_ids(&filter_expr)?;
@@ -2545,10 +2658,10 @@ where
         display_name: String,
         snapshot: TransactionSnapshot,
         txn_id: TxnId,
-    ) -> Result<StatementResult<P>> {
+    ) -> Result<RuntimeStatementResult<P>> {
         let total_rows = table.total_rows.load(Ordering::SeqCst);
         if total_rows == 0 {
-            return Ok(StatementResult::Delete {
+            return Ok(RuntimeStatementResult::Delete {
                 table_name: display_name,
                 rows_deleted: 0,
             });
@@ -2569,9 +2682,9 @@ where
         display_name: String,
         row_ids: Vec<u64>,
         txn_id: TxnId,
-    ) -> Result<StatementResult<P>> {
+    ) -> Result<RuntimeStatementResult<P>> {
         if row_ids.is_empty() {
-            return Ok(StatementResult::Delete {
+            return Ok(RuntimeStatementResult::Delete {
                 table_name: display_name,
                 rows_deleted: 0,
             });
@@ -2587,7 +2700,7 @@ where
             .map_err(|_| Error::InvalidArgumentError("row count exceeds supported range".into()))?;
         table.total_rows.fetch_sub(removed_u64, Ordering::SeqCst);
 
-        Ok(StatementResult::Delete {
+        Ok(RuntimeStatementResult::Delete {
             table_name: display_name,
             rows_deleted: removed,
         })
@@ -2684,13 +2797,21 @@ where
                 return Ok(Arc::clone(table));
             }
         } // Release read lock
-        
+
         // Slow path: load table from catalog (happens once per table)
-        tracing::debug!("[LAZY_LOAD] Loading table '{}' from catalog", canonical_name);
-        
+        tracing::debug!(
+            "[LAZY_LOAD] Loading table '{}' from catalog",
+            canonical_name
+        );
+
+        // Check catalog first for table existence
+        let _catalog_table_id = self.catalog.table_id(canonical_name).ok_or_else(|| {
+            Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
+        })?;
+
         let store = ColumnStore::open(Arc::clone(&self.pager))?;
         let catalog = SysCatalog::new(&store);
-        
+
         // Find the table metadata in the catalog
         let all_metas = catalog.all_table_metas()?;
         let (table_id, _meta) = all_metas
@@ -2704,15 +2825,16 @@ where
             .ok_or_else(|| {
                 Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
             })?;
-        
+
         // Open the table and build ExecutorTable
         let table = Table::new(*table_id, Arc::clone(&self.pager))?;
         let schema = table.schema()?;
-        
+
         // Build ExecutorSchema from Arrow schema (skip row_id field at index 0)
         let mut executor_columns = Vec::new();
-        let mut lookup = FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
-        
+        let mut lookup =
+            FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
+
         for (idx, field) in schema.fields().iter().enumerate().skip(1) {
             // Get field_id from metadata
             let field_id = field
@@ -2720,11 +2842,11 @@ where
                 .get(llkv_table::constants::FIELD_ID_META_KEY)
                 .and_then(|s| s.parse::<FieldId>().ok())
                 .unwrap_or(idx as FieldId);
-            
+
             let normalized = field.name().to_ascii_lowercase();
             let col_idx = executor_columns.len();
             lookup.insert(normalized, col_idx);
-            
+
             executor_columns.push(ExecutorColumn {
                 name: field.name().to_string(),
                 data_type: field.data_type().clone(),
@@ -2733,26 +2855,25 @@ where
                 field_id,
             });
         }
-        
+
         let exec_schema = Arc::new(ExecutorSchema {
             columns: executor_columns,
             lookup,
         });
-        
+
         // Find the maximum row_id in the table to set next_row_id correctly
         let max_row_id = {
-            use llkv_column_map::store::scan::{
-                PrimitiveVisitor, PrimitiveWithRowIdsVisitor,
-                PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor,
-                ScanBuilder, ScanOptions
-            };
-            use llkv_column_map::store::rowid_fid;
             use arrow::array::UInt64Array;
-            
+            use llkv_column_map::store::rowid_fid;
+            use llkv_column_map::store::scan::{
+                PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
+                PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
+            };
+
             struct MaxRowIdVisitor {
                 max: RowId,
             }
-            
+
             impl PrimitiveVisitor for MaxRowIdVisitor {
                 fn u64_chunk(&mut self, values: &UInt64Array) {
                     for i in 0..values.len() {
@@ -2763,15 +2884,15 @@ where
                     }
                 }
             }
-            
+
             impl PrimitiveWithRowIdsVisitor for MaxRowIdVisitor {}
             impl PrimitiveSortedVisitor for MaxRowIdVisitor {}
             impl PrimitiveSortedWithRowIdsVisitor for MaxRowIdVisitor {}
-            
+
             // Scan the row_id column for any user field in this table
             let row_id_field = rowid_fid(LogicalFieldId::for_user(*table_id, 1));
             let mut visitor = MaxRowIdVisitor { max: 0 };
-            
+
             match ScanBuilder::new(table.store(), row_id_field)
                 .options(ScanOptions::default())
                 .run(&mut visitor)
@@ -2779,36 +2900,52 @@ where
                 Ok(_) => visitor.max,
                 Err(llkv_result::Error::NotFound) => 0,
                 Err(e) => {
-                    tracing::warn!("[LAZY_LOAD] Failed to scan max row_id for table '{}': {}", canonical_name, e);
+                    tracing::warn!(
+                        "[LAZY_LOAD] Failed to scan max row_id for table '{}': {}",
+                        canonical_name,
+                        e
+                    );
                     0
                 }
             }
         };
-        
+
         let next_row_id = if max_row_id > 0 {
             max_row_id.saturating_add(1)
         } else {
             0
         };
-        
+
         // Get the actual persisted row count from table metadata
         // This is an O(1) catalog lookup that reads ColumnDescriptor.total_row_count
         // Fallback to 0 for truly empty tables
         let total_rows = table.total_rows().unwrap_or(0);
-        
+
         let executor_table = Arc::new(ExecutorTable {
             table: Arc::new(table),
             schema: exec_schema,
             next_row_id: AtomicU64::new(next_row_id),
             total_rows: AtomicU64::new(total_rows),
         });
-        
+
         // Cache the loaded table
         {
             let mut tables = self.tables.write().unwrap();
             tables.insert(canonical_name.to_string(), Arc::clone(&executor_table));
         }
-        
+
+        // Register fields in catalog (may already be registered from RuntimeContext::new())
+        if let Some(field_resolver) = self.catalog.field_resolver(_catalog_table_id) {
+            for col in &executor_table.schema.columns {
+                let _ = field_resolver.register_field(&col.name); // Ignore "already exists" errors
+            }
+            tracing::debug!(
+                "[CATALOG] Registered {} field(s) for lazy-loaded table '{}'",
+                executor_table.schema.columns.len(),
+                canonical_name
+            );
+        }
+
         tracing::debug!(
             "[LAZY_LOAD] Loaded table '{}' (id={}) with {} columns, next_row_id={}",
             canonical_name,
@@ -2816,7 +2953,7 @@ where
             schema.fields().len() - 1,
             next_row_id
         );
-        
+
         Ok(executor_table)
     }
 
@@ -2844,6 +2981,14 @@ where
             }
         }
         drop(tables);
+
+        // Unregister from catalog
+        self.catalog.unregister_table(&canonical_name);
+        tracing::debug!(
+            "[CATALOG] Unregistered table '{}' from catalog",
+            canonical_name
+        );
+
         self.dropped_tables.write().unwrap().insert(canonical_name);
         Ok(())
     }
@@ -2878,21 +3023,21 @@ where
         let mut following = next
             .checked_add(1)
             .ok_or_else(|| Error::InvalidArgumentError("exhausted available table ids".into()))?;
-        
+
         // Skip any reserved table IDs for the next allocation
         while llkv_table::reserved::is_reserved_table_id(following) {
             following = following.checked_add(1).ok_or_else(|| {
                 Error::InvalidArgumentError("exhausted available table ids".into())
             })?;
         }
-        
+
         catalog.put_next_table_id(following)?;
         Ok(next)
     }
 }
 
 // Implement TransactionContext for ContextWrapper to enable llkv-transaction integration
-impl<P> TransactionContext for ContextWrapper<P>
+impl<P> TransactionContext for RuntimeContextWrapper<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
@@ -2907,14 +3052,14 @@ where
     }
 
     fn table_column_specs(&self, table_name: &str) -> llkv_result::Result<Vec<ColumnSpec>> {
-        Context::table_column_specs(self.context(), table_name)
+        RuntimeContext::table_column_specs(self.context(), table_name)
     }
 
     fn export_table_rows(
         &self,
         table_name: &str,
     ) -> llkv_result::Result<llkv_transaction::RowBatch> {
-        let batch = Context::export_table_rows(self.context(), table_name)?;
+        let batch = RuntimeContext::export_table_rows(self.context(), table_name)?;
         // Convert from llkv_executor::RowBatch to llkv_transaction::RowBatch
         Ok(llkv_transaction::RowBatch {
             columns: batch.columns,
@@ -2927,7 +3072,7 @@ where
         table_name: &str,
         filter: Option<LlkvExpr<'static, String>>,
     ) -> llkv_result::Result<Vec<RecordBatch>> {
-        Context::get_batches_with_row_ids_with_snapshot(
+        RuntimeContext::get_batches_with_row_ids_with_snapshot(
             self.context(),
             table_name,
             filter,
@@ -2939,14 +3084,14 @@ where
         &self,
         plan: SelectPlan,
     ) -> llkv_result::Result<SelectExecution<Self::Pager>> {
-        Context::execute_select_with_snapshot(self.context(), plan, self.snapshot())
+        RuntimeContext::execute_select_with_snapshot(self.context(), plan, self.snapshot())
     }
 
     fn create_table_plan(
         &self,
         plan: CreateTablePlan,
     ) -> llkv_result::Result<TransactionResult<P>> {
-        let result = Context::create_table_plan(self.context(), plan)?;
+        let result = RuntimeContext::create_table_plan(self.context(), plan)?;
         Ok(convert_statement_result(result))
     }
 
@@ -2960,7 +3105,7 @@ where
         let result = if snapshot.txn_id == TXN_ID_AUTO_COMMIT {
             self.ctx().insert(plan)?
         } else {
-            Context::insert_with_snapshot(self.context(), plan, snapshot)?
+            RuntimeContext::insert_with_snapshot(self.context(), plan, snapshot)?
         };
         Ok(convert_statement_result(result))
     }
@@ -2970,7 +3115,7 @@ where
         let result = if snapshot.txn_id == TXN_ID_AUTO_COMMIT {
             self.ctx().update(plan)?
         } else {
-            Context::update_with_snapshot(self.context(), plan, snapshot)?
+            RuntimeContext::update_with_snapshot(self.context(), plan, snapshot)?
         };
         Ok(convert_statement_result(result))
     }
@@ -2980,7 +3125,7 @@ where
         let result = if snapshot.txn_id == TXN_ID_AUTO_COMMIT {
             self.ctx().delete(plan)?
         } else {
-            Context::delete_with_snapshot(self.context(), plan, snapshot)?
+            RuntimeContext::delete_with_snapshot(self.context(), plan, snapshot)?
         };
         Ok(convert_statement_result(result))
     }
@@ -2990,11 +3135,11 @@ where
         table_name: &str,
         batches: Vec<RecordBatch>,
     ) -> llkv_result::Result<usize> {
-        Context::append_batches_with_row_ids(self.context(), table_name, batches)
+        RuntimeContext::append_batches_with_row_ids(self.context(), table_name, batches)
     }
 
     fn table_names(&self) -> Vec<String> {
-        Context::table_names(self.context())
+        RuntimeContext::table_names(self.context())
     }
 
     fn table_id(&self, table_name: &str) -> llkv_result::Result<llkv_table::types::TableId> {
@@ -3011,23 +3156,28 @@ where
         let table = ctx.lookup_table(table_name)?;
         Ok(table.table.table_id())
     }
+
+    fn catalog_snapshot(&self) -> llkv_table::catalog::TableCatalogSnapshot {
+        let ctx = self.context();
+        ctx.catalog.snapshot()
+    }
 }
 
 // Helper to convert StatementResult between types (legacy)
-fn convert_statement_result<P>(result: StatementResult<P>) -> TransactionResult<P>
+fn convert_statement_result<P>(result: RuntimeStatementResult<P>) -> TransactionResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     use llkv_transaction::TransactionResult as TxResult;
     match result {
-        StatementResult::CreateTable { table_name } => TxResult::CreateTable { table_name },
-        StatementResult::Insert { rows_inserted, .. } => TxResult::Insert { rows_inserted },
-        StatementResult::Update { rows_updated, .. } => TxResult::Update {
+        RuntimeStatementResult::CreateTable { table_name } => TxResult::CreateTable { table_name },
+        RuntimeStatementResult::Insert { rows_inserted, .. } => TxResult::Insert { rows_inserted },
+        RuntimeStatementResult::Update { rows_updated, .. } => TxResult::Update {
             rows_matched: rows_updated,
             rows_updated,
         },
-        StatementResult::Delete { rows_deleted, .. } => TxResult::Delete { rows_deleted },
-        StatementResult::Transaction { kind } => TxResult::Transaction { kind },
+        RuntimeStatementResult::Delete { rows_deleted, .. } => TxResult::Delete { rows_deleted },
+        RuntimeStatementResult::Transaction { kind } => TxResult::Transaction { kind },
         _ => panic!("unsupported StatementResult conversion"),
     }
 }
@@ -3196,7 +3346,7 @@ struct ContextProvider<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    context: Arc<Context<P>>,
+    context: Arc<RuntimeContext<P>>,
 }
 
 impl<P> TableProvider<P> for ContextProvider<P>
@@ -3209,19 +3359,19 @@ where
 }
 
 /// Lazily built logical plan (thin wrapper over SelectPlan).
-pub struct LazyFrame<P>
+pub struct RuntimeLazyFrame<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    context: Arc<Context<P>>,
+    context: Arc<RuntimeContext<P>>,
     plan: SelectPlan,
 }
 
-impl<P> LazyFrame<P>
+impl<P> RuntimeLazyFrame<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    pub fn scan(context: Arc<Context<P>>, table: &str) -> Result<Self> {
+    pub fn scan(context: Arc<RuntimeContext<P>>, table: &str) -> Result<Self> {
         let (display, canonical) = canonical_table_name(table)?;
         context.lookup_table(&canonical)?;
         Ok(Self {
@@ -3620,11 +3770,11 @@ fn group_by_is_empty(expr: &GroupByExpr) -> bool {
 }
 
 #[derive(Clone)]
-pub struct RangeSelectRows {
+pub struct RuntimeRangeSelectRows {
     rows: Vec<Vec<PlanValue>>,
 }
 
-impl RangeSelectRows {
+impl RuntimeRangeSelectRows {
     pub fn into_rows(self) -> Vec<Vec<PlanValue>> {
         self.rows
     }
@@ -3637,7 +3787,7 @@ enum RangeProjection {
 }
 
 #[derive(Clone)]
-pub struct RangeSpec {
+pub struct RuntimeRangeSpec {
     start: i64,
     #[allow(dead_code)] // Used for validation, computed into row_count
     end: i64,
@@ -3646,7 +3796,7 @@ pub struct RangeSpec {
     table_alias_lower: Option<String>,
 }
 
-impl RangeSpec {
+impl RuntimeRangeSpec {
     fn matches_identifier(&self, ident: &str) -> bool {
         let lower = ident.to_ascii_lowercase();
         lower == self.column_name_lower || lower == "range"
@@ -3671,7 +3821,7 @@ impl RangeSpec {
     }
 }
 
-pub fn extract_rows_from_range(select: &Select) -> Result<Option<RangeSelectRows>> {
+pub fn extract_rows_from_range(select: &Select) -> Result<Option<RuntimeRangeSelectRows>> {
     let spec = match parse_range_spec(select)? {
         Some(spec) => spec,
         None => return Ok(None),
@@ -3743,10 +3893,10 @@ pub fn extract_rows_from_range(select: &Select) -> Result<Option<RangeSelectRows
         rows.push(row);
     }
 
-    Ok(Some(RangeSelectRows { rows }))
+    Ok(Some(RuntimeRangeSelectRows { rows }))
 }
 
-fn build_range_projection_expr(expr: &SqlExpr, spec: &RangeSpec) -> Result<RangeProjection> {
+fn build_range_projection_expr(expr: &SqlExpr, spec: &RuntimeRangeSpec) -> Result<RangeProjection> {
     match expr {
         SqlExpr::Identifier(ident) => {
             if spec.matches_identifier(&ident.value) {
@@ -3775,7 +3925,7 @@ fn build_range_projection_expr(expr: &SqlExpr, spec: &RangeSpec) -> Result<Range
     }
 }
 
-fn parse_range_spec(select: &Select) -> Result<Option<RangeSpec>> {
+fn parse_range_spec(select: &Select) -> Result<Option<RuntimeRangeSpec>> {
     if select.from.len() != 1 {
         return Ok(None);
     }
@@ -3827,7 +3977,7 @@ fn parse_range_spec_from_args(
     name: &ObjectName,
     args: &[FunctionArg],
     alias: &Option<TableAlias>,
-) -> Result<Option<RangeSpec>> {
+) -> Result<Option<RuntimeRangeSpec>> {
     if name.0.len() != 1 {
         return Ok(None);
     }
@@ -3903,7 +4053,7 @@ fn parse_range_spec_from_args(
         .unwrap_or_else(|| "range".to_string());
     let table_alias_lower = alias.as_ref().map(|a| a.name.value.to_ascii_lowercase());
 
-    Ok(Some(RangeSpec {
+    Ok(Some(RuntimeRangeSpec {
         start,
         end,
         row_count,
@@ -3912,15 +4062,15 @@ fn parse_range_spec_from_args(
     }))
 }
 
-pub struct CreateTableBuilder<'ctx, P>
+pub struct RuntimeCreateTableBuilder<'ctx, P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    ctx: &'ctx Context<P>,
+    ctx: &'ctx RuntimeContext<P>,
     plan: CreateTablePlan,
 }
 
-impl<'ctx, P> CreateTableBuilder<'ctx, P>
+impl<'ctx, P> RuntimeCreateTableBuilder<'ctx, P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -3953,17 +4103,17 @@ where
         self
     }
 
-    pub fn finish(self) -> Result<StatementResult<P>> {
+    pub fn finish(self) -> Result<RuntimeStatementResult<P>> {
         self.ctx.execute_create_table(self.plan)
     }
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct Row {
+pub struct RuntimeRow {
     values: Vec<(String, PlanValue)>,
 }
 
-impl Row {
+impl RuntimeRow {
     pub fn new() -> Self {
         Self { values: Vec::new() }
     }
@@ -4007,12 +4157,12 @@ impl Row {
     }
 }
 
-pub fn row() -> Row {
-    Row::new()
+pub fn row() -> RuntimeRow {
+    RuntimeRow::new()
 }
 
 #[doc(hidden)]
-pub enum InsertRowKind {
+pub enum RuntimeInsertRowKind {
     Named {
         columns: Vec<String>,
         values: Vec<PlanValue>,
@@ -4021,11 +4171,11 @@ pub enum InsertRowKind {
 }
 
 pub trait IntoInsertRow {
-    fn into_insert_row(self) -> Result<InsertRowKind>;
+    fn into_insert_row(self) -> Result<RuntimeInsertRowKind>;
 }
 
-impl IntoInsertRow for Row {
-    fn into_insert_row(self) -> Result<InsertRowKind> {
+impl IntoInsertRow for RuntimeRow {
+    fn into_insert_row(self) -> Result<RuntimeInsertRowKind> {
         let row = self;
         if row.values.is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -4034,7 +4184,7 @@ impl IntoInsertRow for Row {
         }
         let columns = row.columns();
         let values = row.values_for_columns(&columns)?;
-        Ok(InsertRowKind::Named { columns, values })
+        Ok(RuntimeInsertRowKind::Named { columns, values })
     }
 }
 
@@ -4046,13 +4196,13 @@ impl<T> IntoInsertRow for Vec<T>
 where
     T: Into<PlanValue>,
 {
-    fn into_insert_row(self) -> Result<InsertRowKind> {
+    fn into_insert_row(self) -> Result<RuntimeInsertRowKind> {
         if self.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "insert requires at least one column".into(),
             ));
         }
-        Ok(InsertRowKind::Positional(
+        Ok(RuntimeInsertRowKind::Positional(
             self.into_iter().map(Into::into).collect(),
         ))
     }
@@ -4062,13 +4212,13 @@ impl<T, const N: usize> IntoInsertRow for [T; N]
 where
     T: Into<PlanValue>,
 {
-    fn into_insert_row(self) -> Result<InsertRowKind> {
+    fn into_insert_row(self) -> Result<RuntimeInsertRowKind> {
         if N == 0 {
             return Err(Error::InvalidArgumentError(
                 "insert requires at least one column".into(),
             ));
         }
-        Ok(InsertRowKind::Positional(
+        Ok(RuntimeInsertRowKind::Positional(
             self.into_iter().map(Into::into).collect(),
         ))
     }
@@ -4080,9 +4230,9 @@ macro_rules! impl_into_insert_row_tuple {
         where
             $($type: Into<PlanValue>,)+
         {
-            fn into_insert_row(self) -> Result<InsertRowKind> {
+            fn into_insert_row(self) -> Result<RuntimeInsertRowKind> {
                 let ($($value,)+) = self;
-                Ok(InsertRowKind::Positional(vec![$($value.into(),)+]))
+                Ok(RuntimeInsertRowKind::Positional(vec![$($value.into(),)+]))
             }
         }
     };
@@ -4114,20 +4264,20 @@ impl_into_insert_row_tuple!(
     T8 => v8
 );
 
-pub struct TableHandle<P>
+pub struct RuntimeTableHandle<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    context: Arc<Context<P>>,
+    context: Arc<RuntimeContext<P>>,
     display_name: String,
     _canonical_name: String,
 }
 
-impl<P> TableHandle<P>
+impl<P> RuntimeTableHandle<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    pub fn new(context: Arc<Context<P>>, name: &str) -> Result<Self> {
+    pub fn new(context: Arc<RuntimeContext<P>>, name: &str) -> Result<Self> {
         let (display_name, canonical_name) = canonical_table_name(name)?;
         context.lookup_table(&canonical_name)?;
         Ok(Self {
@@ -4137,11 +4287,14 @@ where
         })
     }
 
-    pub fn lazy(&self) -> Result<LazyFrame<P>> {
-        LazyFrame::scan(Arc::clone(&self.context), &self.display_name)
+    pub fn lazy(&self) -> Result<RuntimeLazyFrame<P>> {
+        RuntimeLazyFrame::scan(Arc::clone(&self.context), &self.display_name)
     }
 
-    pub fn insert_rows<R>(&self, rows: impl IntoIterator<Item = R>) -> Result<StatementResult<P>>
+    pub fn insert_rows<R>(
+        &self,
+        rows: impl IntoIterator<Item = R>,
+    ) -> Result<RuntimeStatementResult<P>>
     where
         R: IntoInsertRow,
     {
@@ -4162,7 +4315,7 @@ where
         for row in rows.into_iter() {
             row_count += 1;
             match row.into_insert_row()? {
-                InsertRowKind::Named { columns, values } => {
+                RuntimeInsertRowKind::Named { columns, values } => {
                     if let Some(existing) = &mode {
                         if !matches!(existing, InsertMode::Named) {
                             return Err(Error::InvalidArgumentError(
@@ -4171,7 +4324,8 @@ where
                         }
                     } else {
                         mode = Some(InsertMode::Named);
-                        let mut seen = FxHashSet::with_capacity_and_hasher(columns.len(), Default::default());
+                        let mut seen =
+                            FxHashSet::with_capacity_and_hasher(columns.len(), Default::default());
                         for column in &columns {
                             if !seen.insert(column.clone()) {
                                 return Err(Error::InvalidArgumentError(format!(
@@ -4200,7 +4354,7 @@ where
                     }
                     normalized_rows.push(values);
                 }
-                InsertRowKind::Positional(values) => {
+                RuntimeInsertRowKind::Positional(values) => {
                     if let Some(existing) = &mode {
                         if !matches!(existing, InsertMode::Positional) {
                             return Err(Error::InvalidArgumentError(
@@ -4237,7 +4391,7 @@ where
         })
     }
 
-    pub fn insert_row_batch(&self, batch: RowBatch) -> Result<StatementResult<P>> {
+    pub fn insert_row_batch(&self, batch: RowBatch) -> Result<RuntimeStatementResult<P>> {
         if batch.rows.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "insert requires at least one row".into(),
@@ -4264,7 +4418,7 @@ where
         self.context.insert(plan)
     }
 
-    pub fn insert_batches(&self, batches: Vec<RecordBatch>) -> Result<StatementResult<P>> {
+    pub fn insert_batches(&self, batches: Vec<RecordBatch>) -> Result<RuntimeStatementResult<P>> {
         let plan = InsertPlan {
             table: self.display_name.clone(),
             columns: Vec::new(),
@@ -4273,7 +4427,7 @@ where
         self.context.insert(plan)
     }
 
-    pub fn insert_lazy(&self, frame: LazyFrame<P>) -> Result<StatementResult<P>> {
+    pub fn insert_lazy(&self, frame: RuntimeLazyFrame<P>) -> Result<RuntimeStatementResult<P>> {
         let RowBatch { columns, rows } = frame.collect_rows()?;
         self.insert_row_batch(RowBatch { columns, rows })
     }
@@ -4293,7 +4447,7 @@ mod tests {
     #[test]
     fn create_insert_select_roundtrip() {
         let pager = Arc::new(MemPager::default());
-        let context = Arc::new(Context::new(pager));
+        let context = Arc::new(RuntimeContext::new(pager));
 
         let table = context
             .create_table(
@@ -4323,7 +4477,7 @@ mod tests {
     #[test]
     fn aggregate_count_nulls() {
         let pager = Arc::new(MemPager::default());
-        let context = Arc::new(Context::new(pager));
+        let context = Arc::new(RuntimeContext::new(pager));
 
         let table = context
             .create_table("ints", [("i", DataType::Int64)])
