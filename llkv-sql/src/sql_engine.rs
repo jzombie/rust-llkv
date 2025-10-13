@@ -19,10 +19,10 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
     ColumnOptionDef, DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName,
-    ObjectNamePart, ObjectType, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, Set, SetExpr, Statement, TableFactor, TableObject,
-    TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator, UpdateTableFromKind,
-    Value, ValueWithSpan,
+    ObjectNamePart, ObjectType, OrderBy, OrderByExpr, OrderByKind, Query, SchemaName, Select,
+    SelectItem, SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableFactor,
+    TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
+    UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -209,6 +209,24 @@ where
             Statement::CreateTable(stmt) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateTable");
                 self.handle_create_table(stmt)
+            }
+            Statement::CreateSchema {
+                schema_name,
+                if_not_exists,
+                with,
+                options,
+                default_collate_spec,
+                clone,
+            } => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateSchema");
+                self.handle_create_schema(
+                    schema_name,
+                    if_not_exists,
+                    with,
+                    options,
+                    default_collate_spec,
+                    clone,
+                )
             }
             Statement::Insert(stmt) => {
                 let table_name =
@@ -459,6 +477,56 @@ where
             source: None,
         };
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
+    }
+
+    fn handle_create_schema(
+        &self,
+        schema_name: SchemaName,
+        _if_not_exists: bool,
+        with: Option<Vec<SqlOption>>,
+        options: Option<Vec<SqlOption>>,
+        default_collate_spec: Option<SqlExpr>,
+        clone: Option<ObjectName>,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        if clone.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE SCHEMA ... CLONE is not supported".into(),
+            ));
+        }
+        if with.as_ref().map_or(false, |opts| !opts.is_empty()) {
+            return Err(Error::InvalidArgumentError(
+                "CREATE SCHEMA ... WITH options are not supported".into(),
+            ));
+        }
+        if options.as_ref().map_or(false, |opts| !opts.is_empty()) {
+            return Err(Error::InvalidArgumentError(
+                "CREATE SCHEMA options are not supported".into(),
+            ));
+        }
+        if default_collate_spec.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE SCHEMA DEFAULT COLLATE is not supported".into(),
+            ));
+        }
+
+        let schema_name = match schema_name {
+            SchemaName::Simple(name) => name,
+            _ => {
+                return Err(Error::InvalidArgumentError(
+                    "CREATE SCHEMA authorization is not supported".into(),
+                ));
+            }
+        };
+
+        let (display_name, _canonical) = canonical_object_name(&schema_name)?;
+        if display_name.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "schema name must not be empty".into(),
+            ));
+        }
+
+        // No schema catalog yet: accept the statement so clients can proceed.
+        Ok(RuntimeStatementResult::NoOp)
     }
 
     fn try_handle_range_ctas(
@@ -1038,6 +1106,21 @@ where
             return Err(Error::InvalidArgumentError(
                 "advanced SELECT clauses are not supported".into(),
             ));
+        }
+
+        let table_alias =
+            select
+                .from
+                .get(0)
+                .and_then(|table_with_joins| match &table_with_joins.relation {
+                    TableFactor::Table { alias, .. } => {
+                        alias.as_ref().map(|a| a.name.value.clone())
+                    }
+                    _ => None,
+                });
+
+        if let Some(alias) = table_alias.as_ref() {
+            validate_projection_alias_qualifiers(&select.projection, alias)?;
         }
 
         let (display_name, _canonical_name) = extract_single_table(&select.from)?;
@@ -1663,6 +1746,33 @@ fn resolve_column_name(expr: &SqlExpr) -> SqlResult<String> {
             "aggregate arguments must be plain column identifiers".into(),
         )),
     }
+}
+
+fn validate_projection_alias_qualifiers(
+    projection_items: &[SelectItem],
+    alias: &str,
+) -> SqlResult<()> {
+    let alias_lower = alias.to_ascii_lowercase();
+    for item in projection_items {
+        match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                if let SqlExpr::CompoundIdentifier(parts) = expr {
+                    if parts.len() >= 2 {
+                        if let Some(first) = parts.first() {
+                            if !first.value.eq_ignore_ascii_case(&alias_lower) {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "Binder Error: table '{}' not found",
+                                    first.value
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Try to parse a function as an aggregate call for use in scalar expressions
