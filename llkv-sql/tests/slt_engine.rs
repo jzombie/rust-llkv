@@ -9,6 +9,64 @@ use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 
+/// Format a struct value in DuckDB-compatible format: {'field1': value1, 'field2': value2}
+fn format_struct_value(struct_array: &arrow::array::StructArray, row_idx: usize) -> String {
+    let mut parts = Vec::new();
+    let field_names = struct_array.column_names();
+    for (field_idx, column) in struct_array.columns().iter().enumerate() {
+        let field_name = field_names[field_idx];
+        let value_str = match column.data_type() {
+            arrow::datatypes::DataType::Int64 => {
+                let a = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap();
+                if a.is_null(row_idx) {
+                    "NULL".to_string()
+                } else {
+                    a.value(row_idx).to_string()
+                }
+            }
+            arrow::datatypes::DataType::Int32 => {
+                let a = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .unwrap();
+                if a.is_null(row_idx) {
+                    "NULL".to_string()
+                } else {
+                    a.value(row_idx).to_string()
+                }
+            }
+            arrow::datatypes::DataType::Utf8 => {
+                let a = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                if a.is_null(row_idx) {
+                    "NULL".to_string()
+                } else {
+                    format!("'{}'", a.value(row_idx))
+                }
+            }
+            arrow::datatypes::DataType::Float64 => {
+                let a = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::Float64Array>()
+                    .unwrap();
+                if a.is_null(row_idx) {
+                    "NULL".to_string()
+                } else {
+                    a.value(row_idx).to_string()
+                }
+            }
+            _ => "NULL".to_string(),
+        };
+        parts.push(format!("'{}': {}", field_name, value_str));
+    }
+    format!("{{{}}}", parts.join(", "))
+}
+
 pub struct EngineHarness {
     engine: SqlEngine<MemPager>,
 }
@@ -114,6 +172,17 @@ impl AsyncDB for EngineHarness {
                                                 "NULL".to_string()
                                             } else {
                                                 a.value(row_idx).to_string()
+                                            }
+                                        }
+                                        arrow::datatypes::DataType::Struct(_) => {
+                                            let a = array
+                                                .as_any()
+                                                .downcast_ref::<arrow::array::StructArray>()
+                                                .unwrap();
+                                            if a.is_null(row_idx) {
+                                                "NULL".to_string()
+                                            } else {
+                                                format_struct_value(a, row_idx)
                                             }
                                         }
                                         _ => "".to_string(),

@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayData, ArrayRef, FixedSizeListArray, Float32Array, make_array};
 use arrow::buffer::Buffer;
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{DataType, Field, Schema};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -112,11 +112,26 @@ const MAGIC: [u8; 4] = *b"ARR0";
 ///   - Notes:
 ///     - `type_code` is a `PrimType` and must be `Binary` for now.
 ///     - Nulls are not supported yet (null_count must be 0).
+///
+/// - **Struct** (`Layout::Struct`)
+///
+///   - Header:
+///     - len = number of struct values
+///     - extra_a = unused (0)
+///     - extra_b = payload_len (u32) in bytes
+///
+///   - Payload:
+///     - [IPC-serialized struct array bytes]
+///
+///   - Notes:
+///     - Uses Arrow IPC format for struct serialization
+///     - Nulls are not supported yet (null_count must be 0).
 #[repr(u8)]
 enum Layout {
     Primitive = 0,
     FslFloat32 = 1,
     Varlen = 2,
+    Struct = 3,
 }
 
 /// Stable on-disk primitive type codes. Do not reorder. Only append new
@@ -220,6 +235,9 @@ pub fn serialize_array(arr: &dyn Array) -> Result<Vec<u8>> {
             }
             serialize_fsl_float32(arr, list_size)
         }
+
+        // Struct types use IPC serialization
+        DataType::Struct(_) => serialize_struct(arr),
 
         // All remaining supported fixed-width primitives route here.
         dt => {
@@ -337,6 +355,55 @@ fn serialize_fsl_float32(arr: &dyn Array, list_size: i32) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn serialize_struct(arr: &dyn Array) -> Result<Vec<u8>> {
+    if arr.null_count() != 0 {
+        return Err(Error::Internal(
+            "nulls not supported in zero-copy format (yet)".into(),
+        ));
+    }
+
+    // Use Arrow IPC format to serialize the struct array
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+    
+    // Create a RecordBatch with a single column containing the struct array
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "struct_col",
+        arr.data_type().clone(),
+        false,
+    )]));
+    let array_ref = make_array(arr.to_data());
+    let batch = RecordBatch::try_new(schema, vec![array_ref])
+        .map_err(|e| Error::Internal(format!("failed to create record batch: {}", e)))?;
+    
+    // Serialize to IPC format
+    let mut ipc_bytes = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut ipc_bytes, &batch.schema())
+            .map_err(|e| Error::Internal(format!("failed to create IPC writer: {}", e)))?;
+        writer
+            .write(&batch)
+            .map_err(|e| Error::Internal(format!("failed to write IPC: {}", e)))?;
+        writer
+            .finish()
+            .map_err(|e| Error::Internal(format!("failed to finish IPC: {}", e)))?;
+    }
+    
+    let payload_len = u32::try_from(ipc_bytes.len())
+        .map_err(|_| Error::Internal("IPC payload too large".into()))?;
+    
+    let mut out = Vec::with_capacity(24 + ipc_bytes.len());
+    out.extend_from_slice(&MAGIC);
+    out.push(Layout::Struct as u8);
+    out.push(0); // no PrimType for struct
+    out.extend_from_slice(&[0u8; 2]); // padding
+    write_u64_le(&mut out, arr.len() as u64);
+    write_u32_le(&mut out, 0); // extra_a unused
+    write_u32_le(&mut out, payload_len);
+    out.extend_from_slice(&ipc_bytes);
+    Ok(out)
+}
+
 /// Deserialize zero-copy from a pager blob.
 pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
     let raw = blob.as_ref();
@@ -417,6 +484,32 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
                 .add_buffer(values)
                 .build()?;
             Ok(make_array(data))
+        }
+
+        x if x == Layout::Struct as u8 => {
+            let payload_len = extra_b as usize;
+            if payload.len() != payload_len {
+                return Err(Error::Internal("struct payload length mismatch".into()));
+            }
+
+            // Deserialize from IPC format
+            use arrow::ipc::reader::StreamReader;
+            use std::io::Cursor;
+            
+            let cursor = Cursor::new(payload.as_slice());
+            let mut reader = StreamReader::try_new(cursor, None)
+                .map_err(|e| Error::Internal(format!("failed to create IPC reader: {}", e)))?;
+            
+            let batch = reader
+                .next()
+                .ok_or_else(|| Error::Internal("no batch in IPC stream".into()))?
+                .map_err(|e| Error::Internal(format!("failed to read IPC batch: {}", e)))?;
+            
+            if batch.num_columns() != 1 {
+                return Err(Error::Internal("expected single column in struct batch".into()));
+            }
+            
+            Ok(batch.column(0).clone())
         }
 
         _ => Err(Error::Internal("unknown layout".into())),

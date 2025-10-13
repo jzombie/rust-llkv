@@ -2,6 +2,7 @@ use crate::SqlResult;
 use llkv_plan::plans::PlanValue;
 use llkv_result::Error;
 use sqlparser::ast::{Expr as SqlExpr, UnaryOperator, Value, ValueWithSpan};
+use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub(crate) enum SqlValue {
@@ -9,6 +10,7 @@ pub(crate) enum SqlValue {
     Integer(i64),
     Float(f64),
     String(String),
+    Struct(HashMap<String, SqlValue>),
 }
 
 impl SqlValue {
@@ -21,9 +23,11 @@ impl SqlValue {
             } => match SqlValue::try_from_expr(expr)? {
                 SqlValue::Integer(v) => Ok(SqlValue::Integer(-v)),
                 SqlValue::Float(v) => Ok(SqlValue::Float(-v)),
-                SqlValue::Null | SqlValue::String(_) => Err(Error::InvalidArgumentError(
-                    "cannot negate non-numeric literal".into(),
-                )),
+                SqlValue::Null | SqlValue::String(_) | SqlValue::Struct(_) => {
+                    Err(Error::InvalidArgumentError(
+                        "cannot negate non-numeric literal".into(),
+                    ))
+                }
             },
             SqlExpr::UnaryOp {
                 op: UnaryOperator::Plus,
@@ -31,15 +35,32 @@ impl SqlValue {
             } => SqlValue::try_from_expr(expr),
             SqlExpr::Cast { expr, .. } => match SqlValue::try_from_expr(expr)? {
                 SqlValue::Null => Ok(SqlValue::Null),
+                SqlValue::Struct(_) => Err(Error::InvalidArgumentError(
+                    "cannot CAST struct literals".into(),
+                )),
                 other => Err(Error::InvalidArgumentError(format!(
                     "unsupported literal CAST expression: {other:?}"
                 ))),
             },
             SqlExpr::Nested(inner) => SqlValue::try_from_expr(inner),
+            SqlExpr::Dictionary(fields) => SqlValue::from_dictionary(fields),
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported literal expression: {other:?}"
             ))),
         }
+    }
+
+    fn from_dictionary(fields: &[sqlparser::ast::DictionaryField]) -> SqlResult<Self> {
+        let mut map = HashMap::new();
+        for field in fields {
+            let key = field.key.value.clone();
+            let value = match field.value.as_ref() {
+                SqlExpr::Value(v) => SqlValue::from_value(v)?,
+                other => SqlValue::try_from_expr(other)?,
+            };
+            map.insert(key, value);
+        }
+        Ok(SqlValue::Struct(map))
     }
 
     fn from_value(value: &ValueWithSpan) -> SqlResult<Self> {
@@ -83,6 +104,13 @@ impl From<SqlValue> for PlanValue {
             SqlValue::Integer(v) => PlanValue::Integer(v),
             SqlValue::Float(v) => PlanValue::Float(v),
             SqlValue::String(s) => PlanValue::String(s),
+            SqlValue::Struct(fields) => {
+                let converted: HashMap<String, PlanValue> = fields
+                    .into_iter()
+                    .map(|(k, v)| (k, PlanValue::from(v)))
+                    .collect();
+                PlanValue::Struct(converted)
+            }
         }
     }
 }

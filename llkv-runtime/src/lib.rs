@@ -41,7 +41,7 @@ use arrow::array::{
     Array, ArrayRef, Date32Builder, Float64Builder, Int64Builder, StringBuilder, UInt64Array,
     UInt64Builder,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{
@@ -1104,6 +1104,11 @@ where
             txn_id: TXN_ID_AUTO_COMMIT,
             snapshot_id: self.txn_manager.last_committed(),
         }
+    }
+
+    /// Get the table catalog for schema and table name management.
+    pub fn table_catalog(&self) -> Arc<llkv_table::catalog::TableCatalog> {
+        Arc::clone(&self.catalog)
     }
 
     /// Create a new session for transaction management.
@@ -3498,9 +3503,9 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(*v),
                     PlanValue::Float(v) => builder.append_value(*v as i64),
-                    PlanValue::String(_) => {
+                    PlanValue::String(_) | PlanValue::Struct(_) => {
                         return Err(Error::InvalidArgumentError(
-                            "cannot insert string into INT column".into(),
+                            "cannot insert non-integer into INT column".into(),
                         ));
                     }
                 }
@@ -3514,9 +3519,9 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(*v as f64),
                     PlanValue::Float(v) => builder.append_value(*v),
-                    PlanValue::String(_) => {
+                    PlanValue::String(_) | PlanValue::Struct(_) => {
                         return Err(Error::InvalidArgumentError(
-                            "cannot insert string into DOUBLE column".into(),
+                            "cannot insert non-numeric into DOUBLE column".into(),
                         ));
                     }
                 }
@@ -3531,6 +3536,11 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Integer(v) => builder.append_value(v.to_string()),
                     PlanValue::Float(v) => builder.append_value(v.to_string()),
                     PlanValue::String(s) => builder.append_value(s),
+                    PlanValue::Struct(_) => {
+                        return Err(Error::InvalidArgumentError(
+                            "cannot insert struct into STRING column".into(),
+                        ));
+                    }
                 }
             }
             Ok(Arc::new(builder.finish()))
@@ -3548,9 +3558,9 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                         })?;
                         builder.append_value(casted);
                     }
-                    PlanValue::Float(_) => {
+                    PlanValue::Float(_) | PlanValue::Struct(_) => {
                         return Err(Error::InvalidArgumentError(
-                            "cannot insert float into DATE column".into(),
+                            "cannot insert non-date value into DATE column".into(),
                         ));
                     }
                     PlanValue::String(text) => {
@@ -3560,6 +3570,37 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                 }
             }
             Ok(Arc::new(builder.finish()))
+        }
+        DataType::Struct(fields) => {
+            use arrow::array::StructArray;
+            let mut field_arrays: Vec<(FieldRef, ArrayRef)> = Vec::with_capacity(fields.len());
+            
+            for field in fields.iter() {
+                let field_name = field.name();
+                let field_type = field.data_type();
+                let mut field_values = Vec::with_capacity(values.len());
+                
+                for value in values {
+                    match value {
+                        PlanValue::Null => field_values.push(PlanValue::Null),
+                        PlanValue::Struct(map) => {
+                            let field_value = map.get(field_name).cloned().unwrap_or(PlanValue::Null);
+                            field_values.push(field_value);
+                        }
+                        _ => {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "expected struct value for struct column, got {:?}",
+                                value
+                            )));
+                        }
+                    }
+                }
+                
+                let field_array = build_array_for_column(field_type, &field_values)?;
+                field_arrays.push((Arc::clone(field), field_array));
+            }
+            
+            Ok(Arc::new(StructArray::from(field_arrays)))
         }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported Arrow data type for INSERT: {other:?}"
@@ -3742,15 +3783,26 @@ fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
         } => match plan_value_from_sql_expr(expr)? {
             PlanValue::Integer(v) => Ok(PlanValue::Integer(-v)),
             PlanValue::Float(v) => Ok(PlanValue::Float(-v)),
-            PlanValue::Null | PlanValue::String(_) => Err(Error::InvalidArgumentError(
-                "cannot negate non-numeric literal".into(),
-            )),
+            PlanValue::Null | PlanValue::String(_) | PlanValue::Struct(_) => {
+                Err(Error::InvalidArgumentError(
+                    "cannot negate non-numeric literal".into(),
+                ))
+            }
         },
         SqlExpr::UnaryOp {
             op: UnaryOperator::Plus,
             expr,
         } => plan_value_from_sql_expr(expr),
         SqlExpr::Nested(inner) => plan_value_from_sql_expr(inner),
+        SqlExpr::Dictionary(fields) => {
+            let mut map = std::collections::HashMap::new();
+            for field in fields {
+                let key = field.key.value.clone();
+                let value = plan_value_from_sql_expr(&field.value)?;
+                map.insert(key, value);
+            }
+            Ok(PlanValue::Struct(map))
+        }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported literal expression: {other:?}"
         ))),

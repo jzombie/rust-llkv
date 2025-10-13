@@ -1,0 +1,27 @@
+# Basic schema functionality test
+
+statement ok
+CREATE SCHEMA test
+
+statement ok
+CREATE TABLE test.tbl(col INTEGER);
+
+statement ok
+INSERT INTO test.tbl VALUES (1), (2), (3);
+
+query I
+SELECT col FROM test.tbl;
+----
+1
+2
+3
+
+query I
+SELECT test.tbl.col FROM test.tbl;
+----
+1
+2
+3
+
+statement ok
+DROP SCHEMA test CASCADE;

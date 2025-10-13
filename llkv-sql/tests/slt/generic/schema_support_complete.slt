@@ -1,0 +1,75 @@
+# Schema support verification test
+# Tests the schema functionality that is fully implemented
+
+statement ok
+CREATE SCHEMA test;
+
+statement ok
+CREATE TABLE test.users(id INTEGER, name TEXT);
+
+statement ok
+INSERT INTO test.users VALUES (1, 'Alice'), (2, 'Bob');
+
+query IT
+SELECT id, name FROM test.users;
+----
+1	Alice
+2	Bob
+
+statement ok
+CREATE SCHEMA production;
+
+statement ok
+CREATE TABLE production.orders(order_id INTEGER, amount DOUBLE);
+
+statement ok
+INSERT INTO production.orders VALUES (100, 99.99), (101, 149.50);
+
+query IF
+SELECT order_id, amount FROM production.orders;
+----
+100	99.99
+101	149.5
+
+# Verify schemas are isolated
+statement ok
+CREATE TABLE test.orders(id INTEGER);
+
+statement ok
+INSERT INTO test.orders VALUES (1);
+
+query I
+SELECT id FROM test.orders;
+----
+1
+
+query IF
+SELECT order_id, amount FROM production.orders;
+----
+100	99.99
+101	149.5
+
+# Drop schema cascade
+statement ok
+DROP SCHEMA test CASCADE;
+
+# Verify test.users and test.orders are gone
+statement error
+SELECT * FROM test.users;
+----
+<REGEX>:.*does not exist.*
+
+statement error
+SELECT * FROM test.orders;
+----
+<REGEX>:.*does not exist.*
+
+# production.orders should still exist
+query IF
+SELECT order_id, amount FROM production.orders;
+----
+100	99.99
+101	149.5
+
+statement ok
+DROP SCHEMA production CASCADE;

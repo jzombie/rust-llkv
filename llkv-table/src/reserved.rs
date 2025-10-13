@@ -164,6 +164,10 @@ pub const CATALOG_FIELD_LAST_COMMITTED_TXN_ID: u32 = 102;
 /// Stores all table and field name→ID mappings for persistence.
 pub const CATALOG_FIELD_CATALOG_STATE: u32 = 103;
 
+/// Catalog field for schema metadata (Binary-encoded SchemaMeta).
+/// Stores schema names and metadata for SQL schema support.
+pub const CATALOG_FIELD_SCHEMA_META_ID: u32 = 104;
+
 /// Check if a field ID is used by the catalog's internal structure.
 #[inline]
 pub fn is_catalog_internal_field(id: u32) -> bool {
@@ -175,6 +179,7 @@ pub fn is_catalog_internal_field(id: u32) -> bool {
             | CATALOG_FIELD_NEXT_TXN_ID
             | CATALOG_FIELD_LAST_COMMITTED_TXN_ID
             | CATALOG_FIELD_CATALOG_STATE
+            | CATALOG_FIELD_SCHEMA_META_ID
     )
 }
 
@@ -292,6 +297,7 @@ mod tests {
             CATALOG_FIELD_LAST_COMMITTED_TXN_ID
         ));
         assert!(is_catalog_internal_field(CATALOG_FIELD_CATALOG_STATE));
+        assert!(is_catalog_internal_field(CATALOG_FIELD_SCHEMA_META_ID));
         assert!(!is_catalog_internal_field(2));
         assert!(!is_catalog_internal_field(200));
     }

@@ -67,11 +67,14 @@ pub struct TableCatalog {
 #[derive(Debug)]
 struct TableCatalogInner {
     /// Canonical table name (lowercase) -> TableId
+    /// Table names may be schema-qualified (e.g., "test.tbl")
     table_name_to_id: FxHashMap<String, TableId>,
     /// TableId -> TableMetadata
     table_id_to_meta: FxHashMap<TableId, TableMetadata>,
     /// Next table ID to assign (monotonically increasing)
     next_table_id: TableId,
+    /// Set of registered schema names (canonical lowercase)
+    schemas: rustc_hash::FxHashSet<String>,
 }
 
 /// Metadata for a registered table
@@ -96,6 +99,7 @@ impl TableCatalog {
                 table_name_to_id: FxHashMap::default(),
                 table_id_to_meta: FxHashMap::default(),
                 next_table_id: 1, // Start at 1, reserve 0 for system
+                schemas: rustc_hash::FxHashSet::default(),
             })),
         }
     }
@@ -333,6 +337,83 @@ impl TableCatalog {
         }
     }
 
+    /// Register a new schema in the catalog.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The schema name (case will be preserved in lookups but stored canonically)
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the schema was registered successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::CatalogError` if a schema with this name already exists (case-insensitive).
+    pub fn register_schema(&self, name: impl Into<String>) -> Result<()> {
+        let name = name.into();
+        let canonical = name.to_ascii_lowercase();
+
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| Error::Internal("Failed to acquire catalog write lock".to_string()))?;
+
+        if inner.schemas.contains(&canonical) {
+            return Err(Error::CatalogError(format!(
+                "Schema '{}' already exists",
+                name
+            )));
+        }
+
+        inner.schemas.insert(canonical);
+        Ok(())
+    }
+
+    /// Check if a schema exists (case-insensitive).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Schema name to check
+    ///
+    /// # Returns
+    ///
+    /// `true` if schema exists, `false` otherwise.
+    pub fn schema_exists(&self, name: &str) -> bool {
+        let canonical = name.to_ascii_lowercase();
+        match self.inner.read() {
+            Ok(inner) => inner.schemas.contains(&canonical),
+            Err(_) => false,
+        }
+    }
+
+    /// List all registered schema names.
+    ///
+    /// Returns all schema names in canonical (lowercase) form.
+    pub fn schema_names(&self) -> Vec<String> {
+        match self.inner.read() {
+            Ok(inner) => inner.schemas.iter().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Drop (unregister) a schema from the catalog.
+    ///
+    /// This does NOT cascade to tables - caller must handle that separately.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the schema was found and removed, `false` if it didn't exist.
+    pub fn unregister_schema(&self, name: &str) -> bool {
+        let canonical = name.to_ascii_lowercase();
+        let mut inner = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(_) => return false,
+        };
+
+        inner.schemas.remove(&canonical)
+    }
+
     /// Export catalog state for persistence.
     ///
     /// Returns a serializable representation of the entire catalog state,
@@ -356,6 +437,7 @@ impl TableCatalog {
                 return TableCatalogState {
                     tables: Vec::new(),
                     next_table_id: 1,
+                    schemas: Vec::new(),
                 };
             }
         };
@@ -373,9 +455,12 @@ impl TableCatalog {
             });
         }
 
+        let schemas: Vec<String> = inner.schemas.iter().cloned().collect();
+
         TableCatalogState {
             tables,
             next_table_id: inner.next_table_id,
+            schemas,
         }
     }
 
@@ -437,6 +522,7 @@ impl TableCatalog {
                 table_name_to_id,
                 table_id_to_meta,
                 next_table_id: state.next_table_id,
+                schemas: state.schemas.into_iter().collect(),
             })),
         })
     }
@@ -757,6 +843,8 @@ pub struct TableCatalogState {
     pub tables: Vec<TableState>,
     /// Next table ID to assign
     pub next_table_id: TableId,
+    /// All registered schema names (canonical lowercase)
+    pub schemas: Vec<String>,
 }
 
 /// Serializable table state.
@@ -1112,6 +1200,7 @@ mod tests {
                 },
             ],
             next_table_id: 3,
+            schemas: Vec::new(),
         };
 
         assert!(TableCatalog::from_state(state).is_err());
@@ -1137,6 +1226,7 @@ mod tests {
                 },
             ],
             next_table_id: 3,
+            schemas: Vec::new(),
         };
 
         assert!(TableCatalog::from_state(state).is_err());

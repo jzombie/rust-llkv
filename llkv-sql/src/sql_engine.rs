@@ -378,7 +378,26 @@ where
     ) -> SqlResult<RuntimeStatementResult<P>> {
         validate_create_table_common(&stmt)?;
 
-        let (display_name, canonical_name) = canonical_object_name(&stmt.name)?;
+        let (schema_name, table_name) = parse_schema_qualified_name(&stmt.name)?;
+        
+        // Validate schema exists if specified
+        if let Some(ref schema) = schema_name {
+            let catalog = self.engine.context().table_catalog();
+            if !catalog.schema_exists(schema) {
+                return Err(Error::CatalogError(format!(
+                    "Schema '{}' does not exist",
+                    schema
+                )));
+            }
+        }
+
+        // Use full qualified name (schema.table or just table)
+        let display_name = match &schema_name {
+            Some(schema) => format!("{}.{}", schema, table_name),
+            None => table_name.clone(),
+        };
+        let canonical_name = display_name.to_ascii_lowercase();
+
         tracing::trace!(
             "\n=== HANDLE_CREATE_TABLE: table='{}' columns={} ===",
             display_name,
@@ -518,14 +537,24 @@ where
             }
         };
 
-        let (display_name, _canonical) = canonical_object_name(&schema_name)?;
+        let (display_name, canonical) = canonical_object_name(&schema_name)?;
         if display_name.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "schema name must not be empty".into(),
             ));
         }
 
-        // No schema catalog yet: accept the statement so clients can proceed.
+        // Register schema in the catalog
+        let catalog = self.engine.context().table_catalog();
+        
+        if _if_not_exists && catalog.schema_exists(&canonical) {
+            return Ok(RuntimeStatementResult::NoOp);
+        }
+
+        catalog.register_schema(&canonical).map_err(|err| {
+            Error::CatalogError(format!("Failed to create schema '{}': {}", display_name, err))
+        })?;
+
         Ok(RuntimeStatementResult::NoOp)
     }
 
@@ -999,26 +1028,96 @@ where
         purge: bool,
         temporary: bool,
     ) -> SqlResult<RuntimeStatementResult<P>> {
-        if cascade || restrict || purge || temporary {
+        if purge || temporary {
             return Err(Error::InvalidArgumentError(
-                "DROP TABLE cascade/restrict/purge/temporary options are not supported".into(),
+                "DROP purge/temporary options are not supported".into(),
             ));
         }
 
-        if object_type != ObjectType::Table {
-            return Err(Error::InvalidArgumentError(
-                "only DROP TABLE is supported".into(),
-            ));
-        }
+        match object_type {
+            ObjectType::Table => {
+                if cascade || restrict {
+                    return Err(Error::InvalidArgumentError(
+                        "DROP TABLE CASCADE/RESTRICT is not supported".into(),
+                    ));
+                }
 
-        let ctx = self.engine.context();
-        for name in names {
-            let table_name = Self::object_name_to_string(&name)?;
-            ctx.drop_table_immediate(&table_name, if_exists)
-                .map_err(|err| Self::map_table_error(&table_name, err))?;
-        }
+                let ctx = self.engine.context();
+                for name in names {
+                    let table_name = Self::object_name_to_string(&name)?;
+                    ctx.drop_table_immediate(&table_name, if_exists)
+                        .map_err(|err| Self::map_table_error(&table_name, err))?;
+                }
 
-        Ok(RuntimeStatementResult::NoOp)
+                Ok(RuntimeStatementResult::NoOp)
+            }
+            ObjectType::Schema => {
+                if restrict {
+                    return Err(Error::InvalidArgumentError(
+                        "DROP SCHEMA RESTRICT is not supported".into(),
+                    ));
+                }
+
+                let catalog = self.engine.context().table_catalog();
+
+                for name in names {
+                    let (display_name, canonical_name) = canonical_object_name(&name)?;
+
+                    if !catalog.schema_exists(&canonical_name) {
+                        if if_exists {
+                            continue;
+                        }
+                        return Err(Error::CatalogError(format!(
+                            "Schema '{}' does not exist",
+                            display_name
+                        )));
+                    }
+
+                    if cascade {
+                        // Drop all tables in this schema
+                        let all_tables = catalog.table_names();
+                        let schema_prefix = format!("{}.", canonical_name);
+                        
+                        let ctx = self.engine.context();
+                        for table in all_tables {
+                            if table.to_ascii_lowercase().starts_with(&schema_prefix) {
+                                ctx.drop_table_immediate(&table, false)?;
+                            }
+                        }
+                    } else {
+                        // Check if schema has any tables
+                        let all_tables = catalog.table_names();
+                        let schema_prefix = format!("{}.", canonical_name);
+                        let has_tables = all_tables.iter().any(|t| {
+                            t.to_ascii_lowercase().starts_with(&schema_prefix)
+                        });
+
+                        if has_tables {
+                            return Err(Error::CatalogError(format!(
+                                "Schema '{}' is not empty. Use CASCADE to drop schema and all its tables",
+                                display_name
+                            )));
+                        }
+                    }
+
+                    // Drop the schema
+                    if !catalog.unregister_schema(&canonical_name) {
+                        if !if_exists {
+                            return Err(Error::CatalogError(format!(
+                                "Schema '{}' does not exist",
+                                display_name
+                            )));
+                        }
+                    }
+                }
+
+                Ok(RuntimeStatementResult::NoOp)
+            }
+            _ => Err(Error::InvalidArgumentError(format!(
+                "DROP {} is not supported",
+                object_type
+            ))),
+        }
     }
 
     fn handle_query(&self, query: Query) -> SqlResult<RuntimeStatementResult<P>> {
@@ -1645,6 +1744,44 @@ fn canonical_object_name(name: &ObjectName) -> SqlResult<(String, String)> {
     let display = parts.join(".");
     let canonical = display.to_ascii_lowercase();
     Ok((display, canonical))
+}
+
+/// Parse an object name into optional schema and table name components.
+///
+/// Returns (schema_name, table_name) where schema_name is None if not qualified.
+///
+/// Examples:
+/// - "users" -> (None, "users")
+/// - "test.users" -> (Some("test"), "users")
+/// - "catalog.test.users" -> Error (too many parts)
+fn parse_schema_qualified_name(name: &ObjectName) -> SqlResult<(Option<String>, String)> {
+    if name.0.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "object name must not be empty".into(),
+        ));
+    }
+
+    let mut parts: Vec<String> = Vec::with_capacity(name.0.len());
+    for part in &name.0 {
+        let ident = match part {
+            ObjectNamePart::Identifier(ident) => ident,
+            _ => {
+                return Err(Error::InvalidArgumentError(
+                    "object names using functions are not supported".into(),
+                ));
+            }
+        };
+        parts.push(ident.value.clone());
+    }
+
+    match parts.len() {
+        1 => Ok((None, parts[0].clone())),
+        2 => Ok((Some(parts[0].clone()), parts[1].clone())),
+        _ => Err(Error::InvalidArgumentError(format!(
+            "table name has too many parts: {}",
+            name
+        ))),
+    }
 }
 
 fn validate_create_table_common(stmt: &sqlparser::ast::CreateTable) -> SqlResult<()> {

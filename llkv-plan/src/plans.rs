@@ -24,6 +24,7 @@ pub enum PlanValue {
     Integer(i64),
     Float(f64),
     String(String),
+    Struct(std::collections::HashMap<String, PlanValue>),
 }
 
 impl From<&str> for PlanValue {

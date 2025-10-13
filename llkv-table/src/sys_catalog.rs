@@ -110,6 +110,19 @@ pub struct ColMeta {
     pub default: Option<Vec<u8>>,
 }
 
+/// Metadata about a schema.
+///
+/// Stored in the system catalog (table 0) and serialized using [`bitcode`].
+#[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
+pub struct SchemaMeta {
+    /// Human-readable schema name (case-preserved).
+    pub name: String,
+    /// When the schema was created (microseconds since epoch).
+    pub created_at_micros: u64,
+    /// Bitflags for schema properties (reserved for future use).
+    pub flags: u32,
+}
+
 // ----- SysCatalog -----
 
 /// Interface to the system catalog (table 0).
@@ -578,6 +591,155 @@ where
         })?;
         Ok(Some(state))
     }
+
+    /// Persist schema metadata to the catalog.
+    ///
+    /// Stores schema metadata at a row ID derived from the schema name hash.
+    /// This allows efficient lookup and prevents collisions.
+    pub fn put_schema_meta(&self, meta: &SchemaMeta) -> LlkvResult<()> {
+        let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_SCHEMA_META_ID).into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("meta", DataType::Binary, false).with_metadata(HashMap::from([(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            )])),
+        ]));
+
+        // Use hash of canonical (lowercase) schema name as row ID
+        let canonical = meta.name.to_ascii_lowercase();
+        let row_id_val = schema_name_to_row_id(&canonical);
+        let row_id = Arc::new(UInt64Array::from(vec![row_id_val]));
+        let meta_encoded = bitcode::encode(meta);
+        let meta_bytes = Arc::new(BinaryArray::from(vec![meta_encoded.as_slice()]));
+
+        let batch = RecordBatch::try_new(schema, vec![row_id, meta_bytes])?;
+        self.store.append(&batch)?;
+        Ok(())
+    }
+
+    /// Retrieve schema metadata by name.
+    ///
+    /// Returns `None` if the schema does not exist.
+    pub fn get_schema_meta(&self, schema_name: &str) -> LlkvResult<Option<SchemaMeta>> {
+        let canonical = schema_name.to_ascii_lowercase();
+        let row_id = schema_name_to_row_id(&canonical);
+        let lfid = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_SCHEMA_META_ID);
+
+        let batch = match self.store.gather_rows(
+            &[lfid],
+            &[row_id],
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(batch) => batch,
+            Err(llkv_result::Error::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        if batch.num_columns() == 0 || batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal("catalog schema_meta column should be Binary".into())
+            })?;
+
+        if array.is_empty() || array.is_null(0) {
+            return Ok(None);
+        }
+
+        let bytes = array.value(0);
+        let meta = bitcode::decode(bytes).map_err(|e| {
+            llkv_result::Error::Internal(format!("Failed to decode schema metadata: {}", e))
+        })?;
+        Ok(Some(meta))
+    }
+
+    /// Scan all schema metadata entries from the catalog.
+    ///
+    /// Returns a vector of all persisted schemas.
+    pub fn all_schema_metas(&self) -> LlkvResult<Vec<SchemaMeta>> {
+        let meta_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_SCHEMA_META_ID);
+        let row_field = rowid_fid(meta_field);
+
+        // Collect all row IDs that have schema metadata
+        struct RowIdCollector {
+            row_ids: Vec<u64>,
+        }
+
+        impl PrimitiveVisitor for RowIdCollector {
+            fn u64_chunk(&mut self, values: &UInt64Array) {
+                for i in 0..values.len() {
+                    self.row_ids.push(values.value(i));
+                }
+            }
+        }
+        impl PrimitiveWithRowIdsVisitor for RowIdCollector {}
+        impl PrimitiveSortedVisitor for RowIdCollector {}
+        impl PrimitiveSortedWithRowIdsVisitor for RowIdCollector {}
+
+        let mut collector = RowIdCollector {
+            row_ids: Vec::new(),
+        };
+        match ScanBuilder::new(self.store, row_field)
+            .options(ScanOptions::default())
+            .run(&mut collector)
+        {
+            Ok(()) => {}
+            Err(llkv_result::Error::NotFound) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        }
+
+        if collector.row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Gather all schema metadata using the collected row IDs
+        let batch = self.store.gather_rows(
+            &[meta_field],
+            &collector.row_ids,
+            GatherNullPolicy::IncludeNulls,
+        )?;
+
+        let meta_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal("catalog schema_meta column should be Binary".into())
+            })?;
+
+        let mut result = Vec::new();
+        for idx in 0..collector.row_ids.len() {
+            if !meta_col.is_null(idx) {
+                let bytes = meta_col.value(idx);
+                if let Ok(meta) = bitcode::decode::<SchemaMeta>(bytes) {
+                    result.push(meta);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+/// Generate a row ID for schema metadata based on schema name.
+///
+/// Uses a simple hash to map schema names to row IDs. This is deterministic
+/// and allows direct lookup without scanning.
+fn schema_name_to_row_id(canonical_name: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    canonical_name.hash(&mut hasher);
+    // Use high bits to avoid collision with reserved catalog row IDs (0-3)
+    // and table metadata row IDs
+    hasher.finish() | (1u64 << 63)
 }
 
 struct MaxRowIdCollector {
