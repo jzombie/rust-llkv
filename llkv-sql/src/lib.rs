@@ -36,3 +36,6 @@ use sql_value::SqlValue;
 
 pub use llkv_runtime::{RuntimeStatementResult, SelectExecution};
 pub use llkv_transaction::TransactionKind;
+
+// SQL Logic Test harness (used by tests)
+pub mod slt;

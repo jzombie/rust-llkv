@@ -1378,11 +1378,6 @@ name = "llkv-test-utils"
 version = "0.3.0-alpha"
 dependencies = [
  "ctor",
- "libtest-mimic 0.6.1",
- "llkv-result",
- "sqllogictest",
- "tempfile",
- "tokio",
  "tracing",
  "tracing-subscriber",
 ]
