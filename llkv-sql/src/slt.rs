@@ -245,7 +245,7 @@ pub fn expand_loops_with_mapping(
     Ok((out_lines, out_map))
 }
 
-/// Convert legacy sqllogictest inline connection syntax (e.g. `statement ok con1`)
+/// Convert sqllogictest inline connection syntax (e.g. `statement ok con1`)
 /// into explicit `connection` records so the upstream parser can understand them.
 /// Also ensures proper termination of statement error blocks by adding a blank line
 /// after ---- when there's no expected error pattern.

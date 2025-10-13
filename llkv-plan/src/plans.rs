@@ -279,9 +279,8 @@ impl TableRef {
 /// Logical query plan for SELECT operations.
 #[derive(Clone, Debug)]
 pub struct SelectPlan {
-    /// Legacy single table field for backward compatibility
-    pub table: String,
-    /// Multiple tables for joins/cross products (if present, overrides `table`)
+    /// Tables to query. Empty vec means no FROM clause (e.g., SELECT 42).
+    /// Single element for simple queries, multiple for joins/cross products.
     pub tables: Vec<TableRef>,
     pub projections: Vec<SelectProjection>,
     pub filter: Option<llkv_expr::expr::Expr<'static, String>>,
@@ -290,10 +289,24 @@ pub struct SelectPlan {
 }
 
 impl SelectPlan {
+    /// Create a SelectPlan for a single table.
     pub fn new(table: impl Into<String>) -> Self {
+        let table_name = table.into();
+        let tables = if table_name.is_empty() {
+            Vec::new()
+        } else {
+            // Parse "schema.table" or just "table"
+            let parts: Vec<&str> = table_name.split('.').collect();
+            if parts.len() >= 2 {
+                let table_part = parts[1..].join(".");
+                vec![TableRef::new(parts[0], table_part)]
+            } else {
+                vec![TableRef::new("", table_name)]
+            }
+        };
+        
         Self {
-            table: table.into(),
-            tables: Vec::new(),
+            tables,
             projections: Vec::new(),
             filter: None,
             aggregates: Vec::new(),
@@ -301,10 +314,9 @@ impl SelectPlan {
         }
     }
     
-    /// Create a SelectPlan with multiple tables for cross product/joins
+    /// Create a SelectPlan with multiple tables for cross product/joins.
     pub fn with_tables(tables: Vec<TableRef>) -> Self {
         Self {
-            table: String::new(),
             tables,
             projections: Vec::new(),
             filter: None,

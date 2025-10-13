@@ -1248,7 +1248,7 @@ where
             // No FROM clause - use empty string for table context (e.g., SELECT 42, SELECT {'a': 1} AS x)
             SelectPlan::new("")
         } else if select.from.len() == 1 {
-            // Single table - use legacy path
+            // Single table query
             let (display_name, _canonical_name) = extract_single_table(&select.from)?;
             let mut p = SelectPlan::new(display_name.clone());
             if let Some(aggregates) = self.detect_simple_aggregates(&select.projection)? {

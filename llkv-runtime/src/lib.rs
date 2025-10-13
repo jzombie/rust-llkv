@@ -316,13 +316,11 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
         PlanStatement::Update(plan) => Some(&plan.table),
         PlanStatement::Delete(plan) => Some(&plan.table),
         PlanStatement::Select(plan) => {
-            // For multi-table queries, return None (no single table name)
-            if !plan.tables.is_empty() {
-                None
-            } else if plan.table.is_empty() {
-                None
+            // Return Some only for single-table queries
+            if plan.tables.len() == 1 {
+                Some(&plan.tables[0].table)
             } else {
-                Some(&plan.table)
+                None
             }
         }
         PlanStatement::BeginTransaction
@@ -748,7 +746,11 @@ where
             let context = self.inner.context();
             let default_snapshot = context.ctx().default_snapshot();
             TransactionContext::set_snapshot(&**context, default_snapshot);
-            let table_name = plan.table.clone();
+            let table_name = if plan.tables.len() == 1 {
+                plan.tables[0].qualified_name()
+            } else {
+                String::new()
+            };
             let execution = TransactionContext::execute_select(&**context, plan)?;
             let schema = execution.schema();
             Ok(RuntimeStatementResult::Select {
@@ -1137,7 +1139,7 @@ where
         RuntimeTableHandle::new(Arc::clone(self), name)
     }
 
-    /// Check if there's an active transaction (legacy - checks if ANY session has a transaction).
+    /// Check if there's an active transaction (checks if ANY session has a transaction).
     #[deprecated(note = "Use session-based transactions instead")]
     pub fn has_active_transaction(&self) -> bool {
         self.transaction_manager.has_active_transaction()
@@ -1682,7 +1684,7 @@ where
 
     pub fn execute_select(self: &Arc<Self>, plan: SelectPlan) -> Result<SelectExecution<P>> {
         // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
-        if plan.table.is_empty() && plan.tables.is_empty() {
+        if plan.tables.is_empty() {
             // No table to query - just evaluate computed expressions
             let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
                 context: Arc::clone(self),
@@ -1691,41 +1693,24 @@ where
             return executor.execute_select(plan);
         }
         
-        // Handle multi-table queries (cross products/joins)
-        if !plan.tables.is_empty() {
-            // Resolve canonical names (don't verify existence yet - let executor do it)
-            let mut canonical_tables = Vec::new();
-            for table_ref in &plan.tables {
-                let qualified = table_ref.qualified_name();
-                let (_display, canonical) = canonical_table_name(&qualified)?;
-                // Parse canonical back into schema.table
-                let parts: Vec<&str> = canonical.split('.').collect();
-                let canon_ref = if parts.len() >= 2 {
-                    llkv_plan::TableRef::new(parts[0], parts[1])
-                } else {
-                    llkv_plan::TableRef::new("", &canonical)
-                };
-                canonical_tables.push(canon_ref);
-            }
-            
-            let mut canonical_plan = plan.clone();
-            canonical_plan.tables = canonical_tables;
-            
-            let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
-                context: Arc::clone(self),
-            });
-            let executor = QueryExecutor::new(provider);
-            return executor.execute_select(canonical_plan);
+        // Resolve canonical names for all tables (don't verify existence yet - let executor do it)
+        let mut canonical_tables = Vec::new();
+        for table_ref in &plan.tables {
+            let qualified = table_ref.qualified_name();
+            let (_display, canonical) = canonical_table_name(&qualified)?;
+            // Parse canonical back into schema.table
+            let parts: Vec<&str> = canonical.split('.').collect();
+            let canon_ref = if parts.len() >= 2 {
+                llkv_plan::TableRef::new(parts[0], parts[1])
+            } else {
+                llkv_plan::TableRef::new("", &canonical)
+            };
+            canonical_tables.push(canon_ref);
         }
-
-        let (_display_name, canonical_name) = canonical_table_name(&plan.table)?;
-        // Don't verify table exists here - let executor handle it (for transaction isolation)
-
-        // Create a plan with canonical table name
+        
         let mut canonical_plan = plan.clone();
-        canonical_plan.table = canonical_name;
-
-        // Use the QueryExecutor from llkv-executor
+        canonical_plan.tables = canonical_tables;
+        
         let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
             context: Arc::clone(self),
         });
@@ -1739,7 +1724,7 @@ where
         snapshot: TransactionSnapshot,
     ) -> Result<SelectExecution<P>> {
         // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
-        if plan.table.is_empty() && plan.tables.is_empty() {
+        if plan.tables.is_empty() {
             let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
                 context: Arc::clone(self),
             });
@@ -1748,49 +1733,41 @@ where
             return executor.execute_select_with_filter(plan, None);
         }
         
-        // Handle multi-table queries (cross products/joins)
-        if !plan.tables.is_empty() {
-            // Resolve canonical names (don't verify existence - executor will handle it with snapshot)
-            let mut canonical_tables = Vec::new();
-            for table_ref in &plan.tables {
-                let qualified = table_ref.qualified_name();
-                let (_display, canonical) = canonical_table_name(&qualified)?;
-                // Parse canonical back into schema.table
-                let parts: Vec<&str> = canonical.split('.').collect();
-                let canon_ref = if parts.len() >= 2 {
-                    llkv_plan::TableRef::new(parts[0], parts[1])
-                } else {
-                    llkv_plan::TableRef::new("", &canonical)
-                };
-                canonical_tables.push(canon_ref);
-            }
-            
-            let mut canonical_plan = plan.clone();
-            canonical_plan.tables = canonical_tables;
-            
-            let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
-                context: Arc::clone(self),
-            });
-            let executor = QueryExecutor::new(provider);
-            // For multi-table, we don't apply MVCC filtering yet (TODO)
-            return executor.execute_select_with_filter(canonical_plan, None);
+        // Resolve canonical names for all tables (don't verify existence - executor will handle it with snapshot)
+        let mut canonical_tables = Vec::new();
+        for table_ref in &plan.tables {
+            let qualified = table_ref.qualified_name();
+            let (_display, canonical) = canonical_table_name(&qualified)?;
+            // Parse canonical back into schema.table
+            let parts: Vec<&str> = canonical.split('.').collect();
+            let canon_ref = if parts.len() >= 2 {
+                llkv_plan::TableRef::new(parts[0], parts[1])
+            } else {
+                llkv_plan::TableRef::new("", &canonical)
+            };
+            canonical_tables.push(canon_ref);
         }
-
-        let (_display_name, canonical_name) = canonical_table_name(&plan.table)?;
-        // Don't verify table exists here - executor will handle it with snapshot
-
+        
         let mut canonical_plan = plan.clone();
-        canonical_plan.table = canonical_name;
-
+        canonical_plan.tables = canonical_tables;
+        
         let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
             context: Arc::clone(self),
         });
         let executor = QueryExecutor::new(provider);
-        let row_filter: Arc<dyn RowIdFilter<P>> = Arc::new(MvccRowIdFilter::new(
-            Arc::clone(&self.txn_manager),
-            snapshot,
-        ));
-        executor.execute_select_with_filter(canonical_plan, Some(row_filter))
+        
+        // For single-table queries, apply MVCC filtering
+        let row_filter: Option<Arc<dyn RowIdFilter<P>>> = if canonical_plan.tables.len() == 1 {
+            Some(Arc::new(MvccRowIdFilter::new(
+                Arc::clone(&self.txn_manager),
+                snapshot,
+            )))
+        } else {
+            // For multi-table queries, we don't apply MVCC filtering yet (TODO)
+            None
+        };
+        
+        executor.execute_select_with_filter(canonical_plan, row_filter)
     }
 
     fn create_table_from_columns(
@@ -3298,7 +3275,7 @@ where
     }
 }
 
-// Helper to convert StatementResult between types (legacy)
+// Helper to convert StatementResult between types
 fn convert_statement_result<P>(result: RuntimeStatementResult<P>) -> TransactionResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,

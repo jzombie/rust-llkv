@@ -63,17 +63,19 @@ where
         row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
         // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
-        if plan.table.is_empty() && plan.tables.is_empty() {
+        if plan.tables.is_empty() {
             return self.execute_select_without_table(plan);
         }
         
-        // Handle multi-table queries (cross products)
-        if !plan.tables.is_empty() {
+        // Handle multi-table queries (cross products/joins)
+        if plan.tables.len() > 1 {
             return self.execute_cross_product(plan);
         }
 
-        let table = self.provider.get_table(&plan.table)?;
-        let display_name = plan.table.clone();
+        // Single table query
+        let table_ref = &plan.tables[0];
+        let table = self.provider.get_table(&table_ref.qualified_name())?;
+        let display_name = table_ref.qualified_name();
 
         if !plan.aggregates.is_empty() {
             self.execute_aggregates(table, display_name, plan, row_filter)
