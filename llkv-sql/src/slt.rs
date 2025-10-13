@@ -1,22 +1,20 @@
 use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
+use llkv_result::Error;
 use sqllogictest::{AsyncDB, DefaultColumnType, Runner};
 use std::path::{Component, Path};
 
 /// Run a single slt file using the provided AsyncDB factory. The factory is
 /// a closure that returns a future resolving to a new DB instance for the
 /// runner. This mirrors sqllogictest's Runner::new signature and behavior.
-pub async fn run_slt_file_with_factory<F, Fut, D, E>(
-    path: &Path,
-    factory: F,
-) -> Result<(), llkv_result::Error>
+pub async fn run_slt_file_with_factory<F, Fut, D, E>(path: &Path, factory: F) -> Result<(), Error>
 where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<D, E>> + Send,
-    D: AsyncDB<Error = llkv_result::Error, ColumnType = DefaultColumnType> + Send + 'static,
+    D: AsyncDB<Error = Error, ColumnType = DefaultColumnType> + Send + 'static,
     E: std::fmt::Debug,
 {
     let text = std::fs::read_to_string(path)
-        .map_err(|e| llkv_result::Error::Internal(format!("failed to read slt file: {}", e)))?;
+        .map_err(|e| Error::Internal(format!("failed to read slt file: {}", e)))?;
     let raw_lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let (expanded_lines, mapping) = expand_loops_with_mapping(&raw_lines, 0)?;
     let (expanded_lines, mapping) = {
@@ -51,13 +49,12 @@ where
     };
 
     let expanded_text = normalized_lines.join("\n");
-    let mut named = tempfile::NamedTempFile::new().map_err(|e| {
-        llkv_result::Error::Internal(format!("failed to create temp slt file: {}", e))
-    })?;
+    let mut named = tempfile::NamedTempFile::new()
+        .map_err(|e| Error::Internal(format!("failed to create temp slt file: {}", e)))?;
     use std::io::Write as _;
-    named.write_all(expanded_text.as_bytes()).map_err(|e| {
-        llkv_result::Error::Internal(format!("failed to write temp slt file: {}", e))
-    })?;
+    named
+        .write_all(expanded_text.as_bytes())
+        .map_err(|e| Error::Internal(format!("failed to write temp slt file: {}", e)))?;
     if std::env::var("LLKV_DUMP_SLT").is_ok() {
         let dump_path = std::path::Path::new("target/normalized.slt");
         if let Some(parent) = dump_path.parent() {
@@ -72,7 +69,7 @@ where
     let mut runner = Runner::new(|| async {
         factory()
             .await
-            .map_err(|e| llkv_result::Error::Internal(format!("factory error: {:?}", e)))
+            .map_err(|e| Error::Internal(format!("factory error: {:?}", e)))
     });
     if let Err(e) = runner.run_file_async(&tmp).await {
         let (mapped, opt_orig_line) =
@@ -89,10 +86,7 @@ where
             );
         }
         drop(named);
-        return Err(llkv_result::Error::Internal(format!(
-            "slt runner failed: {}",
-            mapped
-        )));
+        return Err(Error::Internal(format!("slt runner failed: {}", mapped)));
     }
 
     drop(named);
@@ -112,7 +106,7 @@ where
     FF: Fn() -> F + Send + Sync + 'static + Clone,
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<D, E>> + Send + 'static,
-    D: AsyncDB<Error = llkv_result::Error, ColumnType = DefaultColumnType> + Send + 'static,
+    D: AsyncDB<Error = Error, ColumnType = DefaultColumnType> + Send + 'static,
     E: std::fmt::Debug + Send + 'static,
 {
     let args = Arguments::from_args();
@@ -136,7 +130,7 @@ where
     FF: Fn() -> F + Send + Sync + 'static + Clone,
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<D, E>> + Send + 'static,
-    D: AsyncDB<Error = llkv_result::Error, ColumnType = DefaultColumnType> + Send + 'static,
+    D: AsyncDB<Error = Error, ColumnType = DefaultColumnType> + Send + 'static,
     E: std::fmt::Debug + Send + 'static,
 {
     let base = std::path::Path::new(slt_dir);
@@ -185,7 +179,7 @@ where
                 .enable_all()
                 .build()
                 .map_err(|e| Failed::from(format!("failed to build tokio runtime: {e}")))?;
-            let res: Result<(), llkv_result::Error> =
+            let res: Result<(), Error> =
                 rt.block_on(async move { run_slt_file_with_factory(&p, fac).await });
             res.map_err(|e| Failed::from(format!("slt runner error: {e}")))
         }));
@@ -199,7 +193,7 @@ where
 pub fn expand_loops_with_mapping(
     lines: &[String],
     base_index: usize,
-) -> Result<(Vec<String>, Vec<usize>), llkv_result::Error> {
+) -> Result<(Vec<String>, Vec<usize>), Error> {
     let mut out_lines: Vec<String> = Vec::new();
     let mut out_map: Vec<usize> = Vec::new();
     let mut i = 0usize;
@@ -208,7 +202,7 @@ pub fn expand_loops_with_mapping(
         if line.starts_with("loop ") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 4 {
-                return Err(llkv_result::Error::Internal(format!(
+                return Err(Error::Internal(format!(
                     "malformed loop directive: {}",
                     line
                 )));
@@ -216,19 +210,17 @@ pub fn expand_loops_with_mapping(
             let var = parts[1];
             let start: i64 = parts[2]
                 .parse()
-                .map_err(|e| llkv_result::Error::Internal(format!("invalid loop start: {}", e)))?;
+                .map_err(|e| Error::Internal(format!("invalid loop start: {}", e)))?;
             let count: i64 = parts[3]
                 .parse()
-                .map_err(|e| llkv_result::Error::Internal(format!("invalid loop count: {}", e)))?;
+                .map_err(|e| Error::Internal(format!("invalid loop count: {}", e)))?;
 
             let mut j = i + 1;
             while j < lines.len() && lines[j].trim_start() != "endloop" {
                 j += 1;
             }
             if j >= lines.len() {
-                return Err(llkv_result::Error::Internal(
-                    "unterminated loop in slt".to_string(),
-                ));
+                return Err(Error::Internal("unterminated loop in slt".to_string()));
             }
 
             let inner = &lines[i + 1..j];
