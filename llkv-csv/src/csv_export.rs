@@ -21,8 +21,15 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
     C: AsRef<Path>,
 {
+    tracing::trace!(
+        "[CSV_EXPORT] export_csv_from_table called with {} columns",
+        columns.len()
+    );
     let writer = CsvWriter::with_options(table, options.clone());
-    writer.write_columns_to_path(csv_path, columns)
+    tracing::trace!("[CSV_EXPORT] About to call write_columns_to_path");
+    let result = writer.write_columns_to_path(csv_path, columns);
+    tracing::trace!("[CSV_EXPORT] write_columns_to_path returned: {:?}", result);
+    result
 }
 
 pub fn export_csv_from_table_with_filter<P, C>(

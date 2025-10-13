@@ -5,21 +5,21 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use crate::SqlResult;
 use crate::SqlValue;
 
-use llkv_dsl::{
-    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateTablePlan,
-    CreateTableSource, DeletePlan, DslContext, InsertPlan, InsertSource, OrderByPlan,
-    OrderSortType, OrderTarget, PlanValue, SelectExecution, SelectPlan, SelectProjection, Session,
-    StatementResult, UpdatePlan, extract_rows_from_range,
-};
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
+use llkv_runtime::{
+    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateTablePlan,
+    CreateTableSource, DeletePlan, InsertPlan, InsertSource, OrderByPlan, OrderSortType,
+    OrderTarget, PlanStatement, PlanValue, RuntimeContext, RuntimeEngine, RuntimeSession,
+    RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
+};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
     ColumnOptionDef, DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName,
-    ObjectNamePart, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem,
+    ObjectNamePart, ObjectType, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, Set, SetExpr, Statement, TableFactor, TableObject,
     TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator, UpdateTableFromKind,
     Value, ValueWithSpan,
@@ -31,20 +31,23 @@ pub struct SqlEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    context: Arc<DslContext<P>>,
-    session: Session<P>,
+    engine: RuntimeEngine<P>,
     default_nulls_first: AtomicBool,
 }
+
+const DROPPED_TABLE_TRANSACTION_ERR: &str = "another transaction has dropped this table";
 
 impl<P> Clone for SqlEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
+        tracing::warn!(
+            "[SQL_ENGINE] SqlEngine::clone() called - will create new Engine with new session!"
+        );
         // Create a new session from the same context
         Self {
-            context: Arc::clone(&self.context),
-            session: self.context.create_session(),
+            engine: self.engine.clone(),
             default_nulls_first: AtomicBool::new(
                 self.default_nulls_first.load(AtomicOrdering::Relaxed),
             ),
@@ -86,25 +89,38 @@ where
         }
     }
 
+    // `statement_table_name` is provided by llkv-runtime; use it to avoid
+    // duplicating plan-level logic here.
+
+    fn execute_plan_statement(
+        &self,
+        statement: PlanStatement,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let table = llkv_runtime::statement_table_name(&statement).map(str::to_string);
+        self.engine.execute_statement(statement).map_err(|err| {
+            if let Some(table_name) = table {
+                Self::map_table_error(&table_name, err)
+            } else {
+                err
+            }
+        })
+    }
+
     pub fn new(pager: Arc<P>) -> Self {
-        let context = Arc::new(DslContext::new(pager));
-        let session = context.create_session();
+        let engine = RuntimeEngine::new(pager);
         Self {
-            context: Arc::clone(&context),
-            session,
+            engine,
             default_nulls_first: AtomicBool::new(false),
         }
     }
 
-    pub(crate) fn context_arc(&self) -> Arc<DslContext<P>> {
-        Arc::clone(&self.context)
+    pub(crate) fn context_arc(&self) -> Arc<RuntimeContext<P>> {
+        self.engine.context()
     }
 
-    pub fn with_context(context: Arc<DslContext<P>>, default_nulls_first: bool) -> Self {
-        let session = context.create_session();
+    pub fn with_context(context: Arc<RuntimeContext<P>>, default_nulls_first: bool) -> Self {
         Self {
-            context: Arc::clone(&context),
-            session,
+            engine: RuntimeEngine::from_context(context),
             default_nulls_first: AtomicBool::new(default_nulls_first),
         }
     }
@@ -115,22 +131,47 @@ where
     }
 
     fn has_active_transaction(&self) -> bool {
-        self.session.has_active_transaction()
+        self.engine.session().has_active_transaction()
     }
 
-    pub fn execute(&self, sql: &str) -> SqlResult<Vec<StatementResult<P>>> {
+    /// Get a reference to the underlying session (for advanced use like error handling in test harnesses).
+    pub fn session(&self) -> &RuntimeSession<P> {
+        self.engine.session()
+    }
+
+    pub fn execute(&self, sql: &str) -> SqlResult<Vec<RuntimeStatementResult<P>>> {
+        tracing::trace!("DEBUG SQL execute: {}", sql);
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, sql)
             .map_err(|err| Error::InvalidArgumentError(format!("failed to parse SQL: {err}")))?;
+        tracing::trace!("DEBUG SQL execute: parsed {} statements", statements.len());
 
         let mut results = Vec::with_capacity(statements.len());
-        for statement in statements {
-            results.push(self.execute_statement(statement)?);
+        for (i, statement) in statements.iter().enumerate() {
+            tracing::trace!("DEBUG SQL execute: processing statement {}", i);
+            results.push(self.execute_statement(statement.clone())?);
+            tracing::trace!("DEBUG SQL execute: statement {} completed", i);
         }
+        tracing::trace!("DEBUG SQL execute completed successfully");
         Ok(results)
     }
 
-    fn execute_statement(&self, statement: Statement) -> SqlResult<StatementResult<P>> {
+    fn execute_statement(&self, statement: Statement) -> SqlResult<RuntimeStatementResult<P>> {
+        tracing::trace!(
+            "DEBUG SQL execute_statement: {:?}",
+            match &statement {
+                Statement::Insert(insert) =>
+                    format!("Insert(table={:?})", Self::table_name_from_insert(insert)),
+                Statement::Query(_) => "Query".to_string(),
+                Statement::StartTransaction { .. } => "StartTransaction".to_string(),
+                Statement::Commit { .. } => "Commit".to_string(),
+                Statement::Rollback { .. } => "Rollback".to_string(),
+                Statement::CreateTable(_) => "CreateTable".to_string(),
+                Statement::Update { .. } => "Update".to_string(),
+                Statement::Delete(_) => "Delete".to_string(),
+                other => format!("Other({:?})", other),
+            }
+        );
         match statement {
             Statement::StartTransaction {
                 modes,
@@ -162,11 +203,26 @@ where
     fn execute_statement_non_transactional(
         &self,
         statement: Statement,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        tracing::trace!("DEBUG SQL execute_statement_non_transactional called");
         match statement {
-            Statement::CreateTable(stmt) => self.handle_create_table(stmt),
-            Statement::Insert(stmt) => self.handle_insert(stmt),
-            Statement::Query(query) => self.handle_query(*query),
+            Statement::CreateTable(stmt) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateTable");
+                self.handle_create_table(stmt)
+            }
+            Statement::Insert(stmt) => {
+                let table_name =
+                    Self::table_name_from_insert(&stmt).unwrap_or_else(|_| "unknown".to_string());
+                tracing::trace!(
+                    "DEBUG SQL execute_statement_non_transactional: Insert(table={})",
+                    table_name
+                );
+                self.handle_insert(stmt)
+            }
+            Statement::Query(query) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: Query");
+                self.handle_query(*query)
+            }
             Statement::Update {
                 table,
                 assignments,
@@ -174,13 +230,52 @@ where
                 selection,
                 returning,
                 ..
-            } => self.handle_update(table, assignments, from, selection, returning),
-            Statement::Delete(delete) => self.handle_delete(delete),
-            Statement::Set(set_stmt) => self.handle_set(set_stmt),
-            Statement::Pragma { name, value, is_eq } => self.handle_pragma(name, value, is_eq),
-            other => Err(Error::InvalidArgumentError(format!(
-                "unsupported SQL statement: {other:?}"
-            ))),
+            } => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: Update");
+                self.handle_update(table, assignments, from, selection, returning)
+            }
+            Statement::Delete(delete) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: Delete");
+                self.handle_delete(delete)
+            }
+            Statement::Drop {
+                object_type,
+                if_exists,
+                names,
+                cascade,
+                restrict,
+                purge,
+                temporary,
+                ..
+            } => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: Drop");
+                self.handle_drop(
+                    object_type,
+                    if_exists,
+                    names,
+                    cascade,
+                    restrict,
+                    purge,
+                    temporary,
+                )
+            }
+            Statement::Set(set_stmt) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: Set");
+                self.handle_set(set_stmt)
+            }
+            Statement::Pragma { name, value, is_eq } => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: Pragma");
+                self.handle_pragma(name, value, is_eq)
+            }
+            other => {
+                tracing::trace!(
+                    "DEBUG SQL execute_statement_non_transactional: Other({:?})",
+                    other
+                );
+                Err(Error::InvalidArgumentError(format!(
+                    "unsupported SQL statement: {other:?}"
+                )))
+            }
         }
     }
 
@@ -254,13 +349,23 @@ where
         Ok(tables)
     }
 
+    fn is_table_marked_dropped(&self, table_name: &str) -> SqlResult<bool> {
+        let canonical = table_name.to_ascii_lowercase();
+        Ok(self.engine.context().is_table_marked_dropped(&canonical))
+    }
+
     fn handle_create_table(
         &self,
         mut stmt: sqlparser::ast::CreateTable,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         validate_create_table_common(&stmt)?;
 
         let (display_name, canonical_name) = canonical_object_name(&stmt.name)?;
+        tracing::trace!(
+            "\n=== HANDLE_CREATE_TABLE: table='{}' columns={} ===",
+            display_name,
+            stmt.columns.len()
+        );
         if display_name.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "table name must not be empty".into(),
@@ -269,11 +374,21 @@ where
 
         if let Some(query) = stmt.query.take() {
             validate_create_table_as(&stmt)?;
+            if let Some(result) = self.try_handle_range_ctas(
+                &display_name,
+                &canonical_name,
+                &query,
+                stmt.if_not_exists,
+                stmt.or_replace,
+            )? {
+                return Ok(result);
+            }
             return self.handle_create_table_as(
                 display_name,
                 canonical_name,
                 *query,
                 stmt.if_not_exists,
+                stmt.or_replace,
             );
         }
 
@@ -288,14 +403,44 @@ where
         let mut columns: Vec<ColumnSpec> = Vec::with_capacity(stmt.columns.len());
         let mut names: HashMap<String, ()> = HashMap::new();
         for column_def in stmt.columns {
-            let column = ColumnSpec::new(
+            let is_nullable = column_def
+                .options
+                .iter()
+                .all(|opt| !matches!(opt.option, ColumnOption::NotNull));
+
+            let is_primary_key = column_def.options.iter().any(|opt| {
+                matches!(
+                    opt.option,
+                    ColumnOption::Unique {
+                        is_primary: true,
+                        characteristics: _
+                    }
+                )
+            });
+
+            tracing::trace!(
+                "DEBUG CREATE TABLE column '{}' is_primary_key={}",
+                column_def.name.value,
+                is_primary_key
+            );
+
+            let mut column = ColumnSpec::new(
                 column_def.name.value.clone(),
                 arrow_type_from_sql(&column_def.data_type)?,
-                column_def
-                    .options
-                    .iter()
-                    .all(|opt| !matches!(opt.option, ColumnOption::NotNull)),
+                is_nullable,
             );
+            tracing::trace!(
+                "DEBUG ColumnSpec after new(): primary_key={}",
+                column.primary_key
+            );
+
+            column = column.with_primary_key(is_primary_key);
+            tracing::trace!(
+                "DEBUG ColumnSpec after with_primary_key({}): primary_key={}",
+                is_primary_key,
+                column.primary_key
+            );
+
             let normalized = column.name.to_ascii_lowercase();
             if names.insert(normalized, ()).is_some() {
                 return Err(Error::InvalidArgumentError(format!(
@@ -309,10 +454,181 @@ where
         let plan = CreateTablePlan {
             name: display_name,
             if_not_exists: stmt.if_not_exists,
+            or_replace: stmt.or_replace,
             columns,
             source: None,
         };
-        self.session.create_table_plan(plan)
+        self.execute_plan_statement(PlanStatement::CreateTable(plan))
+    }
+
+    fn try_handle_range_ctas(
+        &self,
+        display_name: &str,
+        _canonical_name: &str,
+        query: &Query,
+        if_not_exists: bool,
+        or_replace: bool,
+    ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select,
+            _ => return Ok(None),
+        };
+        if select.from.len() != 1 {
+            return Ok(None);
+        }
+        let table_with_joins = &select.from[0];
+        if !table_with_joins.joins.is_empty() {
+            return Ok(None);
+        }
+        let (range_size, range_alias) = match &table_with_joins.relation {
+            TableFactor::Table {
+                name,
+                args: Some(args),
+                alias,
+                ..
+            } => {
+                let func_name = name.to_string().to_ascii_lowercase();
+                if func_name != "range" {
+                    return Ok(None);
+                }
+                if args.args.len() != 1 {
+                    return Err(Error::InvalidArgumentError(
+                        "range table function expects a single argument".into(),
+                    ));
+                }
+                let size_expr = &args.args[0];
+                let range_size = match size_expr {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value))) => {
+                        match &value.value {
+                            Value::Number(raw, _) => raw.parse::<i64>().map_err(|e| {
+                                Error::InvalidArgumentError(format!(
+                                    "invalid range size literal {}: {}",
+                                    raw, e
+                                ))
+                            })?,
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "unsupported range size value: {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "unsupported range argument".into(),
+                        ));
+                    }
+                };
+                (range_size, alias.as_ref().map(|a| a.name.value.clone()))
+            }
+            _ => return Ok(None),
+        };
+
+        if range_size < 0 {
+            return Err(Error::InvalidArgumentError(
+                "range size must be non-negative".into(),
+            ));
+        }
+
+        if select.projection.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TABLE AS SELECT requires at least one projected column".into(),
+            ));
+        }
+
+        let mut column_specs = Vec::with_capacity(select.projection.len());
+        let mut column_names = Vec::with_capacity(select.projection.len());
+        let mut row_template = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            match item {
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    let (value, data_type) = match expr {
+                        SqlExpr::Value(value_with_span) => match &value_with_span.value {
+                            Value::Number(raw, _) => {
+                                let parsed = raw.parse::<i64>().map_err(|e| {
+                                    Error::InvalidArgumentError(format!(
+                                        "invalid numeric literal {}: {}",
+                                        raw, e
+                                    ))
+                                })?;
+                                (
+                                    PlanValue::Integer(parsed),
+                                    arrow::datatypes::DataType::Int64,
+                                )
+                            }
+                            Value::SingleQuotedString(s) => (
+                                PlanValue::String(s.clone()),
+                                arrow::datatypes::DataType::Utf8,
+                            ),
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "unsupported SELECT expression in range CTAS: {:?}",
+                                    other
+                                )));
+                            }
+                        },
+                        SqlExpr::Identifier(ident) => {
+                            let ident_lower = ident.value.to_ascii_lowercase();
+                            if range_alias
+                                .as_ref()
+                                .map(|a| a.eq_ignore_ascii_case(&ident_lower))
+                                .unwrap_or(false)
+                                || ident_lower == "range"
+                            {
+                                return Err(Error::InvalidArgumentError(
+                                    "range() table function columns are not supported yet".into(),
+                                ));
+                            }
+                            return Err(Error::InvalidArgumentError(format!(
+                                "unsupported identifier '{}' in range CTAS projection",
+                                ident.value
+                            )));
+                        }
+                        other => {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "unsupported SELECT expression in range CTAS: {:?}",
+                                other
+                            )));
+                        }
+                    };
+                    let column_name = alias.value.clone();
+                    column_specs.push(ColumnSpec::new(column_name.clone(), data_type, true));
+                    column_names.push(column_name);
+                    row_template.push(value);
+                }
+                other => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported projection {:?} in range CTAS",
+                        other
+                    )));
+                }
+            }
+        }
+
+        let plan = CreateTablePlan {
+            name: display_name.to_string(),
+            if_not_exists,
+            or_replace,
+            columns: column_specs,
+            source: None,
+        };
+        let create_result = self.execute_plan_statement(PlanStatement::CreateTable(plan))?;
+
+        let row_count = range_size
+            .try_into()
+            .map_err(|_| Error::InvalidArgumentError("range size exceeds usize".into()))?;
+        if row_count > 0 {
+            let rows = vec![row_template; row_count];
+            let insert_plan = InsertPlan {
+                table: display_name.to_string(),
+                columns: column_names,
+                source: InsertSource::Rows(rows),
+            };
+            self.execute_plan_statement(PlanStatement::Insert(insert_plan))?;
+        }
+
+        Ok(Some(create_result))
     }
 
     fn handle_create_table_as(
@@ -321,12 +637,11 @@ where
         _canonical_name: String,
         query: Query,
         if_not_exists: bool,
-    ) -> SqlResult<StatementResult<P>> {
-        let execution = self.execute_query_collect(query)?;
-        let schema = execution.schema();
-        let batches = execution.collect()?;
+        or_replace: bool,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let select_plan = self.build_select_plan(query)?;
 
-        if schema.fields().is_empty() {
+        if select_plan.projections.is_empty() && select_plan.aggregates.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "CREATE TABLE AS SELECT requires at least one projected column".into(),
             ));
@@ -335,13 +650,29 @@ where
         let plan = CreateTablePlan {
             name: display_name,
             if_not_exists,
+            or_replace,
             columns: Vec::new(),
-            source: Some(CreateTableSource::Batches { schema, batches }),
+            source: Some(CreateTableSource::Select {
+                plan: Box::new(select_plan),
+            }),
         };
-        self.session.create_table_plan(plan)
+        self.execute_plan_statement(PlanStatement::CreateTable(plan))
     }
 
-    fn handle_insert(&self, stmt: sqlparser::ast::Insert) -> SqlResult<StatementResult<P>> {
+    fn handle_insert(&self, stmt: sqlparser::ast::Insert) -> SqlResult<RuntimeStatementResult<P>> {
+        let table_name_debug =
+            Self::table_name_from_insert(&stmt).unwrap_or_else(|_| "unknown".to_string());
+        tracing::trace!(
+            "DEBUG SQL handle_insert called for table={}",
+            table_name_debug
+        );
+        if !self.engine.session().has_active_transaction()
+            && self.is_table_marked_dropped(&table_name_debug)?
+        {
+            return Err(Error::TransactionContextError(
+                DROPPED_TABLE_TRANSACTION_ERR.into(),
+            ));
+        }
         if stmt.replace_into || stmt.ignore || stmt.or.is_some() {
             return Err(Error::InvalidArgumentError(
                 "non-standard INSERT forms are not supported".into(),
@@ -420,9 +751,10 @@ where
                 } else if let Some(range_rows) = extract_rows_from_range(select.as_ref())? {
                     InsertSource::Rows(range_rows.into_rows())
                 } else {
-                    let execution = self.execute_query_collect((**source_expr).clone())?;
-                    let rows = execution.into_rows()?;
-                    InsertSource::Rows(rows)
+                    let select_plan = self.build_select_plan((**source_expr).clone())?;
+                    InsertSource::Select {
+                        plan: Box::new(select_plan),
+                    }
                 }
             }
             _ => {
@@ -437,9 +769,11 @@ where
             columns,
             source: insert_source,
         };
-        self.session
-            .insert(plan)
-            .map_err(|err| Self::map_table_error(&display_name, err))
+        tracing::trace!(
+            "DEBUG SQL handle_insert: about to execute insert for table={}",
+            display_name
+        );
+        self.execute_plan_statement(PlanStatement::Insert(plan))
     }
 
     fn handle_update(
@@ -449,7 +783,7 @@ where
         from: Option<UpdateTableFromKind>,
         selection: Option<SqlExpr>,
         returning: Option<Vec<SelectItem>>,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         if from.is_some() {
             return Err(Error::InvalidArgumentError(
                 "UPDATE ... FROM is not supported yet".into(),
@@ -466,7 +800,18 @@ where
             ));
         }
 
-        let (display_name, _) = extract_single_table(std::slice::from_ref(&table))?;
+        let (display_name, canonical_name) = extract_single_table(std::slice::from_ref(&table))?;
+
+        if !self.engine.session().has_active_transaction()
+            && self
+                .engine
+                .context()
+                .is_table_marked_dropped(&canonical_name)
+        {
+            return Err(Error::TransactionContextError(
+                DROPPED_TABLE_TRANSACTION_ERR.into(),
+            ));
+        }
 
         let mut column_assignments = Vec::with_capacity(assignments.len());
         let mut seen: HashMap<String, ()> = HashMap::new();
@@ -505,13 +850,11 @@ where
             assignments: column_assignments,
             filter,
         };
-        self.session
-            .update(plan)
-            .map_err(|err| Self::map_table_error(&display_name, err))
+        self.execute_plan_statement(PlanStatement::Update(plan))
     }
 
     #[allow(clippy::collapsible_if)]
-    fn handle_delete(&self, delete: Delete) -> SqlResult<StatementResult<P>> {
+    fn handle_delete(&self, delete: Delete) -> SqlResult<RuntimeStatementResult<P>> {
         let Delete {
             tables,
             from,
@@ -553,7 +896,18 @@ where
         let from_tables = match from {
             FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
         };
-        let (display_name, _) = extract_single_table(&from_tables)?;
+        let (display_name, canonical_name) = extract_single_table(&from_tables)?;
+
+        if !self.engine.session().has_active_transaction()
+            && self
+                .engine
+                .context()
+                .is_table_marked_dropped(&canonical_name)
+        {
+            return Err(Error::TransactionContextError(
+                DROPPED_TABLE_TRANSACTION_ERR.into(),
+            ));
+        }
 
         let filter = selection
             .map(|expr| translate_condition(&expr))
@@ -563,23 +917,54 @@ where
             table: display_name.clone(),
             filter,
         };
-        self.session
-            .delete(plan)
-            .map_err(|err| Self::map_table_error(&display_name, err))
+        self.execute_plan_statement(PlanStatement::Delete(plan))
     }
 
-    fn handle_query(&self, query: Query) -> SqlResult<StatementResult<P>> {
-        let execution = self.execute_query_collect(query)?;
-        let table_name = execution.table_name().to_string();
-        let schema = execution.schema();
-        Ok(StatementResult::Select {
-            table_name,
-            schema,
-            execution,
-        })
+    #[allow(clippy::too_many_arguments)] // TODO: Consider refactor
+    fn handle_drop(
+        &self,
+        object_type: ObjectType,
+        if_exists: bool,
+        names: Vec<ObjectName>,
+        cascade: bool,
+        restrict: bool,
+        purge: bool,
+        temporary: bool,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        if cascade || restrict || purge || temporary {
+            return Err(Error::InvalidArgumentError(
+                "DROP TABLE cascade/restrict/purge/temporary options are not supported".into(),
+            ));
+        }
+
+        if object_type != ObjectType::Table {
+            return Err(Error::InvalidArgumentError(
+                "only DROP TABLE is supported".into(),
+            ));
+        }
+
+        let ctx = self.engine.context();
+        for name in names {
+            let table_name = Self::object_name_to_string(&name)?;
+            ctx.drop_table_immediate(&table_name, if_exists)
+                .map_err(|err| Self::map_table_error(&table_name, err))?;
+        }
+
+        Ok(RuntimeStatementResult::NoOp)
     }
 
-    fn execute_query_collect(&self, query: Query) -> SqlResult<SelectExecution<P>> {
+    fn handle_query(&self, query: Query) -> SqlResult<RuntimeStatementResult<P>> {
+        let select_plan = self.build_select_plan(query)?;
+        self.execute_plan_statement(PlanStatement::Select(select_plan))
+    }
+
+    fn build_select_plan(&self, query: Query) -> SqlResult<SelectPlan> {
+        if self.engine.session().has_active_transaction() && self.engine.session().is_aborted() {
+            return Err(Error::TransactionContextError(
+                "TransactionContext Error: transaction is aborted".into(),
+            ));
+        }
+
         validate_simple_query(&query)?;
         let mut select_plan = match query.body.as_ref() {
             SetExpr::Select(select) => self.translate_select(select.as_ref())?,
@@ -598,16 +983,7 @@ where
             let order_plan = self.translate_order_by(order_by)?;
             select_plan = select_plan.with_order_by(Some(order_plan));
         }
-        let table_name = select_plan.table.clone();
-        // Use session.select() to go through transaction system if active
-        match self.session.select(select_plan) {
-            Ok(StatementResult::Select { execution, .. }) => Ok(execution),
-            Ok(other) => Err(Error::Internal(format!(
-                "Expected Select result, got {:?}",
-                other
-            ))),
-            Err(err) => Err(Self::map_table_error(&table_name, err)),
-        }
+        Ok(select_plan)
     }
 
     fn translate_select(&self, select: &Select) -> SqlResult<SelectPlan> {
@@ -986,7 +1362,7 @@ where
         statements: Vec<Statement>,
         exception: Option<Vec<ExceptionWhen>>,
         has_end_keyword: bool,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         if !modes.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "transaction modes are not supported".into(),
@@ -1012,7 +1388,7 @@ where
             tracing::warn!("Currently treat `START TRANSACTION` same as `BEGIN`")
         }
 
-        self.session.begin_transaction()
+        self.execute_plan_statement(PlanStatement::BeginTransaction)
     }
 
     fn handle_commit(
@@ -1020,7 +1396,7 @@ where
         chain: bool,
         end: bool,
         modifier: Option<TransactionModifier>,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         if chain {
             return Err(Error::InvalidArgumentError(
                 "COMMIT AND [NO] CHAIN is not supported".into(),
@@ -1037,14 +1413,14 @@ where
             ));
         }
 
-        self.session.commit_transaction()
+        self.execute_plan_statement(PlanStatement::CommitTransaction)
     }
 
     fn handle_rollback(
         &self,
         chain: bool,
         savepoint: Option<Ident>,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         if chain {
             return Err(Error::InvalidArgumentError(
                 "ROLLBACK AND [NO] CHAIN is not supported".into(),
@@ -1056,10 +1432,10 @@ where
             ));
         }
 
-        self.session.rollback_transaction()
+        self.execute_plan_statement(PlanStatement::RollbackTransaction)
     }
 
-    fn handle_set(&self, set_stmt: Set) -> SqlResult<StatementResult<P>> {
+    fn handle_set(&self, set_stmt: Set) -> SqlResult<RuntimeStatementResult<P>> {
         match set_stmt {
             Set::SingleAssignment {
                 scope,
@@ -1073,41 +1449,68 @@ where
                     ));
                 }
 
-                let variable_name = variable.to_string();
-                if !variable_name.eq_ignore_ascii_case("default_null_order") {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "unsupported SET variable: {variable_name}"
-                    )));
+                let variable_name_raw = variable.to_string();
+                let variable_name = variable_name_raw.to_ascii_lowercase();
+
+                match variable_name.as_str() {
+                    "default_null_order" => {
+                        if values.len() != 1 {
+                            return Err(Error::InvalidArgumentError(
+                                "SET default_null_order expects exactly one value".into(),
+                            ));
+                        }
+
+                        let value_expr = &values[0];
+                        let normalized = match value_expr {
+                            SqlExpr::Value(value_with_span) => value_with_span
+                                .value
+                                .clone()
+                                .into_string()
+                                .map(|s| s.to_ascii_lowercase()),
+                            SqlExpr::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
+                            _ => None,
+                        };
+
+                        if !matches!(normalized.as_deref(), Some("nulls_first" | "nulls_last")) {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "unsupported value for SET default_null_order: {value_expr:?}"
+                            )));
+                        }
+
+                        let use_nulls_first = matches!(normalized.as_deref(), Some("nulls_first"));
+                        self.default_nulls_first
+                            .store(use_nulls_first, AtomicOrdering::Relaxed);
+
+                        Ok(RuntimeStatementResult::NoOp)
+                    }
+                    "immediate_transaction_mode" => {
+                        if values.len() != 1 {
+                            return Err(Error::InvalidArgumentError(
+                                "SET immediate_transaction_mode expects exactly one value".into(),
+                            ));
+                        }
+                        let normalized = values[0].to_string().to_ascii_lowercase();
+                        let enabled = match normalized.as_str() {
+                            "true" | "on" | "1" => true,
+                            "false" | "off" | "0" => false,
+                            _ => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "unsupported value for SET immediate_transaction_mode: {}",
+                                    values[0]
+                                )));
+                            }
+                        };
+                        if !enabled {
+                            tracing::warn!(
+                                "SET immediate_transaction_mode=false has no effect; continuing with auto mode"
+                            );
+                        }
+                        Ok(RuntimeStatementResult::NoOp)
+                    }
+                    _ => Err(Error::InvalidArgumentError(format!(
+                        "unsupported SET variable: {variable_name_raw}"
+                    ))),
                 }
-
-                if values.len() != 1 {
-                    return Err(Error::InvalidArgumentError(
-                        "SET default_null_order expects exactly one value".into(),
-                    ));
-                }
-
-                let value_expr = &values[0];
-                let normalized = match value_expr {
-                    SqlExpr::Value(value_with_span) => value_with_span
-                        .value
-                        .clone()
-                        .into_string()
-                        .map(|s| s.to_ascii_lowercase()),
-                    SqlExpr::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
-                    _ => None,
-                };
-
-                if !matches!(normalized.as_deref(), Some("nulls_first" | "nulls_last")) {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "unsupported value for SET default_null_order: {value_expr:?}"
-                    )));
-                }
-
-                let use_nulls_first = matches!(normalized.as_deref(), Some("nulls_first"));
-                self.default_nulls_first
-                    .store(use_nulls_first, AtomicOrdering::Relaxed);
-
-                Ok(StatementResult::NoOp)
             }
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported SQL SET statement: {other:?}",
@@ -1120,7 +1523,7 @@ where
         name: ObjectName,
         value: Option<Value>,
         is_eq: bool,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         let (display, canonical) = canonical_object_name(&name)?;
         if value.is_some() || is_eq {
             return Err(Error::InvalidArgumentError(format!(
@@ -1129,7 +1532,7 @@ where
         }
 
         match canonical.as_str() {
-            "enable_verification" | "disable_verification" => Ok(StatementResult::NoOp),
+            "enable_verification" | "disable_verification" => Ok(RuntimeStatementResult::NoOp),
             _ => Err(Error::InvalidArgumentError(format!(
                 "unsupported PRAGMA '{}'",
                 display
@@ -1167,9 +1570,9 @@ fn validate_create_table_common(stmt: &sqlparser::ast::CreateTable) -> SqlResult
             "CREATE TABLE LIKE/CLONE is not supported".into(),
         ));
     }
-    if stmt.or_replace {
+    if stmt.or_replace && stmt.if_not_exists {
         return Err(Error::InvalidArgumentError(
-            "CREATE OR REPLACE TABLE is not supported".into(),
+            "CREATE TABLE cannot combine OR REPLACE with IF NOT EXISTS".into(),
         ));
     }
     if !stmt.constraints.is_empty() {
@@ -1260,6 +1663,143 @@ fn resolve_column_name(expr: &SqlExpr) -> SqlResult<String> {
             "aggregate arguments must be plain column identifiers".into(),
         )),
     }
+}
+
+/// Try to parse a function as an aggregate call for use in scalar expressions
+/// Check if a scalar expression contains any aggregate functions
+#[allow(dead_code)] // Utility function for future use
+fn expr_contains_aggregate(expr: &llkv_expr::expr::ScalarExpr<String>) -> bool {
+    match expr {
+        llkv_expr::expr::ScalarExpr::Aggregate(_) => true,
+        llkv_expr::expr::ScalarExpr::Binary { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
+        llkv_expr::expr::ScalarExpr::Column(_) | llkv_expr::expr::ScalarExpr::Literal(_) => false,
+    }
+}
+
+fn try_parse_aggregate_function(
+    func: &sqlparser::ast::Function,
+) -> SqlResult<Option<llkv_expr::expr::AggregateCall<String>>> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart};
+
+    if func.uses_odbc_syntax {
+        return Ok(None);
+    }
+    if !matches!(func.parameters, FunctionArguments::None) {
+        return Ok(None);
+    }
+    if func.filter.is_some()
+        || func.null_treatment.is_some()
+        || func.over.is_some()
+        || !func.within_group.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let func_name = if func.name.0.len() == 1 {
+        match &func.name.0[0] {
+            ObjectNamePart::Identifier(ident) => ident.value.to_ascii_lowercase(),
+            _ => return Ok(None),
+        }
+    } else {
+        return Ok(None);
+    };
+
+    let args_slice: &[FunctionArg] = match &func.args {
+        FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return Ok(None);
+            }
+            &list.args
+        }
+        FunctionArguments::None => &[],
+        FunctionArguments::Subquery(_) => return Ok(None),
+    };
+
+    let agg_call = match func_name.as_str() {
+        "count" => {
+            if args_slice.len() != 1 {
+                return Err(Error::InvalidArgumentError(
+                    "COUNT accepts exactly one argument".into(),
+                ));
+            }
+            match &args_slice[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                    llkv_expr::expr::AggregateCall::CountStar
+                }
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) => {
+                    let column = resolve_column_name(arg_expr)?;
+                    llkv_expr::expr::AggregateCall::Count(column)
+                }
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "unsupported COUNT argument".into(),
+                    ));
+                }
+            }
+        }
+        "sum" => {
+            if args_slice.len() != 1 {
+                return Err(Error::InvalidArgumentError(
+                    "SUM accepts exactly one argument".into(),
+                ));
+            }
+            let arg_expr = match &args_slice[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "SUM requires a column argument".into(),
+                    ));
+                }
+            };
+
+            // Check for COUNT(CASE ...) pattern
+            if let Some(column) = parse_count_nulls_case(arg_expr)? {
+                llkv_expr::expr::AggregateCall::CountNulls(column)
+            } else {
+                let column = resolve_column_name(arg_expr)?;
+                llkv_expr::expr::AggregateCall::Sum(column)
+            }
+        }
+        "min" => {
+            if args_slice.len() != 1 {
+                return Err(Error::InvalidArgumentError(
+                    "MIN accepts exactly one argument".into(),
+                ));
+            }
+            let arg_expr = match &args_slice[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "MIN requires a column argument".into(),
+                    ));
+                }
+            };
+            let column = resolve_column_name(arg_expr)?;
+            llkv_expr::expr::AggregateCall::Min(column)
+        }
+        "max" => {
+            if args_slice.len() != 1 {
+                return Err(Error::InvalidArgumentError(
+                    "MAX accepts exactly one argument".into(),
+                ));
+            }
+            let arg_expr = match &args_slice[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "MAX requires a column argument".into(),
+                    ));
+                }
+            };
+            let column = resolve_column_name(arg_expr)?;
+            llkv_expr::expr::AggregateCall::Max(column)
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(agg_call))
 }
 
 fn parse_count_nulls_case(expr: &SqlExpr) -> SqlResult<Option<String>> {
@@ -1475,6 +2015,17 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
             expr,
         } => translate_scalar(expr),
         SqlExpr::Nested(inner) => translate_scalar(inner),
+        SqlExpr::Function(func) => {
+            // Try to parse as an aggregate function
+            if let Some(agg_call) = try_parse_aggregate_function(func)? {
+                Ok(llkv_expr::expr::ScalarExpr::aggregate(agg_call))
+            } else {
+                Err(Error::InvalidArgumentError(format!(
+                    "unsupported function in scalar expression: {:?}",
+                    func.name
+                )))
+            }
+        }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported scalar expression: {other:?}"
         ))),
@@ -1674,14 +2225,17 @@ mod tests {
         let result = engine
             .execute("CREATE TABLE people (id INT NOT NULL, name TEXT NOT NULL)")
             .expect("create table");
-        assert!(matches!(result[0], StatementResult::CreateTable { .. }));
+        assert!(matches!(
+            result[0],
+            RuntimeStatementResult::CreateTable { .. }
+        ));
 
         let result = engine
             .execute("INSERT INTO people (id, name) VALUES (1, 'alice'), (2, 'bob')")
             .expect("insert rows");
         assert!(matches!(
             result[0],
-            StatementResult::Insert {
+            RuntimeStatementResult::Insert {
                 rows_inserted: 2,
                 ..
             }
@@ -1692,7 +2246,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            StatementResult::Select { execution, .. } => {
+            RuntimeStatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),
@@ -1721,7 +2275,7 @@ mod tests {
             .expect("insert literal");
         assert!(matches!(
             result[0],
-            StatementResult::Insert {
+            RuntimeStatementResult::Insert {
                 rows_inserted: 1,
                 ..
             }
@@ -1732,7 +2286,7 @@ mod tests {
             .expect("insert null literal");
         assert!(matches!(
             result[0],
-            StatementResult::Insert {
+            RuntimeStatementResult::Insert {
                 rows_inserted: 1,
                 ..
             }
@@ -1743,7 +2297,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            StatementResult::Select { execution, .. } => {
+            RuntimeStatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),
@@ -1790,7 +2344,7 @@ mod tests {
             .expect("update rows");
         assert!(matches!(
             result[0],
-            StatementResult::Update {
+            RuntimeStatementResult::Update {
                 rows_updated: 1,
                 ..
             }
@@ -1801,7 +2355,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            StatementResult::Select { execution, .. } => {
+            RuntimeStatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),
@@ -1860,7 +2414,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            StatementResult::Select { execution, .. } => {
+            RuntimeStatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),
@@ -1885,7 +2439,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            StatementResult::Select { execution, .. } => {
+            RuntimeStatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),

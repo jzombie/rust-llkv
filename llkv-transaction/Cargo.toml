@@ -1,5 +1,6 @@
 [package]
 name = "llkv-transaction"
+description = "Transaction management and MVCC for the LLKV toolkit."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -18,5 +19,9 @@ llkv-storage.workspace = true
 llkv-table.workspace = true
 simd-r-drive-entry-handle.workspace = true
 rustc-hash.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
+llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
+tempfile.workspace = true

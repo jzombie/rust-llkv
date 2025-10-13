@@ -75,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = ScanStreamOptions {
         include_nulls: false,
         order: None,
+        row_id_filter: None,
     };
 
     println!("Starting streaming scan...");
@@ -85,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let start = Instant::now();
 
-    table.scan_stream(&[projection], &filter_expr, options, |batch| {
+    table.scan_stream(&[projection], &filter_expr, options.clone(), |batch| {
         batch_count += 1;
         total_rows += batch.num_rows();
 

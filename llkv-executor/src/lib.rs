@@ -1,4 +1,4 @@
-use arrow::array::{ArrayRef, Int64Builder, RecordBatch};
+use arrow::array::{Array, ArrayRef, Int64Builder, RecordBatch};
 use arrow::datatypes::{DataType, Schema};
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::store::Projection as StoreProjection;
@@ -6,16 +6,17 @@ use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_plan::{
     AggregateExpr, AggregateFunction, OrderByPlan, OrderSortType, OrderTarget, PlanValue,
-    SelectPlan,
+    SelectPlan, SelectProjection,
 };
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
 use llkv_table::table::{
-    ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions,
+    RowIdFilter, ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection,
+    ScanStreamOptions,
 };
 use llkv_table::types::FieldId;
+use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
-use std::collections::HashMap;
 use std::fmt;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -53,13 +54,46 @@ where
     }
 
     pub fn execute_select(&self, plan: SelectPlan) -> ExecutorResult<SelectExecution<P>> {
+        self.execute_select_with_filter(plan, None)
+    }
+
+    pub fn execute_select_with_filter(
+        &self,
+        plan: SelectPlan,
+        row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+    ) -> ExecutorResult<SelectExecution<P>> {
         let table = self.provider.get_table(&plan.table)?;
         let display_name = plan.table.clone();
 
         if !plan.aggregates.is_empty() {
-            self.execute_aggregates(table, display_name, plan)
+            self.execute_aggregates(table, display_name, plan, row_filter)
+        } else if self.has_computed_aggregates(&plan) {
+            // Handle computed projections that contain embedded aggregates
+            self.execute_computed_aggregates(table, display_name, plan, row_filter)
         } else {
-            self.execute_projection(table, display_name, plan)
+            self.execute_projection(table, display_name, plan, row_filter)
+        }
+    }
+
+    /// Check if any computed projections contain aggregate functions
+    fn has_computed_aggregates(&self, plan: &SelectPlan) -> bool {
+        plan.projections.iter().any(|proj| {
+            if let SelectProjection::Computed { expr, .. } = proj {
+                Self::expr_contains_aggregate(expr)
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Recursively check if a scalar expression contains aggregates
+    fn expr_contains_aggregate(expr: &ScalarExpr<String>) -> bool {
+        match expr {
+            ScalarExpr::Aggregate(_) => true,
+            ScalarExpr::Binary { left, right, .. } => {
+                Self::expr_contains_aggregate(left) || Self::expr_contains_aggregate(right)
+            }
+            ScalarExpr::Column(_) | ScalarExpr::Literal(_) => false,
         }
     }
 
@@ -68,6 +102,7 @@ where
         table: Arc<ExecutorTable<P>>,
         display_name: String,
         plan: SelectPlan,
+        row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
         let table_ref = table.as_ref();
         let projections = if plan.projections.is_empty() {
@@ -91,14 +126,22 @@ where
 
         let options = if let Some(order_plan) = &plan.order_by {
             let order_spec = resolve_scan_order(table_ref, &projections, order_plan)?;
+            if row_filter.is_some() {
+                tracing::debug!("Applying MVCC row filter with ORDER BY");
+            }
             ScanStreamOptions {
                 include_nulls: true,
                 order: Some(order_spec),
+                row_id_filter: row_filter.clone(),
             }
         } else {
+            if row_filter.is_some() {
+                tracing::debug!("Applying MVCC row filter");
+            }
             ScanStreamOptions {
                 include_nulls: true,
                 order: None,
+                row_id_filter: row_filter.clone(),
             }
         };
 
@@ -118,6 +161,7 @@ where
         table: Arc<ExecutorTable<P>>,
         display_name: String,
         plan: SelectPlan,
+        row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
         let table_ref = table.as_ref();
         let mut specs: Vec<AggregateSpec> = Vec::with_capacity(plan.aggregates.len());
@@ -241,19 +285,34 @@ where
 
         let options = ScanStreamOptions {
             include_nulls: true,
-            ..Default::default()
+            order: None,
+            row_id_filter: row_filter.clone(),
         };
 
         let mut states: Vec<AggregateState> = Vec::with_capacity(specs.len());
+        // MVCC Note: We cannot use the total_rows shortcut when MVCC visibility filtering
+        // is enabled, because some rows may be invisible due to uncommitted or aborted transactions.
+        // Always scan to apply proper visibility rules.
         let mut count_star_override: Option<i64> = None;
-        let total_rows = table.total_rows.load(Ordering::SeqCst);
-        if !had_filter {
+        if !had_filter && row_filter.is_none() {
+            // Only use shortcut if no filter AND no MVCC row filtering
+            let total_rows = table.total_rows.load(Ordering::SeqCst);
+            tracing::debug!(
+                "[AGGREGATE] Using COUNT(*) shortcut: total_rows={}",
+                total_rows
+            );
             if total_rows > i64::MAX as u64 {
                 return Err(Error::InvalidArgumentError(
                     "COUNT(*) result exceeds supported range".into(),
                 ));
             }
             count_star_override = Some(total_rows as i64);
+        } else {
+            tracing::debug!(
+                "[AGGREGATE] NOT using COUNT(*) shortcut: had_filter={}, has_row_filter={}",
+                had_filter,
+                row_filter.is_some()
+            );
         }
 
         for (idx, spec) in specs.iter().enumerate() {
@@ -265,16 +324,27 @@ where
                     count_star_override,
                 )?,
                 override_value: match spec.kind {
-                    AggregateKind::CountStar => count_star_override,
+                    AggregateKind::CountStar => {
+                        tracing::debug!(
+                            "[AGGREGATE] CountStar override_value={:?}",
+                            count_star_override
+                        );
+                        count_star_override
+                    }
                     _ => None,
                 },
             });
         }
 
         let mut error: Option<Error> = None;
-        match table
-            .table
-            .scan_stream(projections, &filter_expr, options, |batch| {
+        match table.table.scan_stream(
+            projections,
+            &filter_expr,
+            ScanStreamOptions {
+                row_id_filter: row_filter.clone(),
+                ..options
+            },
+            |batch| {
                 if error.is_some() {
                     return;
                 }
@@ -284,7 +354,8 @@ where
                         return;
                     }
                 }
-            }) {
+            },
+        ) {
             Ok(()) => {}
             Err(llkv_result::Error::NotFound) => {
                 // Treat missing storage keys as an empty result set. This occurs
@@ -312,6 +383,353 @@ where
             batch,
         ))
     }
+
+    /// Execute a query where computed projections contain embedded aggregates
+    /// This extracts aggregates, computes them, then evaluates the scalar expressions
+    fn execute_computed_aggregates(
+        &self,
+        table: Arc<ExecutorTable<P>>,
+        display_name: String,
+        plan: SelectPlan,
+        row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+    ) -> ExecutorResult<SelectExecution<P>> {
+        use arrow::array::Int64Array;
+        use llkv_expr::expr::AggregateCall;
+
+        let table_ref = table.as_ref();
+
+        // First, extract all unique aggregates from the projections
+        let mut aggregate_specs: Vec<(String, AggregateCall<String>)> = Vec::new();
+        for proj in &plan.projections {
+            if let SelectProjection::Computed { expr, .. } = proj {
+                Self::collect_aggregates(expr, &mut aggregate_specs);
+            }
+        }
+
+        // Compute the aggregates using the existing aggregate execution infrastructure
+        let computed_aggregates = self.compute_aggregate_values(
+            table.clone(),
+            &plan.filter,
+            &aggregate_specs,
+            row_filter.clone(),
+        )?;
+
+        // Now build the final projections by evaluating expressions with aggregates substituted
+        let mut fields = Vec::with_capacity(plan.projections.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(plan.projections.len());
+
+        for proj in &plan.projections {
+            match proj {
+                SelectProjection::AllColumns => {
+                    return Err(Error::InvalidArgumentError(
+                        "AllColumns projection not supported with computed aggregates".into(),
+                    ));
+                }
+                SelectProjection::Column { name, alias } => {
+                    let col = table_ref.schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                    })?;
+                    let field_name = alias.as_ref().unwrap_or(name);
+                    fields.push(arrow::datatypes::Field::new(
+                        field_name,
+                        col.data_type.clone(),
+                        col.nullable,
+                    ));
+                    // For regular columns in an aggregate query, we'd need to handle GROUP BY
+                    // For now, return an error as this is not supported
+                    return Err(Error::InvalidArgumentError(
+                        "Regular columns not supported in aggregate queries without GROUP BY"
+                            .into(),
+                    ));
+                }
+                SelectProjection::Computed { expr, alias } => {
+                    // Evaluate the expression with aggregates substituted
+                    let value = Self::evaluate_expr_with_aggregates(expr, &computed_aggregates)?;
+
+                    fields.push(arrow::datatypes::Field::new(alias, DataType::Int64, false));
+
+                    let array = Arc::new(Int64Array::from(vec![value])) as ArrayRef;
+                    arrays.push(array);
+                }
+            }
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+        Ok(SelectExecution::new_single_batch(
+            display_name,
+            schema,
+            batch,
+        ))
+    }
+
+    /// Collect all aggregate calls from an expression
+    fn collect_aggregates(
+        expr: &ScalarExpr<String>,
+        aggregates: &mut Vec<(String, llkv_expr::expr::AggregateCall<String>)>,
+    ) {
+        match expr {
+            ScalarExpr::Aggregate(agg) => {
+                // Create a unique key for this aggregate
+                let key = format!("{:?}", agg);
+                if !aggregates.iter().any(|(k, _)| k == &key) {
+                    aggregates.push((key, agg.clone()));
+                }
+            }
+            ScalarExpr::Binary { left, right, .. } => {
+                Self::collect_aggregates(left, aggregates);
+                Self::collect_aggregates(right, aggregates);
+            }
+            ScalarExpr::Column(_) | ScalarExpr::Literal(_) => {}
+        }
+    }
+
+    /// Compute the actual values for the aggregates
+    fn compute_aggregate_values(
+        &self,
+        table: Arc<ExecutorTable<P>>,
+        filter: &Option<llkv_expr::expr::Expr<'static, String>>,
+        aggregate_specs: &[(String, llkv_expr::expr::AggregateCall<String>)],
+        row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+    ) -> ExecutorResult<FxHashMap<String, i64>> {
+        use llkv_expr::expr::AggregateCall;
+
+        let table_ref = table.as_ref();
+        let mut results =
+            FxHashMap::with_capacity_and_hasher(aggregate_specs.len(), Default::default());
+
+        // Build aggregate specs for the aggregator
+        let mut specs: Vec<AggregateSpec> = Vec::new();
+        for (key, agg) in aggregate_specs {
+            let kind = match agg {
+                AggregateCall::CountStar => AggregateKind::CountStar,
+                AggregateCall::Count(col_name) => {
+                    let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
+                    })?;
+                    AggregateKind::CountField {
+                        field_id: col.field_id,
+                    }
+                }
+                AggregateCall::Sum(col_name) => {
+                    let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
+                    })?;
+                    AggregateKind::SumInt64 {
+                        field_id: col.field_id,
+                    }
+                }
+                AggregateCall::Min(col_name) => {
+                    let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
+                    })?;
+                    AggregateKind::MinInt64 {
+                        field_id: col.field_id,
+                    }
+                }
+                AggregateCall::Max(col_name) => {
+                    let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
+                    })?;
+                    AggregateKind::MaxInt64 {
+                        field_id: col.field_id,
+                    }
+                }
+                AggregateCall::CountNulls(col_name) => {
+                    let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
+                    })?;
+                    AggregateKind::CountNulls {
+                        field_id: col.field_id,
+                    }
+                }
+            };
+            specs.push(AggregateSpec {
+                alias: key.clone(),
+                kind,
+            });
+        }
+
+        // Prepare filter and projections
+        let filter_expr = match filter {
+            Some(expr) => translate_predicate(expr.clone(), table_ref.schema.as_ref())?,
+            None => {
+                let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "table has no columns; cannot perform aggregate scan".into(),
+                    )
+                })?;
+                full_table_scan_filter(field_id)
+            }
+        };
+
+        let mut projections: Vec<ScanProjection> = Vec::new();
+        let mut spec_to_projection: Vec<Option<usize>> = Vec::with_capacity(specs.len());
+        let count_star_override: Option<i64> = None;
+
+        for spec in &specs {
+            if let Some(field_id) = spec.kind.field_id() {
+                spec_to_projection.push(Some(projections.len()));
+                projections.push(ScanProjection::from(StoreProjection::with_alias(
+                    LogicalFieldId::for_user(table.table.table_id(), field_id),
+                    table
+                        .schema
+                        .column_by_field_id(field_id)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| format!("col{field_id}")),
+                )));
+            } else {
+                spec_to_projection.push(None);
+            }
+        }
+
+        if projections.is_empty() {
+            let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
+                Error::InvalidArgumentError(
+                    "table has no columns; cannot perform aggregate scan".into(),
+                )
+            })?;
+            projections.push(ScanProjection::from(StoreProjection::with_alias(
+                LogicalFieldId::for_user(table.table.table_id(), field_id),
+                table
+                    .schema
+                    .column_by_field_id(field_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| format!("col{field_id}")),
+            )));
+        }
+
+        let base_options = ScanStreamOptions {
+            include_nulls: true,
+            order: None,
+            row_id_filter: None,
+        };
+
+        let mut states: Vec<AggregateState> = Vec::with_capacity(specs.len());
+        for (idx, spec) in specs.iter().enumerate() {
+            states.push(AggregateState {
+                alias: spec.alias.clone(),
+                accumulator: AggregateAccumulator::new_with_projection_index(
+                    spec,
+                    spec_to_projection[idx],
+                    count_star_override,
+                )?,
+                override_value: match spec.kind {
+                    AggregateKind::CountStar => count_star_override,
+                    _ => None,
+                },
+            });
+        }
+
+        let mut error: Option<Error> = None;
+        match table.table.scan_stream(
+            projections,
+            &filter_expr,
+            ScanStreamOptions {
+                row_id_filter: row_filter.clone(),
+                ..base_options
+            },
+            |batch| {
+                if error.is_some() {
+                    return;
+                }
+                for state in &mut states {
+                    if let Err(err) = state.update(&batch) {
+                        error = Some(err);
+                        return;
+                    }
+                }
+            },
+        ) {
+            Ok(()) => {}
+            Err(llkv_result::Error::NotFound) => {}
+            Err(err) => return Err(err),
+        }
+        if let Some(err) = error {
+            return Err(err);
+        }
+
+        // Extract the computed values
+        for state in states {
+            let alias = state.alias.clone();
+            let (_field, array) = state.finalize()?;
+
+            // Extract the i64 value from the array
+            let int64_array = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .ok_or_else(|| Error::Internal("Expected Int64Array from aggregate".into()))?;
+
+            if int64_array.len() != 1 {
+                return Err(Error::Internal(format!(
+                    "Expected single value from aggregate, got {}",
+                    int64_array.len()
+                )));
+            }
+
+            let value = if int64_array.is_null(0) {
+                0
+            } else {
+                int64_array.value(0)
+            };
+
+            results.insert(alias, value);
+        }
+
+        Ok(results)
+    }
+
+    /// Evaluate an expression by substituting aggregate values
+    fn evaluate_expr_with_aggregates(
+        expr: &ScalarExpr<String>,
+        aggregates: &FxHashMap<String, i64>,
+    ) -> ExecutorResult<i64> {
+        use llkv_expr::expr::BinaryOp;
+        use llkv_expr::literal::Literal;
+
+        match expr {
+            ScalarExpr::Literal(Literal::Integer(v)) => Ok(*v as i64),
+            ScalarExpr::Literal(Literal::Float(v)) => Ok(*v as i64),
+            ScalarExpr::Literal(Literal::String(_)) => Err(Error::InvalidArgumentError(
+                "String literals not supported in aggregate expressions".into(),
+            )),
+            ScalarExpr::Column(_) => Err(Error::InvalidArgumentError(
+                "Column references not supported in aggregate-only expressions".into(),
+            )),
+            ScalarExpr::Aggregate(agg) => {
+                let key = format!("{:?}", agg);
+                aggregates.get(&key).copied().ok_or_else(|| {
+                    Error::Internal(format!("Aggregate value not found for key: {}", key))
+                })
+            }
+            ScalarExpr::Binary { left, op, right } => {
+                let left_val = Self::evaluate_expr_with_aggregates(left, aggregates)?;
+                let right_val = Self::evaluate_expr_with_aggregates(right, aggregates)?;
+
+                let result = match op {
+                    BinaryOp::Add => left_val.checked_add(right_val),
+                    BinaryOp::Subtract => left_val.checked_sub(right_val),
+                    BinaryOp::Multiply => left_val.checked_mul(right_val),
+                    BinaryOp::Divide => {
+                        if right_val == 0 {
+                            return Err(Error::InvalidArgumentError("Division by zero".into()));
+                        }
+                        left_val.checked_div(right_val)
+                    }
+                    BinaryOp::Modulo => {
+                        if right_val == 0 {
+                            return Err(Error::InvalidArgumentError("Modulo by zero".into()));
+                        }
+                        left_val.checked_rem(right_val)
+                    }
+                };
+
+                result.ok_or_else(|| {
+                    Error::InvalidArgumentError("Arithmetic overflow in expression".into())
+                })
+            }
+        }
+    }
 }
 
 /// Streaming execution handle for SELECT queries.
@@ -334,7 +752,7 @@ where
         table: Arc<ExecutorTable<P>>,
         projections: Vec<ScanProjection>,
         filter_expr: LlkvExpr<'static, FieldId>,
-        options: ScanStreamOptions,
+        options: ScanStreamOptions<P>,
         full_table_scan: bool,
     },
     Aggregation {
@@ -352,7 +770,7 @@ where
         table: Arc<ExecutorTable<P>>,
         projections: Vec<ScanProjection>,
         filter_expr: LlkvExpr<'static, FieldId>,
-        options: ScanStreamOptions,
+        options: ScanStreamOptions<P>,
         full_table_scan: bool,
     ) -> Self {
         Self {
@@ -412,10 +830,13 @@ where
                 let mut produced = false;
                 let mut produced_rows: u64 = 0;
                 let capture_nulls_first = matches!(options.order, Some(spec) if spec.nulls_first);
+                let include_nulls = options.include_nulls;
+                let has_row_id_filter = options.row_id_filter.is_some();
+                let scan_options = options;
                 let mut buffered_batches: Vec<RecordBatch> = Vec::new();
                 table
                     .table
-                    .scan_stream(projections, &filter_expr, options, |batch| {
+                    .scan_stream(projections, &filter_expr, scan_options, |batch| {
                         if error.is_some() {
                             return;
                         }
@@ -439,7 +860,16 @@ where
                     return Ok(());
                 }
                 let mut null_batches: Vec<RecordBatch> = Vec::new();
-                if options.include_nulls && full_table_scan && produced_rows < total_rows {
+                // Only synthesize null rows if:
+                // 1. include_nulls is true
+                // 2. This is a full table scan
+                // 3. We produced fewer rows than the total
+                // 4. We DON'T have a row_id_filter (e.g., MVCC filter) that intentionally filtered rows
+                if include_nulls
+                    && full_table_scan
+                    && produced_rows < total_rows
+                    && !has_row_id_filter
+                {
                     let missing = total_rows - produced_rows;
                     if missing > 0 {
                         null_batches = synthesize_null_scan(Arc::clone(&schema), missing)?;
@@ -525,7 +955,7 @@ where
 
 pub struct ExecutorSchema {
     pub columns: Vec<ExecutorColumn>,
-    pub lookup: HashMap<String, usize>,
+    pub lookup: FxHashMap<String, usize>,
 }
 
 impl ExecutorSchema {
@@ -550,11 +980,12 @@ pub struct ExecutorColumn {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    pub primary_key: bool,
     pub field_id: FieldId,
 }
 
 // Re-export from llkv-plan
-// PlanValue is the plan-level value type; do not re-export DSL-prefixed symbols.
+// PlanValue is the plan-level value type; do not re-export higher-level prefixed symbols.
 
 // Export executor-local types with explicit Exec-prefixed names to avoid
 // colliding with Arrow / storage types imported above.
@@ -701,8 +1132,6 @@ fn synthesize_null_scan(schema: Arc<Schema>, total_rows: u64) -> ExecutorResult<
     Ok(vec![batch])
 }
 
-// DSL-specific array -> value conversion is provided by llkv-plan::dsl_value_from_array
-
 // Translate predicate from column names to field IDs
 fn translate_predicate(
     expr: llkv_expr::expr::Expr<'static, String>,
@@ -763,5 +1192,43 @@ fn translate_scalar(
             op: *op,
             right: Box::new(translate_scalar(right, schema)?),
         }),
+        ScalarExpr::Aggregate(agg) => {
+            // Translate column names in aggregate calls to field IDs
+            use llkv_expr::expr::AggregateCall;
+            let translated_agg = match agg {
+                AggregateCall::CountStar => AggregateCall::CountStar,
+                AggregateCall::Count(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                    })?;
+                    AggregateCall::Count(column.field_id)
+                }
+                AggregateCall::Sum(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                    })?;
+                    AggregateCall::Sum(column.field_id)
+                }
+                AggregateCall::Min(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                    })?;
+                    AggregateCall::Min(column.field_id)
+                }
+                AggregateCall::Max(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                    })?;
+                    AggregateCall::Max(column.field_id)
+                }
+                AggregateCall::CountNulls(name) => {
+                    let column = schema.resolve(name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                    })?;
+                    AggregateCall::CountNulls(column.field_id)
+                }
+            };
+            Ok(ScalarExpr::Aggregate(translated_agg))
+        }
     }
 }

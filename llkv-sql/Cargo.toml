@@ -1,5 +1,6 @@
 [package]
 name = "llkv-sql"
+description = "SQL interface for the LLKV toolkit."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -12,10 +13,10 @@ arrow = { workspace = true, default-features = false }
 async-trait.workspace = true
 libtest-mimic.workspace = true
 llkv-column-map.workspace = true
-llkv-dsl.workspace = true
-llkv-result.workspace = true
-llkv-storage.workspace = true
 llkv-expr.workspace = true
+llkv-result.workspace = true
+llkv-runtime.workspace = true
+llkv-storage.workspace = true
 llkv-table.workspace = true
 llkv-transaction.workspace = true
 llkv-test-utils = { workspace = true, features = ["auto-init"] }
@@ -29,6 +30,7 @@ llkv-plan.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
 
 [[test]]
 name = "slt_harness"

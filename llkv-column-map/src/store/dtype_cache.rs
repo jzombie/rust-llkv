@@ -1,6 +1,6 @@
 use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{ColumnDescriptor, DescriptorIterator};
-use crate::types::LogicalFieldId;
+use crate::types::{LogicalFieldId, ROW_ID_FIELD_ID};
 use arrow::datatypes::DataType;
 use llkv_result::{Error, Result};
 use llkv_storage::{
@@ -76,10 +76,26 @@ where
             return Ok(dt);
         }
 
+        if field_id.field_id() == ROW_ID_FIELD_ID {
+            let dt = DataType::UInt64;
+            self.cache.write().unwrap().insert(field_id, dt.clone());
+            return Ok(dt);
+        }
+
         // Lookup descriptor pk
         let descriptor_pk = {
             let catalog = self.catalog.read().unwrap();
-            *catalog.map.get(&field_id).ok_or(Error::NotFound)?
+            let result = catalog.map.get(&field_id);
+            if result.is_none() && (field_id.table_id() == 1 || field_id.table_id() == 2) {
+                tracing::trace!(
+                    "!!! DTYPE_FOR_FIELD: NOT FOUND for field_id table_id={} field_id={}, DTypeCache at {:p}, catalog has {} entries",
+                    field_id.table_id(),
+                    field_id.field_id(),
+                    self as *const _,
+                    catalog.map.len()
+                );
+            }
+            *result.ok_or(Error::NotFound)?
         };
 
         // Load descriptor to gather first non-empty meta

@@ -1,4 +1,26 @@
-//! System catalog stored inside ColumnStore (table id 0).
+//! System catalog for storing table and column metadata.
+//!
+//! The system catalog uses table 0 (reserved) to store metadata about all tables
+//! and columns in the database. This metadata includes:
+//!
+//! - **Table metadata** ([`TableMeta`]): Table ID, name, creation time, flags
+//! - **Column metadata** ([`ColMeta`]): Column ID, name, flags, default values
+//!
+//! # Storage Format
+//!
+//! The catalog stores metadata as serialized [`bitcode`] blobs in special catalog
+//! columns within table 0. See [`CATALOG_TABLE_ID`] and related constants in the
+//! [`reserved`](crate::reserved) module.
+//!
+//! # Usage
+//!
+//! The [`SysCatalog`] provides methods to:
+//! - Insert/update table metadata ([`put_table_meta`](SysCatalog::put_table_meta))
+//! - Query table metadata ([`get_table_meta`](SysCatalog::get_table_meta))
+//! - Manage column metadata similarly
+//!
+//! This metadata is used by higher-level components to validate schemas, assign
+//! field IDs, and enforce table constraints.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,20 +46,8 @@ use llkv_result::{self, Result as LlkvResult};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
-// ----- Catalog constants -----
-
-/// Reserved table id used for the system catalog itself.
-pub const CATALOG_TABLE_ID: TableId = 0;
-
-/// Column id storing serialized `TableMeta` entries (bitcode-encoded).
-/// Field id for serialized `TableMeta` entries (bitcode-encoded).
-const CATALOG_FIELD_TABLE_META_ID: u32 = 1;
-/// Field id for serialized `ColMeta` entries (bitcode-encoded).
-const CATALOG_FIELD_COL_META_ID: u32 = 10;
-/// Field id for the next available user table id (the cell value is persisted as `UInt64`).
-const CATALOG_FIELD_NEXT_TABLE_ID: u32 = 100;
-/// Row id reserved for the singleton next-table-id value.
-const CATALOG_NEXT_TABLE_ROW_ID: u64 = 0;
+// Import all reserved constants and validation functions
+use crate::reserved::*;
 
 // ----- Namespacing helpers -----
 
@@ -68,25 +78,50 @@ fn rid_col(table_id: TableId, col_id: u32) -> u64 {
 
 // ----- Public catalog types -----
 
+/// Metadata about a table.
+///
+/// Stored in the system catalog (table 0) and serialized using [`bitcode`].
 #[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
 pub struct TableMeta {
+    /// Unique identifier for this table.
     pub table_id: TableId,
+    /// Optional human-readable name for the table.
     pub name: Option<String>,
+    /// When the table was created (microseconds since epoch).
     pub created_at_micros: u64,
+    /// Bitflags for table properties (e.g., temporary, system).
     pub flags: u32,
+    /// Schema version or modification counter.
     pub epoch: u64,
 }
 
+/// Metadata about a column.
+///
+/// Stored in the system catalog (table 0) and serialized using [`bitcode`].
 #[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
 pub struct ColMeta {
+    /// Unique identifier for this column within its table.
     pub col_id: u32,
+    /// Optional human-readable name for the column.
     pub name: Option<String>,
+    /// Bitflags for column properties (e.g., nullable, indexed).
     pub flags: u32,
+    /// Optional serialized default value for the column.
     pub default: Option<Vec<u8>>,
 }
 
 // ----- SysCatalog -----
 
+/// Interface to the system catalog (table 0).
+///
+/// The system catalog stores metadata about all tables and columns in the database.
+/// It uses special reserved columns within table 0 to persist [`TableMeta`] and
+/// [`ColMeta`] structures.
+///
+/// # Lifetime
+///
+/// `SysCatalog` borrows a reference to the [`ColumnStore`] and does not own it.
+/// This allows multiple catalog instances to coexist with the same storage.
 pub struct SysCatalog<'a, P = MemPager>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -98,11 +133,15 @@ impl<'a, P> SysCatalog<'a, P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    /// Create a new system catalog interface using the provided column store.
     pub fn new(store: &'a ColumnStore<P>) -> Self {
         Self { store }
     }
 
-    /// Upsert table metadata.
+    /// Insert or update table metadata.
+    ///
+    /// This persists the table's metadata to the system catalog. If metadata for
+    /// this table ID already exists, it is overwritten (last-write-wins).
     pub fn put_table_meta(&self, meta: &TableMeta) {
         let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_TABLE_META_ID).into();
         let schema = Arc::new(Schema::new(vec![
@@ -121,7 +160,9 @@ where
         self.store.append(&batch).unwrap();
     }
 
-    /// Fetch table metadata by table_id.
+    /// Retrieve table metadata by table ID.
+    ///
+    /// Returns `None` if no metadata exists for the given table ID.
     pub fn get_table_meta(&self, table_id: TableId) -> Option<TableMeta> {
         struct MetaVisitor {
             target_rid: u64,
@@ -299,6 +340,243 @@ where
 
         let logical: LogicalFieldId = max_value.into();
         Ok(Some(logical.table_id()))
+    }
+
+    /// Scan all table metadata entries from the catalog.
+    /// Returns a vector of (table_id, TableMeta) pairs for all persisted tables.
+    ///
+    /// This method first scans for all row IDs in the table metadata column,
+    /// then uses gather_rows to retrieve the actual metadata.
+    pub fn all_table_metas(&self) -> LlkvResult<Vec<(TableId, TableMeta)>> {
+        let meta_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_TABLE_META_ID);
+        let row_field = rowid_fid(meta_field);
+
+        // Collect all row IDs that have table metadata
+        struct RowIdCollector {
+            row_ids: Vec<u64>,
+        }
+
+        impl PrimitiveVisitor for RowIdCollector {
+            fn u64_chunk(&mut self, values: &UInt64Array) {
+                for i in 0..values.len() {
+                    self.row_ids.push(values.value(i));
+                }
+            }
+        }
+        impl PrimitiveWithRowIdsVisitor for RowIdCollector {}
+        impl PrimitiveSortedVisitor for RowIdCollector {}
+        impl PrimitiveSortedWithRowIdsVisitor for RowIdCollector {}
+
+        let mut collector = RowIdCollector {
+            row_ids: Vec::new(),
+        };
+        match ScanBuilder::new(self.store, row_field)
+            .options(ScanOptions::default())
+            .run(&mut collector)
+        {
+            Ok(()) => {}
+            Err(llkv_result::Error::NotFound) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        }
+
+        if collector.row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Gather all table metadata using the collected row IDs
+        let batch = self.store.gather_rows(
+            &[meta_field],
+            &collector.row_ids,
+            GatherNullPolicy::IncludeNulls,
+        )?;
+
+        let meta_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal("catalog table_meta column should be Binary".into())
+            })?;
+
+        let mut result = Vec::new();
+        for (idx, &row_id) in collector.row_ids.iter().enumerate() {
+            if !meta_col.is_null(idx) {
+                let bytes = meta_col.value(idx);
+                if let Ok(meta) = bitcode::decode::<TableMeta>(bytes) {
+                    let logical: LogicalFieldId = row_id.into();
+                    let table_id = logical.table_id();
+                    result.push((table_id, meta));
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Persist the next transaction id to the catalog.
+    pub fn put_next_txn_id(&self, next_txn_id: u64) -> LlkvResult<()> {
+        let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_NEXT_TXN_ID).into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("next_txn_id", DataType::UInt64, false).with_metadata(HashMap::from([(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            )])),
+        ]));
+
+        let row_id = Arc::new(UInt64Array::from(vec![CATALOG_NEXT_TXN_ROW_ID]));
+        let value_array = Arc::new(UInt64Array::from(vec![next_txn_id]));
+        let batch = RecordBatch::try_new(schema, vec![row_id, value_array])?;
+        self.store.append(&batch)?;
+        Ok(())
+    }
+
+    /// Load the next transaction id from the catalog.
+    pub fn get_next_txn_id(&self) -> LlkvResult<Option<u64>> {
+        let lfid = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_NEXT_TXN_ID);
+        let batch = match self.store.gather_rows(
+            &[lfid],
+            &[CATALOG_NEXT_TXN_ROW_ID],
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(batch) => batch,
+            Err(llkv_result::Error::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        if batch.num_columns() == 0 || batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal(
+                    "catalog next_txn_id column stored unexpected type".into(),
+                )
+            })?;
+        if array.is_empty() || array.is_null(0) {
+            return Ok(None);
+        }
+
+        let value = array.value(0);
+        Ok(Some(value))
+    }
+
+    /// Persist the last committed transaction id to the catalog.
+    pub fn put_last_committed_txn_id(&self, last_committed: u64) -> LlkvResult<()> {
+        let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_LAST_COMMITTED_TXN_ID).into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("last_committed_txn_id", DataType::UInt64, false).with_metadata(
+                HashMap::from([(
+                    crate::constants::FIELD_ID_META_KEY.to_string(),
+                    lfid_val.to_string(),
+                )]),
+            ),
+        ]));
+
+        let row_id = Arc::new(UInt64Array::from(vec![CATALOG_LAST_COMMITTED_TXN_ROW_ID]));
+        let value_array = Arc::new(UInt64Array::from(vec![last_committed]));
+        let batch = RecordBatch::try_new(schema, vec![row_id, value_array])?;
+        self.store.append(&batch)?;
+        Ok(())
+    }
+
+    /// Load the last committed transaction id from the catalog.
+    pub fn get_last_committed_txn_id(&self) -> LlkvResult<Option<u64>> {
+        let lfid = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_LAST_COMMITTED_TXN_ID);
+        let batch = match self.store.gather_rows(
+            &[lfid],
+            &[CATALOG_LAST_COMMITTED_TXN_ROW_ID],
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(batch) => batch,
+            Err(llkv_result::Error::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        if batch.num_columns() == 0 || batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal(
+                    "catalog last_committed_txn_id column stored unexpected type".into(),
+                )
+            })?;
+        if array.is_empty() || array.is_null(0) {
+            return Ok(None);
+        }
+
+        let value = array.value(0);
+        Ok(Some(value))
+    }
+
+    /// Persist the catalog state to the system catalog.
+    ///
+    /// Stores the complete catalog state (all tables and fields) as a binary blob
+    /// using bitcode serialization.
+    pub fn put_catalog_state(&self, state: &crate::catalog::TableCatalogState) -> LlkvResult<()> {
+        let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_CATALOG_STATE).into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("catalog_state", DataType::Binary, false).with_metadata(HashMap::from([(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            )])),
+        ]));
+
+        let row_id = Arc::new(UInt64Array::from(vec![CATALOG_STATE_ROW_ID]));
+        let encoded = bitcode::encode(state);
+        let state_bytes = Arc::new(BinaryArray::from(vec![encoded.as_slice()]));
+
+        let batch = RecordBatch::try_new(schema, vec![row_id, state_bytes])?;
+        self.store.append(&batch)?;
+        Ok(())
+    }
+
+    /// Load the catalog state from the system catalog.
+    ///
+    /// Retrieves the complete catalog state including all table and field mappings.
+    pub fn get_catalog_state(&self) -> LlkvResult<Option<crate::catalog::TableCatalogState>> {
+        let lfid = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_CATALOG_STATE);
+        let batch = match self.store.gather_rows(
+            &[lfid],
+            &[CATALOG_STATE_ROW_ID],
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(batch) => batch,
+            Err(llkv_result::Error::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        if batch.num_columns() == 0 || batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal("catalog state column stored unexpected type".into())
+            })?;
+        if array.is_empty() || array.is_null(0) {
+            return Ok(None);
+        }
+
+        let bytes = array.value(0);
+        let state = bitcode::decode(bytes).map_err(|e| {
+            llkv_result::Error::Internal(format!("Failed to decode catalog state: {}", e))
+        })?;
+        Ok(Some(state))
     }
 }
 

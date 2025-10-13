@@ -1175,16 +1175,17 @@ checksum = "cd945864f07fe9f5371a27ad7b52a172b4b499999f1d97574c9fa68373937e12"
 
 [[package]]
 name = "llkv-aggregate"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "arrow",
+ "llkv-plan",
  "llkv-result",
  "llkv-table",
 ]
 
 [[package]]
 name = "llkv-column-map"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -1206,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-csv"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "arrow",
  "llkv-column-map",
@@ -1221,27 +1222,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "llkv-dsl"
-version = "0.2.0-alpha"
-dependencies = [
- "arrow",
- "llkv-column-map",
- "llkv-executor",
- "llkv-expr",
- "llkv-plan",
- "llkv-result",
- "llkv-storage",
- "llkv-table",
- "llkv-transaction",
- "simd-r-drive-entry-handle",
- "sqlparser",
- "time",
- "tracing",
-]
-
-[[package]]
 name = "llkv-executor"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "arrow",
  "llkv-aggregate",
@@ -1251,6 +1233,8 @@ dependencies = [
  "llkv-result",
  "llkv-storage",
  "llkv-table",
+ "llkv-test-utils",
+ "rustc-hash",
  "simd-r-drive-entry-handle",
  "time",
  "tracing",
@@ -1258,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-expr"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -1267,7 +1251,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-join"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "arrow",
  "criterion",
@@ -1285,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-plan"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "arrow",
  "llkv-expr",
@@ -1298,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-result"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "arrow",
  "llkv-test-utils",
@@ -1306,17 +1290,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-runtime"
+version = "0.3.0-alpha"
+dependencies = [
+ "arrow",
+ "llkv-column-map",
+ "llkv-executor",
+ "llkv-expr",
+ "llkv-plan",
+ "llkv-result",
+ "llkv-storage",
+ "llkv-table",
+ "llkv-test-utils",
+ "llkv-transaction",
+ "rustc-hash",
+ "simd-r-drive-entry-handle",
+ "sqlparser",
+ "time",
+ "tracing",
+]
+
+[[package]]
 name = "llkv-sql"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "arrow",
  "async-trait",
  "libtest-mimic 0.6.1",
  "llkv-column-map",
- "llkv-dsl",
  "llkv-expr",
  "llkv-plan",
  "llkv-result",
+ "llkv-runtime",
  "llkv-storage",
  "llkv-table",
  "llkv-test-utils",
@@ -1332,7 +1337,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-storage"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "arrow",
  "llkv-result",
@@ -1347,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-table"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -1370,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-test-utils"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "ctor",
  "libtest-mimic 0.6.1",
@@ -1384,7 +1389,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-transaction"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "arrow",
  "llkv-column-map",
@@ -1394,8 +1399,11 @@ dependencies = [
  "llkv-result",
  "llkv-storage",
  "llkv-table",
+ "llkv-test-utils",
  "rustc-hash",
  "simd-r-drive-entry-handle",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -2788,11 +2796,3 @@ dependencies = [
  "quote",
  "syn",
 ]
-
-[[patch.unused]]
-name = "simd-r-drive"
-version = "0.14.0-alpha"
-
-[[patch.unused]]
-name = "simd-r-drive-entry-handle"
-version = "0.14.0-alpha"

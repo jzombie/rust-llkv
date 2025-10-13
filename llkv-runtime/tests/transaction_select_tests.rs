@@ -1,15 +1,15 @@
-use llkv_dsl::{
-    AggregateExpr, ColumnSpec, CreateTablePlan, DslContext, InsertPlan, InsertSource, SelectPlan,
-    SelectProjection,
-};
 use llkv_plan::PlanValue;
+use llkv_runtime::{
+    AggregateExpr, ColumnSpec, CreateTablePlan, InsertPlan, InsertSource, RuntimeContext,
+    RuntimeStatementResult, SelectPlan,
+};
 use llkv_storage::pager::MemPager;
 use std::sync::Arc;
 
 #[test]
-fn test_dsl_transaction_select() {
+fn test_transaction_select() {
     let pager = Arc::new(MemPager::default());
-    let ctx = Arc::new(DslContext::new(pager));
+    let ctx = Arc::new(RuntimeContext::new(pager));
     let session = ctx.create_session();
 
     // Create table
@@ -20,6 +20,7 @@ fn test_dsl_transaction_select() {
             ColumnSpec::new("name", arrow::datatypes::DataType::Utf8, true),
         ],
         if_not_exists: false,
+        or_replace: false,
         source: None,
     };
     session.create_table_plan(create_plan).unwrap();
@@ -49,14 +50,14 @@ fn test_dsl_transaction_select() {
     };
     session.insert(insert_plan2).unwrap();
 
-    // SELECT within transaction should see all 3 rows
-    let select_plan = SelectPlan::new("users").with_projections(vec![SelectProjection::AllColumns]);
-    let result = session.select(select_plan).unwrap();
+    // Select all rows (should see 3)
+    let select_plan = SelectPlan::new("users");
+    let result1 = session.select(select_plan).unwrap();
 
-    if let llkv_dsl::StatementResult::Select { execution, .. } = result {
+    if let RuntimeStatementResult::Select { execution, .. } = result1 {
         let batches = execution.collect().unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 3, "Should see 3 rows in transaction");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 3);
     } else {
         panic!("Expected SELECT result");
     }
@@ -64,24 +65,23 @@ fn test_dsl_transaction_select() {
     // Rollback
     session.rollback_transaction().unwrap();
 
-    // SELECT after rollback should only see 2 rows
-    let select_plan2 =
-        SelectPlan::new("users").with_projections(vec![SelectProjection::AllColumns]);
+    // Select again (should see only 2 - Charlie should be gone)
+    let select_plan2 = SelectPlan::new("users");
     let result2 = session.select(select_plan2).unwrap();
 
-    if let llkv_dsl::StatementResult::Select { execution, .. } = result2 {
+    if let RuntimeStatementResult::Select { execution, .. } = result2 {
         let batches = execution.collect().unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 2, "Should see only 2 rows after rollback");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
     } else {
         panic!("Expected SELECT result");
     }
 }
 
 #[test]
-fn test_dsl_transaction_select_with_aggregates() {
+fn test_transaction_select_with_aggregates() {
     let pager = Arc::new(MemPager::default());
-    let ctx = Arc::new(DslContext::new(pager));
+    let ctx = Arc::new(RuntimeContext::new(pager));
     let session = ctx.create_session();
 
     // Create table
@@ -92,6 +92,7 @@ fn test_dsl_transaction_select_with_aggregates() {
             ColumnSpec::new("price", arrow::datatypes::DataType::Int64, true),
         ],
         if_not_exists: false,
+        or_replace: false,
         source: None,
     };
     session.create_table_plan(create_plan).unwrap();
@@ -123,7 +124,7 @@ fn test_dsl_transaction_select_with_aggregates() {
         .with_aggregates(vec![AggregateExpr::sum_int64("price", "total_price")]);
     let result = session.select(select_plan).unwrap();
 
-    if let llkv_dsl::StatementResult::Select { execution, .. } = result {
+    if let RuntimeStatementResult::Select { execution, .. } = result {
         let batches = execution.collect().unwrap();
         assert_eq!(batches.len(), 1);
         let array = batches[0]
@@ -146,7 +147,7 @@ fn test_dsl_transaction_select_with_aggregates() {
         .with_aggregates(vec![AggregateExpr::sum_int64("price", "total_price")]);
     let result2 = session.select(select_plan2).unwrap();
 
-    if let llkv_dsl::StatementResult::Select { execution, .. } = result2 {
+    if let RuntimeStatementResult::Select { execution, .. } = result2 {
         let batches = execution.collect().unwrap();
         assert_eq!(batches.len(), 1);
         let array = batches[0]

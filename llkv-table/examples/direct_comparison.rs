@@ -359,6 +359,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let options = ScanStreamOptions {
             include_nulls: false,
             order: None,
+            row_id_filter: None,
         };
 
         let mut total_rows = 0;

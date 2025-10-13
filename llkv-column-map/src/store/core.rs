@@ -23,6 +23,30 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{Arc, RwLock};
 
+/// Columnar storage engine for managing Arrow-based data.
+///
+/// `ColumnStore` provides the primary interface for persisting and retrieving columnar
+/// data using Apache Arrow [`RecordBatch`]es. It manages:
+///
+/// - Column descriptors and metadata (chunk locations, row counts, min/max values)
+/// - Data type caching for efficient schema queries
+/// - Index management (presence indexes, value indexes)
+/// - Integration with the [`Pager`] for persistent storage
+///
+/// # Namespaces
+///
+/// Columns are identified by [`LogicalFieldId`], which combines a namespace, table ID,
+/// and field ID. This prevents collisions between user data, row IDs, and MVCC metadata:
+///
+/// - `UserData`: Regular table columns
+/// - `RowIdShadow`: Internal row ID tracking
+/// - `TxnCreatedBy`: MVCC transaction creation timestamps
+/// - `TxnDeletedBy`: MVCC transaction deletion timestamps
+///
+/// # Thread Safety
+///
+/// `ColumnStore` is `Send + Sync` and can be safely shared across threads via `Arc`.
+/// Internal state (catalog, caches) uses `RwLock` for concurrent access.
 pub struct ColumnStore<P: Pager> {
     pub(crate) pager: Arc<P>,
     pub(crate) catalog: Arc<RwLock<ColumnCatalog>>,
@@ -35,6 +59,15 @@ impl<P> ColumnStore<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    /// Open or create a `ColumnStore` using the provided pager.
+    ///
+    /// This loads the column catalog from the pager's root catalog key, or initializes
+    /// an empty catalog if none exists. The catalog maps [`LogicalFieldId`] to the
+    /// physical keys of column descriptors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pager fails to load the catalog or if deserialization fails.
     pub fn open(pager: Arc<P>) -> Result<Self> {
         let cfg = ColumnStoreConfig::default();
         let catalog = match pager
@@ -59,17 +92,39 @@ where
         })
     }
 
-    /// Registers an index for a given column, building it for existing data atomically and with low memory usage.
+    /// Create and persist an index for a column.
+    ///
+    /// This builds the specified index type for all existing data in the column and
+    /// persists it atomically. The index will be maintained automatically on subsequent
+    /// appends and updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if index creation fails.
     pub fn register_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
         self.index_manager.register_index(self, field_id, kind)
     }
 
-    /// Unregisters a persisted index from a given column atomically.
+    /// Remove a persisted index from a column.
+    ///
+    /// This atomically removes the index and frees associated storage. The column data
+    /// itself is not affected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column or index doesn't exist.
     pub fn unregister_index(&self, field_id: LogicalFieldId, kind: IndexKind) -> Result<()> {
         self.index_manager.unregister_index(self, field_id, kind)
     }
 
-    /// Returns the Arrow data type of the given field, loading it if not cached.
+    /// Get the Arrow data type of a column.
+    ///
+    /// This returns the data type from cache if available, otherwise loads it from
+    /// the column descriptor and caches it for future queries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if the descriptor is corrupted.
     pub fn data_type(&self, field_id: LogicalFieldId) -> Result<DataType> {
         if let Some(dt) = self.dtype_cache.cached_data_type(field_id) {
             return Ok(dt);
@@ -77,7 +132,15 @@ where
         self.dtype_cache.dtype_for_field(field_id)
     }
 
-    /// Collects the row ids whose values satisfy the provided predicate.
+    /// Find all row IDs where a column satisfies a predicate.
+    ///
+    /// This evaluates the predicate against the column's data and returns a vector
+    /// of matching row IDs. Uses indexes and chunk metadata (min/max values) to
+    /// skip irrelevant data when possible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if chunk data is corrupted.
     pub fn filter_row_ids<T>(
         &self,
         field_id: LogicalFieldId,
@@ -86,9 +149,17 @@ where
     where
         T: FilterDispatch,
     {
-        T::run_filter(self, field_id, predicate)
+        tracing::trace!(field=?field_id, "filter_row_ids start");
+        let res = T::run_filter(self, field_id, predicate);
+        if let Err(ref err) = res {
+            tracing::trace!(field=?field_id, error=?err, "filter_row_ids error");
+        } else {
+            tracing::trace!(field=?field_id, "filter_row_ids ok");
+        }
+        res
     }
 
+    // TODO: Document
     pub fn filter_matches<T, F>(
         &self,
         field_id: LogicalFieldId,
@@ -101,7 +172,14 @@ where
         T::run_filter_with_result(self, field_id, predicate)
     }
 
-    /// Lists the names of all persisted indexes for a given column.
+    /// List all indexes registered for a column.
+    ///
+    /// Returns the types of indexes (e.g., presence, value) that are currently
+    /// persisted for the specified column.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if the descriptor is corrupted.
     pub fn list_persisted_indexes(&self, field_id: LogicalFieldId) -> Result<Vec<IndexKind>> {
         let catalog = self.catalog.read().unwrap();
         let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
@@ -121,11 +199,14 @@ where
         Ok(kinds)
     }
 
-    /// Return the total number of rows recorded for the given logical field.
+    /// Get the total number of rows in a column.
     ///
-    /// This reads the ColumnDescriptor.total_row_count stored in the catalog and
-    /// descriptor pages and returns it as a u64. The value is updated by append
-    /// / delete code paths and represents the persisted row count for that column.
+    /// Returns the persisted row count from the column's descriptor. This value is
+    /// updated by append and delete operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if the descriptor is corrupted.
     pub fn total_rows_for_field(&self, field_id: LogicalFieldId) -> Result<u64> {
         let catalog = self.catalog.read().unwrap();
         let desc_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
@@ -145,12 +226,14 @@ where
         Ok(desc.total_row_count)
     }
 
-    /// Return the total number of rows for a table by inspecting any persisted
-    /// user-data column descriptor belonging to `table_id`.
+    /// Get the total number of rows in a table.
     ///
-    /// This method picks the first user-data column found in the in-memory
-    /// catalog for the table and returns its descriptor.total_row_count. If the
-    /// table has no persisted columns, `Ok(0)` is returned.
+    /// This returns the maximum row count across all user-data columns in the table.
+    /// If the table has no persisted columns, returns `0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if column descriptors cannot be loaded.
     pub fn total_rows_for_table(&self, table_id: crate::types::TableId) -> Result<u64> {
         use crate::types::Namespace;
         // Acquire read lock on catalog and find any matching user-data field
@@ -179,7 +262,11 @@ where
         Ok(max_rows)
     }
 
-    /// Return the logical field identifiers for all user columns in `table_id`.
+    /// Get all user-data column IDs for a table.
+    ///
+    /// This returns the [`LogicalFieldId`]s of all persisted user columns (namespace
+    /// `UserData`) belonging to the specified table. MVCC and row ID columns are not
+    /// included.
     pub fn user_field_ids_for_table(&self, table_id: crate::types::TableId) -> Vec<LogicalFieldId> {
         use crate::types::Namespace;
 
@@ -192,9 +279,16 @@ where
             .collect()
     }
 
-    /// Fast presence check using the presence index (row-id permutation) if available.
-    /// Returns true if `row_id` exists in the column; false otherwise.
-    pub fn has_row_id(&self, field_id: LogicalFieldId, row_id: u64) -> Result<bool> {
+    /// Check whether a specific row ID exists in a column.
+    ///
+    /// This uses presence indexes and binary search when available for fast lookups.
+    /// If no presence index exists, it scans chunks and uses min/max metadata to
+    /// prune irrelevant data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if chunk data is corrupted.
+    pub fn has_row_id(&self, field_id: LogicalFieldId, row_id: RowId) -> Result<bool> {
         let rid_fid = rowid_fid(field_id);
         let catalog = self.catalog.read().unwrap();
         let rid_desc_pk = *catalog.map.get(&rid_fid).ok_or(Error::NotFound)?;
@@ -288,45 +382,34 @@ where
     }
 
     // TODO: Set up a way to optionally auto-increment a row ID column if not provided.
-
-    /// NOTE (logical table separation):
+    /// Append a [`RecordBatch`] to the store.
     ///
-    /// The ColumnStore stores data per logical field (a LogicalFieldId) rather
-    /// than per 'table' directly. A LogicalFieldId encodes a namespace and a
-    /// table id together (see [crate::types::LogicalFieldId]). This design lets
-    /// multiple tables share the same underlying storage layer without
-    /// collisions because every persisted column descriptor, chunk chain and
-    /// presence/permutation index is keyed by the full LogicalFieldId.
+    /// The batch must include a `rowid` column (type `UInt64`) that uniquely identifies
+    /// each row. Each other column must have `field_id` metadata mapping it to a
+    /// [`LogicalFieldId`].
     ///
-    /// Concretely:
-    /// - `catalog.map` maps each LogicalFieldId -> descriptor physical key .
-    /// - Each ColumnDescriptor contains chunk metadata and a persisted
-    ///   `total_row_count` for that logical field only.
-    /// - Row-id shadow columns (presence/permutation indices) are created per
-    ///   logical field (they are derived from the LogicalFieldId) and are used
-    ///   for fast existence checks and indexed gathers.
+    /// ## Last-Write-Wins Updates
     ///
-    /// The `append` implementation below expects incoming RecordBatches to be
-    /// namespaced: each field's metadata contains a "field_id" that, when
-    /// combined with the current table id, maps to the LogicalFieldId the
-    /// ColumnStore will append into. This ensures that appends for different
-    /// tables never overwrite each other's descriptors or chunks because the
-    /// LogicalFieldId namespace keeps them separate.
+    /// If any row IDs in the batch already exist, they are updated in-place (overwritten)
+    /// rather than creating duplicates. This happens in a separate transaction before
+    /// appending new rows.
     ///
-    /// Constraints and recommended usage:
-    /// - A single `RecordBatch` carries exactly one `ROW_ID` column which is
-    ///   shared by all other columns in that batch. Because of this, a batch
-    ///   is implicitly tied to a single table's row-id space and should not
-    ///   mix columns from different tables.
-    /// - To append data for multiple tables, create separate `RecordBatch`
-    ///   instances (one per table) and call `append` for each. These calls
-    ///   may be executed concurrently for throughput; the ColumnStore persists
-    ///   data per-logical-field so physical writes won't collide.
-    /// - If you need an atomic multi-table append, the current API does not
-    ///   provide that; you'd need a higher-level coordinator that issues the
-    ///   per-table appends within a single transaction boundary (or extend the
-    ///   API to accept per-column row-id arrays). Such a change is more
-    ///   invasive and requires reworking LWW/commit logic.
+    /// ## Row ID Ordering
+    ///
+    /// The batch is automatically sorted by `rowid` if not already sorted. This ensures
+    /// efficient metadata updates and naturally sorted shadow columns.
+    ///
+    /// ## Table Separation
+    ///
+    /// Each batch should contain columns from only one table. To append to multiple
+    /// tables, call `append` separately for each table's batch (may be concurrent).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The batch is missing the `rowid` column
+    /// - Column metadata is missing or invalid
+    /// - Storage operations fail
     #[allow(unused_variables, unused_assignments)] // TODO: Keep `presence_index_created`?
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         // --- PHASE 1: PRE-PROCESSING THE INCOMING BATCH ---
@@ -476,6 +559,7 @@ where
             }
 
             let field = append_schema.field(i);
+
             let field_id = field
                 .metadata()
                 .get(crate::store::FIELD_ID_META_KEY)
@@ -896,6 +980,11 @@ where
         rows_to_delete: &[RowId],
         staged_puts: &mut Vec<BatchPut>,
     ) -> Result<bool> {
+        tracing::warn!(
+            field_id = ?field_id,
+            rows = rows_to_delete.len(),
+            "delete_rows stage_delete_rows_for_field: start"
+        );
         use crate::store::descriptor::DescriptorIterator;
         use crate::store::ingest::ChunkEdit;
 
@@ -910,16 +999,41 @@ where
 
         // Lookup descriptors (data and optional row_id).
         let catalog = self.catalog.read().unwrap();
-        let desc_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+        let desc_pk = match catalog.map.get(&field_id) {
+            Some(pk) => *pk,
+            None => {
+                tracing::trace!(
+                    field_id = ?field_id,
+                    "delete_rows stage_delete_rows_for_field: data descriptor missing"
+                );
+                return Err(Error::NotFound);
+            }
+        };
         let rid_fid = rowid_fid(field_id);
         let desc_pk_rid = catalog.map.get(&rid_fid).copied();
+        tracing::warn!(
+            field_id = ?field_id,
+            desc_pk,
+            desc_pk_rid = ?desc_pk_rid,
+            "delete_rows stage_delete_rows_for_field: descriptor keys"
+        );
 
         // Batch fetch descriptor blobs up front.
         let mut gets = vec![BatchGet::Raw { key: desc_pk }];
         if let Some(pk) = desc_pk_rid {
             gets.push(BatchGet::Raw { key: pk });
         }
-        let results = self.pager.batch_get(&gets)?;
+        let results = match self.pager.batch_get(&gets) {
+            Ok(res) => res,
+            Err(err) => {
+                tracing::trace!(
+                    field_id = ?field_id,
+                    error = ?err,
+                    "delete_rows stage_delete_rows_for_field: descriptor batch_get failed"
+                );
+                return Err(err);
+            }
+        };
         let mut blobs_by_pk = FxHashMap::default();
         for res in results {
             if let GetResult::Raw { key, bytes } = res {
@@ -927,7 +1041,19 @@ where
             }
         }
 
+        tracing::warn!(
+            field_id = ?field_id,
+            desc_blob_found = blobs_by_pk.contains_key(&desc_pk),
+            rid_blob_found = desc_pk_rid.map(|pk| blobs_by_pk.contains_key(&pk)),
+            "delete_rows stage_delete_rows_for_field: descriptor fetch status"
+        );
+
         let desc_blob = blobs_by_pk.remove(&desc_pk).ok_or_else(|| {
+            tracing::trace!(
+                field_id = ?field_id,
+                desc_pk,
+                "delete_rows stage_delete_rows_for_field: descriptor blob missing"
+            );
             Error::Internal(format!(
                 "descriptor pk={} missing during delete_rows for field {:?}",
                 desc_pk, field_id
@@ -948,6 +1074,12 @@ where
         // Optionally mirror metas for row_id column.
         let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
         let mut descriptor_rid: Option<ColumnDescriptor> = None;
+        tracing::warn!(
+            field_id = ?field_id,
+            metas_len = metas.len(),
+            desc_pk_rid = ?desc_pk_rid,
+            "delete_rows stage_delete_rows_for_field: data metas loaded"
+        );
         if let Some(pk_rid) = desc_pk_rid
             && let Some(desc_blob_rid) = blobs_by_pk.remove(&pk_rid)
         {
@@ -957,6 +1089,12 @@ where
             }
             descriptor_rid = Some(d_rid);
         }
+
+        tracing::warn!(
+            field_id = ?field_id,
+            metas_rid_len = metas_rid.len(),
+            "delete_rows stage_delete_rows_for_field: rowid metas loaded"
+        );
 
         let mut cum_rows = 0u64;
         let mut any_changed = false;
@@ -1005,7 +1143,18 @@ where
             if let Some(rm) = metas_rid.get(i) {
                 chunk_gets.push(BatchGet::Raw { key: rm.chunk_pk });
             }
-            let chunk_results = self.pager.batch_get(&chunk_gets)?;
+            let chunk_results = match self.pager.batch_get(&chunk_gets) {
+                Ok(res) => res,
+                Err(err) => {
+                    tracing::trace!(
+                        field_id = ?field_id,
+                        chunk_pk = meta.chunk_pk,
+                        error = ?err,
+                        "delete_rows stage_delete_rows_for_field: chunk batch_get failed"
+                    );
+                    return Err(err);
+                }
+            };
             let mut chunk_blobs = FxHashMap::default();
             for res in chunk_results {
                 if let GetResult::Raw { key, bytes } = res {
@@ -1013,11 +1162,42 @@ where
                 }
             }
 
-            let data_blob = chunk_blobs.remove(&meta.chunk_pk).ok_or(Error::NotFound)?;
+            tracing::warn!(
+                field_id = ?field_id,
+                chunk_pk = meta.chunk_pk,
+                rid_chunk_pk = metas_rid.get(i).map(|rm| rm.chunk_pk),
+                data_found = chunk_blobs.contains_key(&meta.chunk_pk),
+                rid_found = metas_rid
+                    .get(i)
+                    .map(|rm| chunk_blobs.contains_key(&rm.chunk_pk)),
+                "delete_rows stage_delete_rows_for_field: chunk fetch status"
+            );
+
+            let data_blob = match chunk_blobs.remove(&meta.chunk_pk) {
+                Some(bytes) => bytes,
+                None => {
+                    tracing::trace!(
+                        field_id = ?field_id,
+                        chunk_pk = meta.chunk_pk,
+                        "delete_rows stage_delete_rows_for_field: chunk missing"
+                    );
+                    return Err(Error::NotFound);
+                }
+            };
             let data_arr = deserialize_array(data_blob)?;
 
             let rid_arr_any = if let Some(rm) = metas_rid.get(i) {
-                let rid_blob = chunk_blobs.remove(&rm.chunk_pk).ok_or(Error::NotFound)?;
+                let rid_blob = match chunk_blobs.remove(&rm.chunk_pk) {
+                    Some(bytes) => bytes,
+                    None => {
+                        tracing::trace!(
+                            field_id = ?field_id,
+                            rowid_chunk_pk = rm.chunk_pk,
+                            "delete_rows stage_delete_rows_for_field: rowid chunk missing"
+                        );
+                        return Err(Error::NotFound);
+                    }
+                };
                 Some(deserialize_array(rid_blob)?)
             } else {
                 None
@@ -1075,6 +1255,11 @@ where
             rid_desc.rewrite_pages(Arc::clone(&self.pager), rid_pk, &mut metas_rid, staged_puts)?;
         }
         drop(catalog);
+        tracing::trace!(
+            field_id = ?field_id,
+            changed = any_changed,
+            "delete_rows stage_delete_rows_for_field: finished stage"
+        );
         Ok(any_changed)
     }
 
@@ -1092,7 +1277,13 @@ where
         let mut touched: FxHashSet<LogicalFieldId> = FxHashSet::default();
         let mut table_id: Option<TableId> = None;
 
+        tracing::warn!(
+            fields = fields.len(),
+            rows = rows_to_delete.len(),
+            "delete_rows begin"
+        );
         for field_id in fields {
+            tracing::warn!(field = ?field_id, "delete_rows iter field");
             if let Some(expected) = table_id {
                 if field_id.table_id() != expected {
                     return Err(Error::InvalidArgumentError(
@@ -1114,9 +1305,12 @@ where
 
         self.pager.batch_put(&puts)?;
 
+        tracing::warn!(touched = touched.len(), "delete_rows apply writes");
+
         for field_id in touched {
             self.compact_field_bounded(field_id)?;
         }
+        tracing::warn!("delete_rows complete");
         Ok(())
     }
 

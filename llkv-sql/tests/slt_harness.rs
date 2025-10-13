@@ -8,7 +8,6 @@ mod slt_engine;
 
 fn main() {
     init_tracing_for_tests();
-
     let args = Arguments::from_args();
     let conclusion =
         slt::run_slt_harness_with_args(SLT_DIR, slt_engine::make_factory_factory(), args);

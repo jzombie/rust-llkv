@@ -4,6 +4,8 @@
 
 Prototype B+Tree replacement with batch-only pager I/O for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
 
+This crate provides low-level columnar storage using Arrow format. It is used by [`llkv-table`](../llkv-table/) for table storage and accessed by [`llkv-runtime`](../llkv-runtime/) for data operations.
+
 ## Features
 
 - Physical/Logical key separation (batched writes of many logical keys can consume far less physical keys than writing directly to storage keys).

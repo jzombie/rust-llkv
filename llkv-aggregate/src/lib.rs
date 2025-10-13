@@ -4,8 +4,9 @@ use llkv_result::Error;
 use llkv_table::types::FieldId;
 use std::sync::Arc;
 
-pub type AggregateResult<T> = Result<T, Error>;
+pub use llkv_plan::{AggregateExpr, AggregateFunction};
 
+pub type AggregateResult<T> = Result<T, Error>;
 /// Specification for an aggregate operation
 #[derive(Clone)]
 pub struct AggregateSpec {
@@ -70,7 +71,7 @@ pub enum AggregateAccumulator {
     CountNulls {
         column_index: usize,
         non_null_rows: i64,
-        total_rows: i64,
+        total_rows_seen: i64,
     },
 }
 
@@ -80,7 +81,7 @@ impl AggregateAccumulator {
     pub fn new_with_projection_index(
         spec: &AggregateSpec,
         projection_idx: Option<usize>,
-        total_rows_hint: Option<i64>,
+        _total_rows_hint: Option<i64>,
     ) -> AggregateResult<Self> {
         match spec.kind {
             AggregateKind::CountStar => Ok(AggregateAccumulator::CountStar { value: 0 }),
@@ -125,16 +126,11 @@ impl AggregateAccumulator {
                 let idx = projection_idx.ok_or_else(|| {
                     Error::Internal("CountNulls aggregate requires projection index".into())
                 })?;
-                let total_rows = total_rows_hint.ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "SUM(CASE WHEN ... IS NULL ...) with WHERE clauses is not supported yet"
-                            .into(),
-                    )
-                })?;
+                // We no longer require total_rows_hint upfront - we'll count as we scan
                 Ok(AggregateAccumulator::CountNulls {
                     column_index: idx,
                     non_null_rows: 0,
-                    total_rows,
+                    total_rows_seen: 0,
                 })
             }
         }
@@ -230,12 +226,18 @@ impl AggregateAccumulator {
             AggregateAccumulator::CountNulls {
                 column_index,
                 non_null_rows,
-                total_rows: _,
+                total_rows_seen,
             } => {
                 let array = batch.column(*column_index);
+                let batch_size = i64::try_from(array.len()).map_err(|_| {
+                    Error::InvalidArgumentError("Batch size exceeds i64 range".into())
+                })?;
                 let non_null = (0..array.len()).filter(|idx| array.is_valid(*idx)).count();
                 let non_null = i64::try_from(non_null).map_err(|_| {
                     Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
+                })?;
+                *total_rows_seen = total_rows_seen.checked_add(batch_size).ok_or_else(|| {
+                    Error::InvalidArgumentError("Total rows exceeds i64 range".into())
                 })?;
                 *non_null_rows = non_null_rows.checked_add(non_null).ok_or_else(|| {
                     Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
@@ -294,10 +296,10 @@ impl AggregateAccumulator {
             }
             AggregateAccumulator::CountNulls {
                 non_null_rows,
-                total_rows,
+                total_rows_seen,
                 ..
             } => {
-                let nulls = total_rows.checked_sub(non_null_rows).ok_or_else(|| {
+                let nulls = total_rows_seen.checked_sub(non_null_rows).ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "NULL-count aggregate observed more non-null rows than total rows".into(),
                     )

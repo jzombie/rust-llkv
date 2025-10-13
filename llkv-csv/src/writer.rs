@@ -104,6 +104,10 @@ where
     where
         C: AsRef<Path>,
     {
+        tracing::trace!(
+            "[CSV_EXPORT] write_columns_to_path called with {} columns",
+            columns.len()
+        );
         if columns.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "at least one column must be provided for CSV export".into(),
@@ -118,7 +122,13 @@ where
             },
         });
 
-        self.write_columns_to_path_with_filter(csv_path, columns, &filter_expr)
+        tracing::trace!("[CSV_EXPORT] Calling write_columns_to_path_with_filter");
+        let result = self.write_columns_to_path_with_filter(csv_path, columns, &filter_expr);
+        tracing::trace!(
+            "[CSV_EXPORT] write_columns_to_path_with_filter returned: {:?}",
+            result
+        );
+        result
     }
 
     pub fn write_columns_to_path_with_filter<C>(
@@ -130,7 +140,10 @@ where
     where
         C: AsRef<Path>,
     {
+        tracing::trace!("[CSV_EXPORT] write_columns_to_path_with_filter called");
+        tracing::trace!("[CSV_EXPORT] About to call build_column_projections");
         let projections = build_column_projections(self.table, columns)?;
+        tracing::trace!("[CSV_EXPORT] build_column_projections returned successfully");
         self.write_projections_to_path(csv_path, projections, filter_expr)
     }
 
@@ -158,6 +171,7 @@ where
         I: IntoIterator<Item = SP>,
         SP: Into<ScanProjection>,
     {
+        tracing::trace!("[CSV_EXPORT] write_projections_to_path called");
         let file = File::create(csv_path.as_ref()).map_err(|err| {
             Error::Internal(format!(
                 "failed to create CSV file '{}': {err}",
@@ -165,7 +179,13 @@ where
             ))
         })?;
         let writer = BufWriter::new(file);
-        self.write_projections_to_writer(writer, projections, filter_expr)
+        tracing::trace!("[CSV_EXPORT] About to call write_projections_to_writer");
+        let result = self.write_projections_to_writer(writer, projections, filter_expr);
+        tracing::trace!(
+            "[CSV_EXPORT] write_projections_to_writer returned: {:?}",
+            result
+        );
+        result
     }
 
     pub fn write_projections_to_writer<W, I, SP>(
@@ -179,16 +199,21 @@ where
         I: IntoIterator<Item = SP>,
         SP: Into<ScanProjection>,
     {
+        tracing::trace!("[CSV_EXPORT] write_projections_to_writer called");
         let mut projections: Vec<ScanProjection> =
             projections.into_iter().map(|p| p.into()).collect();
 
+        tracing::trace!("[CSV_EXPORT] Got {} projections", projections.len());
         if projections.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "at least one projection must be provided for CSV export".into(),
             ));
         }
 
-        ensure_column_aliases(self.table, &mut projections)?;
+        tracing::trace!("[CSV_EXPORT] About to call ensure_column_aliases");
+        let result = ensure_column_aliases(self.table, &mut projections);
+        tracing::trace!("[CSV_EXPORT] ensure_column_aliases returned: {:?}", result);
+        result?;
 
         let mut builder = WriterBuilder::new();
         builder = builder.with_delimiter(self.options.delimiter);
@@ -199,18 +224,27 @@ where
         let scan_options = ScanStreamOptions {
             include_nulls: self.options.include_nulls,
             order: None,
+            row_id_filter: None,
         };
 
-        self.table
-            .scan_stream_with_exprs(&projections, filter_expr, scan_options, |batch| {
-                if write_error.is_some() {
-                    return;
-                }
-                if let Err(err) = csv_writer.write(&batch) {
-                    write_error =
-                        Some(Error::Internal(format!("failed to write CSV batch: {err}")));
-                }
-            })?;
+        tracing::trace!("[CSV_EXPORT] About to call scan_stream_with_exprs");
+        tracing::trace!("[CSV_EXPORT] filter_expr: {:?}", filter_expr);
+        let scan_result =
+            self.table
+                .scan_stream_with_exprs(&projections, filter_expr, scan_options, |batch| {
+                    if write_error.is_some() {
+                        return;
+                    }
+                    if let Err(err) = csv_writer.write(&batch) {
+                        write_error =
+                            Some(Error::Internal(format!("failed to write CSV batch: {err}")));
+                    }
+                });
+        tracing::trace!(
+            "[CSV_EXPORT] scan_stream_with_exprs returned: {:?}",
+            scan_result
+        );
+        scan_result?;
 
         if let Some(err) = write_error {
             return Err(err);
@@ -244,7 +278,19 @@ where
     let mut projections: Vec<ScanProjection> = Vec::with_capacity(columns.len());
     for (idx, column) in columns.iter().enumerate() {
         let lfid = LogicalFieldId::for_user(table.table_id(), column.field_id);
-        table.store().data_type(lfid)?;
+        tracing::trace!(
+            "[CSV_EXPORT] Checking column field_id={}, lfid={:?}, table_id={}",
+            column.field_id,
+            lfid,
+            table.table_id()
+        );
+        match table.store().data_type(lfid) {
+            Ok(dt) => tracing::trace!("[CSV_EXPORT] Found data_type: {:?}", dt),
+            Err(e) => {
+                tracing::trace!("[CSV_EXPORT] data_type lookup failed: {:?}", e);
+                return Err(e);
+            }
+        }
 
         let resolved_name = column
             .alias

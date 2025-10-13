@@ -81,6 +81,19 @@ impl NumericKernels {
                 Self::collect_fields(left, acc);
                 Self::collect_fields(right, acc);
             }
+            ScalarExpr::Aggregate(agg) => {
+                // Collect fields referenced by the aggregate
+                match agg {
+                    llkv_expr::expr::AggregateCall::CountStar => {}
+                    llkv_expr::expr::AggregateCall::Count(fid)
+                    | llkv_expr::expr::AggregateCall::Sum(fid)
+                    | llkv_expr::expr::AggregateCall::Min(fid)
+                    | llkv_expr::expr::AggregateCall::Max(fid)
+                    | llkv_expr::expr::AggregateCall::CountNulls(fid) => {
+                        acc.insert(*fid);
+                    }
+                }
+            }
         }
     }
 
@@ -148,6 +161,9 @@ impl NumericKernels {
                 let r = Self::evaluate_value(right, idx, arrays)?;
                 Ok(Self::apply_binary(*op, l, r))
             }
+            ScalarExpr::Aggregate(_) => Err(Error::Internal(
+                "Aggregate expressions should not appear in row-level evaluation".into(),
+            )),
         }
     }
 
@@ -224,6 +240,9 @@ impl NumericKernels {
                     _ => Ok(None),
                 }
             }
+            ScalarExpr::Aggregate(_) => Err(Error::Internal(
+                "Aggregate expressions should not appear in row-level evaluation".into(),
+            )),
         }
     }
 
@@ -321,7 +340,9 @@ impl NumericKernels {
     /// Recursively simplify the expression by folding literals and eliminating identity operations.
     pub fn simplify(expr: &ScalarExpr<FieldId>) -> ScalarExpr<FieldId> {
         match expr {
-            ScalarExpr::Column(_) | ScalarExpr::Literal(_) => expr.clone(),
+            ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Aggregate(_) => {
+                expr.clone()
+            }
             ScalarExpr::Binary { left, op, right } => {
                 let left_s = Self::simplify(left);
                 let right_s = Self::simplify(right);
@@ -408,6 +429,7 @@ impl NumericKernels {
                     offset: value,
                 })
             }
+            ScalarExpr::Aggregate(_) => None, // Aggregates not supported in affine transformations
             ScalarExpr::Binary { left, op, right } => {
                 let left_state = Self::affine_state(left)?;
                 let right_state = Self::affine_state(right)?;

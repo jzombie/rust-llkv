@@ -1,6 +1,6 @@
 use super::*;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
-use crate::types::LogicalFieldId;
+use crate::types::{LogicalFieldId, RowId};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, GenericBinaryArray, GenericBinaryBuilder, GenericStringArray,
     GenericStringBuilder, OffsetSizeTrait, PrimitiveArray, PrimitiveBuilder, UInt64Array,
@@ -146,7 +146,7 @@ impl MultiGatherContext {
         self.row_scratch = scratch;
     }
 
-    pub fn chunk_span_for_row(&self, row_id: u64) -> Option<(usize, u64, u64)> {
+    pub fn chunk_span_for_row(&self, row_id: RowId) -> Option<(usize, RowId, RowId)> {
         let first_plan = self.plans.first()?;
         let mut chunk_idx = None;
         for (idx, meta) in first_plan.row_metas.iter().enumerate() {
@@ -195,13 +195,13 @@ struct FieldPlan {
 
 #[derive(Clone, Copy)]
 enum RowLocator<'a> {
-    Dense { base: u64 },
-    Sparse { index: &'a FxHashMap<u64, usize> },
+    Dense { base: RowId },
+    Sparse { index: &'a FxHashMap<RowId, usize> },
 }
 
 impl<'a> RowLocator<'a> {
     #[inline]
-    fn lookup(&self, row_id: u64, len: usize) -> Option<usize> {
+    fn lookup(&self, row_id: RowId, len: usize) -> Option<usize> {
         match self {
             RowLocator::Dense { base } => {
                 let offset = row_id.checked_sub(*base)?;

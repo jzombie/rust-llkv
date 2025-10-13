@@ -1,5 +1,6 @@
 pub mod plan_graph;
 
+use std::cell::RefCell;
 use std::cmp::{self, Ordering};
 use std::convert::TryFrom;
 use std::ops::Bound;
@@ -7,17 +8,17 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, Float64Array, Int64Array, OffsetSizeTrait, RecordBatch, StringArray,
-    new_null_array,
+    UInt64Array, new_null_array,
 };
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
 use llkv_column_map::ScanBuilder;
-use llkv_column_map::llkv_for_each_arrow_numeric;
 use llkv_column_map::parallel;
 use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_column_map::{llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric};
 use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
@@ -35,7 +36,7 @@ use crate::scalar_eval::{NumericArrayMap, NumericKernels};
 use crate::table::{
     ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
 };
-use crate::types::FieldId;
+use crate::types::{FieldId, ROW_ID_FIELD_ID};
 
 use self::plan_graph::{
     PlanEdge, PlanExpression, PlanField, PlanGraph, PlanGraphBuilder, PlanGraphError, PlanNode,
@@ -324,6 +325,84 @@ macro_rules! impl_affine_reject_sorted_run_with_rids {
     };
 }
 
+macro_rules! impl_row_id_ignore_chunk {
+    (
+        $_base:ident,
+        $chunk:ident,
+        $_chunk_with_rids:ident,
+        $_run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $chunk(&mut self, _values: &$array_ty) {}
+    };
+}
+
+macro_rules! impl_row_id_ignore_sorted_run {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $_chunk_with_rids:ident,
+        $run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $run(&mut self, _values: &$array_ty, _start: usize, _len: usize) {}
+    };
+}
+
+macro_rules! impl_row_id_collect_chunk_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $chunk_with_rids:ident,
+        $_run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $chunk_with_rids(&mut self, _values: &$array_ty, row_ids: &UInt64Array) {
+            self.extend_from_array(row_ids);
+        }
+    };
+}
+
+macro_rules! impl_row_id_collect_sorted_run_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $_chunk_with_rids:ident,
+        $_run:ident,
+        $run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $run_with_rids(
+            &mut self,
+            _values: &$array_ty,
+            row_ids: &UInt64Array,
+            start: usize,
+            len: usize,
+        ) {
+            self.extend_from_slice(row_ids, start, len);
+        }
+    };
+}
+
 #[derive(Clone)]
 struct ColumnProjectionInfo {
     logical_field_id: LogicalFieldId,
@@ -343,10 +422,13 @@ enum ProjectionEval {
     Computed(ComputedProjectionInfo),
 }
 
-struct PlannedScan<'expr> {
+struct PlannedScan<'expr, P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
     projections: Vec<ScanProjection>,
     filter_expr: Expr<'expr, FieldId>,
-    options: ScanStreamOptions,
+    options: ScanStreamOptions<P>,
     plan_graph: PlanGraph,
 }
 
@@ -404,6 +486,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     table: &'a Table<P>,
+    row_id_cache: RefCell<Option<Vec<u64>>>,
 }
 
 pub(crate) struct TablePlanner<'a, P>
@@ -425,7 +508,7 @@ where
         &self,
         projections: &[ScanProjection],
         filter_expr: &Expr<'expr, FieldId>,
-        options: ScanStreamOptions,
+        options: ScanStreamOptions<P>,
         on_batch: F,
     ) -> LlkvResult<()>
     where
@@ -440,8 +523,8 @@ where
         &self,
         projections: &[ScanProjection],
         filter_expr: &Expr<'expr, FieldId>,
-        options: ScanStreamOptions,
-    ) -> LlkvResult<PlannedScan<'expr>> {
+        options: ScanStreamOptions<P>,
+    ) -> LlkvResult<PlannedScan<'expr, P>> {
         if projections.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "scan_stream requires at least one projection".into(),
@@ -450,7 +533,7 @@ where
 
         let projections_vec = projections.to_vec();
         let filter_clone = filter_expr.clone();
-        let plan_graph = self.build_plan_graph(&projections_vec, &filter_clone, options)?;
+        let plan_graph = self.build_plan_graph(&projections_vec, &filter_clone, options.clone())?;
 
         Ok(PlannedScan {
             projections: projections_vec,
@@ -464,7 +547,7 @@ where
         &self,
         projections: &[ScanProjection],
         filter_expr: &Expr<'_, FieldId>,
-        options: ScanStreamOptions,
+        options: ScanStreamOptions<P>,
     ) -> LlkvResult<PlanGraph> {
         let mut builder = PlanGraphBuilder::new();
 
@@ -554,10 +637,130 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub(crate) fn new(table: &'a Table<P>) -> Self {
-        Self { table }
+        Self {
+            table,
+            row_id_cache: RefCell::new(None),
+        }
     }
 
-    fn execute<'expr, F>(&self, plan: PlannedScan<'expr>, mut on_batch: F) -> LlkvResult<()>
+    fn table_row_ids(&self) -> LlkvResult<Vec<u64>> {
+        if let Some(cached) = self.row_id_cache.borrow().as_ref() {
+            return Ok(cached.clone());
+        }
+        let computed = self.compute_table_row_ids()?;
+        *self.row_id_cache.borrow_mut() = Some(computed.clone());
+        Ok(computed)
+    }
+
+    fn compute_table_row_ids(&self) -> LlkvResult<Vec<u64>> {
+        use llkv_column_map::store::rowid_fid;
+
+        let fields = self
+            .table
+            .store()
+            .user_field_ids_for_table(self.table.table_id());
+        if fields.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Optimization: Try scanning the dedicated row_id shadow column first.
+        // This is significantly faster than scanning multiple user columns because:
+        // 1. It's a single column scan instead of multiple
+        // 2. Row IDs are already in the format we need (no deduplication required)
+        // 3. The shadow column is guaranteed to have all row IDs for the table
+        //
+        // We use the first user field to construct the shadow column ID.
+        if let Some(&first_field) = fields.first() {
+            let rid_shadow = rowid_fid(first_field);
+            let mut collector = RowIdScanCollector::default();
+
+            // Try to scan the row_id shadow column
+            match ScanBuilder::new(self.table.store(), rid_shadow)
+                .options(ScanOptions {
+                    with_row_ids: true,
+                    ..Default::default()
+                })
+                .run(&mut collector)
+            {
+                Ok(_) => {
+                    // Success! We got all row IDs from the shadow column
+                    let mut row_ids = collector.into_inner();
+                    row_ids.sort_unstable();
+                    tracing::trace!(
+                        "[PERF] Fast path: collected {} row_ids from shadow column for table {}",
+                        row_ids.len(),
+                        self.table.table_id()
+                    );
+                    return Ok(row_ids);
+                }
+                Err(llkv_result::Error::NotFound) => {
+                    // Shadow column doesn't exist, fall back to multi-column scan
+                    tracing::trace!(
+                        "[PERF] Shadow column not found for table {}, using multi-column scan",
+                        self.table.table_id()
+                    );
+                }
+                Err(e) => {
+                    // Other error, fall back but log it
+                    tracing::debug!(
+                        "[PERF] Error scanning shadow column for table {}: {}, falling back to multi-column scan",
+                        self.table.table_id(),
+                        e
+                    );
+                }
+            }
+        }
+
+        // Fallback: Multi-column scan with deduplication
+        // This is needed when:
+        // - The shadow column doesn't exist (for whatever reason)
+        // - Columns may have different row_id sets (sparse columns)
+        // - We need the union of all visible rows
+        let expected = self
+            .table
+            .store()
+            .total_rows_for_table(self.table.table_id())
+            .unwrap_or_default();
+
+        let mut seen: FxHashSet<u64> = FxHashSet::default();
+        let mut collected: Vec<u64> = Vec::new();
+
+        for lfid in fields {
+            let mut collector = RowIdScanCollector::default();
+            ScanBuilder::new(self.table.store(), lfid)
+                .options(ScanOptions {
+                    with_row_ids: true,
+                    ..Default::default()
+                })
+                .run(&mut collector)?;
+            for rid in collector.into_inner() {
+                if seen.insert(rid) {
+                    collected.push(rid);
+                }
+            }
+            if expected > 0 && (seen.len() as u64) >= expected {
+                break;
+            }
+        }
+
+        collected.sort_unstable();
+        tracing::trace!(
+            "[PERF] Multi-column scan: collected {} row_ids for table {}",
+            collected.len(),
+            self.table.table_id()
+        );
+        Ok(collected)
+    }
+
+    fn collect_row_ids_for_rowid_filter(&self, op: &Operator<'_>) -> LlkvResult<Vec<u64>> {
+        let all_row_ids = self.table_row_ids()?;
+        if all_row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        filter_row_ids_by_operator(&all_row_ids, op)
+    }
+
+    fn execute<'expr, F>(&self, plan: PlannedScan<'expr, P>, mut on_batch: F) -> LlkvResult<()>
     where
         F: FnMut(RecordBatch),
     {
@@ -568,7 +771,12 @@ where
             plan_graph: _plan_graph,
         } = plan;
 
-        if self.try_single_column_direct_scan(&projections, &filter_expr, options, &mut on_batch)? {
+        if self.try_single_column_direct_scan(
+            &projections,
+            &filter_expr,
+            options.clone(),
+            &mut on_batch,
+        )? {
             return Ok(());
         }
 
@@ -684,6 +892,11 @@ where
                                     Error::Internal("missing dtype for computed column".into())
                                 })?
                             }
+                            ScalarExpr::Aggregate(_) => {
+                                // Aggregates in computed columns return Int64
+                                // TODO: Fix: This is a simplification - ideally we'd determine type from the aggregate
+                                DataType::Int64
+                            }
                         };
                         schema_fields.push(Field::new(info.alias.clone(), dtype, true));
                     }
@@ -694,10 +907,51 @@ where
 
         let fusion_cache = PredicateFusionCache::from_expr(&filter_expr);
         let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
-        let mut row_ids =
-            self.collect_row_ids_for_expr(&filter_expr, &fusion_cache, &mut all_rows_cache)?;
+
+        // When we have a trivial filter (no predicates), enumerate ALL row IDs.
+        // This is necessary for:
+        // 1. MVCC filtering to check visibility of all rows including NULL rows
+        // 2. Aggregates like COUNT_NULLS that need to count NULL rows
+        // We scan the MVCC created_by column which exists for every row.
+        let mut row_ids = if is_trivial_filter(&filter_expr) {
+            use arrow::datatypes::UInt64Type;
+            use llkv_expr::typed_predicate::Predicate;
+            let created_lfid = LogicalFieldId::for_mvcc_created_by(self.table.table_id());
+            tracing::trace!(
+                "[SCAN_STREAM] MVCC + trivial filter: scanning created_by column for all row IDs"
+            );
+            // Get all rows where created_by exists (which is all rows that have been written)
+            self.table
+                .store()
+                .filter_row_ids::<UInt64Type>(created_lfid, &Predicate::All)?
+        } else {
+            self.collect_row_ids_for_expr(&filter_expr, &fusion_cache, &mut all_rows_cache)?
+        };
+
+        tracing::trace!(
+            "[SCAN_STREAM] collected {} row_ids, has_row_filter={}",
+            row_ids.len(),
+            options.row_id_filter.is_some()
+        );
+        if let Some(filter) = options.row_id_filter.as_ref() {
+            let before_len = row_ids.len();
+            row_ids = filter.filter(self.table, row_ids)?;
+            tracing::trace!(
+                "[SCAN_STREAM] after MVCC filter: {} -> {} row_ids",
+                before_len,
+                row_ids.len()
+            );
+        }
         if row_ids.is_empty() {
-            if is_trivial_filter(&filter_expr) {
+            tracing::trace!(
+                "[SCAN_STREAM] row_ids is empty after filtering, returning early (no synthetic batch)"
+            );
+            // MVCC Note: If row_ids is empty after MVCC filtering, don't create synthetic batches!
+            // The old optimization of creating NULL rows for trivial filters breaks MVCC visibility.
+            // An empty row_ids list means NO visible rows, so we should return empty results.
+            if options.row_id_filter.is_none() && is_trivial_filter(&filter_expr) {
+                tracing::trace!("[SCAN_STREAM] would create synthetic batch but skipping");
+                // Only use the synthetic batch optimization when there's NO MVCC filtering
                 let total_rows = self.table.total_rows()?;
                 let row_count = usize::try_from(total_rows).map_err(|_| {
                     Error::InvalidArgumentError("table row count exceeds supported range".into())
@@ -906,7 +1160,7 @@ where
         &self,
         projections: &[ScanProjection],
         filter_expr: &Expr<'expr, FieldId>,
-        options: ScanStreamOptions,
+        options: ScanStreamOptions<P>,
         on_batch: &mut F,
     ) -> LlkvResult<bool>
     where
@@ -1172,6 +1426,16 @@ where
     }
 
     fn collect_row_ids_for_filter(&self, filter: &Filter<'_, FieldId>) -> LlkvResult<Vec<u64>> {
+        if filter.field_id == ROW_ID_FIELD_ID {
+            let row_ids = self.collect_row_ids_for_rowid_filter(&filter.op)?;
+            tracing::debug!(
+                field = "rowid",
+                row_count = row_ids.len(),
+                "collect_row_ids_for_filter rowid"
+            );
+            return Ok(row_ids);
+        }
+
         let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), filter.field_id);
         let dtype = self.table.store().data_type(filter_lfid)?;
 
@@ -1262,27 +1526,38 @@ where
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
+        let mut numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
+        let has_row_id = numeric_fields.remove(&ROW_ID_FIELD_ID);
         let lfids: Vec<LogicalFieldId> = fields
             .iter()
-            .map(|fid| LogicalFieldId::for_user(self.table.table_id(), *fid))
+            .copied()
+            .filter(|fid| *fid != ROW_ID_FIELD_ID)
+            .map(|fid| LogicalFieldId::for_user(self.table.table_id(), fid))
             .collect();
         let mut result = Vec::new();
-        let numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
         let mut start = 0usize;
         while start < row_ids.len() {
             let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
             let window = &row_ids[start..end];
-            let gathered =
-                self.table
-                    .store()
-                    .gather_rows(&lfids, window, GatherNullPolicy::IncludeNulls)?;
-            if gathered.num_rows() == 0 {
-                start = end;
-                continue;
+            let mut numeric_arrays: NumericArrayMap = if lfids.is_empty() {
+                NumericKernels::prepare_numeric_arrays(&[], &[], &numeric_fields)?
+            } else {
+                let gathered = self.table.store().gather_rows(
+                    &lfids,
+                    window,
+                    GatherNullPolicy::IncludeNulls,
+                )?;
+                if gathered.num_rows() == 0 {
+                    start = end;
+                    continue;
+                }
+                let arrays = gathered.columns();
+                NumericKernels::prepare_numeric_arrays(&lfids, arrays, &numeric_fields)?
+            };
+            if has_row_id {
+                let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
+                numeric_arrays.insert(ROW_ID_FIELD_ID, Arc::new(Float64Array::from(rid_values)));
             }
-            let arrays = gathered.columns();
-            let numeric_arrays: NumericArrayMap =
-                NumericKernels::prepare_numeric_arrays(&lfids, arrays, &numeric_fields)?;
             for (offset, &row_id) in window.iter().enumerate() {
                 let left_val = NumericKernels::evaluate_value(left, offset, &numeric_arrays)?;
                 let right_val = NumericKernels::evaluate_value(right, offset, &numeric_arrays)?;
@@ -1615,6 +1890,7 @@ fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::Literal(_) => false,
         ScalarExpr::Column(_) => true,
         ScalarExpr::Binary { .. } => true,
+        ScalarExpr::Aggregate(_) => false, // Aggregates are computed separately
     }
 }
 
@@ -1642,7 +1918,7 @@ fn synthesize_computed_literal_array(
         ScalarExpr::Literal(Literal::String(value)) => {
             Ok(Arc::new(StringArray::from(vec![value.clone(); row_count])) as ArrayRef)
         }
-        ScalarExpr::Column(_) | ScalarExpr::Binary { .. } => {
+        ScalarExpr::Column(_) | ScalarExpr::Binary { .. } | ScalarExpr::Aggregate(_) => {
             Ok(new_null_array(data_type, row_count))
         }
     }
@@ -1769,6 +2045,7 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
             format_binary_op(*op),
             format_scalar_expr(right)
         ),
+        ScalarExpr::Aggregate(agg) => format!("AGG({:?})", agg),
     }
 }
 
@@ -2189,10 +2466,162 @@ where
     llkv_for_each_arrow_numeric!(impl_affine_reject_sorted_run_with_rids);
 }
 
+#[derive(Default)]
+struct RowIdScanCollector {
+    row_ids: Vec<u64>,
+}
+
+impl RowIdScanCollector {
+    fn extend_from_array(&mut self, row_ids: &UInt64Array) {
+        for idx in 0..row_ids.len() {
+            self.row_ids.push(row_ids.value(idx));
+        }
+    }
+
+    fn extend_from_slice(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = (start + len).min(row_ids.len());
+        for idx in start..end {
+            self.row_ids.push(row_ids.value(idx));
+        }
+    }
+
+    fn into_inner(self) -> Vec<u64> {
+        self.row_ids
+    }
+}
+
+impl llkv_column_map::scan::PrimitiveVisitor for RowIdScanCollector {
+    llkv_for_each_arrow_numeric!(impl_row_id_ignore_chunk);
+    llkv_for_each_arrow_boolean!(impl_row_id_ignore_chunk);
+}
+
+impl llkv_column_map::scan::PrimitiveSortedVisitor for RowIdScanCollector {
+    llkv_for_each_arrow_numeric!(impl_row_id_ignore_sorted_run);
+    llkv_for_each_arrow_boolean!(impl_row_id_ignore_sorted_run);
+}
+
+impl llkv_column_map::scan::PrimitiveWithRowIdsVisitor for RowIdScanCollector {
+    llkv_for_each_arrow_numeric!(impl_row_id_collect_chunk_with_rids);
+    llkv_for_each_arrow_boolean!(impl_row_id_collect_chunk_with_rids);
+}
+
+impl llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor for RowIdScanCollector {
+    llkv_for_each_arrow_numeric!(impl_row_id_collect_sorted_run_with_rids);
+    llkv_for_each_arrow_boolean!(impl_row_id_collect_sorted_run_with_rids);
+
+    fn null_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
+        self.extend_from_slice(row_ids, start, len);
+    }
+}
+
 fn normalize_row_ids(mut row_ids: Vec<u64>) -> Vec<u64> {
     row_ids.sort_unstable();
     row_ids.dedup();
     row_ids
+}
+
+fn literal_to_u64(lit: &Literal) -> LlkvResult<u64> {
+    u64::from_literal(lit)
+        .map_err(|err| Error::InvalidArgumentError(format!("rowid literal cast failed: {err}")))
+}
+
+fn lower_bound_index(row_ids: &[u64], bound: &Bound<Literal>) -> LlkvResult<usize> {
+    Ok(match bound {
+        Bound::Unbounded => 0,
+        Bound::Included(lit) => {
+            let value = literal_to_u64(lit)?;
+            row_ids.partition_point(|&rid| rid < value)
+        }
+        Bound::Excluded(lit) => {
+            let value = literal_to_u64(lit)?;
+            row_ids.partition_point(|&rid| rid <= value)
+        }
+    })
+}
+
+fn upper_bound_index(row_ids: &[u64], bound: &Bound<Literal>) -> LlkvResult<usize> {
+    Ok(match bound {
+        Bound::Unbounded => row_ids.len(),
+        Bound::Included(lit) => {
+            let value = literal_to_u64(lit)?;
+            row_ids.partition_point(|&rid| rid <= value)
+        }
+        Bound::Excluded(lit) => {
+            let value = literal_to_u64(lit)?;
+            row_ids.partition_point(|&rid| rid < value)
+        }
+    })
+}
+
+fn filter_row_ids_by_operator(row_ids: &[u64], op: &Operator<'_>) -> LlkvResult<Vec<u64>> {
+    use Operator::*;
+
+    match op {
+        Equals(lit) => {
+            let value = literal_to_u64(lit)?;
+            match row_ids.binary_search(&value) {
+                Ok(idx) => Ok(vec![row_ids[idx]]),
+                Err(_) => Ok(Vec::new()),
+            }
+        }
+        GreaterThan(lit) => {
+            let value = literal_to_u64(lit)?;
+            let idx = row_ids.partition_point(|&rid| rid <= value);
+            Ok(row_ids[idx..].to_vec())
+        }
+        GreaterThanOrEquals(lit) => {
+            let value = literal_to_u64(lit)?;
+            let idx = row_ids.partition_point(|&rid| rid < value);
+            Ok(row_ids[idx..].to_vec())
+        }
+        LessThan(lit) => {
+            let value = literal_to_u64(lit)?;
+            let idx = row_ids.partition_point(|&rid| rid < value);
+            Ok(row_ids[..idx].to_vec())
+        }
+        LessThanOrEquals(lit) => {
+            let value = literal_to_u64(lit)?;
+            let idx = row_ids.partition_point(|&rid| rid <= value);
+            Ok(row_ids[..idx].to_vec())
+        }
+        Range { lower, upper } => {
+            let start = lower_bound_index(row_ids, lower)?;
+            let end = upper_bound_index(row_ids, upper)?;
+            if start >= end {
+                Ok(Vec::new())
+            } else {
+                Ok(row_ids[start..end].to_vec())
+            }
+        }
+        In(literals) => {
+            if literals.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut targets = FxHashSet::default();
+            for lit in *literals {
+                targets.insert(literal_to_u64(lit)?);
+            }
+            if targets.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut matches = Vec::with_capacity(targets.len());
+            for &rid in row_ids {
+                if targets.remove(&rid) {
+                    matches.push(rid);
+                    if targets.is_empty() {
+                        break;
+                    }
+                }
+            }
+            Ok(matches)
+        }
+        StartsWith { .. } | EndsWith { .. } | Contains { .. } => Err(Error::InvalidArgumentError(
+            "rowid predicates do not support string pattern matching".into(),
+        )),
+    }
 }
 
 fn intersect_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {

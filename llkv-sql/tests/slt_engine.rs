@@ -1,11 +1,11 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::Array as ArrowArray;
-use llkv_dsl::DslContext;
+use llkv_runtime::{RuntimeContext, RuntimeStatementResult};
 use llkv_sql::SqlEngine;
-use llkv_sql::StatementResult;
 use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 
@@ -15,13 +15,15 @@ pub struct EngineHarness {
 
 impl EngineHarness {
     pub fn new(engine: SqlEngine<MemPager>) -> Self {
-        Self { engine }
+        let harness = Self { engine };
+        tracing::debug!("[HARNESS] new() created harness at {:p}", &harness);
+        harness
     }
 }
 
 #[derive(Clone)]
 pub struct SharedContext {
-    context: Arc<DslContext<MemPager>>,
+    context: Arc<RuntimeContext<MemPager>>,
 }
 
 impl Default for SharedContext {
@@ -33,7 +35,7 @@ impl Default for SharedContext {
 impl SharedContext {
     pub fn new() -> Self {
         let pager = Arc::new(MemPager::default());
-        let context = Arc::new(DslContext::new(pager));
+        let context = Arc::new(RuntimeContext::new(pager));
         Self { context }
     }
 
@@ -48,14 +50,20 @@ impl AsyncDB for EngineHarness {
     type ColumnType = DefaultColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
+        // Log which SQL is being executed by this harness
+        tracing::debug!("[HARNESS {:p}] run() called, sql=\"{}\"", self, sql.trim());
         match self.engine.execute(sql) {
             Ok(mut results) => {
+                tracing::trace!(
+                    "[HARNESS] execute() returned Ok with {} results",
+                    results.len()
+                );
                 if results.is_empty() {
                     return Ok(DBOutput::StatementComplete(0));
                 }
                 let result = results.remove(0);
                 match result {
-                    StatementResult::Select { execution, .. } => {
+                    RuntimeStatementResult::Select { execution, .. } => {
                         let batches = execution.collect()?;
                         let mut rows: Vec<Vec<String>> = Vec::new();
                         for batch in &batches {
@@ -136,21 +144,40 @@ impl AsyncDB for EngineHarness {
 
                         Ok(DBOutput::Rows { types, rows })
                     }
-                    StatementResult::Insert { rows_inserted, .. } => {
-                        Ok(DBOutput::StatementComplete(rows_inserted as u64))
+                    RuntimeStatementResult::Insert { rows_inserted, .. } => {
+                        // Return as a single-row result for compatibility with query directives
+                        Ok(DBOutput::Rows {
+                            types: vec![DefaultColumnType::Integer],
+                            rows: vec![vec![rows_inserted.to_string()]],
+                        })
                     }
-                    StatementResult::Update { rows_updated, .. } => {
-                        Ok(DBOutput::StatementComplete(rows_updated as u64))
+                    RuntimeStatementResult::Update { rows_updated, .. } => {
+                        // Return as a single-row result for compatibility with query directives
+                        Ok(DBOutput::Rows {
+                            types: vec![DefaultColumnType::Integer],
+                            rows: vec![vec![rows_updated.to_string()]],
+                        })
                     }
-                    StatementResult::Delete { rows_deleted, .. } => {
-                        Ok(DBOutput::StatementComplete(rows_deleted as u64))
+                    RuntimeStatementResult::Delete { rows_deleted, .. } => {
+                        // Return as a single-row result for compatibility with query directives
+                        Ok(DBOutput::Rows {
+                            types: vec![DefaultColumnType::Integer],
+                            rows: vec![vec![rows_deleted.to_string()]],
+                        })
                     }
-                    StatementResult::CreateTable { .. } => Ok(DBOutput::StatementComplete(0)),
-                    StatementResult::Transaction { .. } => Ok(DBOutput::StatementComplete(0)),
-                    StatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
+                    RuntimeStatementResult::CreateTable { .. } => {
+                        Ok(DBOutput::StatementComplete(0))
+                    }
+                    RuntimeStatementResult::Transaction { .. } => {
+                        Ok(DBOutput::StatementComplete(0))
+                    }
+                    RuntimeStatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                tracing::trace!("[HARNESS] execute() returned Err: {:?}", e);
+                Err(e)
+            }
         }
     }
 
@@ -162,11 +189,22 @@ pub type HarnessFactory = Box<dyn Fn() -> HarnessFuture + Send + Sync + 'static>
 
 pub fn make_factory_factory() -> impl Fn() -> HarnessFactory + Clone {
     || {
+        tracing::trace!("[FACTORY] make_factory_factory: Creating SharedContext");
         let shared = SharedContext::new();
+        let counter = Arc::new(AtomicUsize::new(0));
         let factory: HarnessFactory = Box::new(move || {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            tracing::debug!(
+                "[FACTORY] Factory called #{}: Creating new EngineHarness",
+                n
+            );
             let shared_clone = shared.clone();
             Box::pin(async move {
                 let engine = shared_clone.make_engine();
+                tracing::debug!(
+                    "[FACTORY] Factory #{}: Created SqlEngine with new Session",
+                    n
+                );
                 Ok::<_, ()>(EngineHarness::new(engine))
             })
         });

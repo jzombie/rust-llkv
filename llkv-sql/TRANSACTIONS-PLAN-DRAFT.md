@@ -8,7 +8,7 @@ Whenever a SELECT (or any reader) runs inside a transaction, the main engine wil
 This gives us snapshot isolation semantics without copying everything up front.
 Commit / rollback
 
-COMMIT will lock the affected tables and replay only the delta rows into the main engine by calling the normal insert/update DSL APIs—no low-level pager manipulation, so we preserve the logical integrity guarantees.
+COMMIT will lock the affected tables and replay only the delta rows into the main engine by calling the normal runtime APIs—no low-level pager manipulation, so we preserve the logical integrity guarantees.
 ROLLBACK simply drops the delta context; no work required on the primary pager.
 Efficiency safeguards
 

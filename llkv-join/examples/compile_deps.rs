@@ -8,11 +8,12 @@ use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
+use llkv_table::types::TableId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 fn create_table_with_rows(
-    table_id: u16,
+    table_id: TableId,
     pager: &Arc<MemPager>,
     num_rows: usize,
 ) -> Table<MemPager> {

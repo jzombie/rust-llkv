@@ -1,6 +1,6 @@
 use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
 use sqllogictest::{AsyncDB, DefaultColumnType, Runner};
-use std::path::Path;
+use std::path::{Component, Path};
 
 /// Run a single slt file using the provided AsyncDB factory. The factory is
 /// a closure that returns a future resolving to a new DB instance for the
@@ -19,7 +19,36 @@ where
         .map_err(|e| llkv_result::Error::Internal(format!("failed to read slt file: {}", e)))?;
     let raw_lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let (expanded_lines, mapping) = expand_loops_with_mapping(&raw_lines, 0)?;
+    let (expanded_lines, mapping) = {
+        let mut filtered_lines = Vec::with_capacity(expanded_lines.len());
+        let mut filtered_mapping = Vec::with_capacity(mapping.len());
+        for (line, orig_line) in expanded_lines.into_iter().zip(mapping.into_iter()) {
+            if line.trim_start().starts_with("load ") {
+                tracing::warn!(
+                    "Ignoring unsupported SLT directive `load`: {}:{} -> {}",
+                    path.display(),
+                    orig_line,
+                    line.trim()
+                );
+                continue;
+            }
+            filtered_lines.push(line);
+            filtered_mapping.push(orig_line);
+        }
+        (filtered_lines, filtered_mapping)
+    };
     let (normalized_lines, mapping) = normalize_inline_connections(expanded_lines, mapping);
+
+    // TODO: Remove this check once the harness implements dialects (https://github.com/jzombie/rust-llkv/issues/111)
+    // DuckDB-specific fix: add extra blank line after plain text error messages
+    let is_duckdb_suite = path
+        .components()
+        .any(|component| matches!(component, Component::Normal(name) if name == "duckdb"));
+    let normalized_lines = if is_duckdb_suite {
+        fix_error_message_spacing(normalized_lines)
+    } else {
+        normalized_lines
+    };
 
     let expanded_text = normalized_lines.join("\n");
     let mut named = tempfile::NamedTempFile::new().map_err(|e| {
@@ -29,6 +58,15 @@ where
     named.write_all(expanded_text.as_bytes()).map_err(|e| {
         llkv_result::Error::Internal(format!("failed to write temp slt file: {}", e))
     })?;
+    if std::env::var("LLKV_DUMP_SLT").is_ok() {
+        let dump_path = std::path::Path::new("target/normalized.slt");
+        if let Some(parent) = dump_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(dump_path, &expanded_text) {
+            tracing::warn!("failed to dump normalized slt file: {}", e);
+        }
+    }
     let tmp = named.path().to_path_buf();
 
     let mut runner = Runner::new(|| async {
@@ -219,10 +257,65 @@ pub fn expand_loops_with_mapping(
 /// into explicit `connection` records so the upstream parser can understand them.
 /// Also ensures proper termination of statement error blocks by adding a blank line
 /// after ---- when there's no expected error pattern.
+#[allow(clippy::type_complexity)] // TODO: Refactor type complexity
 fn normalize_inline_connections(
     lines: Vec<String>,
     mapping: Vec<usize>,
 ) -> (Vec<String>, Vec<usize>) {
+    fn collect_statement_error_block(
+        lines: &[String],
+        mapping: &[usize],
+        start: usize,
+    ) -> (
+        Vec<(String, usize)>,
+        Option<String>,
+        Vec<(String, usize)>,
+        bool,
+        usize,
+    ) {
+        let mut sql_lines = Vec::new();
+        let mut message_lines = Vec::new();
+        let mut regex_pattern = None;
+        let mut idx = start;
+        let mut saw_separator = false;
+
+        while idx < lines.len() {
+            let line = &lines[idx];
+            let trimmed = line.trim_start();
+            if trimmed == "----" {
+                saw_separator = true;
+                idx += 1;
+                break;
+            }
+            sql_lines.push((line.clone(), mapping[idx]));
+            idx += 1;
+        }
+
+        if saw_separator {
+            while idx < lines.len() {
+                let line = &lines[idx];
+                let trimmed_full = line.trim();
+                if trimmed_full.is_empty() {
+                    idx += 1;
+                    break;
+                }
+                if let Some(pattern) = trimmed_full.strip_prefix("<REGEX>:") {
+                    regex_pattern = Some(pattern.to_string());
+                    idx += 1;
+                    while idx < lines.len() && lines[idx].trim().is_empty() {
+                        idx += 1;
+                    }
+                    message_lines.clear();
+                    break;
+                }
+                message_lines.push((line.clone(), mapping[idx]));
+                idx += 1;
+            }
+        }
+
+        (sql_lines, regex_pattern, message_lines, saw_separator, idx)
+    }
+
     fn is_connection_token(token: &str) -> bool {
         token
             .strip_prefix("con")
@@ -252,56 +345,34 @@ fn normalize_inline_connections(
 
                 let normalized = format!("{indent}{}", tokens.join(" "));
                 let normalized_trimmed = normalized.trim_start();
-
-                // Check if this is a statement error that needs special handling
                 if normalized_trimmed.starts_with("statement error") {
-                    out_lines.push(normalized.clone());
-                    out_map.push(orig);
-                    i += 1;
+                    let (sql_lines, regex_pattern, message_lines, saw_separator, new_idx) =
+                        collect_statement_error_block(&lines, &mapping, i + 1);
+                    i = new_idx;
 
-                    // Collect the SQL statement lines until we hit ----
-                    let mut sql_lines = Vec::new();
-                    while i < lines.len() {
-                        let next_line = &lines[i];
-                        let next_trimmed = next_line.trim_start();
-
-                        if next_trimmed == "----" {
-                            // Found the delimiter - now check what follows
-                            i += 1;
-
-                            let has_expected_pattern = if i < lines.len() {
-                                let following = lines[i].trim();
-                                !following.is_empty() && following.starts_with("<REGEX>:")
-                            } else {
-                                false
-                            };
-
-                            if has_expected_pattern {
-                                // OMIT the ---- and output the expected pattern line directly
-                                for sql_line in sql_lines {
-                                    out_lines.push(sql_line);
-                                    out_map.push(orig);
-                                }
-                                // Output the expected pattern line WITHOUT the ---- delimiter
-                                out_lines.push(lines[i].clone());
-                                out_map.push(mapping[i]);
-                                i += 1; // Move past the expected pattern line
-                            } else {
-                                // No expected pattern - omit the ---- delimiter entirely
-                                for sql_line in sql_lines {
-                                    out_lines.push(sql_line);
-                                    out_map.push(orig);
-                                }
-                                // Add a blank line to ensure proper termination
-                                out_lines.push(String::new());
-                                out_map.push(mapping[i - 1]);
-                            }
-                            break;
-                        } else {
-                            sql_lines.push(next_line.clone());
-                            i += 1;
+                    if let Some(pattern) = regex_pattern {
+                        out_lines.push(format!("{indent}connection {conn}"));
+                        out_map.push(orig);
+                        out_lines.push(format!("{indent}statement error {}", pattern));
+                        out_map.push(orig);
+                    } else {
+                        out_lines.push(normalized.clone());
+                        out_map.push(orig);
+                    }
+                    for (sql_line, sql_map) in sql_lines {
+                        out_lines.push(sql_line);
+                        out_map.push(sql_map);
+                    }
+                    if saw_separator && !message_lines.is_empty() {
+                        out_lines.push(format!("{indent}----"));
+                        out_map.push(orig);
+                        for (msg_line, msg_map) in message_lines {
+                            out_lines.push(msg_line);
+                            out_map.push(msg_map);
                         }
                     }
+                    out_lines.push(String::new());
+                    out_map.push(orig);
                     continue;
                 } else {
                     // Not a statement error, just output the normalized line
@@ -315,55 +386,32 @@ fn normalize_inline_connections(
 
         // Check if this is a statement error (without inline connection) followed by ----
         if trimmed.starts_with("statement error") {
-            out_lines.push(line.clone());
-            out_map.push(orig);
-            i += 1;
+            let indent = &line[..line.len() - trimmed.len()];
+            let (sql_lines, regex_pattern, message_lines, saw_separator, new_idx) =
+                collect_statement_error_block(&lines, &mapping, i + 1);
+            i = new_idx;
 
-            // Collect the SQL statement lines until we hit ----
-            let mut sql_lines = Vec::new();
-            while i < lines.len() {
-                let next_line = &lines[i];
-                let next_trimmed = next_line.trim_start();
-
-                if next_trimmed == "----" {
-                    // Found the delimiter - now check what follows
-                    i += 1;
-
-                    let has_expected_pattern = if i < lines.len() {
-                        let following = lines[i].trim();
-                        !following.is_empty() && following.starts_with("<REGEX>:")
-                    } else {
-                        false
-                    };
-
-                    if has_expected_pattern {
-                        // OMIT the ---- and output the expected pattern line directly
-                        for sql_line in sql_lines {
-                            out_lines.push(sql_line);
-                            out_map.push(orig); // Use same orig for SQL lines
-                        }
-                        // Output the expected pattern line WITHOUT the ---- delimiter
-                        out_lines.push(lines[i].clone());
-                        out_map.push(mapping[i]);
-                        i += 1; // Move past the expected pattern line
-                    // The blank line terminating the error pattern should already be in the input
-                    } else {
-                        // No expected pattern - omit the ---- delimiter entirely
-                        for sql_line in sql_lines {
-                            out_lines.push(sql_line);
-                            out_map.push(orig); // Use same orig for SQL lines
-                        }
-                        // Add a blank line to ensure proper termination
-                        out_lines.push(String::new());
-                        out_map.push(mapping[i - 1]);
-                    }
-                    break;
-                } else {
-                    // Part of the SQL statement
-                    sql_lines.push(next_line.clone());
-                    i += 1;
+            if let Some(pattern) = regex_pattern {
+                out_lines.push(format!("{indent}statement error {}", pattern));
+                out_map.push(orig);
+            } else {
+                out_lines.push(line.clone());
+                out_map.push(orig);
+            }
+            for (sql_line, sql_map) in sql_lines {
+                out_lines.push(sql_line);
+                out_map.push(sql_map);
+            }
+            if saw_separator && !message_lines.is_empty() {
+                out_lines.push(format!("{indent}----"));
+                out_map.push(orig);
+                for (msg_line, msg_map) in message_lines {
+                    out_lines.push(msg_line);
+                    out_map.push(msg_map);
                 }
             }
+            out_lines.push(String::new());
+            out_map.push(orig);
             continue;
         }
 
@@ -422,4 +470,63 @@ pub fn map_temp_error_message(
         }
     }
     (out, None)
+}
+
+/// Fix error message spacing to prevent sqllogictest multiline interpretation.
+/// Adds an extra blank line after plain text error messages (not regex patterns).
+fn fix_error_message_spacing(lines: Vec<String>) -> Vec<String> {
+    let mut out_lines = Vec::with_capacity(lines.len() + 10);
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = &lines[i];
+        let trimmed = line.trim();
+
+        // Detect error block: statement error followed by SQL, ----, optional message, blank line
+        if trimmed.starts_with("statement error") && !trimmed.contains("<REGEX>:") {
+            // Output the statement error line
+            out_lines.push(line.clone());
+            i += 1;
+
+            // Collect SQL lines until ----
+            while i < lines.len() && lines[i].trim() != "----" {
+                out_lines.push(lines[i].clone());
+                i += 1;
+            }
+
+            // Output ----
+            if i < lines.len() && lines[i].trim() == "----" {
+                out_lines.push(lines[i].clone());
+                i += 1;
+
+                // Check if there's an error message (non-empty line after ----)
+                if i < lines.len() && !lines[i].trim().is_empty() {
+                    // Output the error message
+                    out_lines.push(lines[i].clone());
+                    i += 1;
+
+                    // Output the existing blank line
+                    if i < lines.len() && lines[i].trim().is_empty() {
+                        out_lines.push(lines[i].clone());
+                        i += 1;
+                    }
+
+                    // Add EXTRA blank line to prevent multiline interpretation
+                    out_lines.push(String::new());
+                } else {
+                    // No message - just pass through the blank line
+                    if i < lines.len() {
+                        out_lines.push(lines[i].clone());
+                        i += 1;
+                    }
+                }
+            }
+        } else {
+            // Not an error block - pass through
+            out_lines.push(line.clone());
+            i += 1;
+        }
+    }
+
+    out_lines
 }

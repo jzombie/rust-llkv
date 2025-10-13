@@ -1,9 +1,11 @@
+use std::fmt;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use crate::planner::{TablePlanner, collect_row_ids_for_table};
 use crate::types::TableId;
 
-use arrow::array::{ArrayRef, RecordBatch, StringArray, UInt32Array};
+use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 
@@ -12,67 +14,205 @@ use llkv_column_map::{ColumnStore, types::LogicalFieldId};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::sys_catalog::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
+use crate::reserved::is_reserved_table_id;
+use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
 use llkv_expr::{Expr, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 
+/// Cached information about which system columns exist in the table schema.
+/// This avoids repeated string comparisons in hot paths like append().
+#[derive(Debug, Clone, Copy)]
+struct MvccColumnCache {
+    has_created_by: bool,
+    has_deleted_by: bool,
+}
+
+/// A schema-aware table built on top of columnar storage.
+///
+/// `Table` provides a higher-level interface than [`ColumnStore`], adding:
+///
+/// - **Schema management**: Validates field IDs and data types on append
+/// - **MVCC integration**: Automatically manages `created_by` and `deleted_by` columns
+/// - **Scan operations**: Supports projection, filtering, ordering, and computed columns
+/// - **Row ID filtering**: Allows transaction visibility enforcement via [`RowIdFilter`]
+///
+/// # Table IDs
+///
+/// Each table is identified by a [`TableId`]. Table 0 is reserved for the system catalog.
+/// User tables start at ID 1.
+///
+/// # Field IDs
+///
+/// Each column is assigned a [`FieldId`] stored in the Arrow field metadata. This maps
+/// to a [`LogicalFieldId`] in the underlying storage layer, combining the table ID,
+/// namespace, and field ID.
+///
+/// # Thread Safety
+///
+/// `Table` is `Send + Sync` and can be safely shared via `Arc`.
 pub struct Table<P = MemPager>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     store: ColumnStore<P>,
     table_id: TableId,
+    /// Cache of MVCC column presence. Initialized lazily on first schema() call.
+    /// None means not yet initialized.
+    mvcc_cache: RwLock<Option<MvccColumnCache>>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ScanStreamOptions {
-    /// Preserve null rows emitted by the projected columns when `true`.
-    /// When `false`, the scan gatherer drops rows where all projected
-    /// columns are null or missing before yielding batches. This keeps
-    /// the table scan column-oriented while delegating row-level
-    /// filtering to the column-map layer.
+/// Filter row IDs before they are materialized into batches.
+///
+/// This trait allows implementations to enforce transaction visibility (MVCC),
+/// access control, or other row-level filtering policies. The filter is applied
+/// after column-level predicates but before data is gathered into Arrow batches.
+///
+/// # Example Use Case
+///
+/// MVCC implementations use this to hide rows that were:
+/// - Created after the transaction's snapshot timestamp
+/// - Deleted before the transaction's snapshot timestamp
+pub trait RowIdFilter<P>: Send + Sync
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    /// Filter a list of row IDs, returning only those that should be visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if visibility metadata cannot be loaded or is corrupted.
+    fn filter(&self, table: &Table<P>, row_ids: Vec<u64>) -> LlkvResult<Vec<u64>>;
+}
+
+/// Options for configuring table scans.
+///
+/// These options control how rows are filtered, ordered, and materialized during
+/// scan operations.
+pub struct ScanStreamOptions<P = MemPager>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    /// Whether to include rows where all projected columns are null.
+    ///
+    /// When `false` (default), rows with all-null projections are dropped before
+    /// batches are yielded. This is useful for sparse data where many rows may not
+    /// have values for the selected columns.
     pub include_nulls: bool,
-    /// Optional ordering specification applied to the gathered row ids
-    /// before projection results are materialized.
+    /// Optional ordering to apply to results.
+    ///
+    /// If specified, row IDs are sorted according to this specification before
+    /// data is gathered into batches.
     pub order: Option<ScanOrderSpec>,
+    /// Optional filter for row-level visibility (e.g., MVCC).
+    ///
+    /// Applied after column-level predicates but before data is materialized.
+    /// Used to enforce transaction isolation.
+    pub row_id_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
 }
 
+impl<P> fmt::Debug for ScanStreamOptions<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScanStreamOptions")
+            .field("include_nulls", &self.include_nulls)
+            .field("order", &self.order)
+            .field(
+                "row_id_filter",
+                &self.row_id_filter.as_ref().map(|_| "<RowIdFilter>"),
+            )
+            .finish()
+    }
+}
+
+impl<P> Clone for ScanStreamOptions<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            include_nulls: self.include_nulls,
+            order: self.order,
+            row_id_filter: self.row_id_filter.clone(),
+        }
+    }
+}
+
+impl<P> Default for ScanStreamOptions<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn default() -> Self {
+        Self {
+            include_nulls: false,
+            order: None,
+            row_id_filter: None,
+        }
+    }
+}
+
+/// Specification for ordering scan results.
+///
+/// Defines how to sort rows based on a single column's values.
 #[derive(Clone, Copy, Debug)]
 pub struct ScanOrderSpec {
+    /// The field to sort by.
     pub field_id: FieldId,
+    /// Sort direction (ascending or descending).
     pub direction: ScanOrderDirection,
+    /// Whether null values appear first or last.
     pub nulls_first: bool,
+    /// Optional transformation to apply before sorting.
     pub transform: ScanOrderTransform,
 }
 
+/// Sort direction for scan ordering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanOrderDirection {
+    /// Sort from smallest to largest.
     Ascending,
+    /// Sort from largest to smallest.
     Descending,
 }
 
+/// Value transformation to apply before sorting.
+///
+/// Used to enable sorting on columns that need type coercion or conversion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanOrderTransform {
+    /// Sort integers as-is.
     IdentityInteger,
+    /// Sort strings lexicographically.
     IdentityUtf8,
+    /// Parse strings as integers, then sort numerically.
     CastUtf8ToInteger,
 }
 
+/// A column or computed expression to include in scan results.
+///
+/// Scans can project either stored columns or expressions computed from them.
 #[derive(Clone, Debug)]
 pub enum ScanProjection {
+    /// Project a stored column directly.
     Column(Projection),
+    /// Compute a value from an expression and return it with an alias.
     Computed {
+        /// The expression to evaluate (can reference column field IDs).
         expr: ScalarExpr<FieldId>,
+        /// The name to give the computed column in results.
         alias: String,
     },
 }
 
 impl ScanProjection {
+    /// Create a projection for a stored column.
     pub fn column<P: Into<Projection>>(proj: P) -> Self {
         Self::Column(proj.into())
     }
 
+    /// Create a projection for a computed expression.
     pub fn computed<S: Into<String>>(expr: ScalarExpr<FieldId>, alias: S) -> Self {
         Self::Computed {
             expr,
@@ -103,21 +243,134 @@ impl<P> Table<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    /// Create a new `Table` instance for the given table ID.
+    ///
+    /// This opens the underlying [`ColumnStore`] and initializes table-specific state.
+    /// The table does not need to already exist; this method works for both new and
+    /// existing tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The table ID is reserved (e.g., table 0)
+    /// - The column store cannot be opened
     pub fn new(table_id: TableId, pager: Arc<P>) -> LlkvResult<Self> {
-        if table_id == CATALOG_TABLE_ID {
-            return Err(Error::reserved_table_id(table_id));
+        if is_reserved_table_id(table_id) {
+            return Err(Error::ReservedTableId(table_id));
         }
 
+        tracing::trace!(
+            "!!! Table::new: Creating table table_id={} with pager at {:p}",
+            table_id,
+            &*pager
+        );
         let store = ColumnStore::open(pager)?;
-        Ok(Self { store, table_id })
+        Ok(Self {
+            store,
+            table_id,
+            mvcc_cache: RwLock::new(None),
+        })
     }
 
+    /// Get or initialize the MVCC column cache from the provided schema.
+    /// This is an optimization to avoid repeated string comparisons in append().
+    fn get_mvcc_cache(&self, schema: &Arc<Schema>) -> MvccColumnCache {
+        // Fast path: check if cache is already initialized
+        {
+            let cache_read = self.mvcc_cache.read().unwrap();
+            if let Some(cache) = *cache_read {
+                return cache;
+            }
+        }
+
+        // Slow path: initialize cache from schema
+        let has_created_by = schema
+            .fields()
+            .iter()
+            .any(|f| f.name() == llkv_column_map::store::CREATED_BY_COLUMN_NAME);
+        let has_deleted_by = schema
+            .fields()
+            .iter()
+            .any(|f| f.name() == llkv_column_map::store::DELETED_BY_COLUMN_NAME);
+
+        let cache = MvccColumnCache {
+            has_created_by,
+            has_deleted_by,
+        };
+
+        // Store in cache for future calls
+        *self.mvcc_cache.write().unwrap() = Some(cache);
+
+        cache
+    }
+
+    /// Append a [`RecordBatch`] to the table.
+    ///
+    /// The batch must include:
+    /// - A `row_id` column (type `UInt64`) with unique row identifiers
+    /// - `field_id` metadata for each user column, mapping to this table's field IDs
+    ///
+    /// ## MVCC Columns
+    ///
+    /// If the batch includes `created_by` or `deleted_by` columns, they are automatically
+    /// assigned the correct [`LogicalFieldId`] for this table's MVCC metadata.
+    ///
+    /// ## Field ID Mapping
+    ///
+    /// Each column's `field_id` metadata is converted to a [`LogicalFieldId`] by combining
+    /// it with this table's ID. This ensures columns from different tables don't collide
+    /// in the underlying storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The batch is missing the `row_id` column
+    /// - Any user column is missing `field_id` metadata
+    /// - Field IDs are invalid or malformed
+    /// - The underlying storage operation fails
     pub fn append(&self, batch: &RecordBatch) -> LlkvResult<()> {
-        let mut new_fields = Vec::with_capacity(batch.schema().fields().len());
-        for field in batch.schema().fields() {
+        use arrow::array::UInt64Builder;
+
+        // Check if MVCC columns already exist in the batch using cache
+        // This avoids repeated string comparisons on every append
+        let cache = self.get_mvcc_cache(&batch.schema());
+        let has_created_by = cache.has_created_by;
+        let has_deleted_by = cache.has_deleted_by;
+
+        let mut new_fields = Vec::with_capacity(batch.schema().fields().len() + 2);
+        let mut new_columns: Vec<Arc<dyn Array>> = Vec::with_capacity(batch.columns().len() + 2);
+
+        for (idx, field) in batch.schema().fields().iter().enumerate() {
             let maybe_field_id = field.metadata().get(crate::constants::FIELD_ID_META_KEY);
-            if maybe_field_id.is_none() && field.name() == ROW_ID_COLUMN_NAME {
-                new_fields.push(field.as_ref().clone());
+            // System columns (row_id, MVCC columns) don't need field_id metadata
+            if maybe_field_id.is_none()
+                && (field.name() == ROW_ID_COLUMN_NAME
+                    || field.name() == llkv_column_map::store::CREATED_BY_COLUMN_NAME
+                    || field.name() == llkv_column_map::store::DELETED_BY_COLUMN_NAME)
+            {
+                if field.name() == ROW_ID_COLUMN_NAME {
+                    new_fields.push(field.as_ref().clone());
+                    new_columns.push(batch.column(idx).clone());
+                } else {
+                    let lfid = if field.name() == llkv_column_map::store::CREATED_BY_COLUMN_NAME {
+                        LogicalFieldId::for_mvcc_created_by(self.table_id)
+                    } else {
+                        LogicalFieldId::for_mvcc_deleted_by(self.table_id)
+                    };
+
+                    let mut metadata = field.metadata().clone();
+                    let lfid_val: u64 = lfid.into();
+                    metadata.insert(
+                        crate::constants::FIELD_ID_META_KEY.to_string(),
+                        lfid_val.to_string(),
+                    );
+
+                    let new_field =
+                        Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                            .with_metadata(metadata);
+                    new_fields.push(new_field);
+                    new_columns.push(batch.column(idx).clone());
+                }
                 continue;
             }
 
@@ -165,6 +418,7 @@ where
                 Field::new(field.name(), field.data_type().clone(), field.is_nullable())
                     .with_metadata(new_metadata);
             new_fields.push(new_field);
+            new_columns.push(batch.column(idx).clone());
 
             // Ensure the catalog remembers the human-friendly column name for
             // this field so callers of `Table::schema()` (and other metadata
@@ -190,8 +444,62 @@ where
             }
         }
 
+        // Inject MVCC columns if they don't exist
+        // For non-transactional appends (e.g., CSV ingest), we use TXN_ID_AUTO_COMMIT (1)
+        // which is treated as "committed by system" and always visible.
+        // Use TXN_ID_NONE (0) for deleted_by to indicate "not deleted".
+        const TXN_ID_AUTO_COMMIT: u64 = 1;
+        const TXN_ID_NONE: u64 = 0;
+        let row_count = batch.num_rows();
+
+        if !has_created_by {
+            let mut created_by_builder = UInt64Builder::with_capacity(row_count);
+            for _ in 0..row_count {
+                created_by_builder.append_value(TXN_ID_AUTO_COMMIT);
+            }
+            let created_by_lfid = LogicalFieldId::for_mvcc_created_by(self.table_id);
+            let mut metadata = HashMap::new();
+            let lfid_val: u64 = created_by_lfid.into();
+            metadata.insert(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            );
+            new_fields.push(
+                Field::new(
+                    llkv_column_map::store::CREATED_BY_COLUMN_NAME,
+                    DataType::UInt64,
+                    false,
+                )
+                .with_metadata(metadata),
+            );
+            new_columns.push(Arc::new(created_by_builder.finish()));
+        }
+
+        if !has_deleted_by {
+            let mut deleted_by_builder = UInt64Builder::with_capacity(row_count);
+            for _ in 0..row_count {
+                deleted_by_builder.append_value(TXN_ID_NONE);
+            }
+            let deleted_by_lfid = LogicalFieldId::for_mvcc_deleted_by(self.table_id);
+            let mut metadata = HashMap::new();
+            let lfid_val: u64 = deleted_by_lfid.into();
+            metadata.insert(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            );
+            new_fields.push(
+                Field::new(
+                    llkv_column_map::store::DELETED_BY_COLUMN_NAME,
+                    DataType::UInt64,
+                    false,
+                )
+                .with_metadata(metadata),
+            );
+            new_columns.push(Arc::new(deleted_by_builder.finish()));
+        }
+
         let new_schema = Arc::new(Schema::new(new_fields));
-        let namespaced_batch = RecordBatch::try_new(new_schema, batch.columns().to_vec())?;
+        let namespaced_batch = RecordBatch::try_new(new_schema, new_columns)?;
         self.store.append(&namespaced_batch)
     }
 
@@ -206,7 +514,7 @@ where
         &self,
         projections: I,
         filter_expr: &Expr<'a, FieldId>,
-        options: ScanStreamOptions,
+        options: ScanStreamOptions<P>,
         on_batch: F,
     ) -> LlkvResult<()>
     where
@@ -224,7 +532,7 @@ where
         &self,
         projections: &[ScanProjection],
         filter_expr: &Expr<'a, FieldId>,
-        options: ScanStreamOptions,
+        options: ScanStreamOptions<P>,
         on_batch: F,
     ) -> LlkvResult<()>
     where
@@ -378,7 +686,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sys_catalog::CATALOG_TABLE_ID;
+    use crate::reserved::CATALOG_TABLE_ID;
     use crate::types::RowId;
     use arrow::array::Array;
     use arrow::array::ArrayRef;
@@ -1262,6 +1570,7 @@ mod tests {
                 ScanStreamOptions {
                     include_nulls: true,
                     order: None,
+                    row_id_filter: None,
                 },
                 |b| {
                     let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
