@@ -251,10 +251,38 @@ pub struct DeletePlan {
 // SELECT Plan
 // ============================================================================
 
+/// Table reference in FROM clause.
+#[derive(Clone, Debug)]
+pub struct TableRef {
+    pub schema: String,
+    pub table: String,
+}
+
+impl TableRef {
+    pub fn new(schema: impl Into<String>, table: impl Into<String>) -> Self {
+        Self {
+            schema: schema.into(),
+            table: table.into(),
+        }
+    }
+    
+    /// Get fully qualified name as "schema.table"
+    pub fn qualified_name(&self) -> String {
+        if self.schema.is_empty() {
+            self.table.clone()
+        } else {
+            format!("{}.{}", self.schema, self.table)
+        }
+    }
+}
+
 /// Logical query plan for SELECT operations.
 #[derive(Clone, Debug)]
 pub struct SelectPlan {
+    /// Legacy single table field for backward compatibility
     pub table: String,
+    /// Multiple tables for joins/cross products (if present, overrides `table`)
+    pub tables: Vec<TableRef>,
     pub projections: Vec<SelectProjection>,
     pub filter: Option<llkv_expr::expr::Expr<'static, String>>,
     pub aggregates: Vec<AggregateExpr>,
@@ -265,6 +293,19 @@ impl SelectPlan {
     pub fn new(table: impl Into<String>) -> Self {
         Self {
             table: table.into(),
+            tables: Vec::new(),
+            projections: Vec::new(),
+            filter: None,
+            aggregates: Vec::new(),
+            order_by: None,
+        }
+    }
+    
+    /// Create a SelectPlan with multiple tables for cross product/joins
+    pub fn with_tables(tables: Vec<TableRef>) -> Self {
+        Self {
+            table: String::new(),
+            tables,
             projections: Vec::new(),
             filter: None,
             aggregates: Vec::new(),
@@ -297,6 +338,9 @@ impl SelectPlan {
 #[derive(Clone, Debug)]
 pub enum SelectProjection {
     AllColumns,
+    AllColumnsExcept {
+        exclude: Vec<String>,
+    },
     Column {
         name: String,
         alias: Option<String>,

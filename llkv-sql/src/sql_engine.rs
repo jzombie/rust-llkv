@@ -113,6 +113,22 @@ where
             default_nulls_first: AtomicBool::new(false),
         }
     }
+    
+    /// Preprocess SQL to handle qualified names in EXCLUDE clauses
+    /// Converts EXCLUDE (schema.table.col) to EXCLUDE ("schema.table.col")
+    fn preprocess_exclude_syntax(sql: &str) -> String {
+        use regex::Regex;
+        
+        // Pattern to match EXCLUDE followed by qualified identifiers
+        // Matches: EXCLUDE (identifier.identifier.identifier)
+        let re = Regex::new(r"(?i)EXCLUDE\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)+)\s*\)")
+            .unwrap();
+        
+        re.replace_all(sql, |caps: &regex::Captures| {
+            let qualified_name = &caps[1];
+            format!("EXCLUDE (\"{}\")", qualified_name)
+        }).to_string()
+    }
 
     pub(crate) fn context_arc(&self) -> Arc<RuntimeContext<P>> {
         self.engine.context()
@@ -141,8 +157,13 @@ where
 
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<RuntimeStatementResult<P>>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
+        
+        // Preprocess SQL to handle qualified names in EXCLUDE
+        // Replace EXCLUDE (schema.table.col) with EXCLUDE ("schema.table.col")
+        let processed_sql = Self::preprocess_exclude_syntax(sql);
+        
         let dialect = GenericDialect {};
-        let statements = Parser::parse_sql(&dialect, sql)
+        let statements = Parser::parse_sql(&dialect, &processed_sql)
             .map_err(|err| Error::InvalidArgumentError(format!("failed to parse SQL: {err}")))?;
         tracing::trace!("DEBUG SQL execute: parsed {} statements", statements.len());
 
@@ -1222,20 +1243,38 @@ where
             validate_projection_alias_qualifiers(&select.projection, alias)?;
         }
 
-        // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1} AS x)
-        let (display_name, _canonical_name) = if select.from.is_empty() {
-            // No FROM clause - use empty string for table context
-            ("".to_string(), "".to_string())
+        // Handle different FROM clause scenarios
+        let mut plan = if select.from.is_empty() {
+            // No FROM clause - use empty string for table context (e.g., SELECT 42, SELECT {'a': 1} AS x)
+            SelectPlan::new("")
+        } else if select.from.len() == 1 {
+            // Single table - use legacy path
+            let (display_name, _canonical_name) = extract_single_table(&select.from)?;
+            let mut p = SelectPlan::new(display_name.clone());
+            if let Some(aggregates) = self.detect_simple_aggregates(&select.projection)? {
+                p = p.with_aggregates(aggregates);
+            } else {
+                let projections = self.build_projection_list(&select.projection, &_canonical_name)?;
+                p = p.with_projections(projections);
+            }
+            p
         } else {
-            extract_single_table(&select.from)?
+            // Multiple tables - cross product
+            let tables = extract_tables(&select.from)?;
+            let mut p = SelectPlan::with_tables(tables);
+            // For multi-table queries, we'll build projections differently
+            // For now, just handle simple column references
+            let projections = self.build_projection_list(&select.projection, "")?;
+            p = p.with_projections(projections);
+            p
         };
         
-        let mut plan = SelectPlan::new(display_name.clone());
-
-        if let Some(aggregates) = self.detect_simple_aggregates(&select.projection)? {
-            plan = plan.with_aggregates(aggregates);
-        } else {
-            let projections = self.build_projection_list(&select.projection, &_canonical_name)?;
+        // Handle aggregates for single table case (already handled above for multi-table)
+        if select.from.len() == 1 && plan.aggregates.is_empty() {
+            // Already handled in the branch above
+        } else if select.from.is_empty() {
+            // Handle literals/expressions without FROM
+            let projections = self.build_projection_list(&select.projection, "")?;
             plan = plan.with_projections(projections);
         }
 
@@ -1506,8 +1545,24 @@ where
         let mut projections = Vec::with_capacity(projection_items.len());
         for (idx, item) in projection_items.iter().enumerate() {
             match item {
-                SelectItem::Wildcard(_) => {
-                    projections.push(SelectProjection::AllColumns);
+                SelectItem::Wildcard(options) => {
+                    // Check if EXCLUDE is specified
+                    if let Some(exclude) = &options.opt_exclude {
+                        use sqlparser::ast::ExcludeSelectItem;
+                        let exclude_cols = match exclude {
+                            ExcludeSelectItem::Single(ident) => {
+                                vec![ident.value.clone()]
+                            }
+                            ExcludeSelectItem::Multiple(idents) => {
+                                idents.iter().map(|id| id.value.clone()).collect()
+                            }
+                        };
+                        projections.push(SelectProjection::AllColumnsExcept {
+                            exclude: exclude_cols,
+                        });
+                    } else {
+                        projections.push(SelectProjection::AllColumns);
+                    }
                 }
                 SelectItem::QualifiedWildcard(kind, _) => match kind {
                     SelectItemQualifiedWildcardKind::ObjectName(name) => {
@@ -2233,6 +2288,12 @@ fn translate_scalar_with_context(expr: &SqlExpr, from_table: &str) -> SqlResult<
             // Build the full identifier path
             let full_path: Vec<String> = idents.iter().map(|id| id.value.clone()).collect();
             
+            // For multi-table queries (empty from_table), use the full qualified name
+            if from_table.is_empty() {
+                // s1.t1.t becomes column name "s1.t1.t"
+                return Ok(llkv_expr::expr::ScalarExpr::column(full_path.join(".")));
+            }
+            
             // Check if the identifier starts with the FROM table prefix (schema.table or just table)
             // from_table might be "schema.table" or just "table"
             let from_parts: Vec<&str> = from_table.split('.').collect();
@@ -2255,8 +2316,28 @@ fn translate_scalar_with_context(expr: &SqlExpr, from_table: &str) -> SqlResult<
                     && full_path[0].eq_ignore_ascii_case(from_parts[1]) {
                     // "table.column..." - just table name, column starts at index 1
                     1
+                } else if full_path.len() >= 3 
+                    && full_path[1].eq_ignore_ascii_case(from_parts[1]) {
+                    // We have 3+ parts (x.y.z...) and FROM is schema.table
+                    // If the second part (y) matches the table name but first part doesn't match schema,
+                    // then the user is trying to reference the table with wrong schema
+                    // Example: testX.tbl.col when FROM is test.tbl
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Binder Error: table '{}' not found",
+                        full_path[0]
+                    )));
+                } else if full_path.len() >= 3 
+                    && full_path[0].eq_ignore_ascii_case(from_parts[0]) {
+                    // We have 3+ parts (x.y.z...) and FROM is schema.table
+                    // If the first part matches the schema but second part doesn't match table,
+                    // then the user is trying to reference a wrong table in the correct schema
+                    // Example: test.tblX.col when FROM is test.tbl
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Binder Error: table '{}' not found",
+                        full_path[1]
+                    )));
                 } else {
-                    // No match, assume first part is column
+                    // Treat first part as column name
                     0
                 }
             } else if from_parts.len() == 1 {
@@ -2266,7 +2347,7 @@ fn translate_scalar_with_context(expr: &SqlExpr, from_table: &str) -> SqlResult<
                     // "table.column..." - skip table name, column starts at index 1
                     1
                 } else {
-                    // No match, assume first part is column
+                    // Doesn't match FROM table - treat first part as column name
                     0
                 }
             } else {
@@ -2736,6 +2817,36 @@ fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> 
             "queries require a plain table name".into(),
         )),
     }
+}
+
+/// Extract multiple tables from FROM clause for cross products
+fn extract_tables(from: &[TableWithJoins]) -> SqlResult<Vec<llkv_plan::TableRef>> {
+    let mut tables = Vec::new();
+    
+    for item in from {
+        // Check if this table has joins - we don't support JOIN yet
+        if !item.joins.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "JOIN clauses are not supported yet".into(),
+            ));
+        }
+        
+        // Extract table name
+        match &item.relation {
+            TableFactor::Table { name, .. } => {
+                let (schema_opt, table) = parse_schema_qualified_name(name)?;
+                let schema = schema_opt.unwrap_or_default();
+                tables.push(llkv_plan::TableRef::new(schema, table));
+            }
+            _ => {
+                return Err(Error::InvalidArgumentError(
+                    "queries require a plain table name".into(),
+                ))
+            }
+        }
+    }
+    
+    Ok(tables)
 }
 
 fn group_by_is_empty(expr: &GroupByExpr) -> bool {

@@ -63,8 +63,13 @@ where
         row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
         // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
-        if plan.table.is_empty() {
+        if plan.table.is_empty() && plan.tables.is_empty() {
             return self.execute_select_without_table(plan);
+        }
+        
+        // Handle multi-table queries (cross products)
+        if !plan.tables.is_empty() {
+            return self.execute_cross_product(plan);
         }
 
         let table = self.provider.get_table(&plan.table)?;
@@ -188,6 +193,179 @@ where
                 Ok((DataType::Struct(inner_fields.into()), Arc::new(struct_array) as ArrayRef))
             }
         }
+    }
+
+    /// Execute a cross product query (FROM table1, table2, ...)
+    fn execute_cross_product(&self, plan: SelectPlan) -> ExecutorResult<SelectExecution<P>> {
+        use arrow::compute::concat_batches;
+        
+        if plan.tables.len() < 2 {
+            return Err(Error::InvalidArgumentError(
+                "cross product requires at least 2 tables".into()
+            ));
+        }
+        
+        // Get all tables
+        let mut tables = Vec::new();
+        for table_ref in &plan.tables {
+            let qualified_name = table_ref.qualified_name();
+            let table = self.provider.get_table(&qualified_name)?;
+            tables.push((table_ref.clone(), table));
+        }
+        
+        // For now, support only 2-table cross product
+        if tables.len() > 2 {
+            return Err(Error::InvalidArgumentError(
+                "cross products with more than 2 tables not yet supported".into()
+            ));
+        }
+        
+        let (left_ref, left_table) = &tables[0];
+        let (right_ref, right_table) = &tables[1];
+        
+        // Build the cross product using llkv-join crate
+        // For cross product, we pass empty join keys = Cartesian product
+        use llkv_join::{TableJoinExt, JoinOptions, JoinType};
+        
+        let mut result_batches = Vec::new();
+        left_table.table.join_stream(
+            &right_table.table,
+            &[], // Empty join keys = cross product
+            &JoinOptions {
+                join_type: JoinType::Inner,
+                ..Default::default()
+            },
+            |batch| {
+                result_batches.push(batch);
+            },
+        )?;
+        
+        // Build combined schema with qualified column names
+        let mut combined_fields = Vec::new();
+        
+        // Add left table columns with schema.table.column prefix
+        for col in &left_table.schema.columns {
+            let qualified_name = format!("{}.{}.{}", 
+                left_ref.schema, left_ref.table, col.name);
+            combined_fields.push(arrow::datatypes::Field::new(
+                qualified_name,
+                col.data_type.clone(),
+                col.nullable,
+            ));
+        }
+        
+        // Add right table columns with schema.table.column prefix
+        for col in &right_table.schema.columns {
+            let qualified_name = format!("{}.{}.{}", 
+                right_ref.schema, right_ref.table, col.name);
+            combined_fields.push(arrow::datatypes::Field::new(
+                qualified_name,
+                col.data_type.clone(),
+                col.nullable,
+            ));
+        }
+        
+        let combined_schema = Arc::new(Schema::new(combined_fields));
+        
+        // Combine all result batches with the combined schema (renames columns)
+        let mut combined_batch = if result_batches.is_empty() {
+            RecordBatch::new_empty(Arc::clone(&combined_schema))
+        } else if result_batches.len() == 1 {
+            let batch = result_batches.into_iter().next().unwrap();
+            // The batch from join has original column names, we need to apply our qualified schema
+            RecordBatch::try_new(Arc::clone(&combined_schema), batch.columns().to_vec())
+                .map_err(|e| Error::Internal(format!("failed to create batch with qualified names: {}", e)))?
+        } else {
+            // First concatenate with original schema
+            let original_batch = concat_batches(&result_batches[0].schema(), &result_batches)
+                .map_err(|e| Error::Internal(format!("failed to concatenate batches: {}", e)))?;
+            // Then apply qualified schema
+            RecordBatch::try_new(Arc::clone(&combined_schema), original_batch.columns().to_vec())
+                .map_err(|e| Error::Internal(format!("failed to create batch with qualified names: {}", e)))?
+        };
+        
+        // Apply SELECT projections if specified
+        if !plan.projections.is_empty() {
+            let mut selected_fields = Vec::new();
+            let mut selected_columns = Vec::new();
+            
+            for proj in &plan.projections {
+                match proj {
+                    SelectProjection::AllColumns => {
+                        // Keep all columns
+                        selected_fields = combined_schema.fields().iter().cloned().collect();
+                        selected_columns = combined_batch.columns().to_vec();
+                        break;
+                    }
+                    SelectProjection::AllColumnsExcept { exclude } => {
+                        // Keep all columns except the excluded ones
+                        let exclude_lower: Vec<String> = exclude.iter()
+                            .map(|e| e.to_ascii_lowercase())
+                            .collect();
+                        
+                        for (idx, field) in combined_schema.fields().iter().enumerate() {
+                            let field_name_lower = field.name().to_ascii_lowercase();
+                            if !exclude_lower.contains(&field_name_lower) {
+                                selected_fields.push(field.clone());
+                                selected_columns.push(combined_batch.column(idx).clone());
+                            }
+                        }
+                        break;
+                    }
+                    SelectProjection::Column { name, alias } => {
+                        // Find the column by qualified name
+                        let col_name = name.to_ascii_lowercase();
+                        if let Some((idx, field)) = combined_schema.fields().iter().enumerate()
+                            .find(|(_, f)| f.name().to_ascii_lowercase() == col_name) {
+                            let output_name = alias.as_ref().unwrap_or(name).clone();
+                            selected_fields.push(Arc::new(arrow::datatypes::Field::new(
+                                output_name,
+                                field.data_type().clone(),
+                                field.is_nullable(),
+                            )));
+                            selected_columns.push(combined_batch.column(idx).clone());
+                        } else {
+                            return Err(Error::InvalidArgumentError(
+                                format!("column '{}' not found in cross product result", name)
+                            ));
+                        }
+                    }
+                    SelectProjection::Computed { expr, alias } => {
+                        // Handle simple column references (like s1.t1.t)
+                        if let ScalarExpr::Column(col_name) = expr {
+                            let col_name_lower = col_name.to_ascii_lowercase();
+                            if let Some((idx, field)) = combined_schema.fields().iter().enumerate()
+                                .find(|(_, f)| f.name().to_ascii_lowercase() == col_name_lower) {
+                                selected_fields.push(Arc::new(arrow::datatypes::Field::new(
+                                    alias.clone(),
+                                    field.data_type().clone(),
+                                    field.is_nullable(),
+                                )));
+                                selected_columns.push(combined_batch.column(idx).clone());
+                            } else {
+                                return Err(Error::InvalidArgumentError(
+                                    format!("column '{}' not found in cross product result", col_name)
+                                ));
+                            }
+                        } else {
+                            return Err(Error::InvalidArgumentError(
+                                "complex computed projections not yet supported in cross products".into()
+                            ));
+                        }
+                    }
+                }
+            }
+            
+            let projected_schema = Arc::new(Schema::new(selected_fields));
+            combined_batch = RecordBatch::try_new(projected_schema, selected_columns)
+                .map_err(|e| Error::Internal(format!("failed to apply projections: {}", e)))?;
+        }
+        
+        Ok(SelectExecution::new_single_batch(
+            format!("{},{}", left_ref.qualified_name(), right_ref.qualified_name()),
+            combined_batch.schema(),
+            combined_batch,
+        ))
     }
 
     fn execute_projection(
@@ -513,9 +691,9 @@ where
 
         for proj in &plan.projections {
             match proj {
-                SelectProjection::AllColumns => {
+                SelectProjection::AllColumns | SelectProjection::AllColumnsExcept { .. } => {
                     return Err(Error::InvalidArgumentError(
-                        "AllColumns projection not supported with computed aggregates".into(),
+                        "Wildcard projections not supported with computed aggregates".into(),
                     ));
                 }
                 SelectProjection::Column { name, alias } => {

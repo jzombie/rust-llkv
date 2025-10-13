@@ -1,0 +1,12 @@
+# Test struct literals in CREATE TABLE AS SELECT
+
+statement ok
+CREATE SCHEMA test
+
+statement ok
+CREATE TABLE test.mystruct AS SELECT {'a': 1, 'b': 2} AS mystruct
+
+query T
+SELECT * FROM test.mystruct
+----
+{'a': 1, 'b': 2}

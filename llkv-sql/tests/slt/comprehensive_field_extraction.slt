@@ -1,0 +1,53 @@
+# Comprehensive struct field extraction test
+# Tests all the struct field extraction cases from test_multi_column_reference.slt
+# that don't require CREATE TABLE AS SELECT with struct literals
+
+statement ok
+CREATE SCHEMA test
+
+statement ok
+CREATE TABLE test.tbl(col INTEGER);
+
+statement ok
+INSERT INTO test.tbl VALUES (1), (2), (3);
+
+# Test schema.table.column resolution
+query I
+SELECT test.tbl.col FROM test.tbl;
+----
+1
+2
+3
+
+statement ok
+CREATE SCHEMA t
+
+statement ok
+CREATE TABLE t.t(t ROW(t INTEGER));
+
+statement ok
+INSERT INTO t.t VALUES ({'t': 42});
+
+# Test "t" selects the column (returns whole struct)
+query I
+SELECT t FROM t.t;
+----
+{'t': 42}
+
+# Test "t.t" - ambiguous case, currently returns column
+query I
+SELECT t.t FROM t.t;
+----
+{'t': 42}
+
+# Test "t.t.t" - ambiguous, currently returns column  
+query I
+SELECT t.t.t FROM t.t;
+----
+{'t': 42}
+
+# Test "t.t.t.t" - THIS EXTRACTS THE FIELD
+query I
+SELECT t.t.t.t FROM t.t;
+----
+42

@@ -1,0 +1,22 @@
+# Test struct field extraction feature
+# This tests the GetField expression implementation
+# NOTE: Without a full catalog/binder, we can't distinguish table.column from column.field
+# So this test uses single-part identifiers where possible
+
+statement ok
+CREATE TABLE my_table(my_struct ROW(value INTEGER));
+
+statement ok
+INSERT INTO my_table VALUES ({'value': 42});
+
+# Select the column (returns the whole struct)
+query I
+SELECT my_struct FROM my_table;
+----
+{'value': 42}
+
+# Extract the integer field value using struct field access
+query I
+SELECT my_struct.value FROM my_table;
+----
+42

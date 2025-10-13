@@ -315,7 +315,16 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
         PlanStatement::Insert(plan) => Some(&plan.table),
         PlanStatement::Update(plan) => Some(&plan.table),
         PlanStatement::Delete(plan) => Some(&plan.table),
-        PlanStatement::Select(plan) => Some(&plan.table),
+        PlanStatement::Select(plan) => {
+            // For multi-table queries, return None (no single table name)
+            if !plan.tables.is_empty() {
+                None
+            } else if plan.table.is_empty() {
+                None
+            } else {
+                Some(&plan.table)
+            }
+        }
         PlanStatement::BeginTransaction
         | PlanStatement::CommitTransaction
         | PlanStatement::RollbackTransaction => None,
@@ -1180,11 +1189,21 @@ where
                 col.primary_key
             );
         }
-        let exists = {
+        let (exists, is_dropped) = {
             let tables = self.tables.read().unwrap();
-            tables.contains_key(&canonical_name)
+            let in_cache = tables.contains_key(&canonical_name);
+            let is_dropped = self.dropped_tables.read().unwrap().contains(&canonical_name);
+            // Table exists if it's in cache and NOT marked as dropped
+            (in_cache && !is_dropped, is_dropped)
         };
-        tracing::trace!("DEBUG create_table_plan: exists={}", exists);
+        tracing::trace!("DEBUG create_table_plan: exists={}, is_dropped={}", exists, is_dropped);
+        
+        // If table was dropped, remove it from cache before creating new one
+        if is_dropped {
+            self.remove_table_entry(&canonical_name);
+            self.dropped_tables.write().unwrap().remove(&canonical_name);
+        }
+        
         if exists {
             if plan.or_replace {
                 tracing::trace!(
@@ -1207,8 +1226,6 @@ where
                 )));
             }
         }
-
-        self.dropped_tables.write().unwrap().remove(&canonical_name);
 
         match plan.source {
             Some(CreateTableSource::Batches { schema, batches }) => self.create_table_from_batches(
@@ -1642,7 +1659,11 @@ where
         snapshot: TransactionSnapshot,
     ) -> Result<RuntimeStatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
-        let table = self.lookup_table(&canonical_name)?;
+        // Get table - will be checked against snapshot during actual deletion
+        let table = match self.tables.read().unwrap().get(&canonical_name) {
+            Some(t) => Arc::clone(t),
+            None => return Err(Error::NotFound),
+        };
         match plan.filter {
             Some(filter) => self.delete_filtered_rows(
                 table.as_ref(),
@@ -1661,7 +1682,7 @@ where
 
     pub fn execute_select(self: &Arc<Self>, plan: SelectPlan) -> Result<SelectExecution<P>> {
         // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
-        if plan.table.is_empty() {
+        if plan.table.is_empty() && plan.tables.is_empty() {
             // No table to query - just evaluate computed expressions
             let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
                 context: Arc::clone(self),
@@ -1669,10 +1690,36 @@ where
             let executor = QueryExecutor::new(provider);
             return executor.execute_select(plan);
         }
+        
+        // Handle multi-table queries (cross products/joins)
+        if !plan.tables.is_empty() {
+            // Resolve canonical names (don't verify existence yet - let executor do it)
+            let mut canonical_tables = Vec::new();
+            for table_ref in &plan.tables {
+                let qualified = table_ref.qualified_name();
+                let (_display, canonical) = canonical_table_name(&qualified)?;
+                // Parse canonical back into schema.table
+                let parts: Vec<&str> = canonical.split('.').collect();
+                let canon_ref = if parts.len() >= 2 {
+                    llkv_plan::TableRef::new(parts[0], parts[1])
+                } else {
+                    llkv_plan::TableRef::new("", &canonical)
+                };
+                canonical_tables.push(canon_ref);
+            }
+            
+            let mut canonical_plan = plan.clone();
+            canonical_plan.tables = canonical_tables;
+            
+            let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
+                context: Arc::clone(self),
+            });
+            let executor = QueryExecutor::new(provider);
+            return executor.execute_select(canonical_plan);
+        }
 
         let (_display_name, canonical_name) = canonical_table_name(&plan.table)?;
-        // Verify table exists
-        let _table = self.lookup_table(&canonical_name)?;
+        // Don't verify table exists here - let executor handle it (for transaction isolation)
 
         // Create a plan with canonical table name
         let mut canonical_plan = plan.clone();
@@ -1692,7 +1739,7 @@ where
         snapshot: TransactionSnapshot,
     ) -> Result<SelectExecution<P>> {
         // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
-        if plan.table.is_empty() {
+        if plan.table.is_empty() && plan.tables.is_empty() {
             let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
                 context: Arc::clone(self),
             });
@@ -1700,9 +1747,37 @@ where
             // No row filter needed since there's no table
             return executor.execute_select_with_filter(plan, None);
         }
+        
+        // Handle multi-table queries (cross products/joins)
+        if !plan.tables.is_empty() {
+            // Resolve canonical names (don't verify existence - executor will handle it with snapshot)
+            let mut canonical_tables = Vec::new();
+            for table_ref in &plan.tables {
+                let qualified = table_ref.qualified_name();
+                let (_display, canonical) = canonical_table_name(&qualified)?;
+                // Parse canonical back into schema.table
+                let parts: Vec<&str> = canonical.split('.').collect();
+                let canon_ref = if parts.len() >= 2 {
+                    llkv_plan::TableRef::new(parts[0], parts[1])
+                } else {
+                    llkv_plan::TableRef::new("", &canonical)
+                };
+                canonical_tables.push(canon_ref);
+            }
+            
+            let mut canonical_plan = plan.clone();
+            canonical_plan.tables = canonical_tables;
+            
+            let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
+                context: Arc::clone(self),
+            });
+            let executor = QueryExecutor::new(provider);
+            // For multi-table, we don't apply MVCC filtering yet (TODO)
+            return executor.execute_select_with_filter(canonical_plan, None);
+        }
 
         let (_display_name, canonical_name) = canonical_table_name(&plan.table)?;
-        self.lookup_table(&canonical_name)?;
+        // Don't verify table exists here - executor will handle it with snapshot
 
         let mut canonical_plan = plan.clone();
         canonical_plan.table = canonical_name;
@@ -2839,6 +2914,11 @@ where
         {
             let tables = self.tables.read().unwrap();
             if let Some(table) = tables.get(canonical_name) {
+                // Check if table has been dropped
+                if self.dropped_tables.read().unwrap().contains(canonical_name) {
+                    // Table was dropped - treat as not found
+                    return Err(Error::NotFound);
+                }
                 tracing::trace!(
                     "=== LOOKUP_TABLE '{}' (cached) table_id={} columns={} context_pager={:p} ===",
                     canonical_name,
@@ -3034,8 +3114,8 @@ where
         }
         drop(tables);
 
-        // Remove from tables cache
-        self.remove_table_entry(&canonical_name);
+        // Don't remove from tables cache - keep it for transactions with earlier snapshots
+        // self.remove_table_entry(&canonical_name);
 
         // Unregister from catalog
         self.catalog.unregister_table(&canonical_name);
@@ -3511,7 +3591,7 @@ pub fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> Re
         let index = schema
             .lookup
             .get(&normalized)
-            .ok_or_else(|| Error::InvalidArgumentError(format!("unknown column '{}'", column)))?;
+            .ok_or_else(|| Error::InvalidArgumentError(format!("Binder Error: does not have a column named '{}'", column)))?;
         resolved.push(*index);
     }
     Ok(resolved)
@@ -3696,7 +3776,7 @@ fn resolve_field_id_from_schema(schema: &ExecutorSchema, name: &str) -> Result<F
         .resolve(name)
         .map(|column| column.field_id)
         .ok_or_else(|| {
-            Error::InvalidArgumentError(format!("unknown column '{name}' in expression"))
+            Error::InvalidArgumentError(format!("Binder Error: does not have a column named '{name}'"))
         })
 }
 

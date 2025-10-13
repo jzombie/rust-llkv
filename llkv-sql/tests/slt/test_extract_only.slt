@@ -1,0 +1,14 @@
+statement ok
+CREATE SCHEMA t
+
+statement ok
+CREATE TABLE t.t(t ROW(t INTEGER));
+
+statement ok
+INSERT INTO t.t VALUES ({'t': 42});
+
+# This should extract the field and return 42
+query I
+SELECT t.t.t.t FROM t.t;
+----
+42
