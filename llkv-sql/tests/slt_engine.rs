@@ -60,6 +60,18 @@ fn format_struct_value(struct_array: &arrow::array::StructArray, row_idx: usize)
                     a.value(row_idx).to_string()
                 }
             }
+            arrow::datatypes::DataType::Struct(_) => {
+                // Recursively format nested struct
+                let a = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::StructArray>()
+                    .unwrap();
+                if a.is_null(row_idx) {
+                    "NULL".to_string()
+                } else {
+                    format_struct_value(a, row_idx)
+                }
+            }
             _ => "NULL".to_string(),
         };
         parts.push(format!("'{}': {}", field_name, value_str));
