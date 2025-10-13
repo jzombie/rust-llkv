@@ -279,9 +279,9 @@ fn test_join_validation_errors() {
     let left = create_test_table(1, &pager, vec![(0, 1, "Alice")]);
     let right = create_test_table(2, &pager, vec![(0, 1, "Alpha")]);
 
-    // Empty keys should error
+    // Empty keys is valid (cross product) - should succeed
     let result = left.join_stream(&right, &[], &JoinOptions::default(), |_| {});
-    assert!(result.is_err());
+    assert!(result.is_ok());
 
     // Bad batch size should error
     let bad_opts = JoinOptions {
