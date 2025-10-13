@@ -23,13 +23,13 @@ llkv-test-utils = { workspace = true, features = ["auto-init"] }
 simd-r-drive-entry-handle.workspace = true
 sqllogictest.workspace = true
 sqlparser.workspace = true
+tempfile.workspace = true
 time = { workspace = true, features = ["parsing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing = { workspace = true }
 llkv-plan.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
 
 [[test]]

@@ -70,25 +70,6 @@ Notes:
 - Default log level is `info` when `RUST_LOG` is not set. Use `RUST_LOG=<module>=debug` or `RUST_LOG=debug` to see debug traces.
 - If you enable `auto-init` in a crate's `dev-dependencies` you do not need (and should not) call the initializer manually; it will already have run.
 
-## SQL logic test harness
-
-The crate also exposes helpers for running [sqllogictest](https://github.com/sqllogictest) suites:
-
-- `pub fn run_slt_harness(...)` discovers `.slt` files and executes them as [`libtest-mimic`](https://docs.rs/libtest-mimic) trials.
-- `pub fn run_slt_harness_with_args(...)` is the same but accepts pre-parsed `Arguments`, allowing custom entry points (for example, dedicated binaries or integration tests with `harness = false`).
-
-Because the harness delegates argument parsing to `libtest-mimic`, you automatically get the familiar `cargo test` filtering semantics. In `llkv-sql` you can drive the suite directly via the dedicated integration test target:
-
-```bash
-# List all generated trials (similar to `cargo test -- --list`)
-cargo test -p llkv-sql --test slt_harness -- --list
-
-# Run a subset by name substring (only matching .slt files execute)
-cargo test -p llkv-sql --test slt_harness -- transactions/test_basic
-```
-
-You can pass any other `libtest`-style flag (`--ignored`, `--test-threads=1`, etc.) and the harness will honor it.
-
 ## How to turn it off
 
 - Remove the `auto-init` feature from the `dev-dependencies` entry in the crate(s) where you do not want automatic startup.

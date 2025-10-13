@@ -26,5 +26,3 @@ mod auto {
         super::init_tracing_for_tests();
     }
 }
-
-pub mod slt;
