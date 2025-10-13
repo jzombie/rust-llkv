@@ -1,15 +1,12 @@
 use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
+use llkv_result::Error;
 use sqllogictest::{AsyncDB, DefaultColumnType, Runner};
 use std::path::{Component, Path};
-use llkv_result::Error;
 
 /// Run a single slt file using the provided AsyncDB factory. The factory is
 /// a closure that returns a future resolving to a new DB instance for the
 /// runner. This mirrors sqllogictest's Runner::new signature and behavior.
-pub async fn run_slt_file_with_factory<F, Fut, D, E>(
-    path: &Path,
-    factory: F,
-) -> Result<(), Error>
+pub async fn run_slt_file_with_factory<F, Fut, D, E>(path: &Path, factory: F) -> Result<(), Error>
 where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<D, E>> + Send,
@@ -52,13 +49,12 @@ where
     };
 
     let expanded_text = normalized_lines.join("\n");
-    let mut named = tempfile::NamedTempFile::new().map_err(|e| {
-        Error::Internal(format!("failed to create temp slt file: {}", e))
-    })?;
+    let mut named = tempfile::NamedTempFile::new()
+        .map_err(|e| Error::Internal(format!("failed to create temp slt file: {}", e)))?;
     use std::io::Write as _;
-    named.write_all(expanded_text.as_bytes()).map_err(|e| {
-        Error::Internal(format!("failed to write temp slt file: {}", e))
-    })?;
+    named
+        .write_all(expanded_text.as_bytes())
+        .map_err(|e| Error::Internal(format!("failed to write temp slt file: {}", e)))?;
     if std::env::var("LLKV_DUMP_SLT").is_ok() {
         let dump_path = std::path::Path::new("target/normalized.slt");
         if let Some(parent) = dump_path.parent() {
@@ -90,10 +86,7 @@ where
             );
         }
         drop(named);
-        return Err(Error::Internal(format!(
-            "slt runner failed: {}",
-            mapped
-        )));
+        return Err(Error::Internal(format!("slt runner failed: {}", mapped)));
     }
 
     drop(named);
@@ -227,9 +220,7 @@ pub fn expand_loops_with_mapping(
                 j += 1;
             }
             if j >= lines.len() {
-                return Err(Error::Internal(
-                    "unterminated loop in slt".to_string(),
-                ));
+                return Err(Error::Internal("unterminated loop in slt".to_string()));
             }
 
             let inner = &lines[i + 1..j];

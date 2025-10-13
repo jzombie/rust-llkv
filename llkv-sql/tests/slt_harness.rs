@@ -1,6 +1,6 @@
 use libtest_mimic::Arguments;
-use llkv_test_utils::init_tracing_for_tests;
 use llkv_sql::slt;
+use llkv_test_utils::init_tracing_for_tests;
 
 const SLT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/slt");
 
