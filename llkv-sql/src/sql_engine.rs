@@ -8,10 +8,10 @@ use crate::SqlValue;
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
 use llkv_runtime::{
-    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, Context, CreateTablePlan,
-    CreateTableSource, DeletePlan, Engine, InsertPlan, InsertSource, OrderByPlan, OrderSortType,
-    OrderTarget, PlanStatement, PlanValue, SelectPlan, SelectProjection, Session, StatementResult,
-    UpdatePlan, extract_rows_from_range,
+    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateTablePlan,
+    CreateTableSource, DeletePlan, InsertPlan, InsertSource, OrderByPlan, OrderSortType,
+    OrderTarget, PlanStatement, PlanValue, RuntimeContext, RuntimeEngine, RuntimeSession,
+    RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -31,7 +31,7 @@ pub struct SqlEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    engine: Engine<P>,
+    engine: RuntimeEngine<P>,
     default_nulls_first: AtomicBool,
 }
 
@@ -92,7 +92,10 @@ where
     // `statement_table_name` is provided by llkv-runtime; use it to avoid
     // duplicating plan-level logic here.
 
-    fn execute_plan_statement(&self, statement: PlanStatement) -> SqlResult<StatementResult<P>> {
+    fn execute_plan_statement(
+        &self,
+        statement: PlanStatement,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         let table = llkv_runtime::statement_table_name(&statement).map(str::to_string);
         self.engine.execute_statement(statement).map_err(|err| {
             if let Some(table_name) = table {
@@ -104,20 +107,20 @@ where
     }
 
     pub fn new(pager: Arc<P>) -> Self {
-        let engine = Engine::new(pager);
+        let engine = RuntimeEngine::new(pager);
         Self {
             engine,
             default_nulls_first: AtomicBool::new(false),
         }
     }
 
-    pub(crate) fn context_arc(&self) -> Arc<Context<P>> {
+    pub(crate) fn context_arc(&self) -> Arc<RuntimeContext<P>> {
         self.engine.context()
     }
 
-    pub fn with_context(context: Arc<Context<P>>, default_nulls_first: bool) -> Self {
+    pub fn with_context(context: Arc<RuntimeContext<P>>, default_nulls_first: bool) -> Self {
         Self {
-            engine: Engine::from_context(context),
+            engine: RuntimeEngine::from_context(context),
             default_nulls_first: AtomicBool::new(default_nulls_first),
         }
     }
@@ -132,11 +135,11 @@ where
     }
 
     /// Get a reference to the underlying session (for advanced use like error handling in test harnesses).
-    pub fn session(&self) -> &Session<P> {
+    pub fn session(&self) -> &RuntimeSession<P> {
         self.engine.session()
     }
 
-    pub fn execute(&self, sql: &str) -> SqlResult<Vec<StatementResult<P>>> {
+    pub fn execute(&self, sql: &str) -> SqlResult<Vec<RuntimeStatementResult<P>>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, sql)
@@ -153,7 +156,7 @@ where
         Ok(results)
     }
 
-    fn execute_statement(&self, statement: Statement) -> SqlResult<StatementResult<P>> {
+    fn execute_statement(&self, statement: Statement) -> SqlResult<RuntimeStatementResult<P>> {
         tracing::trace!(
             "DEBUG SQL execute_statement: {:?}",
             match &statement {
@@ -200,7 +203,7 @@ where
     fn execute_statement_non_transactional(
         &self,
         statement: Statement,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         tracing::trace!("DEBUG SQL execute_statement_non_transactional called");
         match statement {
             Statement::CreateTable(stmt) => {
@@ -354,7 +357,7 @@ where
     fn handle_create_table(
         &self,
         mut stmt: sqlparser::ast::CreateTable,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         validate_create_table_common(&stmt)?;
 
         let (display_name, canonical_name) = canonical_object_name(&stmt.name)?;
@@ -465,7 +468,7 @@ where
         query: &Query,
         if_not_exists: bool,
         or_replace: bool,
-    ) -> SqlResult<Option<StatementResult<P>>> {
+    ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
         let select = match query.body.as_ref() {
             SetExpr::Select(select) => select,
             _ => return Ok(None),
@@ -635,7 +638,7 @@ where
         query: Query,
         if_not_exists: bool,
         or_replace: bool,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         let select_plan = self.build_select_plan(query)?;
 
         if select_plan.projections.is_empty() && select_plan.aggregates.is_empty() {
@@ -656,7 +659,7 @@ where
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
     }
 
-    fn handle_insert(&self, stmt: sqlparser::ast::Insert) -> SqlResult<StatementResult<P>> {
+    fn handle_insert(&self, stmt: sqlparser::ast::Insert) -> SqlResult<RuntimeStatementResult<P>> {
         let table_name_debug =
             Self::table_name_from_insert(&stmt).unwrap_or_else(|_| "unknown".to_string());
         tracing::trace!(
@@ -780,7 +783,7 @@ where
         from: Option<UpdateTableFromKind>,
         selection: Option<SqlExpr>,
         returning: Option<Vec<SelectItem>>,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         if from.is_some() {
             return Err(Error::InvalidArgumentError(
                 "UPDATE ... FROM is not supported yet".into(),
@@ -851,7 +854,7 @@ where
     }
 
     #[allow(clippy::collapsible_if)]
-    fn handle_delete(&self, delete: Delete) -> SqlResult<StatementResult<P>> {
+    fn handle_delete(&self, delete: Delete) -> SqlResult<RuntimeStatementResult<P>> {
         let Delete {
             tables,
             from,
@@ -927,7 +930,7 @@ where
         restrict: bool,
         purge: bool,
         temporary: bool,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         if cascade || restrict || purge || temporary {
             return Err(Error::InvalidArgumentError(
                 "DROP TABLE cascade/restrict/purge/temporary options are not supported".into(),
@@ -947,10 +950,10 @@ where
                 .map_err(|err| Self::map_table_error(&table_name, err))?;
         }
 
-        Ok(StatementResult::NoOp)
+        Ok(RuntimeStatementResult::NoOp)
     }
 
-    fn handle_query(&self, query: Query) -> SqlResult<StatementResult<P>> {
+    fn handle_query(&self, query: Query) -> SqlResult<RuntimeStatementResult<P>> {
         let select_plan = self.build_select_plan(query)?;
         self.execute_plan_statement(PlanStatement::Select(select_plan))
     }
@@ -1359,7 +1362,7 @@ where
         statements: Vec<Statement>,
         exception: Option<Vec<ExceptionWhen>>,
         has_end_keyword: bool,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         if !modes.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "transaction modes are not supported".into(),
@@ -1393,7 +1396,7 @@ where
         chain: bool,
         end: bool,
         modifier: Option<TransactionModifier>,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         if chain {
             return Err(Error::InvalidArgumentError(
                 "COMMIT AND [NO] CHAIN is not supported".into(),
@@ -1417,7 +1420,7 @@ where
         &self,
         chain: bool,
         savepoint: Option<Ident>,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         if chain {
             return Err(Error::InvalidArgumentError(
                 "ROLLBACK AND [NO] CHAIN is not supported".into(),
@@ -1432,7 +1435,7 @@ where
         self.execute_plan_statement(PlanStatement::RollbackTransaction)
     }
 
-    fn handle_set(&self, set_stmt: Set) -> SqlResult<StatementResult<P>> {
+    fn handle_set(&self, set_stmt: Set) -> SqlResult<RuntimeStatementResult<P>> {
         match set_stmt {
             Set::SingleAssignment {
                 scope,
@@ -1478,7 +1481,7 @@ where
                         self.default_nulls_first
                             .store(use_nulls_first, AtomicOrdering::Relaxed);
 
-                        Ok(StatementResult::NoOp)
+                        Ok(RuntimeStatementResult::NoOp)
                     }
                     "immediate_transaction_mode" => {
                         if values.len() != 1 {
@@ -1502,7 +1505,7 @@ where
                                 "SET immediate_transaction_mode=false has no effect; continuing with auto mode"
                             );
                         }
-                        Ok(StatementResult::NoOp)
+                        Ok(RuntimeStatementResult::NoOp)
                     }
                     _ => Err(Error::InvalidArgumentError(format!(
                         "unsupported SET variable: {variable_name_raw}"
@@ -1520,7 +1523,7 @@ where
         name: ObjectName,
         value: Option<Value>,
         is_eq: bool,
-    ) -> SqlResult<StatementResult<P>> {
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         let (display, canonical) = canonical_object_name(&name)?;
         if value.is_some() || is_eq {
             return Err(Error::InvalidArgumentError(format!(
@@ -1529,7 +1532,7 @@ where
         }
 
         match canonical.as_str() {
-            "enable_verification" | "disable_verification" => Ok(StatementResult::NoOp),
+            "enable_verification" | "disable_verification" => Ok(RuntimeStatementResult::NoOp),
             _ => Err(Error::InvalidArgumentError(format!(
                 "unsupported PRAGMA '{}'",
                 display
@@ -2222,14 +2225,17 @@ mod tests {
         let result = engine
             .execute("CREATE TABLE people (id INT NOT NULL, name TEXT NOT NULL)")
             .expect("create table");
-        assert!(matches!(result[0], StatementResult::CreateTable { .. }));
+        assert!(matches!(
+            result[0],
+            RuntimeStatementResult::CreateTable { .. }
+        ));
 
         let result = engine
             .execute("INSERT INTO people (id, name) VALUES (1, 'alice'), (2, 'bob')")
             .expect("insert rows");
         assert!(matches!(
             result[0],
-            StatementResult::Insert {
+            RuntimeStatementResult::Insert {
                 rows_inserted: 2,
                 ..
             }
@@ -2240,7 +2246,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            StatementResult::Select { execution, .. } => {
+            RuntimeStatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),
@@ -2269,7 +2275,7 @@ mod tests {
             .expect("insert literal");
         assert!(matches!(
             result[0],
-            StatementResult::Insert {
+            RuntimeStatementResult::Insert {
                 rows_inserted: 1,
                 ..
             }
@@ -2280,7 +2286,7 @@ mod tests {
             .expect("insert null literal");
         assert!(matches!(
             result[0],
-            StatementResult::Insert {
+            RuntimeStatementResult::Insert {
                 rows_inserted: 1,
                 ..
             }
@@ -2291,7 +2297,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            StatementResult::Select { execution, .. } => {
+            RuntimeStatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),
@@ -2338,7 +2344,7 @@ mod tests {
             .expect("update rows");
         assert!(matches!(
             result[0],
-            StatementResult::Update {
+            RuntimeStatementResult::Update {
                 rows_updated: 1,
                 ..
             }
@@ -2349,7 +2355,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            StatementResult::Select { execution, .. } => {
+            RuntimeStatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),
@@ -2408,7 +2414,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            StatementResult::Select { execution, .. } => {
+            RuntimeStatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),
@@ -2433,7 +2439,7 @@ mod tests {
             .expect("select rows");
         let select_result = result.remove(0);
         let batches = match select_result {
-            StatementResult::Select { execution, .. } => {
+            RuntimeStatementResult::Select { execution, .. } => {
                 execution.collect().expect("collect batches")
             }
             _ => panic!("expected select result"),

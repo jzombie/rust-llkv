@@ -25,11 +25,6 @@
 //! - Both left and right key columns have matching data types
 //! - Data type is one of: Int32, Int64, UInt32, UInt64
 //!
-//! **Performance improvements:**
-//! - Int32/Int64/UInt32/UInt64: 1.2-3.6× faster (20-72% speedup)
-//! - Largest gains on Semi/Anti joins (3-3.5× faster)
-//! - Moderate gains on Inner/Left joins (1.2-1.8× faster)
-//!
 //! **Fallback behavior:**
 //! - Multi-column joins use generic path
 //! - Non-primitive types (Utf8, Binary, Float) use generic path
@@ -45,6 +40,7 @@ use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::{Expr, Filter, Operator};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
+use llkv_table::schema_ext::CachedSchema;
 use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::FieldId;
 use rustc_hash::FxHashMap;
@@ -733,19 +729,15 @@ fn build_user_projections<P>(
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    let cached = CachedSchema::new(Arc::clone(schema));
     let mut projections = Vec::new();
 
-    for field in schema.fields() {
-        let Some(field_id_str) = field
-            .metadata()
-            .get(llkv_column_map::store::FIELD_ID_META_KEY)
-        else {
+    for (idx, field) in schema.fields().iter().enumerate() {
+        // Use cached field_id lookup instead of metadata extraction
+        let Some(field_id) = cached.field_id(idx) else {
             continue;
         };
 
-        let field_id: FieldId = field_id_str.parse().map_err(|_| {
-            Error::Internal(format!("Invalid field_id in schema: {}", field_id_str))
-        })?;
         let lfid = LogicalFieldId::for_user(table.table_id(), field_id);
         projections.push(ScanProjection::Column(Projection::with_alias(
             lfid,
@@ -798,56 +790,38 @@ fn extract_right_key_indices(keys: &[JoinKey], schema: &Arc<Schema>) -> LlkvResu
 }
 
 fn find_field_index(schema: &Schema, target_field_id: FieldId) -> LlkvResult<usize> {
+    // Use cached schema for O(1) field ID lookup.
+    // NOTE: We need the index among USER fields only (excluding system fields like rowid)
+    // because the projected batch only contains user fields.
+    let cached = CachedSchema::new(Arc::new(schema.clone()));
+
+    // Find the schema index of the target field
+    let schema_index = cached.index_of_field_id(target_field_id).ok_or_else(|| {
+        Error::Internal(format!("field_id {} not found in schema", target_field_id))
+    })?;
+
+    // Count how many user fields come BEFORE this field
+    // (this gives us the index in the projected batch which only has user fields)
     let mut user_col_idx = 0;
-
-    for field in schema.fields() {
-        let Some(field_id_str) = field
-            .metadata()
-            .get(llkv_column_map::store::FIELD_ID_META_KEY)
-        else {
-            continue;
-        };
-
-        let field_id: FieldId = field_id_str.parse().map_err(|_| {
-            Error::Internal(format!("Invalid field_id in schema: {}", field_id_str))
-        })?;
-
-        if field_id == target_field_id {
-            return Ok(user_col_idx);
+    for idx in 0..schema_index {
+        if cached.field_id(idx).is_some() {
+            user_col_idx += 1;
         }
-
-        user_col_idx += 1;
     }
 
-    Err(Error::Internal(format!(
-        "field_id {} not found in schema",
-        target_field_id
-    )))
+    Ok(user_col_idx)
 }
 
 /// Get the DataType of a join key field from schema.
 fn get_key_datatype(schema: &Schema, field_id: FieldId) -> LlkvResult<DataType> {
-    for field in schema.fields() {
-        let Some(field_id_str) = field
-            .metadata()
-            .get(llkv_column_map::store::FIELD_ID_META_KEY)
-        else {
-            continue;
-        };
+    // Use cached schema for O(1) field ID lookup.
+    let cached = CachedSchema::new(Arc::new(schema.clone()));
 
-        let fid: u32 = field_id_str.parse().map_err(|_| {
-            Error::Internal(format!("Invalid field_id in schema: {}", field_id_str))
-        })?;
+    let index = cached
+        .index_of_field_id(field_id)
+        .ok_or_else(|| Error::Internal(format!("field_id {} not found in schema", field_id)))?;
 
-        if fid == field_id {
-            return Ok(field.data_type().clone());
-        }
-    }
-
-    Err(Error::Internal(format!(
-        "field_id {} not found in schema",
-        field_id
-    )))
+    Ok(schema.field(index).data_type().clone())
 }
 
 fn build_output_schema(

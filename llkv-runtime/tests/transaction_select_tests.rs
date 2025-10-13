@@ -1,7 +1,7 @@
 use llkv_plan::PlanValue;
 use llkv_runtime::{
-    AggregateExpr, ColumnSpec, Context, CreateTablePlan, InsertPlan, InsertSource, SelectPlan,
-    StatementResult,
+    AggregateExpr, ColumnSpec, CreateTablePlan, InsertPlan, InsertSource, RuntimeContext,
+    RuntimeStatementResult, SelectPlan,
 };
 use llkv_storage::pager::MemPager;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::sync::Arc;
 #[test]
 fn test_transaction_select() {
     let pager = Arc::new(MemPager::default());
-    let ctx = Arc::new(Context::new(pager));
+    let ctx = Arc::new(RuntimeContext::new(pager));
     let session = ctx.create_session();
 
     // Create table
@@ -54,7 +54,7 @@ fn test_transaction_select() {
     let select_plan = SelectPlan::new("users");
     let result1 = session.select(select_plan).unwrap();
 
-    if let StatementResult::Select { execution, .. } = result1 {
+    if let RuntimeStatementResult::Select { execution, .. } = result1 {
         let batches = execution.collect().unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
@@ -69,7 +69,7 @@ fn test_transaction_select() {
     let select_plan2 = SelectPlan::new("users");
     let result2 = session.select(select_plan2).unwrap();
 
-    if let StatementResult::Select { execution, .. } = result2 {
+    if let RuntimeStatementResult::Select { execution, .. } = result2 {
         let batches = execution.collect().unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 2);
@@ -81,7 +81,7 @@ fn test_transaction_select() {
 #[test]
 fn test_transaction_select_with_aggregates() {
     let pager = Arc::new(MemPager::default());
-    let ctx = Arc::new(Context::new(pager));
+    let ctx = Arc::new(RuntimeContext::new(pager));
     let session = ctx.create_session();
 
     // Create table
@@ -124,7 +124,7 @@ fn test_transaction_select_with_aggregates() {
         .with_aggregates(vec![AggregateExpr::sum_int64("price", "total_price")]);
     let result = session.select(select_plan).unwrap();
 
-    if let StatementResult::Select { execution, .. } = result {
+    if let RuntimeStatementResult::Select { execution, .. } = result {
         let batches = execution.collect().unwrap();
         assert_eq!(batches.len(), 1);
         let array = batches[0]
@@ -147,7 +147,7 @@ fn test_transaction_select_with_aggregates() {
         .with_aggregates(vec![AggregateExpr::sum_int64("price", "total_price")]);
     let result2 = session.select(select_plan2).unwrap();
 
-    if let StatementResult::Select { execution, .. } = result2 {
+    if let RuntimeStatementResult::Select { execution, .. } = result2 {
         let batches = execution.collect().unwrap();
         assert_eq!(batches.len(), 1);
         let array = batches[0]

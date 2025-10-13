@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use llkv_runtime::{
-    AggregateExpr, Context, InsertPlan, InsertSource, PlanValue, StatementResult, TransactionKind,
-    row,
+    AggregateExpr, InsertPlan, InsertSource, PlanValue, RuntimeContext, RuntimeStatementResult,
+    TransactionKind, row,
 };
 use llkv_storage::pager::MemPager;
 
 #[test]
 fn fluent_create_insert_select() {
     let pager = Arc::new(MemPager::default());
-    let context = Arc::new(Context::new(pager));
+    let context = Arc::new(RuntimeContext::new(pager));
 
     let create_result = context
         .create_table_builder("people")
@@ -18,7 +18,10 @@ fn fluent_create_insert_select() {
         .with_column("name", DataType::Utf8)
         .finish()
         .expect("create table");
-    assert!(matches!(create_result, StatementResult::CreateTable { .. }));
+    assert!(matches!(
+        create_result,
+        RuntimeStatementResult::CreateTable { .. }
+    ));
 
     let table = context.table("people").expect("table handle");
     let insert_result = table
@@ -29,7 +32,7 @@ fn fluent_create_insert_select() {
         .expect("insert rows");
     assert!(matches!(
         insert_result,
-        StatementResult::Insert {
+        RuntimeStatementResult::Insert {
             rows_inserted: 2,
             ..
         }
@@ -55,7 +58,7 @@ fn fluent_create_insert_select() {
 #[test]
 fn fluent_transaction_flow() {
     let pager = Arc::new(MemPager::default());
-    let context = Arc::new(Context::new(pager));
+    let context = Arc::new(RuntimeContext::new(pager));
     let session = context.create_session();
 
     context
@@ -76,7 +79,7 @@ fn fluent_transaction_flow() {
     let insert_result = session.insert(insert_plan).expect("insert");
     assert!(matches!(
         insert_result,
-        StatementResult::Insert {
+        RuntimeStatementResult::Insert {
             rows_inserted: 1,
             ..
         }
@@ -88,7 +91,7 @@ fn fluent_transaction_flow() {
     let commit = session.commit_transaction().expect("commit");
     assert!(matches!(
         commit,
-        StatementResult::Transaction {
+        RuntimeStatementResult::Transaction {
             kind: TransactionKind::Commit
         }
     ));
