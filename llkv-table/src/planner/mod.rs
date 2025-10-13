@@ -653,6 +653,8 @@ where
     }
 
     fn compute_table_row_ids(&self) -> LlkvResult<Vec<u64>> {
+        use llkv_column_map::store::rowid_fid;
+        
         let fields = self
             .table
             .store()
@@ -661,6 +663,59 @@ where
             return Ok(Vec::new());
         }
 
+        // Optimization: Try scanning the dedicated row_id shadow column first.
+        // This is significantly faster than scanning multiple user columns because:
+        // 1. It's a single column scan instead of multiple
+        // 2. Row IDs are already in the format we need (no deduplication required)
+        // 3. The shadow column is guaranteed to have all row IDs for the table
+        //
+        // We use the first user field to construct the shadow column ID.
+        if let Some(&first_field) = fields.first() {
+            let rid_shadow = rowid_fid(first_field);
+            let mut collector = RowIdScanCollector::default();
+            
+            // Try to scan the row_id shadow column
+            match ScanBuilder::new(self.table.store(), rid_shadow)
+                .options(ScanOptions {
+                    with_row_ids: true,
+                    ..Default::default()
+                })
+                .run(&mut collector)
+            {
+                Ok(_) => {
+                    // Success! We got all row IDs from the shadow column
+                    let mut row_ids = collector.into_inner();
+                    row_ids.sort_unstable();
+                    tracing::trace!(
+                        "[PERF] Fast path: collected {} row_ids from shadow column for table {}",
+                        row_ids.len(),
+                        self.table.table_id()
+                    );
+                    return Ok(row_ids);
+                }
+                Err(llkv_result::Error::NotFound) => {
+                    // Shadow column doesn't exist, fall back to multi-column scan
+                    tracing::trace!(
+                        "[PERF] Shadow column not found for table {}, using multi-column scan",
+                        self.table.table_id()
+                    );
+                }
+                Err(e) => {
+                    // Other error, fall back but log it
+                    tracing::debug!(
+                        "[PERF] Error scanning shadow column for table {}: {}, falling back to multi-column scan",
+                        self.table.table_id(),
+                        e
+                    );
+                }
+            }
+        }
+
+        // Fallback: Multi-column scan with deduplication
+        // This is needed when:
+        // - The shadow column doesn't exist (for whatever reason)
+        // - Columns may have different row_id sets (sparse columns)
+        // - We need the union of all visible rows
         let expected = self
             .table
             .store()
@@ -689,6 +744,11 @@ where
         }
 
         collected.sort_unstable();
+        tracing::trace!(
+            "[PERF] Multi-column scan: collected {} row_ids for table {}",
+            collected.len(),
+            self.table.table_id()
+        );
         Ok(collected)
     }
 
