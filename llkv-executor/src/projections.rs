@@ -117,5 +117,9 @@ fn translate_scalar(
             };
             Ok(ScalarExpr::Aggregate(translated_agg))
         }
+        ScalarExpr::GetField { base, field_name } => Ok(ScalarExpr::GetField {
+            base: Box::new(translate_scalar(base, schema)?),
+            field_name: field_name.clone(),
+        }),
     }
 }

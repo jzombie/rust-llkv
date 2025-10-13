@@ -62,6 +62,11 @@ where
         plan: SelectPlan,
         row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
+        // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
+        if plan.table.is_empty() {
+            return self.execute_select_without_table(plan);
+        }
+
         let table = self.provider.get_table(&plan.table)?;
         let display_name = plan.table.clone();
 
@@ -93,7 +98,95 @@ where
             ScalarExpr::Binary { left, right, .. } => {
                 Self::expr_contains_aggregate(left) || Self::expr_contains_aggregate(right)
             }
+            ScalarExpr::GetField { base, .. } => Self::expr_contains_aggregate(base),
             ScalarExpr::Column(_) | ScalarExpr::Literal(_) => false,
+        }
+    }
+
+    /// Execute a SELECT without a FROM clause (e.g., SELECT 42, SELECT {'a': 1})
+    fn execute_select_without_table(&self, plan: SelectPlan) -> ExecutorResult<SelectExecution<P>> {
+        use arrow::array::{ArrayRef};
+        use arrow::datatypes::{Field};
+        use llkv_expr::literal::Literal;
+
+        // Build schema from computed projections
+        let mut fields = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+
+        for proj in &plan.projections {
+            match proj {
+                SelectProjection::Computed { expr, alias } => {
+                    // Infer the data type from the expression
+                    let (field_name, dtype, array) = match expr {
+                        ScalarExpr::Literal(lit) => {
+                            let (dtype, array) = Self::literal_to_array(lit)?;
+                            (alias.clone(), dtype, array)
+                        }
+                        _ => {
+                            return Err(Error::InvalidArgumentError(
+                                "SELECT without FROM only supports literal expressions".into()
+                            ));
+                        }
+                    };
+
+                    fields.push(Field::new(field_name, dtype, true));
+                    arrays.push(array);
+                }
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "SELECT without FROM only supports computed projections".into()
+                    ));
+                }
+            }
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
+            .map_err(|e| Error::Internal(format!("failed to create record batch: {}", e)))?;
+
+        Ok(SelectExecution::new_single_batch(
+            String::new(),  // No table name
+            schema,
+            batch,
+        ))
+    }
+
+    /// Convert a Literal to an Arrow array (recursive for nested structs)
+    fn literal_to_array(lit: &llkv_expr::literal::Literal) -> ExecutorResult<(DataType, ArrayRef)> {
+        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, StructArray};
+        use arrow::datatypes::{DataType, Field};
+        use llkv_expr::literal::Literal;
+
+        match lit {
+            Literal::Integer(v) => {
+                let val = i64::try_from(*v).unwrap_or(0);
+                Ok((DataType::Int64, Arc::new(Int64Array::from(vec![val])) as ArrayRef))
+            }
+            Literal::Float(v) => {
+                Ok((DataType::Float64, Arc::new(Float64Array::from(vec![*v])) as ArrayRef))
+            }
+            Literal::String(v) => {
+                Ok((DataType::Utf8, Arc::new(StringArray::from(vec![v.clone()])) as ArrayRef))
+            }
+            Literal::Struct(struct_fields) => {
+                // Build a struct array recursively
+                let mut inner_fields = Vec::new();
+                let mut inner_arrays = Vec::new();
+
+                for (field_name, field_lit) in struct_fields {
+                    let (field_dtype, field_array) = Self::literal_to_array(field_lit)?;
+                    inner_fields.push(Field::new(field_name.clone(), field_dtype, true));
+                    inner_arrays.push(field_array);
+                }
+
+                let struct_array = StructArray::try_new(
+                    inner_fields.clone().into(),
+                    inner_arrays,
+                    None,
+                ).map_err(|e| Error::Internal(format!("failed to create struct array: {}", e)))?;
+
+                Ok((DataType::Struct(inner_fields.into()), Arc::new(struct_array) as ArrayRef))
+            }
         }
     }
 
@@ -480,6 +573,9 @@ where
                 Self::collect_aggregates(left, aggregates);
                 Self::collect_aggregates(right, aggregates);
             }
+            ScalarExpr::GetField { base, .. } => {
+                Self::collect_aggregates(base, aggregates);
+            }
             ScalarExpr::Column(_) | ScalarExpr::Literal(_) => {}
         }
     }
@@ -693,6 +789,9 @@ where
             ScalarExpr::Literal(Literal::String(_)) => Err(Error::InvalidArgumentError(
                 "String literals not supported in aggregate expressions".into(),
             )),
+            ScalarExpr::Literal(Literal::Struct(_)) => Err(Error::InvalidArgumentError(
+                "Struct literals not supported in aggregate expressions".into(),
+            )),
             ScalarExpr::Column(_) => Err(Error::InvalidArgumentError(
                 "Column references not supported in aggregate-only expressions".into(),
             )),
@@ -728,6 +827,9 @@ where
                     Error::InvalidArgumentError("Arithmetic overflow in expression".into())
                 })
             }
+            ScalarExpr::GetField { .. } => Err(Error::InvalidArgumentError(
+                "GetField not supported in aggregate-only expressions".into(),
+            )),
         }
     }
 }
@@ -1230,5 +1332,9 @@ fn translate_scalar(
             };
             Ok(ScalarExpr::Aggregate(translated_agg))
         }
+        ScalarExpr::GetField { base, field_name } => Ok(ScalarExpr::GetField {
+            base: Box::new(translate_scalar(base, schema)?),
+            field_name: field_name.clone(),
+        }),
     }
 }

@@ -36,7 +36,7 @@ use crate::scalar_eval::{NumericArrayMap, NumericKernels};
 use crate::table::{
     ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
 };
-use crate::types::{FieldId, ROW_ID_FIELD_ID};
+use crate::types::{FieldId, ROW_ID_FIELD_ID, TableId};
 
 use self::plan_graph::{
     PlanEdge, PlanExpression, PlanField, PlanGraph, PlanGraphBuilder, PlanGraphError, PlanNode,
@@ -885,6 +885,45 @@ where
                             ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
                             ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
                             ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
+                            ScalarExpr::Literal(Literal::Struct(fields)) => {
+                                // Infer struct type from the literal fields
+                                let struct_fields = fields
+                                    .iter()
+                                    .map(|(name, lit)| {
+                                        let field_dtype = match lit.as_ref() {
+                                            Literal::Integer(_) => DataType::Int64,
+                                            Literal::Float(_) => DataType::Float64,
+                                            Literal::String(_) => DataType::Utf8,
+                                            Literal::Struct(nested_fields) => {
+                                                // Recursively handle nested structs
+                                                // For simplicity, we'll create a basic inference
+                                                // This could be made more sophisticated
+                                                let nested_arrow_fields = nested_fields
+                                                    .iter()
+                                                    .map(|(nested_name, nested_lit)| {
+                                                        let nested_dtype = match nested_lit.as_ref() {
+                                                            Literal::Integer(_) => DataType::Int64,
+                                                            Literal::Float(_) => DataType::Float64,
+                                                            Literal::String(_) => DataType::Utf8,
+                                                            Literal::Struct(_) => {
+                                                                // For deeply nested, use a placeholder
+                                                                // This is a limitation - we'd need recursive function
+                                                                return Err(Error::InvalidArgumentError(
+                                                                    "Deeply nested struct literals not yet supported".into()
+                                                                ));
+                                                            }
+                                                        };
+                                                        Ok(Field::new(nested_name.clone(), nested_dtype, true))
+                                                    })
+                                                    .collect::<LlkvResult<Vec<_>>>()?;
+                                                DataType::Struct(nested_arrow_fields.into())
+                                            }
+                                        };
+                                        Ok(Field::new(name.clone(), field_dtype, true))
+                                    })
+                                    .collect::<LlkvResult<Vec<_>>>()?;
+                                DataType::Struct(struct_fields.into())
+                            }
                             ScalarExpr::Binary { .. } => DataType::Float64,
                             ScalarExpr::Column(fid) => {
                                 let lfid = LogicalFieldId::for_user(self.table.table_id(), *fid);
@@ -896,6 +935,46 @@ where
                                 // Aggregates in computed columns return Int64
                                 // TODO: Fix: This is a simplification - ideally we'd determine type from the aggregate
                                 DataType::Int64
+                            }
+                            ScalarExpr::GetField { base, field_name } => {
+                                // Determine the data type of the field being extracted
+                                fn get_field_dtype(
+                                    expr: &ScalarExpr<FieldId>,
+                                    field_name: &str,
+                                    table_id: TableId,
+                                    lfid_dtypes: &FxHashMap<LogicalFieldId, DataType>,
+                                ) -> LlkvResult<DataType> {
+                                    let base_dtype = match expr {
+                                        ScalarExpr::Column(fid) => {
+                                            let lfid = LogicalFieldId::for_user(table_id, *fid);
+                                            lfid_dtypes.get(&lfid).cloned().ok_or_else(|| {
+                                                Error::Internal("missing dtype for column".into())
+                                            })?
+                                        }
+                                        ScalarExpr::GetField { base: inner_base, field_name: inner_field } => {
+                                            get_field_dtype(inner_base, inner_field, table_id, lfid_dtypes)?
+                                        }
+                                        _ => return Err(Error::InvalidArgumentError(
+                                            "GetField base must be a column or another GetField".into()
+                                        )),
+                                    };
+
+                                    if let DataType::Struct(fields) = base_dtype {
+                                        fields
+                                            .iter()
+                                            .find(|f| f.name() == field_name)
+                                            .map(|f| f.data_type().clone())
+                                            .ok_or_else(|| Error::InvalidArgumentError(
+                                                format!("Field '{}' not found in struct", field_name)
+                                            ))
+                                    } else {
+                                        Err(Error::InvalidArgumentError(
+                                            "GetField can only be applied to struct types".into()
+                                        ))
+                                    }
+                                }
+
+                                get_field_dtype(base, field_name, self.table.table_id(), &lfid_dtypes)?
                             }
                         };
                         schema_fields.push(Field::new(info.alias.clone(), dtype, true));
@@ -1117,6 +1196,64 @@ where
                                                     value.clone();
                                                     batch_len
                                                 ])) as ArrayRef
+                                            }
+                                            ScalarExpr::GetField { base, field_name } => {
+                                                // Recursively evaluate GetField expressions
+                                                fn eval_get_field(
+                                                    expr: &ScalarExpr<FieldId>,
+                                                    field_name: &str,
+                                                    unique_arrays_owned: &[ArrayRef],
+                                                    unique_index: &FxHashMap<LogicalFieldId, usize>,
+                                                    table_id: TableId,
+                                                ) -> LlkvResult<ArrayRef> {
+                                                    // Evaluate base expression to get the struct array
+                                                    let base_array = match expr {
+                                                        ScalarExpr::Column(fid) => {
+                                                            let lfid = LogicalFieldId::for_user(table_id, *fid);
+                                                            let arr_idx = *unique_index
+                                                                .get(&lfid)
+                                                                .ok_or_else(|| Error::Internal(
+                                                                    format!("field {} not found in unique arrays", fid)
+                                                                ))?;
+                                                            Arc::clone(&unique_arrays_owned[arr_idx])
+                                                        }
+                                                        ScalarExpr::GetField { base: inner_base, field_name: inner_field } => {
+                                                            eval_get_field(
+                                                                inner_base,
+                                                                inner_field,
+                                                                unique_arrays_owned,
+                                                                unique_index,
+                                                                table_id,
+                                                            )?
+                                                        }
+                                                        _ => return Err(Error::InvalidArgumentError(
+                                                            "GetField base must be a column or another GetField".into()
+                                                        )),
+                                                    };
+
+                                                    // Extract the field from the struct array
+                                                    let struct_array = base_array
+                                                        .as_any()
+                                                        .downcast_ref::<arrow::array::StructArray>()
+                                                        .ok_or_else(|| Error::InvalidArgumentError(
+                                                            "GetField can only be applied to struct types".into()
+                                                        ))?;
+
+                                                    struct_array
+                                                        .column_by_name(field_name)
+                                                        .ok_or_else(|| Error::InvalidArgumentError(
+                                                            format!("Field '{}' not found in struct", field_name)
+                                                        ))
+                                                        .map(Arc::clone)
+                                                }
+
+                                                eval_get_field(
+                                                    base,
+                                                    field_name,
+                                                    &unique_arrays_owned,
+                                                    &unique_index,
+                                                    table_id,
+                                                )?
                                             }
                                             _ => {
                                                 let numeric_arrays = numeric_arrays.as_ref().expect(
@@ -1891,6 +2028,7 @@ fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::Column(_) => true,
         ScalarExpr::Binary { .. } => true,
         ScalarExpr::Aggregate(_) => false, // Aggregates are computed separately
+        ScalarExpr::GetField { .. } => false, // GetField requires raw arrays, not numeric conversion
     }
 }
 
@@ -1918,7 +2056,71 @@ fn synthesize_computed_literal_array(
         ScalarExpr::Literal(Literal::String(value)) => {
             Ok(Arc::new(StringArray::from(vec![value.clone(); row_count])) as ArrayRef)
         }
-        ScalarExpr::Column(_) | ScalarExpr::Binary { .. } | ScalarExpr::Aggregate(_) => {
+        ScalarExpr::Literal(Literal::Struct(fields)) => {
+            // Build a struct array from the literal fields
+            use arrow::array::StructArray;
+            
+            // Convert each field to an array
+            let mut field_arrays = Vec::new();
+            let mut arrow_fields = Vec::new();
+            
+            for (field_name, field_literal) in fields {
+                let field_dtype = match field_literal.as_ref() {
+                    Literal::Integer(_) => DataType::Int64,
+                    Literal::Float(_) => DataType::Float64,
+                    Literal::String(_) => DataType::Utf8,
+                    Literal::Struct(_) => {
+                        // Recursively handle nested struct - create a dummy data type for now
+                        // We need the actual dtype from somewhere
+                        if let DataType::Struct(struct_fields) = data_type {
+                            struct_fields
+                                .iter()
+                                .find(|f| f.name() == field_name)
+                                .map(|f| f.data_type().clone())
+                                .unwrap_or(DataType::Utf8)
+                        } else {
+                            DataType::Utf8
+                        }
+                    }
+                };
+                
+                arrow_fields.push(Field::new(field_name.clone(), field_dtype.clone(), true));
+                
+                // Create the array for this field
+                let field_array = match field_literal.as_ref() {
+                    Literal::Integer(v) => {
+                        let int_val = i64::try_from(*v).unwrap_or(0);
+                        Arc::new(Int64Array::from(vec![int_val; row_count])) as ArrayRef
+                    }
+                    Literal::Float(v) => {
+                        Arc::new(Float64Array::from(vec![*v; row_count])) as ArrayRef
+                    }
+                    Literal::String(v) => {
+                        Arc::new(StringArray::from(vec![v.clone(); row_count])) as ArrayRef
+                    }
+                    Literal::Struct(nested_fields) => {
+                        // Recursively build nested struct
+                        // Create a temporary ComputedProjectionInfo for nested struct
+                        let nested_info = ComputedProjectionInfo {
+                            expr: ScalarExpr::Literal(Literal::Struct(nested_fields.clone())),
+                            alias: field_name.clone(),
+                        };
+                        synthesize_computed_literal_array(&nested_info, &field_dtype, row_count)?
+                    }
+                };
+                
+                field_arrays.push(field_array);
+            }
+            
+            let struct_array = StructArray::try_new(
+                arrow_fields.into(),
+                field_arrays,
+                None, // No null buffer
+            ).map_err(|e| Error::Internal(format!("failed to create struct array: {}", e)))?;
+            
+            Ok(Arc::new(struct_array) as ArrayRef)
+        }
+        ScalarExpr::Column(_) | ScalarExpr::Binary { .. } | ScalarExpr::Aggregate(_) | ScalarExpr::GetField { .. } => {
             Ok(new_null_array(data_type, row_count))
         }
     }
@@ -2046,6 +2248,11 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
             format_scalar_expr(right)
         ),
         ScalarExpr::Aggregate(agg) => format!("AGG({:?})", agg),
+        ScalarExpr::GetField { base, field_name } => format!(
+            "{}.{}",
+            format_scalar_expr(base),
+            field_name
+        ),
     }
 }
 
@@ -2075,6 +2282,13 @@ fn format_literal(lit: &Literal) -> String {
         Literal::Integer(i) => i.to_string(),
         Literal::Float(f) => f.to_string(),
         Literal::String(s) => format!("\"{}\"", escape_string(s)),
+        Literal::Struct(fields) => {
+            let field_strs: Vec<_> = fields
+                .iter()
+                .map(|(name, lit)| format!("{}: {}", name, format_literal(lit)))
+                .collect();
+            format!("{{{}}}", field_strs.join(", "))
+        }
     }
 }
 

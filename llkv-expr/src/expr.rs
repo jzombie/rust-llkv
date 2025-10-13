@@ -58,6 +58,13 @@ pub enum ScalarExpr<F> {
     /// Aggregate function call (e.g., COUNT(*), SUM(col), etc.)
     /// This is used in expressions like COUNT(*) + 1
     Aggregate(AggregateCall<F>),
+    /// Extract a field from a struct expression.
+    /// For example: `user.address.city` would be represented as
+    /// GetField { base: GetField { base: Column(user), field_name: "address" }, field_name: "city" }
+    GetField {
+        base: Box<ScalarExpr<F>>,
+        field_name: String,
+    },
 }
 
 /// Aggregate function call within a scalar expression
@@ -94,6 +101,14 @@ impl<F> ScalarExpr<F> {
     #[inline]
     pub fn aggregate(call: AggregateCall<F>) -> Self {
         Self::Aggregate(call)
+    }
+
+    #[inline]
+    pub fn get_field(base: Self, field_name: String) -> Self {
+        Self::GetField {
+            base: Box::new(base),
+            field_name,
+        }
     }
 }
 

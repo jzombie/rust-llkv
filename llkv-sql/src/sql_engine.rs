@@ -1222,13 +1222,20 @@ where
             validate_projection_alias_qualifiers(&select.projection, alias)?;
         }
 
-        let (display_name, _canonical_name) = extract_single_table(&select.from)?;
-        let mut plan = SelectPlan::new(display_name);
+        // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1} AS x)
+        let (display_name, _canonical_name) = if select.from.is_empty() {
+            // No FROM clause - use empty string for table context
+            ("".to_string(), "".to_string())
+        } else {
+            extract_single_table(&select.from)?
+        };
+        
+        let mut plan = SelectPlan::new(display_name.clone());
 
         if let Some(aggregates) = self.detect_simple_aggregates(&select.projection)? {
             plan = plan.with_aggregates(aggregates);
         } else {
-            let projections = self.build_projection_list(&select.projection)?;
+            let projections = self.build_projection_list(&select.projection, &_canonical_name)?;
             plan = plan.with_projections(projections);
         }
 
@@ -1489,6 +1496,7 @@ where
     fn build_projection_list(
         &self,
         projection_items: &[SelectItem],
+        from_table: &str,
     ) -> SqlResult<Vec<SelectProjection>> {
         if projection_items.is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -1515,7 +1523,7 @@ where
                     }
                 },
                 SelectItem::UnnamedExpr(expr) => {
-                    let scalar = translate_scalar(expr)?;
+                    let scalar = translate_scalar_with_context(expr, from_table)?;
                     let alias = format!("col{}", idx + 1);
                     projections.push(SelectProjection::Computed {
                         expr: scalar,
@@ -1523,7 +1531,7 @@ where
                     });
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
-                    let scalar = translate_scalar(expr)?;
+                    let scalar = translate_scalar_with_context(expr, from_table)?;
                     projections.push(SelectProjection::Computed {
                         expr: scalar,
                         alias: alias.value.clone(),
@@ -1921,6 +1929,9 @@ fn expr_contains_aggregate(expr: &llkv_expr::expr::ScalarExpr<String>) -> bool {
         llkv_expr::expr::ScalarExpr::Binary { left, right, .. } => {
             expr_contains_aggregate(left) || expr_contains_aggregate(right)
         }
+        llkv_expr::expr::ScalarExpr::GetField { base, .. } => {
+            expr_contains_aggregate(base)
+        }
         llkv_expr::expr::ScalarExpr::Column(_) | llkv_expr::expr::ScalarExpr::Literal(_) => false,
     }
 }
@@ -2207,18 +2218,104 @@ fn flip_compare_op(op: llkv_expr::expr::CompareOp) -> Option<llkv_expr::expr::Co
         llkv_expr::expr::CompareOp::NotEq => None,
     }
 }
+/// Translate scalar expression with knowledge of the FROM table context.
+/// This allows us to properly distinguish schema.table.column from column.field.field.
+fn translate_scalar_with_context(expr: &SqlExpr, from_table: &str) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
+    match expr {
+        SqlExpr::Identifier(ident) => Ok(llkv_expr::expr::ScalarExpr::column(ident.value.clone())),
+        SqlExpr::CompoundIdentifier(idents) => {
+            if idents.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "invalid compound identifier".into(),
+                ));
+            }
+            
+            // Build the full identifier path
+            let full_path: Vec<String> = idents.iter().map(|id| id.value.clone()).collect();
+            
+            // Check if the identifier starts with the FROM table prefix (schema.table or just table)
+            // from_table might be "schema.table" or just "table"
+            let from_parts: Vec<&str> = from_table.split('.').collect();
+            
+            // Try to match the FROM table context
+            let column_start_idx = if from_parts.len() >= 2 {
+                // FROM is schema.table, check if identifier starts with that
+                if full_path.len() >= 3
+                    && full_path[0].eq_ignore_ascii_case(from_parts[0])
+                    && full_path[1].eq_ignore_ascii_case(from_parts[1]) {
+                    // "schema.table.column..." - skip schema.table, column starts at index 2
+                    2
+                } else if full_path.len() == 2
+                    && full_path[0].eq_ignore_ascii_case(from_parts[0])
+                    && full_path[1].eq_ignore_ascii_case(from_parts[1]) {
+                    // "schema.table" with no column - this is ambiguous, treat as "table.column"
+                    // (second part is the column name)
+                    1
+                } else if full_path.len() >= 2
+                    && full_path[0].eq_ignore_ascii_case(from_parts[1]) {
+                    // "table.column..." - just table name, column starts at index 1
+                    1
+                } else {
+                    // No match, assume first part is column
+                    0
+                }
+            } else if from_parts.len() == 1 {
+                // FROM is just a table name
+                if full_path.len() >= 2
+                    && full_path[0].eq_ignore_ascii_case(from_parts[0]) {
+                    // "table.column..." - skip table name, column starts at index 1
+                    1
+                } else {
+                    // No match, assume first part is column
+                    0
+                }
+            } else {
+                // No FROM context, assume first part is column
+                0
+            };
+            
+            if column_start_idx >= full_path.len() {
+                return Err(Error::InvalidArgumentError(
+                    format!("invalid column reference in identifier: {}", full_path.join("."))
+                ));
+            }
+            
+            // The part at column_start_idx is the column name
+            let column_name = full_path[column_start_idx].clone();
+            let mut result = llkv_expr::expr::ScalarExpr::column(column_name);
+            
+            // Everything after is struct field access
+            for field_name in &full_path[(column_start_idx + 1)..] {
+                result = llkv_expr::expr::ScalarExpr::get_field(result, field_name.clone());
+            }
+            
+            Ok(result)
+        }
+        // For all other expression types, delegate to translate_scalar
+        _ => translate_scalar(expr),
+    }
+}
 
 fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     match expr {
         SqlExpr::Identifier(ident) => Ok(llkv_expr::expr::ScalarExpr::column(ident.value.clone())),
         SqlExpr::CompoundIdentifier(idents) => {
-            if let Some(last) = idents.last() {
-                translate_scalar(&SqlExpr::Identifier(last.clone()))
-            } else {
-                Err(Error::InvalidArgumentError(
+            if idents.is_empty() {
+                return Err(Error::InvalidArgumentError(
                     "invalid compound identifier".into(),
-                ))
+                ));
             }
+            
+            // Without table context, treat first part as column, rest as fields
+            let column_name = idents[0].value.clone();
+            let mut result = llkv_expr::expr::ScalarExpr::column(column_name);
+            
+            for part in &idents[1..] {
+                let field_name = part.value.clone();
+                result = llkv_expr::expr::ScalarExpr::get_field(result, field_name);
+            }
+            
+            Ok(result)
         }
         SqlExpr::Value(value) => literal_from_value(value),
         SqlExpr::BinaryOp { left, op, right } => {
@@ -2252,6 +2349,9 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                 Literal::String(_) => Err(Error::InvalidArgumentError(
                     "cannot negate string literal".into(),
                 )),
+                Literal::Struct(_) => Err(Error::InvalidArgumentError(
+                    "cannot negate struct literal".into(),
+                )),
             },
             _ => Err(Error::InvalidArgumentError(
                 "cannot negate non-literal expression".into(),
@@ -2272,6 +2372,27 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                     func.name
                 )))
             }
+        }
+        SqlExpr::Dictionary(fields) => {
+            // Dictionary literal like {'a': 1, 'b': 2} represents a STRUCT literal
+            let mut struct_fields = Vec::new();
+            for entry in fields {
+                let key = entry.key.value.clone();  // Use .value to get the actual identifier value
+                // Parse the value to a literal
+                let value_expr = translate_scalar(&entry.value)?;
+                // Extract the literal from the expression
+                match value_expr {
+                    llkv_expr::expr::ScalarExpr::Literal(lit) => {
+                        struct_fields.push((key, Box::new(lit)));
+                    }
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "Dictionary values must be literals".to_string()
+                        ));
+                    }
+                }
+            }
+            Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Struct(struct_fields)))
         }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported scalar expression: {other:?}"

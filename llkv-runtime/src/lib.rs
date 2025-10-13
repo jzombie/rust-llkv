@@ -1660,6 +1660,16 @@ where
     }
 
     pub fn execute_select(self: &Arc<Self>, plan: SelectPlan) -> Result<SelectExecution<P>> {
+        // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
+        if plan.table.is_empty() {
+            // No table to query - just evaluate computed expressions
+            let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
+                context: Arc::clone(self),
+            });
+            let executor = QueryExecutor::new(provider);
+            return executor.execute_select(plan);
+        }
+
         let (_display_name, canonical_name) = canonical_table_name(&plan.table)?;
         // Verify table exists
         let _table = self.lookup_table(&canonical_name)?;
@@ -1681,6 +1691,16 @@ where
         plan: SelectPlan,
         snapshot: TransactionSnapshot,
     ) -> Result<SelectExecution<P>> {
+        // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
+        if plan.table.is_empty() {
+            let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
+                context: Arc::clone(self),
+            });
+            let executor = QueryExecutor::new(provider);
+            // No row filter needed since there's no table
+            return executor.execute_select_with_filter(plan, None);
+        }
+
         let (_display_name, canonical_name) = canonical_table_name(&plan.table)?;
         self.lookup_table(&canonical_name)?;
 
@@ -1859,7 +1879,7 @@ where
             FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
         for (idx, field) in schema.fields().iter().enumerate() {
             let data_type = match field.data_type() {
-                DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Date32 => {
+                DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Date32 | DataType::Struct(_) => {
                     field.data_type().clone()
                 }
                 other => {
@@ -3014,6 +3034,9 @@ where
         }
         drop(tables);
 
+        // Remove from tables cache
+        self.remove_table_entry(&canonical_name);
+
         // Unregister from catalog
         self.catalog.unregister_table(&canonical_name);
         tracing::debug!(
@@ -3021,7 +3044,7 @@ where
             canonical_name
         );
 
-        self.dropped_tables.write().unwrap().insert(canonical_name);
+        self.dropped_tables.write().unwrap().insert(canonical_name.clone());
         Ok(())
     }
 
@@ -3770,6 +3793,13 @@ fn translate_scalar(
                 }
             };
             Ok(ScalarExpr::Aggregate(translated_agg))
+        }
+        ScalarExpr::GetField { base, field_name } => {
+            let base_expr = translate_scalar(base, schema)?;
+            Ok(ScalarExpr::GetField {
+                base: Box::new(base_expr),
+                field_name: field_name.clone(),
+            })
         }
     }
 }
