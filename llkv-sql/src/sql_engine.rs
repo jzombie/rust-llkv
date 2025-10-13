@@ -2220,8 +2220,195 @@ fn arrow_type_from_sql(data_type: &SqlDataType) -> SqlResult<arrow::datatypes::D
         SqlDataType::Boolean => Err(Error::InvalidArgumentError(
             "BOOLEAN columns are not supported yet".into(),
         )),
+        SqlDataType::Custom(name, args) => {
+            if name.0.len() == 1 {
+                if let ObjectNamePart::Identifier(ident) = &name.0[0] {
+                    if ident.value.eq_ignore_ascii_case("row") {
+                        return row_type_to_arrow(data_type, args);
+                    }
+                }
+            }
+            Err(Error::InvalidArgumentError(format!(
+                "unsupported SQL data type: {data_type:?}"
+            )))
+        }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported SQL data type: {other:?}"
+        ))),
+    }
+}
+
+fn row_type_to_arrow(
+    data_type: &SqlDataType,
+    tokens: &[String],
+) -> SqlResult<arrow::datatypes::DataType> {
+    use arrow::datatypes::{DataType, Field, FieldRef, Fields};
+
+    let row_str = data_type.to_string();
+    if tokens.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "ROW type must define at least one field".into(),
+        ));
+    }
+
+    let dialect = GenericDialect {};
+    let field_definitions = resolve_row_field_types(tokens, &dialect).map_err(|err| {
+        Error::InvalidArgumentError(format!("unable to parse ROW type '{row_str}': {err}"))
+    })?;
+
+    let mut fields: Vec<FieldRef> = Vec::with_capacity(field_definitions.len());
+    for (field_name, field_type) in field_definitions {
+        let arrow_field_type = arrow_type_from_sql(&field_type)?;
+        fields.push(Arc::new(Field::new(field_name, arrow_field_type, true)));
+    }
+
+    let struct_fields: Fields = fields.into();
+    Ok(DataType::Struct(struct_fields))
+}
+
+fn resolve_row_field_types(
+    tokens: &[String],
+    dialect: &GenericDialect,
+) -> SqlResult<Vec<(String, SqlDataType)>> {
+    if tokens.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "ROW type must define at least one field".into(),
+        ));
+    }
+
+    let mut start = 0;
+    let mut end = tokens.len();
+    if tokens[start] == "(" {
+        if end == 0 || tokens[end - 1] != ")" {
+            return Err(Error::InvalidArgumentError(
+                "ROW type is missing closing ')'".into(),
+            ));
+        }
+        start += 1;
+        end -= 1;
+    } else if tokens[end - 1] == ")" {
+        return Err(Error::InvalidArgumentError(
+            "ROW type contains unmatched ')'".into(),
+        ));
+    }
+
+    let slice = &tokens[start..end];
+    if slice.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "ROW type did not provide any field definitions".into(),
+        ));
+    }
+
+    let mut fields = Vec::new();
+    let mut index = 0;
+
+    while index < slice.len() {
+        if slice[index] == "," {
+            index += 1;
+            continue;
+        }
+
+        let field_name = normalize_row_field_name(&slice[index])?;
+        index += 1;
+
+        if index >= slice.len() {
+            return Err(Error::InvalidArgumentError(format!(
+                "ROW field '{field_name}' is missing a type specification"
+            )));
+        }
+
+        let mut last_success: Option<(usize, SqlDataType)> = None;
+        let mut type_end = index;
+
+        while type_end <= slice.len() {
+            let candidate = slice[index..type_end].join(" ");
+            if candidate.trim().is_empty() {
+                type_end += 1;
+                continue;
+            }
+
+            if let Ok(parsed_type) = parse_sql_data_type(&candidate, dialect) {
+                last_success = Some((type_end, parsed_type));
+            }
+
+            if type_end == slice.len() {
+                break;
+            }
+
+            if slice[type_end] == "," && last_success.is_some() {
+                break;
+            }
+
+            type_end += 1;
+        }
+
+        let Some((next_index, data_type)) = last_success else {
+            return Err(Error::InvalidArgumentError(format!(
+                "failed to parse ROW field type for '{field_name}'"
+            )));
+        };
+
+        fields.push((field_name, data_type));
+        index = next_index;
+
+        if index < slice.len() && slice[index] == "," {
+            index += 1;
+        }
+    }
+
+    if fields.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "ROW type did not provide any field definitions".into(),
+        ));
+    }
+
+    Ok(fields)
+}
+
+fn normalize_row_field_name(raw: &str) -> SqlResult<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "ROW field name must not be empty".into(),
+        ));
+    }
+
+    if let Some(stripped) = trimmed.strip_prefix('"') {
+        let without_end = stripped.strip_suffix('"').ok_or_else(|| {
+            Error::InvalidArgumentError(format!("unterminated quoted ROW field name: {trimmed}"))
+        })?;
+        let name = without_end.replace("\"\"", "\"");
+        return Ok(name);
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn parse_sql_data_type(type_str: &str, dialect: &GenericDialect) -> SqlResult<SqlDataType> {
+    let trimmed = type_str.trim();
+    let sql = format!("CREATE TABLE __row(__field {trimmed});");
+    let statements = Parser::parse_sql(dialect, &sql).map_err(|err| {
+        Error::InvalidArgumentError(format!("failed to parse ROW field type '{trimmed}': {err}"))
+    })?;
+
+    let stmt = statements.into_iter().next().ok_or_else(|| {
+        Error::InvalidArgumentError(format!(
+            "ROW field type '{trimmed}' did not produce a statement"
+        ))
+    })?;
+
+    match stmt {
+        Statement::CreateTable(table) => table
+            .columns
+            .get(0)
+            .map(|col| col.data_type.clone())
+            .ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "ROW field type '{trimmed}' missing column definition"
+                ))
+            }),
+        other => Err(Error::InvalidArgumentError(format!(
+            "unexpected statement while parsing ROW field type: {other:?}"
         ))),
     }
 }
@@ -2560,5 +2747,32 @@ mod tests {
             values,
             vec![None, Some("4".to_string()), Some("13".to_string())]
         );
+    }
+
+    #[test]
+    fn arrow_type_from_row_returns_struct_fields() {
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(
+            &dialect,
+            "CREATE TABLE row_types(payload ROW(a INTEGER, b VARCHAR));",
+        )
+        .expect("parse ROW type definition");
+
+        let data_type = match &statements[0] {
+            Statement::CreateTable(stmt) => stmt.columns[0].data_type.clone(),
+            other => panic!("unexpected statement: {other:?}"),
+        };
+
+        let arrow_type = arrow_type_from_sql(&data_type).expect("convert ROW type");
+        match arrow_type {
+            arrow::datatypes::DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 2, "unexpected field count");
+                assert_eq!(fields[0].name(), "a");
+                assert_eq!(fields[1].name(), "b");
+                assert_eq!(fields[0].data_type(), &arrow::datatypes::DataType::Int64);
+                assert_eq!(fields[1].data_type(), &arrow::datatypes::DataType::Utf8);
+            }
+            other => panic!("expected struct type, got {other:?}"),
+        }
     }
 }

@@ -32,3 +32,29 @@ fn schema_qualified_column_with_alias_errors() {
         "unexpected error: {err}"
     );
 }
+
+#[test]
+fn create_table_with_row_type() {
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+    let mut results = engine
+        .execute("CREATE TABLE row_struct(payload ROW(a INTEGER, b VARCHAR));")
+        .expect("create table with ROW type succeeds");
+    assert_eq!(results.len(), 1);
+    assert!(matches!(
+        results.remove(0),
+        RuntimeStatementResult::CreateTable { .. }
+    ));
+}
+
+#[test]
+fn create_table_with_double_precision_row_field() {
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+    let mut results = engine
+        .execute("CREATE TABLE row_double(payload ROW(d DOUBLE PRECISION));")
+        .expect("create table with DOUBLE PRECISION ROW field");
+    assert_eq!(results.len(), 1);
+    assert!(matches!(
+        results.remove(0),
+        RuntimeStatementResult::CreateTable { .. }
+    ));
+}
