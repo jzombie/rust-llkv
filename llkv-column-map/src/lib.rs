@@ -1,7 +1,24 @@
-// NOTE: rustfmt appears to repeatedly re-indent portions of some macros in
-// this file when running `cargo fmt` (likely a rustfmt bug). To avoid noisy
-// diffs and churn, skip automatic formatting on the affected macro_rules!
-// declarations. Keep the rest of the module formatted normally.
+// NOTE: rustfmt currently re-indents portions of macro_rules! blocks in this
+// file (observed when running `cargo fmt`). This produces noisy diffs and
+// churn because rustfmt will flip formatting between runs. The problematic
+// locations in this module are the macro_rules! dispatch macros declared
+// below. Until the underlying rustfmt bug is fixed, we intentionally opt out
+// of automatic formatting for those specific macros using `#[rustfmt::skip]`,
+// while keeping the rest of the module formatted normally.
+//
+// Reproduction / debugging tips for contributors:
+// - Run `rustup run stable rustfmt -- --version` to confirm the rustfmt
+//   version, then `cargo fmt` to reproduce the behavior.
+// - Narrow the change by running rustfmt on this file only:
+//     rustfmt llkv-column-map/src/store/scan/unsorted.rs
+// - If you can produce a minimal self-contained example that triggers the
+//   re-indent, open an issue with rustfmt (include rustfmt version and the
+//   minimal example) and link it here.
+//
+// TODO: When/if a reproducer is found, link the rustfmt issue and remove the
+// `#[rustfmt::skip]` attributes so the file can be formatted normally. If you
+// have a reproducer or additional context, please refer to this existing
+// discussion: https://github.com/rust-lang/rustfmt/issues/6629#issuecomment-3395446770
 
 /// Expands to the provided body with `$ty` bound to the concrete Arrow primitive type that
 /// matches the supplied `DataType`. Integer and floating-point primitives are supported; any
