@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
+use arrow::record_batch::RecordBatch;
 use crate::SqlResult;
 use crate::SqlValue;
 
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
+use llkv_executor::SelectExecution;
 use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateTablePlan,
     CreateTableSource, DeletePlan, InsertPlan, InsertSource, OrderByPlan, OrderSortType,
@@ -749,6 +751,208 @@ where
         Ok(Some(create_result))
     }
 
+    // TODO: Refactor into runtime or executor layer?
+    /// Try to handle pragma_table_info('table_name') table function
+    fn try_handle_pragma_table_info(
+        &self,
+        query: &Query,
+    ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select,
+            _ => return Ok(None),
+        };
+        
+        if select.from.len() != 1 {
+            return Ok(None);
+        }
+        
+        let table_with_joins = &select.from[0];
+        if !table_with_joins.joins.is_empty() {
+            return Ok(None);
+        }
+        
+        // Check if this is pragma_table_info function call
+        let table_name = match &table_with_joins.relation {
+            TableFactor::Table { name, args: Some(args), .. } => {
+                let func_name = name.to_string().to_ascii_lowercase();
+                if func_name != "pragma_table_info" {
+                    return Ok(None);
+                }
+                
+                // Extract table name from argument
+                if args.args.len() != 1 {
+                    return Err(Error::InvalidArgumentError(
+                        "pragma_table_info expects exactly one argument".into(),
+                    ));
+                }
+                
+                match &args.args[0] {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value))) => {
+                        match &value.value {
+                            Value::SingleQuotedString(s) => s.clone(),
+                            Value::DoubleQuotedString(s) => s.clone(),
+                            _ => {
+                                return Err(Error::InvalidArgumentError(
+                                    "pragma_table_info argument must be a string".into(),
+                                ));
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "pragma_table_info argument must be a string literal".into(),
+                        ));
+                    }
+                }
+            }
+            _ => return Ok(None),
+        };
+        
+        // Get table column specs from runtime context
+        let context = self.engine.context();
+        let columns = context.table_column_specs(&table_name)?;
+        
+        // Build RecordBatch with table column information
+        use arrow::array::{Int32Array, StringArray, BooleanArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        
+        let mut cid_values = Vec::new();
+        let mut name_values = Vec::new();
+        let mut type_values = Vec::new();
+        let mut notnull_values = Vec::new();
+        let mut dflt_value_values: Vec<Option<String>> = Vec::new();
+        let mut pk_values = Vec::new();
+        
+        for (idx, col) in columns.iter().enumerate() {
+            cid_values.push(idx as i32);
+            name_values.push(col.name.clone());
+            type_values.push(format!("{:?}", col.data_type)); // Simple type representation
+            notnull_values.push(!col.nullable);
+            dflt_value_values.push(None); // We don't track default values yet
+            pk_values.push(col.primary_key);
+        }
+        
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("cid", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("type", DataType::Utf8, false),
+            Field::new("notnull", DataType::Boolean, false),
+            Field::new("dflt_value", DataType::Utf8, true),
+            Field::new("pk", DataType::Boolean, false),
+        ]));
+        
+        use arrow::array::ArrayRef;
+        let mut batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(cid_values)) as ArrayRef,
+                Arc::new(StringArray::from(name_values)) as ArrayRef,
+                Arc::new(StringArray::from(type_values)) as ArrayRef,
+                Arc::new(BooleanArray::from(notnull_values)) as ArrayRef,
+                Arc::new(StringArray::from(dflt_value_values)) as ArrayRef,
+                Arc::new(BooleanArray::from(pk_values)) as ArrayRef,
+            ],
+        ).map_err(|e| Error::Internal(format!("failed to create pragma_table_info batch: {}", e)))?;
+        
+        // Apply SELECT projections: extract only requested columns
+        let projection_indices: Vec<usize> = select.projection.iter()
+            .filter_map(|item| {
+                match item {
+                    SelectItem::UnnamedExpr(SqlExpr::Identifier(ident)) => {
+                        schema.index_of(&ident.value).ok()
+                    }
+                    SelectItem::ExprWithAlias { expr, .. } => {
+                        if let SqlExpr::Identifier(ident) = expr {
+                            schema.index_of(&ident.value).ok()
+                        } else {
+                            None
+                        }
+                    }
+                    SelectItem::Wildcard(_) => None, // Handle * separately
+                    _ => None,
+                }
+            })
+            .collect();
+        
+        // Apply projections if not SELECT *
+        let projected_schema;
+        if !projection_indices.is_empty() {
+            let projected_fields: Vec<Field> = projection_indices.iter()
+                .map(|&idx| schema.field(idx).clone())
+                .collect();
+            projected_schema = Arc::new(Schema::new(projected_fields));
+            
+            let projected_columns: Vec<ArrayRef> = projection_indices.iter()
+                .map(|&idx| Arc::clone(batch.column(idx)))
+                .collect();
+            
+            batch = RecordBatch::try_new(Arc::clone(&projected_schema), projected_columns)
+                .map_err(|e| Error::Internal(format!("failed to project columns: {}", e)))?;
+        } else {
+            // SELECT * or complex projections - use original schema
+            projected_schema = schema;
+        }
+        
+        // Apply ORDER BY using Arrow compute kernels
+        if let Some(order_by) = &query.order_by {
+            use arrow::compute::SortColumn;
+            use arrow::compute::lexsort_to_indices;
+            use sqlparser::ast::OrderByKind;
+            
+            let exprs = match &order_by.kind {
+                OrderByKind::Expressions(exprs) => exprs,
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "unsupported ORDER BY clause".into(),
+                    ));
+                }
+            };
+            
+            let mut sort_columns = Vec::new();
+            for order_expr in exprs {
+                if let SqlExpr::Identifier(ident) = &order_expr.expr {
+                    if let Ok(col_idx) = projected_schema.index_of(&ident.value) {
+                        let options = arrow::compute::SortOptions {
+                            descending: !order_expr.options.asc.unwrap_or(true),
+                            nulls_first: order_expr.options.nulls_first.unwrap_or(false),
+                        };
+                        sort_columns.push(SortColumn {
+                            values: Arc::clone(batch.column(col_idx)),
+                            options: Some(options),
+                        });
+                    }
+                }
+            }
+            
+            if !sort_columns.is_empty() {
+                let indices = lexsort_to_indices(&sort_columns, None)
+                    .map_err(|e| Error::Internal(format!("failed to sort: {}", e)))?;
+                
+                use arrow::compute::take;
+                let sorted_columns: Result<Vec<ArrayRef>, _> = batch.columns().iter()
+                    .map(|col| take(col.as_ref(), &indices, None))
+                    .collect();
+                
+                batch = RecordBatch::try_new(
+                    Arc::clone(&projected_schema),
+                    sorted_columns.map_err(|e| Error::Internal(format!("failed to apply sort: {}", e)))?
+                ).map_err(|e| Error::Internal(format!("failed to create sorted batch: {}", e)))?;
+            }
+        }
+        
+        let execution = SelectExecution::new_single_batch(
+            table_name.clone(),
+            Arc::clone(&projected_schema),
+            batch,
+        );
+        
+        Ok(Some(RuntimeStatementResult::Select {
+            table_name,
+            schema: projected_schema,
+            execution,
+        }))
+    }
+
     fn handle_create_table_as(
         &self,
         display_name: String,
@@ -1142,6 +1346,11 @@ where
     }
 
     fn handle_query(&self, query: Query) -> SqlResult<RuntimeStatementResult<P>> {
+        // Check for pragma_table_info() table function first
+        if let Some(result) = self.try_handle_pragma_table_info(&query)? {
+            return Ok(result);
+        }
+        
         let select_plan = self.build_select_plan(query)?;
         self.execute_plan_statement(PlanStatement::Select(select_plan))
     }
@@ -1578,19 +1787,118 @@ where
                     }
                 },
                 SelectItem::UnnamedExpr(expr) => {
-                    let scalar = translate_scalar_with_context(expr, from_table)?;
-                    let alias = format!("col{}", idx + 1);
-                    projections.push(SelectProjection::Computed {
-                        expr: scalar,
-                        alias,
-                    });
+                    // Check if this is a simple column reference
+                    match expr {
+                        SqlExpr::Identifier(ident) => {
+                            // Simple column reference - preserve original name from table
+                            projections.push(SelectProjection::Column {
+                                name: ident.value.clone(),
+                                alias: None,
+                            });
+                        }
+                        SqlExpr::CompoundIdentifier(parts) => {
+                            // Determine if this is JUST a table-qualified column (table.column)
+                            // vs a struct field access (column.field OR table.column.field)
+                            let (is_simple_column_ref, col_idx) = if !from_table.is_empty() && parts.len() >= 2 {
+                                if parts[0].value.eq_ignore_ascii_case(from_table) && parts.len() == 2 {
+                                    // table.column with no further parts
+                                    (true, 1)
+                                } else if from_table.contains('.') && parts.len() == 3 {
+                                    // schema.table.column with no further parts
+                                    let first_two = format!("{}.{}", parts[0].value, parts[1].value);
+                                    if first_two.eq_ignore_ascii_case(from_table) {
+                                        (true, 2)
+                                    } else {
+                                        (false, 0)
+                                    }
+                                } else {
+                                    (false, 0)
+                                }
+                            } else {
+                                (false, 0)
+                            };
+                            
+                            if is_simple_column_ref {
+                                // Simple table-qualified column reference
+                                let col_name = parts[col_idx].value.clone();
+                                projections.push(SelectProjection::Column {
+                                    name: col_name,
+                                    alias: None,
+                                });
+                            } else {
+                                // Struct field access or other computed expression
+                                let scalar = translate_scalar_with_context(expr, from_table)?;
+                                let alias = format!("col{}", idx + 1);
+                                projections.push(SelectProjection::Computed {
+                                    expr: scalar,
+                                    alias,
+                                });
+                            }
+                        }
+                        _ => {
+                            // Computed expression
+                            let scalar = translate_scalar_with_context(expr, from_table)?;
+                            let alias = format!("col{}", idx + 1);
+                            projections.push(SelectProjection::Computed {
+                                expr: scalar,
+                                alias,
+                            });
+                        }
+                    }
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
-                    let scalar = translate_scalar_with_context(expr, from_table)?;
-                    projections.push(SelectProjection::Computed {
-                        expr: scalar,
-                        alias: alias.value.clone(),
-                    });
+                    // Check if this is a simple column reference with alias
+                    match expr {
+                        SqlExpr::Identifier(ident) => {
+                            projections.push(SelectProjection::Column {
+                                name: ident.value.clone(),
+                                alias: Some(alias.value.clone()),
+                            });
+                        }
+                        SqlExpr::CompoundIdentifier(parts) => {
+                            // Same logic as UnnamedExpr case
+                            let (is_simple_column_ref, col_idx) = if !from_table.is_empty() && parts.len() >= 2 {
+                                if parts[0].value.eq_ignore_ascii_case(from_table) && parts.len() == 2 {
+                                    (true, 1)
+                                } else if from_table.contains('.') && parts.len() == 3 {
+                                    let first_two = format!("{}.{}", parts[0].value, parts[1].value);
+                                    if first_two.eq_ignore_ascii_case(from_table) {
+                                        (true, 2)
+                                    } else {
+                                        (false, 0)
+                                    }
+                                } else {
+                                    (false, 0)
+                                }
+                            } else {
+                                (false, 0)
+                            };
+                            
+                            if is_simple_column_ref {
+                                // Simple table-qualified column reference with alias
+                                let col_name = parts[col_idx].value.clone();
+                                projections.push(SelectProjection::Column {
+                                    name: col_name,
+                                    alias: Some(alias.value.clone()),
+                                });
+                            } else {
+                                // Struct field access with alias
+                                let scalar = translate_scalar_with_context(expr, from_table)?;
+                                projections.push(SelectProjection::Computed {
+                                    expr: scalar,
+                                    alias: alias.value.clone(),
+                                });
+                            }
+                        }
+                        _ => {
+                            // Computed expression with alias
+                            let scalar = translate_scalar_with_context(expr, from_table)?;
+                            projections.push(SelectProjection::Computed {
+                                expr: scalar,
+                                alias: alias.value.clone(),
+                            });
+                        }
+                    }
                 }
             }
         }

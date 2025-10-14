@@ -1344,6 +1344,7 @@ dependencies = [
  "async-trait",
  "libtest-mimic 0.6.1",
  "llkv-column-map",
+ "llkv-executor",
  "llkv-expr",
  "llkv-plan",
  "llkv-result",

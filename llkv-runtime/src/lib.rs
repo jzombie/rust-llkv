@@ -419,6 +419,7 @@ where
         );
         let staging_ctx = Arc::new(RuntimeContext::new(staging_pager));
 
+        // TODO: Verify if this is copying the entire table!!  This should not be the case!
         // Copy table metadata from the main context to the staging context,
         // but create new Table instances that use the staging pager
         self.inner
@@ -1295,6 +1296,7 @@ where
             .collect())
     }
 
+    // TODO: This comment is outdated
     /// Copy table metadata from this context to a staging context.
     /// This creates new Table instances that use the staging context's pager.
     fn copy_tables_to_staging<Q>(&self, staging: &RuntimeContext<Q>) -> Result<()>

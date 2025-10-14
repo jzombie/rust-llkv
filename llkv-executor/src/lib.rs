@@ -1068,7 +1068,7 @@ where
         }
     }
 
-    fn new_single_batch(table_name: String, schema: Arc<Schema>, batch: RecordBatch) -> Self {
+    pub fn new_single_batch(table_name: String, schema: Arc<Schema>, batch: RecordBatch) -> Self {
         Self {
             table_name,
             schema,
