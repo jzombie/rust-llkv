@@ -12,10 +12,10 @@ use llkv_executor::SelectExecution;
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
 use llkv_runtime::{
-    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan,
-    CreateTablePlan, CreateTableSource, DeletePlan, IndexColumnPlan, InsertPlan, InsertSource,
-    OrderByPlan, OrderSortType, OrderTarget, PlanStatement, PlanValue, RuntimeContext,
-    RuntimeEngine, RuntimeSession, RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan,
+    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan, CreateTablePlan,
+    CreateTableSource, DeletePlan, IndexColumnPlan, InsertPlan, InsertSource, OrderByPlan,
+    OrderSortType, OrderTarget, PlanStatement, PlanValue, RuntimeContext, RuntimeEngine,
+    RuntimeSession, RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan,
     extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
@@ -26,10 +26,10 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
     ColumnOptionDef, DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName,
-    ObjectNamePart, ObjectType, OrderBy, OrderByKind, Query, SchemaName, Select,
-    SelectItem, SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableFactor,
-    TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
-    UpdateTableFromKind, Value, ValueWithSpan,
+    ObjectNamePart, ObjectType, OrderBy, OrderByKind, Query, SchemaName, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableFactor, TableObject,
+    TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator, UpdateTableFromKind,
+    Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -662,8 +662,8 @@ where
             None => None,
         };
 
-    let mut index_columns: Vec<IndexColumnPlan> = Vec::with_capacity(columns.len());
-    let mut seen_column_names: HashSet<String> = HashSet::new();
+        let mut index_columns: Vec<IndexColumnPlan> = Vec::with_capacity(columns.len());
+        let mut seen_column_names: HashSet<String> = HashSet::new();
         for item in columns {
             if item.operator_class.is_some() {
                 return Err(Error::InvalidArgumentError(

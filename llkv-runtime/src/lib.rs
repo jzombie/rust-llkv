@@ -55,7 +55,7 @@ use llkv_storage::pager::{MemPager, Pager};
 use llkv_table::catalog::{FieldConstraints, FieldDefinition};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
-use llkv_table::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
+use llkv_table::{CATALOG_TABLE_ID, ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta};
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName, ObjectNamePart, Select,
@@ -181,6 +181,12 @@ enum UniqueKey {
     Float(u64),
     Str(String),
     Composite(Vec<UniqueKey>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoredMultiColumnUnique {
+    index_name: Option<String>,
+    field_ids: Vec<FieldId>,
 }
 
 /// Result of running a plan statement.
@@ -984,7 +990,7 @@ where
     pager: Arc<P>,
     tables: RwLock<FxHashMap<String, Arc<ExecutorTable<P>>>>,
     dropped_tables: RwLock<FxHashSet<String>>,
-    multi_column_uniques: RwLock<FxHashMap<String, Vec<ExecutorMultiColumnUnique>>>,
+    multi_column_uniques: RwLock<FxHashMap<String, Vec<StoredMultiColumnUnique>>>,
     // Centralized catalog for table/field name resolution
     catalog: Arc<llkv_table::catalog::TableCatalog>,
     // Transaction manager for session-based transactions
@@ -1001,75 +1007,98 @@ where
         tracing::trace!("RuntimeContext::new called, pager={:p}", &*pager);
 
         // Load transaction state and table registry from catalog if it exists
-        let (next_txn_id, last_committed, loaded_tables) = match ColumnStore::open(Arc::clone(
-            &pager,
-        )) {
-            Ok(store) => {
-                let catalog = SysCatalog::new(&store);
-                let next_txn_id = match catalog.get_next_txn_id() {
-                    Ok(Some(id)) => {
-                        tracing::debug!("[CONTEXT] Loaded next_txn_id={} from catalog", id);
-                        id
-                    }
-                    Ok(None) => {
-                        tracing::debug!(
-                            "[CONTEXT] No persisted next_txn_id found, starting from default"
-                        );
-                        TXN_ID_AUTO_COMMIT + 1
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "[CONTEXT] Failed to load next_txn_id: {}, using default",
-                            e
-                        );
-                        TXN_ID_AUTO_COMMIT + 1
-                    }
-                };
-                let last_committed = match catalog.get_last_committed_txn_id() {
-                    Ok(Some(id)) => {
-                        tracing::debug!("[CONTEXT] Loaded last_committed={} from catalog", id);
-                        id
-                    }
-                    Ok(None) => {
-                        tracing::debug!(
-                            "[CONTEXT] No persisted last_committed found, starting from default"
-                        );
-                        TXN_ID_AUTO_COMMIT
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "[CONTEXT] Failed to load last_committed: {}, using default",
-                            e
-                        );
-                        TXN_ID_AUTO_COMMIT
-                    }
-                };
+        let (next_txn_id, last_committed, loaded_tables, persisted_unique_metas) =
+            match ColumnStore::open(Arc::clone(&pager)) {
+                Ok(store) => {
+                    let catalog = SysCatalog::new(&store);
+                    let next_txn_id = match catalog.get_next_txn_id() {
+                        Ok(Some(id)) => {
+                            tracing::debug!("[CONTEXT] Loaded next_txn_id={} from catalog", id);
+                            id
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                "[CONTEXT] No persisted next_txn_id found, starting from default"
+                            );
+                            TXN_ID_AUTO_COMMIT + 1
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[CONTEXT] Failed to load next_txn_id: {}, using default",
+                                e
+                            );
+                            TXN_ID_AUTO_COMMIT + 1
+                        }
+                    };
+                    let last_committed = match catalog.get_last_committed_txn_id() {
+                        Ok(Some(id)) => {
+                            tracing::debug!("[CONTEXT] Loaded last_committed={} from catalog", id);
+                            id
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                "[CONTEXT] No persisted last_committed found, starting from default"
+                            );
+                            TXN_ID_AUTO_COMMIT
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[CONTEXT] Failed to load last_committed: {}, using default",
+                                e
+                            );
+                            TXN_ID_AUTO_COMMIT
+                        }
+                    };
 
-                // Load table registry from catalog
-                let loaded_tables = match catalog.all_table_metas() {
-                    Ok(metas) => {
-                        tracing::debug!("[CONTEXT] Loaded {} table(s) from catalog", metas.len());
-                        metas
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "[CONTEXT] Failed to load table metas: {}, starting with empty registry",
-                            e
-                        );
-                        Vec::new()
-                    }
-                };
+                    // Load table registry from catalog
+                    let loaded_tables = match catalog.all_table_metas() {
+                        Ok(metas) => {
+                            tracing::debug!(
+                                "[CONTEXT] Loaded {} table(s) from catalog",
+                                metas.len()
+                            );
+                            metas
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[CONTEXT] Failed to load table metas: {}, starting with empty registry",
+                                e
+                            );
+                            Vec::new()
+                        }
+                    };
 
-                (next_txn_id, last_committed, loaded_tables)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "[CONTEXT] Failed to open ColumnStore: {}, using default state",
-                    e
-                );
-                (TXN_ID_AUTO_COMMIT + 1, TXN_ID_AUTO_COMMIT, Vec::new())
-            }
-        };
+                    let persisted_unique_metas = match catalog.all_multi_column_unique_metas() {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            tracing::warn!(
+                                "[CONTEXT] Failed to load multi-column unique metas: {}, starting with empty set",
+                                e
+                            );
+                            Vec::new()
+                        }
+                    };
+
+                    (
+                        next_txn_id,
+                        last_committed,
+                        loaded_tables,
+                        persisted_unique_metas,
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[CONTEXT] Failed to open ColumnStore: {}, using default state",
+                        e
+                    );
+                    (
+                        TXN_ID_AUTO_COMMIT + 1,
+                        TXN_ID_AUTO_COMMIT,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                }
+            };
 
         let transaction_manager =
             TransactionManager::new_with_initial_state(next_txn_id, last_committed);
@@ -1101,6 +1130,43 @@ where
             loaded_tables.len()
         );
 
+        let mut canonical_by_id: FxHashMap<TableId, String> = FxHashMap::default();
+        for (table_id, table_meta) in &loaded_tables {
+            if let Some(ref table_name) = table_meta.name {
+                canonical_by_id.insert(*table_id, table_name.to_ascii_lowercase());
+            }
+        }
+
+        let mut persisted_multi: FxHashMap<String, Vec<StoredMultiColumnUnique>> =
+            FxHashMap::default();
+        for meta in persisted_unique_metas {
+            if meta.uniques.is_empty() {
+                continue;
+            }
+            let Some(canonical_name) = canonical_by_id.get(&meta.table_id) else {
+                tracing::debug!(
+                    "[CONTEXT] Skipping persisted multi-column UNIQUE metadata for unknown table_id={}",
+                    meta.table_id
+                );
+                continue;
+            };
+
+            let mut stored_entries = Vec::with_capacity(meta.uniques.len());
+            for entry in meta.uniques {
+                if entry.column_ids.is_empty() {
+                    continue;
+                }
+                stored_entries.push(StoredMultiColumnUnique {
+                    index_name: entry.index_name,
+                    field_ids: entry.column_ids,
+                });
+            }
+
+            if !stored_entries.is_empty() {
+                persisted_multi.insert(canonical_name.clone(), stored_entries);
+            }
+        }
+
         // Initialize catalog and populate with existing tables
         let catalog = Arc::new(llkv_table::catalog::TableCatalog::new());
         for (_table_id, table_meta) in &loaded_tables {
@@ -1123,7 +1189,7 @@ where
             pager,
             tables: RwLock::new(FxHashMap::default()), // Start with empty table cache
             dropped_tables: RwLock::new(FxHashSet::default()),
-            multi_column_uniques: RwLock::new(FxHashMap::default()),
+            multi_column_uniques: RwLock::new(persisted_multi),
             catalog,
             transaction_manager,
             txn_manager,
@@ -1148,6 +1214,65 @@ where
             last_committed
         );
         Ok(())
+    }
+
+    fn persist_multi_column_uniques(
+        &self,
+        table_id: TableId,
+        entries: &[StoredMultiColumnUnique],
+    ) -> Result<()> {
+        let store = ColumnStore::open(Arc::clone(&self.pager))?;
+        let catalog = SysCatalog::new(&store);
+        let metas: Vec<MultiColumnUniqueEntryMeta> = entries
+            .iter()
+            .map(|entry| MultiColumnUniqueEntryMeta {
+                index_name: entry.index_name.clone(),
+                column_ids: entry.field_ids.clone(),
+            })
+            .collect();
+        catalog.put_multi_column_uniques(table_id, &metas)?;
+        Ok(())
+    }
+
+    fn build_executor_multi_column_uniques(
+        table: &ExecutorTable<P>,
+        stored: &[StoredMultiColumnUnique],
+    ) -> Vec<ExecutorMultiColumnUnique> {
+        let mut results = Vec::with_capacity(stored.len());
+
+        'outer: for entry in stored {
+            if entry.field_ids.is_empty() {
+                continue;
+            }
+
+            let mut column_indices = Vec::with_capacity(entry.field_ids.len());
+            for field_id in &entry.field_ids {
+                if let Some((idx, _)) = table
+                    .schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, col)| &col.field_id == field_id)
+                {
+                    column_indices.push(idx);
+                } else {
+                    tracing::warn!(
+                        "[CATALOG] Skipping persisted multi-column UNIQUE {:?} for table_id={} missing field_id {}",
+                        entry.index_name,
+                        table.table.table_id(),
+                        field_id
+                    );
+                    continue 'outer;
+                }
+            }
+
+            results.push(ExecutorMultiColumnUnique {
+                index_name: entry.index_name.clone(),
+                column_indices,
+            });
+        }
+
+        results
     }
 
     /// Construct the default snapshot for auto-commit operations.
@@ -1333,12 +1458,17 @@ where
 
         for column_plan in &plan.columns {
             let normalized = column_plan.name.to_ascii_lowercase();
-            let col_idx = table.schema.lookup.get(&normalized).copied().ok_or_else(|| {
-                Error::InvalidArgumentError(format!(
-                    "column '{}' does not exist in table '{}'",
-                    column_plan.name, display_name
-                ))
-            })?;
+            let col_idx = table
+                .schema
+                .lookup
+                .get(&normalized)
+                .copied()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "column '{}' does not exist in table '{}'",
+                        column_plan.name, display_name
+                    ))
+                })?;
             if !seen_column_indices.insert(col_idx) {
                 return Err(Error::InvalidArgumentError(format!(
                     "duplicate column '{}' in CREATE INDEX",
@@ -1415,7 +1545,7 @@ where
             .and_then(|entries| {
                 entries
                     .iter()
-                    .find(|entry| entry.column_indices == column_indices)
+                    .find(|entry| entry.field_ids == field_ids)
                     .cloned()
             })
         {
@@ -1423,7 +1553,7 @@ where
                 drop(table);
                 return Ok(RuntimeStatementResult::CreateIndex {
                     table_name: display_name,
-                    index_name: existing.index_name,
+                    index_name: existing.index_name.clone(),
                 });
             }
 
@@ -1435,20 +1565,48 @@ where
 
         self.ensure_existing_rows_unique_multi(table.as_ref(), &field_ids, &column_names)?;
 
-        let entry = ExecutorMultiColumnUnique {
+        let executor_entry = ExecutorMultiColumnUnique {
             index_name: index_name.clone(),
             column_indices: column_indices.clone(),
         };
 
+        let mut entries_to_persist = {
+            let guard = self.multi_column_uniques.read().unwrap();
+            guard.get(&canonical_name).cloned().unwrap_or_default()
+        };
+
+        if entries_to_persist
+            .iter()
+            .any(|existing| existing.field_ids == field_ids)
         {
-            let mut guard = self.multi_column_uniques.write().unwrap();
-            guard
-                .entry(canonical_name.clone())
-                .or_default()
-                .push(entry.clone());
+            // Race condition guard: another thread inserted the same index after the initial check.
+            if plan.if_not_exists {
+                drop(table);
+                return Ok(RuntimeStatementResult::CreateIndex {
+                    table_name: display_name,
+                    index_name: index_name.clone(),
+                });
+            }
+            return Err(Error::CatalogError(format!(
+                "Index already exists on columns '{}'",
+                column_names.join(", ")
+            )));
         }
 
-        table.add_multi_column_unique(entry);
+        let stored_entry = StoredMultiColumnUnique {
+            index_name: index_name.clone(),
+            field_ids: field_ids.clone(),
+        };
+        entries_to_persist.push(stored_entry.clone());
+
+        self.persist_multi_column_uniques(table.table.table_id(), &entries_to_persist)?;
+
+        {
+            let mut guard = self.multi_column_uniques.write().unwrap();
+            guard.insert(canonical_name.clone(), entries_to_persist);
+        }
+
+        table.add_multi_column_unique(executor_entry);
 
         Ok(RuntimeStatementResult::CreateIndex {
             table_name: display_name,
@@ -2868,18 +3026,16 @@ where
             let existing_rows = self.scan_multi_column_values(table, &field_ids, snapshot)?;
             let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
             for row_values in existing_rows {
-                if let Some(key) = Self::build_composite_unique_key(
-                    &row_values,
-                    &constraint_column_names,
-                )? {
+                if let Some(key) =
+                    Self::build_composite_unique_key(&row_values, &constraint_column_names)?
+                {
                     existing_keys.insert(key);
                 }
             }
 
             let mut new_keys: FxHashSet<UniqueKey> = FxHashSet::default();
             for row in rows {
-                let mut values_for_constraint =
-                    Vec::with_capacity(constraint.column_indices.len());
+                let mut values_for_constraint = Vec::with_capacity(constraint.column_indices.len());
                 for &col_idx in &constraint.column_indices {
                     if let Some(pos) = column_order.iter().position(|&dest| dest == col_idx) {
                         values_for_constraint.push(row[pos].clone());
@@ -2888,9 +3044,10 @@ where
                     }
                 }
 
-                if let Some(key) =
-                    Self::build_composite_unique_key(&values_for_constraint, &constraint_column_names)?
-                {
+                if let Some(key) = Self::build_composite_unique_key(
+                    &values_for_constraint,
+                    &constraint_column_names,
+                )? {
                     if existing_keys.contains(&key) || !new_keys.insert(key) {
                         return Err(Error::ConstraintError(format!(
                             "constraint violation on columns '{}'",
@@ -3975,7 +4132,9 @@ where
             .get(canonical_name)
             .cloned()
         {
-            executor_table.set_multi_column_uniques(stored);
+            let executor_uniques =
+                Self::build_executor_multi_column_uniques(&executor_table, &stored);
+            executor_table.set_multi_column_uniques(executor_uniques);
         }
 
         // Cache the loaded table

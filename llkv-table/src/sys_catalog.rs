@@ -5,6 +5,7 @@
 //!
 //! - **Table metadata** ([`TableMeta`]): Table ID, name, creation time, flags
 //! - **Column metadata** ([`ColMeta`]): Column ID, name, flags, default values
+//! - **Multi-column unique metadata** ([`TableMultiColumnUniqueMeta`]): Unique index definitions per table
 //!
 //! # Storage Format
 //!
@@ -121,6 +122,24 @@ pub struct SchemaMeta {
     pub created_at_micros: u64,
     /// Bitflags for schema properties (reserved for future use).
     pub flags: u32,
+}
+
+/// Metadata describing a single multi-column UNIQUE index.
+#[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
+pub struct MultiColumnUniqueEntryMeta {
+    /// Optional human-readable index name.
+    pub index_name: Option<String>,
+    /// Field IDs participating in this UNIQUE constraint.
+    pub column_ids: Vec<u32>,
+}
+
+/// Metadata describing all multi-column UNIQUE indexes for a table.
+#[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
+pub struct TableMultiColumnUniqueMeta {
+    /// Table identifier these UNIQUE entries belong to.
+    pub table_id: TableId,
+    /// Definitions of each persisted multi-column UNIQUE.
+    pub uniques: Vec<MultiColumnUniqueEntryMeta>,
 }
 
 // ----- SysCatalog -----
@@ -274,6 +293,155 @@ where
                 }
             })
             .collect()
+    }
+
+    /// Persist the complete set of multi-column UNIQUE definitions for a table.
+    pub fn put_multi_column_uniques(
+        &self,
+        table_id: TableId,
+        uniques: &[MultiColumnUniqueEntryMeta],
+    ) -> LlkvResult<()> {
+        let lfid_val: u64 =
+            lfid(CATALOG_TABLE_ID, CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID).into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("meta", DataType::Binary, false).with_metadata(HashMap::from([(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            )])),
+        ]));
+
+        let row_id = Arc::new(UInt64Array::from(vec![rid_table(table_id)]));
+        let meta = TableMultiColumnUniqueMeta {
+            table_id,
+            uniques: uniques.to_vec(),
+        };
+        let encoded = bitcode::encode(&meta);
+        let meta_bytes = Arc::new(BinaryArray::from(vec![encoded.as_slice()]));
+
+        let batch = RecordBatch::try_new(schema, vec![row_id, meta_bytes])?;
+        self.store.append(&batch)?;
+        Ok(())
+    }
+
+    /// Retrieve all persisted multi-column UNIQUE definitions for a table.
+    pub fn get_multi_column_uniques(
+        &self,
+        table_id: TableId,
+    ) -> LlkvResult<Vec<MultiColumnUniqueEntryMeta>> {
+        let lfid = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID);
+        let row_id = rid_table(table_id);
+        let batch = match self
+            .store
+            .gather_rows(&[lfid], &[row_id], GatherNullPolicy::IncludeNulls)
+        {
+            Ok(batch) => batch,
+            Err(llkv_result::Error::NotFound) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+
+        if batch.num_columns() == 0 || batch.num_rows() == 0 {
+            return Ok(Vec::new());
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal(
+                    "catalog multi-column unique column stored unexpected type".into(),
+                )
+            })?;
+
+        if array.is_null(0) {
+            return Ok(Vec::new());
+        }
+
+        let meta: TableMultiColumnUniqueMeta = bitcode::decode(array.value(0)).map_err(|err| {
+            llkv_result::Error::Internal(format!(
+                "failed to decode multi-column unique metadata: {err}"
+            ))
+        })?;
+
+        Ok(meta.uniques)
+    }
+
+    /// Retrieve all persisted multi-column UNIQUE definitions across tables.
+    pub fn all_multi_column_unique_metas(&self) -> LlkvResult<Vec<TableMultiColumnUniqueMeta>> {
+        let meta_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID);
+        let row_field = rowid_fid(meta_field);
+
+        struct RowIdCollector {
+            row_ids: Vec<u64>,
+        }
+
+        impl PrimitiveVisitor for RowIdCollector {
+            fn u64_chunk(&mut self, values: &UInt64Array) {
+                for i in 0..values.len() {
+                    self.row_ids.push(values.value(i));
+                }
+            }
+        }
+        impl PrimitiveWithRowIdsVisitor for RowIdCollector {}
+        impl PrimitiveSortedVisitor for RowIdCollector {}
+        impl PrimitiveSortedWithRowIdsVisitor for RowIdCollector {}
+
+        let mut collector = RowIdCollector {
+            row_ids: Vec::new(),
+        };
+        match ScanBuilder::new(self.store, row_field)
+            .options(ScanOptions::default())
+            .run(&mut collector)
+        {
+            Ok(()) => {}
+            Err(llkv_result::Error::NotFound) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        }
+
+        if collector.row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let batch = match self.store.gather_rows(
+            &[meta_field],
+            &collector.row_ids,
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(batch) => batch,
+            Err(llkv_result::Error::NotFound) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+
+        if batch.num_columns() == 0 {
+            return Ok(Vec::new());
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal(
+                    "catalog multi-column unique column stored unexpected type".into(),
+                )
+            })?;
+
+        let mut metas = Vec::with_capacity(batch.num_rows());
+        for idx in 0..batch.num_rows() {
+            if array.is_null(idx) {
+                continue;
+            }
+            let meta: TableMultiColumnUniqueMeta =
+                bitcode::decode(array.value(idx)).map_err(|err| {
+                    llkv_result::Error::Internal(format!(
+                        "failed to decode multi-column unique metadata: {err}"
+                    ))
+                })?;
+            metas.push(meta);
+        }
+
+        Ok(metas)
     }
 
     pub fn put_next_table_id(&self, next_id: TableId) -> LlkvResult<()> {
