@@ -1302,6 +1302,7 @@ pub struct ExecutorColumn {
     pub data_type: DataType,
     pub nullable: bool,
     pub primary_key: bool,
+    pub unique: bool,
     pub field_id: FieldId,
     pub check_expr: Option<String>,
 }

@@ -1298,6 +1298,8 @@ where
                     column.nullable,
                 )
                 .with_primary_key(column.primary_key)
+                .with_unique(column.unique)
+                .with_check(column.check_expr.clone())
             })
             .collect())
     }
@@ -1698,27 +1700,30 @@ where
                 )));
             }
             tracing::trace!(
-                "DEBUG create_table_from_columns[{}]: name='{}' data_type={:?} nullable={} primary_key={}",
+                "DEBUG create_table_from_columns[{}]: name='{}' data_type={:?} nullable={} primary_key={} unique={}",
                 idx,
                 column.name,
                 column.data_type,
                 column.nullable,
-                column.primary_key
+                column.primary_key,
+                column.unique
             );
             column_defs.push(ExecutorColumn {
                 name: column.name.clone(),
                 data_type: column.data_type.clone(),
                 nullable: column.nullable,
                 primary_key: column.primary_key,
+                unique: column.unique,
                 field_id: (idx + 1) as FieldId,
                 check_expr: column.check_expr.clone(),
             });
             let pushed = column_defs.last().unwrap();
             tracing::trace!(
-                "DEBUG create_table_from_columns[{}]: pushed ExecutorColumn name='{}' primary_key={}",
+                "DEBUG create_table_from_columns[{}]: pushed ExecutorColumn name='{}' primary_key={} unique={}",
                 idx,
                 pushed.name,
-                pushed.primary_key
+                pushed.primary_key,
+                pushed.unique
             );
         }
 
@@ -1786,6 +1791,7 @@ where
             for column in &column_defs {
                 let definition = FieldDefinition::new(&column.name)
                     .with_primary_key(column.primary_key)
+                    .with_unique(column.unique)
                     .with_check_expr(column.check_expr.clone());
                 if let Err(e) = field_resolver.register_field(definition) {
                     tracing::warn!(
@@ -1849,6 +1855,7 @@ where
                 data_type,
                 nullable: field.is_nullable(),
                 primary_key: false, // CTAS does not preserve PRIMARY KEY constraints
+                unique: false, // CTAS does not preserve UNIQUE constraints
                 field_id: (idx + 1) as FieldId,
                 check_expr: None, // CTAS does not preserve CHECK constraints
             });
@@ -1955,10 +1962,11 @@ where
         );
         for (idx, col) in table_entry.schema.columns.iter().enumerate() {
             tracing::trace!(
-                "  inserting column[{}]: name='{}' primary_key={}",
+                "  inserting column[{}]: name='{}' primary_key={} unique={}",
                 idx,
                 col.name,
-                col.primary_key
+                col.primary_key,
+                col.unique
             );
         }
         tables.insert(canonical_name.clone(), table_entry);
@@ -1977,6 +1985,7 @@ where
             for column in &column_defs {
                 let definition = FieldDefinition::new(&column.name)
                     .with_primary_key(column.primary_key)
+                    .with_unique(column.unique)
                     .with_check_expr(column.check_expr.clone());
                 if let Err(e) = field_resolver.register_field(definition) {
                     tracing::warn!(
@@ -2526,6 +2535,54 @@ where
         }
     }
 
+    fn check_unique_constraints(
+        &self,
+        table: &ExecutorTable<P>,
+        rows: &[Vec<PlanValue>],
+        column_order: &[usize],
+        snapshot: TransactionSnapshot,
+    ) -> Result<()> {
+        let unique_columns: Vec<(usize, &ExecutorColumn)> = table
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, col)| col.unique && !col.primary_key)
+            .collect();
+
+        if unique_columns.is_empty() {
+            return Ok(());
+        }
+
+        for (col_idx, column) in unique_columns {
+            let existing_values = self.scan_column_values(table, column.field_id, snapshot)?;
+            let mut new_values: Vec<PlanValue> = Vec::new();
+
+            for row in rows {
+                let Some(insert_position) = column_order.iter().position(|&dest| dest == col_idx)
+                else {
+                    continue;
+                };
+                let value = row[insert_position].clone();
+
+                if matches!(value, PlanValue::Null) {
+                    continue;
+                }
+
+                if existing_values.contains(&value) || new_values.contains(&value) {
+                    return Err(Error::ConstraintError(format!(
+                        "constraint violation on column '{}'",
+                        column.name
+                    )));
+                }
+
+                new_values.push(value);
+            }
+        }
+
+        Ok(())
+    }
+
     fn check_primary_key_constraints(
         &self,
         table: &ExecutorTable<P>,
@@ -2552,6 +2609,7 @@ where
             // Get existing values for this column from the table
             let field_id = column.field_id;
             let existing_values = self.scan_column_values(table, field_id, snapshot)?;
+            let mut new_values: Vec<PlanValue> = Vec::new();
 
             tracing::trace!(
                 "[PK_CHECK] snapshot(txn={}, snap_id={}) column '{}': found {} existing VISIBLE values: {:?}",
@@ -2578,12 +2636,14 @@ where
                     }
 
                     // Check if this value already exists
-                    if existing_values.contains(new_value) {
+                    if existing_values.contains(new_value) || new_values.contains(new_value) {
                         return Err(Error::ConstraintError(format!(
                             "constraint violation on column '{}'",
                             column.name
                         )));
                     }
+
+                    new_values.push(new_value.clone());
                 }
             }
         }
@@ -2685,9 +2745,8 @@ where
         self.check_not_null_constraints(table, &rows, &column_order)?;
         // Check CHECK constraints
         self.check_check_constraints(table, &rows, &column_order)?;
-
-        // Check PRIMARY KEY constraints
-        self.check_primary_key_constraints(table, &rows, &column_order, snapshot)?;
+        // Check UNIQUE constraints
+        self.check_unique_constraints(table, &rows, &column_order, snapshot)?;
 
         if display_name == "keys" {
             tracing::trace!(
@@ -3405,6 +3464,7 @@ where
                 data_type: field.data_type().clone(),
                 nullable: field.is_nullable(),
                 primary_key: constraints.primary_key,
+                unique: constraints.primary_key || constraints.unique,
                 field_id,
                 check_expr: constraints.check_expr.clone(),
             });
@@ -3493,6 +3553,7 @@ where
             for col in &executor_table.schema.columns {
                 let definition = FieldDefinition::new(&col.name)
                     .with_primary_key(col.primary_key)
+                    .with_unique(col.unique)
                     .with_check_expr(col.check_expr.clone());
                 let _ = field_resolver.register_field(definition); // Ignore "already exists" errors
             }

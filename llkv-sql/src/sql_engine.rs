@@ -500,6 +500,10 @@ where
                 )
             });
 
+            let has_unique_constraint = column_def.options.iter().any(|opt| {
+                matches!(opt.option, ColumnOption::Unique { .. })
+            });
+
             // Extract CHECK constraint if present and validate it
             let check_expr = column_def.options.iter().find_map(|opt| {
                 if let ColumnOption::Check(expr) = &opt.option {
@@ -518,9 +522,10 @@ where
             let check_expr_str = check_expr.map(|e| e.to_string());
 
             tracing::trace!(
-                "DEBUG CREATE TABLE column '{}' is_primary_key={} check_expr={:?}",
+                "DEBUG CREATE TABLE column '{}' is_primary_key={} has_unique={} check_expr={:?}",
                 column_def.name.value,
                 is_primary_key,
+                has_unique_constraint,
                 check_expr_str
             );
 
@@ -530,17 +535,21 @@ where
                 is_nullable,
             );
             tracing::trace!(
-                "DEBUG ColumnSpec after new(): primary_key={}",
-                column.primary_key
+                "DEBUG ColumnSpec after new(): primary_key={} unique={}",
+                column.primary_key,
+                column.unique
             );
 
             column = column
                 .with_primary_key(is_primary_key)
+                .with_unique(has_unique_constraint)
                 .with_check(check_expr_str);
             tracing::trace!(
-                "DEBUG ColumnSpec after with_primary_key({}): primary_key={} check_expr={:?}",
+                "DEBUG ColumnSpec after with_primary_key({})/with_unique({}): primary_key={} unique={} check_expr={:?}",
                 is_primary_key,
+                has_unique_constraint,
                 column.primary_key,
+                column.unique,
                 column.check_expr
             );
 

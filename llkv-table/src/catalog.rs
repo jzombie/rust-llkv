@@ -962,6 +962,7 @@ impl<'a> IdentifierResolver<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Default, bitcode::Encode, bitcode::Decode)]
 pub struct FieldConstraints {
     pub primary_key: bool,
+    pub unique: bool,
     pub check_expr: Option<String>,
 }
 
@@ -982,6 +983,16 @@ impl FieldDefinition {
 
     pub fn with_primary_key(mut self, primary_key: bool) -> Self {
         self.constraints.primary_key = primary_key;
+        if primary_key {
+            self.constraints.unique = true;
+        }
+        self
+    }
+
+    pub fn with_unique(mut self, unique: bool) -> Self {
+        if unique {
+            self.constraints.unique = true;
+        }
         self
     }
 
@@ -1702,12 +1713,14 @@ mod tests {
             .register_field(
                 FieldDefinition::new("id")
                     .with_primary_key(true)
+                    .with_unique(true)
                     .with_check_expr(Some("id > 0".to_string())),
             )
             .unwrap();
 
         let constraints = resolver.field_constraints(fid).unwrap();
         assert!(constraints.primary_key);
+        assert!(constraints.unique);
         assert_eq!(constraints.check_expr.as_deref(), Some("id > 0"));
 
         let by_name = resolver.field_constraints_by_name("ID").unwrap();
@@ -1717,6 +1730,7 @@ mod tests {
         assert_eq!(info.field_id, fid);
         assert_eq!(info.display_name, "id");
         assert!(info.constraints.primary_key);
+    assert!(info.constraints.unique);
 
         let state = resolver.export_state();
         let restored = FieldResolver::from_state(state).unwrap();
