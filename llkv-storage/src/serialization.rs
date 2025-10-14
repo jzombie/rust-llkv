@@ -365,7 +365,7 @@ fn serialize_struct(arr: &dyn Array) -> Result<Vec<u8>> {
     // Use Arrow IPC format to serialize the struct array
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
-    
+
     // Create a RecordBatch with a single column containing the struct array
     let schema = Arc::new(Schema::new(vec![Field::new(
         "struct_col",
@@ -375,7 +375,7 @@ fn serialize_struct(arr: &dyn Array) -> Result<Vec<u8>> {
     let array_ref = make_array(arr.to_data());
     let batch = RecordBatch::try_new(schema, vec![array_ref])
         .map_err(|e| Error::Internal(format!("failed to create record batch: {}", e)))?;
-    
+
     // Serialize to IPC format
     let mut ipc_bytes = Vec::new();
     {
@@ -388,10 +388,10 @@ fn serialize_struct(arr: &dyn Array) -> Result<Vec<u8>> {
             .finish()
             .map_err(|e| Error::Internal(format!("failed to finish IPC: {}", e)))?;
     }
-    
+
     let payload_len = u32::try_from(ipc_bytes.len())
         .map_err(|_| Error::Internal("IPC payload too large".into()))?;
-    
+
     let mut out = Vec::with_capacity(24 + ipc_bytes.len());
     out.extend_from_slice(&MAGIC);
     out.push(Layout::Struct as u8);
@@ -495,20 +495,22 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
             // Deserialize from IPC format
             use arrow::ipc::reader::StreamReader;
             use std::io::Cursor;
-            
+
             let cursor = Cursor::new(payload.as_slice());
             let mut reader = StreamReader::try_new(cursor, None)
                 .map_err(|e| Error::Internal(format!("failed to create IPC reader: {}", e)))?;
-            
+
             let batch = reader
                 .next()
                 .ok_or_else(|| Error::Internal("no batch in IPC stream".into()))?
                 .map_err(|e| Error::Internal(format!("failed to read IPC batch: {}", e)))?;
-            
+
             if batch.num_columns() != 1 {
-                return Err(Error::Internal("expected single column in struct batch".into()));
+                return Err(Error::Internal(
+                    "expected single column in struct batch".into(),
+                ));
             }
-            
+
             Ok(batch.column(0).clone())
         }
 

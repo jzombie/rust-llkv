@@ -72,20 +72,24 @@ where
                         {
                             let base_dtype = match expr {
                                 ScalarExpr::Column(fid) => {
-                                    let column = table.schema.column_by_field_id(*fid).ok_or_else(|| {
-                                        Error::InvalidArgumentError(format!(
-                                            "unknown column with field id {} in GetField",
-                                            fid
-                                        ))
-                                    })?;
+                                    let column =
+                                        table.schema.column_by_field_id(*fid).ok_or_else(|| {
+                                            Error::InvalidArgumentError(format!(
+                                                "unknown column with field id {} in GetField",
+                                                fid
+                                            ))
+                                        })?;
                                     column.data_type.clone()
                                 }
-                                ScalarExpr::GetField { base: inner_base, field_name: inner_field } => {
-                                    get_field_type(inner_base, inner_field, table)?
+                                ScalarExpr::GetField {
+                                    base: inner_base,
+                                    field_name: inner_field,
+                                } => get_field_type(inner_base, inner_field, table)?,
+                                _ => {
+                                    return Err(Error::InvalidArgumentError(
+                                        "GetField base must be a column or another GetField".into(),
+                                    ));
                                 }
-                                _ => return Err(Error::InvalidArgumentError(
-                                    "GetField base must be a column or another GetField".into()
-                                )),
                             };
 
                             if let DataType::Struct(fields) = base_dtype {
@@ -93,12 +97,15 @@ where
                                     .iter()
                                     .find(|f| f.name() == field_name)
                                     .map(|f| f.data_type().clone())
-                                    .ok_or_else(|| Error::InvalidArgumentError(
-                                        format!("Field '{}' not found in struct", field_name)
-                                    ))
+                                    .ok_or_else(|| {
+                                        Error::InvalidArgumentError(format!(
+                                            "Field '{}' not found in struct",
+                                            field_name
+                                        ))
+                                    })
                             } else {
                                 Err(Error::InvalidArgumentError(
-                                    "GetField can only be applied to struct types".into()
+                                    "GetField can only be applied to struct types".into(),
                                 ))
                             }
                         }

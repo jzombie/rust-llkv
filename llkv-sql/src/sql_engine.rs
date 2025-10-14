@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    atomic::{AtomicBool, Ordering as AtomicOrdering},
     Arc, OnceLock,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
 };
 
 use crate::SqlResult;
@@ -17,9 +17,9 @@ use llkv_runtime::{
     OrderTarget, PlanStatement, PlanValue, RuntimeContext, RuntimeEngine, RuntimeSession,
     RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
 };
-use regex::Regex;
 use llkv_storage::pager::Pager;
 use llkv_table::catalog::{IdentifierContext, IdentifierResolver};
+use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
@@ -571,12 +571,12 @@ where
                 "CREATE SCHEMA ... CLONE is not supported".into(),
             ));
         }
-        if with.as_ref().map_or(false, |opts| !opts.is_empty()) {
+        if with.as_ref().is_some_and(|opts| !opts.is_empty()) {
             return Err(Error::InvalidArgumentError(
                 "CREATE SCHEMA ... WITH options are not supported".into(),
             ));
         }
-        if options.as_ref().map_or(false, |opts| !opts.is_empty()) {
+        if options.as_ref().is_some_and(|opts| !opts.is_empty()) {
             return Err(Error::InvalidArgumentError(
                 "CREATE SCHEMA options are not supported".into(),
             ));
@@ -958,17 +958,17 @@ where
 
             let mut sort_columns = Vec::new();
             for order_expr in exprs {
-                if let SqlExpr::Identifier(ident) = &order_expr.expr {
-                    if let Ok(col_idx) = projected_schema.index_of(&ident.value) {
-                        let options = arrow::compute::SortOptions {
-                            descending: !order_expr.options.asc.unwrap_or(true),
-                            nulls_first: order_expr.options.nulls_first.unwrap_or(false),
-                        };
-                        sort_columns.push(SortColumn {
-                            values: Arc::clone(batch.column(col_idx)),
-                            options: Some(options),
-                        });
-                    }
+                if let SqlExpr::Identifier(ident) = &order_expr.expr
+                    && let Ok(col_idx) = projected_schema.index_of(&ident.value)
+                {
+                    let options = arrow::compute::SortOptions {
+                        descending: !order_expr.options.asc.unwrap_or(true),
+                        nulls_first: order_expr.options.nulls_first.unwrap_or(false),
+                    };
+                    sort_columns.push(SortColumn {
+                        values: Arc::clone(batch.column(col_idx)),
+                        options: Some(options),
+                    });
                 }
             }
 
@@ -1301,11 +1301,7 @@ where
 
         let filter = selection
             .map(|expr| {
-                translate_condition_with_context(
-                    &resolver,
-                    IdentifierContext::new(table_id),
-                    &expr,
-                )
+                translate_condition_with_context(&resolver, IdentifierContext::new(table_id), &expr)
             })
             .transpose()?;
 
@@ -1400,13 +1396,11 @@ where
                     }
 
                     // Drop the schema
-                    if !catalog.unregister_schema(&canonical_name) {
-                        if !if_exists {
-                            return Err(Error::CatalogError(format!(
-                                "Schema '{}' does not exist",
-                                display_name
-                            )));
-                        }
+                    if !catalog.unregister_schema(&canonical_name) && !if_exists {
+                        return Err(Error::CatalogError(format!(
+                            "Schema '{}' does not exist",
+                            display_name
+                        )));
                     }
                 }
 
@@ -1454,8 +1448,7 @@ where
                     "ORDER BY is not supported for aggregate queries".into(),
                 ));
             }
-            let order_plan =
-                self.translate_order_by(&resolver, select_context, order_by)?;
+            let order_plan = self.translate_order_by(&resolver, select_context, order_by)?;
             select_plan = select_plan.with_order_by(Some(order_plan));
         }
         Ok(select_plan)
@@ -1519,16 +1512,13 @@ where
             ));
         }
 
-        let table_alias =
-            select
-                .from
-                .get(0)
-                .and_then(|table_with_joins| match &table_with_joins.relation {
-                    TableFactor::Table { alias, .. } => {
-                        alias.as_ref().map(|a| a.name.value.clone())
-                    }
-                    _ => None,
-                });
+        let table_alias = select
+            .from
+            .first()
+            .and_then(|table_with_joins| match &table_with_joins.relation {
+                TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+                _ => None,
+            });
 
         if let Some(alias) = table_alias.as_ref() {
             validate_projection_alias_qualifiers(&select.projection, alias)?;
@@ -1539,7 +1529,7 @@ where
             // No FROM clause - use empty string for table context (e.g., SELECT 42, SELECT {'a': 1} AS x)
             let mut p = SelectPlan::new("");
             let projections = self.build_projection_list(
-                &resolver,
+                resolver,
                 IdentifierContext::new(None),
                 &select.projection,
             )?;
@@ -1554,7 +1544,7 @@ where
                 p = p.with_aggregates(aggregates);
             } else {
                 let projections = self.build_projection_list(
-                    &resolver,
+                    resolver,
                     IdentifierContext::new(table_id),
                     &select.projection,
                 )?;
@@ -1568,7 +1558,7 @@ where
             // For multi-table queries, we'll build projections differently
             // For now, just handle simple column references
             let projections = self.build_projection_list(
-                &resolver,
+                resolver,
                 IdentifierContext::new(None),
                 &select.projection,
             )?;
@@ -1578,9 +1568,7 @@ where
 
         let filter_expr = match &select.selection {
             Some(expr) => Some(translate_condition_with_context(
-                &resolver,
-                id_context,
-                expr,
+                resolver, id_context, expr,
             )?),
             None => None,
         };
@@ -1622,7 +1610,7 @@ where
             .nulls_first
             .unwrap_or(default_nulls_first_for_direction);
 
-    let resolve_simple_column = |expr: &SqlExpr| -> SqlResult<String> {
+        let resolve_simple_column = |expr: &SqlExpr| -> SqlResult<String> {
             let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
             match scalar {
                 llkv_expr::expr::ScalarExpr::Column(column) => Ok(column),
@@ -1929,7 +1917,7 @@ where
                     }
                     _ => {
                         let alias = format!("col{}", idx + 1);
-                        let scalar = translate_scalar_with_context(&resolver, id_context, expr)?;
+                        let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
                         projections.push(SelectProjection::Computed {
                             expr: scalar,
                             alias,
@@ -1969,7 +1957,7 @@ where
                         }
                     }
                     _ => {
-                        let scalar = translate_scalar_with_context(&resolver, id_context, expr)?;
+                        let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
                         projections.push(SelectProjection::Computed {
                             expr: scalar,
                             alias: alias.value.clone(),
@@ -2283,7 +2271,7 @@ fn validate_check_constraint(
                     sqlparser::ast::FunctionArgExpr::Expr(expr),
                 ) = arg
                 {
-                    validate_check_constraint(&expr, table_name, column_names)?;
+                    validate_check_constraint(expr, table_name, column_names)?;
                 }
             }
         }
@@ -2380,16 +2368,16 @@ fn validate_check_constraint(
         }
         // Binary operations - recursively validate both sides
         SqlExpr::BinaryOp { left, right, .. } => {
-            validate_check_constraint(&left, table_name, column_names)?;
-            validate_check_constraint(&right, table_name, column_names)?;
+            validate_check_constraint(left, table_name, column_names)?;
+            validate_check_constraint(right, table_name, column_names)?;
         }
         // Unary operations - validate the operand
         SqlExpr::UnaryOp { expr, .. } => {
-            validate_check_constraint(&expr, table_name, column_names)?;
+            validate_check_constraint(expr, table_name, column_names)?;
         }
         // Nested expressions
         SqlExpr::Nested(expr) => {
-            validate_check_constraint(&expr, table_name, column_names)?;
+            validate_check_constraint(expr, table_name, column_names)?;
         }
         // Literals and other safe expressions are allowed
         SqlExpr::Value(_) | SqlExpr::TypedString { .. } => {}
@@ -2493,17 +2481,15 @@ fn validate_projection_alias_qualifiers(
     for item in projection_items {
         match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                if let SqlExpr::CompoundIdentifier(parts) = expr {
-                    if parts.len() >= 2 {
-                        if let Some(first) = parts.first() {
-                            if !first.value.eq_ignore_ascii_case(&alias_lower) {
-                                return Err(Error::InvalidArgumentError(format!(
-                                    "Binder Error: table '{}' not found",
-                                    first.value
-                                )));
-                            }
-                        }
-                    }
+                if let SqlExpr::CompoundIdentifier(parts) = expr
+                    && parts.len() >= 2
+                    && let Some(first) = parts.first()
+                    && !first.value.eq_ignore_ascii_case(&alias_lower)
+                {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Binder Error: table '{}' not found",
+                        first.value
+                    )));
                 }
             }
             _ => {}
@@ -2716,13 +2702,9 @@ fn translate_condition_with_context(
             | BinaryOperator::Lt
             | BinaryOperator::LtEq
             | BinaryOperator::Gt
-            | BinaryOperator::GtEq => translate_comparison_with_context(
-                resolver,
-                context,
-                left,
-                op.clone(),
-                right,
-            ),
+            | BinaryOperator::GtEq => {
+                translate_comparison_with_context(resolver, context, left, op.clone(), right)
+            }
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported binary operator in WHERE clause: {other:?}"
             ))),
@@ -2730,9 +2712,9 @@ fn translate_condition_with_context(
         SqlExpr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
-        } => Ok(llkv_expr::expr::Expr::not(translate_condition_with_context(
-            resolver, context, expr,
-        )?)),
+        } => Ok(llkv_expr::expr::Expr::not(
+            translate_condition_with_context(resolver, context, expr)?,
+        )),
         SqlExpr::Nested(inner) => translate_condition_with_context(resolver, context, inner),
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported WHERE clause: {other:?}"
@@ -3035,12 +3017,11 @@ fn arrow_type_from_sql(data_type: &SqlDataType) -> SqlResult<arrow::datatypes::D
             "BOOLEAN columns are not supported yet".into(),
         )),
         SqlDataType::Custom(name, args) => {
-            if name.0.len() == 1 {
-                if let ObjectNamePart::Identifier(ident) = &name.0[0] {
-                    if ident.value.eq_ignore_ascii_case("row") {
-                        return row_type_to_arrow(data_type, args);
-                    }
-                }
+            if name.0.len() == 1
+                && let ObjectNamePart::Identifier(ident) = &name.0[0]
+                && ident.value.eq_ignore_ascii_case("row")
+            {
+                return row_type_to_arrow(data_type, args);
             }
             Err(Error::InvalidArgumentError(format!(
                 "unsupported SQL data type: {data_type:?}"
@@ -3214,7 +3195,7 @@ fn parse_sql_data_type(type_str: &str, dialect: &GenericDialect) -> SqlResult<Sq
     match stmt {
         Statement::CreateTable(table) => table
             .columns
-            .get(0)
+            .first()
             .map(|col| col.data_type.clone())
             .ok_or_else(|| {
                 Error::InvalidArgumentError(format!(

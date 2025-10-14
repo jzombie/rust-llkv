@@ -923,11 +923,18 @@ where
                                                 Error::Internal("missing dtype for column".into())
                                             })?
                                         }
-                                        ScalarExpr::GetField { base: inner_base, field_name: inner_field } => {
-                                            get_field_dtype(inner_base, inner_field, table_id, lfid_dtypes)?
-                                        }
+                                        ScalarExpr::GetField {
+                                            base: inner_base,
+                                            field_name: inner_field,
+                                        } => get_field_dtype(
+                                            inner_base,
+                                            inner_field,
+                                            table_id,
+                                            lfid_dtypes,
+                                        )?,
                                         _ => return Err(Error::InvalidArgumentError(
-                                            "GetField base must be a column or another GetField".into()
+                                            "GetField base must be a column or another GetField"
+                                                .into(),
                                         )),
                                     };
 
@@ -936,17 +943,25 @@ where
                                             .iter()
                                             .find(|f| f.name() == field_name)
                                             .map(|f| f.data_type().clone())
-                                            .ok_or_else(|| Error::InvalidArgumentError(
-                                                format!("Field '{}' not found in struct", field_name)
-                                            ))
+                                            .ok_or_else(|| {
+                                                Error::InvalidArgumentError(format!(
+                                                    "Field '{}' not found in struct",
+                                                    field_name
+                                                ))
+                                            })
                                     } else {
                                         Err(Error::InvalidArgumentError(
-                                            "GetField can only be applied to struct types".into()
+                                            "GetField can only be applied to struct types".into(),
                                         ))
                                     }
                                 }
 
-                                get_field_dtype(base, field_name, self.table.table_id(), &lfid_dtypes)?
+                                get_field_dtype(
+                                    base,
+                                    field_name,
+                                    self.table.table_id(),
+                                    &lfid_dtypes,
+                                )?
                             }
                         };
                         schema_fields.push(Field::new(info.alias.clone(), dtype, true));
@@ -2053,12 +2068,12 @@ fn synthesize_computed_literal_array(
             // Convert each field to an array
             let mut field_arrays = Vec::new();
             let mut arrow_fields = Vec::new();
-            
+
             for (field_name, field_literal) in fields {
                 // Infer the proper data type from the literal
                 let field_dtype = infer_literal_datatype(field_literal.as_ref())?;
                 arrow_fields.push(Field::new(field_name.clone(), field_dtype.clone(), true));
-                
+
                 // Create the array for this field
                 let field_array = match field_literal.as_ref() {
                     Literal::Integer(v) => {
@@ -2081,21 +2096,23 @@ fn synthesize_computed_literal_array(
                         synthesize_computed_literal_array(&nested_info, &field_dtype, row_count)?
                     }
                 };
-                
+
                 field_arrays.push(field_array);
             }
-            
+
             let struct_array = StructArray::try_new(
                 arrow_fields.into(),
                 field_arrays,
                 None, // No null buffer
-            ).map_err(|e| Error::Internal(format!("failed to create struct array: {}", e)))?;
-            
+            )
+            .map_err(|e| Error::Internal(format!("failed to create struct array: {}", e)))?;
+
             Ok(Arc::new(struct_array) as ArrayRef)
         }
-        ScalarExpr::Column(_) | ScalarExpr::Binary { .. } | ScalarExpr::Aggregate(_) | ScalarExpr::GetField { .. } => {
-            Ok(new_null_array(data_type, row_count))
-        }
+        ScalarExpr::Column(_)
+        | ScalarExpr::Binary { .. }
+        | ScalarExpr::Aggregate(_)
+        | ScalarExpr::GetField { .. } => Ok(new_null_array(data_type, row_count)),
     }
 }
 
@@ -2221,11 +2238,9 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
             format_scalar_expr(right)
         ),
         ScalarExpr::Aggregate(agg) => format!("AGG({:?})", agg),
-        ScalarExpr::GetField { base, field_name } => format!(
-            "{}.{}",
-            format_scalar_expr(base),
-            field_name
-        ),
+        ScalarExpr::GetField { base, field_name } => {
+            format!("{}.{}", format_scalar_expr(base), field_name)
+        }
     }
 }
 

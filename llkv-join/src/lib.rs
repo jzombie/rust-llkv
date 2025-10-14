@@ -199,9 +199,10 @@ impl JoinOptions {
     }
 }
 
+// TODO: Build out more fully or remove
 /// Validate join keys before execution.
 /// Note: Empty keys = cross product (Cartesian product)
-pub fn validate_join_keys(keys: &[JoinKey]) -> LlkvResult<()> {
+pub fn validate_join_keys(_keys: &[JoinKey]) -> LlkvResult<()> {
     // Empty keys is valid for cross product
     Ok(())
 }

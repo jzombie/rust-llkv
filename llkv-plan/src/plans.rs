@@ -274,7 +274,7 @@ impl TableRef {
             table: table.into(),
         }
     }
-    
+
     /// Get fully qualified name as "schema.table"
     pub fn qualified_name(&self) -> String {
         if self.schema.is_empty() {
@@ -313,7 +313,7 @@ impl SelectPlan {
                 vec![TableRef::new("", table_name)]
             }
         };
-        
+
         Self {
             tables,
             projections: Vec::new(),
@@ -322,7 +322,7 @@ impl SelectPlan {
             order_by: None,
         }
     }
-    
+
     /// Create a SelectPlan with multiple tables for cross product/joins.
     pub fn with_tables(tables: Vec<TableRef>) -> Self {
         Self {

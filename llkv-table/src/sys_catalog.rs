@@ -626,11 +626,10 @@ where
         let row_id = schema_name_to_row_id(&canonical);
         let lfid = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_SCHEMA_META_ID);
 
-        let batch = match self.store.gather_rows(
-            &[lfid],
-            &[row_id],
-            GatherNullPolicy::IncludeNulls,
-        ) {
+        let batch = match self
+            .store
+            .gather_rows(&[lfid], &[row_id], GatherNullPolicy::IncludeNulls)
+        {
             Ok(batch) => batch,
             Err(llkv_result::Error::NotFound) => return Ok(None),
             Err(err) => return Err(err),
@@ -741,7 +740,6 @@ fn schema_name_to_row_id(canonical_name: &str) -> u64 {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
-
 
     // Use high bit to avoid collision with reserved catalog row IDs (0-3) and table metadata rows
     hash | (1u64 << 63)

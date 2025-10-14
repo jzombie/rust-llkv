@@ -189,19 +189,21 @@ impl TableNameKey {
         }
     }
 
-    fn to_string(&self) -> String {
-        match &self.schema {
-            Some(schema) => format!("{schema}.{}", self.table),
-            None => self.table.clone(),
-        }
-    }
-
     fn schema(&self) -> Option<&str> {
         self.schema.as_deref()
     }
 
     fn table(&self) -> &str {
         &self.table
+    }
+}
+
+impl fmt::Display for TableNameKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.schema {
+            Some(schema) => write!(f, "{schema}.{}", self.table),
+            None => write!(f, "{}", self.table),
+        }
     }
 }
 
@@ -280,17 +282,13 @@ struct TableMetadata {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TableMetadataView {
-    display_name: QualifiedTableName,
     canonical_name: TableNameKey,
-    field_resolver: FieldResolver,
 }
 
 impl TableMetadata {
     fn to_view(&self) -> TableMetadataView {
         TableMetadataView {
-            display_name: self.display_name.clone(),
             canonical_name: self.canonical_name.clone(),
-            field_resolver: self.field_resolver.clone(),
         }
     }
 }
@@ -805,10 +803,7 @@ impl TableCatalogSnapshot {
 
     /// Get all table names in this snapshot.
     pub fn table_names(&self) -> Vec<String> {
-        self.table_ids
-            .keys()
-            .map(TableNameKey::to_string)
-            .collect()
+        self.table_ids.keys().map(TableNameKey::to_string).collect()
     }
 
     /// Get the number of tables in this snapshot.
@@ -899,15 +894,12 @@ impl<'a> IdentifierResolver<'a> {
         }
 
         let table_id = context.default_table_id().unwrap();
-        let table_meta = self
-            .catalog
-            .table_metadata_view(table_id)
-            .ok_or_else(|| {
-                Error::CatalogError(format!(
-                    "Catalog Error: table id {} is not registered",
-                    table_id
-                ))
-            })?;
+        let table_meta = self.catalog.table_metadata_view(table_id).ok_or_else(|| {
+            Error::CatalogError(format!(
+                "Catalog Error: table id {} is not registered",
+                table_id
+            ))
+        })?;
 
         let canonical_table = table_meta.canonical_name.table().to_string();
         let canonical_schema = table_meta.canonical_name.schema().map(str::to_string);
@@ -917,19 +909,18 @@ impl<'a> IdentifierResolver<'a> {
         let mut column_start_idx = 0usize;
 
         if let Some(schema) = canonical_schema.as_deref() {
+            let schema_then_table = canonical_parts.len() == 2
+                && canonical_parts[0] == schema
+                && canonical_parts[1] == canonical_table;
+            let starts_with_table =
+                canonical_parts.len() >= 2 && canonical_parts[0] == canonical_table;
+
             if canonical_parts.len() >= 3
                 && canonical_parts[0] == schema
                 && canonical_parts[1] == canonical_table
             {
                 column_start_idx = 2;
-            } else if canonical_parts.len() == 2
-                && canonical_parts[0] == schema
-                && canonical_parts[1] == canonical_table
-            {
-                column_start_idx = 1;
-            } else if canonical_parts.len() >= 2
-                && canonical_parts[0] == canonical_table
-            {
+            } else if schema_then_table || starts_with_table {
                 column_start_idx = 1;
             } else if canonical_parts.len() >= 3 && canonical_parts[1] == canonical_table {
                 return Err(Error::InvalidArgumentError(format!(
@@ -1002,7 +993,6 @@ impl FieldDefinition {
     pub fn constraints(&self) -> &FieldConstraints {
         &self.constraints
     }
-
 }
 
 impl From<&str> for FieldDefinition {
@@ -1130,7 +1120,9 @@ impl FieldResolver {
             .checked_add(1)
             .ok_or_else(|| Error::Internal("FieldId overflow".to_string()))?;
 
-        inner.field_name_to_id.insert(canonical_name.clone(), field_id);
+        inner
+            .field_name_to_id
+            .insert(canonical_name.clone(), field_id);
         inner.field_id_to_meta.insert(
             field_id,
             FieldMetadata {

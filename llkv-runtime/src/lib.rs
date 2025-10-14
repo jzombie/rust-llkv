@@ -1193,18 +1193,26 @@ where
         let (exists, is_dropped) = {
             let tables = self.tables.read().unwrap();
             let in_cache = tables.contains_key(&canonical_name);
-            let is_dropped = self.dropped_tables.read().unwrap().contains(&canonical_name);
+            let is_dropped = self
+                .dropped_tables
+                .read()
+                .unwrap()
+                .contains(&canonical_name);
             // Table exists if it's in cache and NOT marked as dropped
             (in_cache && !is_dropped, is_dropped)
         };
-        tracing::trace!("DEBUG create_table_plan: exists={}, is_dropped={}", exists, is_dropped);
-        
+        tracing::trace!(
+            "DEBUG create_table_plan: exists={}, is_dropped={}",
+            exists,
+            is_dropped
+        );
+
         // If table was dropped, remove it from cache before creating new one
         if is_dropped {
             self.remove_table_entry(&canonical_name);
             self.dropped_tables.write().unwrap().remove(&canonical_name);
         }
-        
+
         if exists {
             if plan.or_replace {
                 tracing::trace!(
@@ -1575,7 +1583,7 @@ where
             let executor = QueryExecutor::new(provider);
             return executor.execute_select(plan);
         }
-        
+
         // Resolve canonical names for all tables (don't verify existence yet - let executor do it)
         let mut canonical_tables = Vec::new();
         for table_ref in &plan.tables {
@@ -1590,10 +1598,10 @@ where
             };
             canonical_tables.push(canon_ref);
         }
-        
+
         let mut canonical_plan = plan.clone();
         canonical_plan.tables = canonical_tables;
-        
+
         let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
             context: Arc::clone(self),
         });
@@ -1615,7 +1623,7 @@ where
             // No row filter needed since there's no table
             return executor.execute_select_with_filter(plan, None);
         }
-        
+
         // Resolve canonical names for all tables (don't verify existence - executor will handle it with snapshot)
         let mut canonical_tables = Vec::new();
         for table_ref in &plan.tables {
@@ -1630,15 +1638,15 @@ where
             };
             canonical_tables.push(canon_ref);
         }
-        
+
         let mut canonical_plan = plan.clone();
         canonical_plan.tables = canonical_tables;
-        
+
         let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
             context: Arc::clone(self),
         });
         let executor = QueryExecutor::new(provider);
-        
+
         // For single-table queries, apply MVCC filtering
         let row_filter: Option<Arc<dyn RowIdFilter<P>>> = if canonical_plan.tables.len() == 1 {
             Some(Arc::new(MvccRowIdFilter::new(
@@ -1649,7 +1657,7 @@ where
             // For multi-table queries, we don't apply MVCC filtering yet (TODO)
             None
         };
-        
+
         executor.execute_select_with_filter(canonical_plan, row_filter)
     }
 
@@ -1818,9 +1826,11 @@ where
             FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
         for (idx, field) in schema.fields().iter().enumerate() {
             let data_type = match field.data_type() {
-                DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Date32 | DataType::Struct(_) => {
-                    field.data_type().clone()
-                }
+                DataType::Int64
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::Date32
+                | DataType::Struct(_) => field.data_type().clone(),
                 other => {
                     return Err(Error::InvalidArgumentError(format!(
                         "unsupported column type in CTAS result: {other:?}"
@@ -2022,11 +2032,12 @@ where
             for (col_idx, column, check_expr_str) in &check_columns {
                 // Parse the CHECK expression
                 let sql = format!("SELECT {}", check_expr_str);
-                let ast = Parser::parse_sql(&dialect, &sql)
-                    .map_err(|e| Error::InvalidArgumentError(format!(
+                let ast = Parser::parse_sql(&dialect, &sql).map_err(|e| {
+                    Error::InvalidArgumentError(format!(
                         "Failed to parse CHECK expression '{}': {}",
                         check_expr_str, e
-                    )))?;
+                    ))
+                })?;
 
                 let stmt = ast.into_iter().next().ok_or_else(|| {
                     Error::InvalidArgumentError(format!(
@@ -2037,19 +2048,23 @@ where
 
                 let select = match stmt {
                     sqlparser::ast::Statement::Query(q) => q,
-                    _ => return Err(Error::InvalidArgumentError(format!(
-                        "CHECK expression '{}' did not parse as SELECT",
-                        check_expr_str
-                    ))),
+                    _ => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "CHECK expression '{}' did not parse as SELECT",
+                            check_expr_str
+                        )));
+                    }
                 };
 
                 // Extract the expression from SELECT
                 let body = match *select.body {
                     sqlparser::ast::SetExpr::Select(s) => s,
-                    _ => return Err(Error::InvalidArgumentError(format!(
-                        "CHECK expression '{}' is not a simple SELECT",
-                        check_expr_str
-                    ))),
+                    _ => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "CHECK expression '{}' is not a simple SELECT",
+                            check_expr_str
+                        )));
+                    }
                 };
 
                 if body.projection.len() != 1 {
@@ -2060,15 +2075,18 @@ where
                 }
 
                 let expr = match &body.projection[0] {
-                    sqlparser::ast::SelectItem::UnnamedExpr(e) | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => e,
-                    _ => return Err(Error::InvalidArgumentError(format!(
-                        "CHECK expression '{}' projection is not a simple expression",
-                        check_expr_str
-                    ))),
+                    sqlparser::ast::SelectItem::UnnamedExpr(e)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => e,
+                    _ => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "CHECK expression '{}' projection is not a simple expression",
+                            check_expr_str
+                        )));
+                    }
                 };
 
                 // Evaluate the expression against this row
-                let result = self.evaluate_check_expression(
+                let result = Self::evaluate_check_expression(
                     expr,
                     row,
                     column_order,
@@ -2090,7 +2108,6 @@ where
     }
 
     fn evaluate_check_expression(
-        &self,
         expr: &sqlparser::ast::Expr,
         row: &[PlanValue],
         column_order: &[usize],
@@ -2102,74 +2119,86 @@ where
 
         match expr {
             SqlExpr::BinaryOp { left, op, right } => {
-                let left_val = self.evaluate_check_expr_value(left, row, column_order, table)?;
-                let right_val = self.evaluate_check_expr_value(right, row, column_order, table)?;
+                let left_val = Self::evaluate_check_expr_value(left, row, column_order, table)?;
+                let right_val = Self::evaluate_check_expr_value(right, row, column_order, table)?;
 
                 use sqlparser::ast::BinaryOperator;
                 match op {
                     BinaryOperator::Eq => {
                         // NULL = anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
-                            return Ok(true);  // Unknown = pass CHECK
+                        if matches!(left_val, PlanValue::Null)
+                            || matches!(right_val, PlanValue::Null)
+                        {
+                            return Ok(true); // Unknown = pass CHECK
                         }
                         Ok(left_val == right_val)
                     }
                     BinaryOperator::NotEq => {
                         // NULL != anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
-                            return Ok(true);  // Unknown = pass CHECK
+                        if matches!(left_val, PlanValue::Null)
+                            || matches!(right_val, PlanValue::Null)
+                        {
+                            return Ok(true); // Unknown = pass CHECK
                         }
                         Ok(left_val != right_val)
                     }
                     BinaryOperator::Lt => {
                         // NULL < anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
-                            return Ok(true);  // Unknown = pass CHECK
+                        if matches!(left_val, PlanValue::Null)
+                            || matches!(right_val, PlanValue::Null)
+                        {
+                            return Ok(true); // Unknown = pass CHECK
                         }
                         match (left_val, right_val) {
                             (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l < r),
                             (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l < r),
                             _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint < operator requires numeric values".into()
+                                "CHECK constraint < operator requires numeric values".into(),
                             )),
                         }
                     }
                     BinaryOperator::LtEq => {
                         // NULL <= anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
-                            return Ok(true);  // Unknown = pass CHECK
+                        if matches!(left_val, PlanValue::Null)
+                            || matches!(right_val, PlanValue::Null)
+                        {
+                            return Ok(true); // Unknown = pass CHECK
                         }
                         match (left_val, right_val) {
                             (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l <= r),
                             (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l <= r),
                             _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint <= operator requires numeric values".into()
+                                "CHECK constraint <= operator requires numeric values".into(),
                             )),
                         }
                     }
                     BinaryOperator::Gt => {
                         // NULL > anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
-                            return Ok(true);  // Unknown = pass CHECK
+                        if matches!(left_val, PlanValue::Null)
+                            || matches!(right_val, PlanValue::Null)
+                        {
+                            return Ok(true); // Unknown = pass CHECK
                         }
                         match (left_val, right_val) {
                             (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l > r),
                             (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l > r),
                             _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint > operator requires numeric values".into()
+                                "CHECK constraint > operator requires numeric values".into(),
                             )),
                         }
                     }
                     BinaryOperator::GtEq => {
                         // NULL >= anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
-                            return Ok(true);  // Unknown = pass CHECK
+                        if matches!(left_val, PlanValue::Null)
+                            || matches!(right_val, PlanValue::Null)
+                        {
+                            return Ok(true); // Unknown = pass CHECK
                         }
                         match (left_val, right_val) {
                             (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l >= r),
                             (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l >= r),
                             _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint >= operator requires numeric values".into()
+                                "CHECK constraint >= operator requires numeric values".into(),
                             )),
                         }
                     }
@@ -2187,7 +2216,6 @@ where
     }
 
     fn evaluate_check_expr_value(
-        &self,
         expr: &sqlparser::ast::Expr,
         row: &[PlanValue],
         column_order: &[usize],
@@ -2198,83 +2226,101 @@ where
         match expr {
             SqlExpr::BinaryOp { left, op, right } => {
                 // Handle arithmetic operations in CHECK expressions (e.g., i + j)
-                let left_val = self.evaluate_check_expr_value(left, row, column_order, table)?;
-                let right_val = self.evaluate_check_expr_value(right, row, column_order, table)?;
+                let left_val = Self::evaluate_check_expr_value(left, row, column_order, table)?;
+                let right_val = Self::evaluate_check_expr_value(right, row, column_order, table)?;
 
                 use sqlparser::ast::BinaryOperator;
                 match op {
-                    BinaryOperator::Plus => {
-                        match (left_val, right_val) {
-                            (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
-                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(PlanValue::Integer(l + r)),
-                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l + r)),
-                            (PlanValue::Integer(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l as f64 + r)),
-                            (PlanValue::Float(l), PlanValue::Integer(r)) => Ok(PlanValue::Float(l + r as f64)),
-                            _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint + operator requires numeric values".into()
-                            )),
+                    BinaryOperator::Plus => match (left_val, right_val) {
+                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
+                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
+                            Ok(PlanValue::Integer(l + r))
                         }
-                    }
-                    BinaryOperator::Minus => {
-                        match (left_val, right_val) {
-                            (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
-                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(PlanValue::Integer(l - r)),
-                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l - r)),
-                            (PlanValue::Integer(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l as f64 - r)),
-                            (PlanValue::Float(l), PlanValue::Integer(r)) => Ok(PlanValue::Float(l - r as f64)),
-                            _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint - operator requires numeric values".into()
-                            )),
+                        (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l + r)),
+                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
+                            Ok(PlanValue::Float(l as f64 + r))
                         }
-                    }
-                    BinaryOperator::Multiply => {
-                        match (left_val, right_val) {
-                            (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
-                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(PlanValue::Integer(l * r)),
-                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l * r)),
-                            (PlanValue::Integer(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l as f64 * r)),
-                            (PlanValue::Float(l), PlanValue::Integer(r)) => Ok(PlanValue::Float(l * r as f64)),
-                            _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint * operator requires numeric values".into()
-                            )),
+                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
+                            Ok(PlanValue::Float(l + r as f64))
                         }
-                    }
-                    BinaryOperator::Divide => {
-                        match (left_val, right_val) {
-                            (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
-                            (PlanValue::Integer(l), PlanValue::Integer(r)) => {
-                                if r == 0 {
-                                    Err(Error::InvalidArgumentError("Division by zero in CHECK constraint".into()))
-                                } else {
-                                    Ok(PlanValue::Integer(l / r))
-                                }
-                            }
-                            (PlanValue::Float(l), PlanValue::Float(r)) => {
-                                if r == 0.0 {
-                                    Err(Error::InvalidArgumentError("Division by zero in CHECK constraint".into()))
-                                } else {
-                                    Ok(PlanValue::Float(l / r))
-                                }
-                            }
-                            (PlanValue::Integer(l), PlanValue::Float(r)) => {
-                                if r == 0.0 {
-                                    Err(Error::InvalidArgumentError("Division by zero in CHECK constraint".into()))
-                                } else {
-                                    Ok(PlanValue::Float(l as f64 / r))
-                                }
-                            }
-                            (PlanValue::Float(l), PlanValue::Integer(r)) => {
-                                if r == 0 {
-                                    Err(Error::InvalidArgumentError("Division by zero in CHECK constraint".into()))
-                                } else {
-                                    Ok(PlanValue::Float(l / r as f64))
-                                }
-                            }
-                            _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint / operator requires numeric values".into()
-                            )),
+                        _ => Err(Error::InvalidArgumentError(
+                            "CHECK constraint + operator requires numeric values".into(),
+                        )),
+                    },
+                    BinaryOperator::Minus => match (left_val, right_val) {
+                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
+                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
+                            Ok(PlanValue::Integer(l - r))
                         }
-                    }
+                        (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l - r)),
+                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
+                            Ok(PlanValue::Float(l as f64 - r))
+                        }
+                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
+                            Ok(PlanValue::Float(l - r as f64))
+                        }
+                        _ => Err(Error::InvalidArgumentError(
+                            "CHECK constraint - operator requires numeric values".into(),
+                        )),
+                    },
+                    BinaryOperator::Multiply => match (left_val, right_val) {
+                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
+                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
+                            Ok(PlanValue::Integer(l * r))
+                        }
+                        (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l * r)),
+                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
+                            Ok(PlanValue::Float(l as f64 * r))
+                        }
+                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
+                            Ok(PlanValue::Float(l * r as f64))
+                        }
+                        _ => Err(Error::InvalidArgumentError(
+                            "CHECK constraint * operator requires numeric values".into(),
+                        )),
+                    },
+                    BinaryOperator::Divide => match (left_val, right_val) {
+                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
+                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
+                            if r == 0 {
+                                Err(Error::InvalidArgumentError(
+                                    "Division by zero in CHECK constraint".into(),
+                                ))
+                            } else {
+                                Ok(PlanValue::Integer(l / r))
+                            }
+                        }
+                        (PlanValue::Float(l), PlanValue::Float(r)) => {
+                            if r == 0.0 {
+                                Err(Error::InvalidArgumentError(
+                                    "Division by zero in CHECK constraint".into(),
+                                ))
+                            } else {
+                                Ok(PlanValue::Float(l / r))
+                            }
+                        }
+                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
+                            if r == 0.0 {
+                                Err(Error::InvalidArgumentError(
+                                    "Division by zero in CHECK constraint".into(),
+                                ))
+                            } else {
+                                Ok(PlanValue::Float(l as f64 / r))
+                            }
+                        }
+                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
+                            if r == 0 {
+                                Err(Error::InvalidArgumentError(
+                                    "Division by zero in CHECK constraint".into(),
+                                ))
+                            } else {
+                                Ok(PlanValue::Float(l / r as f64))
+                            }
+                        }
+                        _ => Err(Error::InvalidArgumentError(
+                            "CHECK constraint / operator requires numeric values".into(),
+                        )),
+                    },
                     _ => Err(Error::InvalidArgumentError(format!(
                         "Unsupported binary operator in CHECK constraint value expression: {:?}",
                         op
@@ -2340,18 +2386,16 @@ where
 
                     // Extract struct field
                     match &row[insert_pos] {
-                        PlanValue::Struct(fields) => {
-                            fields
-                                .iter()
-                                .find(|(name, _)| name.eq_ignore_ascii_case(field_name))
-                                .map(|(_, val)| val.clone())
-                                .ok_or_else(|| {
-                                    Error::InvalidArgumentError(format!(
-                                        "Struct field '{}' not found in column '{}'",
-                                        field_name, column_name
-                                    ))
-                                })
-                        }
+                        PlanValue::Struct(fields) => fields
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(field_name))
+                            .map(|(_, val)| val.clone())
+                            .ok_or_else(|| {
+                                Error::InvalidArgumentError(format!(
+                                    "Struct field '{}' not found in column '{}'",
+                                    field_name, column_name
+                                ))
+                            }),
                         _ => Err(Error::InvalidArgumentError(format!(
                             "Column '{}' is not a struct, cannot access field '{}'",
                             column_name, field_name
@@ -2385,18 +2429,16 @@ where
                         })?;
 
                     match &row[insert_pos] {
-                        PlanValue::Struct(fields) => {
-                            fields
-                                .iter()
-                                .find(|(name, _)| name.eq_ignore_ascii_case(field_name))
-                                .map(|(_, val)| val.clone())
-                                .ok_or_else(|| {
-                                    Error::InvalidArgumentError(format!(
-                                        "Struct field '{}' not found in column '{}'",
-                                        field_name, column_name
-                                    ))
-                                })
-                        }
+                        PlanValue::Struct(fields) => fields
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(field_name))
+                            .map(|(_, val)| val.clone())
+                            .ok_or_else(|| {
+                                Error::InvalidArgumentError(format!(
+                                    "Struct field '{}' not found in column '{}'",
+                                    field_name, column_name
+                                ))
+                            }),
                         _ => Err(Error::InvalidArgumentError(format!(
                             "Column '{}' is not a struct, cannot access field '{}'",
                             column_name, field_name
@@ -3458,7 +3500,10 @@ where
             canonical_name
         );
 
-        self.dropped_tables.write().unwrap().insert(canonical_name.clone());
+        self.dropped_tables
+            .write()
+            .unwrap()
+            .insert(canonical_name.clone());
         Ok(())
     }
 
@@ -3922,10 +3967,12 @@ pub fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> Re
     let mut resolved = Vec::with_capacity(columns.len());
     for column in columns {
         let normalized = column.to_ascii_lowercase();
-        let index = schema
-            .lookup
-            .get(&normalized)
-            .ok_or_else(|| Error::InvalidArgumentError(format!("Binder Error: does not have a column named '{}'", column)))?;
+        let index = schema.lookup.get(&normalized).ok_or_else(|| {
+            Error::InvalidArgumentError(format!(
+                "Binder Error: does not have a column named '{}'",
+                column
+            ))
+        })?;
         resolved.push(*index);
     }
     Ok(resolved)
@@ -4011,17 +4058,18 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
         DataType::Struct(fields) => {
             use arrow::array::StructArray;
             let mut field_arrays: Vec<(FieldRef, ArrayRef)> = Vec::with_capacity(fields.len());
-            
+
             for field in fields.iter() {
                 let field_name = field.name();
                 let field_type = field.data_type();
                 let mut field_values = Vec::with_capacity(values.len());
-                
+
                 for value in values {
                     match value {
                         PlanValue::Null => field_values.push(PlanValue::Null),
                         PlanValue::Struct(map) => {
-                            let field_value = map.get(field_name).cloned().unwrap_or(PlanValue::Null);
+                            let field_value =
+                                map.get(field_name).cloned().unwrap_or(PlanValue::Null);
                             field_values.push(field_value);
                         }
                         _ => {
@@ -4032,11 +4080,11 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                         }
                     }
                 }
-                
+
                 let field_array = build_array_for_column(field_type, &field_values)?;
                 field_arrays.push((Arc::clone(field), field_array));
             }
-            
+
             Ok(Arc::new(StructArray::from(field_arrays)))
         }
         other => Err(Error::InvalidArgumentError(format!(
@@ -4110,7 +4158,9 @@ fn resolve_field_id_from_schema(schema: &ExecutorSchema, name: &str) -> Result<F
         .resolve(name)
         .map(|column| column.field_id)
         .ok_or_else(|| {
-            Error::InvalidArgumentError(format!("Binder Error: does not have a column named '{name}'"))
+            Error::InvalidArgumentError(format!(
+                "Binder Error: does not have a column named '{name}'"
+            ))
         })
 }
 
@@ -4227,11 +4277,9 @@ fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
         } => match plan_value_from_sql_expr(expr)? {
             PlanValue::Integer(v) => Ok(PlanValue::Integer(-v)),
             PlanValue::Float(v) => Ok(PlanValue::Float(-v)),
-            PlanValue::Null | PlanValue::String(_) | PlanValue::Struct(_) => {
-                Err(Error::InvalidArgumentError(
-                    "cannot negate non-numeric literal".into(),
-                ))
-            }
+            PlanValue::Null | PlanValue::String(_) | PlanValue::Struct(_) => Err(
+                Error::InvalidArgumentError("cannot negate non-numeric literal".into()),
+            ),
         },
         SqlExpr::UnaryOp {
             op: UnaryOperator::Plus,

@@ -638,7 +638,6 @@ where
                         allow_missing,
                     ),
                     DataType::Struct(_) => Self::gather_rows_from_chunks_struct(
-                        row_ids,
                         row_locator,
                         len,
                         &plan.candidate_indices,
@@ -890,7 +889,7 @@ where
     ) -> Result<ArrayRef> {
         use arrow::array::StructArray;
         use arrow::compute;
-        
+
         if len == 0 {
             // Create an empty struct array with the correct schema
             if let DataType::Struct(fields) = dtype {
@@ -898,8 +897,10 @@ where
                     .iter()
                     .map(|f| arrow::array::new_empty_array(f.data_type()))
                     .collect();
-                let empty = StructArray::try_new(fields.clone(), empty_columns, None)
-                    .map_err(|e| Error::Internal(format!("failed to create empty struct: {}", e)))?;
+                let empty =
+                    StructArray::try_new(fields.clone(), empty_columns, None).map_err(|e| {
+                        Error::Internal(format!("failed to create empty struct: {}", e))
+                    })?;
                 return Ok(Arc::new(empty) as ArrayRef);
             }
             return Err(Error::Internal("expected Struct dtype".into()));
@@ -908,7 +909,7 @@ where
         // Collect all struct arrays from chunks
         let mut all_structs = Vec::new();
         let mut all_row_ids = Vec::new();
-        
+
         for &idx in &plan.candidate_indices {
             let value_chunk = chunk_blobs
                 .remove(&plan.value_metas[idx].chunk_pk)
@@ -922,7 +923,7 @@ where
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| Error::Internal("gather_rows_struct: dtype mismatch".into()))?;
-            
+
             let row_any = deserialize_array(row_chunk)?;
             let row_arr = row_any
                 .as_any()
@@ -947,7 +948,7 @@ where
         // Build indices array for taking from the appropriate chunks
         let mut take_indices = vec![None; len];
         let mut found = vec![false; len];
-        
+
         for (row_id, &out_idx) in row_index {
             if let Some(&(chunk_idx, pos)) = row_to_chunk_pos.get(row_id) {
                 // We need to map this to a global index across all chunks
@@ -991,7 +992,7 @@ where
         // Use Arrow's take to gather the rows
         let indices = UInt64Array::from(global_indices);
         let result = compute::take(concat_struct, &indices, None)?;
-        
+
         Ok(result)
     }
 
@@ -1526,7 +1527,6 @@ where
 
     #[allow(clippy::too_many_arguments)] // TODO: Refactor
     fn gather_rows_from_chunks_struct(
-        row_ids: &[u64],
         row_locator: RowLocator,
         len: usize,
         candidate_indices: &[usize],
@@ -1538,15 +1538,17 @@ where
     ) -> Result<ArrayRef> {
         use arrow::array::StructArray;
         use arrow::compute;
-        
+
         if len == 0 {
             if let DataType::Struct(fields) = dtype {
                 let empty_columns: Vec<ArrayRef> = fields
                     .iter()
                     .map(|f| arrow::array::new_empty_array(f.data_type()))
                     .collect();
-                let empty = StructArray::try_new(fields.clone(), empty_columns, None)
-                    .map_err(|e| Error::Internal(format!("failed to create empty struct: {}", e)))?;
+                let empty =
+                    StructArray::try_new(fields.clone(), empty_columns, None).map_err(|e| {
+                        Error::Internal(format!("failed to create empty struct: {}", e))
+                    })?;
                 return Ok(Arc::new(empty) as ArrayRef);
             }
             return Err(Error::Internal("expected Struct dtype".into()));
@@ -1612,7 +1614,10 @@ where
             if let Some((chunk_idx, value_idx)) = row_scratch_item {
                 for (cand_chunk_idx, _, _) in &candidates {
                     if *cand_chunk_idx == *chunk_idx {
-                        chunk_takes.get_mut(cand_chunk_idx).unwrap().push(Some(*value_idx as u64));
+                        chunk_takes
+                            .get_mut(cand_chunk_idx)
+                            .unwrap()
+                            .push(Some(*value_idx as u64));
                     } else {
                         chunk_takes.get_mut(cand_chunk_idx).unwrap().push(None);
                     }
@@ -1645,13 +1650,15 @@ where
                     .iter()
                     .map(|f| arrow::array::new_empty_array(f.data_type()))
                     .collect();
-                let empty = StructArray::try_new(fields.clone(), empty_columns, None)
-                    .map_err(|e| Error::Internal(format!("failed to create empty struct: {}", e)))?;
+                let empty =
+                    StructArray::try_new(fields.clone(), empty_columns, None).map_err(|e| {
+                        Error::Internal(format!("failed to create empty struct: {}", e))
+                    })?;
                 return Ok(Arc::new(empty) as ArrayRef);
             }
             return Err(Error::Internal("no results for struct gather".into()));
         }
-        
+
         // For now, just return the first result if we have overlapping chunks
         // This is a simplification - in practice we'd need to merge properly
         Ok(results.into_iter().next().unwrap())

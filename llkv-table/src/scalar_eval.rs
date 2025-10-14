@@ -355,9 +355,10 @@ impl NumericKernels {
     /// Recursively simplify the expression by folding literals and eliminating identity operations.
     pub fn simplify(expr: &ScalarExpr<FieldId>) -> ScalarExpr<FieldId> {
         match expr {
-            ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Aggregate(_) | ScalarExpr::GetField { .. } => {
-                expr.clone()
-            }
+            ScalarExpr::Column(_)
+            | ScalarExpr::Literal(_)
+            | ScalarExpr::Aggregate(_)
+            | ScalarExpr::GetField { .. } => expr.clone(),
             ScalarExpr::Binary { left, op, right } => {
                 let left_s = Self::simplify(left);
                 let right_s = Self::simplify(right);
