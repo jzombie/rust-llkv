@@ -2100,9 +2100,25 @@ where
 
                 use sqlparser::ast::BinaryOperator;
                 match op {
-                    BinaryOperator::Eq => Ok(left_val == right_val),
-                    BinaryOperator::NotEq => Ok(left_val != right_val),
+                    BinaryOperator::Eq => {
+                        // NULL = anything is UNKNOWN, which doesn't violate CHECK
+                        if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
+                            return Ok(true);  // Unknown = pass CHECK
+                        }
+                        Ok(left_val == right_val)
+                    }
+                    BinaryOperator::NotEq => {
+                        // NULL != anything is UNKNOWN, which doesn't violate CHECK
+                        if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
+                            return Ok(true);  // Unknown = pass CHECK
+                        }
+                        Ok(left_val != right_val)
+                    }
                     BinaryOperator::Lt => {
+                        // NULL < anything is UNKNOWN, which doesn't violate CHECK
+                        if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
+                            return Ok(true);  // Unknown = pass CHECK
+                        }
                         match (left_val, right_val) {
                             (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l < r),
                             (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l < r),
@@ -2112,6 +2128,10 @@ where
                         }
                     }
                     BinaryOperator::LtEq => {
+                        // NULL <= anything is UNKNOWN, which doesn't violate CHECK
+                        if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
+                            return Ok(true);  // Unknown = pass CHECK
+                        }
                         match (left_val, right_val) {
                             (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l <= r),
                             (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l <= r),
@@ -2121,6 +2141,10 @@ where
                         }
                     }
                     BinaryOperator::Gt => {
+                        // NULL > anything is UNKNOWN, which doesn't violate CHECK
+                        if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
+                            return Ok(true);  // Unknown = pass CHECK
+                        }
                         match (left_val, right_val) {
                             (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l > r),
                             (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l > r),
@@ -2130,6 +2154,10 @@ where
                         }
                     }
                     BinaryOperator::GtEq => {
+                        // NULL >= anything is UNKNOWN, which doesn't violate CHECK
+                        if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
+                            return Ok(true);  // Unknown = pass CHECK
+                        }
                         match (left_val, right_val) {
                             (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l >= r),
                             (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l >= r),
@@ -2161,6 +2189,91 @@ where
         use sqlparser::ast::Expr as SqlExpr;
 
         match expr {
+            SqlExpr::BinaryOp { left, op, right } => {
+                // Handle arithmetic operations in CHECK expressions (e.g., i + j)
+                let left_val = self.evaluate_check_expr_value(left, row, column_order, table)?;
+                let right_val = self.evaluate_check_expr_value(right, row, column_order, table)?;
+
+                use sqlparser::ast::BinaryOperator;
+                match op {
+                    BinaryOperator::Plus => {
+                        match (left_val, right_val) {
+                            (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
+                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(PlanValue::Integer(l + r)),
+                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l + r)),
+                            (PlanValue::Integer(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l as f64 + r)),
+                            (PlanValue::Float(l), PlanValue::Integer(r)) => Ok(PlanValue::Float(l + r as f64)),
+                            _ => Err(Error::InvalidArgumentError(
+                                "CHECK constraint + operator requires numeric values".into()
+                            )),
+                        }
+                    }
+                    BinaryOperator::Minus => {
+                        match (left_val, right_val) {
+                            (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
+                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(PlanValue::Integer(l - r)),
+                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l - r)),
+                            (PlanValue::Integer(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l as f64 - r)),
+                            (PlanValue::Float(l), PlanValue::Integer(r)) => Ok(PlanValue::Float(l - r as f64)),
+                            _ => Err(Error::InvalidArgumentError(
+                                "CHECK constraint - operator requires numeric values".into()
+                            )),
+                        }
+                    }
+                    BinaryOperator::Multiply => {
+                        match (left_val, right_val) {
+                            (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
+                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(PlanValue::Integer(l * r)),
+                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l * r)),
+                            (PlanValue::Integer(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l as f64 * r)),
+                            (PlanValue::Float(l), PlanValue::Integer(r)) => Ok(PlanValue::Float(l * r as f64)),
+                            _ => Err(Error::InvalidArgumentError(
+                                "CHECK constraint * operator requires numeric values".into()
+                            )),
+                        }
+                    }
+                    BinaryOperator::Divide => {
+                        match (left_val, right_val) {
+                            (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
+                            (PlanValue::Integer(l), PlanValue::Integer(r)) => {
+                                if r == 0 {
+                                    Err(Error::InvalidArgumentError("Division by zero in CHECK constraint".into()))
+                                } else {
+                                    Ok(PlanValue::Integer(l / r))
+                                }
+                            }
+                            (PlanValue::Float(l), PlanValue::Float(r)) => {
+                                if r == 0.0 {
+                                    Err(Error::InvalidArgumentError("Division by zero in CHECK constraint".into()))
+                                } else {
+                                    Ok(PlanValue::Float(l / r))
+                                }
+                            }
+                            (PlanValue::Integer(l), PlanValue::Float(r)) => {
+                                if r == 0.0 {
+                                    Err(Error::InvalidArgumentError("Division by zero in CHECK constraint".into()))
+                                } else {
+                                    Ok(PlanValue::Float(l as f64 / r))
+                                }
+                            }
+                            (PlanValue::Float(l), PlanValue::Integer(r)) => {
+                                if r == 0 {
+                                    Err(Error::InvalidArgumentError("Division by zero in CHECK constraint".into()))
+                                } else {
+                                    Ok(PlanValue::Float(l / r as f64))
+                                }
+                            }
+                            _ => Err(Error::InvalidArgumentError(
+                                "CHECK constraint / operator requires numeric values".into()
+                            )),
+                        }
+                    }
+                    _ => Err(Error::InvalidArgumentError(format!(
+                        "Unsupported binary operator in CHECK constraint value expression: {:?}",
+                        op
+                    ))),
+                }
+            }
             SqlExpr::Identifier(ident) => {
                 // Simple column reference
                 let column_name = &ident.value;
