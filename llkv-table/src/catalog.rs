@@ -1730,7 +1730,7 @@ mod tests {
         assert_eq!(info.field_id, fid);
         assert_eq!(info.display_name, "id");
         assert!(info.constraints.primary_key);
-    assert!(info.constraints.unique);
+        assert!(info.constraints.unique);
 
         let state = resolver.export_state();
         let restored = FieldResolver::from_state(state).unwrap();

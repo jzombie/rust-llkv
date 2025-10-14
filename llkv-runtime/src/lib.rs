@@ -1855,7 +1855,7 @@ where
                 data_type,
                 nullable: field.is_nullable(),
                 primary_key: false, // CTAS does not preserve PRIMARY KEY constraints
-                unique: false, // CTAS does not preserve UNIQUE constraints
+                unique: false,      // CTAS does not preserve UNIQUE constraints
                 field_id: (idx + 1) as FieldId,
                 check_expr: None, // CTAS does not preserve CHECK constraints
             });

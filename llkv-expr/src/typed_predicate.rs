@@ -417,11 +417,9 @@ pub fn build_var_width_predicate(
             pattern: pattern.to_string(),
             case_sensitive: *case_sensitive,
         }),
-        Operator::IsNull | Operator::IsNotNull => Err(
-            PredicateBuildError::UnsupportedOperator(
-                "operator lacks string literal support",
-            ),
-        ),
+        Operator::IsNull | Operator::IsNotNull => Err(PredicateBuildError::UnsupportedOperator(
+            "operator lacks string literal support",
+        )),
     }
 }
 

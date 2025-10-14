@@ -1479,7 +1479,6 @@ where
                         .all(|op| !matches!(op, Operator::IsNull | Operator::IsNotNull));
 
                     if supports_fused && fusion_cache.should_fuse(fid, &dtype) {
-
                         let row_ids = match &dtype {
                             DataType::Utf8 => {
                                 self.collect_matching_row_ids_string_fused::<i32>(filter_lfid, &ops)
@@ -1571,8 +1570,7 @@ where
         match &filter.op {
             Operator::IsNotNull => {
                 let mut cache = FxHashMap::default();
-                let non_null =
-                    self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
+                let non_null = self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
                 tracing::debug!(
                     field = ?filter_lfid,
                     row_count = non_null.len(),
@@ -1586,8 +1584,7 @@ where
                     return Ok(Vec::new());
                 }
                 let mut cache = FxHashMap::default();
-                let non_null =
-                    self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
+                let non_null = self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
                 let null_ids = difference_sorted(all_row_ids, non_null);
                 tracing::debug!(
                     field = ?filter_lfid,

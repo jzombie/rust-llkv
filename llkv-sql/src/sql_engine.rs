@@ -500,9 +500,10 @@ where
                 )
             });
 
-            let has_unique_constraint = column_def.options.iter().any(|opt| {
-                matches!(opt.option, ColumnOption::Unique { .. })
-            });
+            let has_unique_constraint = column_def
+                .options
+                .iter()
+                .any(|opt| matches!(opt.option, ColumnOption::Unique { .. }));
 
             // Extract CHECK constraint if present and validate it
             let check_expr = column_def.options.iter().find_map(|opt| {
@@ -1458,7 +1459,7 @@ where
                 ));
             }
             let order_plan = self.translate_order_by(&resolver, select_context, order_by)?;
-            select_plan = select_plan.with_order_by(Some(order_plan));
+            select_plan = select_plan.with_order_by(order_plan);
         }
         Ok(select_plan)
     }
@@ -1590,7 +1591,7 @@ where
         resolver: &IdentifierResolver<'_>,
         id_context: IdentifierContext,
         order_by: &OrderBy,
-    ) -> SqlResult<OrderByPlan> {
+    ) -> SqlResult<Vec<OrderByPlan>> {
         let exprs = match &order_by.kind {
             OrderByKind::Expressions(exprs) => exprs,
             _ => {
@@ -1600,24 +1601,7 @@ where
             }
         };
 
-        if exprs.len() != 1 {
-            return Err(Error::InvalidArgumentError(
-                "ORDER BY currently supports a single expression".into(),
-            ));
-        }
-
-        let order_expr: &OrderByExpr = &exprs[0];
-        let ascending = order_expr.options.asc.unwrap_or(true);
         let base_nulls_first = self.default_nulls_first.load(AtomicOrdering::Relaxed);
-        let default_nulls_first_for_direction = if ascending {
-            base_nulls_first
-        } else {
-            !base_nulls_first
-        };
-        let nulls_first = order_expr
-            .options
-            .nulls_first
-            .unwrap_or(default_nulls_first_for_direction);
 
         let resolve_simple_column = |expr: &SqlExpr| -> SqlResult<String> {
             let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
@@ -1629,64 +1613,80 @@ where
             }
         };
 
-        let (target, sort_type) = match &order_expr.expr {
-            SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => (
-                OrderTarget::Column(resolve_simple_column(&order_expr.expr)?),
-                OrderSortType::Native,
-            ),
-            SqlExpr::Cast {
-                expr,
-                data_type:
-                    SqlDataType::Int(_)
-                    | SqlDataType::Integer(_)
-                    | SqlDataType::BigInt(_)
-                    | SqlDataType::SmallInt(_)
-                    | SqlDataType::TinyInt(_),
-                ..
-            } => (
-                OrderTarget::Column(resolve_simple_column(expr)?),
-                OrderSortType::CastTextToInteger,
-            ),
-            SqlExpr::Cast { data_type, .. } => {
-                return Err(Error::InvalidArgumentError(format!(
-                    "ORDER BY CAST target type {:?} is not supported",
-                    data_type
-                )));
-            }
-            SqlExpr::Value(value_with_span) => match &value_with_span.value {
-                Value::Number(raw, _) => {
-                    let position: usize = raw.parse().map_err(|_| {
-                        Error::InvalidArgumentError(format!(
-                            "ORDER BY position '{}' is not a valid positive integer",
-                            raw
-                        ))
-                    })?;
-                    if position == 0 {
-                        return Err(Error::InvalidArgumentError(
-                            "ORDER BY position must be at least 1".into(),
-                        ));
-                    }
-                    (OrderTarget::Index(position - 1), OrderSortType::Native)
-                }
-                other => {
+        let mut plans = Vec::with_capacity(exprs.len());
+        for order_expr in exprs {
+            let ascending = order_expr.options.asc.unwrap_or(true);
+            let default_nulls_first_for_direction = if ascending {
+                base_nulls_first
+            } else {
+                !base_nulls_first
+            };
+            let nulls_first = order_expr
+                .options
+                .nulls_first
+                .unwrap_or(default_nulls_first_for_direction);
+
+            let (target, sort_type) = match &order_expr.expr {
+                SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => (
+                    OrderTarget::Column(resolve_simple_column(&order_expr.expr)?),
+                    OrderSortType::Native,
+                ),
+                SqlExpr::Cast {
+                    expr,
+                    data_type:
+                        SqlDataType::Int(_)
+                        | SqlDataType::Integer(_)
+                        | SqlDataType::BigInt(_)
+                        | SqlDataType::SmallInt(_)
+                        | SqlDataType::TinyInt(_),
+                    ..
+                } => (
+                    OrderTarget::Column(resolve_simple_column(expr)?),
+                    OrderSortType::CastTextToInteger,
+                ),
+                SqlExpr::Cast { data_type, .. } => {
                     return Err(Error::InvalidArgumentError(format!(
-                        "unsupported ORDER BY literal expression: {other:?}"
+                        "ORDER BY CAST target type {:?} is not supported",
+                        data_type
                     )));
                 }
-            },
-            other => {
-                return Err(Error::InvalidArgumentError(format!(
-                    "unsupported ORDER BY expression: {other:?}"
-                )));
-            }
-        };
+                SqlExpr::Value(value_with_span) => match &value_with_span.value {
+                    Value::Number(raw, _) => {
+                        let position: usize = raw.parse().map_err(|_| {
+                            Error::InvalidArgumentError(format!(
+                                "ORDER BY position '{}' is not a valid positive integer",
+                                raw
+                            ))
+                        })?;
+                        if position == 0 {
+                            return Err(Error::InvalidArgumentError(
+                                "ORDER BY position must be at least 1".into(),
+                            ));
+                        }
+                        (OrderTarget::Index(position - 1), OrderSortType::Native)
+                    }
+                    other => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "unsupported ORDER BY literal expression: {other:?}"
+                        )));
+                    }
+                },
+                other => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported ORDER BY expression: {other:?}"
+                    )));
+                }
+            };
 
-        Ok(OrderByPlan {
-            target,
-            sort_type,
-            ascending,
-            nulls_first,
-        })
+            plans.push(OrderByPlan {
+                target,
+                sort_type,
+                ascending,
+                nulls_first,
+            });
+        }
+
+        Ok(plans)
     }
 
     fn detect_simple_aggregates(
@@ -2700,12 +2700,12 @@ fn translate_condition_with_context(
         SqlExpr::IsNull(inner) => {
             let scalar = translate_scalar_with_context(resolver, context, inner)?;
             match scalar {
-                llkv_expr::expr::ScalarExpr::Column(column) => Ok(llkv_expr::expr::Expr::Pred(
-                    llkv_expr::expr::Filter {
+                llkv_expr::expr::ScalarExpr::Column(column) => {
+                    Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
                         field_id: column,
                         op: llkv_expr::expr::Operator::IsNull,
-                    },
-                )),
+                    }))
+                }
                 _ => Err(Error::InvalidArgumentError(
                     "IS NULL predicates currently support column references only".into(),
                 )),
@@ -2714,12 +2714,12 @@ fn translate_condition_with_context(
         SqlExpr::IsNotNull(inner) => {
             let scalar = translate_scalar_with_context(resolver, context, inner)?;
             match scalar {
-                llkv_expr::expr::ScalarExpr::Column(column) => Ok(llkv_expr::expr::Expr::Pred(
-                    llkv_expr::expr::Filter {
+                llkv_expr::expr::ScalarExpr::Column(column) => {
+                    Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
                         field_id: column,
                         op: llkv_expr::expr::Operator::IsNotNull,
-                    },
-                )),
+                    }))
+                }
                 _ => Err(Error::InvalidArgumentError(
                     "IS NOT NULL predicates currently support column references only".into(),
                 )),

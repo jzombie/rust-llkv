@@ -306,7 +306,7 @@ pub struct SelectPlan {
     pub projections: Vec<SelectProjection>,
     pub filter: Option<llkv_expr::expr::Expr<'static, String>>,
     pub aggregates: Vec<AggregateExpr>,
-    pub order_by: Option<OrderByPlan>,
+    pub order_by: Vec<OrderByPlan>,
 }
 
 impl SelectPlan {
@@ -331,7 +331,7 @@ impl SelectPlan {
             projections: Vec::new(),
             filter: None,
             aggregates: Vec::new(),
-            order_by: None,
+            order_by: Vec::new(),
         }
     }
 
@@ -342,7 +342,7 @@ impl SelectPlan {
             projections: Vec::new(),
             filter: None,
             aggregates: Vec::new(),
-            order_by: None,
+            order_by: Vec::new(),
         }
     }
 
@@ -361,7 +361,7 @@ impl SelectPlan {
         self
     }
 
-    pub fn with_order_by(mut self, order_by: Option<OrderByPlan>) -> Self {
+    pub fn with_order_by(mut self, order_by: Vec<OrderByPlan>) -> Self {
         self.order_by = order_by;
         self
     }
