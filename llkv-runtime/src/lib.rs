@@ -52,6 +52,7 @@ use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 // Literal is not used at top-level; keep it out to avoid unused import warnings.
 use llkv_result::Error;
 use llkv_storage::pager::{MemPager, Pager};
+use llkv_table::catalog::{FieldConstraints, FieldDefinition};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_table::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
@@ -1775,7 +1776,10 @@ where
         // Register fields in catalog
         if let Some(field_resolver) = self.catalog.field_resolver(registered_table_id) {
             for column in &column_defs {
-                if let Err(e) = field_resolver.register_field(&column.name) {
+                let definition = FieldDefinition::new(&column.name)
+                    .with_primary_key(column.primary_key)
+                    .with_check_expr(column.check_expr.clone());
+                if let Err(e) = field_resolver.register_field(definition) {
                     tracing::warn!(
                         "[CATALOG] Failed to register field '{}' in table '{}': {}",
                         column.name,
@@ -1961,7 +1965,10 @@ where
         // Register fields in catalog
         if let Some(field_resolver) = self.catalog.field_resolver(registered_table_id) {
             for column in &column_defs {
-                if let Err(e) = field_resolver.register_field(&column.name) {
+                let definition = FieldDefinition::new(&column.name)
+                    .with_primary_key(column.primary_key)
+                    .with_check_expr(column.check_expr.clone());
+                if let Err(e) = field_resolver.register_field(definition) {
                     tracing::warn!(
                         "[CATALOG] Failed to register field '{}' in table '{}': {}",
                         column.name,
@@ -3278,6 +3285,7 @@ where
         // Open the table and build ExecutorTable
         let table = Table::new(*table_id, Arc::clone(&self.pager))?;
         let schema = table.schema()?;
+        let catalog_field_resolver = self.catalog.field_resolver(_catalog_table_id);
 
         // Build ExecutorSchema from Arrow schema (skip row_id field at index 0)
         let mut executor_columns = Vec::new();
@@ -3296,13 +3304,18 @@ where
             let col_idx = executor_columns.len();
             lookup.insert(normalized, col_idx);
 
+            let constraints: FieldConstraints = catalog_field_resolver
+                .as_ref()
+                .and_then(|resolver| resolver.field_constraints_by_name(field.name()))
+                .unwrap_or_default();
+
             executor_columns.push(ExecutorColumn {
                 name: field.name().to_string(),
                 data_type: field.data_type().clone(),
                 nullable: field.is_nullable(),
-                primary_key: false, // Not stored in schema metadata currently
+                primary_key: constraints.primary_key,
                 field_id,
-                check_expr: None, // CHECK constraints not stored in physical schema yet
+                check_expr: constraints.check_expr.clone(),
             });
         }
 
@@ -3387,7 +3400,10 @@ where
         // Register fields in catalog (may already be registered from RuntimeContext::new())
         if let Some(field_resolver) = self.catalog.field_resolver(_catalog_table_id) {
             for col in &executor_table.schema.columns {
-                let _ = field_resolver.register_field(&col.name); // Ignore "already exists" errors
+                let definition = FieldDefinition::new(&col.name)
+                    .with_primary_key(col.primary_key)
+                    .with_check_expr(col.check_expr.clone());
+                let _ = field_resolver.register_field(definition); // Ignore "already exists" errors
             }
             tracing::debug!(
                 "[CATALOG] Registered {} field(s) for lazy-loaded table '{}'",

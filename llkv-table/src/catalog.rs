@@ -967,6 +967,72 @@ impl<'a> IdentifierResolver<'a> {
 // FieldResolver - Per-table field name resolution
 // ============================================================================
 
+/// Constraint metadata recorded for each field.
+#[derive(Debug, Clone, PartialEq, Eq, Default, bitcode::Encode, bitcode::Decode)]
+pub struct FieldConstraints {
+    pub primary_key: bool,
+    pub check_expr: Option<String>,
+}
+
+/// Definition for registering a field with the catalog.
+#[derive(Debug, Clone)]
+pub struct FieldDefinition {
+    display_name: String,
+    constraints: FieldConstraints,
+}
+
+impl FieldDefinition {
+    pub fn new(display_name: impl Into<String>) -> Self {
+        Self {
+            display_name: display_name.into(),
+            constraints: FieldConstraints::default(),
+        }
+    }
+
+    pub fn with_primary_key(mut self, primary_key: bool) -> Self {
+        self.constraints.primary_key = primary_key;
+        self
+    }
+
+    pub fn with_check_expr(mut self, check_expr: Option<String>) -> Self {
+        self.constraints.check_expr = check_expr;
+        self
+    }
+
+    pub fn constraints(&self) -> &FieldConstraints {
+        &self.constraints
+    }
+
+}
+
+impl From<&str> for FieldDefinition {
+    fn from(value: &str) -> Self {
+        FieldDefinition::new(value)
+    }
+}
+
+impl From<String> for FieldDefinition {
+    fn from(value: String) -> Self {
+        FieldDefinition::new(value)
+    }
+}
+
+/// Rich field metadata exposed by the catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldInfo {
+    pub field_id: FieldId,
+    pub display_name: String,
+    pub canonical_name: String,
+    pub constraints: FieldConstraints,
+}
+
+#[derive(Debug, Clone)]
+struct FieldMetadata {
+    display_name: String,
+    canonical_name: String,
+    constraints: FieldConstraints,
+}
+
 /// Per-table field name resolver.
 ///
 /// Each table has its own field resolver that maintains bidirectional mappings
@@ -990,8 +1056,8 @@ pub struct FieldResolver {
 struct FieldResolverInner {
     /// Canonical field name (lowercase) -> FieldId
     field_name_to_id: FxHashMap<String, FieldId>,
-    /// FieldId -> display name
-    field_id_to_name: FxHashMap<FieldId, String>,
+    /// FieldId -> field metadata
+    field_id_to_meta: FxHashMap<FieldId, FieldMetadata>,
     /// Next field ID to assign (starts at 3, reserves 0-2 for system columns)
     next_field_id: FieldId,
 }
@@ -1006,7 +1072,7 @@ impl FieldResolver {
         Self {
             inner: Arc::new(RwLock::new(FieldResolverInner {
                 field_name_to_id: FxHashMap::default(),
-                field_id_to_name: FxHashMap::default(),
+                field_id_to_meta: FxHashMap::default(),
                 next_field_id: FIRST_USER_FIELD_ID,
             })),
         }
@@ -1038,8 +1104,11 @@ impl FieldResolver {
     /// // Case-insensitive duplicate detection
     /// assert!(resolver.register_field("NAME").is_err());
     /// ```
-    pub fn register_field(&self, display_name: impl Into<String>) -> Result<FieldId> {
-        let display_name = display_name.into();
+    pub fn register_field(&self, definition: impl Into<FieldDefinition>) -> Result<FieldId> {
+        let FieldDefinition {
+            display_name,
+            constraints,
+        } = definition.into();
         let canonical_name = display_name.to_ascii_lowercase();
 
         let mut inner = self.inner.write().map_err(|_| {
@@ -1061,9 +1130,15 @@ impl FieldResolver {
             .checked_add(1)
             .ok_or_else(|| Error::Internal("FieldId overflow".to_string()))?;
 
-        // Store mappings
-        inner.field_name_to_id.insert(canonical_name, field_id);
-        inner.field_id_to_name.insert(field_id, display_name);
+        inner.field_name_to_id.insert(canonical_name.clone(), field_id);
+        inner.field_id_to_meta.insert(
+            field_id,
+            FieldMetadata {
+                display_name,
+                canonical_name,
+                constraints,
+            },
+        );
 
         Ok(field_id)
     }
@@ -1105,7 +1180,10 @@ impl FieldResolver {
     /// `Some(String)` with the display name if field exists, `None` otherwise.
     pub fn field_name(&self, id: FieldId) -> Option<String> {
         let inner = self.inner.read().ok()?;
-        inner.field_id_to_name.get(&id).cloned()
+        inner
+            .field_id_to_meta
+            .get(&id)
+            .map(|meta| meta.display_name.clone())
     }
 
     /// Check if a field exists (case-insensitive).
@@ -1124,7 +1202,7 @@ impl FieldResolver {
     /// Get the number of registered fields.
     pub fn field_count(&self) -> usize {
         match self.inner.read() {
-            Ok(inner) => inner.field_id_to_name.len(),
+            Ok(inner) => inner.field_id_to_meta.len(),
             Err(_) => 0,
         }
     }
@@ -1132,9 +1210,45 @@ impl FieldResolver {
     /// Get all field names in display format.
     pub fn field_names(&self) -> Vec<String> {
         match self.inner.read() {
-            Ok(inner) => inner.field_id_to_name.values().cloned().collect(),
+            Ok(inner) => inner
+                .field_id_to_meta
+                .values()
+                .map(|meta| meta.display_name.clone())
+                .collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// Retrieve constraint metadata for a field id.
+    pub fn field_constraints(&self, id: FieldId) -> Option<FieldConstraints> {
+        let inner = self.inner.read().ok()?;
+        inner
+            .field_id_to_meta
+            .get(&id)
+            .map(|meta| meta.constraints.clone())
+    }
+
+    /// Retrieve constraint metadata for a field name.
+    pub fn field_constraints_by_name(&self, name: &str) -> Option<FieldConstraints> {
+        let id = self.field_id(name)?;
+        self.field_constraints(id)
+    }
+
+    /// Retrieve complete field information by field id.
+    pub fn field_info(&self, id: FieldId) -> Option<FieldInfo> {
+        let inner = self.inner.read().ok()?;
+        inner.field_id_to_meta.get(&id).map(|meta| FieldInfo {
+            field_id: id,
+            display_name: meta.display_name.clone(),
+            canonical_name: meta.canonical_name.clone(),
+            constraints: meta.constraints.clone(),
+        })
+    }
+
+    /// Retrieve complete field information by field name.
+    pub fn field_info_by_name(&self, name: &str) -> Option<FieldInfo> {
+        let id = self.field_id(name)?;
+        self.field_info(id)
     }
 
     /// Export field resolver state for persistence.
@@ -1146,18 +1260,18 @@ impl FieldResolver {
             Err(_) => {
                 return FieldResolverState {
                     fields: Vec::new(),
-                    next_field_id: 3,
+                    next_field_id: crate::reserved::FIRST_USER_FIELD_ID,
                 };
             }
         };
 
         let mut fields = Vec::new();
-        for (&field_id, display_name) in &inner.field_id_to_name {
-            let canonical_name = display_name.to_ascii_lowercase();
+        for (&field_id, meta) in &inner.field_id_to_meta {
             fields.push(FieldState {
                 field_id,
-                display_name: display_name.clone(),
-                canonical_name,
+                display_name: meta.display_name.clone(),
+                canonical_name: meta.canonical_name.clone(),
+                constraints: meta.constraints.clone(),
             });
         }
 
@@ -1173,33 +1287,46 @@ impl FieldResolver {
     /// restored from the provided state.
     pub fn from_state(state: FieldResolverState) -> Result<Self> {
         let mut field_name_to_id = FxHashMap::default();
-        let mut field_id_to_name = FxHashMap::default();
+        let mut field_id_to_meta = FxHashMap::default();
 
         for field_state in state.fields {
+            let FieldState {
+                field_id,
+                display_name,
+                canonical_name,
+                constraints,
+            } = field_state;
             // Check for duplicate field IDs
-            if field_id_to_name.contains_key(&field_state.field_id) {
+            if field_id_to_meta.contains_key(&field_id) {
                 return Err(Error::CatalogError(format!(
                     "Duplicate field_id {} in field resolver state",
-                    field_state.field_id
+                    field_id
                 )));
             }
 
             // Check for duplicate field names
-            if field_name_to_id.contains_key(&field_state.canonical_name) {
+            if field_name_to_id.contains_key(&canonical_name) {
                 return Err(Error::CatalogError(format!(
                     "Duplicate field name '{}' in field resolver state",
-                    field_state.display_name
+                    display_name
                 )));
             }
 
-            field_name_to_id.insert(field_state.canonical_name, field_state.field_id);
-            field_id_to_name.insert(field_state.field_id, field_state.display_name);
+            field_name_to_id.insert(canonical_name.clone(), field_id);
+            field_id_to_meta.insert(
+                field_id,
+                FieldMetadata {
+                    display_name,
+                    canonical_name,
+                    constraints,
+                },
+            );
         }
 
         Ok(Self {
             inner: Arc::new(RwLock::new(FieldResolverInner {
                 field_name_to_id,
-                field_id_to_name,
+                field_id_to_meta,
                 next_field_id: state.next_field_id,
             })),
         })
@@ -1267,6 +1394,8 @@ pub struct FieldState {
     pub display_name: String,
     /// Canonical name (lowercase)
     pub canonical_name: String,
+    /// Persisted constraint metadata for this field
+    pub constraints: FieldConstraints,
 }
 
 #[cfg(test)]
@@ -1571,6 +1700,38 @@ mod tests {
         // New registrations should continue from saved counter
         let fid4 = restored.register_field("field4").unwrap();
         assert!(fid4 > fid3);
+    }
+
+    #[test]
+    fn test_field_constraints_roundtrip() {
+        let resolver = FieldResolver::new();
+
+        let fid = resolver
+            .register_field(
+                FieldDefinition::new("id")
+                    .with_primary_key(true)
+                    .with_check_expr(Some("id > 0".to_string())),
+            )
+            .unwrap();
+
+        let constraints = resolver.field_constraints(fid).unwrap();
+        assert!(constraints.primary_key);
+        assert_eq!(constraints.check_expr.as_deref(), Some("id > 0"));
+
+        let by_name = resolver.field_constraints_by_name("ID").unwrap();
+        assert_eq!(by_name, constraints);
+
+        let info = resolver.field_info(fid).unwrap();
+        assert_eq!(info.field_id, fid);
+        assert_eq!(info.display_name, "id");
+        assert!(info.constraints.primary_key);
+
+        let state = resolver.export_state();
+        let restored = FieldResolver::from_state(state).unwrap();
+        let restored_constraints = restored.field_constraints(fid).unwrap();
+        assert_eq!(restored_constraints, constraints);
+        let restored_info = restored.field_info_by_name("id").unwrap();
+        assert_eq!(restored_info.constraints, constraints);
     }
 
     #[test]
