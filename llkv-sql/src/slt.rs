@@ -1,7 +1,7 @@
 use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
 use llkv_result::Error;
 use sqllogictest::{AsyncDB, DefaultColumnType, Runner};
-use std::path::{Component, Path};
+use std::path::Path;
 
 /// Run a single slt file using the provided AsyncDB factory. The factory is
 /// a closure that returns a future resolving to a new DB instance for the
@@ -36,17 +36,6 @@ where
         (filtered_lines, filtered_mapping)
     };
     let (normalized_lines, mapping) = normalize_inline_connections(expanded_lines, mapping);
-
-    // TODO: Remove this check once the harness implements dialects (https://github.com/jzombie/rust-llkv/issues/111)
-    // DuckDB-specific fix: add extra blank line after plain text error messages
-    let is_duckdb_suite = path
-        .components()
-        .any(|component| matches!(component, Component::Normal(name) if name == "duckdb"));
-    let normalized_lines = if is_duckdb_suite {
-        fix_error_message_spacing(normalized_lines)
-    } else {
-        normalized_lines
-    };
 
     let expanded_text = normalized_lines.join("\n");
     let mut named = tempfile::NamedTempFile::new()
@@ -245,7 +234,7 @@ pub fn expand_loops_with_mapping(
     Ok((out_lines, out_map))
 }
 
-/// Convert legacy sqllogictest inline connection syntax (e.g. `statement ok con1`)
+/// Convert sqllogictest inline connection syntax (e.g. `statement ok con1`)
 /// into explicit `connection` records so the upstream parser can understand them.
 /// Also ensures proper termination of statement error blocks by adding a blank line
 /// after ---- when there's no expected error pattern.
@@ -342,6 +331,7 @@ fn normalize_inline_connections(
                         collect_statement_error_block(&lines, &mapping, i + 1);
                     i = new_idx;
 
+                    let has_regex = regex_pattern.is_some();
                     if let Some(pattern) = regex_pattern {
                         out_lines.push(format!("{indent}connection {conn}"));
                         out_map.push(orig);
@@ -355,13 +345,17 @@ fn normalize_inline_connections(
                         out_lines.push(sql_line);
                         out_map.push(sql_map);
                     }
-                    if saw_separator && !message_lines.is_empty() {
+                    // Only output ---- when there are actual error message lines
+                    if saw_separator && !has_regex && !message_lines.is_empty() {
                         out_lines.push(format!("{indent}----"));
                         out_map.push(orig);
                         for (msg_line, msg_map) in message_lines {
                             out_lines.push(msg_line);
                             out_map.push(msg_map);
                         }
+                        // Add extra blank line after plain text error messages to prevent multiline interpretation
+                        out_lines.push(String::new());
+                        out_map.push(orig);
                     }
                     out_lines.push(String::new());
                     out_map.push(orig);
@@ -383,6 +377,7 @@ fn normalize_inline_connections(
                 collect_statement_error_block(&lines, &mapping, i + 1);
             i = new_idx;
 
+            let has_regex = regex_pattern.is_some();
             if let Some(pattern) = regex_pattern {
                 out_lines.push(format!("{indent}statement error {}", pattern));
                 out_map.push(orig);
@@ -394,13 +389,17 @@ fn normalize_inline_connections(
                 out_lines.push(sql_line);
                 out_map.push(sql_map);
             }
-            if saw_separator && !message_lines.is_empty() {
+            // Only output ---- when there are actual error message lines
+            if saw_separator && !has_regex && !message_lines.is_empty() {
                 out_lines.push(format!("{indent}----"));
                 out_map.push(orig);
                 for (msg_line, msg_map) in message_lines {
                     out_lines.push(msg_line);
                     out_map.push(msg_map);
                 }
+                // Add extra blank line after plain text error messages to prevent multiline interpretation
+                out_lines.push(String::new());
+                out_map.push(orig);
             }
             out_lines.push(String::new());
             out_map.push(orig);
@@ -462,63 +461,4 @@ pub fn map_temp_error_message(
         }
     }
     (out, None)
-}
-
-/// Fix error message spacing to prevent sqllogictest multiline interpretation.
-/// Adds an extra blank line after plain text error messages (not regex patterns).
-fn fix_error_message_spacing(lines: Vec<String>) -> Vec<String> {
-    let mut out_lines = Vec::with_capacity(lines.len() + 10);
-
-    let mut i = 0;
-    while i < lines.len() {
-        let line = &lines[i];
-        let trimmed = line.trim();
-
-        // Detect error block: statement error followed by SQL, ----, optional message, blank line
-        if trimmed.starts_with("statement error") && !trimmed.contains("<REGEX>:") {
-            // Output the statement error line
-            out_lines.push(line.clone());
-            i += 1;
-
-            // Collect SQL lines until ----
-            while i < lines.len() && lines[i].trim() != "----" {
-                out_lines.push(lines[i].clone());
-                i += 1;
-            }
-
-            // Output ----
-            if i < lines.len() && lines[i].trim() == "----" {
-                out_lines.push(lines[i].clone());
-                i += 1;
-
-                // Check if there's an error message (non-empty line after ----)
-                if i < lines.len() && !lines[i].trim().is_empty() {
-                    // Output the error message
-                    out_lines.push(lines[i].clone());
-                    i += 1;
-
-                    // Output the existing blank line
-                    if i < lines.len() && lines[i].trim().is_empty() {
-                        out_lines.push(lines[i].clone());
-                        i += 1;
-                    }
-
-                    // Add EXTRA blank line to prevent multiline interpretation
-                    out_lines.push(String::new());
-                } else {
-                    // No message - just pass through the blank line
-                    if i < lines.len() {
-                        out_lines.push(lines[i].clone());
-                        i += 1;
-                    }
-                }
-            }
-        } else {
-            // Not an error block - pass through
-            out_lines.push(line.clone());
-            i += 1;
-        }
-    }
-
-    out_lines
 }

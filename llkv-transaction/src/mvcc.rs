@@ -111,7 +111,8 @@ impl TxnIdManager {
         }
     }
 
-    /// Legacy helper that only returns the allocated transaction ID.
+    // TODO: Is this method a good idea?  A transaction has to begin in order to determine the next ID?
+    /// Convenience helper that returns only the allocated transaction ID.
     /// Prefer [`TxnIdManager::begin_transaction`] when a snapshot is required.
     pub fn next_txn_id(&self) -> TxnId {
         self.begin_transaction().txn_id

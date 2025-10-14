@@ -24,6 +24,7 @@ pub enum PlanValue {
     Integer(i64),
     Float(f64),
     String(String),
+    Struct(std::collections::HashMap<String, PlanValue>),
 }
 
 impl From<&str> for PlanValue {
@@ -100,6 +101,9 @@ pub struct ColumnSpec {
     pub data_type: DataType,
     pub nullable: bool,
     pub primary_key: bool,
+    /// Optional CHECK constraint expression (SQL string).
+    /// Example: "t.t=42" for CHECK(t.t=42)
+    pub check_expr: Option<String>,
 }
 
 impl ColumnSpec {
@@ -109,11 +113,17 @@ impl ColumnSpec {
             data_type,
             nullable,
             primary_key: false,
+            check_expr: None,
         }
     }
 
     pub fn with_primary_key(mut self, primary_key: bool) -> Self {
         self.primary_key = primary_key;
+        self
+    }
+
+    pub fn with_check(mut self, check_expr: Option<String>) -> Self {
+        self.check_expr = check_expr;
         self
     }
 }
@@ -250,10 +260,37 @@ pub struct DeletePlan {
 // SELECT Plan
 // ============================================================================
 
+/// Table reference in FROM clause.
+#[derive(Clone, Debug)]
+pub struct TableRef {
+    pub schema: String,
+    pub table: String,
+}
+
+impl TableRef {
+    pub fn new(schema: impl Into<String>, table: impl Into<String>) -> Self {
+        Self {
+            schema: schema.into(),
+            table: table.into(),
+        }
+    }
+
+    /// Get fully qualified name as "schema.table"
+    pub fn qualified_name(&self) -> String {
+        if self.schema.is_empty() {
+            self.table.clone()
+        } else {
+            format!("{}.{}", self.schema, self.table)
+        }
+    }
+}
+
 /// Logical query plan for SELECT operations.
 #[derive(Clone, Debug)]
 pub struct SelectPlan {
-    pub table: String,
+    /// Tables to query. Empty vec means no FROM clause (e.g., SELECT 42).
+    /// Single element for simple queries, multiple for joins/cross products.
+    pub tables: Vec<TableRef>,
     pub projections: Vec<SelectProjection>,
     pub filter: Option<llkv_expr::expr::Expr<'static, String>>,
     pub aggregates: Vec<AggregateExpr>,
@@ -261,9 +298,35 @@ pub struct SelectPlan {
 }
 
 impl SelectPlan {
+    /// Create a SelectPlan for a single table.
     pub fn new(table: impl Into<String>) -> Self {
+        let table_name = table.into();
+        let tables = if table_name.is_empty() {
+            Vec::new()
+        } else {
+            // Parse "schema.table" or just "table"
+            let parts: Vec<&str> = table_name.split('.').collect();
+            if parts.len() >= 2 {
+                let table_part = parts[1..].join(".");
+                vec![TableRef::new(parts[0], table_part)]
+            } else {
+                vec![TableRef::new("", table_name)]
+            }
+        };
+
         Self {
-            table: table.into(),
+            tables,
+            projections: Vec::new(),
+            filter: None,
+            aggregates: Vec::new(),
+            order_by: None,
+        }
+    }
+
+    /// Create a SelectPlan with multiple tables for cross product/joins.
+    pub fn with_tables(tables: Vec<TableRef>) -> Self {
+        Self {
+            tables,
             projections: Vec::new(),
             filter: None,
             aggregates: Vec::new(),
@@ -296,6 +359,9 @@ impl SelectPlan {
 #[derive(Clone, Debug)]
 pub enum SelectProjection {
     AllColumns,
+    AllColumnsExcept {
+        exclude: Vec<String>,
+    },
     Column {
         name: String,
         alias: Option<String>,

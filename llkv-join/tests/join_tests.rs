@@ -279,9 +279,9 @@ fn test_join_validation_errors() {
     let left = create_test_table(1, &pager, vec![(0, 1, "Alice")]);
     let right = create_test_table(2, &pager, vec![(0, 1, "Alpha")]);
 
-    // Empty keys should error
+    // Empty keys is valid (cross product) - should succeed
     let result = left.join_stream(&right, &[], &JoinOptions::default(), |_| {});
-    assert!(result.is_err());
+    assert!(result.is_ok());
 
     // Bad batch size should error
     let bad_opts = JoinOptions {
@@ -556,4 +556,246 @@ fn test_join_with_expression_filters() {
     }
 
     assert_eq!(seen_customers, HashSet::from([1003, 1005]));
+}
+
+// ============================================================================
+// Cartesian Product / Cross Join Tests
+// ============================================================================
+
+#[test]
+fn test_cartesian_product_basic() {
+    let pager = Arc::new(MemPager::default());
+    let left = create_test_table(1, &pager, vec![(0, 1, "A"), (1, 2, "B")]);
+    let right = create_test_table(2, &pager, vec![(0, 10, "X"), (1, 20, "Y")]);
+
+    let mut result_batches = Vec::new();
+
+    // Empty join keys = Cartesian product
+    left.join_stream(&right, &[], &JoinOptions::default(), |batch| {
+        result_batches.push(batch);
+    })
+    .unwrap();
+
+    // Should produce 2 × 2 = 4 rows
+    let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 4,
+        "Cartesian product should produce 2 × 2 = 4 rows"
+    );
+
+    // Verify we have columns from both tables
+    let schema = result_batches[0].schema();
+    assert!(schema.column_with_name("user_id").is_some());
+    assert!(schema.column_with_name("name").is_some());
+    assert!(schema.column_with_name("user_id_1").is_some());
+    assert!(schema.column_with_name("name_1").is_some());
+}
+
+#[test]
+fn test_cartesian_product_asymmetric() {
+    let pager = Arc::new(MemPager::default());
+    // Left: 3 rows
+    let left = create_test_table(1, &pager, vec![(0, 1, "A"), (1, 2, "B"), (2, 3, "C")]);
+    // Right: 2 rows
+    let right = create_test_table(2, &pager, vec![(0, 10, "X"), (1, 20, "Y")]);
+
+    let mut result_batches = Vec::new();
+
+    left.join_stream(&right, &[], &JoinOptions::default(), |batch| {
+        result_batches.push(batch);
+    })
+    .unwrap();
+
+    // Should produce 3 × 2 = 6 rows
+    let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 6,
+        "Cartesian product should produce 3 × 2 = 6 rows"
+    );
+}
+
+#[test]
+fn test_cartesian_product_with_filters() {
+    let pager = Arc::new(MemPager::default());
+    let left = create_test_table(1, &pager, vec![(0, 1, "A"), (1, 2, "B"), (2, 3, "C")]);
+    let right = create_test_table(2, &pager, vec![(0, 10, "X"), (1, 20, "Y"), (2, 30, "Z")]);
+
+    let mut all_rows = Vec::new();
+
+    left.join_stream(&right, &[], &JoinOptions::default(), |batch| {
+        // Extract data from batch
+        let left_ids = batch
+            .column_by_name("user_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let right_ids = batch
+            .column_by_name("user_id_1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        for i in 0..batch.num_rows() {
+            all_rows.push((left_ids.value(i), right_ids.value(i)));
+        }
+    })
+    .unwrap();
+
+    // Should produce 3 × 3 = 9 rows
+    assert_eq!(all_rows.len(), 9);
+
+    // Verify all combinations exist
+    let expected_combinations: HashSet<(i32, i32)> = [
+        (1, 10),
+        (1, 20),
+        (1, 30),
+        (2, 10),
+        (2, 20),
+        (2, 30),
+        (3, 10),
+        (3, 20),
+        (3, 30),
+    ]
+    .iter()
+    .cloned()
+    .collect();
+
+    let actual_combinations: HashSet<(i32, i32)> = all_rows.into_iter().collect();
+    assert_eq!(actual_combinations, expected_combinations);
+}
+
+#[test]
+fn test_cartesian_product_with_empty_left() {
+    let pager = Arc::new(MemPager::default());
+    let left = create_test_table(1, &pager, vec![]); // Empty
+    let right = create_test_table(2, &pager, vec![(0, 10, "X"), (1, 20, "Y")]);
+
+    let mut result_batches = Vec::new();
+
+    left.join_stream(&right, &[], &JoinOptions::default(), |batch| {
+        result_batches.push(batch);
+    })
+    .unwrap();
+
+    // Empty left table means no results
+    let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 0,
+        "Cartesian product with empty left should produce 0 rows"
+    );
+}
+
+#[test]
+fn test_cartesian_product_with_empty_right() {
+    let pager = Arc::new(MemPager::default());
+    let left = create_test_table(1, &pager, vec![(0, 1, "A"), (1, 2, "B")]);
+    let right = create_test_table(2, &pager, vec![]); // Empty
+
+    let mut result_batches = Vec::new();
+
+    left.join_stream(&right, &[], &JoinOptions::default(), |batch| {
+        result_batches.push(batch);
+    })
+    .unwrap();
+
+    // Empty right table means no results
+    let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 0,
+        "Cartesian product with empty right should produce 0 rows"
+    );
+}
+
+#[test]
+fn test_cartesian_product_larger_dataset() {
+    let pager = Arc::new(MemPager::default());
+
+    // Create larger tables
+    let left_data: Vec<_> = (0..10).map(|i| (i, i as i32, "L")).collect();
+    let right_data: Vec<_> = (0..8).map(|i| (i, (i * 10) as i32, "R")).collect();
+
+    let left = create_test_table(1, &pager, left_data);
+    let right = create_test_table(2, &pager, right_data);
+
+    let mut result_batches = Vec::new();
+
+    left.join_stream(&right, &[], &JoinOptions::default(), |batch| {
+        result_batches.push(batch);
+    })
+    .unwrap();
+
+    // Should produce 10 × 8 = 80 rows
+    let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 80,
+        "Cartesian product should produce 10 × 8 = 80 rows"
+    );
+}
+
+#[test]
+fn test_cartesian_product_data_integrity() {
+    let pager = Arc::new(MemPager::default());
+    let left = create_test_table(1, &pager, vec![(0, 1, "Alice"), (1, 2, "Bob")]);
+    let right = create_test_table(2, &pager, vec![(0, 100, "X"), (1, 200, "Y")]);
+
+    let mut all_rows = Vec::new();
+
+    left.join_stream(&right, &[], &JoinOptions::default(), |batch| {
+        let left_ids = batch
+            .column_by_name("user_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let left_names = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let right_ids = batch
+            .column_by_name("user_id_1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let right_names = batch
+            .column_by_name("name_1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        for i in 0..batch.num_rows() {
+            all_rows.push((
+                left_ids.value(i),
+                left_names.value(i).to_string(),
+                right_ids.value(i),
+                right_names.value(i).to_string(),
+            ));
+        }
+    })
+    .unwrap();
+
+    assert_eq!(all_rows.len(), 4);
+
+    // Verify data integrity - all combinations should exist with correct data
+    let expected = [
+        (1, "Alice", 100, "X"),
+        (1, "Alice", 200, "Y"),
+        (2, "Bob", 100, "X"),
+        (2, "Bob", 200, "Y"),
+    ];
+
+    for (exp_lid, exp_lname, exp_rid, exp_rname) in &expected {
+        assert!(
+            all_rows.iter().any(|(lid, lname, rid, rname)| {
+                lid == exp_lid && lname == exp_lname && rid == exp_rid && rname == exp_rname
+            }),
+            "Missing expected combination: {:?}",
+            (exp_lid, exp_lname, exp_rid, exp_rname)
+        );
+    }
 }

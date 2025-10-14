@@ -37,9 +37,27 @@ where
             SelectProjection::AllColumns => {
                 result.extend(build_wildcard_projections(table));
             }
+            SelectProjection::AllColumnsExcept { exclude } => {
+                // Get all columns except the excluded ones
+                let exclude_lower: Vec<String> =
+                    exclude.iter().map(|e| e.to_ascii_lowercase()).collect();
+
+                for col in &table.schema.columns {
+                    let col_name_lower = col.name.to_ascii_lowercase();
+                    if !exclude_lower.contains(&col_name_lower) {
+                        result.push(ScanProjection::from(StoreProjection::with_alias(
+                            LogicalFieldId::for_user(table.table.table_id(), col.field_id),
+                            col.name.clone(),
+                        )));
+                    }
+                }
+            }
             SelectProjection::Column { name, alias } => {
                 let column = table.schema.resolve(name).ok_or_else(|| {
-                    Error::InvalidArgumentError(format!("unknown column '{}' in projection", name))
+                    Error::InvalidArgumentError(format!(
+                        "Binder Error: does not have a column named '{}'",
+                        name
+                    ))
                 })?;
                 let alias = alias.clone().unwrap_or_else(|| column.name.clone());
                 result.push(ScanProjection::from(StoreProjection::with_alias(
@@ -69,9 +87,12 @@ fn translate_scalar(
     match expr {
         ScalarExpr::Literal(lit) => Ok(ScalarExpr::Literal(lit.clone())),
         ScalarExpr::Column(name) => {
-            let column = schema
-                .resolve(name)
-                .ok_or_else(|| Error::InvalidArgumentError(format!("unknown column '{}'", name)))?;
+            let column = schema.resolve(name).ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "Binder Error: does not have a column named '{}'",
+                    name
+                ))
+            })?;
             Ok(ScalarExpr::Column(column.field_id))
         }
         ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
@@ -86,36 +107,55 @@ fn translate_scalar(
                 AggregateCall::CountStar => AggregateCall::CountStar,
                 AggregateCall::Count(name) => {
                     let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                        Error::InvalidArgumentError(format!(
+                            "Binder Error: does not have a column named '{}'",
+                            name
+                        ))
                     })?;
                     AggregateCall::Count(column.field_id)
                 }
                 AggregateCall::Sum(name) => {
                     let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                        Error::InvalidArgumentError(format!(
+                            "Binder Error: does not have a column named '{}'",
+                            name
+                        ))
                     })?;
                     AggregateCall::Sum(column.field_id)
                 }
                 AggregateCall::Min(name) => {
                     let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                        Error::InvalidArgumentError(format!(
+                            "Binder Error: does not have a column named '{}'",
+                            name
+                        ))
                     })?;
                     AggregateCall::Min(column.field_id)
                 }
                 AggregateCall::Max(name) => {
                     let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                        Error::InvalidArgumentError(format!(
+                            "Binder Error: does not have a column named '{}'",
+                            name
+                        ))
                     })?;
                     AggregateCall::Max(column.field_id)
                 }
                 AggregateCall::CountNulls(name) => {
                     let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                        Error::InvalidArgumentError(format!(
+                            "Binder Error: does not have a column named '{}'",
+                            name
+                        ))
                     })?;
                     AggregateCall::CountNulls(column.field_id)
                 }
             };
             Ok(ScalarExpr::Aggregate(translated_agg))
         }
+        ScalarExpr::GetField { base, field_name } => Ok(ScalarExpr::GetField {
+            base: Box::new(translate_scalar(base, schema)?),
+            field_name: field_name.clone(),
+        }),
     }
 }

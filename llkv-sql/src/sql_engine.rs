@@ -1,10 +1,14 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::collections::{HashMap, HashSet};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+};
 
 use crate::SqlResult;
 use crate::SqlValue;
+use arrow::record_batch::RecordBatch;
 
+use llkv_executor::SelectExecution;
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
 use llkv_runtime::{
@@ -14,15 +18,17 @@ use llkv_runtime::{
     RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
+use llkv_table::catalog::{IdentifierContext, IdentifierResolver};
+use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
     ColumnOptionDef, DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName,
-    ObjectNamePart, ObjectType, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, Set, SetExpr, Statement, TableFactor, TableObject,
-    TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator, UpdateTableFromKind,
-    Value, ValueWithSpan,
+    ObjectNamePart, ObjectType, OrderBy, OrderByExpr, OrderByKind, Query, SchemaName, Select,
+    SelectItem, SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableFactor,
+    TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
+    UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -89,9 +95,6 @@ where
         }
     }
 
-    // `statement_table_name` is provided by llkv-runtime; use it to avoid
-    // duplicating plan-level logic here.
-
     fn execute_plan_statement(
         &self,
         statement: PlanStatement,
@@ -112,6 +115,27 @@ where
             engine,
             default_nulls_first: AtomicBool::new(false),
         }
+    }
+
+    /// Preprocess SQL to handle qualified names in EXCLUDE clauses
+    /// Converts EXCLUDE (schema.table.col) to EXCLUDE ("schema.table.col")
+    fn preprocess_exclude_syntax(sql: &str) -> String {
+        static EXCLUDE_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        // Pattern to match EXCLUDE followed by qualified identifiers
+        // Matches: EXCLUDE (identifier.identifier.identifier)
+        let re = EXCLUDE_REGEX.get_or_init(|| {
+            Regex::new(
+                r"(?i)EXCLUDE\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)+)\s*\)",
+            )
+            .expect("valid EXCLUDE qualifier regex")
+        });
+
+        re.replace_all(sql, |caps: &regex::Captures| {
+            let qualified_name = &caps[1];
+            format!("EXCLUDE (\"{}\")", qualified_name)
+        })
+        .to_string()
     }
 
     pub(crate) fn context_arc(&self) -> Arc<RuntimeContext<P>> {
@@ -141,8 +165,13 @@ where
 
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<RuntimeStatementResult<P>>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
+
+        // Preprocess SQL to handle qualified names in EXCLUDE
+        // Replace EXCLUDE (schema.table.col) with EXCLUDE ("schema.table.col")
+        let processed_sql = Self::preprocess_exclude_syntax(sql);
+
         let dialect = GenericDialect {};
-        let statements = Parser::parse_sql(&dialect, sql)
+        let statements = Parser::parse_sql(&dialect, &processed_sql)
             .map_err(|err| Error::InvalidArgumentError(format!("failed to parse SQL: {err}")))?;
         tracing::trace!("DEBUG SQL execute: parsed {} statements", statements.len());
 
@@ -209,6 +238,24 @@ where
             Statement::CreateTable(stmt) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateTable");
                 self.handle_create_table(stmt)
+            }
+            Statement::CreateSchema {
+                schema_name,
+                if_not_exists,
+                with,
+                options,
+                default_collate_spec,
+                clone,
+            } => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateSchema");
+                self.handle_create_schema(
+                    schema_name,
+                    if_not_exists,
+                    with,
+                    options,
+                    default_collate_spec,
+                    clone,
+                )
             }
             Statement::Insert(stmt) => {
                 let table_name =
@@ -360,7 +407,26 @@ where
     ) -> SqlResult<RuntimeStatementResult<P>> {
         validate_create_table_common(&stmt)?;
 
-        let (display_name, canonical_name) = canonical_object_name(&stmt.name)?;
+        let (schema_name, table_name) = parse_schema_qualified_name(&stmt.name)?;
+
+        // Validate schema exists if specified
+        if let Some(ref schema) = schema_name {
+            let catalog = self.engine.context().table_catalog();
+            if !catalog.schema_exists(schema) {
+                return Err(Error::CatalogError(format!(
+                    "Schema '{}' does not exist",
+                    schema
+                )));
+            }
+        }
+
+        // Use full qualified name (schema.table or just table)
+        let display_name = match &schema_name {
+            Some(schema) => format!("{}.{}", schema, table_name),
+            None => table_name.clone(),
+        };
+        let canonical_name = display_name.to_ascii_lowercase();
+
         tracing::trace!(
             "\n=== HANDLE_CREATE_TABLE: table='{}' columns={} ===",
             display_name,
@@ -401,7 +467,23 @@ where
         validate_create_table_definition(&stmt)?;
 
         let mut columns: Vec<ColumnSpec> = Vec::with_capacity(stmt.columns.len());
-        let mut names: HashMap<String, ()> = HashMap::new();
+
+        // First pass: collect all column names and check for duplicates
+        let mut seen_names: HashSet<String> = HashSet::with_capacity(stmt.columns.len());
+        let mut all_column_names: Vec<String> = Vec::with_capacity(stmt.columns.len());
+        for column_def in &stmt.columns {
+            let column_name = column_def.name.value.clone();
+            let normalized = column_name.to_ascii_lowercase();
+            if !seen_names.insert(normalized) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "duplicate column name '{}' in table '{}'",
+                    column_name, display_name
+                )));
+            }
+            all_column_names.push(column_name);
+        }
+
+        // Second pass: process columns including CHECK validation
         for column_def in stmt.columns {
             let is_nullable = column_def
                 .options
@@ -418,10 +500,28 @@ where
                 )
             });
 
+            // Extract CHECK constraint if present and validate it
+            let check_expr = column_def.options.iter().find_map(|opt| {
+                if let ColumnOption::Check(expr) = &opt.option {
+                    Some(expr)
+                } else {
+                    None
+                }
+            });
+
+            // Validate CHECK constraint if present (now we have all column names)
+            if let Some(check_expr) = check_expr {
+                let all_col_refs: Vec<&str> = all_column_names.iter().map(|s| s.as_str()).collect();
+                validate_check_constraint(check_expr, &display_name, &all_col_refs)?;
+            }
+
+            let check_expr_str = check_expr.map(|e| e.to_string());
+
             tracing::trace!(
-                "DEBUG CREATE TABLE column '{}' is_primary_key={}",
+                "DEBUG CREATE TABLE column '{}' is_primary_key={} check_expr={:?}",
                 column_def.name.value,
-                is_primary_key
+                is_primary_key,
+                check_expr_str
             );
 
             let mut column = ColumnSpec::new(
@@ -434,20 +534,16 @@ where
                 column.primary_key
             );
 
-            column = column.with_primary_key(is_primary_key);
+            column = column
+                .with_primary_key(is_primary_key)
+                .with_check(check_expr_str);
             tracing::trace!(
-                "DEBUG ColumnSpec after with_primary_key({}): primary_key={}",
+                "DEBUG ColumnSpec after with_primary_key({}): primary_key={} check_expr={:?}",
                 is_primary_key,
-                column.primary_key
+                column.primary_key,
+                column.check_expr
             );
 
-            let normalized = column.name.to_ascii_lowercase();
-            if names.insert(normalized, ()).is_some() {
-                return Err(Error::InvalidArgumentError(format!(
-                    "duplicate column name '{}' in table '{}'",
-                    column.name, display_name
-                )));
-            }
             columns.push(column);
         }
 
@@ -459,6 +555,69 @@ where
             source: None,
         };
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
+    }
+
+    fn handle_create_schema(
+        &self,
+        schema_name: SchemaName,
+        _if_not_exists: bool,
+        with: Option<Vec<SqlOption>>,
+        options: Option<Vec<SqlOption>>,
+        default_collate_spec: Option<SqlExpr>,
+        clone: Option<ObjectName>,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        if clone.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE SCHEMA ... CLONE is not supported".into(),
+            ));
+        }
+        if with.as_ref().is_some_and(|opts| !opts.is_empty()) {
+            return Err(Error::InvalidArgumentError(
+                "CREATE SCHEMA ... WITH options are not supported".into(),
+            ));
+        }
+        if options.as_ref().is_some_and(|opts| !opts.is_empty()) {
+            return Err(Error::InvalidArgumentError(
+                "CREATE SCHEMA options are not supported".into(),
+            ));
+        }
+        if default_collate_spec.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE SCHEMA DEFAULT COLLATE is not supported".into(),
+            ));
+        }
+
+        let schema_name = match schema_name {
+            SchemaName::Simple(name) => name,
+            _ => {
+                return Err(Error::InvalidArgumentError(
+                    "CREATE SCHEMA authorization is not supported".into(),
+                ));
+            }
+        };
+
+        let (display_name, canonical) = canonical_object_name(&schema_name)?;
+        if display_name.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "schema name must not be empty".into(),
+            ));
+        }
+
+        // Register schema in the catalog
+        let catalog = self.engine.context().table_catalog();
+
+        if _if_not_exists && catalog.schema_exists(&canonical) {
+            return Ok(RuntimeStatementResult::NoOp);
+        }
+
+        catalog.register_schema(&canonical).map_err(|err| {
+            Error::CatalogError(format!(
+                "Failed to create schema '{}': {}",
+                display_name, err
+            ))
+        })?;
+
+        Ok(RuntimeStatementResult::NoOp)
     }
 
     fn try_handle_range_ctas(
@@ -629,6 +788,221 @@ where
         }
 
         Ok(Some(create_result))
+    }
+
+    // TODO: Refactor into runtime or executor layer?
+    /// Try to handle pragma_table_info('table_name') table function
+    fn try_handle_pragma_table_info(
+        &self,
+        query: &Query,
+    ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select,
+            _ => return Ok(None),
+        };
+
+        if select.from.len() != 1 {
+            return Ok(None);
+        }
+
+        let table_with_joins = &select.from[0];
+        if !table_with_joins.joins.is_empty() {
+            return Ok(None);
+        }
+
+        // Check if this is pragma_table_info function call
+        let table_name = match &table_with_joins.relation {
+            TableFactor::Table {
+                name,
+                args: Some(args),
+                ..
+            } => {
+                let func_name = name.to_string().to_ascii_lowercase();
+                if func_name != "pragma_table_info" {
+                    return Ok(None);
+                }
+
+                // Extract table name from argument
+                if args.args.len() != 1 {
+                    return Err(Error::InvalidArgumentError(
+                        "pragma_table_info expects exactly one argument".into(),
+                    ));
+                }
+
+                match &args.args[0] {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value))) => {
+                        match &value.value {
+                            Value::SingleQuotedString(s) => s.clone(),
+                            Value::DoubleQuotedString(s) => s.clone(),
+                            _ => {
+                                return Err(Error::InvalidArgumentError(
+                                    "pragma_table_info argument must be a string".into(),
+                                ));
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "pragma_table_info argument must be a string literal".into(),
+                        ));
+                    }
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        // Get table column specs from runtime context
+        let context = self.engine.context();
+        let columns = context.table_column_specs(&table_name)?;
+
+        // Build RecordBatch with table column information
+        use arrow::array::{BooleanArray, Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let mut cid_values = Vec::new();
+        let mut name_values = Vec::new();
+        let mut type_values = Vec::new();
+        let mut notnull_values = Vec::new();
+        let mut dflt_value_values: Vec<Option<String>> = Vec::new();
+        let mut pk_values = Vec::new();
+
+        for (idx, col) in columns.iter().enumerate() {
+            cid_values.push(idx as i32);
+            name_values.push(col.name.clone());
+            type_values.push(format!("{:?}", col.data_type)); // Simple type representation
+            notnull_values.push(!col.nullable);
+            dflt_value_values.push(None); // We don't track default values yet
+            pk_values.push(col.primary_key);
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("cid", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("type", DataType::Utf8, false),
+            Field::new("notnull", DataType::Boolean, false),
+            Field::new("dflt_value", DataType::Utf8, true),
+            Field::new("pk", DataType::Boolean, false),
+        ]));
+
+        use arrow::array::ArrayRef;
+        let mut batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(cid_values)) as ArrayRef,
+                Arc::new(StringArray::from(name_values)) as ArrayRef,
+                Arc::new(StringArray::from(type_values)) as ArrayRef,
+                Arc::new(BooleanArray::from(notnull_values)) as ArrayRef,
+                Arc::new(StringArray::from(dflt_value_values)) as ArrayRef,
+                Arc::new(BooleanArray::from(pk_values)) as ArrayRef,
+            ],
+        )
+        .map_err(|e| Error::Internal(format!("failed to create pragma_table_info batch: {}", e)))?;
+
+        // Apply SELECT projections: extract only requested columns
+        let projection_indices: Vec<usize> = select
+            .projection
+            .iter()
+            .filter_map(|item| {
+                match item {
+                    SelectItem::UnnamedExpr(SqlExpr::Identifier(ident)) => {
+                        schema.index_of(&ident.value).ok()
+                    }
+                    SelectItem::ExprWithAlias { expr, .. } => {
+                        if let SqlExpr::Identifier(ident) = expr {
+                            schema.index_of(&ident.value).ok()
+                        } else {
+                            None
+                        }
+                    }
+                    SelectItem::Wildcard(_) => None, // Handle * separately
+                    _ => None,
+                }
+            })
+            .collect();
+
+        // Apply projections if not SELECT *
+        let projected_schema;
+        if !projection_indices.is_empty() {
+            let projected_fields: Vec<Field> = projection_indices
+                .iter()
+                .map(|&idx| schema.field(idx).clone())
+                .collect();
+            projected_schema = Arc::new(Schema::new(projected_fields));
+
+            let projected_columns: Vec<ArrayRef> = projection_indices
+                .iter()
+                .map(|&idx| Arc::clone(batch.column(idx)))
+                .collect();
+
+            batch = RecordBatch::try_new(Arc::clone(&projected_schema), projected_columns)
+                .map_err(|e| Error::Internal(format!("failed to project columns: {}", e)))?;
+        } else {
+            // SELECT * or complex projections - use original schema
+            projected_schema = schema;
+        }
+
+        // Apply ORDER BY using Arrow compute kernels
+        if let Some(order_by) = &query.order_by {
+            use arrow::compute::SortColumn;
+            use arrow::compute::lexsort_to_indices;
+            use sqlparser::ast::OrderByKind;
+
+            let exprs = match &order_by.kind {
+                OrderByKind::Expressions(exprs) => exprs,
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "unsupported ORDER BY clause".into(),
+                    ));
+                }
+            };
+
+            let mut sort_columns = Vec::new();
+            for order_expr in exprs {
+                if let SqlExpr::Identifier(ident) = &order_expr.expr
+                    && let Ok(col_idx) = projected_schema.index_of(&ident.value)
+                {
+                    let options = arrow::compute::SortOptions {
+                        descending: !order_expr.options.asc.unwrap_or(true),
+                        nulls_first: order_expr.options.nulls_first.unwrap_or(false),
+                    };
+                    sort_columns.push(SortColumn {
+                        values: Arc::clone(batch.column(col_idx)),
+                        options: Some(options),
+                    });
+                }
+            }
+
+            if !sort_columns.is_empty() {
+                let indices = lexsort_to_indices(&sort_columns, None)
+                    .map_err(|e| Error::Internal(format!("failed to sort: {}", e)))?;
+
+                use arrow::compute::take;
+                let sorted_columns: Result<Vec<ArrayRef>, _> = batch
+                    .columns()
+                    .iter()
+                    .map(|col| take(col.as_ref(), &indices, None))
+                    .collect();
+
+                batch = RecordBatch::try_new(
+                    Arc::clone(&projected_schema),
+                    sorted_columns
+                        .map_err(|e| Error::Internal(format!("failed to apply sort: {}", e)))?,
+                )
+                .map_err(|e| Error::Internal(format!("failed to create sorted batch: {}", e)))?;
+            }
+        }
+
+        let execution = SelectExecution::new_single_batch(
+            table_name.clone(),
+            Arc::clone(&projected_schema),
+            batch,
+        );
+
+        Ok(Some(RuntimeStatementResult::Select {
+            table_name,
+            schema: projected_schema,
+            execution,
+        }))
     }
 
     fn handle_create_table_as(
@@ -813,6 +1187,10 @@ where
             ));
         }
 
+        let catalog = self.engine.context().table_catalog();
+        let resolver = catalog.identifier_resolver();
+        let table_id = catalog.table_id(&canonical_name);
+
         let mut column_assignments = Vec::with_capacity(assignments.len());
         let mut seen: HashMap<String, ()> = HashMap::new();
         for assignment in assignments {
@@ -829,7 +1207,11 @@ where
                 Err(Error::InvalidArgumentError(msg))
                     if msg.contains("unsupported literal expression") =>
                 {
-                    let translated = translate_scalar(&assignment.value)?;
+                    let translated = translate_scalar_with_context(
+                        &resolver,
+                        IdentifierContext::new(table_id),
+                        &assignment.value,
+                    )?;
                     AssignmentValue::Expression(translated)
                 }
                 Err(err) => return Err(err),
@@ -841,7 +1223,11 @@ where
         }
 
         let filter = match selection {
-            Some(expr) => Some(translate_condition(&expr)?),
+            Some(expr) => Some(translate_condition_with_context(
+                &resolver,
+                IdentifierContext::new(table_id),
+                &expr,
+            )?),
             None => None,
         };
 
@@ -909,8 +1295,14 @@ where
             ));
         }
 
+        let catalog = self.engine.context().table_catalog();
+        let resolver = catalog.identifier_resolver();
+        let table_id = catalog.table_id(&canonical_name);
+
         let filter = selection
-            .map(|expr| translate_condition(&expr))
+            .map(|expr| {
+                translate_condition_with_context(&resolver, IdentifierContext::new(table_id), &expr)
+            })
             .transpose()?;
 
         let plan = DeletePlan {
@@ -931,29 +1323,102 @@ where
         purge: bool,
         temporary: bool,
     ) -> SqlResult<RuntimeStatementResult<P>> {
-        if cascade || restrict || purge || temporary {
+        if purge || temporary {
             return Err(Error::InvalidArgumentError(
-                "DROP TABLE cascade/restrict/purge/temporary options are not supported".into(),
+                "DROP purge/temporary options are not supported".into(),
             ));
         }
 
-        if object_type != ObjectType::Table {
-            return Err(Error::InvalidArgumentError(
-                "only DROP TABLE is supported".into(),
-            ));
-        }
+        match object_type {
+            ObjectType::Table => {
+                if cascade || restrict {
+                    return Err(Error::InvalidArgumentError(
+                        "DROP TABLE CASCADE/RESTRICT is not supported".into(),
+                    ));
+                }
 
-        let ctx = self.engine.context();
-        for name in names {
-            let table_name = Self::object_name_to_string(&name)?;
-            ctx.drop_table_immediate(&table_name, if_exists)
-                .map_err(|err| Self::map_table_error(&table_name, err))?;
-        }
+                let ctx = self.engine.context();
+                for name in names {
+                    let table_name = Self::object_name_to_string(&name)?;
+                    ctx.drop_table_immediate(&table_name, if_exists)
+                        .map_err(|err| Self::map_table_error(&table_name, err))?;
+                }
 
-        Ok(RuntimeStatementResult::NoOp)
+                Ok(RuntimeStatementResult::NoOp)
+            }
+            ObjectType::Schema => {
+                if restrict {
+                    return Err(Error::InvalidArgumentError(
+                        "DROP SCHEMA RESTRICT is not supported".into(),
+                    ));
+                }
+
+                let catalog = self.engine.context().table_catalog();
+
+                for name in names {
+                    let (display_name, canonical_name) = canonical_object_name(&name)?;
+
+                    if !catalog.schema_exists(&canonical_name) {
+                        if if_exists {
+                            continue;
+                        }
+                        return Err(Error::CatalogError(format!(
+                            "Schema '{}' does not exist",
+                            display_name
+                        )));
+                    }
+
+                    if cascade {
+                        // Drop all tables in this schema
+                        let all_tables = catalog.table_names();
+                        let schema_prefix = format!("{}.", canonical_name);
+
+                        let ctx = self.engine.context();
+                        for table in all_tables {
+                            if table.to_ascii_lowercase().starts_with(&schema_prefix) {
+                                ctx.drop_table_immediate(&table, false)?;
+                            }
+                        }
+                    } else {
+                        // Check if schema has any tables
+                        let all_tables = catalog.table_names();
+                        let schema_prefix = format!("{}.", canonical_name);
+                        let has_tables = all_tables
+                            .iter()
+                            .any(|t| t.to_ascii_lowercase().starts_with(&schema_prefix));
+
+                        if has_tables {
+                            return Err(Error::CatalogError(format!(
+                                "Schema '{}' is not empty. Use CASCADE to drop schema and all its tables",
+                                display_name
+                            )));
+                        }
+                    }
+
+                    // Drop the schema
+                    if !catalog.unregister_schema(&canonical_name) && !if_exists {
+                        return Err(Error::CatalogError(format!(
+                            "Schema '{}' does not exist",
+                            display_name
+                        )));
+                    }
+                }
+
+                Ok(RuntimeStatementResult::NoOp)
+            }
+            _ => Err(Error::InvalidArgumentError(format!(
+                "DROP {} is not supported",
+                object_type
+            ))),
+        }
     }
 
     fn handle_query(&self, query: Query) -> SqlResult<RuntimeStatementResult<P>> {
+        // Check for pragma_table_info() table function first
+        if let Some(result) = self.try_handle_pragma_table_info(&query)? {
+            return Ok(result);
+        }
+
         let select_plan = self.build_select_plan(query)?;
         self.execute_plan_statement(PlanStatement::Select(select_plan))
     }
@@ -966,8 +1431,11 @@ where
         }
 
         validate_simple_query(&query)?;
-        let mut select_plan = match query.body.as_ref() {
-            SetExpr::Select(select) => self.translate_select(select.as_ref())?,
+        let catalog = self.engine.context().table_catalog();
+        let resolver = catalog.identifier_resolver();
+
+        let (mut select_plan, select_context) = match query.body.as_ref() {
+            SetExpr::Select(select) => self.translate_select(select.as_ref(), &resolver)?,
             other => {
                 return Err(Error::InvalidArgumentError(format!(
                     "unsupported query expression: {other:?}"
@@ -980,13 +1448,17 @@ where
                     "ORDER BY is not supported for aggregate queries".into(),
                 ));
             }
-            let order_plan = self.translate_order_by(order_by)?;
+            let order_plan = self.translate_order_by(&resolver, select_context, order_by)?;
             select_plan = select_plan.with_order_by(Some(order_plan));
         }
         Ok(select_plan)
     }
 
-    fn translate_select(&self, select: &Select) -> SqlResult<SelectPlan> {
+    fn translate_select(
+        &self,
+        select: &Select,
+        resolver: &IdentifierResolver<'_>,
+    ) -> SqlResult<(SelectPlan, IdentifierContext)> {
         if select.distinct.is_some() {
             return Err(Error::InvalidArgumentError(
                 "SELECT DISTINCT is not supported".into(),
@@ -1040,25 +1512,76 @@ where
             ));
         }
 
-        let (display_name, _canonical_name) = extract_single_table(&select.from)?;
-        let mut plan = SelectPlan::new(display_name);
+        let table_alias = select
+            .from
+            .first()
+            .and_then(|table_with_joins| match &table_with_joins.relation {
+                TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+                _ => None,
+            });
 
-        if let Some(aggregates) = self.detect_simple_aggregates(&select.projection)? {
-            plan = plan.with_aggregates(aggregates);
-        } else {
-            let projections = self.build_projection_list(&select.projection)?;
-            plan = plan.with_projections(projections);
+        if let Some(alias) = table_alias.as_ref() {
+            validate_projection_alias_qualifiers(&select.projection, alias)?;
         }
+        // Handle different FROM clause scenarios
+        let catalog = self.engine.context().table_catalog();
+        let (mut plan, id_context) = if select.from.is_empty() {
+            // No FROM clause - use empty string for table context (e.g., SELECT 42, SELECT {'a': 1} AS x)
+            let mut p = SelectPlan::new("");
+            let projections = self.build_projection_list(
+                resolver,
+                IdentifierContext::new(None),
+                &select.projection,
+            )?;
+            p = p.with_projections(projections);
+            (p, IdentifierContext::new(None))
+        } else if select.from.len() == 1 {
+            // Single table query
+            let (display_name, canonical_name) = extract_single_table(&select.from)?;
+            let table_id = catalog.table_id(&canonical_name);
+            let mut p = SelectPlan::new(display_name.clone());
+            if let Some(aggregates) = self.detect_simple_aggregates(&select.projection)? {
+                p = p.with_aggregates(aggregates);
+            } else {
+                let projections = self.build_projection_list(
+                    resolver,
+                    IdentifierContext::new(table_id),
+                    &select.projection,
+                )?;
+                p = p.with_projections(projections);
+            }
+            (p, IdentifierContext::new(table_id))
+        } else {
+            // Multiple tables - cross product
+            let tables = extract_tables(&select.from)?;
+            let mut p = SelectPlan::with_tables(tables);
+            // For multi-table queries, we'll build projections differently
+            // For now, just handle simple column references
+            let projections = self.build_projection_list(
+                resolver,
+                IdentifierContext::new(None),
+                &select.projection,
+            )?;
+            p = p.with_projections(projections);
+            (p, IdentifierContext::new(None))
+        };
 
         let filter_expr = match &select.selection {
-            Some(expr) => Some(translate_condition(expr)?),
+            Some(expr) => Some(translate_condition_with_context(
+                resolver, id_context, expr,
+            )?),
             None => None,
         };
         plan = plan.with_filter(filter_expr);
-        Ok(plan)
+        Ok((plan, id_context))
     }
 
-    fn translate_order_by(&self, order_by: &OrderBy) -> SqlResult<OrderByPlan> {
+    fn translate_order_by(
+        &self,
+        resolver: &IdentifierResolver<'_>,
+        id_context: IdentifierContext,
+        order_by: &OrderBy,
+    ) -> SqlResult<OrderByPlan> {
         let exprs = match &order_by.kind {
             OrderByKind::Expressions(exprs) => exprs,
             _ => {
@@ -1087,9 +1610,19 @@ where
             .nulls_first
             .unwrap_or(default_nulls_first_for_direction);
 
+        let resolve_simple_column = |expr: &SqlExpr| -> SqlResult<String> {
+            let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
+            match scalar {
+                llkv_expr::expr::ScalarExpr::Column(column) => Ok(column),
+                other => Err(Error::InvalidArgumentError(format!(
+                    "ORDER BY expression must reference a simple column, found {other:?}"
+                ))),
+            }
+        };
+
         let (target, sort_type) = match &order_expr.expr {
             SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => (
-                OrderTarget::Column(resolve_column_name(&order_expr.expr)?),
+                OrderTarget::Column(resolve_simple_column(&order_expr.expr)?),
                 OrderSortType::Native,
             ),
             SqlExpr::Cast {
@@ -1102,7 +1635,7 @@ where
                     | SqlDataType::TinyInt(_),
                 ..
             } => (
-                OrderTarget::Column(resolve_column_name(expr)?),
+                OrderTarget::Column(resolve_simple_column(expr)?),
                 OrderSortType::CastTextToInteger,
             ),
             SqlExpr::Cast { data_type, .. } => {
@@ -1306,6 +1839,8 @@ where
 
     fn build_projection_list(
         &self,
+        resolver: &IdentifierResolver<'_>,
+        id_context: IdentifierContext,
         projection_items: &[SelectItem],
     ) -> SqlResult<Vec<SelectProjection>> {
         if projection_items.is_empty() {
@@ -1313,11 +1848,25 @@ where
                 "SELECT projection must include at least one column".into(),
             ));
         }
+
         let mut projections = Vec::with_capacity(projection_items.len());
         for (idx, item) in projection_items.iter().enumerate() {
             match item {
-                SelectItem::Wildcard(_) => {
-                    projections.push(SelectProjection::AllColumns);
+                SelectItem::Wildcard(options) => {
+                    if let Some(exclude) = &options.opt_exclude {
+                        use sqlparser::ast::ExcludeSelectItem;
+                        let exclude_cols = match exclude {
+                            ExcludeSelectItem::Single(ident) => vec![ident.value.clone()],
+                            ExcludeSelectItem::Multiple(idents) => {
+                                idents.iter().map(|id| id.value.clone()).collect()
+                            }
+                        };
+                        projections.push(SelectProjection::AllColumnsExcept {
+                            exclude: exclude_cols,
+                        });
+                    } else {
+                        projections.push(SelectProjection::AllColumns);
+                    }
                 }
                 SelectItem::QualifiedWildcard(kind, _) => match kind {
                     SelectItemQualifiedWildcardKind::ObjectName(name) => {
@@ -1332,21 +1881,89 @@ where
                         ));
                     }
                 },
-                SelectItem::UnnamedExpr(expr) => {
-                    let scalar = translate_scalar(expr)?;
-                    let alias = format!("col{}", idx + 1);
-                    projections.push(SelectProjection::Computed {
-                        expr: scalar,
-                        alias,
-                    });
-                }
-                SelectItem::ExprWithAlias { expr, alias } => {
-                    let scalar = translate_scalar(expr)?;
-                    projections.push(SelectProjection::Computed {
-                        expr: scalar,
-                        alias: alias.value.clone(),
-                    });
-                }
+                SelectItem::UnnamedExpr(expr) => match expr {
+                    SqlExpr::Identifier(ident) => {
+                        let parts = vec![ident.value.clone()];
+                        let resolution = resolver.resolve(&parts, id_context)?;
+                        if resolution.is_simple() {
+                            projections.push(SelectProjection::Column {
+                                name: resolution.column().to_string(),
+                                alias: None,
+                            });
+                        } else {
+                            let alias = format!("col{}", idx + 1);
+                            projections.push(SelectProjection::Computed {
+                                expr: resolution.into_scalar_expr(),
+                                alias,
+                            });
+                        }
+                    }
+                    SqlExpr::CompoundIdentifier(parts) => {
+                        let name_parts: Vec<String> =
+                            parts.iter().map(|part| part.value.clone()).collect();
+                        let resolution = resolver.resolve(&name_parts, id_context)?;
+                        if resolution.is_simple() {
+                            projections.push(SelectProjection::Column {
+                                name: resolution.column().to_string(),
+                                alias: None,
+                            });
+                        } else {
+                            let alias = format!("col{}", idx + 1);
+                            projections.push(SelectProjection::Computed {
+                                expr: resolution.into_scalar_expr(),
+                                alias,
+                            });
+                        }
+                    }
+                    _ => {
+                        let alias = format!("col{}", idx + 1);
+                        let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
+                        projections.push(SelectProjection::Computed {
+                            expr: scalar,
+                            alias,
+                        });
+                    }
+                },
+                SelectItem::ExprWithAlias { expr, alias } => match expr {
+                    SqlExpr::Identifier(ident) => {
+                        let parts = vec![ident.value.clone()];
+                        let resolution = resolver.resolve(&parts, id_context)?;
+                        if resolution.is_simple() {
+                            projections.push(SelectProjection::Column {
+                                name: resolution.column().to_string(),
+                                alias: Some(alias.value.clone()),
+                            });
+                        } else {
+                            projections.push(SelectProjection::Computed {
+                                expr: resolution.into_scalar_expr(),
+                                alias: alias.value.clone(),
+                            });
+                        }
+                    }
+                    SqlExpr::CompoundIdentifier(parts) => {
+                        let name_parts: Vec<String> =
+                            parts.iter().map(|part| part.value.clone()).collect();
+                        let resolution = resolver.resolve(&name_parts, id_context)?;
+                        if resolution.is_simple() {
+                            projections.push(SelectProjection::Column {
+                                name: resolution.column().to_string(),
+                                alias: Some(alias.value.clone()),
+                            });
+                        } else {
+                            projections.push(SelectProjection::Computed {
+                                expr: resolution.into_scalar_expr(),
+                                alias: alias.value.clone(),
+                            });
+                        }
+                    }
+                    _ => {
+                        let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
+                        projections.push(SelectProjection::Computed {
+                            expr: scalar,
+                            alias: alias.value.clone(),
+                        });
+                    }
+                },
             }
         }
         Ok(projections)
@@ -1564,6 +2181,44 @@ fn canonical_object_name(name: &ObjectName) -> SqlResult<(String, String)> {
     Ok((display, canonical))
 }
 
+/// Parse an object name into optional schema and table name components.
+///
+/// Returns (schema_name, table_name) where schema_name is None if not qualified.
+///
+/// Examples:
+/// - "users" -> (None, "users")
+/// - "test.users" -> (Some("test"), "users")
+/// - "catalog.test.users" -> Error (too many parts)
+fn parse_schema_qualified_name(name: &ObjectName) -> SqlResult<(Option<String>, String)> {
+    if name.0.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "object name must not be empty".into(),
+        ));
+    }
+
+    let mut parts: Vec<String> = Vec::with_capacity(name.0.len());
+    for part in &name.0 {
+        let ident = match part {
+            ObjectNamePart::Identifier(ident) => ident,
+            _ => {
+                return Err(Error::InvalidArgumentError(
+                    "object names using functions are not supported".into(),
+                ));
+            }
+        };
+        parts.push(ident.value.clone());
+    }
+
+    match parts.len() {
+        1 => Ok((None, parts[0].clone())),
+        2 => Ok((Some(parts[0].clone()), parts[1].clone())),
+        _ => Err(Error::InvalidArgumentError(format!(
+            "table name has too many parts: {}",
+            name
+        ))),
+    }
+}
+
 fn validate_create_table_common(stmt: &sqlparser::ast::CreateTable) -> SqlResult<()> {
     if stmt.clone.is_some() || stmt.like.is_some() {
         return Err(Error::InvalidArgumentError(
@@ -1583,11 +2238,164 @@ fn validate_create_table_common(stmt: &sqlparser::ast::CreateTable) -> SqlResult
     Ok(())
 }
 
+fn validate_check_constraint(
+    check_expr: &sqlparser::ast::Expr,
+    table_name: &str,
+    column_names: &[&str],
+) -> SqlResult<()> {
+    use sqlparser::ast::Expr as SqlExpr;
+
+    match check_expr {
+        // Subqueries are not allowed
+        SqlExpr::Subquery(_) => {
+            return Err(Error::InvalidArgumentError(
+                "Subqueries are not allowed in CHECK constraints".into(),
+            ));
+        }
+        // Aggregate functions are not allowed
+        SqlExpr::Function(func) => {
+            // Check if it's an aggregate function
+            let func_name = func.name.to_string().to_uppercase();
+            if matches!(func_name.as_str(), "SUM" | "AVG" | "COUNT" | "MIN" | "MAX") {
+                return Err(Error::InvalidArgumentError(
+                    "Aggregate functions are not allowed in CHECK constraints".into(),
+                ));
+            }
+            // Recursively validate function arguments
+            let args_slice: &[sqlparser::ast::FunctionArg] = match &func.args {
+                sqlparser::ast::FunctionArguments::List(list) => &list.args,
+                _ => &[],
+            };
+            for arg in args_slice {
+                if let sqlparser::ast::FunctionArg::Unnamed(
+                    sqlparser::ast::FunctionArgExpr::Expr(expr),
+                ) = arg
+                {
+                    validate_check_constraint(expr, table_name, column_names)?;
+                }
+            }
+        }
+        // Check column references
+        SqlExpr::Identifier(ident) => {
+            let col_name = &ident.value;
+            if !column_names
+                .iter()
+                .any(|&name| name.eq_ignore_ascii_case(col_name))
+            {
+                return Err(Error::InvalidArgumentError(format!(
+                    "Column '{}' referenced in CHECK constraint does not exist",
+                    col_name
+                )));
+            }
+        }
+        SqlExpr::CompoundIdentifier(idents) => {
+            // Handle table.column, col.field, or schema.table.column references
+            if idents.len() == 2 {
+                // Could be table.column OR col.field (struct field access)
+                let first_part = &idents[0].value;
+                let second_part = &idents[1].value;
+
+                // Check if first part is a column name (struct field access case)
+                if column_names
+                    .iter()
+                    .any(|&name| name.eq_ignore_ascii_case(first_part))
+                {
+                    // This is col.field - struct field access, which is valid
+                    // Runtime will validate the struct field exists during INSERT
+                    return Ok(());
+                }
+
+                // Otherwise, treat as table.column
+                // Check if table reference matches the current table being created
+                if !first_part.eq_ignore_ascii_case(table_name) {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "CHECK constraint references column from different table '{}'",
+                        first_part
+                    )));
+                }
+
+                // Check if column exists
+                if !column_names
+                    .iter()
+                    .any(|&name| name.eq_ignore_ascii_case(second_part))
+                {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Column '{}' referenced in CHECK constraint does not exist",
+                        second_part
+                    )));
+                }
+            } else if idents.len() == 3 {
+                // Could be schema.table.column OR table.column.field
+                let first_part = &idents[0].value;
+                let second_part = &idents[1].value;
+                let third_part = &idents[2].value;
+
+                // Check if first part matches table name (table.column.field case)
+                if first_part.eq_ignore_ascii_case(table_name) {
+                    // This is table.column.field - validate column exists
+                    if !column_names
+                        .iter()
+                        .any(|&name| name.eq_ignore_ascii_case(second_part))
+                    {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Column '{}' referenced in CHECK constraint does not exist",
+                            second_part
+                        )));
+                    }
+                    // Field access will be validated at runtime
+                } else if second_part.eq_ignore_ascii_case(table_name) {
+                    // This is schema.table.column - validate column exists
+                    if !column_names
+                        .iter()
+                        .any(|&name| name.eq_ignore_ascii_case(third_part))
+                    {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Column '{}' referenced in CHECK constraint does not exist",
+                            third_part
+                        )));
+                    }
+                } else {
+                    // References different table - reject
+                    return Err(Error::InvalidArgumentError(format!(
+                        "CHECK constraint references column from different table '{}'",
+                        second_part
+                    )));
+                }
+            } else {
+                // For longer paths (col.field.subfield), allow it
+                // Runtime will validate during INSERT
+            }
+        }
+        // Binary operations - recursively validate both sides
+        SqlExpr::BinaryOp { left, right, .. } => {
+            validate_check_constraint(left, table_name, column_names)?;
+            validate_check_constraint(right, table_name, column_names)?;
+        }
+        // Unary operations - validate the operand
+        SqlExpr::UnaryOp { expr, .. } => {
+            validate_check_constraint(expr, table_name, column_names)?;
+        }
+        // Nested expressions
+        SqlExpr::Nested(expr) => {
+            validate_check_constraint(expr, table_name, column_names)?;
+        }
+        // Literals and other safe expressions are allowed
+        SqlExpr::Value(_) | SqlExpr::TypedString { .. } => {}
+        // Allow other expression types for now
+        _ => {}
+    }
+
+    Ok(())
+}
+
 fn validate_create_table_definition(stmt: &sqlparser::ast::CreateTable) -> SqlResult<()> {
     for column in &stmt.columns {
         for ColumnOptionDef { option, .. } in &column.options {
             match option {
-                ColumnOption::Null | ColumnOption::NotNull | ColumnOption::Unique { .. } => {}
+                ColumnOption::Null
+                | ColumnOption::NotNull
+                | ColumnOption::Unique { .. }
+                | ColumnOption::Check(_) => {}
                 ColumnOption::Default(_) => {
                     return Err(Error::InvalidArgumentError(format!(
                         "DEFAULT values are not supported for column '{}'",
@@ -1665,6 +2473,31 @@ fn resolve_column_name(expr: &SqlExpr) -> SqlResult<String> {
     }
 }
 
+fn validate_projection_alias_qualifiers(
+    projection_items: &[SelectItem],
+    alias: &str,
+) -> SqlResult<()> {
+    let alias_lower = alias.to_ascii_lowercase();
+    for item in projection_items {
+        match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                if let SqlExpr::CompoundIdentifier(parts) = expr
+                    && parts.len() >= 2
+                    && let Some(first) = parts.first()
+                    && !first.value.eq_ignore_ascii_case(&alias_lower)
+                {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Binder Error: table '{}' not found",
+                        first.value
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Try to parse a function as an aggregate call for use in scalar expressions
 /// Check if a scalar expression contains any aggregate functions
 #[allow(dead_code)] // Utility function for future use
@@ -1674,6 +2507,7 @@ fn expr_contains_aggregate(expr: &llkv_expr::expr::ScalarExpr<String>) -> bool {
         llkv_expr::expr::ScalarExpr::Binary { left, right, .. } => {
             expr_contains_aggregate(left) || expr_contains_aggregate(right)
         }
+        llkv_expr::expr::ScalarExpr::GetField { base, .. } => expr_contains_aggregate(base),
         llkv_expr::expr::ScalarExpr::Column(_) | llkv_expr::expr::ScalarExpr::Literal(_) => false,
     }
 }
@@ -1848,23 +2682,29 @@ fn is_integer_literal(expr: &SqlExpr, expected: i64) -> bool {
     }
 }
 
-fn translate_condition(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
+fn translate_condition_with_context(
+    resolver: &IdentifierResolver<'_>,
+    context: IdentifierContext,
+    expr: &SqlExpr,
+) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     match expr {
         SqlExpr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => Ok(llkv_expr::expr::Expr::And(vec![
-                translate_condition(left)?,
-                translate_condition(right)?,
+                translate_condition_with_context(resolver, context, left)?,
+                translate_condition_with_context(resolver, context, right)?,
             ])),
             BinaryOperator::Or => Ok(llkv_expr::expr::Expr::Or(vec![
-                translate_condition(left)?,
-                translate_condition(right)?,
+                translate_condition_with_context(resolver, context, left)?,
+                translate_condition_with_context(resolver, context, right)?,
             ])),
             BinaryOperator::Eq
             | BinaryOperator::NotEq
             | BinaryOperator::Lt
             | BinaryOperator::LtEq
             | BinaryOperator::Gt
-            | BinaryOperator::GtEq => translate_comparison(left, op.clone(), right),
+            | BinaryOperator::GtEq => {
+                translate_comparison_with_context(resolver, context, left, op.clone(), right)
+            }
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported binary operator in WHERE clause: {other:?}"
             ))),
@@ -1872,21 +2712,25 @@ fn translate_condition(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::Expr<'stati
         SqlExpr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
-        } => Ok(llkv_expr::expr::Expr::not(translate_condition(expr)?)),
-        SqlExpr::Nested(inner) => translate_condition(inner),
+        } => Ok(llkv_expr::expr::Expr::not(
+            translate_condition_with_context(resolver, context, expr)?,
+        )),
+        SqlExpr::Nested(inner) => translate_condition_with_context(resolver, context, inner),
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported WHERE clause: {other:?}"
         ))),
     }
 }
 
-fn translate_comparison(
+fn translate_comparison_with_context(
+    resolver: &IdentifierResolver<'_>,
+    context: IdentifierContext,
     left: &SqlExpr,
     op: BinaryOperator,
     right: &SqlExpr,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
-    let left_scalar = translate_scalar(left)?;
-    let right_scalar = translate_scalar(right)?;
+    let left_scalar = translate_scalar_with_context(resolver, context, left)?;
+    let right_scalar = translate_scalar_with_context(resolver, context, right)?;
     let compare_op = match op {
         BinaryOperator::Eq => llkv_expr::expr::CompareOp::Eq,
         BinaryOperator::NotEq => llkv_expr::expr::CompareOp::NotEq,
@@ -1960,18 +2804,54 @@ fn flip_compare_op(op: llkv_expr::expr::CompareOp) -> Option<llkv_expr::expr::Co
         llkv_expr::expr::CompareOp::NotEq => None,
     }
 }
+/// Translate scalar expression with knowledge of the FROM table context.
+/// This allows us to properly distinguish schema.table.column from column.field.field.
+fn translate_scalar_with_context(
+    resolver: &IdentifierResolver<'_>,
+    context: IdentifierContext,
+    expr: &SqlExpr,
+) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
+    match expr {
+        SqlExpr::Identifier(ident) => {
+            let parts = vec![ident.value.clone()];
+            let resolution = resolver.resolve(&parts, context)?;
+            Ok(resolution.into_scalar_expr())
+        }
+        SqlExpr::CompoundIdentifier(idents) => {
+            if idents.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "invalid compound identifier".into(),
+                ));
+            }
+
+            let parts: Vec<String> = idents.iter().map(|ident| ident.value.clone()).collect();
+            let resolution = resolver.resolve(&parts, context)?;
+            Ok(resolution.into_scalar_expr())
+        }
+        _ => translate_scalar(expr),
+    }
+}
 
 fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     match expr {
         SqlExpr::Identifier(ident) => Ok(llkv_expr::expr::ScalarExpr::column(ident.value.clone())),
         SqlExpr::CompoundIdentifier(idents) => {
-            if let Some(last) = idents.last() {
-                translate_scalar(&SqlExpr::Identifier(last.clone()))
-            } else {
-                Err(Error::InvalidArgumentError(
+            if idents.is_empty() {
+                return Err(Error::InvalidArgumentError(
                     "invalid compound identifier".into(),
-                ))
+                ));
             }
+
+            // Without table context, treat first part as column, rest as fields
+            let column_name = idents[0].value.clone();
+            let mut result = llkv_expr::expr::ScalarExpr::column(column_name);
+
+            for part in &idents[1..] {
+                let field_name = part.value.clone();
+                result = llkv_expr::expr::ScalarExpr::get_field(result, field_name);
+            }
+
+            Ok(result)
         }
         SqlExpr::Value(value) => literal_from_value(value),
         SqlExpr::BinaryOp { left, op, right } => {
@@ -2005,6 +2885,9 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                 Literal::String(_) => Err(Error::InvalidArgumentError(
                     "cannot negate string literal".into(),
                 )),
+                Literal::Struct(_) => Err(Error::InvalidArgumentError(
+                    "cannot negate struct literal".into(),
+                )),
             },
             _ => Err(Error::InvalidArgumentError(
                 "cannot negate non-literal expression".into(),
@@ -2025,6 +2908,29 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                     func.name
                 )))
             }
+        }
+        SqlExpr::Dictionary(fields) => {
+            // Dictionary literal like {'a': 1, 'b': 2} represents a STRUCT literal
+            let mut struct_fields = Vec::new();
+            for entry in fields {
+                let key = entry.key.value.clone(); // Use .value to get the actual identifier value
+                // Parse the value to a literal
+                let value_expr = translate_scalar(&entry.value)?;
+                // Extract the literal from the expression
+                match value_expr {
+                    llkv_expr::expr::ScalarExpr::Literal(lit) => {
+                        struct_fields.push((key, Box::new(lit)));
+                    }
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "Dictionary values must be literals".to_string(),
+                        ));
+                    }
+                }
+            }
+            Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Struct(
+                struct_fields,
+            )))
         }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported scalar expression: {other:?}"
@@ -2110,8 +3016,194 @@ fn arrow_type_from_sql(data_type: &SqlDataType) -> SqlResult<arrow::datatypes::D
         SqlDataType::Boolean => Err(Error::InvalidArgumentError(
             "BOOLEAN columns are not supported yet".into(),
         )),
+        SqlDataType::Custom(name, args) => {
+            if name.0.len() == 1
+                && let ObjectNamePart::Identifier(ident) = &name.0[0]
+                && ident.value.eq_ignore_ascii_case("row")
+            {
+                return row_type_to_arrow(data_type, args);
+            }
+            Err(Error::InvalidArgumentError(format!(
+                "unsupported SQL data type: {data_type:?}"
+            )))
+        }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported SQL data type: {other:?}"
+        ))),
+    }
+}
+
+fn row_type_to_arrow(
+    data_type: &SqlDataType,
+    tokens: &[String],
+) -> SqlResult<arrow::datatypes::DataType> {
+    use arrow::datatypes::{DataType, Field, FieldRef, Fields};
+
+    let row_str = data_type.to_string();
+    if tokens.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "ROW type must define at least one field".into(),
+        ));
+    }
+
+    let dialect = GenericDialect {};
+    let field_definitions = resolve_row_field_types(tokens, &dialect).map_err(|err| {
+        Error::InvalidArgumentError(format!("unable to parse ROW type '{row_str}': {err}"))
+    })?;
+
+    let mut fields: Vec<FieldRef> = Vec::with_capacity(field_definitions.len());
+    for (field_name, field_type) in field_definitions {
+        let arrow_field_type = arrow_type_from_sql(&field_type)?;
+        fields.push(Arc::new(Field::new(field_name, arrow_field_type, true)));
+    }
+
+    let struct_fields: Fields = fields.into();
+    Ok(DataType::Struct(struct_fields))
+}
+
+fn resolve_row_field_types(
+    tokens: &[String],
+    dialect: &GenericDialect,
+) -> SqlResult<Vec<(String, SqlDataType)>> {
+    if tokens.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "ROW type must define at least one field".into(),
+        ));
+    }
+
+    let mut start = 0;
+    let mut end = tokens.len();
+    if tokens[start] == "(" {
+        if end == 0 || tokens[end - 1] != ")" {
+            return Err(Error::InvalidArgumentError(
+                "ROW type is missing closing ')'".into(),
+            ));
+        }
+        start += 1;
+        end -= 1;
+    } else if tokens[end - 1] == ")" {
+        return Err(Error::InvalidArgumentError(
+            "ROW type contains unmatched ')'".into(),
+        ));
+    }
+
+    let slice = &tokens[start..end];
+    if slice.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "ROW type did not provide any field definitions".into(),
+        ));
+    }
+
+    let mut fields = Vec::new();
+    let mut index = 0;
+
+    while index < slice.len() {
+        if slice[index] == "," {
+            index += 1;
+            continue;
+        }
+
+        let field_name = normalize_row_field_name(&slice[index])?;
+        index += 1;
+
+        if index >= slice.len() {
+            return Err(Error::InvalidArgumentError(format!(
+                "ROW field '{field_name}' is missing a type specification"
+            )));
+        }
+
+        let mut last_success: Option<(usize, SqlDataType)> = None;
+        let mut type_end = index;
+
+        while type_end <= slice.len() {
+            let candidate = slice[index..type_end].join(" ");
+            if candidate.trim().is_empty() {
+                type_end += 1;
+                continue;
+            }
+
+            if let Ok(parsed_type) = parse_sql_data_type(&candidate, dialect) {
+                last_success = Some((type_end, parsed_type));
+            }
+
+            if type_end == slice.len() {
+                break;
+            }
+
+            if slice[type_end] == "," && last_success.is_some() {
+                break;
+            }
+
+            type_end += 1;
+        }
+
+        let Some((next_index, data_type)) = last_success else {
+            return Err(Error::InvalidArgumentError(format!(
+                "failed to parse ROW field type for '{field_name}'"
+            )));
+        };
+
+        fields.push((field_name, data_type));
+        index = next_index;
+
+        if index < slice.len() && slice[index] == "," {
+            index += 1;
+        }
+    }
+
+    if fields.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "ROW type did not provide any field definitions".into(),
+        ));
+    }
+
+    Ok(fields)
+}
+
+fn normalize_row_field_name(raw: &str) -> SqlResult<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "ROW field name must not be empty".into(),
+        ));
+    }
+
+    if let Some(stripped) = trimmed.strip_prefix('"') {
+        let without_end = stripped.strip_suffix('"').ok_or_else(|| {
+            Error::InvalidArgumentError(format!("unterminated quoted ROW field name: {trimmed}"))
+        })?;
+        let name = without_end.replace("\"\"", "\"");
+        return Ok(name);
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn parse_sql_data_type(type_str: &str, dialect: &GenericDialect) -> SqlResult<SqlDataType> {
+    let trimmed = type_str.trim();
+    let sql = format!("CREATE TABLE __row(__field {trimmed});");
+    let statements = Parser::parse_sql(dialect, &sql).map_err(|err| {
+        Error::InvalidArgumentError(format!("failed to parse ROW field type '{trimmed}': {err}"))
+    })?;
+
+    let stmt = statements.into_iter().next().ok_or_else(|| {
+        Error::InvalidArgumentError(format!(
+            "ROW field type '{trimmed}' did not produce a statement"
+        ))
+    })?;
+
+    match stmt {
+        Statement::CreateTable(table) => table
+            .columns
+            .first()
+            .map(|col| col.data_type.clone())
+            .ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "ROW field type '{trimmed}' missing column definition"
+                ))
+            }),
+        other => Err(Error::InvalidArgumentError(format!(
+            "unexpected statement while parsing ROW field type: {other:?}"
         ))),
     }
 }
@@ -2181,6 +3273,36 @@ fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> 
             "queries require a plain table name".into(),
         )),
     }
+}
+
+/// Extract multiple tables from FROM clause for cross products
+fn extract_tables(from: &[TableWithJoins]) -> SqlResult<Vec<llkv_plan::TableRef>> {
+    let mut tables = Vec::new();
+
+    for item in from {
+        // Check if this table has joins - we don't support JOIN yet
+        if !item.joins.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "JOIN clauses are not supported yet".into(),
+            ));
+        }
+
+        // Extract table name
+        match &item.relation {
+            TableFactor::Table { name, .. } => {
+                let (schema_opt, table) = parse_schema_qualified_name(name)?;
+                let schema = schema_opt.unwrap_or_default();
+                tables.push(llkv_plan::TableRef::new(schema, table));
+            }
+            _ => {
+                return Err(Error::InvalidArgumentError(
+                    "queries require a plain table name".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(tables)
 }
 
 fn group_by_is_empty(expr: &GroupByExpr) -> bool {
@@ -2450,5 +3572,32 @@ mod tests {
             values,
             vec![None, Some("4".to_string()), Some("13".to_string())]
         );
+    }
+
+    #[test]
+    fn arrow_type_from_row_returns_struct_fields() {
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(
+            &dialect,
+            "CREATE TABLE row_types(payload ROW(a INTEGER, b VARCHAR));",
+        )
+        .expect("parse ROW type definition");
+
+        let data_type = match &statements[0] {
+            Statement::CreateTable(stmt) => stmt.columns[0].data_type.clone(),
+            other => panic!("unexpected statement: {other:?}"),
+        };
+
+        let arrow_type = arrow_type_from_sql(&data_type).expect("convert ROW type");
+        match arrow_type {
+            arrow::datatypes::DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 2, "unexpected field count");
+                assert_eq!(fields[0].name(), "a");
+                assert_eq!(fields[1].name(), "b");
+                assert_eq!(fields[0].data_type(), &arrow::datatypes::DataType::Int64);
+                assert_eq!(fields[1].data_type(), &arrow::datatypes::DataType::Utf8);
+            }
+            other => panic!("expected struct type, got {other:?}"),
+        }
     }
 }

@@ -13,6 +13,7 @@ arrow = { workspace = true, default-features = false }
 llkv-aggregate.workspace = true
 llkv-column-map.workspace = true
 llkv-expr.workspace = true
+llkv-join.workspace = true
 llkv-plan.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true

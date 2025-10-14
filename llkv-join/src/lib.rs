@@ -199,13 +199,11 @@ impl JoinOptions {
     }
 }
 
+// TODO: Build out more fully or remove
 /// Validate join keys before execution.
-pub fn validate_join_keys(keys: &[JoinKey]) -> LlkvResult<()> {
-    if keys.is_empty() {
-        return Err(Error::InvalidArgumentError(
-            "join requires at least one key pair".to_string(),
-        ));
-    }
+/// Note: Empty keys = cross product (Cartesian product)
+pub fn validate_join_keys(_keys: &[JoinKey]) -> LlkvResult<()> {
+    // Empty keys is valid for cross product
     Ok(())
 }
 
@@ -303,8 +301,9 @@ mod tests {
 
     #[test]
     fn test_validate_join_keys() {
+        // Empty keys are valid (cross product)
         let empty: Vec<JoinKey> = vec![];
-        assert!(validate_join_keys(&empty).is_err());
+        assert!(validate_join_keys(&empty).is_ok());
 
         let keys = vec![JoinKey::new(1, 2)];
         assert!(validate_join_keys(&keys).is_ok());
