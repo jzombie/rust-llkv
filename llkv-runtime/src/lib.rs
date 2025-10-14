@@ -410,7 +410,8 @@ where
     }
 
     /// Begin a transaction in this session.
-    /// Creates an isolated staging context automatically.
+    /// Creates an empty staging context for new tables created within the transaction.
+    /// Existing tables are accessed via MVCC visibility filtering - NO data copying occurs.
     pub fn begin_transaction(&self) -> Result<RuntimeStatementResult<P>> {
         let staging_pager = Arc::new(MemPager::default());
         tracing::trace!(
@@ -419,13 +420,9 @@ where
         );
         let staging_ctx = Arc::new(RuntimeContext::new(staging_pager));
 
-        // TODO: Verify if this is copying the entire table!!  This should not be the case!
-        // Copy table metadata from the main context to the staging context,
-        // but create new Table instances that use the staging pager
-        self.inner
-            .context()
-            .ctx()
-            .copy_tables_to_staging(&staging_ctx)?;
+        // Staging context is EMPTY - used only for tables created within the transaction.
+        // Existing tables are read from base context with MVCC visibility filtering.
+        // No data copying occurs at BEGIN - this is pure MVCC.
 
         let staging_wrapper = Arc::new(RuntimeContextWrapper::new(staging_ctx));
 
@@ -1294,123 +1291,6 @@ where
                 .with_primary_key(column.primary_key)
             })
             .collect())
-    }
-
-    // TODO: This comment is outdated
-    /// Copy table metadata from this context to a staging context.
-    /// This creates new Table instances that use the staging context's pager.
-    fn copy_tables_to_staging<Q>(&self, staging: &RuntimeContext<Q>) -> Result<()>
-    where
-        Q: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-    {
-        let base_store = ColumnStore::open(Arc::clone(&self.pager))?;
-        let base_catalog = SysCatalog::new(&base_store);
-
-        let staging_store = ColumnStore::open(Arc::clone(&staging.pager))?;
-        let staging_catalog = SysCatalog::new(&staging_store);
-
-        let mut next_table_id = match base_catalog.get_next_table_id()? {
-            Some(value) => value,
-            None => {
-                let seed = base_catalog.max_table_id()?.unwrap_or(CATALOG_TABLE_ID);
-                seed.checked_add(1).ok_or_else(|| {
-                    Error::InvalidArgumentError("exhausted available table ids".into())
-                })?
-            }
-        };
-        if next_table_id == CATALOG_TABLE_ID {
-            next_table_id = next_table_id.checked_add(1).ok_or_else(|| {
-                Error::InvalidArgumentError("exhausted available table ids".into())
-            })?;
-        }
-
-        staging_catalog.put_next_table_id(next_table_id)?;
-
-        let source_tables: Vec<(String, Arc<ExecutorTable<P>>)> = {
-            let guard = self.tables.read().unwrap();
-            guard
-                .iter()
-                .map(|(name, table)| (name.clone(), Arc::clone(table)))
-                .collect()
-        };
-
-        for (table_name, source_table) in source_tables.iter() {
-            tracing::trace!(
-                "!!! COPY_TABLES_TO_STAGING: Copying table '{}' with {} columns:",
-                table_name,
-                source_table.schema.columns.len()
-            );
-            for (idx, col) in source_table.schema.columns.iter().enumerate() {
-                tracing::trace!(
-                    "    source column[{}]: name='{}' primary_key={}",
-                    idx,
-                    col.name,
-                    col.primary_key
-                );
-            }
-
-            // Create a new Table instance with the same table_id but using the staging pager
-            let new_table = Table::new(source_table.table.table_id(), Arc::clone(&staging.pager))?;
-
-            // Create a new ExecutorTable with the new table but same schema
-            // Start with fresh row counters (0) for transaction isolation
-            let new_executor_table = Arc::new(ExecutorTable {
-                table: Arc::new(new_table),
-                schema: source_table.schema.clone(),
-                next_row_id: AtomicU64::new(0),
-                total_rows: AtomicU64::new(0),
-            });
-
-            tracing::trace!(
-                "!!! COPY_TABLES_TO_STAGING: After copy, {} columns in new executor table:",
-                new_executor_table.schema.columns.len()
-            );
-            for (idx, col) in new_executor_table.schema.columns.iter().enumerate() {
-                tracing::trace!(
-                    "    new column[{}]: name='{}' primary_key={}",
-                    idx,
-                    col.name,
-                    col.primary_key
-                );
-            }
-
-            {
-                let mut staging_tables = staging.tables.write().unwrap();
-                staging_tables.insert(table_name.clone(), Arc::clone(&new_executor_table));
-            }
-
-            // Snapshot existing rows (with row_ids) into staging for transaction isolation.
-            // This provides full REPEATABLE READ isolation by copying data at BEGIN.
-            let batches = match self.get_batches_with_row_ids(table_name, None) {
-                Ok(batches) => batches,
-                Err(Error::NotFound) => {
-                    // Table exists but has no data yet (empty table)
-                    Vec::new()
-                }
-                Err(e) => return Err(e),
-            };
-            if !batches.is_empty() {
-                for batch in batches {
-                    new_executor_table.table.append(&batch)?;
-                }
-            }
-
-            let next_row_id = source_table.next_row_id.load(Ordering::SeqCst);
-            new_executor_table
-                .next_row_id
-                .store(next_row_id, Ordering::SeqCst);
-            let total_rows = source_table.total_rows.load(Ordering::SeqCst);
-            new_executor_table
-                .total_rows
-                .store(total_rows, Ordering::SeqCst);
-        }
-
-        let staging_count = staging.tables.read().unwrap().len();
-        tracing::trace!(
-            "!!! COPY_TABLES_TO_STAGING: Copied {} tables to staging context",
-            staging_count
-        );
-        Ok(())
     }
 
     pub fn export_table_rows(self: &Arc<Self>, name: &str) -> Result<RowBatch> {
