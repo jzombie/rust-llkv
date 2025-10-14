@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-use arrow::record_batch::RecordBatch;
 use crate::SqlResult;
 use crate::SqlValue;
+use arrow::record_batch::RecordBatch;
 
+use llkv_executor::SelectExecution;
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
-use llkv_executor::SelectExecution;
 use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateTablePlan,
     CreateTableSource, DeletePlan, InsertPlan, InsertSource, OrderByPlan, OrderSortType,
@@ -16,6 +16,7 @@ use llkv_runtime::{
     RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
+use llkv_table::catalog::{IdentifierContext, IdentifierResolver};
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
@@ -91,9 +92,6 @@ where
         }
     }
 
-    // `statement_table_name` is provided by llkv-runtime; use it to avoid
-    // duplicating plan-level logic here.
-
     fn execute_plan_statement(
         &self,
         statement: PlanStatement,
@@ -115,21 +113,24 @@ where
             default_nulls_first: AtomicBool::new(false),
         }
     }
-    
+
     /// Preprocess SQL to handle qualified names in EXCLUDE clauses
     /// Converts EXCLUDE (schema.table.col) to EXCLUDE ("schema.table.col")
     fn preprocess_exclude_syntax(sql: &str) -> String {
         use regex::Regex;
-        
+
         // Pattern to match EXCLUDE followed by qualified identifiers
         // Matches: EXCLUDE (identifier.identifier.identifier)
-        let re = Regex::new(r"(?i)EXCLUDE\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)+)\s*\)")
-            .unwrap();
-        
+        let re = Regex::new(
+            r"(?i)EXCLUDE\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)+)\s*\)",
+        )
+        .unwrap();
+
         re.replace_all(sql, |caps: &regex::Captures| {
             let qualified_name = &caps[1];
             format!("EXCLUDE (\"{}\")", qualified_name)
-        }).to_string()
+        })
+        .to_string()
     }
 
     pub(crate) fn context_arc(&self) -> Arc<RuntimeContext<P>> {
@@ -159,11 +160,11 @@ where
 
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<RuntimeStatementResult<P>>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
-        
+
         // Preprocess SQL to handle qualified names in EXCLUDE
         // Replace EXCLUDE (schema.table.col) with EXCLUDE ("schema.table.col")
         let processed_sql = Self::preprocess_exclude_syntax(sql);
-        
+
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, &processed_sql)
             .map_err(|err| Error::InvalidArgumentError(format!("failed to parse SQL: {err}")))?;
@@ -402,7 +403,7 @@ where
         validate_create_table_common(&stmt)?;
 
         let (schema_name, table_name) = parse_schema_qualified_name(&stmt.name)?;
-        
+
         // Validate schema exists if specified
         if let Some(ref schema) = schema_name {
             let catalog = self.engine.context().table_catalog();
@@ -462,9 +463,13 @@ where
 
         let mut columns: Vec<ColumnSpec> = Vec::with_capacity(stmt.columns.len());
         let mut names: HashMap<String, ()> = HashMap::new();
-        
+
         // First pass: collect all column names and check for duplicates
-        let all_column_names: Vec<String> = stmt.columns.iter().map(|col| col.name.value.clone()).collect();
+        let all_column_names: Vec<String> = stmt
+            .columns
+            .iter()
+            .map(|col| col.name.value.clone())
+            .collect();
         for col_name in &all_column_names {
             let normalized = col_name.to_ascii_lowercase();
             if names.insert(normalized, ()).is_some() {
@@ -474,7 +479,7 @@ where
                 )));
             }
         }
-        
+
         // Second pass: process columns including CHECK validation
         for column_def in stmt.columns {
             let is_nullable = column_def
@@ -493,16 +498,13 @@ where
             });
 
             // Extract CHECK constraint if present and validate it
-            let check_expr = column_def
-                .options
-                .iter()
-                .find_map(|opt| {
-                    if let ColumnOption::Check(expr) = &opt.option {
-                        Some(expr)
-                    } else {
-                        None
-                    }
-                });
+            let check_expr = column_def.options.iter().find_map(|opt| {
+                if let ColumnOption::Check(expr) = &opt.option {
+                    Some(expr)
+                } else {
+                    None
+                }
+            });
 
             // Validate CHECK constraint if present (now we have all column names)
             if let Some(check_expr) = check_expr {
@@ -529,7 +531,9 @@ where
                 column.primary_key
             );
 
-            column = column.with_primary_key(is_primary_key).with_check(check_expr_str);
+            column = column
+                .with_primary_key(is_primary_key)
+                .with_check(check_expr_str);
             tracing::trace!(
                 "DEBUG ColumnSpec after with_primary_key({}): primary_key={} check_expr={:?}",
                 is_primary_key,
@@ -598,13 +602,16 @@ where
 
         // Register schema in the catalog
         let catalog = self.engine.context().table_catalog();
-        
+
         if _if_not_exists && catalog.schema_exists(&canonical) {
             return Ok(RuntimeStatementResult::NoOp);
         }
 
         catalog.register_schema(&canonical).map_err(|err| {
-            Error::CatalogError(format!("Failed to create schema '{}': {}", display_name, err))
+            Error::CatalogError(format!(
+                "Failed to create schema '{}': {}",
+                display_name, err
+            ))
         })?;
 
         Ok(RuntimeStatementResult::NoOp)
@@ -790,31 +797,35 @@ where
             SetExpr::Select(select) => select,
             _ => return Ok(None),
         };
-        
+
         if select.from.len() != 1 {
             return Ok(None);
         }
-        
+
         let table_with_joins = &select.from[0];
         if !table_with_joins.joins.is_empty() {
             return Ok(None);
         }
-        
+
         // Check if this is pragma_table_info function call
         let table_name = match &table_with_joins.relation {
-            TableFactor::Table { name, args: Some(args), .. } => {
+            TableFactor::Table {
+                name,
+                args: Some(args),
+                ..
+            } => {
                 let func_name = name.to_string().to_ascii_lowercase();
                 if func_name != "pragma_table_info" {
                     return Ok(None);
                 }
-                
+
                 // Extract table name from argument
                 if args.args.len() != 1 {
                     return Err(Error::InvalidArgumentError(
                         "pragma_table_info expects exactly one argument".into(),
                     ));
                 }
-                
+
                 match &args.args[0] {
                     FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value))) => {
                         match &value.value {
@@ -836,22 +847,22 @@ where
             }
             _ => return Ok(None),
         };
-        
+
         // Get table column specs from runtime context
         let context = self.engine.context();
         let columns = context.table_column_specs(&table_name)?;
-        
+
         // Build RecordBatch with table column information
-        use arrow::array::{Int32Array, StringArray, BooleanArray};
+        use arrow::array::{BooleanArray, Int32Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
-        
+
         let mut cid_values = Vec::new();
         let mut name_values = Vec::new();
         let mut type_values = Vec::new();
         let mut notnull_values = Vec::new();
         let mut dflt_value_values: Vec<Option<String>> = Vec::new();
         let mut pk_values = Vec::new();
-        
+
         for (idx, col) in columns.iter().enumerate() {
             cid_values.push(idx as i32);
             name_values.push(col.name.clone());
@@ -860,7 +871,7 @@ where
             dflt_value_values.push(None); // We don't track default values yet
             pk_values.push(col.primary_key);
         }
-        
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("cid", DataType::Int32, false),
             Field::new("name", DataType::Utf8, false),
@@ -869,7 +880,7 @@ where
             Field::new("dflt_value", DataType::Utf8, true),
             Field::new("pk", DataType::Boolean, false),
         ]));
-        
+
         use arrow::array::ArrayRef;
         let mut batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -881,10 +892,13 @@ where
                 Arc::new(StringArray::from(dflt_value_values)) as ArrayRef,
                 Arc::new(BooleanArray::from(pk_values)) as ArrayRef,
             ],
-        ).map_err(|e| Error::Internal(format!("failed to create pragma_table_info batch: {}", e)))?;
-        
+        )
+        .map_err(|e| Error::Internal(format!("failed to create pragma_table_info batch: {}", e)))?;
+
         // Apply SELECT projections: extract only requested columns
-        let projection_indices: Vec<usize> = select.projection.iter()
+        let projection_indices: Vec<usize> = select
+            .projection
+            .iter()
             .filter_map(|item| {
                 match item {
                     SelectItem::UnnamedExpr(SqlExpr::Identifier(ident)) => {
@@ -902,32 +916,34 @@ where
                 }
             })
             .collect();
-        
+
         // Apply projections if not SELECT *
         let projected_schema;
         if !projection_indices.is_empty() {
-            let projected_fields: Vec<Field> = projection_indices.iter()
+            let projected_fields: Vec<Field> = projection_indices
+                .iter()
                 .map(|&idx| schema.field(idx).clone())
                 .collect();
             projected_schema = Arc::new(Schema::new(projected_fields));
-            
-            let projected_columns: Vec<ArrayRef> = projection_indices.iter()
+
+            let projected_columns: Vec<ArrayRef> = projection_indices
+                .iter()
                 .map(|&idx| Arc::clone(batch.column(idx)))
                 .collect();
-            
+
             batch = RecordBatch::try_new(Arc::clone(&projected_schema), projected_columns)
                 .map_err(|e| Error::Internal(format!("failed to project columns: {}", e)))?;
         } else {
             // SELECT * or complex projections - use original schema
             projected_schema = schema;
         }
-        
+
         // Apply ORDER BY using Arrow compute kernels
         if let Some(order_by) = &query.order_by {
             use arrow::compute::SortColumn;
             use arrow::compute::lexsort_to_indices;
             use sqlparser::ast::OrderByKind;
-            
+
             let exprs = match &order_by.kind {
                 OrderByKind::Expressions(exprs) => exprs,
                 _ => {
@@ -936,7 +952,7 @@ where
                     ));
                 }
             };
-            
+
             let mut sort_columns = Vec::new();
             for order_expr in exprs {
                 if let SqlExpr::Identifier(ident) = &order_expr.expr {
@@ -952,29 +968,33 @@ where
                     }
                 }
             }
-            
+
             if !sort_columns.is_empty() {
                 let indices = lexsort_to_indices(&sort_columns, None)
                     .map_err(|e| Error::Internal(format!("failed to sort: {}", e)))?;
-                
+
                 use arrow::compute::take;
-                let sorted_columns: Result<Vec<ArrayRef>, _> = batch.columns().iter()
+                let sorted_columns: Result<Vec<ArrayRef>, _> = batch
+                    .columns()
+                    .iter()
                     .map(|col| take(col.as_ref(), &indices, None))
                     .collect();
-                
+
                 batch = RecordBatch::try_new(
                     Arc::clone(&projected_schema),
-                    sorted_columns.map_err(|e| Error::Internal(format!("failed to apply sort: {}", e)))?
-                ).map_err(|e| Error::Internal(format!("failed to create sorted batch: {}", e)))?;
+                    sorted_columns
+                        .map_err(|e| Error::Internal(format!("failed to apply sort: {}", e)))?,
+                )
+                .map_err(|e| Error::Internal(format!("failed to create sorted batch: {}", e)))?;
             }
         }
-        
+
         let execution = SelectExecution::new_single_batch(
             table_name.clone(),
             Arc::clone(&projected_schema),
             batch,
         );
-        
+
         Ok(Some(RuntimeStatementResult::Select {
             table_name,
             schema: projected_schema,
@@ -1164,6 +1184,10 @@ where
             ));
         }
 
+        let catalog = self.engine.context().table_catalog();
+        let resolver = catalog.identifier_resolver();
+        let table_id = catalog.table_id(&canonical_name);
+
         let mut column_assignments = Vec::with_capacity(assignments.len());
         let mut seen: HashMap<String, ()> = HashMap::new();
         for assignment in assignments {
@@ -1180,7 +1204,11 @@ where
                 Err(Error::InvalidArgumentError(msg))
                     if msg.contains("unsupported literal expression") =>
                 {
-                    let translated = translate_scalar(&assignment.value)?;
+                    let translated = translate_scalar_with_context(
+                        &resolver,
+                        IdentifierContext::new(table_id),
+                        &assignment.value,
+                    )?;
                     AssignmentValue::Expression(translated)
                 }
                 Err(err) => return Err(err),
@@ -1192,7 +1220,11 @@ where
         }
 
         let filter = match selection {
-            Some(expr) => Some(translate_condition(&expr)?),
+            Some(expr) => Some(translate_condition_with_context(
+                &resolver,
+                IdentifierContext::new(table_id),
+                &expr,
+            )?),
             None => None,
         };
 
@@ -1260,8 +1292,18 @@ where
             ));
         }
 
+        let catalog = self.engine.context().table_catalog();
+        let resolver = catalog.identifier_resolver();
+        let table_id = catalog.table_id(&canonical_name);
+
         let filter = selection
-            .map(|expr| translate_condition(&expr))
+            .map(|expr| {
+                translate_condition_with_context(
+                    &resolver,
+                    IdentifierContext::new(table_id),
+                    &expr,
+                )
+            })
             .transpose()?;
 
         let plan = DeletePlan {
@@ -1331,7 +1373,7 @@ where
                         // Drop all tables in this schema
                         let all_tables = catalog.table_names();
                         let schema_prefix = format!("{}.", canonical_name);
-                        
+
                         let ctx = self.engine.context();
                         for table in all_tables {
                             if table.to_ascii_lowercase().starts_with(&schema_prefix) {
@@ -1342,9 +1384,9 @@ where
                         // Check if schema has any tables
                         let all_tables = catalog.table_names();
                         let schema_prefix = format!("{}.", canonical_name);
-                        let has_tables = all_tables.iter().any(|t| {
-                            t.to_ascii_lowercase().starts_with(&schema_prefix)
-                        });
+                        let has_tables = all_tables
+                            .iter()
+                            .any(|t| t.to_ascii_lowercase().starts_with(&schema_prefix));
 
                         if has_tables {
                             return Err(Error::CatalogError(format!(
@@ -1379,7 +1421,7 @@ where
         if let Some(result) = self.try_handle_pragma_table_info(&query)? {
             return Ok(result);
         }
-        
+
         let select_plan = self.build_select_plan(query)?;
         self.execute_plan_statement(PlanStatement::Select(select_plan))
     }
@@ -1392,8 +1434,11 @@ where
         }
 
         validate_simple_query(&query)?;
-        let mut select_plan = match query.body.as_ref() {
-            SetExpr::Select(select) => self.translate_select(select.as_ref())?,
+        let catalog = self.engine.context().table_catalog();
+        let resolver = catalog.identifier_resolver();
+
+        let (mut select_plan, select_context) = match query.body.as_ref() {
+            SetExpr::Select(select) => self.translate_select(select.as_ref(), &resolver)?,
             other => {
                 return Err(Error::InvalidArgumentError(format!(
                     "unsupported query expression: {other:?}"
@@ -1406,13 +1451,18 @@ where
                     "ORDER BY is not supported for aggregate queries".into(),
                 ));
             }
-            let order_plan = self.translate_order_by(order_by)?;
+            let order_plan =
+                self.translate_order_by(&resolver, select_context, order_by)?;
             select_plan = select_plan.with_order_by(Some(order_plan));
         }
         Ok(select_plan)
     }
 
-    fn translate_select(&self, select: &Select) -> SqlResult<SelectPlan> {
+    fn translate_select(
+        &self,
+        select: &Select,
+        resolver: &IdentifierResolver<'_>,
+    ) -> SqlResult<(SelectPlan, IdentifierContext)> {
         if select.distinct.is_some() {
             return Err(Error::InvalidArgumentError(
                 "SELECT DISTINCT is not supported".into(),
@@ -1480,51 +1530,67 @@ where
         if let Some(alias) = table_alias.as_ref() {
             validate_projection_alias_qualifiers(&select.projection, alias)?;
         }
-
         // Handle different FROM clause scenarios
-        let mut plan = if select.from.is_empty() {
+        let catalog = self.engine.context().table_catalog();
+        let (mut plan, id_context) = if select.from.is_empty() {
             // No FROM clause - use empty string for table context (e.g., SELECT 42, SELECT {'a': 1} AS x)
-            SelectPlan::new("")
+            let mut p = SelectPlan::new("");
+            let projections = self.build_projection_list(
+                &resolver,
+                IdentifierContext::new(None),
+                &select.projection,
+            )?;
+            p = p.with_projections(projections);
+            (p, IdentifierContext::new(None))
         } else if select.from.len() == 1 {
             // Single table query
-            let (display_name, _canonical_name) = extract_single_table(&select.from)?;
+            let (display_name, canonical_name) = extract_single_table(&select.from)?;
+            let table_id = catalog.table_id(&canonical_name);
             let mut p = SelectPlan::new(display_name.clone());
             if let Some(aggregates) = self.detect_simple_aggregates(&select.projection)? {
                 p = p.with_aggregates(aggregates);
             } else {
-                let projections = self.build_projection_list(&select.projection, &_canonical_name)?;
+                let projections = self.build_projection_list(
+                    &resolver,
+                    IdentifierContext::new(table_id),
+                    &select.projection,
+                )?;
                 p = p.with_projections(projections);
             }
-            p
+            (p, IdentifierContext::new(table_id))
         } else {
             // Multiple tables - cross product
             let tables = extract_tables(&select.from)?;
             let mut p = SelectPlan::with_tables(tables);
             // For multi-table queries, we'll build projections differently
             // For now, just handle simple column references
-            let projections = self.build_projection_list(&select.projection, "")?;
+            let projections = self.build_projection_list(
+                &resolver,
+                IdentifierContext::new(None),
+                &select.projection,
+            )?;
             p = p.with_projections(projections);
-            p
+            (p, IdentifierContext::new(None))
         };
-        
-        // Handle aggregates for single table case (already handled above for multi-table)
-        if select.from.len() == 1 && plan.aggregates.is_empty() {
-            // Already handled in the branch above
-        } else if select.from.is_empty() {
-            // Handle literals/expressions without FROM
-            let projections = self.build_projection_list(&select.projection, "")?;
-            plan = plan.with_projections(projections);
-        }
 
         let filter_expr = match &select.selection {
-            Some(expr) => Some(translate_condition(expr)?),
+            Some(expr) => Some(translate_condition_with_context(
+                &resolver,
+                id_context,
+                expr,
+            )?),
             None => None,
         };
         plan = plan.with_filter(filter_expr);
-        Ok(plan)
+        Ok((plan, id_context))
     }
 
-    fn translate_order_by(&self, order_by: &OrderBy) -> SqlResult<OrderByPlan> {
+    fn translate_order_by(
+        &self,
+        resolver: &IdentifierResolver<'_>,
+        id_context: IdentifierContext,
+        order_by: &OrderBy,
+    ) -> SqlResult<OrderByPlan> {
         let exprs = match &order_by.kind {
             OrderByKind::Expressions(exprs) => exprs,
             _ => {
@@ -1553,9 +1619,19 @@ where
             .nulls_first
             .unwrap_or(default_nulls_first_for_direction);
 
+    let resolve_simple_column = |expr: &SqlExpr| -> SqlResult<String> {
+            let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
+            match scalar {
+                llkv_expr::expr::ScalarExpr::Column(column) => Ok(column),
+                other => Err(Error::InvalidArgumentError(format!(
+                    "ORDER BY expression must reference a simple column, found {other:?}"
+                ))),
+            }
+        };
+
         let (target, sort_type) = match &order_expr.expr {
             SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => (
-                OrderTarget::Column(resolve_column_name(&order_expr.expr)?),
+                OrderTarget::Column(resolve_simple_column(&order_expr.expr)?),
                 OrderSortType::Native,
             ),
             SqlExpr::Cast {
@@ -1568,7 +1644,7 @@ where
                     | SqlDataType::TinyInt(_),
                 ..
             } => (
-                OrderTarget::Column(resolve_column_name(expr)?),
+                OrderTarget::Column(resolve_simple_column(expr)?),
                 OrderSortType::CastTextToInteger,
             ),
             SqlExpr::Cast { data_type, .. } => {
@@ -1772,25 +1848,24 @@ where
 
     fn build_projection_list(
         &self,
+        resolver: &IdentifierResolver<'_>,
+        id_context: IdentifierContext,
         projection_items: &[SelectItem],
-        from_table: &str,
     ) -> SqlResult<Vec<SelectProjection>> {
         if projection_items.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "SELECT projection must include at least one column".into(),
             ));
         }
+
         let mut projections = Vec::with_capacity(projection_items.len());
         for (idx, item) in projection_items.iter().enumerate() {
             match item {
                 SelectItem::Wildcard(options) => {
-                    // Check if EXCLUDE is specified
                     if let Some(exclude) = &options.opt_exclude {
                         use sqlparser::ast::ExcludeSelectItem;
                         let exclude_cols = match exclude {
-                            ExcludeSelectItem::Single(ident) => {
-                                vec![ident.value.clone()]
-                            }
+                            ExcludeSelectItem::Single(ident) => vec![ident.value.clone()],
                             ExcludeSelectItem::Multiple(idents) => {
                                 idents.iter().map(|id| id.value.clone()).collect()
                             }
@@ -1815,120 +1890,89 @@ where
                         ));
                     }
                 },
-                SelectItem::UnnamedExpr(expr) => {
-                    // Check if this is a simple column reference
-                    match expr {
-                        SqlExpr::Identifier(ident) => {
-                            // Simple column reference - preserve original name from table
+                SelectItem::UnnamedExpr(expr) => match expr {
+                    SqlExpr::Identifier(ident) => {
+                        let parts = vec![ident.value.clone()];
+                        let resolution = resolver.resolve(&parts, id_context)?;
+                        if resolution.is_simple() {
                             projections.push(SelectProjection::Column {
-                                name: ident.value.clone(),
+                                name: resolution.column().to_string(),
                                 alias: None,
                             });
-                        }
-                        SqlExpr::CompoundIdentifier(parts) => {
-                            // Determine if this is JUST a table-qualified column (table.column)
-                            // vs a struct field access (column.field OR table.column.field)
-                            let (is_simple_column_ref, col_idx) = if !from_table.is_empty() && parts.len() >= 2 {
-                                if parts[0].value.eq_ignore_ascii_case(from_table) && parts.len() == 2 {
-                                    // table.column with no further parts
-                                    (true, 1)
-                                } else if from_table.contains('.') && parts.len() == 3 {
-                                    // schema.table.column with no further parts
-                                    let first_two = format!("{}.{}", parts[0].value, parts[1].value);
-                                    if first_two.eq_ignore_ascii_case(from_table) {
-                                        (true, 2)
-                                    } else {
-                                        (false, 0)
-                                    }
-                                } else {
-                                    (false, 0)
-                                }
-                            } else {
-                                (false, 0)
-                            };
-                            
-                            if is_simple_column_ref {
-                                // Simple table-qualified column reference
-                                let col_name = parts[col_idx].value.clone();
-                                projections.push(SelectProjection::Column {
-                                    name: col_name,
-                                    alias: None,
-                                });
-                            } else {
-                                // Struct field access or other computed expression
-                                let scalar = translate_scalar_with_context(expr, from_table)?;
-                                let alias = format!("col{}", idx + 1);
-                                projections.push(SelectProjection::Computed {
-                                    expr: scalar,
-                                    alias,
-                                });
-                            }
-                        }
-                        _ => {
-                            // Computed expression
-                            let scalar = translate_scalar_with_context(expr, from_table)?;
+                        } else {
                             let alias = format!("col{}", idx + 1);
                             projections.push(SelectProjection::Computed {
-                                expr: scalar,
+                                expr: resolution.into_scalar_expr(),
                                 alias,
                             });
                         }
                     }
-                }
-                SelectItem::ExprWithAlias { expr, alias } => {
-                    // Check if this is a simple column reference with alias
-                    match expr {
-                        SqlExpr::Identifier(ident) => {
+                    SqlExpr::CompoundIdentifier(parts) => {
+                        let name_parts: Vec<String> =
+                            parts.iter().map(|part| part.value.clone()).collect();
+                        let resolution = resolver.resolve(&name_parts, id_context)?;
+                        if resolution.is_simple() {
                             projections.push(SelectProjection::Column {
-                                name: ident.value.clone(),
-                                alias: Some(alias.value.clone()),
+                                name: resolution.column().to_string(),
+                                alias: None,
+                            });
+                        } else {
+                            let alias = format!("col{}", idx + 1);
+                            projections.push(SelectProjection::Computed {
+                                expr: resolution.into_scalar_expr(),
+                                alias,
                             });
                         }
-                        SqlExpr::CompoundIdentifier(parts) => {
-                            // Same logic as UnnamedExpr case
-                            let (is_simple_column_ref, col_idx) = if !from_table.is_empty() && parts.len() >= 2 {
-                                if parts[0].value.eq_ignore_ascii_case(from_table) && parts.len() == 2 {
-                                    (true, 1)
-                                } else if from_table.contains('.') && parts.len() == 3 {
-                                    let first_two = format!("{}.{}", parts[0].value, parts[1].value);
-                                    if first_two.eq_ignore_ascii_case(from_table) {
-                                        (true, 2)
-                                    } else {
-                                        (false, 0)
-                                    }
-                                } else {
-                                    (false, 0)
-                                }
-                            } else {
-                                (false, 0)
-                            };
-                            
-                            if is_simple_column_ref {
-                                // Simple table-qualified column reference with alias
-                                let col_name = parts[col_idx].value.clone();
-                                projections.push(SelectProjection::Column {
-                                    name: col_name,
-                                    alias: Some(alias.value.clone()),
-                                });
-                            } else {
-                                // Struct field access with alias
-                                let scalar = translate_scalar_with_context(expr, from_table)?;
-                                projections.push(SelectProjection::Computed {
-                                    expr: scalar,
-                                    alias: alias.value.clone(),
-                                });
-                            }
-                        }
-                        _ => {
-                            // Computed expression with alias
-                            let scalar = translate_scalar_with_context(expr, from_table)?;
+                    }
+                    _ => {
+                        let alias = format!("col{}", idx + 1);
+                        let scalar = translate_scalar_with_context(&resolver, id_context, expr)?;
+                        projections.push(SelectProjection::Computed {
+                            expr: scalar,
+                            alias,
+                        });
+                    }
+                },
+                SelectItem::ExprWithAlias { expr, alias } => match expr {
+                    SqlExpr::Identifier(ident) => {
+                        let parts = vec![ident.value.clone()];
+                        let resolution = resolver.resolve(&parts, id_context)?;
+                        if resolution.is_simple() {
+                            projections.push(SelectProjection::Column {
+                                name: resolution.column().to_string(),
+                                alias: Some(alias.value.clone()),
+                            });
+                        } else {
                             projections.push(SelectProjection::Computed {
-                                expr: scalar,
+                                expr: resolution.into_scalar_expr(),
                                 alias: alias.value.clone(),
                             });
                         }
                     }
-                }
+                    SqlExpr::CompoundIdentifier(parts) => {
+                        let name_parts: Vec<String> =
+                            parts.iter().map(|part| part.value.clone()).collect();
+                        let resolution = resolver.resolve(&name_parts, id_context)?;
+                        if resolution.is_simple() {
+                            projections.push(SelectProjection::Column {
+                                name: resolution.column().to_string(),
+                                alias: Some(alias.value.clone()),
+                            });
+                        } else {
+                            projections.push(SelectProjection::Computed {
+                                expr: resolution.into_scalar_expr(),
+                                alias: alias.value.clone(),
+                            });
+                        }
+                    }
+                    _ => {
+                        let scalar = translate_scalar_with_context(&resolver, id_context, expr)?;
+                        projections.push(SelectProjection::Computed {
+                            expr: scalar,
+                            alias: alias.value.clone(),
+                        });
+                    }
+                },
             }
         }
         Ok(projections)
@@ -2232,7 +2276,10 @@ fn validate_check_constraint(
                 _ => &[],
             };
             for arg in args_slice {
-                if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) = arg {
+                if let sqlparser::ast::FunctionArg::Unnamed(
+                    sqlparser::ast::FunctionArgExpr::Expr(expr),
+                ) = arg
+                {
                     validate_check_constraint(&expr, table_name, column_names)?;
                 }
             }
@@ -2240,7 +2287,10 @@ fn validate_check_constraint(
         // Check column references
         SqlExpr::Identifier(ident) => {
             let col_name = &ident.value;
-            if !column_names.iter().any(|&name| name.eq_ignore_ascii_case(col_name)) {
+            if !column_names
+                .iter()
+                .any(|&name| name.eq_ignore_ascii_case(col_name))
+            {
                 return Err(Error::InvalidArgumentError(format!(
                     "Column '{}' referenced in CHECK constraint does not exist",
                     col_name
@@ -2253,14 +2303,17 @@ fn validate_check_constraint(
                 // Could be table.column OR col.field (struct field access)
                 let first_part = &idents[0].value;
                 let second_part = &idents[1].value;
-                
+
                 // Check if first part is a column name (struct field access case)
-                if column_names.iter().any(|&name| name.eq_ignore_ascii_case(first_part)) {
+                if column_names
+                    .iter()
+                    .any(|&name| name.eq_ignore_ascii_case(first_part))
+                {
                     // This is col.field - struct field access, which is valid
                     // Runtime will validate the struct field exists during INSERT
                     return Ok(());
                 }
-                
+
                 // Otherwise, treat as table.column
                 // Check if table reference matches the current table being created
                 if !first_part.eq_ignore_ascii_case(table_name) {
@@ -2269,9 +2322,12 @@ fn validate_check_constraint(
                         first_part
                     )));
                 }
-                
+
                 // Check if column exists
-                if !column_names.iter().any(|&name| name.eq_ignore_ascii_case(second_part)) {
+                if !column_names
+                    .iter()
+                    .any(|&name| name.eq_ignore_ascii_case(second_part))
+                {
                     return Err(Error::InvalidArgumentError(format!(
                         "Column '{}' referenced in CHECK constraint does not exist",
                         second_part
@@ -2282,11 +2338,14 @@ fn validate_check_constraint(
                 let first_part = &idents[0].value;
                 let second_part = &idents[1].value;
                 let third_part = &idents[2].value;
-                
+
                 // Check if first part matches table name (table.column.field case)
                 if first_part.eq_ignore_ascii_case(table_name) {
                     // This is table.column.field - validate column exists
-                    if !column_names.iter().any(|&name| name.eq_ignore_ascii_case(second_part)) {
+                    if !column_names
+                        .iter()
+                        .any(|&name| name.eq_ignore_ascii_case(second_part))
+                    {
                         return Err(Error::InvalidArgumentError(format!(
                             "Column '{}' referenced in CHECK constraint does not exist",
                             second_part
@@ -2295,7 +2354,10 @@ fn validate_check_constraint(
                     // Field access will be validated at runtime
                 } else if second_part.eq_ignore_ascii_case(table_name) {
                     // This is schema.table.column - validate column exists
-                    if !column_names.iter().any(|&name| name.eq_ignore_ascii_case(third_part)) {
+                    if !column_names
+                        .iter()
+                        .any(|&name| name.eq_ignore_ascii_case(third_part))
+                    {
                         return Err(Error::InvalidArgumentError(format!(
                             "Column '{}' referenced in CHECK constraint does not exist",
                             third_part
@@ -2339,7 +2401,10 @@ fn validate_create_table_definition(stmt: &sqlparser::ast::CreateTable) -> SqlRe
     for column in &stmt.columns {
         for ColumnOptionDef { option, .. } in &column.options {
             match option {
-                ColumnOption::Null | ColumnOption::NotNull | ColumnOption::Unique { .. } | ColumnOption::Check(_) => {}
+                ColumnOption::Null
+                | ColumnOption::NotNull
+                | ColumnOption::Unique { .. }
+                | ColumnOption::Check(_) => {}
                 ColumnOption::Default(_) => {
                     return Err(Error::InvalidArgumentError(format!(
                         "DEFAULT values are not supported for column '{}'",
@@ -2453,9 +2518,7 @@ fn expr_contains_aggregate(expr: &llkv_expr::expr::ScalarExpr<String>) -> bool {
         llkv_expr::expr::ScalarExpr::Binary { left, right, .. } => {
             expr_contains_aggregate(left) || expr_contains_aggregate(right)
         }
-        llkv_expr::expr::ScalarExpr::GetField { base, .. } => {
-            expr_contains_aggregate(base)
-        }
+        llkv_expr::expr::ScalarExpr::GetField { base, .. } => expr_contains_aggregate(base),
         llkv_expr::expr::ScalarExpr::Column(_) | llkv_expr::expr::ScalarExpr::Literal(_) => false,
     }
 }
@@ -2630,23 +2693,33 @@ fn is_integer_literal(expr: &SqlExpr, expected: i64) -> bool {
     }
 }
 
-fn translate_condition(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
+fn translate_condition_with_context(
+    resolver: &IdentifierResolver<'_>,
+    context: IdentifierContext,
+    expr: &SqlExpr,
+) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     match expr {
         SqlExpr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => Ok(llkv_expr::expr::Expr::And(vec![
-                translate_condition(left)?,
-                translate_condition(right)?,
+                translate_condition_with_context(resolver, context, left)?,
+                translate_condition_with_context(resolver, context, right)?,
             ])),
             BinaryOperator::Or => Ok(llkv_expr::expr::Expr::Or(vec![
-                translate_condition(left)?,
-                translate_condition(right)?,
+                translate_condition_with_context(resolver, context, left)?,
+                translate_condition_with_context(resolver, context, right)?,
             ])),
             BinaryOperator::Eq
             | BinaryOperator::NotEq
             | BinaryOperator::Lt
             | BinaryOperator::LtEq
             | BinaryOperator::Gt
-            | BinaryOperator::GtEq => translate_comparison(left, op.clone(), right),
+            | BinaryOperator::GtEq => translate_comparison_with_context(
+                resolver,
+                context,
+                left,
+                op.clone(),
+                right,
+            ),
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported binary operator in WHERE clause: {other:?}"
             ))),
@@ -2654,21 +2727,25 @@ fn translate_condition(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::Expr<'stati
         SqlExpr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
-        } => Ok(llkv_expr::expr::Expr::not(translate_condition(expr)?)),
-        SqlExpr::Nested(inner) => translate_condition(inner),
+        } => Ok(llkv_expr::expr::Expr::not(translate_condition_with_context(
+            resolver, context, expr,
+        )?)),
+        SqlExpr::Nested(inner) => translate_condition_with_context(resolver, context, inner),
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported WHERE clause: {other:?}"
         ))),
     }
 }
 
-fn translate_comparison(
+fn translate_comparison_with_context(
+    resolver: &IdentifierResolver<'_>,
+    context: IdentifierContext,
     left: &SqlExpr,
     op: BinaryOperator,
     right: &SqlExpr,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
-    let left_scalar = translate_scalar(left)?;
-    let right_scalar = translate_scalar(right)?;
+    let left_scalar = translate_scalar_with_context(resolver, context, left)?;
+    let right_scalar = translate_scalar_with_context(resolver, context, right)?;
     let compare_op = match op {
         BinaryOperator::Eq => llkv_expr::expr::CompareOp::Eq,
         BinaryOperator::NotEq => llkv_expr::expr::CompareOp::NotEq,
@@ -2744,104 +2821,28 @@ fn flip_compare_op(op: llkv_expr::expr::CompareOp) -> Option<llkv_expr::expr::Co
 }
 /// Translate scalar expression with knowledge of the FROM table context.
 /// This allows us to properly distinguish schema.table.column from column.field.field.
-fn translate_scalar_with_context(expr: &SqlExpr, from_table: &str) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
+fn translate_scalar_with_context(
+    resolver: &IdentifierResolver<'_>,
+    context: IdentifierContext,
+    expr: &SqlExpr,
+) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     match expr {
-        SqlExpr::Identifier(ident) => Ok(llkv_expr::expr::ScalarExpr::column(ident.value.clone())),
+        SqlExpr::Identifier(ident) => {
+            let parts = vec![ident.value.clone()];
+            let resolution = resolver.resolve(&parts, context)?;
+            Ok(resolution.into_scalar_expr())
+        }
         SqlExpr::CompoundIdentifier(idents) => {
             if idents.is_empty() {
                 return Err(Error::InvalidArgumentError(
                     "invalid compound identifier".into(),
                 ));
             }
-            
-            // Build the full identifier path
-            let full_path: Vec<String> = idents.iter().map(|id| id.value.clone()).collect();
-            
-            // For multi-table queries (empty from_table), use the full qualified name
-            if from_table.is_empty() {
-                // s1.t1.t becomes column name "s1.t1.t"
-                return Ok(llkv_expr::expr::ScalarExpr::column(full_path.join(".")));
-            }
-            
-            // Check if the identifier starts with the FROM table prefix (schema.table or just table)
-            // from_table might be "schema.table" or just "table"
-            let from_parts: Vec<&str> = from_table.split('.').collect();
-            
-            // Try to match the FROM table context
-            let column_start_idx = if from_parts.len() >= 2 {
-                // FROM is schema.table, check if identifier starts with that
-                if full_path.len() >= 3
-                    && full_path[0].eq_ignore_ascii_case(from_parts[0])
-                    && full_path[1].eq_ignore_ascii_case(from_parts[1]) {
-                    // "schema.table.column..." - skip schema.table, column starts at index 2
-                    2
-                } else if full_path.len() == 2
-                    && full_path[0].eq_ignore_ascii_case(from_parts[0])
-                    && full_path[1].eq_ignore_ascii_case(from_parts[1]) {
-                    // "schema.table" with no column - this is ambiguous, treat as "table.column"
-                    // (second part is the column name)
-                    1
-                } else if full_path.len() >= 2
-                    && full_path[0].eq_ignore_ascii_case(from_parts[1]) {
-                    // "table.column..." - just table name, column starts at index 1
-                    1
-                } else if full_path.len() >= 3 
-                    && full_path[1].eq_ignore_ascii_case(from_parts[1]) {
-                    // We have 3+ parts (x.y.z...) and FROM is schema.table
-                    // If the second part (y) matches the table name but first part doesn't match schema,
-                    // then the user is trying to reference the table with wrong schema
-                    // Example: testX.tbl.col when FROM is test.tbl
-                    return Err(Error::InvalidArgumentError(format!(
-                        "Binder Error: table '{}' not found",
-                        full_path[0]
-                    )));
-                } else if full_path.len() >= 3 
-                    && full_path[0].eq_ignore_ascii_case(from_parts[0]) {
-                    // We have 3+ parts (x.y.z...) and FROM is schema.table
-                    // If the first part matches the schema but second part doesn't match table,
-                    // then the user is trying to reference a wrong table in the correct schema
-                    // Example: test.tblX.col when FROM is test.tbl
-                    return Err(Error::InvalidArgumentError(format!(
-                        "Binder Error: table '{}' not found",
-                        full_path[1]
-                    )));
-                } else {
-                    // Treat first part as column name
-                    0
-                }
-            } else if from_parts.len() == 1 {
-                // FROM is just a table name
-                if full_path.len() >= 2
-                    && full_path[0].eq_ignore_ascii_case(from_parts[0]) {
-                    // "table.column..." - skip table name, column starts at index 1
-                    1
-                } else {
-                    // Doesn't match FROM table - treat first part as column name
-                    0
-                }
-            } else {
-                // No FROM context, assume first part is column
-                0
-            };
-            
-            if column_start_idx >= full_path.len() {
-                return Err(Error::InvalidArgumentError(
-                    format!("invalid column reference in identifier: {}", full_path.join("."))
-                ));
-            }
-            
-            // The part at column_start_idx is the column name
-            let column_name = full_path[column_start_idx].clone();
-            let mut result = llkv_expr::expr::ScalarExpr::column(column_name);
-            
-            // Everything after is struct field access
-            for field_name in &full_path[(column_start_idx + 1)..] {
-                result = llkv_expr::expr::ScalarExpr::get_field(result, field_name.clone());
-            }
-            
-            Ok(result)
+
+            let parts: Vec<String> = idents.iter().map(|ident| ident.value.clone()).collect();
+            let resolution = resolver.resolve(&parts, context)?;
+            Ok(resolution.into_scalar_expr())
         }
-        // For all other expression types, delegate to translate_scalar
         _ => translate_scalar(expr),
     }
 }
@@ -2855,16 +2856,16 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                     "invalid compound identifier".into(),
                 ));
             }
-            
+
             // Without table context, treat first part as column, rest as fields
             let column_name = idents[0].value.clone();
             let mut result = llkv_expr::expr::ScalarExpr::column(column_name);
-            
+
             for part in &idents[1..] {
                 let field_name = part.value.clone();
                 result = llkv_expr::expr::ScalarExpr::get_field(result, field_name);
             }
-            
+
             Ok(result)
         }
         SqlExpr::Value(value) => literal_from_value(value),
@@ -2927,7 +2928,7 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
             // Dictionary literal like {'a': 1, 'b': 2} represents a STRUCT literal
             let mut struct_fields = Vec::new();
             for entry in fields {
-                let key = entry.key.value.clone();  // Use .value to get the actual identifier value
+                let key = entry.key.value.clone(); // Use .value to get the actual identifier value
                 // Parse the value to a literal
                 let value_expr = translate_scalar(&entry.value)?;
                 // Extract the literal from the expression
@@ -2937,12 +2938,14 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                     }
                     _ => {
                         return Err(Error::InvalidArgumentError(
-                            "Dictionary values must be literals".to_string()
+                            "Dictionary values must be literals".to_string(),
                         ));
                     }
                 }
             }
-            Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Struct(struct_fields)))
+            Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Struct(
+                struct_fields,
+            )))
         }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported scalar expression: {other:?}"
@@ -3291,7 +3294,7 @@ fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> 
 /// Extract multiple tables from FROM clause for cross products
 fn extract_tables(from: &[TableWithJoins]) -> SqlResult<Vec<llkv_plan::TableRef>> {
     let mut tables = Vec::new();
-    
+
     for item in from {
         // Check if this table has joins - we don't support JOIN yet
         if !item.joins.is_empty() {
@@ -3299,7 +3302,7 @@ fn extract_tables(from: &[TableWithJoins]) -> SqlResult<Vec<llkv_plan::TableRef>
                 "JOIN clauses are not supported yet".into(),
             ));
         }
-        
+
         // Extract table name
         match &item.relation {
             TableFactor::Table { name, .. } => {
@@ -3310,11 +3313,11 @@ fn extract_tables(from: &[TableWithJoins]) -> SqlResult<Vec<llkv_plan::TableRef>
             _ => {
                 return Err(Error::InvalidArgumentError(
                     "queries require a plain table name".into(),
-                ))
+                ));
             }
         }
     }
-    
+
     Ok(tables)
 }
 

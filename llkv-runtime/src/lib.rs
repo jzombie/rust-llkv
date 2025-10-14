@@ -1063,7 +1063,7 @@ where
         let catalog = Arc::new(llkv_table::catalog::TableCatalog::new());
         for (_table_id, table_meta) in &loaded_tables {
             if let Some(ref table_name) = table_meta.name
-                && let Err(e) = catalog.register_table(table_name)
+                && let Err(e) = catalog.register_table(table_name.as_str())
             {
                 tracing::warn!(
                     "[CONTEXT] Failed to register table '{}' in catalog: {}",
@@ -1765,7 +1765,7 @@ where
         drop(tables); // Release write lock before catalog operations
 
         // Register table in catalog
-        let registered_table_id = self.catalog.register_table(&display_name)?;
+        let registered_table_id = self.catalog.register_table(display_name.as_str())?;
         tracing::debug!(
             "[CATALOG] Registered table '{}' with catalog_id={}",
             display_name,
@@ -1951,7 +1951,7 @@ where
         drop(tables); // Release write lock before catalog operations
 
         // Register table in catalog
-        let registered_table_id = self.catalog.register_table(&display_name)?;
+        let registered_table_id = self.catalog.register_table(display_name.as_str())?;
         tracing::debug!(
             "[CATALOG] Registered table '{}' (CTAS) with catalog_id={}",
             display_name,

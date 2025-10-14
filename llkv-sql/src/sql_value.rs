@@ -23,11 +23,9 @@ impl SqlValue {
             } => match SqlValue::try_from_expr(expr)? {
                 SqlValue::Integer(v) => Ok(SqlValue::Integer(-v)),
                 SqlValue::Float(v) => Ok(SqlValue::Float(-v)),
-                SqlValue::Null | SqlValue::String(_) | SqlValue::Struct(_) => {
-                    Err(Error::InvalidArgumentError(
-                        "cannot negate non-numeric literal".into(),
-                    ))
-                }
+                SqlValue::Null | SqlValue::String(_) | SqlValue::Struct(_) => Err(
+                    Error::InvalidArgumentError("cannot negate non-numeric literal".into()),
+                ),
             },
             SqlExpr::UnaryOp {
                 op: UnaryOperator::Plus,
