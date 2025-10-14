@@ -478,10 +478,23 @@ where
                 )
             });
 
+            // Extract CHECK constraint if present
+            let check_expr = column_def
+                .options
+                .iter()
+                .find_map(|opt| {
+                    if let ColumnOption::Check(expr) = &opt.option {
+                        Some(expr.to_string())
+                    } else {
+                        None
+                    }
+                });
+
             tracing::trace!(
-                "DEBUG CREATE TABLE column '{}' is_primary_key={}",
+                "DEBUG CREATE TABLE column '{}' is_primary_key={} check_expr={:?}",
                 column_def.name.value,
-                is_primary_key
+                is_primary_key,
+                check_expr
             );
 
             let mut column = ColumnSpec::new(
@@ -494,11 +507,12 @@ where
                 column.primary_key
             );
 
-            column = column.with_primary_key(is_primary_key);
+            column = column.with_primary_key(is_primary_key).with_check(check_expr);
             tracing::trace!(
-                "DEBUG ColumnSpec after with_primary_key({}): primary_key={}",
+                "DEBUG ColumnSpec after with_primary_key({}): primary_key={} check_expr={:?}",
                 is_primary_key,
-                column.primary_key
+                column.primary_key,
+                column.check_expr
             );
 
             let normalized = column.name.to_ascii_lowercase();
@@ -2178,7 +2192,7 @@ fn validate_create_table_definition(stmt: &sqlparser::ast::CreateTable) -> SqlRe
     for column in &stmt.columns {
         for ColumnOptionDef { option, .. } in &column.options {
             match option {
-                ColumnOption::Null | ColumnOption::NotNull | ColumnOption::Unique { .. } => {}
+                ColumnOption::Null | ColumnOption::NotNull | ColumnOption::Unique { .. } | ColumnOption::Check(_) => {}
                 ColumnOption::Default(_) => {
                     return Err(Error::InvalidArgumentError(format!(
                         "DEFAULT values are not supported for column '{}'",

@@ -1702,6 +1702,7 @@ where
                 nullable: column.nullable,
                 primary_key: column.primary_key,
                 field_id: (idx + 1) as FieldId,
+                check_expr: column.check_expr.clone(),
             });
             let pushed = column_defs.last().unwrap();
             tracing::trace!(
@@ -1835,6 +1836,7 @@ where
                 nullable: field.is_nullable(),
                 primary_key: false, // CTAS does not preserve PRIMARY KEY constraints
                 field_id: (idx + 1) as FieldId,
+                check_expr: None, // CTAS does not preserve CHECK constraints
             });
         }
 
@@ -1978,6 +1980,346 @@ where
         Ok(RuntimeStatementResult::CreateTable {
             table_name: display_name,
         })
+    }
+
+    fn check_check_constraints(
+        &self,
+        table: &ExecutorTable<P>,
+        rows: &[Vec<PlanValue>],
+        column_order: &[usize],
+    ) -> Result<()> {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        // Find columns with CHECK constraints
+        let check_columns: Vec<(usize, &ExecutorColumn, &str)> = table
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| {
+                col.check_expr
+                    .as_ref()
+                    .map(|expr| (idx, col, expr.as_str()))
+            })
+            .collect();
+
+        if check_columns.is_empty() {
+            return Ok(());
+        }
+
+        let dialect = GenericDialect {};
+
+        // Check each row against all CHECK constraints
+        for (row_idx, row) in rows.iter().enumerate() {
+            for (col_idx, column, check_expr_str) in &check_columns {
+                // Parse the CHECK expression
+                let sql = format!("SELECT {}", check_expr_str);
+                let ast = Parser::parse_sql(&dialect, &sql)
+                    .map_err(|e| Error::InvalidArgumentError(format!(
+                        "Failed to parse CHECK expression '{}': {}",
+                        check_expr_str, e
+                    )))?;
+
+                let stmt = ast.into_iter().next().ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "CHECK expression '{}' resulted in empty AST",
+                        check_expr_str
+                    ))
+                })?;
+
+                let select = match stmt {
+                    sqlparser::ast::Statement::Query(q) => q,
+                    _ => return Err(Error::InvalidArgumentError(format!(
+                        "CHECK expression '{}' did not parse as SELECT",
+                        check_expr_str
+                    ))),
+                };
+
+                // Extract the expression from SELECT
+                let body = match *select.body {
+                    sqlparser::ast::SetExpr::Select(s) => s,
+                    _ => return Err(Error::InvalidArgumentError(format!(
+                        "CHECK expression '{}' is not a simple SELECT",
+                        check_expr_str
+                    ))),
+                };
+
+                if body.projection.len() != 1 {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "CHECK expression '{}' must have exactly one projection",
+                        check_expr_str
+                    )));
+                }
+
+                let expr = match &body.projection[0] {
+                    sqlparser::ast::SelectItem::UnnamedExpr(e) | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => e,
+                    _ => return Err(Error::InvalidArgumentError(format!(
+                        "CHECK expression '{}' projection is not a simple expression",
+                        check_expr_str
+                    ))),
+                };
+
+                // Evaluate the expression against this row
+                let result = self.evaluate_check_expression(
+                    expr,
+                    row,
+                    column_order,
+                    table,
+                    *col_idx,
+                    row_idx,
+                )?;
+
+                if !result {
+                    return Err(Error::ConstraintError(format!(
+                        "CHECK constraint failed for column '{}': {}",
+                        column.name, check_expr_str
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn evaluate_check_expression(
+        &self,
+        expr: &sqlparser::ast::Expr,
+        row: &[PlanValue],
+        column_order: &[usize],
+        table: &ExecutorTable<P>,
+        _check_column_idx: usize,
+        _row_idx: usize,
+    ) -> Result<bool> {
+        use sqlparser::ast::Expr as SqlExpr;
+
+        match expr {
+            SqlExpr::BinaryOp { left, op, right } => {
+                let left_val = self.evaluate_check_expr_value(left, row, column_order, table)?;
+                let right_val = self.evaluate_check_expr_value(right, row, column_order, table)?;
+
+                use sqlparser::ast::BinaryOperator;
+                match op {
+                    BinaryOperator::Eq => Ok(left_val == right_val),
+                    BinaryOperator::NotEq => Ok(left_val != right_val),
+                    BinaryOperator::Lt => {
+                        match (left_val, right_val) {
+                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l < r),
+                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l < r),
+                            _ => Err(Error::InvalidArgumentError(
+                                "CHECK constraint < operator requires numeric values".into()
+                            )),
+                        }
+                    }
+                    BinaryOperator::LtEq => {
+                        match (left_val, right_val) {
+                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l <= r),
+                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l <= r),
+                            _ => Err(Error::InvalidArgumentError(
+                                "CHECK constraint <= operator requires numeric values".into()
+                            )),
+                        }
+                    }
+                    BinaryOperator::Gt => {
+                        match (left_val, right_val) {
+                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l > r),
+                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l > r),
+                            _ => Err(Error::InvalidArgumentError(
+                                "CHECK constraint > operator requires numeric values".into()
+                            )),
+                        }
+                    }
+                    BinaryOperator::GtEq => {
+                        match (left_val, right_val) {
+                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l >= r),
+                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l >= r),
+                            _ => Err(Error::InvalidArgumentError(
+                                "CHECK constraint >= operator requires numeric values".into()
+                            )),
+                        }
+                    }
+                    _ => Err(Error::InvalidArgumentError(format!(
+                        "Unsupported operator in CHECK constraint: {:?}",
+                        op
+                    ))),
+                }
+            }
+            _ => Err(Error::InvalidArgumentError(format!(
+                "Unsupported expression in CHECK constraint: {:?}",
+                expr
+            ))),
+        }
+    }
+
+    fn evaluate_check_expr_value(
+        &self,
+        expr: &sqlparser::ast::Expr,
+        row: &[PlanValue],
+        column_order: &[usize],
+        table: &ExecutorTable<P>,
+    ) -> Result<PlanValue> {
+        use sqlparser::ast::Expr as SqlExpr;
+
+        match expr {
+            SqlExpr::Identifier(ident) => {
+                // Simple column reference
+                let column_name = &ident.value;
+                let col_idx = table
+                    .schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(column_name))
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!(
+                            "Unknown column '{}' in CHECK constraint",
+                            column_name
+                        ))
+                    })?;
+
+                // Find value in row
+                let insert_pos = column_order
+                    .iter()
+                    .position(|&dest_idx| dest_idx == col_idx)
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!(
+                            "Column '{}' not provided in INSERT",
+                            column_name
+                        ))
+                    })?;
+
+                Ok(row[insert_pos].clone())
+            }
+            SqlExpr::CompoundIdentifier(idents) => {
+                // Struct field access like t.t or table.t.t
+                if idents.len() == 2 {
+                    // col.field format
+                    let column_name = &idents[0].value;
+                    let field_name = &idents[1].value;
+
+                    let col_idx = table
+                        .schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(column_name))
+                        .ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "Unknown column '{}' in CHECK constraint",
+                                column_name
+                            ))
+                        })?;
+
+                    let insert_pos = column_order
+                        .iter()
+                        .position(|&dest_idx| dest_idx == col_idx)
+                        .ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "Column '{}' not provided in INSERT",
+                                column_name
+                            ))
+                        })?;
+
+                    // Extract struct field
+                    match &row[insert_pos] {
+                        PlanValue::Struct(fields) => {
+                            fields
+                                .iter()
+                                .find(|(name, _)| name.eq_ignore_ascii_case(field_name))
+                                .map(|(_, val)| val.clone())
+                                .ok_or_else(|| {
+                                    Error::InvalidArgumentError(format!(
+                                        "Struct field '{}' not found in column '{}'",
+                                        field_name, column_name
+                                    ))
+                                })
+                        }
+                        _ => Err(Error::InvalidArgumentError(format!(
+                            "Column '{}' is not a struct, cannot access field '{}'",
+                            column_name, field_name
+                        ))),
+                    }
+                } else if idents.len() == 3 {
+                    // table.col.field format - ignore table part
+                    let column_name = &idents[1].value;
+                    let field_name = &idents[2].value;
+
+                    let col_idx = table
+                        .schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(column_name))
+                        .ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "Unknown column '{}' in CHECK constraint",
+                                column_name
+                            ))
+                        })?;
+
+                    let insert_pos = column_order
+                        .iter()
+                        .position(|&dest_idx| dest_idx == col_idx)
+                        .ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "Column '{}' not provided in INSERT",
+                                column_name
+                            ))
+                        })?;
+
+                    match &row[insert_pos] {
+                        PlanValue::Struct(fields) => {
+                            fields
+                                .iter()
+                                .find(|(name, _)| name.eq_ignore_ascii_case(field_name))
+                                .map(|(_, val)| val.clone())
+                                .ok_or_else(|| {
+                                    Error::InvalidArgumentError(format!(
+                                        "Struct field '{}' not found in column '{}'",
+                                        field_name, column_name
+                                    ))
+                                })
+                        }
+                        _ => Err(Error::InvalidArgumentError(format!(
+                            "Column '{}' is not a struct, cannot access field '{}'",
+                            column_name, field_name
+                        ))),
+                    }
+                } else {
+                    Err(Error::InvalidArgumentError(format!(
+                        "Unsupported compound identifier in CHECK constraint: {} parts",
+                        idents.len()
+                    )))
+                }
+            }
+            SqlExpr::Value(val_with_span) => {
+                // Numeric literal
+                match &val_with_span.value {
+                    sqlparser::ast::Value::Number(n, _) => {
+                        if let Ok(i) = n.parse::<i64>() {
+                            Ok(PlanValue::Integer(i))
+                        } else if let Ok(f) = n.parse::<f64>() {
+                            Ok(PlanValue::Float(f))
+                        } else {
+                            Err(Error::InvalidArgumentError(format!(
+                                "Invalid number in CHECK constraint: {}",
+                                n
+                            )))
+                        }
+                    }
+                    sqlparser::ast::Value::SingleQuotedString(s)
+                    | sqlparser::ast::Value::DoubleQuotedString(s) => {
+                        Ok(PlanValue::String(s.clone()))
+                    }
+                    sqlparser::ast::Value::Null => Ok(PlanValue::Null),
+                    _ => Err(Error::InvalidArgumentError(format!(
+                        "Unsupported value type in CHECK constraint: {:?}",
+                        val_with_span.value
+                    ))),
+                }
+            }
+            _ => Err(Error::InvalidArgumentError(format!(
+                "Unsupported expression type in CHECK constraint: {:?}",
+                expr
+            ))),
+        }
     }
 
     fn check_primary_key_constraints(
@@ -2135,6 +2477,9 @@ where
                 )));
             }
         }
+
+        // Check CHECK constraints
+        self.check_check_constraints(table, &rows, &column_order)?;
 
         // Check PRIMARY KEY constraints
         self.check_primary_key_constraints(table, &rows, &column_order, snapshot)?;
@@ -2844,6 +3189,7 @@ where
                 nullable: field.is_nullable(),
                 primary_key: false, // Not stored in schema metadata currently
                 field_id,
+                check_expr: None, // CHECK constraints not stored in physical schema yet
             });
         }
 

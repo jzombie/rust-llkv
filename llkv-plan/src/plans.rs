@@ -101,6 +101,9 @@ pub struct ColumnSpec {
     pub data_type: DataType,
     pub nullable: bool,
     pub primary_key: bool,
+    /// Optional CHECK constraint expression (SQL string).
+    /// Example: "t.t=42" for CHECK(t.t=42)
+    pub check_expr: Option<String>,
 }
 
 impl ColumnSpec {
@@ -110,11 +113,17 @@ impl ColumnSpec {
             data_type,
             nullable,
             primary_key: false,
+            check_expr: None,
         }
     }
 
     pub fn with_primary_key(mut self, primary_key: bool) -> Self {
         self.primary_key = primary_key;
+        self
+    }
+
+    pub fn with_check(mut self, check_expr: Option<String>) -> Self {
+        self.check_expr = check_expr;
         self
     }
 }

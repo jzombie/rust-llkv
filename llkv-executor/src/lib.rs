@@ -1264,6 +1264,7 @@ pub struct ExecutorColumn {
     pub nullable: bool,
     pub primary_key: bool,
     pub field_id: FieldId,
+    pub check_expr: Option<String>,
 }
 
 // Re-export from llkv-plan
