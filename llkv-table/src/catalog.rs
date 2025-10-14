@@ -1237,6 +1237,30 @@ impl FieldResolver {
         self.field_constraints(id)
     }
 
+    /// Update the UNIQUE constraint flag for a field.
+    pub fn set_field_unique(&self, name: &str, unique: bool) -> Result<()> {
+        let canonical = name.to_ascii_lowercase();
+        let mut inner = self.inner.write().map_err(|_| {
+            Error::Internal("Failed to acquire field resolver write lock".to_string())
+        })?;
+
+        let field_id = *inner.field_name_to_id.get(&canonical).ok_or_else(|| {
+            Error::CatalogError(format!("Field '{}' does not exist in table", name))
+        })?;
+
+        let metadata = inner.field_id_to_meta.get_mut(&field_id).ok_or_else(|| {
+            Error::CatalogError(format!("Field '{}' metadata is missing from catalog", name))
+        })?;
+
+        if unique {
+            metadata.constraints.unique = true;
+        } else if !metadata.constraints.primary_key {
+            metadata.constraints.unique = false;
+        }
+
+        Ok(())
+    }
+
     /// Retrieve complete field information by field id.
     pub fn field_info(&self, id: FieldId) -> Option<FieldInfo> {
         let inner = self.inner.read().ok()?;

@@ -12,10 +12,11 @@ use llkv_executor::SelectExecution;
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
 use llkv_runtime::{
-    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateTablePlan,
-    CreateTableSource, DeletePlan, InsertPlan, InsertSource, OrderByPlan, OrderSortType,
-    OrderTarget, PlanStatement, PlanValue, RuntimeContext, RuntimeEngine, RuntimeSession,
-    RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
+    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan,
+    CreateTablePlan, CreateTableSource, DeletePlan, IndexColumnPlan, InsertPlan, InsertSource,
+    OrderByPlan, OrderSortType, OrderTarget, PlanStatement, PlanValue, RuntimeContext,
+    RuntimeEngine, RuntimeSession, RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan,
+    extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
 use llkv_table::catalog::{IdentifierContext, IdentifierResolver};
@@ -25,7 +26,7 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
     ColumnOptionDef, DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName,
-    ObjectNamePart, ObjectType, OrderBy, OrderByExpr, OrderByKind, Query, SchemaName, Select,
+    ObjectNamePart, ObjectType, OrderBy, OrderByKind, Query, SchemaName, Select,
     SelectItem, SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableFactor,
     TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
     UpdateTableFromKind, Value, ValueWithSpan,
@@ -238,6 +239,10 @@ where
             Statement::CreateTable(stmt) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateTable");
                 self.handle_create_table(stmt)
+            }
+            Statement::CreateIndex(stmt) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateIndex");
+                self.handle_create_index(stmt)
             }
             Statement::CreateSchema {
                 schema_name,
@@ -565,6 +570,171 @@ where
             source: None,
         };
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
+    }
+
+    fn handle_create_index(
+        &self,
+        stmt: sqlparser::ast::CreateIndex,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        use sqlparser::ast::Expr as SqlExpr;
+
+        let sqlparser::ast::CreateIndex {
+            name,
+            table_name,
+            using,
+            columns,
+            unique,
+            concurrently,
+            if_not_exists,
+            include,
+            nulls_distinct,
+            with,
+            predicate,
+            index_options,
+            alter_options,
+            ..
+        } = stmt;
+
+        if concurrently {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX CONCURRENTLY is not supported".into(),
+            ));
+        }
+        if using.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX USING clauses are not supported".into(),
+            ));
+        }
+        if !include.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX INCLUDE columns are not supported".into(),
+            ));
+        }
+        if nulls_distinct.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX NULLS DISTINCT is not supported".into(),
+            ));
+        }
+        if !with.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX WITH options are not supported".into(),
+            ));
+        }
+        if predicate.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "partial CREATE INDEX is not supported".into(),
+            ));
+        }
+        if !index_options.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX options are not supported".into(),
+            ));
+        }
+        if !alter_options.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX ALTER options are not supported".into(),
+            ));
+        }
+        if columns.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX requires at least one column".into(),
+            ));
+        }
+
+        let (schema_name, base_table_name) = parse_schema_qualified_name(&table_name)?;
+        if let Some(ref schema) = schema_name {
+            let catalog = self.engine.context().table_catalog();
+            if !catalog.schema_exists(schema) {
+                return Err(Error::CatalogError(format!(
+                    "Schema '{}' does not exist",
+                    schema
+                )));
+            }
+        }
+
+        let display_table_name = schema_name
+            .as_ref()
+            .map(|schema| format!("{}.{}", schema, base_table_name))
+            .unwrap_or_else(|| base_table_name.clone());
+
+        let index_name = match name {
+            Some(name_obj) => Some(Self::object_name_to_string(&name_obj)?),
+            None => None,
+        };
+
+    let mut index_columns: Vec<IndexColumnPlan> = Vec::with_capacity(columns.len());
+    let mut seen_column_names: HashSet<String> = HashSet::new();
+        for item in columns {
+            if item.operator_class.is_some() {
+                return Err(Error::InvalidArgumentError(
+                    "CREATE INDEX operator classes are not supported".into(),
+                ));
+            }
+
+            let order_expr = item.column;
+
+            if order_expr.with_fill.is_some() {
+                return Err(Error::InvalidArgumentError(
+                    "CREATE INDEX column WITH FILL is not supported".into(),
+                ));
+            }
+
+            let column_name = match order_expr.expr {
+                SqlExpr::Identifier(ident) => ident.value,
+                SqlExpr::CompoundIdentifier(idents) => idents
+                    .last()
+                    .map(|ident| ident.value.clone())
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "invalid column reference in CREATE INDEX".into(),
+                        )
+                    })?,
+                other => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "CREATE INDEX only supports column references, found {other:?}",
+                    )));
+                }
+            };
+
+            let ascending = order_expr.options.asc.unwrap_or(true);
+            let nulls_first = order_expr.options.nulls_first.unwrap_or(false);
+
+            if !ascending {
+                return Err(Error::InvalidArgumentError(
+                    "CREATE INDEX DESC ordering is not supported".into(),
+                ));
+            }
+            if nulls_first {
+                return Err(Error::InvalidArgumentError(
+                    "CREATE INDEX NULLS FIRST ordering is not supported".into(),
+                ));
+            }
+
+            let normalized = column_name.to_ascii_lowercase();
+            if !seen_column_names.insert(normalized) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "duplicate column '{}' in CREATE INDEX",
+                    column_name
+                )));
+            }
+
+            let column_plan = IndexColumnPlan::new(column_name).with_sort(ascending, nulls_first);
+            index_columns.push(column_plan);
+        }
+
+        if index_columns.len() > 1 && !unique {
+            return Err(Error::InvalidArgumentError(
+                "multi-column CREATE INDEX currently supports UNIQUE indexes only".into(),
+            ));
+        }
+
+        let plan = CreateIndexPlan::new(display_table_name)
+            .with_name(index_name)
+            .with_unique(unique)
+            .with_if_not_exists(if_not_exists)
+            .with_columns(index_columns);
+
+        self.execute_plan_statement(PlanStatement::CreateIndex(plan))
     }
 
     fn handle_create_schema(

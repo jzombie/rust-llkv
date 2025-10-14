@@ -249,6 +249,9 @@ impl AsyncDB for EngineHarness {
                     RuntimeStatementResult::CreateTable { .. } => {
                         Ok(DBOutput::StatementComplete(0))
                     }
+                    RuntimeStatementResult::CreateIndex { .. } => {
+                        Ok(DBOutput::StatementComplete(0))
+                    }
                     RuntimeStatementResult::Transaction { .. } => {
                         Ok(DBOutput::StatementComplete(0))
                     }

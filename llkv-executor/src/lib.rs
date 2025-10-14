@@ -20,8 +20,8 @@ use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::fmt;
 use std::ops::Bound;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 pub type ExecutorResult<T> = Result<T, Error>;
 
@@ -1303,6 +1303,7 @@ where
     pub schema: Arc<ExecutorSchema>,
     pub next_row_id: AtomicU64,
     pub total_rows: AtomicU64,
+    pub multi_column_uniques: RwLock<Vec<ExecutorMultiColumnUnique>>,
 }
 
 pub struct ExecutorSchema {
@@ -1336,6 +1337,35 @@ pub struct ExecutorColumn {
     pub unique: bool,
     pub field_id: FieldId,
     pub check_expr: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutorMultiColumnUnique {
+    pub index_name: Option<String>,
+    pub column_indices: Vec<usize>,
+}
+
+impl<P> ExecutorTable<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    pub fn multi_column_uniques(&self) -> Vec<ExecutorMultiColumnUnique> {
+        self.multi_column_uniques.read().unwrap().clone()
+    }
+
+    pub fn set_multi_column_uniques(&self, uniques: Vec<ExecutorMultiColumnUnique>) {
+        *self.multi_column_uniques.write().unwrap() = uniques;
+    }
+
+    pub fn add_multi_column_unique(&self, unique: ExecutorMultiColumnUnique) {
+        let mut guard = self.multi_column_uniques.write().unwrap();
+        if !guard
+            .iter()
+            .any(|existing| existing.column_indices == unique.column_indices)
+        {
+            guard.push(unique);
+        }
+    }
 }
 
 // Re-export from llkv-plan

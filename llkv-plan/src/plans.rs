@@ -94,6 +94,76 @@ impl CreateTablePlan {
     }
 }
 
+// ============================================================================
+// CREATE INDEX Plan
+// ============================================================================
+
+/// Column specification for CREATE INDEX statements.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexColumnPlan {
+    pub name: String,
+    pub ascending: bool,
+    pub nulls_first: bool,
+}
+
+impl IndexColumnPlan {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ascending: true,
+            nulls_first: false,
+        }
+    }
+
+    pub fn with_sort(mut self, ascending: bool, nulls_first: bool) -> Self {
+        self.ascending = ascending;
+        self.nulls_first = nulls_first;
+        self
+    }
+}
+
+/// Plan for creating an index on a table.
+#[derive(Clone, Debug)]
+pub struct CreateIndexPlan {
+    pub name: Option<String>,
+    pub table: String,
+    pub unique: bool,
+    pub if_not_exists: bool,
+    pub columns: Vec<IndexColumnPlan>,
+}
+
+impl CreateIndexPlan {
+    pub fn new(table: impl Into<String>) -> Self {
+        Self {
+            name: None,
+            table: table.into(),
+            unique: false,
+            if_not_exists: false,
+            columns: Vec::new(),
+        }
+    }
+
+    pub fn with_name(mut self, name: Option<String>) -> Self {
+        self.name = name;
+        self
+    }
+
+    pub fn with_unique(mut self, unique: bool) -> Self {
+        self.unique = unique;
+        self
+    }
+
+    pub fn with_if_not_exists(mut self, if_not_exists: bool) -> Self {
+        self.if_not_exists = if_not_exists;
+        self
+    }
+
+    pub fn with_columns(mut self, columns: Vec<IndexColumnPlan>) -> Self {
+        self.columns = columns;
+        self
+    }
+}
+
 /// Column specification for CREATE TABLE.
 #[derive(Clone, Debug)]
 pub struct ColumnSpec {
@@ -552,6 +622,7 @@ pub enum PlanStatement {
     CommitTransaction,
     RollbackTransaction,
     CreateTable(CreateTablePlan),
+    CreateIndex(CreateIndexPlan),
     Insert(InsertPlan),
     Update(UpdatePlan),
     Delete(DeletePlan),
