@@ -890,35 +890,7 @@ where
                                 let struct_fields = fields
                                     .iter()
                                     .map(|(name, lit)| {
-                                        let field_dtype = match lit.as_ref() {
-                                            Literal::Integer(_) => DataType::Int64,
-                                            Literal::Float(_) => DataType::Float64,
-                                            Literal::String(_) => DataType::Utf8,
-                                            Literal::Struct(nested_fields) => {
-                                                // Recursively handle nested structs
-                                                // For simplicity, we'll create a basic inference
-                                                // This could be made more sophisticated
-                                                let nested_arrow_fields = nested_fields
-                                                    .iter()
-                                                    .map(|(nested_name, nested_lit)| {
-                                                        let nested_dtype = match nested_lit.as_ref() {
-                                                            Literal::Integer(_) => DataType::Int64,
-                                                            Literal::Float(_) => DataType::Float64,
-                                                            Literal::String(_) => DataType::Utf8,
-                                                            Literal::Struct(_) => {
-                                                                // For deeply nested, use a placeholder
-                                                                // This is a limitation - we'd need recursive function
-                                                                return Err(Error::InvalidArgumentError(
-                                                                    "Deeply nested struct literals not yet supported".into()
-                                                                ));
-                                                            }
-                                                        };
-                                                        Ok(Field::new(nested_name.clone(), nested_dtype, true))
-                                                    })
-                                                    .collect::<LlkvResult<Vec<_>>>()?;
-                                                DataType::Struct(nested_arrow_fields.into())
-                                            }
-                                        };
+                                        let field_dtype = infer_literal_datatype(lit.as_ref())?;
                                         Ok(Field::new(name.clone(), field_dtype, true))
                                     })
                                     .collect::<LlkvResult<Vec<_>>>()?;
@@ -2032,6 +2004,24 @@ fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
     }
 }
 
+fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
+    match literal {
+        Literal::Integer(_) => Ok(DataType::Int64),
+        Literal::Float(_) => Ok(DataType::Float64),
+        Literal::String(_) => Ok(DataType::Utf8),
+        Literal::Struct(fields) => {
+            let inferred_fields = fields
+                .iter()
+                .map(|(name, nested)| {
+                    let dtype = infer_literal_datatype(nested.as_ref())?;
+                    Ok(Field::new(name.clone(), dtype, true))
+                })
+                .collect::<LlkvResult<Vec<_>>>()?;
+            Ok(DataType::Struct(inferred_fields.into()))
+        }
+    }
+}
+
 fn synthesize_computed_literal_array(
     info: &ComputedProjectionInfo,
     data_type: &DataType,
@@ -2059,32 +2049,14 @@ fn synthesize_computed_literal_array(
         ScalarExpr::Literal(Literal::Struct(fields)) => {
             // Build a struct array from the literal fields
             use arrow::array::StructArray;
-            
-            // Helper function to infer DataType from a Literal recursively
-            fn infer_literal_dtype(lit: &Literal) -> DataType {
-                match lit {
-                    Literal::Integer(_) => DataType::Int64,
-                    Literal::Float(_) => DataType::Float64,
-                    Literal::String(_) => DataType::Utf8,
-                    Literal::Struct(nested_fields) => {
-                        let fields: Vec<Field> = nested_fields
-                            .iter()
-                            .map(|(name, nested_lit)| {
-                                Field::new(name.clone(), infer_literal_dtype(nested_lit), true)
-                            })
-                            .collect();
-                        DataType::Struct(fields.into())
-                    }
-                }
-            }
-            
+
             // Convert each field to an array
             let mut field_arrays = Vec::new();
             let mut arrow_fields = Vec::new();
             
             for (field_name, field_literal) in fields {
                 // Infer the proper data type from the literal
-                let field_dtype = infer_literal_dtype(field_literal);
+                let field_dtype = infer_literal_datatype(field_literal.as_ref())?;
                 arrow_fields.push(Field::new(field_name.clone(), field_dtype.clone(), true));
                 
                 // Create the array for this field

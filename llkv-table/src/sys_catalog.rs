@@ -732,14 +732,19 @@ where
 /// Uses a simple hash to map schema names to row IDs. This is deterministic
 /// and allows direct lookup without scanning.
 fn schema_name_to_row_id(canonical_name: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    // Use a simple 64-bit FNV-1a hash for deterministic IDs across platforms and releases
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x1000_0000_01b3;
 
-    let mut hasher = DefaultHasher::new();
-    canonical_name.hash(&mut hasher);
-    // Use high bits to avoid collision with reserved catalog row IDs (0-3)
-    // and table metadata row IDs
-    hasher.finish() | (1u64 << 63)
+    let mut hash = FNV_OFFSET;
+    for byte in canonical_name.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+
+    // Use high bit to avoid collision with reserved catalog row IDs (0-3) and table metadata rows
+    hash | (1u64 << 63)
 }
 
 struct MaxRowIdCollector {

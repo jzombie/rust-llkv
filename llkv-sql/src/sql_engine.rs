@@ -1,6 +1,8 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::collections::{HashMap, HashSet};
+use std::sync::{
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    Arc, OnceLock,
+};
 
 use crate::SqlResult;
 use crate::SqlValue;
@@ -15,6 +17,7 @@ use llkv_runtime::{
     OrderTarget, PlanStatement, PlanValue, RuntimeContext, RuntimeEngine, RuntimeSession,
     RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
 };
+use regex::Regex;
 use llkv_storage::pager::Pager;
 use llkv_table::catalog::{IdentifierContext, IdentifierResolver};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -117,14 +120,16 @@ where
     /// Preprocess SQL to handle qualified names in EXCLUDE clauses
     /// Converts EXCLUDE (schema.table.col) to EXCLUDE ("schema.table.col")
     fn preprocess_exclude_syntax(sql: &str) -> String {
-        use regex::Regex;
+        static EXCLUDE_REGEX: OnceLock<Regex> = OnceLock::new();
 
         // Pattern to match EXCLUDE followed by qualified identifiers
         // Matches: EXCLUDE (identifier.identifier.identifier)
-        let re = Regex::new(
-            r"(?i)EXCLUDE\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)+)\s*\)",
-        )
-        .unwrap();
+        let re = EXCLUDE_REGEX.get_or_init(|| {
+            Regex::new(
+                r"(?i)EXCLUDE\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)+)\s*\)",
+            )
+            .expect("valid EXCLUDE qualifier regex")
+        });
 
         re.replace_all(sql, |caps: &regex::Captures| {
             let qualified_name = &caps[1];
@@ -462,22 +467,20 @@ where
         validate_create_table_definition(&stmt)?;
 
         let mut columns: Vec<ColumnSpec> = Vec::with_capacity(stmt.columns.len());
-        let mut names: HashMap<String, ()> = HashMap::new();
 
         // First pass: collect all column names and check for duplicates
-        let all_column_names: Vec<String> = stmt
-            .columns
-            .iter()
-            .map(|col| col.name.value.clone())
-            .collect();
-        for col_name in &all_column_names {
-            let normalized = col_name.to_ascii_lowercase();
-            if names.insert(normalized, ()).is_some() {
+        let mut seen_names: HashSet<String> = HashSet::with_capacity(stmt.columns.len());
+        let mut all_column_names: Vec<String> = Vec::with_capacity(stmt.columns.len());
+        for column_def in &stmt.columns {
+            let column_name = column_def.name.value.clone();
+            let normalized = column_name.to_ascii_lowercase();
+            if !seen_names.insert(normalized) {
                 return Err(Error::InvalidArgumentError(format!(
                     "duplicate column name '{}' in table '{}'",
-                    col_name, display_name
+                    column_name, display_name
                 )));
             }
+            all_column_names.push(column_name);
         }
 
         // Second pass: process columns including CHECK validation
