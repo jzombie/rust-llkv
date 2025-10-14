@@ -94,6 +94,10 @@ impl NumericKernels {
                     }
                 }
             }
+            ScalarExpr::GetField { base, .. } => {
+                // Collect fields from the base expression
+                Self::collect_fields(base, acc);
+            }
         }
     }
 
@@ -155,6 +159,9 @@ impl NumericKernels {
                 llkv_expr::literal::Literal::String(_) => Err(Error::InvalidArgumentError(
                     "String literals are not supported in numeric expressions".into(),
                 )),
+                llkv_expr::literal::Literal::Struct(_) => Err(Error::InvalidArgumentError(
+                    "Struct literals are not supported in numeric expressions".into(),
+                )),
             },
             ScalarExpr::Binary { left, op, right } => {
                 let l = Self::evaluate_value(left, idx, arrays)?;
@@ -163,6 +170,9 @@ impl NumericKernels {
             }
             ScalarExpr::Aggregate(_) => Err(Error::Internal(
                 "Aggregate expressions should not appear in row-level evaluation".into(),
+            )),
+            ScalarExpr::GetField { .. } => Err(Error::Internal(
+                "GetField expressions should not be evaluated in numeric kernels".into(),
             )),
         }
     }
@@ -213,6 +223,7 @@ impl NumericKernels {
                     Ok(Some(VectorizedExpr::Scalar(Some(*i as f64))))
                 }
                 llkv_expr::literal::Literal::String(_) => Ok(None),
+                llkv_expr::literal::Literal::Struct(_) => Ok(None),
             },
             ScalarExpr::Binary { left, op, right } => {
                 let left_vec = Self::try_evaluate_vectorized(left, len, arrays)?;
@@ -242,6 +253,9 @@ impl NumericKernels {
             }
             ScalarExpr::Aggregate(_) => Err(Error::Internal(
                 "Aggregate expressions should not appear in row-level evaluation".into(),
+            )),
+            ScalarExpr::GetField { .. } => Err(Error::Internal(
+                "GetField expressions should not be evaluated in numeric kernels".into(),
             )),
         }
     }
@@ -327,6 +341,7 @@ impl NumericKernels {
                 llkv_expr::literal::Literal::Float(f) => Some(*f),
                 llkv_expr::literal::Literal::Integer(i) => Some(*i as f64),
                 llkv_expr::literal::Literal::String(_) => None,
+                llkv_expr::literal::Literal::Struct(_) => None,
             }
         } else {
             None
@@ -340,9 +355,10 @@ impl NumericKernels {
     /// Recursively simplify the expression by folding literals and eliminating identity operations.
     pub fn simplify(expr: &ScalarExpr<FieldId>) -> ScalarExpr<FieldId> {
         match expr {
-            ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Aggregate(_) => {
-                expr.clone()
-            }
+            ScalarExpr::Column(_)
+            | ScalarExpr::Literal(_)
+            | ScalarExpr::Aggregate(_)
+            | ScalarExpr::GetField { .. } => expr.clone(),
             ScalarExpr::Binary { left, op, right } => {
                 let left_s = Self::simplify(left);
                 let right_s = Self::simplify(right);
@@ -430,6 +446,7 @@ impl NumericKernels {
                 })
             }
             ScalarExpr::Aggregate(_) => None, // Aggregates not supported in affine transformations
+            ScalarExpr::GetField { .. } => None, // GetField not supported in affine transformations
             ScalarExpr::Binary { left, op, right } => {
                 let left_state = Self::affine_state(left)?;
                 let right_state = Self::affine_state(right)?;

@@ -9,6 +9,8 @@ pub enum Literal {
     Integer(i128),
     Float(f64),
     String(String),
+    /// Struct literal with field names and nested literals
+    Struct(Vec<(String, Box<Literal>)>),
     // Other types like Bool, Bytes can be added here.
 }
 
@@ -90,6 +92,10 @@ macro_rules! impl_from_literal_int {
                             expected: "integer",
                             got: "string",
                         }),
+                        Literal::Struct(_) => Err(LiteralCastError::TypeMismatch {
+                            expected: "integer",
+                            got: "struct",
+                        }),
                     }
                 }
             }
@@ -108,6 +114,12 @@ impl FromLiteral for f32 {
                 return Err(LiteralCastError::TypeMismatch {
                     expected: "float",
                     got: "string",
+                });
+            }
+            Literal::Struct(_) => {
+                return Err(LiteralCastError::TypeMismatch {
+                    expected: "float",
+                    got: "struct",
                 });
             }
         };
@@ -148,6 +160,10 @@ impl FromLiteral for bool {
                     }),
                 }
             }
+            Literal::Struct(_) => Err(LiteralCastError::TypeMismatch {
+                expected: "bool",
+                got: "struct",
+            }),
         }
     }
 }
@@ -161,6 +177,10 @@ impl FromLiteral for f64 {
                 expected: "float",
                 got: "string",
             }),
+            Literal::Struct(_) => Err(LiteralCastError::TypeMismatch {
+                expected: "float",
+                got: "struct",
+            }),
         }
     }
 }
@@ -170,6 +190,7 @@ fn literal_type_name(lit: &Literal) -> &'static str {
         Literal::Integer(_) => "integer",
         Literal::Float(_) => "float",
         Literal::String(_) => "string",
+        Literal::Struct(_) => "struct",
     }
 }
 

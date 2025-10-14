@@ -41,7 +41,7 @@ use arrow::array::{
     Array, ArrayRef, Date32Builder, Float64Builder, Int64Builder, StringBuilder, UInt64Array,
     UInt64Builder,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{
@@ -52,6 +52,7 @@ use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 // Literal is not used at top-level; keep it out to avoid unused import warnings.
 use llkv_result::Error;
 use llkv_storage::pager::{MemPager, Pager};
+use llkv_table::catalog::{FieldConstraints, FieldDefinition};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_table::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
@@ -315,7 +316,14 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
         PlanStatement::Insert(plan) => Some(&plan.table),
         PlanStatement::Update(plan) => Some(&plan.table),
         PlanStatement::Delete(plan) => Some(&plan.table),
-        PlanStatement::Select(plan) => Some(&plan.table),
+        PlanStatement::Select(plan) => {
+            // Return Some only for single-table queries
+            if plan.tables.len() == 1 {
+                Some(&plan.tables[0].table)
+            } else {
+                None
+            }
+        }
         PlanStatement::BeginTransaction
         | PlanStatement::CommitTransaction
         | PlanStatement::RollbackTransaction => None,
@@ -403,7 +411,8 @@ where
     }
 
     /// Begin a transaction in this session.
-    /// Creates an isolated staging context automatically.
+    /// Creates an empty staging context for new tables created within the transaction.
+    /// Existing tables are accessed via MVCC visibility filtering - NO data copying occurs.
     pub fn begin_transaction(&self) -> Result<RuntimeStatementResult<P>> {
         let staging_pager = Arc::new(MemPager::default());
         tracing::trace!(
@@ -412,12 +421,9 @@ where
         );
         let staging_ctx = Arc::new(RuntimeContext::new(staging_pager));
 
-        // Copy table metadata from the main context to the staging context,
-        // but create new Table instances that use the staging pager
-        self.inner
-            .context()
-            .ctx()
-            .copy_tables_to_staging(&staging_ctx)?;
+        // Staging context is EMPTY - used only for tables created within the transaction.
+        // Existing tables are read from base context with MVCC visibility filtering.
+        // No data copying occurs at BEGIN - this is pure MVCC.
 
         let staging_wrapper = Arc::new(RuntimeContextWrapper::new(staging_ctx));
 
@@ -739,7 +745,11 @@ where
             let context = self.inner.context();
             let default_snapshot = context.ctx().default_snapshot();
             TransactionContext::set_snapshot(&**context, default_snapshot);
-            let table_name = plan.table.clone();
+            let table_name = if plan.tables.len() == 1 {
+                plan.tables[0].qualified_name()
+            } else {
+                String::new()
+            };
             let execution = TransactionContext::execute_select(&**context, plan)?;
             let schema = execution.schema();
             Ok(RuntimeStatementResult::Select {
@@ -1054,7 +1064,7 @@ where
         let catalog = Arc::new(llkv_table::catalog::TableCatalog::new());
         for (_table_id, table_meta) in &loaded_tables {
             if let Some(ref table_name) = table_meta.name
-                && let Err(e) = catalog.register_table(table_name)
+                && let Err(e) = catalog.register_table(table_name.as_str())
             {
                 tracing::warn!(
                     "[CONTEXT] Failed to register table '{}' in catalog: {}",
@@ -1106,6 +1116,11 @@ where
         }
     }
 
+    /// Get the table catalog for schema and table name management.
+    pub fn table_catalog(&self) -> Arc<llkv_table::catalog::TableCatalog> {
+        Arc::clone(&self.catalog)
+    }
+
     /// Create a new session for transaction management.
     /// Each session can have its own independent transaction.
     pub fn create_session(self: &Arc<Self>) -> RuntimeSession<P> {
@@ -1123,7 +1138,7 @@ where
         RuntimeTableHandle::new(Arc::clone(self), name)
     }
 
-    /// Check if there's an active transaction (legacy - checks if ANY session has a transaction).
+    /// Check if there's an active transaction (checks if ANY session has a transaction).
     #[deprecated(note = "Use session-based transactions instead")]
     pub fn has_active_transaction(&self) -> bool {
         self.transaction_manager.has_active_transaction()
@@ -1175,11 +1190,29 @@ where
                 col.primary_key
             );
         }
-        let exists = {
+        let (exists, is_dropped) = {
             let tables = self.tables.read().unwrap();
-            tables.contains_key(&canonical_name)
+            let in_cache = tables.contains_key(&canonical_name);
+            let is_dropped = self
+                .dropped_tables
+                .read()
+                .unwrap()
+                .contains(&canonical_name);
+            // Table exists if it's in cache and NOT marked as dropped
+            (in_cache && !is_dropped, is_dropped)
         };
-        tracing::trace!("DEBUG create_table_plan: exists={}", exists);
+        tracing::trace!(
+            "DEBUG create_table_plan: exists={}, is_dropped={}",
+            exists,
+            is_dropped
+        );
+
+        // If table was dropped, remove it from cache before creating new one
+        if is_dropped {
+            self.remove_table_entry(&canonical_name);
+            self.dropped_tables.write().unwrap().remove(&canonical_name);
+        }
+
         if exists {
             if plan.or_replace {
                 tracing::trace!(
@@ -1202,8 +1235,6 @@ where
                 )));
             }
         }
-
-        self.dropped_tables.write().unwrap().remove(&canonical_name);
 
         match plan.source {
             Some(CreateTableSource::Batches { schema, batches }) => self.create_table_from_batches(
@@ -1269,122 +1300,6 @@ where
                 .with_primary_key(column.primary_key)
             })
             .collect())
-    }
-
-    /// Copy table metadata from this context to a staging context.
-    /// This creates new Table instances that use the staging context's pager.
-    fn copy_tables_to_staging<Q>(&self, staging: &RuntimeContext<Q>) -> Result<()>
-    where
-        Q: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-    {
-        let base_store = ColumnStore::open(Arc::clone(&self.pager))?;
-        let base_catalog = SysCatalog::new(&base_store);
-
-        let staging_store = ColumnStore::open(Arc::clone(&staging.pager))?;
-        let staging_catalog = SysCatalog::new(&staging_store);
-
-        let mut next_table_id = match base_catalog.get_next_table_id()? {
-            Some(value) => value,
-            None => {
-                let seed = base_catalog.max_table_id()?.unwrap_or(CATALOG_TABLE_ID);
-                seed.checked_add(1).ok_or_else(|| {
-                    Error::InvalidArgumentError("exhausted available table ids".into())
-                })?
-            }
-        };
-        if next_table_id == CATALOG_TABLE_ID {
-            next_table_id = next_table_id.checked_add(1).ok_or_else(|| {
-                Error::InvalidArgumentError("exhausted available table ids".into())
-            })?;
-        }
-
-        staging_catalog.put_next_table_id(next_table_id)?;
-
-        let source_tables: Vec<(String, Arc<ExecutorTable<P>>)> = {
-            let guard = self.tables.read().unwrap();
-            guard
-                .iter()
-                .map(|(name, table)| (name.clone(), Arc::clone(table)))
-                .collect()
-        };
-
-        for (table_name, source_table) in source_tables.iter() {
-            tracing::trace!(
-                "!!! COPY_TABLES_TO_STAGING: Copying table '{}' with {} columns:",
-                table_name,
-                source_table.schema.columns.len()
-            );
-            for (idx, col) in source_table.schema.columns.iter().enumerate() {
-                tracing::trace!(
-                    "    source column[{}]: name='{}' primary_key={}",
-                    idx,
-                    col.name,
-                    col.primary_key
-                );
-            }
-
-            // Create a new Table instance with the same table_id but using the staging pager
-            let new_table = Table::new(source_table.table.table_id(), Arc::clone(&staging.pager))?;
-
-            // Create a new ExecutorTable with the new table but same schema
-            // Start with fresh row counters (0) for transaction isolation
-            let new_executor_table = Arc::new(ExecutorTable {
-                table: Arc::new(new_table),
-                schema: source_table.schema.clone(),
-                next_row_id: AtomicU64::new(0),
-                total_rows: AtomicU64::new(0),
-            });
-
-            tracing::trace!(
-                "!!! COPY_TABLES_TO_STAGING: After copy, {} columns in new executor table:",
-                new_executor_table.schema.columns.len()
-            );
-            for (idx, col) in new_executor_table.schema.columns.iter().enumerate() {
-                tracing::trace!(
-                    "    new column[{}]: name='{}' primary_key={}",
-                    idx,
-                    col.name,
-                    col.primary_key
-                );
-            }
-
-            {
-                let mut staging_tables = staging.tables.write().unwrap();
-                staging_tables.insert(table_name.clone(), Arc::clone(&new_executor_table));
-            }
-
-            // Snapshot existing rows (with row_ids) into staging for transaction isolation.
-            // This provides full REPEATABLE READ isolation by copying data at BEGIN.
-            let batches = match self.get_batches_with_row_ids(table_name, None) {
-                Ok(batches) => batches,
-                Err(Error::NotFound) => {
-                    // Table exists but has no data yet (empty table)
-                    Vec::new()
-                }
-                Err(e) => return Err(e),
-            };
-            if !batches.is_empty() {
-                for batch in batches {
-                    new_executor_table.table.append(&batch)?;
-                }
-            }
-
-            let next_row_id = source_table.next_row_id.load(Ordering::SeqCst);
-            new_executor_table
-                .next_row_id
-                .store(next_row_id, Ordering::SeqCst);
-            let total_rows = source_table.total_rows.load(Ordering::SeqCst);
-            new_executor_table
-                .total_rows
-                .store(total_rows, Ordering::SeqCst);
-        }
-
-        let staging_count = staging.tables.read().unwrap().len();
-        tracing::trace!(
-            "!!! COPY_TABLES_TO_STAGING: Copied {} tables to staging context",
-            staging_count
-        );
-        Ok(())
     }
 
     pub fn export_table_rows(self: &Arc<Self>, name: &str) -> Result<RowBatch> {
@@ -1637,7 +1552,11 @@ where
         snapshot: TransactionSnapshot,
     ) -> Result<RuntimeStatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
-        let table = self.lookup_table(&canonical_name)?;
+        // Get table - will be checked against snapshot during actual deletion
+        let table = match self.tables.read().unwrap().get(&canonical_name) {
+            Some(t) => Arc::clone(t),
+            None => return Err(Error::NotFound),
+        };
         match plan.filter {
             Some(filter) => self.delete_filtered_rows(
                 table.as_ref(),
@@ -1655,15 +1574,34 @@ where
     }
 
     pub fn execute_select(self: &Arc<Self>, plan: SelectPlan) -> Result<SelectExecution<P>> {
-        let (_display_name, canonical_name) = canonical_table_name(&plan.table)?;
-        // Verify table exists
-        let _table = self.lookup_table(&canonical_name)?;
+        // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
+        if plan.tables.is_empty() {
+            // No table to query - just evaluate computed expressions
+            let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
+                context: Arc::clone(self),
+            });
+            let executor = QueryExecutor::new(provider);
+            return executor.execute_select(plan);
+        }
 
-        // Create a plan with canonical table name
+        // Resolve canonical names for all tables (don't verify existence yet - let executor do it)
+        let mut canonical_tables = Vec::new();
+        for table_ref in &plan.tables {
+            let qualified = table_ref.qualified_name();
+            let (_display, canonical) = canonical_table_name(&qualified)?;
+            // Parse canonical back into schema.table
+            let parts: Vec<&str> = canonical.split('.').collect();
+            let canon_ref = if parts.len() >= 2 {
+                llkv_plan::TableRef::new(parts[0], parts[1])
+            } else {
+                llkv_plan::TableRef::new("", &canonical)
+            };
+            canonical_tables.push(canon_ref);
+        }
+
         let mut canonical_plan = plan.clone();
-        canonical_plan.table = canonical_name;
+        canonical_plan.tables = canonical_tables;
 
-        // Use the QueryExecutor from llkv-executor
         let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
             context: Arc::clone(self),
         });
@@ -1676,21 +1614,51 @@ where
         plan: SelectPlan,
         snapshot: TransactionSnapshot,
     ) -> Result<SelectExecution<P>> {
-        let (_display_name, canonical_name) = canonical_table_name(&plan.table)?;
-        self.lookup_table(&canonical_name)?;
+        // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
+        if plan.tables.is_empty() {
+            let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
+                context: Arc::clone(self),
+            });
+            let executor = QueryExecutor::new(provider);
+            // No row filter needed since there's no table
+            return executor.execute_select_with_filter(plan, None);
+        }
+
+        // Resolve canonical names for all tables (don't verify existence - executor will handle it with snapshot)
+        let mut canonical_tables = Vec::new();
+        for table_ref in &plan.tables {
+            let qualified = table_ref.qualified_name();
+            let (_display, canonical) = canonical_table_name(&qualified)?;
+            // Parse canonical back into schema.table
+            let parts: Vec<&str> = canonical.split('.').collect();
+            let canon_ref = if parts.len() >= 2 {
+                llkv_plan::TableRef::new(parts[0], parts[1])
+            } else {
+                llkv_plan::TableRef::new("", &canonical)
+            };
+            canonical_tables.push(canon_ref);
+        }
 
         let mut canonical_plan = plan.clone();
-        canonical_plan.table = canonical_name;
+        canonical_plan.tables = canonical_tables;
 
         let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
             context: Arc::clone(self),
         });
         let executor = QueryExecutor::new(provider);
-        let row_filter: Arc<dyn RowIdFilter<P>> = Arc::new(MvccRowIdFilter::new(
-            Arc::clone(&self.txn_manager),
-            snapshot,
-        ));
-        executor.execute_select_with_filter(canonical_plan, Some(row_filter))
+
+        // For single-table queries, apply MVCC filtering
+        let row_filter: Option<Arc<dyn RowIdFilter<P>>> = if canonical_plan.tables.len() == 1 {
+            Some(Arc::new(MvccRowIdFilter::new(
+                Arc::clone(&self.txn_manager),
+                snapshot,
+            )))
+        } else {
+            // For multi-table queries, we don't apply MVCC filtering yet (TODO)
+            None
+        };
+
+        executor.execute_select_with_filter(canonical_plan, row_filter)
     }
 
     fn create_table_from_columns(
@@ -1743,6 +1711,7 @@ where
                 nullable: column.nullable,
                 primary_key: column.primary_key,
                 field_id: (idx + 1) as FieldId,
+                check_expr: column.check_expr.clone(),
             });
             let pushed = column_defs.last().unwrap();
             tracing::trace!(
@@ -1805,7 +1774,7 @@ where
         drop(tables); // Release write lock before catalog operations
 
         // Register table in catalog
-        let registered_table_id = self.catalog.register_table(&display_name)?;
+        let registered_table_id = self.catalog.register_table(display_name.as_str())?;
         tracing::debug!(
             "[CATALOG] Registered table '{}' with catalog_id={}",
             display_name,
@@ -1815,7 +1784,10 @@ where
         // Register fields in catalog
         if let Some(field_resolver) = self.catalog.field_resolver(registered_table_id) {
             for column in &column_defs {
-                if let Err(e) = field_resolver.register_field(&column.name) {
+                let definition = FieldDefinition::new(&column.name)
+                    .with_primary_key(column.primary_key)
+                    .with_check_expr(column.check_expr.clone());
+                if let Err(e) = field_resolver.register_field(definition) {
                     tracing::warn!(
                         "[CATALOG] Failed to register field '{}' in table '{}': {}",
                         column.name,
@@ -1854,9 +1826,11 @@ where
             FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
         for (idx, field) in schema.fields().iter().enumerate() {
             let data_type = match field.data_type() {
-                DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Date32 => {
-                    field.data_type().clone()
-                }
+                DataType::Int64
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::Date32
+                | DataType::Struct(_) => field.data_type().clone(),
                 other => {
                     return Err(Error::InvalidArgumentError(format!(
                         "unsupported column type in CTAS result: {other:?}"
@@ -1876,6 +1850,7 @@ where
                 nullable: field.is_nullable(),
                 primary_key: false, // CTAS does not preserve PRIMARY KEY constraints
                 field_id: (idx + 1) as FieldId,
+                check_expr: None, // CTAS does not preserve CHECK constraints
             });
         }
 
@@ -1990,7 +1965,7 @@ where
         drop(tables); // Release write lock before catalog operations
 
         // Register table in catalog
-        let registered_table_id = self.catalog.register_table(&display_name)?;
+        let registered_table_id = self.catalog.register_table(display_name.as_str())?;
         tracing::debug!(
             "[CATALOG] Registered table '{}' (CTAS) with catalog_id={}",
             display_name,
@@ -2000,7 +1975,10 @@ where
         // Register fields in catalog
         if let Some(field_resolver) = self.catalog.field_resolver(registered_table_id) {
             for column in &column_defs {
-                if let Err(e) = field_resolver.register_field(&column.name) {
+                let definition = FieldDefinition::new(&column.name)
+                    .with_primary_key(column.primary_key)
+                    .with_check_expr(column.check_expr.clone());
+                if let Err(e) = field_resolver.register_field(definition) {
                     tracing::warn!(
                         "[CATALOG] Failed to register field '{}' in table '{}': {}",
                         column.name,
@@ -2019,6 +1997,491 @@ where
         Ok(RuntimeStatementResult::CreateTable {
             table_name: display_name,
         })
+    }
+
+    fn check_check_constraints(
+        &self,
+        table: &ExecutorTable<P>,
+        rows: &[Vec<PlanValue>],
+        column_order: &[usize],
+    ) -> Result<()> {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        // Find columns with CHECK constraints
+        let check_columns: Vec<(usize, &ExecutorColumn, &str)> = table
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| {
+                col.check_expr
+                    .as_ref()
+                    .map(|expr| (idx, col, expr.as_str()))
+            })
+            .collect();
+
+        if check_columns.is_empty() {
+            return Ok(());
+        }
+
+        let dialect = GenericDialect {};
+
+        // Check each row against all CHECK constraints
+        for (row_idx, row) in rows.iter().enumerate() {
+            for (col_idx, column, check_expr_str) in &check_columns {
+                // Parse the CHECK expression
+                let sql = format!("SELECT {}", check_expr_str);
+                let ast = Parser::parse_sql(&dialect, &sql).map_err(|e| {
+                    Error::InvalidArgumentError(format!(
+                        "Failed to parse CHECK expression '{}': {}",
+                        check_expr_str, e
+                    ))
+                })?;
+
+                let stmt = ast.into_iter().next().ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "CHECK expression '{}' resulted in empty AST",
+                        check_expr_str
+                    ))
+                })?;
+
+                let select = match stmt {
+                    sqlparser::ast::Statement::Query(q) => q,
+                    _ => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "CHECK expression '{}' did not parse as SELECT",
+                            check_expr_str
+                        )));
+                    }
+                };
+
+                // Extract the expression from SELECT
+                let body = match *select.body {
+                    sqlparser::ast::SetExpr::Select(s) => s,
+                    _ => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "CHECK expression '{}' is not a simple SELECT",
+                            check_expr_str
+                        )));
+                    }
+                };
+
+                if body.projection.len() != 1 {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "CHECK expression '{}' must have exactly one projection",
+                        check_expr_str
+                    )));
+                }
+
+                let expr = match &body.projection[0] {
+                    sqlparser::ast::SelectItem::UnnamedExpr(e)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => e,
+                    _ => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "CHECK expression '{}' projection is not a simple expression",
+                            check_expr_str
+                        )));
+                    }
+                };
+
+                // Evaluate the expression against this row
+                let result = Self::evaluate_check_expression(
+                    expr,
+                    row,
+                    column_order,
+                    table,
+                    *col_idx,
+                    row_idx,
+                )?;
+
+                if !result {
+                    return Err(Error::ConstraintError(format!(
+                        "CHECK constraint failed for column '{}': {}",
+                        column.name, check_expr_str
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn evaluate_check_expression(
+        expr: &sqlparser::ast::Expr,
+        row: &[PlanValue],
+        column_order: &[usize],
+        table: &ExecutorTable<P>,
+        _check_column_idx: usize,
+        _row_idx: usize,
+    ) -> Result<bool> {
+        use sqlparser::ast::Expr as SqlExpr;
+
+        match expr {
+            SqlExpr::BinaryOp { left, op, right } => {
+                let left_val = Self::evaluate_check_expr_value(left, row, column_order, table)?;
+                let right_val = Self::evaluate_check_expr_value(right, row, column_order, table)?;
+
+                use sqlparser::ast::BinaryOperator;
+                match op {
+                    BinaryOperator::Eq => {
+                        // NULL = anything is UNKNOWN, which doesn't violate CHECK
+                        if matches!(left_val, PlanValue::Null)
+                            || matches!(right_val, PlanValue::Null)
+                        {
+                            return Ok(true); // Unknown = pass CHECK
+                        }
+                        Ok(left_val == right_val)
+                    }
+                    BinaryOperator::NotEq => {
+                        // NULL != anything is UNKNOWN, which doesn't violate CHECK
+                        if matches!(left_val, PlanValue::Null)
+                            || matches!(right_val, PlanValue::Null)
+                        {
+                            return Ok(true); // Unknown = pass CHECK
+                        }
+                        Ok(left_val != right_val)
+                    }
+                    BinaryOperator::Lt => {
+                        // NULL < anything is UNKNOWN, which doesn't violate CHECK
+                        if matches!(left_val, PlanValue::Null)
+                            || matches!(right_val, PlanValue::Null)
+                        {
+                            return Ok(true); // Unknown = pass CHECK
+                        }
+                        match (left_val, right_val) {
+                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l < r),
+                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l < r),
+                            _ => Err(Error::InvalidArgumentError(
+                                "CHECK constraint < operator requires numeric values".into(),
+                            )),
+                        }
+                    }
+                    BinaryOperator::LtEq => {
+                        // NULL <= anything is UNKNOWN, which doesn't violate CHECK
+                        if matches!(left_val, PlanValue::Null)
+                            || matches!(right_val, PlanValue::Null)
+                        {
+                            return Ok(true); // Unknown = pass CHECK
+                        }
+                        match (left_val, right_val) {
+                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l <= r),
+                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l <= r),
+                            _ => Err(Error::InvalidArgumentError(
+                                "CHECK constraint <= operator requires numeric values".into(),
+                            )),
+                        }
+                    }
+                    BinaryOperator::Gt => {
+                        // NULL > anything is UNKNOWN, which doesn't violate CHECK
+                        if matches!(left_val, PlanValue::Null)
+                            || matches!(right_val, PlanValue::Null)
+                        {
+                            return Ok(true); // Unknown = pass CHECK
+                        }
+                        match (left_val, right_val) {
+                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l > r),
+                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l > r),
+                            _ => Err(Error::InvalidArgumentError(
+                                "CHECK constraint > operator requires numeric values".into(),
+                            )),
+                        }
+                    }
+                    BinaryOperator::GtEq => {
+                        // NULL >= anything is UNKNOWN, which doesn't violate CHECK
+                        if matches!(left_val, PlanValue::Null)
+                            || matches!(right_val, PlanValue::Null)
+                        {
+                            return Ok(true); // Unknown = pass CHECK
+                        }
+                        match (left_val, right_val) {
+                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l >= r),
+                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l >= r),
+                            _ => Err(Error::InvalidArgumentError(
+                                "CHECK constraint >= operator requires numeric values".into(),
+                            )),
+                        }
+                    }
+                    _ => Err(Error::InvalidArgumentError(format!(
+                        "Unsupported operator in CHECK constraint: {:?}",
+                        op
+                    ))),
+                }
+            }
+            _ => Err(Error::InvalidArgumentError(format!(
+                "Unsupported expression in CHECK constraint: {:?}",
+                expr
+            ))),
+        }
+    }
+
+    fn evaluate_check_expr_value(
+        expr: &sqlparser::ast::Expr,
+        row: &[PlanValue],
+        column_order: &[usize],
+        table: &ExecutorTable<P>,
+    ) -> Result<PlanValue> {
+        use sqlparser::ast::Expr as SqlExpr;
+
+        match expr {
+            SqlExpr::BinaryOp { left, op, right } => {
+                // Handle arithmetic operations in CHECK expressions (e.g., i + j)
+                let left_val = Self::evaluate_check_expr_value(left, row, column_order, table)?;
+                let right_val = Self::evaluate_check_expr_value(right, row, column_order, table)?;
+
+                use sqlparser::ast::BinaryOperator;
+                match op {
+                    BinaryOperator::Plus => match (left_val, right_val) {
+                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
+                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
+                            Ok(PlanValue::Integer(l + r))
+                        }
+                        (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l + r)),
+                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
+                            Ok(PlanValue::Float(l as f64 + r))
+                        }
+                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
+                            Ok(PlanValue::Float(l + r as f64))
+                        }
+                        _ => Err(Error::InvalidArgumentError(
+                            "CHECK constraint + operator requires numeric values".into(),
+                        )),
+                    },
+                    BinaryOperator::Minus => match (left_val, right_val) {
+                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
+                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
+                            Ok(PlanValue::Integer(l - r))
+                        }
+                        (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l - r)),
+                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
+                            Ok(PlanValue::Float(l as f64 - r))
+                        }
+                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
+                            Ok(PlanValue::Float(l - r as f64))
+                        }
+                        _ => Err(Error::InvalidArgumentError(
+                            "CHECK constraint - operator requires numeric values".into(),
+                        )),
+                    },
+                    BinaryOperator::Multiply => match (left_val, right_val) {
+                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
+                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
+                            Ok(PlanValue::Integer(l * r))
+                        }
+                        (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l * r)),
+                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
+                            Ok(PlanValue::Float(l as f64 * r))
+                        }
+                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
+                            Ok(PlanValue::Float(l * r as f64))
+                        }
+                        _ => Err(Error::InvalidArgumentError(
+                            "CHECK constraint * operator requires numeric values".into(),
+                        )),
+                    },
+                    BinaryOperator::Divide => match (left_val, right_val) {
+                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
+                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
+                            if r == 0 {
+                                Err(Error::InvalidArgumentError(
+                                    "Division by zero in CHECK constraint".into(),
+                                ))
+                            } else {
+                                Ok(PlanValue::Integer(l / r))
+                            }
+                        }
+                        (PlanValue::Float(l), PlanValue::Float(r)) => {
+                            if r == 0.0 {
+                                Err(Error::InvalidArgumentError(
+                                    "Division by zero in CHECK constraint".into(),
+                                ))
+                            } else {
+                                Ok(PlanValue::Float(l / r))
+                            }
+                        }
+                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
+                            if r == 0.0 {
+                                Err(Error::InvalidArgumentError(
+                                    "Division by zero in CHECK constraint".into(),
+                                ))
+                            } else {
+                                Ok(PlanValue::Float(l as f64 / r))
+                            }
+                        }
+                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
+                            if r == 0 {
+                                Err(Error::InvalidArgumentError(
+                                    "Division by zero in CHECK constraint".into(),
+                                ))
+                            } else {
+                                Ok(PlanValue::Float(l / r as f64))
+                            }
+                        }
+                        _ => Err(Error::InvalidArgumentError(
+                            "CHECK constraint / operator requires numeric values".into(),
+                        )),
+                    },
+                    _ => Err(Error::InvalidArgumentError(format!(
+                        "Unsupported binary operator in CHECK constraint value expression: {:?}",
+                        op
+                    ))),
+                }
+            }
+            SqlExpr::Identifier(ident) => {
+                // Simple column reference
+                let column_name = &ident.value;
+                let col_idx = table
+                    .schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(column_name))
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!(
+                            "Unknown column '{}' in CHECK constraint",
+                            column_name
+                        ))
+                    })?;
+
+                // Find value in row
+                let insert_pos = column_order
+                    .iter()
+                    .position(|&dest_idx| dest_idx == col_idx)
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!(
+                            "Column '{}' not provided in INSERT",
+                            column_name
+                        ))
+                    })?;
+
+                Ok(row[insert_pos].clone())
+            }
+            SqlExpr::CompoundIdentifier(idents) => {
+                // Struct field access like t.t or table.t.t
+                if idents.len() == 2 {
+                    // col.field format
+                    let column_name = &idents[0].value;
+                    let field_name = &idents[1].value;
+
+                    let col_idx = table
+                        .schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(column_name))
+                        .ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "Unknown column '{}' in CHECK constraint",
+                                column_name
+                            ))
+                        })?;
+
+                    let insert_pos = column_order
+                        .iter()
+                        .position(|&dest_idx| dest_idx == col_idx)
+                        .ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "Column '{}' not provided in INSERT",
+                                column_name
+                            ))
+                        })?;
+
+                    // Extract struct field
+                    match &row[insert_pos] {
+                        PlanValue::Struct(fields) => fields
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(field_name))
+                            .map(|(_, val)| val.clone())
+                            .ok_or_else(|| {
+                                Error::InvalidArgumentError(format!(
+                                    "Struct field '{}' not found in column '{}'",
+                                    field_name, column_name
+                                ))
+                            }),
+                        _ => Err(Error::InvalidArgumentError(format!(
+                            "Column '{}' is not a struct, cannot access field '{}'",
+                            column_name, field_name
+                        ))),
+                    }
+                } else if idents.len() == 3 {
+                    // table.col.field format - ignore table part
+                    let column_name = &idents[1].value;
+                    let field_name = &idents[2].value;
+
+                    let col_idx = table
+                        .schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(column_name))
+                        .ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "Unknown column '{}' in CHECK constraint",
+                                column_name
+                            ))
+                        })?;
+
+                    let insert_pos = column_order
+                        .iter()
+                        .position(|&dest_idx| dest_idx == col_idx)
+                        .ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "Column '{}' not provided in INSERT",
+                                column_name
+                            ))
+                        })?;
+
+                    match &row[insert_pos] {
+                        PlanValue::Struct(fields) => fields
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(field_name))
+                            .map(|(_, val)| val.clone())
+                            .ok_or_else(|| {
+                                Error::InvalidArgumentError(format!(
+                                    "Struct field '{}' not found in column '{}'",
+                                    field_name, column_name
+                                ))
+                            }),
+                        _ => Err(Error::InvalidArgumentError(format!(
+                            "Column '{}' is not a struct, cannot access field '{}'",
+                            column_name, field_name
+                        ))),
+                    }
+                } else {
+                    Err(Error::InvalidArgumentError(format!(
+                        "Unsupported compound identifier in CHECK constraint: {} parts",
+                        idents.len()
+                    )))
+                }
+            }
+            SqlExpr::Value(val_with_span) => {
+                // Numeric literal
+                match &val_with_span.value {
+                    sqlparser::ast::Value::Number(n, _) => {
+                        if let Ok(i) = n.parse::<i64>() {
+                            Ok(PlanValue::Integer(i))
+                        } else if let Ok(f) = n.parse::<f64>() {
+                            Ok(PlanValue::Float(f))
+                        } else {
+                            Err(Error::InvalidArgumentError(format!(
+                                "Invalid number in CHECK constraint: {}",
+                                n
+                            )))
+                        }
+                    }
+                    sqlparser::ast::Value::SingleQuotedString(s)
+                    | sqlparser::ast::Value::DoubleQuotedString(s) => {
+                        Ok(PlanValue::String(s.clone()))
+                    }
+                    sqlparser::ast::Value::Null => Ok(PlanValue::Null),
+                    _ => Err(Error::InvalidArgumentError(format!(
+                        "Unsupported value type in CHECK constraint: {:?}",
+                        val_with_span.value
+                    ))),
+                }
+            }
+            _ => Err(Error::InvalidArgumentError(format!(
+                "Unsupported expression type in CHECK constraint: {:?}",
+                expr
+            ))),
+        }
     }
 
     fn check_primary_key_constraints(
@@ -2176,6 +2639,9 @@ where
                 )));
             }
         }
+
+        // Check CHECK constraints
+        self.check_check_constraints(table, &rows, &column_order)?;
 
         // Check PRIMARY KEY constraints
         self.check_primary_key_constraints(table, &rows, &column_order, snapshot)?;
@@ -2814,6 +3280,11 @@ where
         {
             let tables = self.tables.read().unwrap();
             if let Some(table) = tables.get(canonical_name) {
+                // Check if table has been dropped
+                if self.dropped_tables.read().unwrap().contains(canonical_name) {
+                    // Table was dropped - treat as not found
+                    return Err(Error::NotFound);
+                }
                 tracing::trace!(
                     "=== LOOKUP_TABLE '{}' (cached) table_id={} columns={} context_pager={:p} ===",
                     canonical_name,
@@ -2856,6 +3327,7 @@ where
         // Open the table and build ExecutorTable
         let table = Table::new(*table_id, Arc::clone(&self.pager))?;
         let schema = table.schema()?;
+        let catalog_field_resolver = self.catalog.field_resolver(_catalog_table_id);
 
         // Build ExecutorSchema from Arrow schema (skip row_id field at index 0)
         let mut executor_columns = Vec::new();
@@ -2874,12 +3346,18 @@ where
             let col_idx = executor_columns.len();
             lookup.insert(normalized, col_idx);
 
+            let constraints: FieldConstraints = catalog_field_resolver
+                .as_ref()
+                .and_then(|resolver| resolver.field_constraints_by_name(field.name()))
+                .unwrap_or_default();
+
             executor_columns.push(ExecutorColumn {
                 name: field.name().to_string(),
                 data_type: field.data_type().clone(),
                 nullable: field.is_nullable(),
-                primary_key: false, // Not stored in schema metadata currently
+                primary_key: constraints.primary_key,
                 field_id,
+                check_expr: constraints.check_expr.clone(),
             });
         }
 
@@ -2964,7 +3442,10 @@ where
         // Register fields in catalog (may already be registered from RuntimeContext::new())
         if let Some(field_resolver) = self.catalog.field_resolver(_catalog_table_id) {
             for col in &executor_table.schema.columns {
-                let _ = field_resolver.register_field(&col.name); // Ignore "already exists" errors
+                let definition = FieldDefinition::new(&col.name)
+                    .with_primary_key(col.primary_key)
+                    .with_check_expr(col.check_expr.clone());
+                let _ = field_resolver.register_field(definition); // Ignore "already exists" errors
             }
             tracing::debug!(
                 "[CATALOG] Registered {} field(s) for lazy-loaded table '{}'",
@@ -3009,6 +3490,9 @@ where
         }
         drop(tables);
 
+        // Don't remove from tables cache - keep it for transactions with earlier snapshots
+        // self.remove_table_entry(&canonical_name);
+
         // Unregister from catalog
         self.catalog.unregister_table(&canonical_name);
         tracing::debug!(
@@ -3016,7 +3500,10 @@ where
             canonical_name
         );
 
-        self.dropped_tables.write().unwrap().insert(canonical_name);
+        self.dropped_tables
+            .write()
+            .unwrap()
+            .insert(canonical_name.clone());
         Ok(())
     }
 
@@ -3190,7 +3677,7 @@ where
     }
 }
 
-// Helper to convert StatementResult between types (legacy)
+// Helper to convert StatementResult between types
 fn convert_statement_result<P>(result: RuntimeStatementResult<P>) -> TransactionResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
@@ -3480,10 +3967,12 @@ pub fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> Re
     let mut resolved = Vec::with_capacity(columns.len());
     for column in columns {
         let normalized = column.to_ascii_lowercase();
-        let index = schema
-            .lookup
-            .get(&normalized)
-            .ok_or_else(|| Error::InvalidArgumentError(format!("unknown column '{}'", column)))?;
+        let index = schema.lookup.get(&normalized).ok_or_else(|| {
+            Error::InvalidArgumentError(format!(
+                "Binder Error: does not have a column named '{}'",
+                column
+            ))
+        })?;
         resolved.push(*index);
     }
     Ok(resolved)
@@ -3498,9 +3987,9 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(*v),
                     PlanValue::Float(v) => builder.append_value(*v as i64),
-                    PlanValue::String(_) => {
+                    PlanValue::String(_) | PlanValue::Struct(_) => {
                         return Err(Error::InvalidArgumentError(
-                            "cannot insert string into INT column".into(),
+                            "cannot insert non-integer into INT column".into(),
                         ));
                     }
                 }
@@ -3514,9 +4003,9 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(*v as f64),
                     PlanValue::Float(v) => builder.append_value(*v),
-                    PlanValue::String(_) => {
+                    PlanValue::String(_) | PlanValue::Struct(_) => {
                         return Err(Error::InvalidArgumentError(
-                            "cannot insert string into DOUBLE column".into(),
+                            "cannot insert non-numeric into DOUBLE column".into(),
                         ));
                     }
                 }
@@ -3531,6 +4020,11 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Integer(v) => builder.append_value(v.to_string()),
                     PlanValue::Float(v) => builder.append_value(v.to_string()),
                     PlanValue::String(s) => builder.append_value(s),
+                    PlanValue::Struct(_) => {
+                        return Err(Error::InvalidArgumentError(
+                            "cannot insert struct into STRING column".into(),
+                        ));
+                    }
                 }
             }
             Ok(Arc::new(builder.finish()))
@@ -3548,9 +4042,9 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                         })?;
                         builder.append_value(casted);
                     }
-                    PlanValue::Float(_) => {
+                    PlanValue::Float(_) | PlanValue::Struct(_) => {
                         return Err(Error::InvalidArgumentError(
-                            "cannot insert float into DATE column".into(),
+                            "cannot insert non-date value into DATE column".into(),
                         ));
                     }
                     PlanValue::String(text) => {
@@ -3560,6 +4054,38 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                 }
             }
             Ok(Arc::new(builder.finish()))
+        }
+        DataType::Struct(fields) => {
+            use arrow::array::StructArray;
+            let mut field_arrays: Vec<(FieldRef, ArrayRef)> = Vec::with_capacity(fields.len());
+
+            for field in fields.iter() {
+                let field_name = field.name();
+                let field_type = field.data_type();
+                let mut field_values = Vec::with_capacity(values.len());
+
+                for value in values {
+                    match value {
+                        PlanValue::Null => field_values.push(PlanValue::Null),
+                        PlanValue::Struct(map) => {
+                            let field_value =
+                                map.get(field_name).cloned().unwrap_or(PlanValue::Null);
+                            field_values.push(field_value);
+                        }
+                        _ => {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "expected struct value for struct column, got {:?}",
+                                value
+                            )));
+                        }
+                    }
+                }
+
+                let field_array = build_array_for_column(field_type, &field_values)?;
+                field_arrays.push((Arc::clone(field), field_array));
+            }
+
+            Ok(Arc::new(StructArray::from(field_arrays)))
         }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported Arrow data type for INSERT: {other:?}"
@@ -3632,7 +4158,9 @@ fn resolve_field_id_from_schema(schema: &ExecutorSchema, name: &str) -> Result<F
         .resolve(name)
         .map(|column| column.field_id)
         .ok_or_else(|| {
-            Error::InvalidArgumentError(format!("unknown column '{name}' in expression"))
+            Error::InvalidArgumentError(format!(
+                "Binder Error: does not have a column named '{name}'"
+            ))
         })
 }
 
@@ -3730,6 +4258,13 @@ fn translate_scalar(
             };
             Ok(ScalarExpr::Aggregate(translated_agg))
         }
+        ScalarExpr::GetField { base, field_name } => {
+            let base_expr = translate_scalar(base, schema)?;
+            Ok(ScalarExpr::GetField {
+                base: Box::new(base_expr),
+                field_name: field_name.clone(),
+            })
+        }
     }
 }
 
@@ -3742,15 +4277,24 @@ fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
         } => match plan_value_from_sql_expr(expr)? {
             PlanValue::Integer(v) => Ok(PlanValue::Integer(-v)),
             PlanValue::Float(v) => Ok(PlanValue::Float(-v)),
-            PlanValue::Null | PlanValue::String(_) => Err(Error::InvalidArgumentError(
-                "cannot negate non-numeric literal".into(),
-            )),
+            PlanValue::Null | PlanValue::String(_) | PlanValue::Struct(_) => Err(
+                Error::InvalidArgumentError("cannot negate non-numeric literal".into()),
+            ),
         },
         SqlExpr::UnaryOp {
             op: UnaryOperator::Plus,
             expr,
         } => plan_value_from_sql_expr(expr),
         SqlExpr::Nested(inner) => plan_value_from_sql_expr(inner),
+        SqlExpr::Dictionary(fields) => {
+            let mut map = std::collections::HashMap::new();
+            for field in fields {
+                let key = field.key.value.clone();
+                let value = plan_value_from_sql_expr(&field.value)?;
+                map.insert(key, value);
+            }
+            Ok(PlanValue::Struct(map))
+        }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported literal expression: {other:?}"
         ))),

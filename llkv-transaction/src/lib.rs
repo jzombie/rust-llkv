@@ -77,6 +77,15 @@ pub enum TransactionKind {
     Rollback,
 }
 
+/// Helper to extract table name from SelectPlan (only for single-table queries)
+fn select_plan_table_name(plan: &SelectPlan) -> Option<String> {
+    if plan.tables.len() == 1 {
+        Some(plan.tables[0].qualified_name())
+    } else {
+        None
+    }
+}
+
 /// Transaction result enum (simplified version for transaction module)
 #[allow(clippy::large_enum_variant)] // TODO: Consider refactoring large variants
 #[derive(Clone, Debug)]
@@ -336,28 +345,34 @@ where
         &mut self,
         plan: SelectPlan,
     ) -> LlkvResult<SelectExecution<StagingCtx::Pager>> {
+        // Get table name (for single-table queries only)
+        let table_name = select_plan_table_name(&plan).ok_or_else(|| {
+            Error::InvalidArgumentError(
+                "Transaction execute_select requires single-table query".into(),
+            )
+        })?;
+
         // Ensure table exists
-        self.ensure_table_exists(&plan.table)?;
+        self.ensure_table_exists(&table_name)?;
 
         // If table was created in this transaction, read from staging
-        if self.new_tables.contains(&plan.table) {
+        if self.new_tables.contains(&table_name) {
             tracing::trace!(
                 "[SELECT] Reading from staging for new table '{}'",
-                plan.table
+                table_name
             );
             return self.staging.execute_select(plan);
         }
 
         // Track access to existing table for conflict detection
-        self.accessed_tables.insert(plan.table.clone());
+        self.accessed_tables.insert(table_name.clone());
 
         // Otherwise read from BASE with MVCC visibility
         // The base context already has the snapshot set in SessionTransaction::new()
         tracing::trace!(
             "[SELECT] Reading from BASE with MVCC for existing table '{}'",
-            plan.table
+            table_name
         );
-        let table_name = plan.table.clone();
         self.base_context.execute_select(plan).and_then(|exec| {
             // Convert pager type from BaseCtx to StagingCtx
             // This is a limitation of the current type system
@@ -591,7 +606,7 @@ where
             PlanOperation::Select(ref plan) => {
                 // SELECT is read-only, not tracked for replay
                 // But still fails if transaction is aborted (already checked above)
-                let table_name = plan.table.clone();
+                let table_name = select_plan_table_name(plan).unwrap_or_default();
                 match self.execute_select(plan.clone()) {
                     Ok(staging_execution) => {
                         // Collect staging execution into batches

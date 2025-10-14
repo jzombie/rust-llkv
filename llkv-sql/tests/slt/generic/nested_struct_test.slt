@@ -1,0 +1,13 @@
+# Test nested struct field extraction
+# NOTE: Nested STRUCT/ROW types in CREATE TABLE are not yet supported in the SQL parser
+# This test is a placeholder for when that feature is added
+
+# For now, we've verified that:
+# 1. Single-level struct field extraction works (see struct_field_extraction_test.slt)
+# 2. The GetField expression supports nesting in the evaluation code
+# 3. SQL parsing creates nested GetField expressions for a.b.c syntax
+
+# Future test when nested struct creation is supported:
+# CREATE TABLE nested_test(data STRUCT(outer STRUCT(inner INTEGER)));
+# INSERT INTO nested_test VALUES ({'outer': {'inner': 99}});
+# SELECT data.outer.inner FROM nested_test; -- should return 99
