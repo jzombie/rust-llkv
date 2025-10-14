@@ -835,6 +835,7 @@ fn build_output_schema(
     join_type: JoinType,
 ) -> LlkvResult<Arc<Schema>> {
     let mut fields = Vec::new();
+    let mut field_names = std::collections::HashSet::new();
 
     // For semi/anti joins, only include left side
     if matches!(join_type, JoinType::Semi | JoinType::Anti) {
@@ -845,12 +846,14 @@ fn build_output_schema(
                 .is_some()
             {
                 fields.push(field.clone());
+                field_names.insert(field.name().clone());
             }
         }
         return Ok(Arc::new(Schema::new(fields)));
     }
 
     // For other joins, include both sides
+    // Add left side fields
     for field in left_schema.fields() {
         if field
             .metadata()
@@ -858,16 +861,36 @@ fn build_output_schema(
             .is_some()
         {
             fields.push(field.clone());
+            field_names.insert(field.name().clone());
         }
     }
 
+    // Add right side fields with deduplication
     for field in right_schema.fields() {
         if field
             .metadata()
             .get(llkv_column_map::store::FIELD_ID_META_KEY)
             .is_some()
         {
-            fields.push(field.clone());
+            let field_name = field.name();
+            // If there's a conflict, append "_1" suffix
+            let new_name = if field_names.contains(field_name) {
+                format!("{}_1", field_name)
+            } else {
+                field_name.clone()
+            };
+            
+            let new_field = Arc::new(
+                arrow::datatypes::Field::new(
+                    new_name.clone(),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )
+                .with_metadata(field.metadata().clone())
+            );
+            
+            fields.push(new_field);
+            field_names.insert(new_name);
         }
     }
 
