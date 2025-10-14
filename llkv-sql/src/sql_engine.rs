@@ -2688,6 +2688,34 @@ fn translate_condition_with_context(
     expr: &SqlExpr,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     match expr {
+        SqlExpr::IsNull(inner) => {
+            let scalar = translate_scalar_with_context(resolver, context, inner)?;
+            match scalar {
+                llkv_expr::expr::ScalarExpr::Column(column) => Ok(llkv_expr::expr::Expr::Pred(
+                    llkv_expr::expr::Filter {
+                        field_id: column,
+                        op: llkv_expr::expr::Operator::IsNull,
+                    },
+                )),
+                _ => Err(Error::InvalidArgumentError(
+                    "IS NULL predicates currently support column references only".into(),
+                )),
+            }
+        }
+        SqlExpr::IsNotNull(inner) => {
+            let scalar = translate_scalar_with_context(resolver, context, inner)?;
+            match scalar {
+                llkv_expr::expr::ScalarExpr::Column(column) => Ok(llkv_expr::expr::Expr::Pred(
+                    llkv_expr::expr::Filter {
+                        field_id: column,
+                        op: llkv_expr::expr::Operator::IsNotNull,
+                    },
+                )),
+                _ => Err(Error::InvalidArgumentError(
+                    "IS NOT NULL predicates currently support column references only".into(),
+                )),
+            }
+        }
         SqlExpr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => Ok(llkv_expr::expr::Expr::And(vec![
                 translate_condition_with_context(resolver, context, left)?,
@@ -2888,6 +2916,9 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                 Literal::Struct(_) => Err(Error::InvalidArgumentError(
                     "cannot negate struct literal".into(),
                 )),
+                Literal::Null => Err(Error::InvalidArgumentError(
+                    "cannot negate null literal".into(),
+                )),
             },
             _ => Err(Error::InvalidArgumentError(
                 "cannot negate non-literal expression".into(),
@@ -2958,9 +2989,7 @@ fn literal_from_value(value: &ValueWithSpan) -> SqlResult<llkv_expr::expr::Scala
         Value::Boolean(_) => Err(Error::InvalidArgumentError(
             "BOOLEAN literals are not supported yet".into(),
         )),
-        Value::Null => Err(Error::InvalidArgumentError(
-            "NULL literal is not supported in comparisons; use IS NULL".into(),
-        )),
+        Value::Null => Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Null)),
         other => {
             if let Some(text) = other.clone().into_string() {
                 Ok(llkv_expr::expr::ScalarExpr::literal(Literal::String(text)))

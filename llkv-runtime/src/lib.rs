@@ -2107,6 +2107,48 @@ where
         Ok(())
     }
 
+    fn check_not_null_constraints(
+        &self,
+        table: &ExecutorTable<P>,
+        rows: &[Vec<PlanValue>],
+        column_order: &[usize],
+    ) -> Result<()> {
+        let not_null_columns: Vec<(usize, &ExecutorColumn)> = table
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| !column.nullable)
+            .collect();
+
+        if not_null_columns.is_empty() {
+            return Ok(());
+        }
+
+        for (col_idx, column) in not_null_columns {
+            let insert_pos = column_order
+                .iter()
+                .position(|&dest_idx| dest_idx == col_idx)
+                .ok_or_else(|| {
+                    Error::ConstraintError(format!(
+                        "NOT NULL column '{}' missing from INSERT/UPDATE",
+                        column.name
+                    ))
+                })?;
+
+            for row in rows {
+                if matches!(row.get(insert_pos), Some(PlanValue::Null)) {
+                    return Err(Error::ConstraintError(format!(
+                        "NOT NULL constraint failed for column '{}'",
+                        column.name
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn evaluate_check_expression(
         expr: &sqlparser::ast::Expr,
         row: &[PlanValue],
@@ -2640,6 +2682,7 @@ where
             }
         }
 
+        self.check_not_null_constraints(table, &rows, &column_order)?;
         // Check CHECK constraints
         self.check_check_constraints(table, &rows, &column_order)?;
 
@@ -2914,19 +2957,22 @@ where
             }
         }
 
-        let _ = self.apply_delete(
-            table,
-            display_name.clone(),
-            row_ids.clone(),
-            snapshot.txn_id,
-        )?;
-
         let column_names: Vec<String> = table
             .schema
             .columns
             .iter()
             .map(|column| column.name.clone())
             .collect();
+        let column_order = resolve_insert_columns(&column_names, table.schema.as_ref())?;
+        self.check_not_null_constraints(table, &new_rows, &column_order)?;
+        self.check_check_constraints(table, &new_rows, &column_order)?;
+
+        let _ = self.apply_delete(
+            table,
+            display_name.clone(),
+            row_ids.clone(),
+            snapshot.txn_id,
+        )?;
 
         let _ = self.insert_rows(
             table,
@@ -3097,19 +3143,22 @@ where
             }
         }
 
-        let _ = self.apply_delete(
-            table,
-            display_name.clone(),
-            row_ids.clone(),
-            snapshot.txn_id,
-        )?;
-
         let column_names: Vec<String> = table
             .schema
             .columns
             .iter()
             .map(|column| column.name.clone())
             .collect();
+        let column_order = resolve_insert_columns(&column_names, table.schema.as_ref())?;
+        self.check_not_null_constraints(table, &new_rows, &column_order)?;
+        self.check_check_constraints(table, &new_rows, &column_order)?;
+
+        let _ = self.apply_delete(
+            table,
+            display_name.clone(),
+            row_ids.clone(),
+            snapshot.txn_id,
+        )?;
 
         let _ = self.insert_rows(
             table,

@@ -82,7 +82,6 @@ macro_rules! impl_single_column_reject_chunk_with_rids {
         }
     };
 }
-
 macro_rules! impl_single_column_emit_sorted_run {
     (
         $_base:ident,
@@ -885,6 +884,7 @@ where
                             ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
                             ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
                             ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
+                            ScalarExpr::Literal(Literal::Null) => DataType::Null,
                             ScalarExpr::Literal(Literal::Struct(fields)) => {
                                 // Infer struct type from the literal fields
                                 let struct_fields = fields
@@ -1465,15 +1465,20 @@ where
                     let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
                     let dtype = self.table.store().data_type(filter_lfid)?;
 
-                    if fusion_cache.should_fuse(fid, &dtype) {
-                        // Collect operator list
-                        let ops: Vec<Operator<'_>> = children
-                            .iter()
-                            .map(|c| match c {
-                                Expr::Pred(f) => f.op.clone(),
-                                _ => unreachable!(),
-                            })
-                            .collect();
+                    // Collect operator list once so we can inspect support for fusion
+                    let ops: Vec<Operator<'_>> = children
+                        .iter()
+                        .map(|c| match c {
+                            Expr::Pred(f) => f.op.clone(),
+                            _ => unreachable!(),
+                        })
+                        .collect();
+
+                    let supports_fused = ops
+                        .iter()
+                        .all(|op| !matches!(op, Operator::IsNull | Operator::IsNotNull));
+
+                    if supports_fused && fusion_cache.should_fuse(fid, &dtype) {
 
                         let row_ids = match &dtype {
                             DataType::Utf8 => {
@@ -1562,6 +1567,37 @@ where
 
         let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), filter.field_id);
         let dtype = self.table.store().data_type(filter_lfid)?;
+
+        match &filter.op {
+            Operator::IsNotNull => {
+                let mut cache = FxHashMap::default();
+                let non_null =
+                    self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
+                tracing::debug!(
+                    field = ?filter_lfid,
+                    row_count = non_null.len(),
+                    "collect_row_ids_for_filter NOT NULL fast path"
+                );
+                return Ok(non_null);
+            }
+            Operator::IsNull => {
+                let all_row_ids = self.table_row_ids()?;
+                if all_row_ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let mut cache = FxHashMap::default();
+                let non_null =
+                    self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
+                let null_ids = difference_sorted(all_row_ids, non_null);
+                tracing::debug!(
+                    field = ?filter_lfid,
+                    row_count = null_ids.len(),
+                    "collect_row_ids_for_filter NULL fast path"
+                );
+                return Ok(null_ids);
+            }
+            _ => {}
+        }
 
         if let Operator::Range {
             lower: Bound::Unbounded,
@@ -2024,6 +2060,7 @@ fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
         Literal::Integer(_) => Ok(DataType::Int64),
         Literal::Float(_) => Ok(DataType::Float64),
         Literal::String(_) => Ok(DataType::Utf8),
+        Literal::Null => Ok(DataType::Null),
         Literal::Struct(fields) => {
             let inferred_fields = fields
                 .iter()
@@ -2061,6 +2098,7 @@ fn synthesize_computed_literal_array(
         ScalarExpr::Literal(Literal::String(value)) => {
             Ok(Arc::new(StringArray::from(vec![value.clone(); row_count])) as ArrayRef)
         }
+        ScalarExpr::Literal(Literal::Null) => Ok(new_null_array(data_type, row_count)),
         ScalarExpr::Literal(Literal::Struct(fields)) => {
             // Build a struct array from the literal fields
             use arrow::array::StructArray;
@@ -2086,6 +2124,7 @@ fn synthesize_computed_literal_array(
                     Literal::String(v) => {
                         Arc::new(StringArray::from(vec![v.clone(); row_count])) as ArrayRef
                     }
+                    Literal::Null => new_null_array(&field_dtype, row_count),
                     Literal::Struct(nested_fields) => {
                         // Recursively build nested struct
                         // Create a temporary ComputedProjectionInfo for nested struct
@@ -2200,6 +2239,8 @@ fn format_operator(op: &Operator<'_>) -> String {
             pattern,
             case_sensitive,
         } => format_pattern_op("CONTAINS", pattern, *case_sensitive),
+        Operator::IsNull => "IS NULL".to_string(),
+        Operator::IsNotNull => "IS NOT NULL".to_string(),
     }
 }
 
@@ -2270,6 +2311,7 @@ fn format_literal(lit: &Literal) -> String {
         Literal::Integer(i) => i.to_string(),
         Literal::Float(f) => f.to_string(),
         Literal::String(s) => format!("\"{}\"", escape_string(s)),
+        Literal::Null => "NULL".to_string(),
         Literal::Struct(fields) => {
             let field_strs: Vec<_> = fields
                 .iter()
@@ -2822,6 +2864,9 @@ fn filter_row_ids_by_operator(row_ids: &[u64], op: &Operator<'_>) -> LlkvResult<
         }
         StartsWith { .. } | EndsWith { .. } | Contains { .. } => Err(Error::InvalidArgumentError(
             "rowid predicates do not support string pattern matching".into(),
+        )),
+        IsNull | IsNotNull => Err(Error::InvalidArgumentError(
+            "rowid predicates do not support null checks".into(),
         )),
     }
 }

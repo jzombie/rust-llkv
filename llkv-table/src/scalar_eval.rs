@@ -162,6 +162,7 @@ impl NumericKernels {
                 llkv_expr::literal::Literal::Struct(_) => Err(Error::InvalidArgumentError(
                     "Struct literals are not supported in numeric expressions".into(),
                 )),
+                llkv_expr::literal::Literal::Null => Ok(None),
             },
             ScalarExpr::Binary { left, op, right } => {
                 let l = Self::evaluate_value(left, idx, arrays)?;
@@ -224,6 +225,7 @@ impl NumericKernels {
                 }
                 llkv_expr::literal::Literal::String(_) => Ok(None),
                 llkv_expr::literal::Literal::Struct(_) => Ok(None),
+                llkv_expr::literal::Literal::Null => Ok(Some(VectorizedExpr::Scalar(None))),
             },
             ScalarExpr::Binary { left, op, right } => {
                 let left_vec = Self::try_evaluate_vectorized(left, len, arrays)?;
@@ -342,6 +344,7 @@ impl NumericKernels {
                 llkv_expr::literal::Literal::Integer(i) => Some(*i as f64),
                 llkv_expr::literal::Literal::String(_) => None,
                 llkv_expr::literal::Literal::Struct(_) => None,
+                llkv_expr::literal::Literal::Null => None,
             }
         } else {
             None

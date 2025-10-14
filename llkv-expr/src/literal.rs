@@ -6,6 +6,7 @@ use std::ops::Bound;
 /// type is known.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
+    Null,
     Integer(i128),
     Float(f64),
     String(String),
@@ -96,6 +97,10 @@ macro_rules! impl_from_literal_int {
                             expected: "integer",
                             got: "struct",
                         }),
+                        Literal::Null => Err(LiteralCastError::TypeMismatch {
+                            expected: "integer",
+                            got: "null",
+                        }),
                     }
                 }
             }
@@ -120,6 +125,12 @@ impl FromLiteral for f32 {
                 return Err(LiteralCastError::TypeMismatch {
                     expected: "float",
                     got: "struct",
+                });
+            }
+            Literal::Null => {
+                return Err(LiteralCastError::TypeMismatch {
+                    expected: "float",
+                    got: "null",
                 });
             }
         };
@@ -164,6 +175,10 @@ impl FromLiteral for bool {
                 expected: "bool",
                 got: "struct",
             }),
+            Literal::Null => Err(LiteralCastError::TypeMismatch {
+                expected: "bool",
+                got: "null",
+            }),
         }
     }
 }
@@ -181,6 +196,10 @@ impl FromLiteral for f64 {
                 expected: "float",
                 got: "struct",
             }),
+            Literal::Null => Err(LiteralCastError::TypeMismatch {
+                expected: "float",
+                got: "null",
+            }),
         }
     }
 }
@@ -190,6 +209,7 @@ fn literal_type_name(lit: &Literal) -> &'static str {
         Literal::Integer(_) => "integer",
         Literal::Float(_) => "float",
         Literal::String(_) => "string",
+        Literal::Null => "null",
         Literal::Struct(_) => "struct",
     }
 }
@@ -198,6 +218,10 @@ fn literal_type_name(lit: &Literal) -> &'static str {
 pub fn literal_to_string(lit: &Literal) -> Result<String, LiteralCastError> {
     match lit {
         Literal::String(s) => Ok(s.clone()),
+        Literal::Null => Err(LiteralCastError::TypeMismatch {
+            expected: "string",
+            got: "null",
+        }),
         _ => Err(LiteralCastError::TypeMismatch {
             expected: "string",
             got: literal_type_name(lit),

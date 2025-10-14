@@ -159,7 +159,7 @@ where
 
     /// Convert a Literal to an Arrow array (recursive for nested structs)
     fn literal_to_array(lit: &llkv_expr::literal::Literal) -> ExecutorResult<(DataType, ArrayRef)> {
-        use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, StructArray};
+    use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, StructArray, new_null_array};
         use arrow::datatypes::{DataType, Field};
         use llkv_expr::literal::Literal;
 
@@ -178,6 +178,10 @@ where
             Literal::String(v) => Ok((
                 DataType::Utf8,
                 Arc::new(StringArray::from(vec![v.clone()])) as ArrayRef,
+            )),
+            Literal::Null => Ok((
+                DataType::Null,
+                new_null_array(&DataType::Null, 1),
             )),
             Literal::Struct(struct_fields) => {
                 // Build a struct array recursively
@@ -1000,6 +1004,9 @@ where
             ScalarExpr::Literal(Literal::Float(v)) => Ok(*v as i64),
             ScalarExpr::Literal(Literal::String(_)) => Err(Error::InvalidArgumentError(
                 "String literals not supported in aggregate expressions".into(),
+            )),
+            ScalarExpr::Literal(Literal::Null) => Err(Error::InvalidArgumentError(
+                "NULL literals not supported in aggregate expressions".into(),
             )),
             ScalarExpr::Literal(Literal::Struct(_)) => Err(Error::InvalidArgumentError(
                 "Struct literals not supported in aggregate expressions".into(),
