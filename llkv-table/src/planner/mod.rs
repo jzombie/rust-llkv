@@ -27,7 +27,6 @@ impl StreamOutcome {
 }
 
 use llkv_column_map::ScanBuilder;
-use llkv_column_map::parallel;
 use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
@@ -43,7 +42,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use llkv_storage::pager::Pager;
-use rayon::prelude::*;
 
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::scalar_eval::{NumericArrayMap, NumericKernels};
@@ -56,6 +54,7 @@ use self::plan_graph::{
     PlanEdge, PlanExpression, PlanField, PlanGraph, PlanGraphBuilder, PlanGraphError, PlanNode,
     PlanNodeId, PlanOperator,
 };
+use crate::stream::{RowStream, RowStreamBuilder};
 
 // TODO: Refactor into executor and potentially migrate any remnants to `llkv-plan`
 
@@ -461,20 +460,20 @@ macro_rules! impl_row_id_stream_sorted_run_with_rids {
 }
 
 #[derive(Clone)]
-struct ColumnProjectionInfo {
+pub(crate) struct ColumnProjectionInfo {
     logical_field_id: LogicalFieldId,
     data_type: DataType,
     output_name: String,
 }
 
 #[derive(Clone)]
-struct ComputedProjectionInfo {
+pub(crate) struct ComputedProjectionInfo {
     expr: ScalarExpr<FieldId>,
     alias: String,
 }
 
 #[derive(Clone)]
-enum ProjectionEval {
+pub(crate) enum ProjectionEval {
     Column(ColumnProjectionInfo),
     Computed(ComputedProjectionInfo),
 }
@@ -883,6 +882,12 @@ where
             Some(store.prepare_gather_context(unique_lfids)?)
         };
 
+        let unique_lfids_arc = Arc::new(unique_lfids.to_vec());
+        let projection_evals_arc = Arc::new(projection_evals.to_vec());
+        let passthrough_fields_arc = Arc::new(passthrough_fields.to_vec());
+        let unique_index_arc = Arc::new(unique_index.clone());
+        let numeric_fields_arc = Arc::new(numeric_fields.clone());
+
         let mut any_emitted = false;
 
         let mut process_chunk = |mut chunk: Vec<RowId>| -> LlkvResult<()> {
@@ -893,28 +898,40 @@ where
                 return Ok(());
             }
 
-            if let Some(batch) = materialize_row_window(
+            let mut builder = RowStreamBuilder::new(
                 store,
                 table_id,
-                unique_lfids,
-                projection_evals,
-                passthrough_fields,
-                unique_index,
-                numeric_fields,
+                Arc::clone(out_schema),
+                Arc::clone(&unique_lfids_arc),
+                Arc::clone(&projection_evals_arc),
+                Arc::clone(&passthrough_fields_arc),
+                Arc::clone(&unique_index_arc),
+                Arc::clone(&numeric_fields_arc),
                 requires_numeric,
                 null_policy,
-                out_schema,
-                chunk.as_slice(),
-                gather_ctx.as_mut(),
-            )? {
+                chunk,
+                STREAM_BATCH_ROWS,
+            );
+
+            if let Some(ctx) = gather_ctx.take() {
+                builder = builder.with_gather_context(ctx);
+            }
+
+            let mut stream = builder.build()?;
+            let expected_columns = stream.schema().fields().len();
+
+            while let Some(chunk) = stream.next_chunk()? {
+                let batch = chunk.to_record_batch();
+                debug_assert_eq!(batch.num_columns(), expected_columns);
                 if batch.num_rows() > 0 {
                     any_emitted = true;
                     on_batch(batch);
                 }
             }
+
+            gather_ctx = stream.into_gather_context();
             Ok(())
         };
-
         if !self
             .stream_table_row_ids(STREAM_BATCH_ROWS, &mut process_chunk)?
             .is_handled()
@@ -1258,54 +1275,33 @@ where
         let unique_index = Arc::new(unique_index);
         let numeric_fields = Arc::new(numeric_fields);
 
-        let chunk_ranges: Vec<(usize, usize)> = (0..row_ids.len())
-            .step_by(STREAM_BATCH_ROWS)
-            .map(|start| {
-                let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
-                (start, end)
-            })
-            .collect();
+        let mut row_stream = RowStreamBuilder::new(
+            store,
+            table_id,
+            Arc::clone(&out_schema),
+            Arc::clone(&unique_lfids),
+            Arc::clone(&projection_evals),
+            Arc::clone(&passthrough_fields),
+            Arc::clone(&unique_index),
+            Arc::clone(&numeric_fields),
+            requires_numeric,
+            null_policy,
+            row_ids,
+            STREAM_BATCH_ROWS,
+        )
+        .build()?;
 
-        let chunk_batches: Vec<LlkvResult<Option<RecordBatch>>> =
-            parallel::with_thread_pool(move || {
-                chunk_ranges
-                    .into_par_iter()
-                    .map(|(start, end)| -> LlkvResult<Option<RecordBatch>> {
-                        let window = &row_ids[start..end];
-                        let unique_lfids = Arc::clone(&unique_lfids);
-                        let projection_evals = Arc::clone(&projection_evals);
-                        let passthrough_fields = Arc::clone(&passthrough_fields);
-                        let unique_index = Arc::clone(&unique_index);
-                        let numeric_fields = Arc::clone(&numeric_fields);
-                        let out_schema = Arc::clone(&out_schema);
+        let expected_columns = row_stream.schema().fields().len();
 
-                        materialize_row_window(
-                            store,
-                            table_id,
-                            unique_lfids.as_ref(),
-                            projection_evals.as_ref(),
-                            passthrough_fields.as_ref(),
-                            unique_index.as_ref(),
-                            numeric_fields.as_ref(),
-                            requires_numeric,
-                            null_policy,
-                            &out_schema,
-                            window,
-                            None,
-                        )
-                    })
-                    .collect()
-            });
-
-        for batch_result in chunk_batches {
-            if let Some(batch) = batch_result? {
-                tracing::debug!(
-                    rows = batch.num_rows(),
-                    columns = batch.num_columns(),
-                    "TableExecutor produced batch"
-                );
-                on_batch(batch);
-            }
+        while let Some(chunk) = row_stream.next_chunk()? {
+            let batch = chunk.to_record_batch();
+            debug_assert_eq!(batch.num_columns(), expected_columns);
+            tracing::debug!(
+                rows = batch.num_rows(),
+                columns = batch.num_columns(),
+                "TableExecutor produced batch"
+            );
+            on_batch(batch);
         }
 
         Ok(())
@@ -3011,7 +3007,7 @@ fn normalize_row_ids(mut row_ids: Vec<RowId>) -> Vec<RowId> {
     row_ids
 }
 
-fn materialize_row_window<P>(
+pub(crate) fn materialize_row_window<P>(
     store: &llkv_column_map::store::ColumnStore<P>,
     table_id: TableId,
     unique_lfids: &[LogicalFieldId],

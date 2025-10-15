@@ -32,7 +32,6 @@
 #![forbid(unsafe_code)]
 
 pub mod catalog;
-pub mod column_stream;
 pub mod constants;
 mod planner;
 pub mod reserved;
@@ -46,7 +45,9 @@ pub mod expr {
 pub mod table;
 pub mod types;
 
-pub use column_stream::{ColumnStream, ColumnStreamBatch};
+pub mod stream;
+
+pub use stream::{ColumnStream, ColumnStreamBatch};
 pub use reserved::CATALOG_TABLE_ID;
 pub use sys_catalog::{
     ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta, TableMultiColumnUniqueMeta,

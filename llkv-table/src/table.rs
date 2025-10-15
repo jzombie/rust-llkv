@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use crate::column_stream::ColumnStream;
+use crate::stream::ColumnStream;
 use crate::planner::{TablePlanner, collect_row_ids_for_table};
 use crate::types::TableId;
 
