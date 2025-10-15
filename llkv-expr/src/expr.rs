@@ -168,6 +168,8 @@ pub enum Operator<'a> {
         pattern: &'a str,
         case_sensitive: bool,
     },
+    IsNull,
+    IsNotNull,
 }
 
 impl<'a> Operator<'a> {

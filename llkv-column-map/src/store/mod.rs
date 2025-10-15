@@ -29,7 +29,7 @@ pub mod scan;
 pub use scan::*;
 
 mod projection;
-pub use projection::{GatherNullPolicy, Projection};
+pub use projection::{GatherNullPolicy, MultiGatherContext, Projection};
 
 mod slicing;
 use slicing::*;

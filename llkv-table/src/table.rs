@@ -3,20 +3,22 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use crate::planner::{TablePlanner, collect_row_ids_for_table};
+use crate::stream::ColumnStream;
 use crate::types::TableId;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 
-use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME};
+use crate::constants::STREAM_BATCH_ROWS;
+use llkv_column_map::store::{GatherNullPolicy, Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{ColumnStore, types::LogicalFieldId};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::reserved::is_reserved_table_id;
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
-use crate::types::FieldId;
+use crate::types::{FieldId, RowId};
 use llkv_expr::{Expr, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 
@@ -82,7 +84,7 @@ where
     /// # Errors
     ///
     /// Returns an error if visibility metadata cannot be loaded or is corrupted.
-    fn filter(&self, table: &Table<P>, row_ids: Vec<u64>) -> LlkvResult<Vec<u64>>;
+    fn filter(&self, table: &Table<P>, row_ids: Vec<RowId>) -> LlkvResult<Vec<RowId>>;
 }
 
 /// Options for configuring table scans.
@@ -541,8 +543,7 @@ where
         TablePlanner::new(self).scan_stream_with_exprs(projections, filter_expr, options, on_batch)
     }
 
-    // TODO: Return `LlkvResult<Vec<RowId>>`
-    pub fn filter_row_ids<'a>(&self, filter_expr: &Expr<'a, FieldId>) -> LlkvResult<Vec<u64>> {
+    pub fn filter_row_ids<'a>(&self, filter_expr: &Expr<'a, FieldId>) -> LlkvResult<Vec<RowId>> {
         collect_row_ids_for_table(self, filter_expr)
     }
 
@@ -645,6 +646,25 @@ where
 
         let batch = RecordBatch::try_new(rb_schema, vec![name_array, fid_array, dtype_array])?;
         Ok(batch)
+    }
+
+    /// Create a streaming view over the provided row IDs for the specified logical fields.
+    pub fn stream_columns(
+        &self,
+        logical_fields: impl Into<Arc<[LogicalFieldId]>>,
+        row_ids: Vec<RowId>,
+        policy: GatherNullPolicy,
+    ) -> LlkvResult<ColumnStream<'_, P>> {
+        let logical_fields: Arc<[LogicalFieldId]> = logical_fields.into();
+        let ctx = self.store.prepare_gather_context(logical_fields.as_ref())?;
+        Ok(ColumnStream::new(
+            &self.store,
+            ctx,
+            row_ids,
+            STREAM_BATCH_ROWS,
+            policy,
+            logical_fields,
+        ))
     }
 
     pub fn store(&self) -> &ColumnStore<P> {
@@ -924,11 +944,11 @@ mod tests {
         let alpha_vals_u32: Vec<u32> = vec![7, 11, 13, 17];
         let alpha_vals_i16: Vec<i16> = vec![-2, 4, -6, 8];
 
-        let beta_rows: Vec<u64> = vec![101, 102, 103];
+        let beta_rows: Vec<RowId> = vec![101, 102, 103];
         let beta_vals_u64: Vec<u64> = vec![900, 901, 902];
         let beta_vals_u8: Vec<u8> = vec![1, 2, 3];
 
-        let gamma_rows: Vec<u64> = vec![501, 502];
+        let gamma_rows: Vec<RowId> = vec![501, 502];
         let gamma_vals_i16: Vec<i16> = vec![123, -321];
 
         // First session: create tables and write data.

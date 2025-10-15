@@ -1,4 +1,5 @@
-use arrow::array::{Array, ArrayRef, Int64Builder, RecordBatch};
+use arrow::array::{Array, ArrayRef, Int64Builder, RecordBatch, StringArray, UInt32Array};
+use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Schema};
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::store::Projection as StoreProjection;
@@ -19,8 +20,8 @@ use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::fmt;
 use std::ops::Bound;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 pub type ExecutorResult<T> = Result<T, Error>;
 
@@ -159,7 +160,9 @@ where
 
     /// Convert a Literal to an Arrow array (recursive for nested structs)
     fn literal_to_array(lit: &llkv_expr::literal::Literal) -> ExecutorResult<(DataType, ArrayRef)> {
-        use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, StructArray};
+        use arrow::array::{
+            ArrayRef, Float64Array, Int64Array, StringArray, StructArray, new_null_array,
+        };
         use arrow::datatypes::{DataType, Field};
         use llkv_expr::literal::Literal;
 
@@ -179,6 +182,7 @@ where
                 DataType::Utf8,
                 Arc::new(StringArray::from(vec![v.clone()])) as ArrayRef,
             )),
+            Literal::Null => Ok((DataType::Null, new_null_array(&DataType::Null, 1))),
             Literal::Struct(struct_fields) => {
                 // Build a struct array recursively
                 let mut inner_fields = Vec::new();
@@ -429,8 +433,14 @@ where
             }
         };
 
-        let options = if let Some(order_plan) = &plan.order_by {
-            let order_spec = resolve_scan_order(table_ref, &projections, order_plan)?;
+        let order_items = plan.order_by.clone();
+        let physical_order = if let Some(first) = order_items.first() {
+            Some(resolve_scan_order(table_ref, &projections, first)?)
+        } else {
+            None
+        };
+
+        let options = if let Some(order_spec) = physical_order {
             if row_filter.is_some() {
                 tracing::debug!("Applying MVCC row filter with ORDER BY");
             }
@@ -458,6 +468,7 @@ where
             filter_expr,
             options,
             full_table_scan,
+            order_items,
         ))
     }
 
@@ -1001,6 +1012,9 @@ where
             ScalarExpr::Literal(Literal::String(_)) => Err(Error::InvalidArgumentError(
                 "String literals not supported in aggregate expressions".into(),
             )),
+            ScalarExpr::Literal(Literal::Null) => Err(Error::InvalidArgumentError(
+                "NULL literals not supported in aggregate expressions".into(),
+            )),
             ScalarExpr::Literal(Literal::Struct(_)) => Err(Error::InvalidArgumentError(
                 "Struct literals not supported in aggregate expressions".into(),
             )),
@@ -1068,6 +1082,7 @@ where
         filter_expr: LlkvExpr<'static, FieldId>,
         options: ScanStreamOptions<P>,
         full_table_scan: bool,
+        order_by: Vec<OrderByPlan>,
     },
     Aggregation {
         batch: RecordBatch,
@@ -1078,6 +1093,7 @@ impl<P> SelectExecution<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    #[allow(clippy::too_many_arguments)]
     fn new_projection(
         table_name: String,
         schema: Arc<Schema>,
@@ -1086,6 +1102,7 @@ where
         filter_expr: LlkvExpr<'static, FieldId>,
         options: ScanStreamOptions<P>,
         full_table_scan: bool,
+        order_by: Vec<OrderByPlan>,
     ) -> Self {
         Self {
             table_name,
@@ -1096,6 +1113,7 @@ where
                 filter_expr,
                 options,
                 full_table_scan,
+                order_by,
             },
         }
     }
@@ -1132,6 +1150,7 @@ where
                 filter_expr,
                 options,
                 full_table_scan,
+                order_by,
             } => {
                 // Early return for empty tables to avoid ColumnStore data_type() errors
                 let total_rows = table.total_rows.load(Ordering::SeqCst);
@@ -1144,6 +1163,8 @@ where
                 let mut produced = false;
                 let mut produced_rows: u64 = 0;
                 let capture_nulls_first = matches!(options.order, Some(spec) if spec.nulls_first);
+                let needs_post_sort = order_by.len() > 1;
+                let collect_batches = needs_post_sort || capture_nulls_first;
                 let include_nulls = options.include_nulls;
                 let has_row_id_filter = options.row_id_filter.is_some();
                 let scan_options = options;
@@ -1156,7 +1177,7 @@ where
                         }
                         produced = true;
                         produced_rows = produced_rows.saturating_add(batch.num_rows() as u64);
-                        if capture_nulls_first {
+                        if collect_batches {
                             buffered_batches.push(batch);
                         } else if let Err(err) = on_batch(batch) {
                             error = Some(err);
@@ -1190,12 +1211,30 @@ where
                     }
                 }
 
-                if capture_nulls_first {
-                    for batch in null_batches {
-                        on_batch(batch)?;
-                    }
-                    for batch in buffered_batches {
-                        on_batch(batch)?;
+                if collect_batches {
+                    if needs_post_sort {
+                        if !null_batches.is_empty() {
+                            buffered_batches.extend(null_batches);
+                        }
+                        if !buffered_batches.is_empty() {
+                            let combined =
+                                concat_batches(&schema, &buffered_batches).map_err(|err| {
+                                    Error::InvalidArgumentError(format!(
+                                        "failed to concatenate result batches for ORDER BY: {}",
+                                        err
+                                    ))
+                                })?;
+                            let sorted_batch =
+                                sort_record_batch_with_order(&schema, &combined, &order_by)?;
+                            on_batch(sorted_batch)?;
+                        }
+                    } else if capture_nulls_first {
+                        for batch in null_batches {
+                            on_batch(batch)?;
+                        }
+                        for batch in buffered_batches {
+                            on_batch(batch)?;
+                        }
                     }
                 } else if !null_batches.is_empty() {
                     for batch in null_batches {
@@ -1265,6 +1304,7 @@ where
     pub schema: Arc<ExecutorSchema>,
     pub next_row_id: AtomicU64,
     pub total_rows: AtomicU64,
+    pub multi_column_uniques: RwLock<Vec<ExecutorMultiColumnUnique>>,
 }
 
 pub struct ExecutorSchema {
@@ -1295,8 +1335,38 @@ pub struct ExecutorColumn {
     pub data_type: DataType,
     pub nullable: bool,
     pub primary_key: bool,
+    pub unique: bool,
     pub field_id: FieldId,
     pub check_expr: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutorMultiColumnUnique {
+    pub index_name: Option<String>,
+    pub column_indices: Vec<usize>,
+}
+
+impl<P> ExecutorTable<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    pub fn multi_column_uniques(&self) -> Vec<ExecutorMultiColumnUnique> {
+        self.multi_column_uniques.read().unwrap().clone()
+    }
+
+    pub fn set_multi_column_uniques(&self, uniques: Vec<ExecutorMultiColumnUnique>) {
+        *self.multi_column_uniques.write().unwrap() = uniques;
+    }
+
+    pub fn add_multi_column_unique(&self, unique: ExecutorMultiColumnUnique) {
+        let mut guard = self.multi_column_uniques.write().unwrap();
+        if !guard
+            .iter()
+            .any(|existing| existing.column_indices == unique.column_indices)
+        {
+            guard.push(unique);
+        }
+    }
 }
 
 // Re-export from llkv-plan
@@ -1445,6 +1515,99 @@ fn synthesize_null_scan(schema: Arc<Schema>, total_rows: u64) -> ExecutorResult<
 
     let batch = RecordBatch::try_new(schema, arrays)?;
     Ok(vec![batch])
+}
+
+fn sort_record_batch_with_order(
+    schema: &Arc<Schema>,
+    batch: &RecordBatch,
+    order_by: &[OrderByPlan],
+) -> ExecutorResult<RecordBatch> {
+    if order_by.is_empty() {
+        return Ok(batch.clone());
+    }
+
+    let mut sort_columns: Vec<SortColumn> = Vec::with_capacity(order_by.len());
+
+    for order in order_by {
+        let column_index = match &order.target {
+            OrderTarget::Column(name) => schema.index_of(name).map_err(|_| {
+                Error::InvalidArgumentError(format!(
+                    "ORDER BY references unknown column '{}'",
+                    name
+                ))
+            })?,
+            OrderTarget::Index(idx) => {
+                if *idx >= batch.num_columns() {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "ORDER BY position {} is out of bounds for {} columns",
+                        idx + 1,
+                        batch.num_columns()
+                    )));
+                }
+                *idx
+            }
+        };
+
+        let source_array = batch.column(column_index);
+
+        let values: ArrayRef = match order.sort_type {
+            OrderSortType::Native => Arc::clone(source_array),
+            OrderSortType::CastTextToInteger => {
+                let strings = source_array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "ORDER BY CAST expects the underlying column to be TEXT".into(),
+                        )
+                    })?;
+                let mut builder = Int64Builder::with_capacity(strings.len());
+                for i in 0..strings.len() {
+                    if strings.is_null(i) {
+                        builder.append_null();
+                    } else {
+                        match strings.value(i).parse::<i64>() {
+                            Ok(value) => builder.append_value(value),
+                            Err(_) => builder.append_null(),
+                        }
+                    }
+                }
+                Arc::new(builder.finish()) as ArrayRef
+            }
+        };
+
+        let sort_options = SortOptions {
+            descending: !order.ascending,
+            nulls_first: order.nulls_first,
+        };
+
+        sort_columns.push(SortColumn {
+            values,
+            options: Some(sort_options),
+        });
+    }
+
+    let indices = lexsort_to_indices(&sort_columns, None).map_err(|err| {
+        Error::InvalidArgumentError(format!("failed to compute ORDER BY indices: {err}"))
+    })?;
+
+    let perm = indices
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or_else(|| Error::Internal("ORDER BY sorting produced unexpected index type".into()))?;
+
+    let mut reordered_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for col_idx in 0..batch.num_columns() {
+        let reordered = take(batch.column(col_idx), perm, None).map_err(|err| {
+            Error::InvalidArgumentError(format!(
+                "failed to apply ORDER BY permutation to column {col_idx}: {err}"
+            ))
+        })?;
+        reordered_columns.push(reordered);
+    }
+
+    RecordBatch::try_new(Arc::clone(schema), reordered_columns)
+        .map_err(|err| Error::Internal(format!("failed to build reordered ORDER BY batch: {err}")))
 }
 
 // Translate predicate from column names to field IDs

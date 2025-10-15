@@ -33,6 +33,7 @@
 
 pub mod catalog;
 pub mod constants;
+pub mod gather;
 mod planner;
 pub mod reserved;
 mod scalar_eval;
@@ -45,8 +46,13 @@ pub mod expr {
 pub mod table;
 pub mod types;
 
+pub mod stream;
+
 pub use reserved::CATALOG_TABLE_ID;
-pub use sys_catalog::{ColMeta, SysCatalog, TableMeta};
+pub use stream::{ColumnStream, ColumnStreamBatch};
+pub use sys_catalog::{
+    ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta, TableMultiColumnUniqueMeta,
+};
 pub use table::Table;
 pub use types::{FieldId, RowId};
 

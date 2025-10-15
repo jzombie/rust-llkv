@@ -35,6 +35,9 @@ use crate::{JoinKey, JoinOptions, JoinType};
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Schema};
+use llkv_column_map::gather::{
+    gather_indices, gather_indices_from_batches, gather_optional_indices_from_batches,
+};
 use llkv_column_map::store::Projection;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::{Expr, Filter, Operator};
@@ -835,7 +838,7 @@ fn build_output_schema(
     join_type: JoinType,
 ) -> LlkvResult<Arc<Schema>> {
     let mut fields = Vec::new();
-    let mut field_names = std::collections::HashSet::new();
+    let mut field_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // For semi/anti joins, only include left side
     if matches!(join_type, JoinType::Semi | JoinType::Anti) {
@@ -897,91 +900,7 @@ fn build_output_schema(
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn gather_indices(batch: &RecordBatch, indices: &[usize]) -> LlkvResult<Vec<ArrayRef>> {
-    let indices_array =
-        arrow::array::UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
-
-    let mut result = Vec::new();
-    for column in batch.columns() {
-        let gathered = take(column.as_ref(), &indices_array, None)?;
-        result.push(gathered);
-    }
-
-    Ok(result)
-}
-
-fn gather_indices_from_batches(
-    batches: &[RecordBatch],
-    indices: &[(usize, usize)],
-) -> LlkvResult<Vec<ArrayRef>> {
-    if batches.is_empty() || indices.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let num_columns = batches[0].num_columns();
-    let mut result = Vec::with_capacity(num_columns);
-
-    for col_idx in 0..num_columns {
-        let mut column_data: Vec<ArrayRef> = Vec::new();
-
-        for &(batch_idx, row_idx) in indices {
-            let batch = &batches[batch_idx];
-            let column = batch.column(col_idx);
-            let single_row = take(
-                column.as_ref(),
-                &arrow::array::UInt32Array::from(vec![row_idx as u32]),
-                None,
-            )?;
-            column_data.push(single_row);
-        }
-
-        let concatenated =
-            arrow::compute::concat(&column_data.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?;
-        result.push(concatenated);
-    }
-
-    Ok(result)
-}
-
-fn gather_optional_indices_from_batches(
-    batches: &[RecordBatch],
-    indices: &[Option<(usize, usize)>],
-) -> LlkvResult<Vec<ArrayRef>> {
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let num_columns = batches[0].num_columns();
-    let mut result = Vec::with_capacity(num_columns);
-
-    for col_idx in 0..num_columns {
-        let mut column_data: Vec<ArrayRef> = Vec::new();
-
-        for opt_idx in indices {
-            if let Some((batch_idx, row_idx)) = opt_idx {
-                let batch = &batches[*batch_idx];
-                let column = batch.column(col_idx);
-                let single_row = take(
-                    column.as_ref(),
-                    &arrow::array::UInt32Array::from(vec![*row_idx as u32]),
-                    None,
-                )?;
-                column_data.push(single_row);
-            } else {
-                // NULL value for unmatched row
-                let column = batches[0].column(col_idx);
-                let null_array = arrow::array::new_null_array(column.data_type(), 1);
-                column_data.push(null_array);
-            }
-        }
-
-        let concatenated =
-            arrow::compute::concat(&column_data.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?;
-        result.push(concatenated);
-    }
-
-    Ok(result)
-}
+// gather helpers relocated to `llkv_table::gather`
 
 // ============================================================================
 // Macro to generate fast-path implementations for integer types

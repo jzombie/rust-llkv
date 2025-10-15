@@ -42,6 +42,7 @@ where
                     ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
                     ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
                     ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
+                    ScalarExpr::Literal(Literal::Null) => DataType::Null,
                     ScalarExpr::Literal(Literal::Struct(_)) => {
                         // For struct literals, we need to infer the type
                         // For now, create a simple struct type
