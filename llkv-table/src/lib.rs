@@ -49,7 +49,7 @@ pub use reserved::CATALOG_TABLE_ID;
 pub use sys_catalog::{
     ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta, TableMultiColumnUniqueMeta,
 };
-pub use table::Table;
+pub use table::{ColumnStream, ColumnStreamBatch, Table};
 pub use types::{FieldId, RowId};
 
 pub use planner::plan_graph::{

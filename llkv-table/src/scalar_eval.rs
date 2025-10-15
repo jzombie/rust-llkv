@@ -13,6 +13,7 @@ use crate::types::FieldId;
 /// Mapping from field identifiers to the numeric Arrow array used for evaluation.
 pub type NumericArrayMap = FxHashMap<FieldId, Arc<Float64Array>>;
 
+// TODO: Document
 #[derive(Clone, Copy, Debug)]
 pub struct AffineExpr {
     pub field: FieldId,
@@ -20,6 +21,7 @@ pub struct AffineExpr {
     pub offset: f64,
 }
 
+// TODO: Document
 #[derive(Clone, Copy, Debug)]
 struct AffineState {
     field: Option<FieldId>,
@@ -27,6 +29,7 @@ struct AffineState {
     offset: f64,
 }
 
+// TODO: Place in impl?
 fn merge_field(lhs: Option<FieldId>, rhs: Option<FieldId>) -> Option<Option<FieldId>> {
     match (lhs, rhs) {
         (Some(a), Some(b)) => {
@@ -42,6 +45,7 @@ fn merge_field(lhs: Option<FieldId>, rhs: Option<FieldId>) -> Option<Option<Fiel
     }
 }
 
+// TODO: Document
 enum VectorizedExpr {
     Array(Arc<Float64Array>),
     Scalar(Option<f64>),

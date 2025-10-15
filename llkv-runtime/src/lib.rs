@@ -45,7 +45,8 @@ use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{
-    CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME, GatherNullPolicy, IndexKind, ROW_ID_COLUMN_NAME,
+    CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME, GatherNullPolicy, IndexKind,
+    MultiGatherContext, ROW_ID_COLUMN_NAME,
 };
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
@@ -53,6 +54,7 @@ use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_result::Error;
 use llkv_storage::pager::{MemPager, Pager};
 use llkv_table::catalog::{FieldConstraints, FieldDefinition};
+use llkv_table::constants::STREAM_BATCH_ROWS;
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_table::{CATALOG_TABLE_ID, ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta};
@@ -1625,13 +1627,7 @@ where
         row_ids: Vec<u64>,
         snapshot: TransactionSnapshot,
     ) -> Result<Vec<u64>> {
-        filter_row_ids_for_snapshot(
-            table.table.store(),
-            table.table.table_id(),
-            row_ids,
-            &self.txn_manager,
-            snapshot,
-        )
+        filter_row_ids_for_snapshot(table.table.as_ref(), row_ids, &self.txn_manager, snapshot)
     }
 
     pub fn create_table_builder(&self, name: &str) -> RuntimeCreateTableBuilder<'_, P> {
@@ -1811,22 +1807,18 @@ where
             return Ok(Vec::new());
         }
 
-        // Scan to get the column data
+        // Scan to get the column data without materializing full columns
         let table_id = table.table.table_id();
 
         let mut fields: Vec<Field> = Vec::with_capacity(table.schema.columns.len() + 1);
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(table.schema.columns.len() + 1);
+        let mut logical_fields: Vec<LogicalFieldId> =
+            Vec::with_capacity(table.schema.columns.len());
 
         fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
-        arrays.push(Arc::new(UInt64Array::from(visible_row_ids.clone())));
 
         for column in &table.schema.columns {
             let logical_field_id = LogicalFieldId::for_user(table_id, column.field_id);
-            let gathered = table.table.store().gather_rows(
-                &[logical_field_id],
-                &visible_row_ids,
-                GatherNullPolicy::IncludeNulls,
-            )?;
+            logical_fields.push(logical_field_id);
             let field = mvcc_columns::build_field_with_metadata(
                 &column.name,
                 column.data_type.clone(),
@@ -1834,11 +1826,47 @@ where
                 column.field_id,
             );
             fields.push(field);
-            arrays.push(gathered.column(0).clone());
         }
 
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
-        Ok(vec![batch])
+        let schema = Arc::new(Schema::new(fields));
+
+        if logical_fields.is_empty() {
+            // Tables without user columns should still return row_id batches.
+            let mut row_id_builder = UInt64Builder::with_capacity(visible_row_ids.len());
+            for row_id in &visible_row_ids {
+                row_id_builder.append_value(*row_id);
+            }
+            let arrays: Vec<ArrayRef> = vec![Arc::new(row_id_builder.finish()) as ArrayRef];
+            let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+            return Ok(vec![batch]);
+        }
+
+        let mut stream = table.table.stream_columns(
+            Arc::from(logical_fields),
+            visible_row_ids,
+            GatherNullPolicy::IncludeNulls,
+        )?;
+
+        let mut batches = Vec::new();
+        while let Some(chunk) = stream.next_batch()? {
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(chunk.batch().num_columns() + 1);
+
+            let mut row_id_builder = UInt64Builder::with_capacity(chunk.len());
+            for row_id in chunk.row_ids() {
+                row_id_builder.append_value(*row_id);
+            }
+            arrays.push(Arc::new(row_id_builder.finish()) as ArrayRef);
+
+            let chunk_batch = chunk.into_batch();
+            for column_array in chunk_batch.columns() {
+                arrays.push(column_array.clone());
+            }
+
+            let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+            batches.push(batch);
+        }
+
+        Ok(batches)
     }
 
     /// Append batches directly to a table, preserving row_ids from the batches.
@@ -3129,6 +3157,7 @@ where
         Ok(())
     }
 
+    // TODO: Make streamable; don't buffer all values in memory at once
     fn scan_column_values(
         &self,
         table: &ExecutorTable<P>,
@@ -3158,8 +3187,7 @@ where
 
         // Apply MVCC filtering manually using filter_row_ids_for_snapshot
         let row_ids = filter_row_ids_for_snapshot(
-            table.table.store(),
-            table_id,
+            table.table.as_ref(),
             row_ids,
             &self.txn_manager,
             snapshot,
@@ -3171,18 +3199,24 @@ where
 
         // Gather the column values for visible rows
         let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
-        let batch = match table.table.store().gather_rows(
-            &[logical_field_id],
-            &row_ids,
+        let row_count = row_ids.len();
+        let mut stream = match table.table.stream_columns(
+            vec![logical_field_id],
+            row_ids,
             GatherNullPolicy::IncludeNulls,
         ) {
-            Ok(b) => b,
+            Ok(stream) => stream,
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
 
-        let mut values = Vec::with_capacity(row_ids.len());
-        if batch.num_columns() > 0 {
+        // TODO: Don't buffer all values; make this streamable
+        let mut values = Vec::with_capacity(row_count);
+        while let Some(chunk) = stream.next_batch()? {
+            let batch = chunk.batch();
+            if batch.num_columns() == 0 {
+                continue;
+            }
             let array = batch.column(0);
             for row_idx in 0..batch.num_rows() {
                 if let Ok(value) = llkv_plan::plan_value_from_array(array, row_idx) {
@@ -3194,6 +3228,7 @@ where
         Ok(values)
     }
 
+    // TODO: Make streamable; don't buffer all values in memory at once
     fn scan_multi_column_values(
         &self,
         table: &ExecutorTable<P>,
@@ -3224,8 +3259,7 @@ where
         };
 
         let row_ids = filter_row_ids_for_snapshot(
-            table.table.store(),
-            table_id,
+            table.table.as_ref(),
             row_ids,
             &self.txn_manager,
             snapshot,
@@ -3240,25 +3274,40 @@ where
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
             .collect();
 
-        let batch = match table.table.store().gather_rows(
-            &logical_field_ids,
-            &row_ids,
+        let total_rows = row_ids.len();
+        let mut stream = match table.table.stream_columns(
+            logical_field_ids,
+            row_ids,
             GatherNullPolicy::IncludeNulls,
         ) {
-            Ok(b) => b,
+            Ok(stream) => stream,
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
 
-        let row_count = batch.num_rows();
-        let mut rows = vec![Vec::with_capacity(field_ids.len()); row_count];
+        let mut rows = vec![Vec::with_capacity(field_ids.len()); total_rows];
+        while let Some(chunk) = stream.next_batch()? {
+            let batch = chunk.batch();
+            if batch.num_columns() == 0 {
+                continue;
+            }
 
-        for col_idx in 0..batch.num_columns() {
-            let array = batch.column(col_idx);
-            for row_idx in 0..row_count {
-                match llkv_plan::plan_value_from_array(array, row_idx) {
-                    Ok(value) => rows[row_idx].push(value),
-                    Err(_) => rows[row_idx].push(PlanValue::Null),
+            let base = chunk.row_offset();
+            let local_len = batch.num_rows();
+            for col_idx in 0..batch.num_columns() {
+                let array = batch.column(col_idx);
+                for local_idx in 0..local_len {
+                    let target_index = base + local_idx;
+                    debug_assert!(
+                        target_index < rows.len(),
+                        "stream chunk produced out-of-bounds row index"
+                    );
+                    if let Some(row) = rows.get_mut(target_index) {
+                        match llkv_plan::plan_value_from_array(array, local_idx) {
+                            Ok(value) => row.push(value),
+                            Err(_) => row.push(PlanValue::Null),
+                        }
+                    }
                 }
             }
         }
@@ -3537,21 +3586,38 @@ where
             .map(|column| LogicalFieldId::for_user(table_id, column.field_id))
             .collect();
 
-        let gathered = table.table.store().gather_rows(
-            &logical_fields,
-            &row_ids,
+        let mut stream = table.table.stream_columns(
+            logical_fields.clone(),
+            row_ids.clone(),
             GatherNullPolicy::IncludeNulls,
         )?;
 
         let mut new_rows: Vec<Vec<PlanValue>> =
             vec![Vec::with_capacity(table.schema.columns.len()); row_count];
-        for (col_idx, _column) in table.schema.columns.iter().enumerate() {
-            let array = gathered.column(col_idx);
-            for (row_idx, row) in new_rows.iter_mut().enumerate().take(row_count) {
-                let value = llkv_plan::plan_value_from_array(array, row_idx)?;
-                row.push(value);
+        while let Some(chunk) = stream.next_batch()? {
+            let batch = chunk.batch();
+            let base = chunk.row_offset();
+            let local_len = batch.num_rows();
+            for col_idx in 0..batch.num_columns() {
+                let array = batch.column(col_idx);
+                for local_idx in 0..local_len {
+                    let target_index = base + local_idx;
+                    debug_assert!(
+                        target_index < new_rows.len(),
+                        "column stream produced out-of-range row index"
+                    );
+                    if let Some(row) = new_rows.get_mut(target_index) {
+                        let value = llkv_plan::plan_value_from_array(array, local_idx)?;
+                        row.push(value);
+                    }
+                }
             }
         }
+        debug_assert!(
+            new_rows
+                .iter()
+                .all(|row| row.len() == table.schema.columns.len())
+        );
 
         let column_positions: FxHashMap<FieldId, usize> = FxHashMap::from_iter(
             table
@@ -3723,21 +3789,38 @@ where
             .map(|column| LogicalFieldId::for_user(table_id, column.field_id))
             .collect();
 
-        let gathered = table.table.store().gather_rows(
-            &logical_fields,
-            &row_ids,
+        let mut stream = table.table.stream_columns(
+            logical_fields.clone(),
+            row_ids.clone(),
             GatherNullPolicy::IncludeNulls,
         )?;
 
         let mut new_rows: Vec<Vec<PlanValue>> =
             vec![Vec::with_capacity(table.schema.columns.len()); row_count];
-        for (col_idx, _column) in table.schema.columns.iter().enumerate() {
-            let array = gathered.column(col_idx);
-            for (row_idx, row) in new_rows.iter_mut().enumerate().take(row_count) {
-                let value = llkv_plan::plan_value_from_array(array, row_idx)?;
-                row.push(value);
+        while let Some(chunk) = stream.next_batch()? {
+            let batch = chunk.batch();
+            let base = chunk.row_offset();
+            let local_len = batch.num_rows();
+            for col_idx in 0..batch.num_columns() {
+                let array = batch.column(col_idx);
+                for local_idx in 0..local_len {
+                    let target_index = base + local_idx;
+                    debug_assert!(
+                        target_index < new_rows.len(),
+                        "column stream produced out-of-range row index"
+                    );
+                    if let Some(row) = new_rows.get_mut(target_index) {
+                        let value = llkv_plan::plan_value_from_array(array, local_idx)?;
+                        row.push(value);
+                    }
+                }
             }
         }
+        debug_assert!(
+            new_rows
+                .iter()
+                .all(|row| row.len() == table.schema.columns.len())
+        );
 
         let column_positions: FxHashMap<FieldId, usize> = FxHashMap::from_iter(
             table
@@ -4418,8 +4501,7 @@ where
 }
 
 fn filter_row_ids_for_snapshot<P>(
-    store: &ColumnStore<P>,
-    table_id: TableId,
+    table: &Table<P>,
     row_ids: Vec<u64>,
     txn_manager: &TxnIdManager,
     snapshot: TransactionSnapshot,
@@ -4438,84 +4520,123 @@ where
         return Ok(row_ids);
     }
 
+    let table_id = table.table_id();
     let created_lfid = LogicalFieldId::for_mvcc_created_by(table_id);
     let deleted_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
+    let logical_fields: Arc<[LogicalFieldId]> = Arc::from([created_lfid, deleted_lfid]);
 
-    let version_batch = match store.gather_rows(
-        &[created_lfid, deleted_lfid],
-        &row_ids,
-        GatherNullPolicy::IncludeNulls,
-    ) {
-        Ok(batch) => batch,
+    let mut ctx: MultiGatherContext = match table
+        .store()
+        .prepare_gather_context(logical_fields.as_ref())
+    {
+        Ok(ctx) => ctx,
         Err(Error::NotFound) => {
             tracing::trace!(
-                "[FILTER_ROWS] gather_rows returned NotFound for MVCC columns, treating all {} rows as visible (committed)",
+                "[FILTER_ROWS] MVCC columns not found for table_id={}, treating all {} rows as visible",
+                table_id,
                 row_ids.len()
             );
             return Ok(row_ids);
         }
         Err(err) => {
-            tracing::error!("[FILTER_ROWS] gather_rows error: {:?}", err);
+            tracing::error!("[FILTER_ROWS] Failed to prepare gather context: {:?}", err);
             return Err(err);
         }
     };
 
-    if version_batch.num_columns() < 2 {
-        tracing::debug!(
-            "[FILTER_ROWS] version_batch has < 2 columns, returning all {} rows",
-            row_ids.len()
-        );
-        return Ok(row_ids);
-    }
-
-    let created_column = version_batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<UInt64Array>();
-    let deleted_column = version_batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<UInt64Array>();
-
-    if created_column.is_none() || deleted_column.is_none() {
-        tracing::debug!(
-            "[FILTER_ROWS] Failed to downcast columns, returning all {} rows",
-            row_ids.len()
-        );
-        return Ok(row_ids);
-    }
-
-    let created_column = created_column.unwrap();
-    let deleted_column = deleted_column.unwrap();
-
+    let store = table.store();
     let mut visible = Vec::with_capacity(row_ids.len());
-    for (idx, row_id) in row_ids.iter().enumerate() {
-        let created_by = if created_column.is_null(idx) {
-            TXN_ID_AUTO_COMMIT
-        } else {
-            created_column.value(idx)
-        };
-        let deleted_by = if deleted_column.is_null(idx) {
-            TXN_ID_NONE
-        } else {
-            deleted_column.value(idx)
+    let mut offset = 0;
+
+    while offset < row_ids.len() {
+        let end = (offset + STREAM_BATCH_ROWS).min(row_ids.len());
+        let window = &row_ids[offset..end];
+        let version_batch = match store.gather_rows_with_reusable_context(
+            &mut ctx,
+            window,
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(batch) => batch,
+            Err(Error::NotFound) => {
+                tracing::trace!(
+                    "[FILTER_ROWS] gather_rows_with_reusable_context returned NotFound for MVCC columns (table_id={}), treating all rows in window as visible",
+                    table_id
+                );
+                visible.extend_from_slice(window);
+                offset = end;
+                continue;
+            }
+            Err(err) => {
+                tracing::error!(
+                    "[FILTER_ROWS] gather_rows_with_reusable_context error: {:?}",
+                    err
+                );
+                return Err(err);
+            }
         };
 
-        let version = RowVersion {
-            created_by,
-            deleted_by,
-        };
-        let is_visible = version.is_visible_for(txn_manager, snapshot);
-        tracing::trace!(
-            "[FILTER_ROWS] row_id={}: created_by={}, deleted_by={}, is_visible={}",
-            row_id,
-            created_by,
-            deleted_by,
-            is_visible
-        );
-        if is_visible {
-            visible.push(*row_id);
+        if version_batch.num_columns() < 2 {
+            tracing::debug!(
+                "[FILTER_ROWS] version_batch has < 2 columns for table_id={}, returning window rows unfiltered",
+                table_id
+            );
+            visible.extend_from_slice(window);
+            offset = end;
+            continue;
         }
+
+        let created_column = version_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>();
+        let deleted_column = version_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>();
+
+        if created_column.is_none() || deleted_column.is_none() {
+            tracing::debug!(
+                "[FILTER_ROWS] Failed to downcast MVCC columns for table_id={}, returning window rows unfiltered",
+                table_id
+            );
+            visible.extend_from_slice(window);
+            offset = end;
+            continue;
+        }
+
+        let created_column = created_column.unwrap();
+        let deleted_column = deleted_column.unwrap();
+
+        for (idx, row_id) in window.iter().enumerate() {
+            let created_by = if created_column.is_null(idx) {
+                TXN_ID_AUTO_COMMIT
+            } else {
+                created_column.value(idx)
+            };
+            let deleted_by = if deleted_column.is_null(idx) {
+                TXN_ID_NONE
+            } else {
+                deleted_column.value(idx)
+            };
+
+            let version = RowVersion {
+                created_by,
+                deleted_by,
+            };
+            let is_visible = version.is_visible_for(txn_manager, snapshot);
+            tracing::trace!(
+                "[FILTER_ROWS] row_id={}: created_by={}, deleted_by={}, is_visible={}",
+                row_id,
+                created_by,
+                deleted_by,
+                is_visible
+            );
+            if is_visible {
+                visible.push(*row_id);
+            }
+        }
+
+        offset = end;
     }
 
     tracing::debug!(
@@ -4559,13 +4680,7 @@ where
             self.snapshot.txn_id,
             self.snapshot.snapshot_id
         );
-        let result = filter_row_ids_for_snapshot(
-            table.store(),
-            table.table_id(),
-            row_ids,
-            &self.txn_manager,
-            self.snapshot,
-        );
+        let result = filter_row_ids_for_snapshot(table, row_ids, &self.txn_manager, self.snapshot);
         if let Ok(ref visible) = result {
             tracing::trace!(
                 "[MVCC_FILTER] filter() returning visible row_ids: {:?}",
