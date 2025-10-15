@@ -855,6 +855,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_stream_full_table_scan<F>(
         &self,
         unique_lfids: &[LogicalFieldId],
@@ -1185,8 +1186,9 @@ where
         }
         let out_schema = Arc::new(Schema::new(schema_fields));
 
-        if options.order.is_none() && is_trivial_filter(&filter_expr) {
-            if self
+        if options.order.is_none()
+            && is_trivial_filter(&filter_expr)
+            && self
                 .try_stream_full_table_scan(
                     unique_lfids.as_slice(),
                     &projection_evals,
@@ -1200,9 +1202,8 @@ where
                     &mut on_batch,
                 )?
                 .is_handled()
-            {
-                return Ok(());
-            }
+        {
+            return Ok(());
         }
 
         let fusion_cache = PredicateFusionCache::from_expr(&filter_expr);
@@ -1766,10 +1767,7 @@ where
 
         let mut result: Vec<RowId> = Vec::with_capacity(row_ids.len());
 
-        let mut process_chunk = |
-            window: &[RowId],
-            columns: &[ArrayRef],
-        | -> LlkvResult<()> {
+        let mut process_chunk = |window: &[RowId], columns: &[ArrayRef]| -> LlkvResult<()> {
             if window.is_empty() {
                 return Ok(());
             }
@@ -1786,10 +1784,7 @@ where
 
             if has_row_id {
                 let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
-                numeric_arrays.insert(
-                    ROW_ID_FIELD_ID,
-                    Arc::new(Float64Array::from(rid_values)),
-                );
+                numeric_arrays.insert(ROW_ID_FIELD_ID, Arc::new(Float64Array::from(rid_values)));
             }
 
             for (offset, &row_id) in window.iter().enumerate() {
@@ -1905,12 +1900,14 @@ where
         let ascending = matches!(order.direction, ScanOrderDirection::Ascending);
         let schema = self.table.schema()?;
         let cached_schema = CachedSchema::new(Arc::clone(&schema));
-        let schema_index = cached_schema.index_of_field_id(order.field_id).ok_or_else(|| {
-            Error::InvalidArgumentError(format!(
-                "ORDER BY field {} missing from table schema",
-                order.field_id
-            ))
-        })?;
+        let schema_index = cached_schema
+            .index_of_field_id(order.field_id)
+            .ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "ORDER BY field {} missing from table schema",
+                    order.field_id
+                ))
+            })?;
         let field = schema.field(schema_index).clone();
 
         let out_schema = Arc::new(Schema::new(vec![field.clone()]));
@@ -2043,9 +2040,7 @@ where
                         .as_any()
                         .downcast_ref::<StringArray>()
                         .ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "ORDER BY text expects Utf8 column".into(),
-                            )
+                            Error::InvalidArgumentError("ORDER BY text expects Utf8 column".into())
                         })?
                         .clone();
 
@@ -2123,9 +2118,7 @@ where
                         .as_any()
                         .downcast_ref::<StringArray>()
                         .ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "ORDER BY CAST expects Utf8 column".into(),
-                            )
+                            Error::InvalidArgumentError("ORDER BY CAST expects Utf8 column".into())
                         })?;
 
                     for offset in 0..batch.num_rows() {
@@ -3138,6 +3131,7 @@ fn normalize_row_ids(mut row_ids: Vec<RowId>) -> Vec<RowId> {
     row_ids
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn materialize_row_window<P>(
     store: &llkv_column_map::store::ColumnStore<P>,
     table_id: TableId,
@@ -3173,7 +3167,7 @@ where
         (window.len(), numeric_arrays)
     } else {
         let mut local_ctx;
-        let ctx = match gather_ctx.as_deref_mut() {
+        let ctx = match gather_ctx.as_mut() {
             Some(ctx) => ctx,
             None => {
                 local_ctx = store.prepare_gather_context(unique_lfids)?;

@@ -1093,6 +1093,7 @@ impl<P> SelectExecution<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    #[allow(clippy::too_many_arguments)]
     fn new_projection(
         table_name: String,
         schema: Arc<Schema>,

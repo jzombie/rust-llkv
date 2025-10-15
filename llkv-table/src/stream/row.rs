@@ -13,7 +13,7 @@ use llkv_storage::pager::Pager;
 
 use crate::types::{FieldId, RowId, TableId};
 
-use crate::planner::{materialize_row_window, ProjectionEval};
+use crate::planner::{ProjectionEval, materialize_row_window};
 
 #[allow(dead_code)]
 pub(crate) trait ColumnSliceSet<'a> {
@@ -99,6 +99,7 @@ impl<'table, P> RowStreamBuilder<'table, P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: &'table ColumnStore<P>,
         table_id: TableId,
@@ -221,7 +222,10 @@ impl<'table, P> RowStream for TableRowStream<'table, P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    type Columns<'a> = ColumnSlices<'a> where Self: 'a;
+    type Columns<'a>
+        = ColumnSlices<'a>
+    where
+        Self: 'a;
 
     fn schema(&self) -> &Arc<Schema> {
         &self.schema

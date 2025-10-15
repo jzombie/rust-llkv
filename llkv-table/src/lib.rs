@@ -47,8 +47,8 @@ pub mod types;
 
 pub mod stream;
 
-pub use stream::{ColumnStream, ColumnStreamBatch};
 pub use reserved::CATALOG_TABLE_ID;
+pub use stream::{ColumnStream, ColumnStreamBatch};
 pub use sys_catalog::{
     ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta, TableMultiColumnUniqueMeta,
 };

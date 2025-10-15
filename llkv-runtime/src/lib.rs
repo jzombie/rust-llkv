@@ -45,8 +45,7 @@ use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{
-    CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME, GatherNullPolicy, IndexKind,
-    ROW_ID_COLUMN_NAME,
+    CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME, GatherNullPolicy, IndexKind, ROW_ID_COLUMN_NAME,
 };
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
@@ -1511,17 +1510,14 @@ where
 
             if plan.unique {
                 self.ensure_existing_rows_unique(table.as_ref(), field_id, &column_name)?;
+                if let Some(table_id) = self.catalog.table_id(&canonical_name)
+                    && let Some(resolver) = self.catalog.field_resolver(table_id)
+                {
+                    resolver.set_field_unique(&column_name, true)?;
+                }
             }
 
             store.register_index(logical_field_id, IndexKind::Sort)?;
-
-            if plan.unique {
-                if let Some(table_id) = self.catalog.table_id(&canonical_name) {
-                    if let Some(resolver) = self.catalog.field_resolver(table_id) {
-                        resolver.set_field_unique(&column_name, true)?;
-                    }
-                }
-            }
 
             drop(table);
             self.remove_table_entry(&canonical_name);
@@ -2985,13 +2981,13 @@ where
                 continue;
             }
 
-            if let Some(key) = Self::build_composite_unique_key(&values, column_names)? {
-                if !seen.insert(key) {
-                    return Err(Error::ConstraintError(format!(
-                        "constraint violation on columns '{}'",
-                        column_names.join(", ")
-                    )));
-                }
+            if let Some(key) = Self::build_composite_unique_key(&values, column_names)?
+                && !seen.insert(key)
+            {
+                return Err(Error::ConstraintError(format!(
+                    "constraint violation on columns '{}'",
+                    column_names.join(", ")
+                )));
             }
         }
 
@@ -3082,13 +3078,12 @@ where
                 if let Some(key) = Self::build_composite_unique_key(
                     &values_for_constraint,
                     &constraint_column_names,
-                )? {
-                    if existing_keys.contains(&key) || !new_keys.insert(key) {
-                        return Err(Error::ConstraintError(format!(
-                            "constraint violation on columns '{}'",
-                            constraint_column_names.join(", ")
-                        )));
-                    }
+                )? && (existing_keys.contains(&key) || !new_keys.insert(key))
+                {
+                    return Err(Error::ConstraintError(format!(
+                        "constraint violation on columns '{}'",
+                        constraint_column_names.join(", ")
+                    )));
                 }
             }
         }
@@ -4582,14 +4577,8 @@ where
             continue;
         }
 
-        let created_column = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>();
-        let deleted_column = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<UInt64Array>();
+        let created_column = batch.column(0).as_any().downcast_ref::<UInt64Array>();
+        let deleted_column = batch.column(1).as_any().downcast_ref::<UInt64Array>();
 
         if created_column.is_none() || deleted_column.is_none() {
             tracing::debug!(
