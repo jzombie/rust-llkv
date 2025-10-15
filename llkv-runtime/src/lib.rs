@@ -2655,6 +2655,14 @@ where
                     ))),
                 }
             }
+            SqlExpr::IsNull(inner) => {
+                let value = Self::evaluate_check_expr_value(inner, row, column_order, table)?;
+                Ok(matches!(value, PlanValue::Null))
+            }
+            SqlExpr::IsNotNull(inner) => {
+                let value = Self::evaluate_check_expr_value(inner, row, column_order, table)?;
+                Ok(!matches!(value, PlanValue::Null))
+            }
             _ => Err(Error::InvalidArgumentError(format!(
                 "Unsupported expression in CHECK constraint: {:?}",
                 expr
