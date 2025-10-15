@@ -3004,7 +3004,8 @@ where
         return Ok(None);
     }
 
-    let (batch_len, unique_arrays_owned, numeric_arrays) = if unique_lfids.is_empty() {
+    let mut gathered_batch: Option<RecordBatch> = None;
+    let (batch_len, numeric_arrays) = if unique_lfids.is_empty() {
         let numeric_arrays = if requires_numeric {
             Some(NumericKernels::prepare_numeric_arrays(
                 &[],
@@ -3014,7 +3015,7 @@ where
         } else {
             None
         };
-        (window.len(), Vec::new(), numeric_arrays)
+        (window.len(), numeric_arrays)
     } else {
         let mut local_ctx;
         let ctx = match gather_ctx.as_deref_mut() {
@@ -3028,22 +3029,29 @@ where
         if batch.num_rows() == 0 {
             return Ok(None);
         }
-        let unique_arrays_owned: Vec<ArrayRef> = batch.columns().iter().map(Arc::clone).collect();
+        let batch_len = batch.num_rows();
         let numeric_arrays = if requires_numeric {
             Some(NumericKernels::prepare_numeric_arrays(
                 unique_lfids,
-                unique_arrays_owned.as_slice(),
+                batch.columns(),
                 numeric_fields,
             )?)
         } else {
             None
         };
-        (batch.num_rows(), unique_arrays_owned, numeric_arrays)
+        gathered_batch = Some(batch);
+        (batch_len, numeric_arrays)
     };
 
     if batch_len == 0 {
         return Ok(None);
     }
+
+    let gathered_columns: &[ArrayRef] = if let Some(batch) = gathered_batch.as_ref() {
+        batch.columns()
+    } else {
+        &[]
+    };
 
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
     for (idx, eval) in projection_evals.iter().enumerate() {
@@ -3052,7 +3060,7 @@ where
                 let arr_idx = *unique_index
                     .get(&info.logical_field_id)
                     .expect("logical field id missing from index");
-                columns.push(Arc::clone(&unique_arrays_owned[arr_idx]));
+                columns.push(Arc::clone(&gathered_columns[arr_idx]));
             }
             ProjectionEval::Computed(info) => {
                 if let Some(fid) = passthrough_fields[idx] {
@@ -3060,7 +3068,7 @@ where
                     let arr_idx = *unique_index
                         .get(&lfid)
                         .expect("passthrough field missing from index");
-                    columns.push(Arc::clone(&unique_arrays_owned[arr_idx]));
+                    columns.push(Arc::clone(&gathered_columns[arr_idx]));
                     continue;
                 }
 
@@ -3074,7 +3082,7 @@ where
                         fn eval_get_field(
                             expr: &ScalarExpr<FieldId>,
                             field_name: &str,
-                            unique_arrays_owned: &[ArrayRef],
+                            gathered_columns: &[ArrayRef],
                             unique_index: &FxHashMap<LogicalFieldId, usize>,
                             table_id: TableId,
                         ) -> LlkvResult<ArrayRef> {
@@ -3084,7 +3092,7 @@ where
                                     let arr_idx = *unique_index.get(&lfid).ok_or_else(|| {
                                         Error::Internal("field missing from unique arrays".into())
                                     })?;
-                                    Arc::clone(&unique_arrays_owned[arr_idx])
+                                    Arc::clone(&gathered_columns[arr_idx])
                                 }
                                 ScalarExpr::GetField {
                                     base: inner_base,
@@ -3092,7 +3100,7 @@ where
                                 } => eval_get_field(
                                     inner_base,
                                     inner_field,
-                                    unique_arrays_owned,
+                                    gathered_columns,
                                     unique_index,
                                     table_id,
                                 )?,
@@ -3123,13 +3131,7 @@ where
                                 .map(Arc::clone)
                         }
 
-                        eval_get_field(
-                            base,
-                            field_name,
-                            unique_arrays_owned.as_slice(),
-                            unique_index,
-                            table_id,
-                        )?
+                        eval_get_field(base, field_name, gathered_columns, unique_index, table_id)?
                     }
                     _ => {
                         let numeric_arrays = numeric_arrays
