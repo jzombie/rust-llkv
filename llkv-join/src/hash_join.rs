@@ -32,9 +32,12 @@
 //! - Empty tables safely fall back to generic path
 
 use crate::{JoinKey, JoinOptions, JoinType};
-use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array};
+use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Schema};
+use llkv_column_map::gather::{
+    gather_indices, gather_indices_from_batches, gather_optional_indices_from_batches,
+};
 use llkv_column_map::store::Projection;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::{Expr, Filter, Operator};
@@ -835,7 +838,7 @@ fn build_output_schema(
     join_type: JoinType,
 ) -> LlkvResult<Arc<Schema>> {
     let mut fields = Vec::new();
-    let mut field_names = std::collections::HashSet::new();
+    let mut field_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // For semi/anti joins, only include left side
     if matches!(join_type, JoinType::Semi | JoinType::Anti) {
@@ -897,168 +900,7 @@ fn build_output_schema(
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn gather_indices(batch: &RecordBatch, indices: &[usize]) -> LlkvResult<Vec<ArrayRef>> {
-    if indices.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut indices_vec: Vec<u32> = Vec::with_capacity(indices.len());
-    indices_vec.extend(indices.iter().map(|&idx| idx as u32));
-    let indices_array = UInt32Array::from(indices_vec);
-
-    let mut result = Vec::with_capacity(batch.num_columns());
-    for column in batch.columns() {
-        let gathered = take(column.as_ref(), &indices_array, None)?;
-        result.push(gathered);
-    }
-
-    Ok(result)
-}
-
-fn gather_indices_from_batches(
-    batches: &[RecordBatch],
-    indices: &[(usize, usize)],
-) -> LlkvResult<Vec<ArrayRef>> {
-    if batches.is_empty() || indices.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut grouped: Vec<(usize, UInt32Array)> = Vec::new();
-    let mut current_batch = indices[0].0;
-    let mut current_rows: Vec<u32> = Vec::new();
-
-    for &(batch_idx, row_idx) in indices {
-        if batch_idx == current_batch {
-            current_rows.push(row_idx as u32);
-        } else {
-            if !current_rows.is_empty() {
-                let array = UInt32Array::from(std::mem::take(&mut current_rows));
-                grouped.push((current_batch, array));
-            }
-            current_batch = batch_idx;
-            current_rows.push(row_idx as u32);
-        }
-    }
-
-    if !current_rows.is_empty() {
-        let array = UInt32Array::from(std::mem::take(&mut current_rows));
-        grouped.push((current_batch, array));
-    }
-
-    let num_columns = batches[0].num_columns();
-    let mut result = Vec::with_capacity(num_columns);
-
-    for col_idx in 0..num_columns {
-        let mut segments: Vec<ArrayRef> = Vec::with_capacity(grouped.len());
-        for (batch_idx, rows) in &grouped {
-            let column = batches[*batch_idx].column(col_idx);
-            let segment = take(column.as_ref(), rows, None)?;
-            segments.push(segment);
-        }
-
-        let concatenated = if segments.len() == 1 {
-            segments.pop().unwrap()
-        } else {
-            let inputs: Vec<&dyn Array> = segments.iter().map(|a| a.as_ref()).collect();
-            arrow::compute::concat(&inputs)?
-        };
-        result.push(concatenated);
-    }
-
-    Ok(result)
-}
-
-fn gather_optional_indices_from_batches(
-    batches: &[RecordBatch],
-    indices: &[Option<(usize, usize)>],
-) -> LlkvResult<Vec<ArrayRef>> {
-    if batches.is_empty() || indices.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    enum Segment {
-        Gather { batch_idx: usize, rows: UInt32Array },
-        Null { len: usize },
-    }
-
-    let mut segments: Vec<Segment> = Vec::new();
-    let mut current_batch: Option<usize> = None;
-    let mut current_rows: Vec<u32> = Vec::new();
-    let mut pending_nulls: usize = 0;
-
-    let flush_batch = |segments: &mut Vec<Segment>,
-                       current_batch: &mut Option<usize>,
-                       current_rows: &mut Vec<u32>| {
-        if let Some(batch_idx) = current_batch.take()
-            && !current_rows.is_empty()
-        {
-            let rows = UInt32Array::from(std::mem::take(current_rows));
-            segments.push(Segment::Gather { batch_idx, rows });
-        }
-    };
-
-    let flush_nulls = |segments: &mut Vec<Segment>, pending_nulls: &mut usize| {
-        if *pending_nulls > 0 {
-            segments.push(Segment::Null {
-                len: *pending_nulls,
-            });
-            *pending_nulls = 0;
-        }
-    };
-
-    for opt in indices {
-        match opt {
-            Some((batch_idx, row_idx)) => {
-                flush_nulls(&mut segments, &mut pending_nulls);
-                if current_batch == Some(*batch_idx) {
-                    current_rows.push(*row_idx as u32);
-                } else {
-                    flush_batch(&mut segments, &mut current_batch, &mut current_rows);
-                    current_batch = Some(*batch_idx);
-                    current_rows.push(*row_idx as u32);
-                }
-            }
-            None => {
-                flush_batch(&mut segments, &mut current_batch, &mut current_rows);
-                pending_nulls += 1;
-            }
-        }
-    }
-
-    flush_batch(&mut segments, &mut current_batch, &mut current_rows);
-    flush_nulls(&mut segments, &mut pending_nulls);
-
-    let num_columns = batches[0].num_columns();
-    let mut result = Vec::with_capacity(num_columns);
-
-    for col_idx in 0..num_columns {
-        let mut column_segments: Vec<ArrayRef> = Vec::with_capacity(segments.len());
-        for segment in &segments {
-            match segment {
-                Segment::Gather { batch_idx, rows } => {
-                    let column = batches[*batch_idx].column(col_idx);
-                    let gathered = take(column.as_ref(), rows, None)?;
-                    column_segments.push(gathered);
-                }
-                Segment::Null { len } => {
-                    let template = batches[0].column(col_idx);
-                    let null_array = arrow::array::new_null_array(template.data_type(), *len);
-                    column_segments.push(null_array);
-                }
-            }
-        }
-
-        let concatenated = if column_segments.len() == 1 {
-            column_segments.pop().unwrap()
-        } else {
-            let inputs: Vec<&dyn Array> = column_segments.iter().map(|a| a.as_ref()).collect();
-            arrow::compute::concat(&inputs)?
-        };
-        result.push(concatenated);
-    }
-
-    Ok(result)
-}
+// gather helpers relocated to `llkv_table::gather`
 
 // ============================================================================
 // Macro to generate fast-path implementations for integer types

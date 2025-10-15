@@ -33,6 +33,7 @@
 
 pub mod catalog;
 pub mod constants;
+pub mod gather;
 mod planner;
 pub mod reserved;
 mod scalar_eval;
