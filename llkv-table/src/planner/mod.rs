@@ -13,6 +13,19 @@ use arrow::array::{
 };
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOutcome {
+    Handled,
+    Fallback,
+}
+
+impl StreamOutcome {
+    #[inline]
+    fn is_handled(self) -> bool {
+        matches!(self, StreamOutcome::Handled)
+    }
+}
+
 use llkv_column_map::ScanBuilder;
 use llkv_column_map::parallel;
 use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
@@ -37,7 +50,7 @@ use crate::scalar_eval::{NumericArrayMap, NumericKernels};
 use crate::table::{
     ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
 };
-use crate::types::{FieldId, ROW_ID_FIELD_ID, TableId};
+use crate::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 
 use self::plan_graph::{
     PlanEdge, PlanExpression, PlanField, PlanGraph, PlanGraphBuilder, PlanGraphError, PlanNode,
@@ -530,7 +543,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     table: &'a Table<P>,
-    row_id_cache: RefCell<Option<Vec<u64>>>,
+    row_id_cache: RefCell<Option<Vec<RowId>>>,
 }
 
 pub(crate) struct TablePlanner<'a, P>
@@ -688,7 +701,7 @@ where
         }
     }
 
-    fn table_row_ids(&self) -> LlkvResult<Vec<u64>> {
+    fn table_row_ids(&self) -> LlkvResult<Vec<RowId>> {
         if let Some(cached) = self.row_id_cache.borrow().as_ref() {
             return Ok(cached.clone());
         }
@@ -697,7 +710,7 @@ where
         Ok(computed)
     }
 
-    fn compute_table_row_ids(&self) -> LlkvResult<Vec<u64>> {
+    fn compute_table_row_ids(&self) -> LlkvResult<Vec<RowId>> {
         use llkv_column_map::store::rowid_fid;
 
         let fields = self
@@ -767,8 +780,8 @@ where
             .total_rows_for_table(self.table.table_id())
             .unwrap_or_default();
 
-        let mut seen: FxHashSet<u64> = FxHashSet::default();
-        let mut collected: Vec<u64> = Vec::new();
+        let mut seen: FxHashSet<RowId> = FxHashSet::default();
+        let mut collected: Vec<RowId> = Vec::new();
 
         for lfid in fields {
             let mut collector = RowIdScanCollector::default();
@@ -797,9 +810,13 @@ where
         Ok(collected)
     }
 
-    fn stream_table_row_ids<F>(&self, chunk_size: usize, on_chunk: &mut F) -> LlkvResult<bool>
+    fn stream_table_row_ids<F>(
+        &self,
+        chunk_size: usize,
+        on_chunk: &mut F,
+    ) -> LlkvResult<StreamOutcome>
     where
-        F: FnMut(Vec<u64>) -> LlkvResult<()>,
+        F: FnMut(Vec<RowId>) -> LlkvResult<()>,
     {
         use llkv_column_map::store::rowid_fid;
 
@@ -808,11 +825,11 @@ where
             .store()
             .user_field_ids_for_table(self.table.table_id());
         if fields.is_empty() {
-            return Ok(true);
+            return Ok(StreamOutcome::Handled);
         }
 
         let Some(&first_field) = fields.first() else {
-            return Ok(true);
+            return Ok(StreamOutcome::Handled);
         };
 
         let rid_shadow = rowid_fid(first_field);
@@ -828,9 +845,9 @@ where
         match scan_result {
             Ok(()) => {
                 emitter.finish()?;
-                Ok(true)
+                Ok(StreamOutcome::Handled)
             }
-            Err(Error::NotFound) => Ok(false),
+            Err(Error::NotFound) => Ok(StreamOutcome::Fallback),
             Err(err) => {
                 let _ = emitter.finish();
                 Err(err)
@@ -850,12 +867,12 @@ where
         options: &ScanStreamOptions<P>,
         out_schema: &Arc<Schema>,
         on_batch: &mut F,
-    ) -> LlkvResult<bool>
+    ) -> LlkvResult<StreamOutcome>
     where
         F: FnMut(RecordBatch),
     {
         if options.order.is_some() {
-            return Ok(false);
+            return Ok(StreamOutcome::Fallback);
         }
 
         let store = self.table.store();
@@ -868,7 +885,7 @@ where
 
         let mut any_emitted = false;
 
-        let mut process_chunk = |mut chunk: Vec<u64>| -> LlkvResult<()> {
+        let mut process_chunk = |mut chunk: Vec<RowId>| -> LlkvResult<()> {
             if let Some(filter) = options.row_id_filter.as_ref() {
                 chunk = filter.filter(self.table, chunk)?;
             }
@@ -898,8 +915,11 @@ where
             Ok(())
         };
 
-        if !self.stream_table_row_ids(STREAM_BATCH_ROWS, &mut process_chunk)? {
-            return Ok(false);
+        if !self
+            .stream_table_row_ids(STREAM_BATCH_ROWS, &mut process_chunk)?
+            .is_handled()
+        {
+            return Ok(StreamOutcome::Fallback);
         }
 
         if !any_emitted && options.row_id_filter.is_none() {
@@ -910,10 +930,10 @@ where
             emit_synthetic_null_batch(projection_evals, out_schema, row_count, on_batch)?;
         }
 
-        Ok(true)
+        Ok(StreamOutcome::Handled)
     }
 
-    fn collect_row_ids_for_rowid_filter(&self, op: &Operator<'_>) -> LlkvResult<Vec<u64>> {
+    fn collect_row_ids_for_rowid_filter(&self, op: &Operator<'_>) -> LlkvResult<Vec<RowId>> {
         let all_row_ids = self.table_row_ids()?;
         if all_row_ids.is_empty() {
             return Ok(Vec::new());
@@ -932,12 +952,15 @@ where
             plan_graph: _plan_graph,
         } = plan;
 
-        if self.try_single_column_direct_scan(
-            &projections,
-            &filter_expr,
-            options.clone(),
-            &mut on_batch,
-        )? {
+        if self
+            .try_single_column_direct_scan(
+                &projections,
+                &filter_expr,
+                options.clone(),
+                &mut on_batch,
+            )?
+            .is_handled()
+        {
             return Ok(());
         }
 
@@ -1145,24 +1168,27 @@ where
         let out_schema = Arc::new(Schema::new(schema_fields));
 
         if options.order.is_none() && is_trivial_filter(&filter_expr) {
-            if self.try_stream_full_table_scan(
-                unique_lfids.as_slice(),
-                &projection_evals,
-                &passthrough_fields,
-                &unique_index,
-                &numeric_fields,
-                requires_numeric,
-                null_policy,
-                &options,
-                &out_schema,
-                &mut on_batch,
-            )? {
+            if self
+                .try_stream_full_table_scan(
+                    unique_lfids.as_slice(),
+                    &projection_evals,
+                    &passthrough_fields,
+                    &unique_index,
+                    &numeric_fields,
+                    requires_numeric,
+                    null_policy,
+                    &options,
+                    &out_schema,
+                    &mut on_batch,
+                )?
+                .is_handled()
+            {
                 return Ok(());
             }
         }
 
         let fusion_cache = PredicateFusionCache::from_expr(&filter_expr);
-        let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
+        let mut all_rows_cache: FxHashMap<FieldId, Vec<RowId>> = FxHashMap::default();
 
         // When we have a trivial filter (no predicates), enumerate ALL row IDs.
         // This is necessary for:
@@ -1291,12 +1317,12 @@ where
         filter_expr: &Expr<'expr, FieldId>,
         options: ScanStreamOptions<P>,
         on_batch: &mut F,
-    ) -> LlkvResult<bool>
+    ) -> LlkvResult<StreamOutcome>
     where
         F: FnMut(RecordBatch),
     {
         if options.include_nulls || projections.len() != 1 {
-            return Ok(false);
+            return Ok(StreamOutcome::Fallback);
         }
 
         match &projections[0] {
@@ -1310,12 +1336,12 @@ where
                 }
 
                 if !is_full_range_filter(filter_expr, p.logical_field_id.field_id()) {
-                    return Ok(false);
+                    return Ok(StreamOutcome::Fallback);
                 }
 
                 let dtype = self.table.store().data_type(p.logical_field_id)?;
                 if matches!(dtype, DataType::Utf8 | DataType::LargeUtf8) {
-                    return Ok(false);
+                    return Ok(StreamOutcome::Fallback);
                 }
                 let field_name = p
                     .alias
@@ -1332,20 +1358,20 @@ where
                     .options(ScanOptions::default())
                     .run(&mut visitor)?;
                 visitor.finish()?;
-                Ok(true)
+                Ok(StreamOutcome::Handled)
             }
             ScanProjection::Computed { expr, alias } => {
                 let simplified = NumericKernels::simplify(expr);
                 let mut fields_set: FxHashSet<FieldId> = FxHashSet::default();
                 NumericKernels::collect_fields(&simplified, &mut fields_set);
                 if fields_set.len() != 1 {
-                    return Ok(false);
+                    return Ok(StreamOutcome::Fallback);
                 }
 
                 let field_id = *fields_set.iter().next().unwrap();
                 let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
                 if !is_full_range_filter(filter_expr, field_id) {
-                    return Ok(false);
+                    return Ok(StreamOutcome::Fallback);
                 }
 
                 if lfid.namespace() != Namespace::UserData {
@@ -1374,7 +1400,7 @@ where
                         .options(ScanOptions::default())
                         .run(&mut visitor)?;
                     visitor.finish()?;
-                    return Ok(true);
+                    return Ok(StreamOutcome::Handled);
                 }
 
                 if let Some(affine) = NumericKernels::extract_affine(&simplified) {
@@ -1384,7 +1410,7 @@ where
                         ));
                     }
                     if !is_supported_numeric(&dtype) {
-                        return Ok(false);
+                        return Ok(StreamOutcome::Fallback);
                     }
                     let schema = Arc::new(Schema::new(vec![Field::new(
                         field_alias.clone(),
@@ -1401,7 +1427,7 @@ where
                         .options(ScanOptions::default())
                         .run(&mut visitor)?;
                     visitor.finish()?;
-                    return Ok(true);
+                    return Ok(StreamOutcome::Handled);
                 }
 
                 let mut numeric_fields: FxHashSet<FieldId> = FxHashSet::default();
@@ -1422,7 +1448,7 @@ where
                     .options(ScanOptions::default())
                     .run(&mut visitor)?;
                 visitor.finish()?;
-                Ok(true)
+                Ok(StreamOutcome::Handled)
             }
         }
     }
@@ -1431,8 +1457,8 @@ where
         &self,
         expr: &Expr<'_, FieldId>,
         fusion_cache: &PredicateFusionCache,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
-    ) -> LlkvResult<Vec<u64>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
+    ) -> LlkvResult<Vec<RowId>> {
         match expr {
             Expr::Pred(filter) => self.collect_row_ids_for_filter(filter),
             Expr::Compare { left, op, right } => {
@@ -1558,7 +1584,7 @@ where
         }
     }
 
-    fn collect_row_ids_for_filter(&self, filter: &Filter<'_, FieldId>) -> LlkvResult<Vec<u64>> {
+    fn collect_row_ids_for_filter(&self, filter: &Filter<'_, FieldId>) -> LlkvResult<Vec<RowId>> {
         if filter.field_id == ROW_ID_FIELD_ID {
             let row_ids = self.collect_row_ids_for_rowid_filter(&filter.op)?;
             tracing::debug!(
@@ -1645,8 +1671,8 @@ where
         left: &ScalarExpr<FieldId>,
         op: CompareOp,
         right: &ScalarExpr<FieldId>,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
-    ) -> LlkvResult<Vec<u64>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
+    ) -> LlkvResult<Vec<RowId>> {
         let mut fields = FxHashSet::default();
         NumericKernels::collect_fields(left, &mut fields);
         NumericKernels::collect_fields(right, &mut fields);
@@ -1655,7 +1681,7 @@ where
                 "Comparison expression must reference at least one column".into(),
             ));
         }
-        let mut domain: Option<Vec<u64>> = None;
+        let mut domain: Option<Vec<RowId>> = None;
         let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
         ordered_fields.sort_unstable();
         for fid in &ordered_fields {
@@ -1679,12 +1705,12 @@ where
 
     fn evaluate_compare_over_rows(
         &self,
-        row_ids: &[u64],
+        row_ids: &[RowId],
         fields: &[FieldId],
         left: &ScalarExpr<FieldId>,
         op: CompareOp,
         right: &ScalarExpr<FieldId>,
-    ) -> LlkvResult<Vec<u64>> {
+    ) -> LlkvResult<Vec<RowId>> {
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -1704,7 +1730,7 @@ where
             Some(store.prepare_gather_context(&lfids)?)
         };
 
-        let mut result = Vec::new();
+        let mut result: Vec<RowId> = Vec::new();
         let mut start = 0usize;
         while start < row_ids.len() {
             let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
@@ -1754,8 +1780,8 @@ where
     fn collect_row_ids_domain(
         &self,
         expr: &Expr<'_, FieldId>,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
-    ) -> LlkvResult<Vec<u64>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
+    ) -> LlkvResult<Vec<RowId>> {
         match expr {
             Expr::Pred(filter) => {
                 self.collect_all_row_ids_for_field(filter.field_id, all_rows_cache)
@@ -1769,7 +1795,7 @@ where
                         "Comparison expression must reference at least one column".into(),
                     ));
                 }
-                let mut domain: Option<Vec<u64>> = None;
+                let mut domain: Option<Vec<RowId>> = None;
                 let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
                 ordered_fields.sort_unstable();
                 for fid in ordered_fields {
@@ -1804,9 +1830,9 @@ where
 
     fn sort_row_ids_with_order(
         &self,
-        mut row_ids: Vec<u64>,
+        mut row_ids: Vec<RowId>,
         order: ScanOrderSpec,
-    ) -> LlkvResult<Vec<u64>> {
+    ) -> LlkvResult<Vec<RowId>> {
         if row_ids.len() <= 1 {
             return Ok(row_ids);
         }
@@ -1857,7 +1883,8 @@ where
                     start = end;
                 }
 
-                let mut indices: Vec<(usize, u64)> = row_ids.iter().copied().enumerate().collect();
+                let mut indices: Vec<(usize, RowId)> =
+                    row_ids.iter().copied().enumerate().collect();
                 debug_assert_eq!(positions.len(), row_ids.len());
                 indices.sort_by(|(ai, arid), (bi, brid)| {
                     let (chunk_a, offset_a) = positions[*ai];
@@ -1922,7 +1949,8 @@ where
                     start = end;
                 }
 
-                let mut indices: Vec<(usize, u64)> = row_ids.iter().copied().enumerate().collect();
+                let mut indices: Vec<(usize, RowId)> =
+                    row_ids.iter().copied().enumerate().collect();
                 debug_assert_eq!(positions.len(), row_ids.len());
                 indices.sort_by(|(ai, arid), (bi, brid)| {
                     let (chunk_a, offset_a) = positions[*ai];
@@ -1988,7 +2016,8 @@ where
                     start = end;
                 }
 
-                let mut indices: Vec<(usize, u64)> = row_ids.iter().copied().enumerate().collect();
+                let mut indices: Vec<(usize, RowId)> =
+                    row_ids.iter().copied().enumerate().collect();
                 debug_assert_eq!(keys.len(), row_ids.len());
                 indices.sort_by(|(ai, arid), (bi, brid)| {
                     let left = keys[*ai];
@@ -2010,8 +2039,8 @@ where
     fn collect_all_row_ids_for_field(
         &self,
         field_id: FieldId,
-        cache: &mut FxHashMap<FieldId, Vec<u64>>,
-    ) -> LlkvResult<Vec<u64>> {
+        cache: &mut FxHashMap<FieldId, Vec<RowId>>,
+    ) -> LlkvResult<Vec<RowId>> {
         if let Some(existing) = cache.get(&field_id) {
             return Ok(existing.clone());
         }
@@ -2033,7 +2062,7 @@ where
         &self,
         field_id: LogicalFieldId,
         op: &Operator<'_>,
-    ) -> LlkvResult<Vec<u64>>
+    ) -> LlkvResult<Vec<RowId>>
     where
         T: FilterPrimitive<Native = <T as ArrowPrimitiveType>::Native> + ArrowPrimitiveType,
         <T as ArrowPrimitiveType>::Native: FromLiteral + Copy + PredicateValue,
@@ -2046,7 +2075,7 @@ where
         &self,
         field_id: LogicalFieldId,
         op: &Operator<'_>,
-    ) -> LlkvResult<Vec<u64>>
+    ) -> LlkvResult<Vec<RowId>>
     where
         O: OffsetSizeTrait + llkv_column_map::store::scan::filter::StringContainsKernel,
     {
@@ -2062,7 +2091,7 @@ where
         &self,
         field_id: LogicalFieldId,
         ops: &[Operator<'_>],
-    ) -> LlkvResult<Vec<u64>>
+    ) -> LlkvResult<Vec<RowId>>
     where
         O: OffsetSizeTrait + llkv_column_map::store::scan::filter::StringContainsKernel,
     {
@@ -2086,7 +2115,7 @@ where
         &self,
         field_id: LogicalFieldId,
         op: &Operator<'_>,
-    ) -> LlkvResult<Vec<u64>> {
+    ) -> LlkvResult<Vec<RowId>> {
         let predicate = build_bool_predicate(op).map_err(Error::predicate_build)?;
         self.table
             .store()
@@ -2097,7 +2126,7 @@ where
         &self,
         field_id: LogicalFieldId,
         ops: &[Operator<'_>],
-    ) -> LlkvResult<Vec<u64>> {
+    ) -> LlkvResult<Vec<RowId>> {
         let mut preds: Vec<llkv_expr::typed_predicate::Predicate<bool>> =
             Vec::with_capacity(ops.len());
         for op in ops {
@@ -2116,7 +2145,7 @@ where
         &self,
         field_id: LogicalFieldId,
         ops: &[Operator<'_>],
-    ) -> LlkvResult<Vec<u64>>
+    ) -> LlkvResult<Vec<RowId>>
     where
         T: FilterPrimitive<Native = <T as ArrowPrimitiveType>::Native> + ArrowPrimitiveType,
         <T as ArrowPrimitiveType>::Native: FromLiteral + Copy + PredicateValue,
@@ -2138,17 +2167,16 @@ where
     }
 }
 
-// TODO: Return `LlkvResult<Vec<RowId>>`
 pub(crate) fn collect_row_ids_for_table<'expr, P>(
     table: &Table<P>,
     filter_expr: &Expr<'expr, FieldId>,
-) -> LlkvResult<Vec<u64>>
+) -> LlkvResult<Vec<RowId>>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     let executor = TableExecutor::new(table);
     let fusion_cache = PredicateFusionCache::from_expr(filter_expr);
-    let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
+    let mut all_rows_cache: FxHashMap<FieldId, Vec<RowId>> = FxHashMap::default();
     executor.collect_row_ids_for_expr(filter_expr, &fusion_cache, &mut all_rows_cache)
 }
 
@@ -2819,7 +2847,7 @@ where
 
 #[derive(Default)]
 struct RowIdScanCollector {
-    row_ids: Vec<u64>,
+    row_ids: Vec<RowId>,
 }
 
 impl RowIdScanCollector {
@@ -2839,7 +2867,7 @@ impl RowIdScanCollector {
         }
     }
 
-    fn into_inner(self) -> Vec<u64> {
+    fn into_inner(self) -> Vec<RowId> {
         self.row_ids
     }
 }
@@ -2870,17 +2898,17 @@ impl llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor for RowIdScanCollec
 
 struct RowIdChunkEmitter<'a, F>
 where
-    F: FnMut(Vec<u64>) -> LlkvResult<()>,
+    F: FnMut(Vec<RowId>) -> LlkvResult<()>,
 {
     chunk_size: usize,
-    buffer: Vec<u64>,
+    buffer: Vec<RowId>,
     on_chunk: &'a mut F,
     error: Option<Error>,
 }
 
 impl<'a, F> RowIdChunkEmitter<'a, F>
 where
-    F: FnMut(Vec<u64>) -> LlkvResult<()>,
+    F: FnMut(Vec<RowId>) -> LlkvResult<()>,
 {
     fn new(chunk_size: usize, on_chunk: &'a mut F) -> Self {
         let chunk_size = cmp::max(1, chunk_size);
@@ -2943,7 +2971,7 @@ where
 
 impl<'a, F> llkv_column_map::scan::PrimitiveVisitor for RowIdChunkEmitter<'a, F>
 where
-    F: FnMut(Vec<u64>) -> LlkvResult<()>,
+    F: FnMut(Vec<RowId>) -> LlkvResult<()>,
 {
     llkv_for_each_arrow_numeric!(impl_row_id_ignore_chunk);
     llkv_for_each_arrow_boolean!(impl_row_id_ignore_chunk);
@@ -2951,7 +2979,7 @@ where
 
 impl<'a, F> llkv_column_map::scan::PrimitiveSortedVisitor for RowIdChunkEmitter<'a, F>
 where
-    F: FnMut(Vec<u64>) -> LlkvResult<()>,
+    F: FnMut(Vec<RowId>) -> LlkvResult<()>,
 {
     llkv_for_each_arrow_numeric!(impl_row_id_ignore_sorted_run);
     llkv_for_each_arrow_boolean!(impl_row_id_ignore_sorted_run);
@@ -2959,7 +2987,7 @@ where
 
 impl<'a, F> llkv_column_map::scan::PrimitiveWithRowIdsVisitor for RowIdChunkEmitter<'a, F>
 where
-    F: FnMut(Vec<u64>) -> LlkvResult<()>,
+    F: FnMut(Vec<RowId>) -> LlkvResult<()>,
 {
     llkv_for_each_arrow_numeric!(impl_row_id_stream_chunk_with_rids);
     llkv_for_each_arrow_boolean!(impl_row_id_stream_chunk_with_rids);
@@ -2967,7 +2995,7 @@ where
 
 impl<'a, F> llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor for RowIdChunkEmitter<'a, F>
 where
-    F: FnMut(Vec<u64>) -> LlkvResult<()>,
+    F: FnMut(Vec<RowId>) -> LlkvResult<()>,
 {
     llkv_for_each_arrow_numeric!(impl_row_id_stream_sorted_run_with_rids);
     llkv_for_each_arrow_boolean!(impl_row_id_stream_sorted_run_with_rids);
@@ -2977,7 +3005,7 @@ where
     }
 }
 
-fn normalize_row_ids(mut row_ids: Vec<u64>) -> Vec<u64> {
+fn normalize_row_ids(mut row_ids: Vec<RowId>) -> Vec<RowId> {
     row_ids.sort_unstable();
     row_ids.dedup();
     row_ids
@@ -2994,7 +3022,7 @@ fn materialize_row_window<P>(
     requires_numeric: bool,
     null_policy: GatherNullPolicy,
     out_schema: &Arc<Schema>,
-    window: &[u64],
+    window: &[RowId],
     mut gather_ctx: Option<&mut MultiGatherContext>,
 ) -> LlkvResult<Option<RecordBatch>>
 where
@@ -3185,7 +3213,7 @@ fn literal_to_u64(lit: &Literal) -> LlkvResult<u64> {
         .map_err(|err| Error::InvalidArgumentError(format!("rowid literal cast failed: {err}")))
 }
 
-fn lower_bound_index(row_ids: &[u64], bound: &Bound<Literal>) -> LlkvResult<usize> {
+fn lower_bound_index(row_ids: &[RowId], bound: &Bound<Literal>) -> LlkvResult<usize> {
     Ok(match bound {
         Bound::Unbounded => 0,
         Bound::Included(lit) => {
@@ -3199,7 +3227,7 @@ fn lower_bound_index(row_ids: &[u64], bound: &Bound<Literal>) -> LlkvResult<usiz
     })
 }
 
-fn upper_bound_index(row_ids: &[u64], bound: &Bound<Literal>) -> LlkvResult<usize> {
+fn upper_bound_index(row_ids: &[RowId], bound: &Bound<Literal>) -> LlkvResult<usize> {
     Ok(match bound {
         Bound::Unbounded => row_ids.len(),
         Bound::Included(lit) => {
@@ -3213,7 +3241,7 @@ fn upper_bound_index(row_ids: &[u64], bound: &Bound<Literal>) -> LlkvResult<usiz
     })
 }
 
-fn filter_row_ids_by_operator(row_ids: &[u64], op: &Operator<'_>) -> LlkvResult<Vec<u64>> {
+fn filter_row_ids_by_operator(row_ids: &[RowId], op: &Operator<'_>) -> LlkvResult<Vec<RowId>> {
     use Operator::*;
 
     match op {
@@ -3284,7 +3312,7 @@ fn filter_row_ids_by_operator(row_ids: &[u64], op: &Operator<'_>) -> LlkvResult<
     }
 }
 
-fn intersect_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
+fn intersect_sorted(left: Vec<RowId>, right: Vec<RowId>) -> Vec<RowId> {
     let mut result = Vec::with_capacity(left.len().min(right.len()));
     let mut i = 0;
     let mut j = 0;
@@ -3304,7 +3332,7 @@ fn intersect_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
     result
 }
 
-fn union_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
+fn union_sorted(left: Vec<RowId>, right: Vec<RowId>) -> Vec<RowId> {
     if left.is_empty() {
         return right;
     }
@@ -3344,7 +3372,7 @@ fn union_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
     result
 }
 
-fn difference_sorted(base: Vec<u64>, subtract: Vec<u64>) -> Vec<u64> {
+fn difference_sorted(base: Vec<RowId>, subtract: Vec<RowId>) -> Vec<RowId> {
     if base.is_empty() || subtract.is_empty() {
         return base;
     }
@@ -3372,7 +3400,7 @@ fn difference_sorted(base: Vec<u64>, subtract: Vec<u64>) -> Vec<u64> {
     result
 }
 
-fn expand_filter_runs(runs: &[FilterRun]) -> Vec<u64> {
+fn expand_filter_runs(runs: &[FilterRun]) -> Vec<RowId> {
     let total: usize = runs.iter().map(|r| r.len).sum();
     let mut row_ids = Vec::with_capacity(total);
     for run in runs {

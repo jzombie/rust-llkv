@@ -31,7 +31,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bitcode::{Decode, Encode};
 
-use crate::types::TableId;
+use crate::types::{RowId, TableId};
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
@@ -264,7 +264,7 @@ where
             return Vec::new();
         }
 
-        let row_ids: Vec<u64> = col_ids.iter().map(|&cid| rid_col(table_id, cid)).collect();
+        let row_ids: Vec<RowId> = col_ids.iter().map(|&cid| rid_col(table_id, cid)).collect();
         let catalog_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_COL_META_ID);
 
         let batch =
@@ -373,7 +373,7 @@ where
         let row_field = rowid_fid(meta_field);
 
         struct RowIdCollector {
-            row_ids: Vec<u64>,
+            row_ids: Vec<RowId>,
         }
 
         impl PrimitiveVisitor for RowIdCollector {
@@ -534,7 +534,7 @@ where
 
         // Collect all row IDs that have table metadata
         struct RowIdCollector {
-            row_ids: Vec<u64>,
+            row_ids: Vec<RowId>,
         }
 
         impl PrimitiveVisitor for RowIdCollector {
@@ -835,7 +835,7 @@ where
 
         // Collect all row IDs that have schema metadata
         struct RowIdCollector {
-            row_ids: Vec<u64>,
+            row_ids: Vec<RowId>,
         }
 
         impl PrimitiveVisitor for RowIdCollector {
@@ -898,7 +898,7 @@ where
 ///
 /// Uses a simple hash to map schema names to row IDs. This is deterministic
 /// and allows direct lookup without scanning.
-fn schema_name_to_row_id(canonical_name: &str) -> u64 {
+fn schema_name_to_row_id(canonical_name: &str) -> RowId {
     // Use a simple 64-bit FNV-1a hash for deterministic IDs across platforms and releases
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x1000_0000_01b3;
@@ -914,7 +914,7 @@ fn schema_name_to_row_id(canonical_name: &str) -> u64 {
 }
 
 struct MaxRowIdCollector {
-    max: Option<u64>,
+    max: Option<RowId>,
 }
 
 impl PrimitiveVisitor for MaxRowIdCollector {

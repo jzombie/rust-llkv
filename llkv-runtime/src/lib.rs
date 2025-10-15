@@ -158,7 +158,7 @@ mod mvcc_columns {
     ///
     /// This creates a minimal RecordBatch for marking rows as deleted.
     pub(crate) fn build_delete_batch(
-        row_ids: Vec<u64>,
+        row_ids: Vec<RowId>,
         deleted_by_txn_id: TxnId,
     ) -> llkv_result::Result<RecordBatch> {
         let row_count = row_ids.len();
@@ -1624,9 +1624,9 @@ where
     fn filter_visible_row_ids(
         &self,
         table: &ExecutorTable<P>,
-        row_ids: Vec<u64>,
+        row_ids: Vec<RowId>,
         snapshot: TransactionSnapshot,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<Vec<RowId>> {
         filter_row_ids_for_snapshot(table.table.as_ref(), row_ids, &self.txn_manager, snapshot)
     }
 
@@ -3946,7 +3946,7 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: String,
-        row_ids: Vec<u64>,
+        row_ids: Vec<RowId>,
         txn_id: TxnId,
     ) -> Result<RuntimeStatementResult<P>> {
         if row_ids.is_empty() {
@@ -3978,7 +3978,7 @@ where
         filter_expr: &LlkvExpr<'static, FieldId>,
         expressions: &[ScalarExpr<FieldId>],
         snapshot: TransactionSnapshot,
-    ) -> Result<(Vec<u64>, Vec<Vec<PlanValue>>)> {
+    ) -> Result<(Vec<RowId>, Vec<Vec<PlanValue>>)> {
         let row_ids = table.table.filter_row_ids(filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         if row_ids.is_empty() {
@@ -4502,10 +4502,10 @@ where
 
 fn filter_row_ids_for_snapshot<P>(
     table: &Table<P>,
-    row_ids: Vec<u64>,
+    row_ids: Vec<RowId>,
     txn_manager: &TxnIdManager,
     snapshot: TransactionSnapshot,
-) -> Result<Vec<u64>>
+) -> Result<Vec<RowId>>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -4673,7 +4673,7 @@ impl<P> RowIdFilter<P> for MvccRowIdFilter<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn filter(&self, table: &Table<P>, row_ids: Vec<u64>) -> Result<Vec<u64>> {
+    fn filter(&self, table: &Table<P>, row_ids: Vec<RowId>) -> Result<Vec<RowId>> {
         tracing::trace!(
             "[MVCC_FILTER] filter() called with row_ids {:?}, snapshot txn={}, snapshot_id={}",
             row_ids,

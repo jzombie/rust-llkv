@@ -2,6 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+use crate::column_stream::ColumnStream;
 use crate::planner::{TablePlanner, collect_row_ids_for_table};
 use crate::types::TableId;
 
@@ -10,16 +11,14 @@ use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 
 use crate::constants::STREAM_BATCH_ROWS;
-use llkv_column_map::store::{
-    GatherNullPolicy, MultiGatherContext, Projection, ROW_ID_COLUMN_NAME,
-};
+use llkv_column_map::store::{GatherNullPolicy, Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{ColumnStore, types::LogicalFieldId};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::reserved::is_reserved_table_id;
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
-use crate::types::FieldId;
+use crate::types::{FieldId, RowId};
 use llkv_expr::{Expr, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 
@@ -65,117 +64,6 @@ where
     mvcc_cache: RwLock<Option<MvccColumnCache>>,
 }
 
-/// Streaming view over a set of row IDs for selected logical fields.
-///
-/// `ColumnStream` keeps a reusable gather context so repeated calls avoid
-/// reparsing column descriptors or re-fetching chunk metadata. Each call to
-/// [`ColumnStream::next_batch`] returns at most `STREAM_BATCH_ROWS` values,
-/// backed by Arrow arrays without copying the column data.
-pub struct ColumnStream<'table, P = MemPager>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    store: &'table ColumnStore<P>,
-    ctx: MultiGatherContext,
-    // TODO: Return `Vec<RowId>`
-    row_ids: Vec<u64>,
-    position: usize,
-    chunk_size: usize,
-    policy: GatherNullPolicy,
-    logical_fields: Arc<[LogicalFieldId]>,
-}
-
-/// Single batch produced by [`ColumnStream`].
-pub struct ColumnStreamBatch<'stream> {
-    start: usize,
-    // TODO: Return `&'stream [RowId]`
-    row_ids: &'stream [u64],
-    batch: RecordBatch,
-}
-
-impl<'table, P> ColumnStream<'table, P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    /// Total number of row IDs covered by this stream.
-    #[inline]
-    pub fn total_rows(&self) -> usize {
-        self.row_ids.len()
-    }
-
-    /// Remaining number of row IDs that have not yet been yielded.
-    #[inline]
-    pub fn remaining_rows(&self) -> usize {
-        self.row_ids.len().saturating_sub(self.position)
-    }
-
-    /// Logical fields produced by this stream.
-    #[inline]
-    pub fn logical_fields(&self) -> &[LogicalFieldId] {
-        &self.logical_fields
-    }
-
-    /// Fetch the next chunk of rows, if any remain.
-    pub fn next_batch(&mut self) -> LlkvResult<Option<ColumnStreamBatch<'_>>> {
-        while self.position < self.row_ids.len() {
-            let start = self.position;
-            let end = (start + self.chunk_size).min(self.row_ids.len());
-            let window = &self.row_ids[start..end];
-
-            let batch =
-                self.store
-                    .gather_rows_with_reusable_context(&mut self.ctx, window, self.policy)?;
-
-            self.position = end;
-
-            if batch.num_rows() == 0 && matches!(self.policy, GatherNullPolicy::DropNulls) {
-                // All rows dropped; continue to the next chunk to avoid yielding empties.
-                continue;
-            }
-
-            return Ok(Some(ColumnStreamBatch {
-                start,
-                row_ids: window,
-                batch,
-            }));
-        }
-
-        Ok(None)
-    }
-}
-
-impl<'stream> ColumnStreamBatch<'stream> {
-    #[inline]
-    pub fn row_ids(&self) -> &'stream [u64] {
-        self.row_ids
-    }
-
-    #[inline]
-    pub fn row_offset(&self) -> usize {
-        self.start
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.row_ids.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.row_ids.is_empty()
-    }
-
-    #[inline]
-    pub fn batch(&self) -> &RecordBatch {
-        &self.batch
-    }
-
-    #[inline]
-    pub fn into_batch(self) -> RecordBatch {
-        self.batch
-    }
-}
-
 /// Filter row IDs before they are materialized into batches.
 ///
 /// This trait allows implementations to enforce transaction visibility (MVCC),
@@ -196,7 +84,7 @@ where
     /// # Errors
     ///
     /// Returns an error if visibility metadata cannot be loaded or is corrupted.
-    fn filter(&self, table: &Table<P>, row_ids: Vec<u64>) -> LlkvResult<Vec<u64>>;
+    fn filter(&self, table: &Table<P>, row_ids: Vec<RowId>) -> LlkvResult<Vec<RowId>>;
 }
 
 /// Options for configuring table scans.
@@ -655,8 +543,7 @@ where
         TablePlanner::new(self).scan_stream_with_exprs(projections, filter_expr, options, on_batch)
     }
 
-    // TODO: Return `LlkvResult<Vec<RowId>>`
-    pub fn filter_row_ids<'a>(&self, filter_expr: &Expr<'a, FieldId>) -> LlkvResult<Vec<u64>> {
+    pub fn filter_row_ids<'a>(&self, filter_expr: &Expr<'a, FieldId>) -> LlkvResult<Vec<RowId>> {
         collect_row_ids_for_table(self, filter_expr)
     }
 
@@ -765,20 +652,19 @@ where
     pub fn stream_columns(
         &self,
         logical_fields: impl Into<Arc<[LogicalFieldId]>>,
-        row_ids: Vec<u64>,
+        row_ids: Vec<RowId>,
         policy: GatherNullPolicy,
     ) -> LlkvResult<ColumnStream<'_, P>> {
         let logical_fields: Arc<[LogicalFieldId]> = logical_fields.into();
         let ctx = self.store.prepare_gather_context(logical_fields.as_ref())?;
-        Ok(ColumnStream {
-            store: &self.store,
+        Ok(ColumnStream::new(
+            &self.store,
             ctx,
             row_ids,
-            position: 0,
-            chunk_size: STREAM_BATCH_ROWS,
+            STREAM_BATCH_ROWS,
             policy,
             logical_fields,
-        })
+        ))
     }
 
     pub fn store(&self) -> &ColumnStore<P> {
@@ -1058,11 +944,11 @@ mod tests {
         let alpha_vals_u32: Vec<u32> = vec![7, 11, 13, 17];
         let alpha_vals_i16: Vec<i16> = vec![-2, 4, -6, 8];
 
-        let beta_rows: Vec<u64> = vec![101, 102, 103];
+        let beta_rows: Vec<RowId> = vec![101, 102, 103];
         let beta_vals_u64: Vec<u64> = vec![900, 901, 902];
         let beta_vals_u8: Vec<u8> = vec![1, 2, 3];
 
-        let gamma_rows: Vec<u64> = vec![501, 502];
+        let gamma_rows: Vec<RowId> = vec![501, 502];
         let gamma_vals_i16: Vec<i16> = vec![123, -321];
 
         // First session: create tables and write data.
