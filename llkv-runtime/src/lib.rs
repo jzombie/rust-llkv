@@ -46,7 +46,7 @@ use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{
     CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME, GatherNullPolicy, IndexKind,
-    MultiGatherContext, ROW_ID_COLUMN_NAME,
+    ROW_ID_COLUMN_NAME,
 };
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
@@ -54,7 +54,6 @@ use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_result::Error;
 use llkv_storage::pager::{MemPager, Pager};
 use llkv_table::catalog::{FieldConstraints, FieldDefinition};
-use llkv_table::constants::STREAM_BATCH_ROWS;
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_table::{CATALOG_TABLE_ID, ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta};
@@ -4533,71 +4532,61 @@ where
     let deleted_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
     let logical_fields: Arc<[LogicalFieldId]> = Arc::from([created_lfid, deleted_lfid]);
 
-    let mut ctx: MultiGatherContext = match table
+    if let Err(err) = table
         .store()
         .prepare_gather_context(logical_fields.as_ref())
     {
-        Ok(ctx) => ctx,
-        Err(Error::NotFound) => {
-            tracing::trace!(
-                "[FILTER_ROWS] MVCC columns not found for table_id={}, treating all {} rows as visible",
-                table_id,
-                row_ids.len()
-            );
-            return Ok(row_ids);
+        match err {
+            Error::NotFound => {
+                tracing::trace!(
+                    "[FILTER_ROWS] MVCC columns not found for table_id={}, treating all rows as visible",
+                    table_id
+                );
+                return Ok(row_ids);
+            }
+            other => {
+                tracing::error!(
+                    "[FILTER_ROWS] Failed to prepare gather context: {:?}",
+                    other
+                );
+                return Err(other);
+            }
         }
+    }
+
+    let total_rows = row_ids.len();
+    let mut stream = match table.stream_columns(
+        Arc::clone(&logical_fields),
+        row_ids,
+        GatherNullPolicy::IncludeNulls,
+    ) {
+        Ok(stream) => stream,
         Err(err) => {
-            tracing::error!("[FILTER_ROWS] Failed to prepare gather context: {:?}", err);
+            tracing::error!("[FILTER_ROWS] stream_columns error: {:?}", err);
             return Err(err);
         }
     };
 
-    let store = table.store();
-    let mut visible = Vec::with_capacity(row_ids.len());
-    let mut offset = 0;
+    let mut visible = Vec::with_capacity(total_rows);
 
-    while offset < row_ids.len() {
-        let end = (offset + STREAM_BATCH_ROWS).min(row_ids.len());
-        let window = &row_ids[offset..end];
-        let version_batch = match store.gather_rows_with_reusable_context(
-            &mut ctx,
-            window,
-            GatherNullPolicy::IncludeNulls,
-        ) {
-            Ok(batch) => batch,
-            Err(Error::NotFound) => {
-                tracing::trace!(
-                    "[FILTER_ROWS] gather_rows_with_reusable_context returned NotFound for MVCC columns (table_id={}), treating all rows in window as visible",
-                    table_id
-                );
-                visible.extend_from_slice(window);
-                offset = end;
-                continue;
-            }
-            Err(err) => {
-                tracing::error!(
-                    "[FILTER_ROWS] gather_rows_with_reusable_context error: {:?}",
-                    err
-                );
-                return Err(err);
-            }
-        };
+    while let Some(chunk) = stream.next_batch()? {
+        let batch = chunk.batch();
+        let window = chunk.row_ids();
 
-        if version_batch.num_columns() < 2 {
+        if batch.num_columns() < 2 {
             tracing::debug!(
                 "[FILTER_ROWS] version_batch has < 2 columns for table_id={}, returning window rows unfiltered",
                 table_id
             );
             visible.extend_from_slice(window);
-            offset = end;
             continue;
         }
 
-        let created_column = version_batch
+        let created_column = batch
             .column(0)
             .as_any()
             .downcast_ref::<UInt64Array>();
-        let deleted_column = version_batch
+        let deleted_column = batch
             .column(1)
             .as_any()
             .downcast_ref::<UInt64Array>();
@@ -4608,7 +4597,6 @@ where
                 table_id
             );
             visible.extend_from_slice(window);
-            offset = end;
             continue;
         }
 
@@ -4643,13 +4631,11 @@ where
                 visible.push(*row_id);
             }
         }
-
-        offset = end;
     }
 
     tracing::debug!(
         "[FILTER_ROWS] Filtered from {} to {} visible rows",
-        row_ids.len(),
+        total_rows,
         visible.len()
     );
     Ok(visible)

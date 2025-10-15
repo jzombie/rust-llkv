@@ -45,6 +45,7 @@ use llkv_storage::pager::Pager;
 
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::scalar_eval::{NumericArrayMap, NumericKernels};
+use crate::schema_ext::CachedSchema;
 use crate::table::{
     ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
 };
@@ -1712,51 +1713,85 @@ where
         }
         let mut numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
         let has_row_id = numeric_fields.remove(&ROW_ID_FIELD_ID);
-        let lfids: Vec<LogicalFieldId> = fields
+
+        let table_id = self.table.table_id();
+        let store = self.table.store();
+
+        let physical_fields: Vec<FieldId> = fields
             .iter()
             .copied()
             .filter(|fid| *fid != ROW_ID_FIELD_ID)
-            .map(|fid| LogicalFieldId::for_user(self.table.table_id(), fid))
             .collect();
 
-        let store = self.table.store();
-        let mut gather_ctx = if lfids.is_empty() {
-            None
-        } else {
-            Some(store.prepare_gather_context(&lfids)?)
-        };
+        let schema = self.table.schema()?;
+        let cached_schema = CachedSchema::new(Arc::clone(&schema));
 
-        let mut result: Vec<RowId> = Vec::new();
-        let mut start = 0usize;
-        while start < row_ids.len() {
-            let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
-            let window = &row_ids[start..end];
+        let mut projection_evals: Vec<ProjectionEval> = Vec::with_capacity(physical_fields.len());
+        let mut output_fields: Vec<Field> = Vec::with_capacity(physical_fields.len());
+        let mut unique_index: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();
 
-            let batch = if let Some(ctx) = gather_ctx.as_mut() {
-                Some(store.gather_rows_with_reusable_context(
-                    ctx,
-                    window,
-                    GatherNullPolicy::IncludeNulls,
-                )?)
+        for (idx, field_id) in physical_fields.iter().copied().enumerate() {
+            let schema_idx = cached_schema.index_of_field_id(field_id).ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "field_id {} missing from table schema",
+                    field_id
+                ))
+            })?;
+            let field = schema.field(schema_idx).clone();
+            let lfid = LogicalFieldId::for_user(table_id, field_id);
+
+            projection_evals.push(ProjectionEval::Column(ColumnProjectionInfo {
+                logical_field_id: lfid,
+                data_type: field.data_type().clone(),
+                output_name: field.name().to_string(),
+            }));
+            output_fields.push(field);
+            unique_index.insert(lfid, idx);
+        }
+
+        let logical_fields: Vec<LogicalFieldId> = physical_fields
+            .iter()
+            .map(|&fid| LogicalFieldId::for_user(table_id, fid))
+            .collect();
+        let logical_fields_for_arrays = logical_fields.clone();
+
+        let requires_numeric = !numeric_fields.is_empty();
+        let numeric_fields_arc = Arc::new(numeric_fields);
+
+        let out_schema = Arc::new(Schema::new(output_fields));
+        let unique_lfids_arc = Arc::new(logical_fields.clone());
+        let projection_evals_arc = Arc::new(projection_evals);
+        let passthrough_fields_arc = Arc::new(vec![None; projection_evals_arc.len()]);
+        let unique_index_arc = Arc::new(unique_index);
+
+        let mut result: Vec<RowId> = Vec::with_capacity(row_ids.len());
+
+        let mut process_chunk = |
+            window: &[RowId],
+            columns: &[ArrayRef],
+        | -> LlkvResult<()> {
+            if window.is_empty() {
+                return Ok(());
+            }
+
+            let mut numeric_arrays: NumericArrayMap = if columns.is_empty() {
+                NumericKernels::prepare_numeric_arrays(&[], &[], numeric_fields_arc.as_ref())?
             } else {
-                None
-            };
-
-            let mut numeric_arrays: NumericArrayMap = if let Some(ref gathered) = batch {
-                if gathered.num_rows() == 0 {
-                    start = end;
-                    continue;
-                }
-                let arrays = gathered.columns();
-                NumericKernels::prepare_numeric_arrays(&lfids, arrays, &numeric_fields)?
-            } else {
-                NumericKernels::prepare_numeric_arrays(&[], &[], &numeric_fields)?
+                NumericKernels::prepare_numeric_arrays(
+                    &logical_fields_for_arrays,
+                    columns,
+                    numeric_fields_arc.as_ref(),
+                )?
             };
 
             if has_row_id {
                 let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
-                numeric_arrays.insert(ROW_ID_FIELD_ID, Arc::new(Float64Array::from(rid_values)));
+                numeric_arrays.insert(
+                    ROW_ID_FIELD_ID,
+                    Arc::new(Float64Array::from(rid_values)),
+                );
             }
+
             for (offset, &row_id) in window.iter().enumerate() {
                 let left_val = NumericKernels::evaluate_value(left, offset, &numeric_arrays)?;
                 let right_val = NumericKernels::evaluate_value(right, offset, &numeric_arrays)?;
@@ -1767,7 +1802,39 @@ where
                 }
             }
 
-            start = end;
+            Ok(())
+        };
+
+        if logical_fields_for_arrays.is_empty() {
+            let mut start = 0usize;
+            while start < row_ids.len() {
+                let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
+                process_chunk(&row_ids[start..end], &[])?;
+                start = end;
+            }
+            return Ok(result);
+        }
+
+        let mut row_stream = RowStreamBuilder::new(
+            store,
+            table_id,
+            Arc::clone(&out_schema),
+            Arc::clone(&unique_lfids_arc),
+            Arc::clone(&projection_evals_arc),
+            Arc::clone(&passthrough_fields_arc),
+            Arc::clone(&unique_index_arc),
+            Arc::clone(&numeric_fields_arc),
+            requires_numeric,
+            GatherNullPolicy::IncludeNulls,
+            row_ids.to_vec(),
+            STREAM_BATCH_ROWS,
+        )
+        .build()?;
+
+        while let Some(chunk) = row_stream.next_chunk()? {
+            let window = chunk.row_ids.values();
+            let batch = chunk.to_record_batch();
+            process_chunk(window, batch.columns())?;
         }
 
         Ok(result)
@@ -1836,29 +1903,60 @@ where
         let lfid = LogicalFieldId::for_user(self.table.table_id(), order.field_id);
         let store = self.table.store();
         let ascending = matches!(order.direction, ScanOrderDirection::Ascending);
+        let schema = self.table.schema()?;
+        let cached_schema = CachedSchema::new(Arc::clone(&schema));
+        let schema_index = cached_schema.index_of_field_id(order.field_id).ok_or_else(|| {
+            Error::InvalidArgumentError(format!(
+                "ORDER BY field {} missing from table schema",
+                order.field_id
+            ))
+        })?;
+        let field = schema.field(schema_index).clone();
+
+        let out_schema = Arc::new(Schema::new(vec![field.clone()]));
+        let projection_evals_arc = Arc::new(vec![ProjectionEval::Column(ColumnProjectionInfo {
+            logical_field_id: lfid,
+            data_type: field.data_type().clone(),
+            output_name: field.name().to_string(),
+        })]);
+        let passthrough_fields_arc = Arc::new(vec![None]);
+        let mut unique_index_map = FxHashMap::default();
+        unique_index_map.insert(lfid, 0usize);
+        let unique_index_arc = Arc::new(unique_index_map);
+        let logical_fields_arc = Arc::new(vec![lfid]);
+        let numeric_fields_arc = Arc::new(FxHashSet::default());
 
         match order.transform {
             ScanOrderTransform::IdentityInteger => {
-                let mut ctx = store.prepare_gather_context(&[lfid])?;
+                let mut row_stream = RowStreamBuilder::new(
+                    store,
+                    self.table.table_id(),
+                    Arc::clone(&out_schema),
+                    Arc::clone(&logical_fields_arc),
+                    Arc::clone(&projection_evals_arc),
+                    Arc::clone(&passthrough_fields_arc),
+                    Arc::clone(&unique_index_arc),
+                    Arc::clone(&numeric_fields_arc),
+                    false,
+                    GatherNullPolicy::IncludeNulls,
+                    row_ids.clone(),
+                    STREAM_BATCH_ROWS,
+                )
+                .build()?;
+
                 let mut chunks: Vec<Int64Array> = Vec::new();
                 let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len());
 
-                let mut start = 0usize;
-                while start < row_ids.len() {
-                    let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
-                    let window = &row_ids[start..end];
-                    let batch = store.gather_rows_with_reusable_context(
-                        &mut ctx,
-                        window,
-                        GatherNullPolicy::IncludeNulls,
-                    )?;
-
-                    if batch.num_columns() != 1 || batch.num_rows() != window.len() {
+                while let Some(chunk) = row_stream.next_chunk()? {
+                    let batch = chunk.to_record_batch();
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    if batch.num_columns() != 1 {
                         return Err(Error::Internal(
                             "ORDER BY gather produced unexpected column count".into(),
                         ));
                     }
-
                     let array = batch
                         .column(0)
                         .as_any()
@@ -1870,18 +1968,22 @@ where
                         })?
                         .clone();
 
+                    let chunk_idx = chunks.len();
+                    let row_count = batch.num_rows();
                     chunks.push(array);
-                    let chunk_idx = chunks.len() - 1;
-                    for offset in 0..window.len() {
+                    for offset in 0..row_count {
                         positions.push((chunk_idx, offset));
                     }
+                }
 
-                    start = end;
+                if positions.len() != row_ids.len() {
+                    return Err(Error::Internal(
+                        "ORDER BY gather produced inconsistent row counts".into(),
+                    ));
                 }
 
                 let mut indices: Vec<(usize, RowId)> =
                     row_ids.iter().copied().enumerate().collect();
-                debug_assert_eq!(positions.len(), row_ids.len());
                 indices.sort_by(|(ai, arid), (bi, brid)| {
                     let (chunk_a, offset_a) = positions[*ai];
                     let (chunk_b, offset_b) = positions[*bi];
@@ -1907,47 +2009,62 @@ where
                 row_ids = indices.into_iter().map(|(_, rid)| rid).collect();
             }
             ScanOrderTransform::IdentityUtf8 => {
-                let mut ctx = store.prepare_gather_context(&[lfid])?;
+                let mut row_stream = RowStreamBuilder::new(
+                    store,
+                    self.table.table_id(),
+                    Arc::clone(&out_schema),
+                    Arc::clone(&logical_fields_arc),
+                    Arc::clone(&projection_evals_arc),
+                    Arc::clone(&passthrough_fields_arc),
+                    Arc::clone(&unique_index_arc),
+                    Arc::clone(&numeric_fields_arc),
+                    false,
+                    GatherNullPolicy::IncludeNulls,
+                    row_ids.clone(),
+                    STREAM_BATCH_ROWS,
+                )
+                .build()?;
+
                 let mut chunks: Vec<StringArray> = Vec::new();
                 let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len());
 
-                let mut start = 0usize;
-                while start < row_ids.len() {
-                    let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
-                    let window = &row_ids[start..end];
-                    let batch = store.gather_rows_with_reusable_context(
-                        &mut ctx,
-                        window,
-                        GatherNullPolicy::IncludeNulls,
-                    )?;
-
-                    if batch.num_columns() != 1 || batch.num_rows() != window.len() {
+                while let Some(chunk) = row_stream.next_chunk()? {
+                    let batch = chunk.to_record_batch();
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    if batch.num_columns() != 1 {
                         return Err(Error::Internal(
                             "ORDER BY gather produced unexpected column count".into(),
                         ));
                     }
-
                     let array = batch
                         .column(0)
                         .as_any()
                         .downcast_ref::<StringArray>()
                         .ok_or_else(|| {
-                            Error::InvalidArgumentError("ORDER BY text expects Utf8 column".into())
+                            Error::InvalidArgumentError(
+                                "ORDER BY text expects Utf8 column".into(),
+                            )
                         })?
                         .clone();
 
+                    let chunk_idx = chunks.len();
+                    let row_count = batch.num_rows();
                     chunks.push(array);
-                    let chunk_idx = chunks.len() - 1;
-                    for offset in 0..window.len() {
+                    for offset in 0..row_count {
                         positions.push((chunk_idx, offset));
                     }
+                }
 
-                    start = end;
+                if positions.len() != row_ids.len() {
+                    return Err(Error::Internal(
+                        "ORDER BY gather produced inconsistent row counts".into(),
+                    ));
                 }
 
                 let mut indices: Vec<(usize, RowId)> =
                     row_ids.iter().copied().enumerate().collect();
-                debug_assert_eq!(positions.len(), row_ids.len());
                 indices.sort_by(|(ai, arid), (bi, brid)| {
                     let (chunk_a, offset_a) = positions[*ai];
                     let (chunk_b, offset_b) = positions[*bi];
@@ -1973,34 +2090,45 @@ where
                 row_ids = indices.into_iter().map(|(_, rid)| rid).collect();
             }
             ScanOrderTransform::CastUtf8ToInteger => {
-                let mut ctx = store.prepare_gather_context(&[lfid])?;
+                let mut row_stream = RowStreamBuilder::new(
+                    store,
+                    self.table.table_id(),
+                    Arc::clone(&out_schema),
+                    Arc::clone(&logical_fields_arc),
+                    Arc::clone(&projection_evals_arc),
+                    Arc::clone(&passthrough_fields_arc),
+                    Arc::clone(&unique_index_arc),
+                    Arc::clone(&numeric_fields_arc),
+                    false,
+                    GatherNullPolicy::IncludeNulls,
+                    row_ids.clone(),
+                    STREAM_BATCH_ROWS,
+                )
+                .build()?;
+
                 let mut keys: Vec<Option<i64>> = Vec::with_capacity(row_ids.len());
 
-                let mut start = 0usize;
-                while start < row_ids.len() {
-                    let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
-                    let window = &row_ids[start..end];
-                    let batch = store.gather_rows_with_reusable_context(
-                        &mut ctx,
-                        window,
-                        GatherNullPolicy::IncludeNulls,
-                    )?;
-
-                    if batch.num_columns() != 1 || batch.num_rows() != window.len() {
+                while let Some(chunk) = row_stream.next_chunk()? {
+                    let batch = chunk.to_record_batch();
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    if batch.num_columns() != 1 {
                         return Err(Error::Internal(
                             "ORDER BY gather produced unexpected column count".into(),
                         ));
                     }
-
                     let array = batch
                         .column(0)
                         .as_any()
                         .downcast_ref::<StringArray>()
                         .ok_or_else(|| {
-                            Error::InvalidArgumentError("ORDER BY CAST expects Utf8 column".into())
+                            Error::InvalidArgumentError(
+                                "ORDER BY CAST expects Utf8 column".into(),
+                            )
                         })?;
 
-                    for offset in 0..window.len() {
+                    for offset in 0..batch.num_rows() {
                         let key = if array.is_null(offset) {
                             None
                         } else {
@@ -2008,13 +2136,16 @@ where
                         };
                         keys.push(key);
                     }
+                }
 
-                    start = end;
+                if keys.len() != row_ids.len() {
+                    return Err(Error::Internal(
+                        "ORDER BY gather produced inconsistent row counts".into(),
+                    ));
                 }
 
                 let mut indices: Vec<(usize, RowId)> =
                     row_ids.iter().copied().enumerate().collect();
-                debug_assert_eq!(keys.len(), row_ids.len());
                 indices.sort_by(|(ai, arid), (bi, brid)| {
                     let left = keys[*ai];
                     let right = keys[*bi];
