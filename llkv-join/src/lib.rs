@@ -104,7 +104,9 @@ pub struct JoinOptions {
     pub join_type: JoinType,
     /// Algorithm to use. Planner may override this based on table sizes.
     pub algorithm: JoinAlgorithm,
-    /// Batch size for output RecordBatches.
+    /// Target number of probe rows per output `RecordBatch`.
+    /// Larger batches reduce per-batch overhead (fewer Arrow gathers) at the
+    /// cost of increased peak memory; smaller batches improve latency.
     pub batch_size: usize,
     /// Memory limit in bytes for hash table (hash join only).
     /// When exceeded, algorithm will partition and spill to disk.
