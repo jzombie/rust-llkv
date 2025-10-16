@@ -3503,7 +3503,7 @@ where
 
             if existing_keys.contains(&key) || !new_keys.insert(key) {
                 return Err(Error::ConstraintError(format!(
-                    "constraint violation on {pk_label} '{}'",
+                    "Duplicate key constraint violation on {pk_label} '{}'",
                     pk_display
                 )));
             }
