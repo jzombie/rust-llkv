@@ -498,6 +498,7 @@ where
                     column,
                     alias,
                     function,
+                    distinct,
                 } => {
                     let col = table_ref.schema.resolve(&column).ok_or_else(|| {
                         Error::InvalidArgumentError(format!(
@@ -506,9 +507,17 @@ where
                         ))
                     })?;
                     let kind = match function {
-                        AggregateFunction::Count => AggregateKind::CountField {
-                            field_id: col.field_id,
-                        },
+                        AggregateFunction::Count => {
+                            if distinct {
+                                AggregateKind::CountDistinctField {
+                                    field_id: col.field_id,
+                                }
+                            } else {
+                                AggregateKind::CountField {
+                                    field_id: col.field_id,
+                                }
+                            }
+                        }
                         AggregateFunction::SumInt64 => {
                             if col.data_type != DataType::Int64 {
                                 return Err(Error::InvalidArgumentError(
@@ -539,9 +548,16 @@ where
                                 field_id: col.field_id,
                             }
                         }
-                        AggregateFunction::CountNulls => AggregateKind::CountNulls {
-                            field_id: col.field_id,
-                        },
+                        AggregateFunction::CountNulls => {
+                            if distinct {
+                                return Err(Error::InvalidArgumentError(
+                                    "DISTINCT is not supported for COUNT_NULLS".into(),
+                                ));
+                            }
+                            AggregateKind::CountNulls {
+                                field_id: col.field_id,
+                            }
+                        }
                     };
                     specs.push(AggregateSpec { alias, kind });
                 }

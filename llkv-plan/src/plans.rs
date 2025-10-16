@@ -471,6 +471,7 @@ pub enum AggregateExpr {
         column: String,
         alias: String,
         function: AggregateFunction,
+        distinct: bool,
     },
 }
 
@@ -496,6 +497,16 @@ impl AggregateExpr {
             column: column.into(),
             alias: alias.into(),
             function: AggregateFunction::Count,
+            distinct: false,
+        }
+    }
+
+    pub fn count_distinct_column(column: impl Into<String>, alias: impl Into<String>) -> Self {
+        Self::Column {
+            column: column.into(),
+            alias: alias.into(),
+            function: AggregateFunction::Count,
+            distinct: true,
         }
     }
 
@@ -504,6 +515,7 @@ impl AggregateExpr {
             column: column.into(),
             alias: alias.into(),
             function: AggregateFunction::SumInt64,
+            distinct: false,
         }
     }
 
@@ -512,6 +524,7 @@ impl AggregateExpr {
             column: column.into(),
             alias: alias.into(),
             function: AggregateFunction::MinInt64,
+            distinct: false,
         }
     }
 
@@ -520,6 +533,7 @@ impl AggregateExpr {
             column: column.into(),
             alias: alias.into(),
             function: AggregateFunction::MaxInt64,
+            distinct: false,
         }
     }
 
@@ -528,6 +542,7 @@ impl AggregateExpr {
             column: column.into(),
             alias: alias.into(),
             function: AggregateFunction::CountNulls,
+            distinct: false,
         }
     }
 }

@@ -2036,12 +2036,15 @@ where
                 ));
             }
 
+            let mut is_distinct = false;
             let args_slice: &[FunctionArg] = match &func.args {
                 FunctionArguments::List(list) => {
-                    if list.duplicate_treatment.is_some() {
-                        return Err(Error::InvalidArgumentError(
-                            "DISTINCT aggregates are not supported".into(),
-                        ));
+                    if let Some(dup) = &list.duplicate_treatment {
+                        use sqlparser::ast::DuplicateTreatment;
+                        match dup {
+                            DuplicateTreatment::All => {}
+                            DuplicateTreatment::Distinct => is_distinct = true,
+                        }
                     }
                     if !list.clauses.is_empty() {
                         return Err(Error::InvalidArgumentError(
@@ -2082,11 +2085,20 @@ where
                     }
                     match &args_slice[0] {
                         FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                            if is_distinct {
+                                return Err(Error::InvalidArgumentError(
+                                    "COUNT(DISTINCT *) is not supported".into(),
+                                ));
+                            }
                             AggregateExpr::count_star(alias)
                         }
                         FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) => {
                             let column = resolve_column_name(arg_expr)?;
-                            AggregateExpr::count_column(column, alias)
+                            if is_distinct {
+                                AggregateExpr::count_distinct_column(column, alias)
+                            } else {
+                                AggregateExpr::count_column(column, alias)
+                            }
                         }
                         FunctionArg::Named { .. } | FunctionArg::ExprNamed { .. } => {
                             return Err(Error::InvalidArgumentError(
@@ -2101,6 +2113,11 @@ where
                     }
                 }
                 "sum" | "min" | "max" => {
+                    if is_distinct {
+                        return Err(Error::InvalidArgumentError(
+                            "DISTINCT is not supported for this aggregate".into(),
+                        ));
+                    }
                     if args_slice.len() != 1 {
                         return Err(Error::InvalidArgumentError(format!(
                             "{} accepts exactly one argument",

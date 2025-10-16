@@ -217,8 +217,10 @@ pub fn expand_loops_with_mapping(
 
             for k in 0..count {
                 let val = (start + k).to_string();
+                let token_plain = format!("${}", var);
+                let token_braced = format!("${{{}}}", var);
                 for (s, &orig_line) in expanded_inner.iter().zip(inner_map.iter()) {
-                    let substituted = s.replace(&format!("${}", var), &val);
+                    let substituted = s.replace(&token_braced, &val).replace(&token_plain, &val);
                     out_lines.push(substituted);
                     out_map.push(orig_line);
                 }
