@@ -182,7 +182,7 @@ mod mvcc_columns {
     }
 }
 
-#[derive(Hash, Eq, PartialEq, Debug)]
+#[derive(Hash, Eq, PartialEq, Debug, Clone)]
 enum UniqueKey {
     Int(i64),
     Float(u64),
@@ -3467,7 +3467,7 @@ where
             let key = Self::build_composite_unique_key(&row_values, &pk_column_names)?;
             let key = key.ok_or_else(|| {
                 Error::ConstraintError(format!(
-                    "PRIMARY KEY {pk_label} '{pk_display}' cannot contain NULL"
+                    "constraint failed: PRIMARY KEY {pk_label} '{pk_display}' cannot contain NULL"
                 ))
             })?;
             existing_keys.insert(key);
@@ -3486,7 +3486,7 @@ where
 
                 if matches!(value, PlanValue::Null) {
                     return Err(Error::ConstraintError(format!(
-                        "PRIMARY KEY column '{}' cannot be NULL",
+                        "constraint failed: PRIMARY KEY column '{}' cannot be NULL",
                         column.name
                     )));
                 }
@@ -3497,7 +3497,7 @@ where
             let key = Self::build_composite_unique_key(&values_for_pk, &pk_column_names)?;
             let key = key.ok_or_else(|| {
                 Error::ConstraintError(format!(
-                    "PRIMARY KEY {pk_label} '{pk_display}' cannot contain NULL"
+                    "constraint failed: PRIMARY KEY {pk_label} '{pk_display}' cannot contain NULL"
                 ))
             })?;
 
@@ -3510,6 +3510,185 @@ where
         }
 
         Ok(())
+    }
+
+    fn validate_primary_keys_for_update(
+        &self,
+        table: &ExecutorTable<P>,
+        display_name: &str,
+        primary_key_indices: &[usize],
+        primary_key_names: &[String],
+        original_keys: &[Option<UniqueKey>],
+        new_rows: &[Vec<PlanValue>],
+        snapshot: TransactionSnapshot,
+    ) -> Result<()> {
+        if primary_key_indices.is_empty() {
+            return Ok(());
+        }
+
+        debug_assert_eq!(original_keys.len(), new_rows.len());
+
+        let pk_field_ids: Vec<FieldId> = primary_key_indices
+            .iter()
+            .map(|&idx| table
+                .schema
+                .columns
+                .get(idx)
+                .expect("primary key column index out of bounds")
+                .field_id)
+            .collect();
+
+        let mut existing_rows = self.scan_multi_column_values(table, &pk_field_ids, snapshot)?;
+        let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
+        for row_values in existing_rows.drain(..) {
+            if let Some(key) = Self::build_composite_unique_key(&row_values, primary_key_names)? {
+                tracing::trace!(table = %display_name, ?key, "existing primary key");
+                existing_keys.insert(key);
+            }
+        }
+
+        for original in original_keys {
+            if let Some(key) = original {
+                tracing::trace!(table = %display_name, ?key, "removing original key");
+                existing_keys.remove(key);
+            }
+        }
+
+        tracing::trace!(
+            table = %display_name,
+            pk_columns = ?primary_key_names,
+            existing_keys = existing_keys.len(),
+            pending_rows = new_rows.len(),
+            "validating primary key uniqueness for update"
+        );
+
+        let pk_label = if primary_key_names.len() == 1 {
+            "column"
+        } else {
+            "columns"
+        };
+        let pk_display = if primary_key_names.len() == 1 {
+            primary_key_names[0].clone()
+        } else {
+            primary_key_names.join(", ")
+        };
+
+        let mut new_seen: FxHashSet<UniqueKey> = FxHashSet::default();
+
+        for row in new_rows {
+            let mut values = Vec::with_capacity(primary_key_indices.len());
+            for &idx in primary_key_indices {
+                values.push(row[idx].clone());
+            }
+
+            let key = Self::build_composite_unique_key(&values, primary_key_names)?;
+            let key = key.ok_or_else(|| {
+                Error::ConstraintError(format!(
+                    "constraint failed: PRIMARY KEY {pk_label} '{pk_display}' cannot contain NULL"
+                ))
+            })?;
+
+            tracing::trace!(table = %display_name, ?key, "validating new primary key");
+
+            if existing_keys.contains(&key) {
+                return Err(Error::ConstraintError(format!(
+                    "Duplicate key constraint violation on {pk_label} '{}'",
+                    pk_display
+                )));
+            }
+
+            if !new_seen.insert(key.clone()) {
+                return Err(Error::ConstraintError(format!(
+                    "Duplicate key constraint violation on {pk_label} '{}'",
+                    pk_display
+                )));
+            }
+
+            existing_keys.insert(key);
+        }
+
+        Ok(())
+    }
+
+    fn coerce_plan_value_for_column(
+        &self,
+        value: PlanValue,
+        column: &ExecutorColumn,
+    ) -> Result<PlanValue> {
+        match value {
+            PlanValue::Null => Ok(PlanValue::Null),
+            PlanValue::Integer(v) => match &column.data_type {
+                DataType::Int64 => Ok(PlanValue::Integer(v)),
+                DataType::Float64 => Ok(PlanValue::Float(v as f64)),
+                DataType::Boolean => Ok(PlanValue::Integer(if v != 0 { 1 } else { 0 })),
+                DataType::Utf8 => Ok(PlanValue::String(v.to_string())),
+                DataType::Date32 => {
+                    let casted = i32::try_from(v).map_err(|_| {
+                        Error::InvalidArgumentError(format!(
+                            "integer literal out of range for DATE column '{}'",
+                            column.name
+                        ))
+                    })?;
+                    Ok(PlanValue::Integer(casted as i64))
+                }
+                DataType::Struct(_) => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign integer to STRUCT column '{}'",
+                    column.name
+                ))),
+                _ => Ok(PlanValue::Integer(v)),
+            },
+            PlanValue::Float(v) => match &column.data_type {
+                DataType::Int64 => Ok(PlanValue::Integer(v as i64)),
+                DataType::Float64 => Ok(PlanValue::Float(v)),
+                DataType::Boolean => Ok(PlanValue::Integer(if v != 0.0 { 1 } else { 0 })),
+                DataType::Utf8 => Ok(PlanValue::String(v.to_string())),
+                DataType::Date32 => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign floating-point value to DATE column '{}'",
+                    column.name
+                ))),
+                DataType::Struct(_) => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign floating-point value to STRUCT column '{}'",
+                    column.name
+                ))),
+                _ => Ok(PlanValue::Float(v)),
+            },
+            PlanValue::String(s) => match &column.data_type {
+                DataType::Boolean => {
+                    let normalized = s.trim().to_ascii_lowercase();
+                    match normalized.as_str() {
+                        "true" | "t" | "1" => Ok(PlanValue::Integer(1)),
+                        "false" | "f" | "0" => Ok(PlanValue::Integer(0)),
+                        _ => Err(Error::InvalidArgumentError(format!(
+                            "cannot assign string '{}' to BOOLEAN column '{}'",
+                            s, column.name
+                        ))),
+                    }
+                }
+                DataType::Utf8 => Ok(PlanValue::String(s)),
+                DataType::Date32 => {
+                    let days = parse_date32_literal(&s)?;
+                    Ok(PlanValue::Integer(days as i64))
+                }
+                DataType::Int64 | DataType::Float64 => Err(Error::InvalidArgumentError(
+                    format!(
+                        "cannot assign string '{}' to numeric column '{}'",
+                        s, column.name
+                    ),
+                )),
+                DataType::Struct(_) => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign string to STRUCT column '{}'",
+                    column.name
+                ))),
+                _ => Ok(PlanValue::String(s)),
+            },
+            PlanValue::Struct(map) => match &column.data_type {
+                DataType::Struct(_) => Ok(PlanValue::Struct(map)),
+                _ => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign struct value to column '{}'",
+                    column.name
+                ))),
+            },
+        }
     }
 
     // TODO: Make streamable; don't buffer all values in memory at once
@@ -3974,6 +4153,39 @@ where
                 .all(|row| row.len() == table.schema.columns.len())
         );
 
+        tracing::trace!(
+            table = %display_name,
+            row_count,
+            rows = ?new_rows,
+            "update_filtered_rows captured source rows"
+        );
+
+        let primary_key_columns: Vec<(usize, &ExecutorColumn)> = table
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.primary_key)
+            .collect();
+        let primary_key_indices: Vec<usize> =
+            primary_key_columns.iter().map(|(idx, _)| *idx).collect();
+        let primary_key_names: Vec<String> = primary_key_columns
+            .iter()
+            .map(|(_, column)| column.name.clone())
+            .collect();
+        let mut original_primary_key_keys: Vec<Option<UniqueKey>> = Vec::new();
+        if !primary_key_indices.is_empty() {
+            original_primary_key_keys.reserve(row_count);
+            for row in &new_rows {
+                let mut values = Vec::with_capacity(primary_key_indices.len());
+                for &idx in &primary_key_indices {
+                    values.push(row[idx].clone());
+                }
+                let key = Self::build_composite_unique_key(&values, &primary_key_names)?;
+                original_primary_key_keys.push(key);
+            }
+        }
+
         let column_positions: FxHashMap<FieldId, usize> = FxHashMap::from_iter(
             table
                 .schema
@@ -4014,9 +4226,22 @@ where
 
             for (row_idx, new_value) in values.into_iter().enumerate() {
                 if let Some(row) = new_rows.get_mut(row_idx) {
-                    row[column_index] = new_value;
+                    let coerced = self.coerce_plan_value_for_column(new_value, &column)?;
+                    row[column_index] = coerced;
                 }
             }
+        }
+
+        if !primary_key_indices.is_empty() {
+            self.validate_primary_keys_for_update(
+                table,
+                &display_name,
+                &primary_key_indices,
+                &primary_key_names,
+                &original_primary_key_keys,
+                &new_rows,
+                snapshot,
+            )?;
         }
 
         let column_names: Vec<String> = table
@@ -4177,6 +4402,32 @@ where
                 .all(|row| row.len() == table.schema.columns.len())
         );
 
+        let primary_key_columns: Vec<(usize, &ExecutorColumn)> = table
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.primary_key)
+            .collect();
+        let primary_key_indices: Vec<usize> =
+            primary_key_columns.iter().map(|(idx, _)| *idx).collect();
+        let primary_key_names: Vec<String> = primary_key_columns
+            .iter()
+            .map(|(_, column)| column.name.clone())
+            .collect();
+        let mut original_primary_key_keys: Vec<Option<UniqueKey>> = Vec::new();
+        if !primary_key_indices.is_empty() {
+            original_primary_key_keys.reserve(row_count);
+            for row in &new_rows {
+                let mut values = Vec::with_capacity(primary_key_indices.len());
+                for &idx in &primary_key_indices {
+                    values.push(row[idx].clone());
+                }
+                let key = Self::build_composite_unique_key(&values, &primary_key_names)?;
+                original_primary_key_keys.push(key);
+            }
+        }
+
         let column_positions: FxHashMap<FieldId, usize> = FxHashMap::from_iter(
             table
                 .schema
@@ -4217,9 +4468,22 @@ where
 
             for (row_idx, new_value) in values.into_iter().enumerate() {
                 if let Some(row) = new_rows.get_mut(row_idx) {
-                    row[column_index] = new_value;
+                    let coerced = self.coerce_plan_value_for_column(new_value, &column)?;
+                    row[column_index] = coerced;
                 }
             }
+        }
+
+        if !primary_key_indices.is_empty() {
+            self.validate_primary_keys_for_update(
+                table,
+                &display_name,
+                &primary_key_indices,
+                &primary_key_names,
+                &original_primary_key_keys,
+                &new_rows,
+                snapshot,
+            )?;
         }
 
         let column_names: Vec<String> = table
