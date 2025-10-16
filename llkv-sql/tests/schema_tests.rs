@@ -105,8 +105,5 @@ fn create_table_with_table_level_primary_key() {
         .execute("INSERT INTO pk_combo VALUES (NULL, 3);")
         .expect_err("primary key NULL should error");
     let err_str = format!("{err}").to_ascii_lowercase();
-    assert!(
-        err_str.contains("null"),
-        "unexpected error: {err_str}"
-    );
+    assert!(err_str.contains("null"), "unexpected error: {err_str}");
 }

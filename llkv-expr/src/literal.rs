@@ -269,7 +269,10 @@ mod tests {
         let lit = Literal::from(true);
         assert_eq!(lit, Literal::Boolean(true));
         assert_eq!(literal_to_native::<bool>(&lit).unwrap(), true);
-        assert_eq!(literal_to_native::<bool>(&Literal::Boolean(false)).unwrap(), false);
+        assert_eq!(
+            literal_to_native::<bool>(&Literal::Boolean(false)).unwrap(),
+            false
+        );
     }
 
     #[test]

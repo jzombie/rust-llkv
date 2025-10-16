@@ -88,8 +88,7 @@ use crate::storage_namespace::{
 pub use llkv_transaction::TransactionKind;
 use llkv_transaction::{
     RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TransactionContext, TransactionManager,
-    TransactionResult, TxnId, TxnIdManager,
-    mvcc::TransactionSnapshot,
+    TransactionResult, TxnId, TxnIdManager, mvcc::TransactionSnapshot,
 };
 
 // Internal low-level transaction session type (from llkv-transaction)
@@ -1266,6 +1265,7 @@ where
     transaction_manager:
         TransactionManager<RuntimeContextWrapper<P>, RuntimeContextWrapper<MemPager>>,
     txn_manager: Arc<TxnIdManager>,
+    txn_tables_with_new_rows: RwLock<FxHashMap<TxnId, FxHashSet<String>>>,
 }
 
 impl<P> RuntimeContext<P>
@@ -1485,6 +1485,7 @@ where
             catalog,
             transaction_manager,
             txn_manager,
+            txn_tables_with_new_rows: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -2033,6 +2034,7 @@ where
             InsertSource::Rows(rows) => self.insert_rows(
                 table.as_ref(),
                 display_name.clone(),
+                canonical_name.clone(),
                 rows,
                 plan.columns,
                 snapshot,
@@ -2040,6 +2042,7 @@ where
             InsertSource::Batches(batches) => self.insert_batches(
                 table.as_ref(),
                 display_name.clone(),
+                canonical_name.clone(),
                 batches,
                 plan.columns,
                 snapshot,
@@ -2217,17 +2220,30 @@ where
         plan: UpdatePlan,
         snapshot: TransactionSnapshot,
     ) -> Result<RuntimeStatementResult<P>> {
-        let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
+        let UpdatePlan {
+            table,
+            assignments,
+            filter,
+        } = plan;
+        let (display_name, canonical_name) = canonical_table_name(&table)?;
         let table = self.lookup_table(&canonical_name)?;
-        match plan.filter {
-            Some(filter) => self.update_filtered_rows(
+        if let Some(filter) = filter {
+            self.update_filtered_rows(
                 table.as_ref(),
                 display_name,
-                plan.assignments,
+                canonical_name,
+                assignments,
                 filter,
                 snapshot,
-            ),
-            None => self.update_all_rows(table.as_ref(), display_name, plan.assignments, snapshot),
+            )
+        } else {
+            self.update_all_rows(
+                table.as_ref(),
+                display_name,
+                canonical_name,
+                assignments,
+                snapshot,
+            )
         }
     }
 
@@ -2257,12 +2273,9 @@ where
             None => return Err(Error::NotFound),
         };
         match plan.filter {
-            Some(filter) => self.delete_filtered_rows(
-                table.as_ref(),
-                display_name,
-                filter,
-                snapshot,
-            ),
+            Some(filter) => {
+                self.delete_filtered_rows(table.as_ref(), display_name, filter, snapshot)
+            }
             None => self.delete_all_rows(table.as_ref(), display_name, snapshot),
         }
     }
@@ -3420,6 +3433,7 @@ where
     fn check_primary_key_constraints(
         &self,
         table: &ExecutorTable<P>,
+        _canonical_name: &str,
         rows: &[Vec<PlanValue>],
         column_order: &[usize],
         snapshot: TransactionSnapshot,
@@ -3512,6 +3526,163 @@ where
         Ok(())
     }
 
+    fn record_table_with_new_rows(&self, txn_id: TxnId, canonical_name: String) {
+        if txn_id == TXN_ID_AUTO_COMMIT {
+            return;
+        }
+
+        let mut guard = self.txn_tables_with_new_rows.write().unwrap();
+        guard
+            .entry(txn_id)
+            .or_insert_with(FxHashSet::default)
+            .insert(canonical_name);
+    }
+
+    fn collect_rows_created_by_txn(
+        &self,
+        table: &ExecutorTable<P>,
+        txn_id: TxnId,
+    ) -> Result<Vec<Vec<PlanValue>>> {
+        if txn_id == TXN_ID_AUTO_COMMIT {
+            return Ok(Vec::new());
+        }
+
+        if table.schema.columns.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let Some(first_field_id) = table.schema.first_field_id() else {
+            return Ok(Vec::new());
+        };
+        let filter_expr = full_table_scan_filter(first_field_id);
+
+        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        if row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table_id = table.table.table_id();
+        let mut logical_fields: Vec<LogicalFieldId> =
+            Vec::with_capacity(table.schema.columns.len() + 2);
+        logical_fields.push(LogicalFieldId::for_mvcc_created_by(table_id));
+        logical_fields.push(LogicalFieldId::for_mvcc_deleted_by(table_id));
+        for column in &table.schema.columns {
+            logical_fields.push(LogicalFieldId::for_user(table_id, column.field_id));
+        }
+
+        let logical_fields: Arc<[LogicalFieldId]> = logical_fields.into();
+        let mut stream = table.table.stream_columns(
+            Arc::clone(&logical_fields),
+            row_ids,
+            GatherNullPolicy::IncludeNulls,
+        )?;
+
+        let mut rows = Vec::new();
+        while let Some(chunk) = stream.next_batch()? {
+            let batch = chunk.batch();
+            if batch.num_columns() < table.schema.columns.len() + 2 {
+                continue;
+            }
+
+            let created_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("missing created_by column in MVCC data".into()))?;
+            let deleted_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("missing deleted_by column in MVCC data".into()))?;
+
+            for row_idx in 0..batch.num_rows() {
+                let created_by = if created_col.is_null(row_idx) {
+                    TXN_ID_AUTO_COMMIT
+                } else {
+                    created_col.value(row_idx)
+                };
+                if created_by != txn_id {
+                    continue;
+                }
+
+                let deleted_by = if deleted_col.is_null(row_idx) {
+                    TXN_ID_NONE
+                } else {
+                    deleted_col.value(row_idx)
+                };
+                if deleted_by != TXN_ID_NONE {
+                    continue;
+                }
+
+                let mut row_values = Vec::with_capacity(table.schema.columns.len());
+                for col_idx in 0..table.schema.columns.len() {
+                    let array = batch.column(col_idx + 2);
+                    let value = llkv_plan::plan_value_from_array(array, row_idx)?;
+                    row_values.push(value);
+                }
+                rows.push(row_values);
+            }
+        }
+
+        Ok(rows)
+    }
+
+    fn validate_primary_keys_for_commit(&self, txn_id: TxnId) -> Result<()> {
+        if txn_id == TXN_ID_AUTO_COMMIT {
+            return Ok(());
+        }
+
+        let tables = {
+            let mut guard = self.txn_tables_with_new_rows.write().unwrap();
+            guard.remove(&txn_id)
+        };
+
+        let Some(tables) = tables else {
+            return Ok(());
+        };
+
+        if tables.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot = TransactionSnapshot {
+            txn_id: TXN_ID_AUTO_COMMIT,
+            snapshot_id: self.txn_manager.last_committed(),
+        };
+
+        for table_name in tables {
+            let table = self.lookup_table(&table_name)?;
+            if !table.schema.columns.iter().any(|column| column.primary_key) {
+                continue;
+            }
+
+            let new_rows = self.collect_rows_created_by_txn(table.as_ref(), txn_id)?;
+            if new_rows.is_empty() {
+                continue;
+            }
+
+            let column_order: Vec<usize> = (0..table.schema.columns.len()).collect();
+            self.check_primary_key_constraints(
+                table.as_ref(),
+                table_name.as_str(),
+                &new_rows,
+                &column_order,
+                snapshot,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn clear_transaction_state(&self, txn_id: TxnId) {
+        if txn_id == TXN_ID_AUTO_COMMIT {
+            return;
+        }
+
+        let mut guard = self.txn_tables_with_new_rows.write().unwrap();
+        guard.remove(&txn_id);
+    }
+
     fn validate_primary_keys_for_update(
         &self,
         table: &ExecutorTable<P>,
@@ -3530,12 +3701,14 @@ where
 
         let pk_field_ids: Vec<FieldId> = primary_key_indices
             .iter()
-            .map(|&idx| table
-                .schema
-                .columns
-                .get(idx)
-                .expect("primary key column index out of bounds")
-                .field_id)
+            .map(|&idx| {
+                table
+                    .schema
+                    .columns
+                    .get(idx)
+                    .expect("primary key column index out of bounds")
+                    .field_id
+            })
             .collect();
 
         let mut existing_rows = self.scan_multi_column_values(table, &pk_field_ids, snapshot)?;
@@ -3669,12 +3842,10 @@ where
                     let days = parse_date32_literal(&s)?;
                     Ok(PlanValue::Integer(days as i64))
                 }
-                DataType::Int64 | DataType::Float64 => Err(Error::InvalidArgumentError(
-                    format!(
-                        "cannot assign string '{}' to numeric column '{}'",
-                        s, column.name
-                    ),
-                )),
+                DataType::Int64 | DataType::Float64 => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign string '{}' to numeric column '{}'",
+                    s, column.name
+                ))),
                 DataType::Struct(_) => Err(Error::InvalidArgumentError(format!(
                     "cannot assign string to STRUCT column '{}'",
                     column.name
@@ -3885,6 +4056,7 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: String,
+        canonical_name: String,
         rows: Vec<Vec<PlanValue>>,
         columns: Vec<String>,
         snapshot: TransactionSnapshot,
@@ -3923,8 +4095,13 @@ where
             }
         }
 
-        let constraint_result =
-            self.check_primary_key_constraints(table, &rows, &column_order, snapshot);
+        let constraint_result = self.check_primary_key_constraints(
+            table,
+            canonical_name.as_str(),
+            &rows,
+            &column_order,
+            snapshot,
+        );
 
         if display_name == "keys" {
             match &constraint_result {
@@ -3980,6 +4157,8 @@ where
             .total_rows
             .fetch_add(row_count as u64, Ordering::SeqCst);
 
+        self.record_table_with_new_rows(snapshot.txn_id, canonical_name);
+
         Ok(RuntimeStatementResult::Insert {
             table_name: display_name,
             rows_inserted: row_count,
@@ -3990,6 +4169,7 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: String,
+        canonical_name: String,
         batches: Vec<RecordBatch>,
         columns: Vec<String>,
         snapshot: TransactionSnapshot,
@@ -4030,7 +4210,14 @@ where
                 rows.push(row);
             }
 
-            match self.insert_rows(table, display_name.clone(), rows, columns.clone(), snapshot)? {
+            match self.insert_rows(
+                table,
+                display_name.clone(),
+                canonical_name.clone(),
+                rows,
+                columns.clone(),
+                snapshot,
+            )? {
                 RuntimeStatementResult::Insert { rows_inserted, .. } => {
                     total_rows_inserted += rows_inserted;
                 }
@@ -4048,6 +4235,7 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: String,
+        canonical_name: String,
         assignments: Vec<ColumnAssignment>,
         filter: LlkvExpr<'static, String>,
         snapshot: TransactionSnapshot,
@@ -4254,16 +4442,12 @@ where
         self.check_not_null_constraints(table, &new_rows, &column_order)?;
         self.check_check_constraints(table, &new_rows, &column_order)?;
 
-        let _ = self.apply_delete(
-            table,
-            display_name.clone(),
-            row_ids.clone(),
-            snapshot,
-        )?;
+        let _ = self.apply_delete(table, display_name.clone(), row_ids.clone(), snapshot)?;
 
         let _ = self.insert_rows(
             table,
             display_name.clone(),
+            canonical_name,
             new_rows,
             column_names,
             snapshot,
@@ -4279,6 +4463,7 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: String,
+        canonical_name: String,
         assignments: Vec<ColumnAssignment>,
         snapshot: TransactionSnapshot,
     ) -> Result<RuntimeStatementResult<P>> {
@@ -4496,16 +4681,12 @@ where
         self.check_not_null_constraints(table, &new_rows, &column_order)?;
         self.check_check_constraints(table, &new_rows, &column_order)?;
 
-        let _ = self.apply_delete(
-            table,
-            display_name.clone(),
-            row_ids.clone(),
-            snapshot,
-        )?;
+        let _ = self.apply_delete(table, display_name.clone(), row_ids.clone(), snapshot)?;
 
         let _ = self.insert_rows(
             table,
             display_name.clone(),
+            canonical_name,
             new_rows,
             column_names,
             snapshot,
@@ -4663,10 +4844,7 @@ where
 
                 return Err(Error::TransactionContextError(format!(
                     "transaction conflict on table '{}' for row {}: row locked by transaction {} ({:?})",
-                    display_name,
-                    row_id,
-                    deleted_by,
-                    status
+                    display_name, row_id, deleted_by, status
                 )));
             }
         }
@@ -5173,6 +5351,14 @@ where
     fn catalog_snapshot(&self) -> llkv_table::catalog::TableCatalogSnapshot {
         let ctx = self.context();
         ctx.catalog.snapshot()
+    }
+
+    fn validate_commit_constraints(&self, txn_id: TxnId) -> llkv_result::Result<()> {
+        self.ctx.validate_primary_keys_for_commit(txn_id)
+    }
+
+    fn clear_transaction_state(&self, txn_id: TxnId) {
+        self.ctx.clear_transaction_state(txn_id);
     }
 }
 

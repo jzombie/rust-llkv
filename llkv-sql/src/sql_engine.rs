@@ -3325,9 +3325,9 @@ fn literal_from_value(value: &ValueWithSpan) -> SqlResult<llkv_expr::expr::Scala
                 )))
             }
         }
-        Value::Boolean(value) => Ok(llkv_expr::expr::ScalarExpr::literal(
-            Literal::Boolean(*value),
-        )),
+        Value::Boolean(value) => Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Boolean(
+            *value,
+        ))),
         Value::Null => Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Null)),
         other => {
             if let Some(text) = other.clone().into_string() {

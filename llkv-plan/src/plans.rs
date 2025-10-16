@@ -543,9 +543,7 @@ pub fn plan_value_from_array(array: &ArrayRef, index: usize) -> PlanResult<PlanV
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "expected Boolean array in INSERT SELECT".into(),
-                    )
+                    Error::InvalidArgumentError("expected Boolean array in INSERT SELECT".into())
                 })?;
             Ok(PlanValue::Integer(if values.value(index) { 1 } else { 0 }))
         }

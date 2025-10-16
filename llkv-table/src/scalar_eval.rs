@@ -229,7 +229,11 @@ impl NumericKernels {
                     Ok(Some(VectorizedExpr::Scalar(Some(*i as f64))))
                 }
                 llkv_expr::literal::Literal::Boolean(b) => {
-                    Ok(Some(VectorizedExpr::Scalar(Some(if *b { 1.0 } else { 0.0 }))))
+                    Ok(Some(VectorizedExpr::Scalar(Some(if *b {
+                        1.0
+                    } else {
+                        0.0
+                    }))))
                 }
                 llkv_expr::literal::Literal::String(_) => Ok(None),
                 llkv_expr::literal::Literal::Struct(_) => Ok(None),
