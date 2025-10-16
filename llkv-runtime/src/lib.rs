@@ -71,9 +71,10 @@ pub type Result<T> = llkv_result::Result<T>;
 // Re-export plan structures from llkv-plan
 pub use llkv_plan::{
     AggregateExpr, AggregateFunction, AssignmentValue, ColumnAssignment, ColumnNullability,
-    ColumnSpec, CreateIndexPlan, CreateTablePlan, CreateTableSource, DeletePlan, IndexColumnPlan,
-    InsertPlan, InsertSource, IntoColumnSpec, NotNull, Nullable, OrderByPlan, OrderSortType,
-    OrderTarget, PlanOperation, PlanStatement, PlanValue, SelectPlan, SelectProjection, UpdatePlan,
+    ColumnSpec, CreateIndexPlan, CreateTablePlan, CreateTableSource, DeletePlan, ForeignKeyAction,
+    ForeignKeySpec, IndexColumnPlan, InsertPlan, InsertSource, IntoColumnSpec, NotNull, Nullable,
+    OrderByPlan, OrderSortType, OrderTarget, PlanOperation, PlanStatement, PlanValue, SelectPlan,
+    SelectProjection, UpdatePlan,
 };
 
 // Execution structures from llkv-executor
@@ -193,6 +194,55 @@ enum UniqueKey {
 struct StoredMultiColumnUnique {
     index_name: Option<String>,
     field_ids: Vec<FieldId>,
+}
+
+#[derive(Clone, Debug)]
+struct ForeignKeyMetadata {
+    constraint_name: Option<String>,
+    referencing_display: String,
+    referencing_column_indices: Vec<usize>,
+    referencing_field_ids: Vec<FieldId>,
+    referencing_column_names: Vec<String>,
+    referenced_table: String,
+    referenced_display: String,
+    referenced_field_ids: Vec<FieldId>,
+    referenced_column_names: Vec<String>,
+    on_delete: ForeignKeyAction,
+    _on_update: ForeignKeyAction,
+}
+
+#[derive(Default)]
+struct ForeignKeyRegistry {
+    by_child: FxHashMap<String, Vec<ForeignKeyMetadata>>,
+}
+
+impl ForeignKeyRegistry {
+    fn add(&mut self, child: String, metadata: ForeignKeyMetadata) {
+        self.by_child.entry(child).or_default().push(metadata);
+    }
+
+    fn child_constraints(&self, child: &str) -> Vec<ForeignKeyMetadata> {
+        self.by_child.get(child).cloned().unwrap_or_default()
+    }
+
+    fn referencing_constraints(&self, parent: &str) -> Vec<(String, ForeignKeyMetadata)> {
+        let mut out = Vec::new();
+        for (child, metas) in &self.by_child {
+            for meta in metas {
+                if meta.referenced_table == parent {
+                    out.push((child.clone(), meta.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    fn remove_table(&mut self, canonical: &str) {
+        self.by_child.remove(canonical);
+        for metas in self.by_child.values_mut() {
+            metas.retain(|meta| meta.referenced_table != canonical);
+        }
+    }
 }
 
 /// Result of running a plan statement.
@@ -1259,6 +1309,7 @@ where
     tables: RwLock<FxHashMap<String, Arc<ExecutorTable<P>>>>,
     dropped_tables: RwLock<FxHashSet<String>>,
     multi_column_uniques: RwLock<FxHashMap<String, Vec<StoredMultiColumnUnique>>>,
+    foreign_keys: RwLock<ForeignKeyRegistry>,
     // Centralized catalog for table/field name resolution
     catalog: Arc<TableCatalog>,
     // Transaction manager for session-based transactions
@@ -1482,6 +1533,7 @@ where
             tables: RwLock::new(FxHashMap::default()), // Start with empty table cache
             dropped_tables: RwLock::new(FxHashSet::default()),
             multi_column_uniques: RwLock::new(persisted_multi),
+            foreign_keys: RwLock::new(ForeignKeyRegistry::default()),
             catalog,
             transaction_manager,
             txn_manager,
@@ -1637,13 +1689,23 @@ where
         }
 
         let (display_name, canonical_name) = canonical_table_name(&plan.name)?;
+        let CreateTablePlan {
+            name: _,
+            if_not_exists,
+            or_replace,
+            columns,
+            source,
+            namespace: _,
+            foreign_keys,
+        } = plan;
+
         tracing::trace!(
             "DEBUG create_table_plan: table='{}' if_not_exists={} columns={}",
             display_name,
-            plan.if_not_exists,
-            plan.columns.len()
+            if_not_exists,
+            columns.len()
         );
-        for (idx, col) in plan.columns.iter().enumerate() {
+        for (idx, col) in columns.iter().enumerate() {
             tracing::trace!(
                 "  plan column[{}]: name='{}' primary_key={}",
                 idx,
@@ -1679,7 +1741,7 @@ where
         }
 
         if exists {
-            if plan.or_replace {
+            if or_replace {
                 tracing::trace!(
                     "DEBUG create_table_plan: table '{}' exists and or_replace=true, removing existing table before recreation",
                     display_name
@@ -1689,7 +1751,7 @@ where
                     .write()
                     .unwrap()
                     .remove(&canonical_name);
-            } else if plan.if_not_exists {
+            } else if if_not_exists {
                 tracing::trace!(
                     "DEBUG create_table_plan: table '{}' exists and if_not_exists=true, returning early WITHOUT creating",
                     display_name
@@ -1705,13 +1767,13 @@ where
             }
         }
 
-        match plan.source {
+        match source {
             Some(CreateTableSource::Batches { schema, batches }) => self.create_table_from_batches(
                 display_name,
                 canonical_name,
                 schema,
                 batches,
-                plan.if_not_exists,
+                if_not_exists,
             ),
             Some(CreateTableSource::Select { .. }) => Err(Error::Internal(
                 "CreateTableSource::Select should be materialized before reaching RuntimeContext::create_table_plan"
@@ -1720,8 +1782,9 @@ where
             None => self.create_table_from_columns(
                 display_name,
                 canonical_name,
-                plan.columns,
-                plan.if_not_exists,
+                columns,
+                foreign_keys,
+                if_not_exists,
             ),
         }
     }
@@ -2273,10 +2336,14 @@ where
             None => return Err(Error::NotFound),
         };
         match plan.filter {
-            Some(filter) => {
-                self.delete_filtered_rows(table.as_ref(), display_name, filter, snapshot)
-            }
-            None => self.delete_all_rows(table.as_ref(), display_name, snapshot),
+            Some(filter) => self.delete_filtered_rows(
+                table.as_ref(),
+                display_name,
+                canonical_name.clone(),
+                filter,
+                snapshot,
+            ),
+            None => self.delete_all_rows(table.as_ref(), display_name, canonical_name, snapshot),
         }
     }
 
@@ -2346,6 +2413,7 @@ where
         display_name: String,
         canonical_name: String,
         columns: Vec<ColumnSpec>,
+        foreign_keys: Vec<ForeignKeySpec>,
         if_not_exists: bool,
     ) -> Result<RuntimeStatementResult<P>> {
         tracing::trace!(
@@ -2499,9 +2567,180 @@ where
             );
         }
 
+        if !foreign_keys.is_empty() {
+            self.register_foreign_keys_for_table(
+                &display_name,
+                &canonical_name,
+                &column_defs,
+                foreign_keys,
+            )?;
+        }
+
         Ok(RuntimeStatementResult::CreateTable {
             table_name: display_name,
         })
+    }
+
+    fn register_foreign_keys_for_table(
+        &self,
+        display_name: &str,
+        canonical_name: &str,
+        column_defs: &[ExecutorColumn],
+        foreign_keys: Vec<ForeignKeySpec>,
+    ) -> Result<()> {
+        if foreign_keys.is_empty() {
+            return Ok(());
+        }
+
+        let mut metadata_entries = Vec::with_capacity(foreign_keys.len());
+        for spec in foreign_keys {
+            if spec.columns.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "FOREIGN KEY requires at least one referencing column".into(),
+                ));
+            }
+
+            if spec.referenced_columns.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "FOREIGN KEY requires at least one referenced column".into(),
+                ));
+            }
+
+            if spec.columns.len() != spec.referenced_columns.len() {
+                return Err(Error::InvalidArgumentError(
+                    "FOREIGN KEY must reference the same number of columns".into(),
+                ));
+            }
+
+            let mut seen_referencing = FxHashSet::default();
+            for column_name in &spec.columns {
+                let normalized = column_name.to_ascii_lowercase();
+                if !seen_referencing.insert(normalized.clone()) {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "duplicate column '{}' in FOREIGN KEY constraint",
+                        column_name
+                    )));
+                }
+
+                if !column_defs
+                    .iter()
+                    .any(|col| col.name.eq_ignore_ascii_case(column_name))
+                {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unknown column '{}' in FOREIGN KEY constraint on table '{}'",
+                        column_name, display_name
+                    )));
+                }
+            }
+
+            let mut seen_referenced = FxHashSet::default();
+            for column_name in &spec.referenced_columns {
+                let normalized = column_name.to_ascii_lowercase();
+                if !seen_referenced.insert(normalized.clone()) {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "duplicate referenced column '{}' in FOREIGN KEY constraint",
+                        column_name
+                    )));
+                }
+            }
+
+            let mut referencing_indices = Vec::with_capacity(spec.columns.len());
+            let mut referencing_field_ids = Vec::with_capacity(spec.columns.len());
+            let mut referencing_column_names = Vec::with_capacity(spec.columns.len());
+            for column_name in &spec.columns {
+                let (idx, column) = column_defs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, col)| col.name.eq_ignore_ascii_case(column_name))
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!(
+                            "unknown column '{}' in FOREIGN KEY constraint",
+                            column_name
+                        ))
+                    })?;
+                referencing_indices.push(idx);
+                referencing_field_ids.push(column.field_id);
+                referencing_column_names.push(column.name.clone());
+            }
+
+            let (referenced_display, referenced_canonical) =
+                canonical_table_name(&spec.referenced_table)?;
+            let referenced_table = self.lookup_table(&referenced_canonical)?;
+
+            let mut referenced_field_ids = Vec::with_capacity(spec.referenced_columns.len());
+            let mut referenced_column_names = Vec::with_capacity(spec.referenced_columns.len());
+            for column_name in &spec.referenced_columns {
+                let column = referenced_table
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|col| col.name.eq_ignore_ascii_case(column_name))
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!(
+                            "unknown referenced column '{}' in table '{}'",
+                            column_name, referenced_display
+                        ))
+                    })?;
+
+                if !column.primary_key && !column.unique {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "FOREIGN KEY references column '{}' in table '{}' that is not UNIQUE or PRIMARY KEY",
+                        column_name, referenced_display
+                    )));
+                }
+
+                referenced_field_ids.push(column.field_id);
+                referenced_column_names.push(column.name.clone());
+            }
+
+            for (&child_idx, &parent_field_id) in
+                referencing_indices.iter().zip(&referenced_field_ids)
+            {
+                let child_col = &column_defs[child_idx];
+                let parent_col = referenced_table
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|col| col.field_id == parent_field_id)
+                    .expect("referenced column field id must exist");
+
+                if child_col.data_type != parent_col.data_type {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "FOREIGN KEY column '{}' type {:?} does not match referenced column '{}' type {:?}",
+                        child_col.name, child_col.data_type, parent_col.name, parent_col.data_type
+                    )));
+                }
+
+                if child_col.nullable && !parent_col.nullable {
+                    // allowed; child nullable referencing non-null parent is okay
+                }
+            }
+
+            metadata_entries.push(ForeignKeyMetadata {
+                constraint_name: spec.name.clone(),
+                referencing_display: display_name.to_string(),
+                referencing_column_indices: referencing_indices,
+                referencing_field_ids,
+                referencing_column_names,
+                referenced_table: referenced_canonical,
+                referenced_display,
+                referenced_field_ids,
+                referenced_column_names,
+                on_delete: spec.on_delete.clone(),
+                _on_update: spec.on_update.clone(),
+            });
+        }
+
+        if metadata_entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut registry = self.foreign_keys.write().unwrap();
+        for entry in metadata_entries {
+            registry.add(canonical_name.to_string(), entry);
+        }
+
+        Ok(())
     }
 
     fn create_table_from_batches(
@@ -4020,6 +4259,117 @@ where
         Ok(rows)
     }
 
+    fn collect_row_values_for_ids(
+        &self,
+        table: &ExecutorTable<P>,
+        row_ids: &[RowId],
+        field_ids: &[FieldId],
+    ) -> Result<Vec<Vec<PlanValue>>> {
+        if row_ids.is_empty() || field_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table_id = table.table.table_id();
+        let logical_field_ids: Vec<LogicalFieldId> = field_ids
+            .iter()
+            .map(|&fid| LogicalFieldId::for_user(table_id, fid))
+            .collect();
+
+        let mut stream = match table.table.stream_columns(
+            logical_field_ids.clone(),
+            row_ids.to_vec(),
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(stream) => stream,
+            Err(Error::NotFound) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let mut rows = vec![Vec::with_capacity(field_ids.len()); row_ids.len()];
+        while let Some(chunk) = stream.next_batch()? {
+            let batch = chunk.batch();
+            let base = chunk.row_offset();
+            let local_len = batch.num_rows();
+            for col_idx in 0..batch.num_columns() {
+                let array = batch.column(col_idx);
+                for local_idx in 0..local_len {
+                    let target_index = base + local_idx;
+                    if let Some(row) = rows.get_mut(target_index) {
+                        let value = llkv_plan::plan_value_from_array(array, local_idx)?;
+                        row.push(value);
+                    }
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+
+    fn collect_visible_child_rows(
+        &self,
+        table: &ExecutorTable<P>,
+        field_ids: &[FieldId],
+        snapshot: TransactionSnapshot,
+    ) -> Result<Vec<(RowId, Vec<PlanValue>)>> {
+        if field_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let anchor_field = field_ids[0];
+        let filter_expr = full_table_scan_filter(anchor_field);
+        let raw_row_ids = match table.table.filter_row_ids(&filter_expr) {
+            Ok(ids) => ids,
+            Err(Error::NotFound) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let visible_row_ids = filter_row_ids_for_snapshot(
+            table.table.as_ref(),
+            raw_row_ids,
+            &self.txn_manager,
+            snapshot,
+        )?;
+
+        if visible_row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table_id = table.table.table_id();
+        let logical_field_ids: Vec<LogicalFieldId> = field_ids
+            .iter()
+            .map(|&fid| LogicalFieldId::for_user(table_id, fid))
+            .collect();
+
+        let mut stream = match table.table.stream_columns(
+            logical_field_ids.clone(),
+            visible_row_ids.clone(),
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(stream) => stream,
+            Err(Error::NotFound) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let mut rows = vec![Vec::with_capacity(field_ids.len()); visible_row_ids.len()];
+        while let Some(chunk) = stream.next_batch()? {
+            let batch = chunk.batch();
+            let base = chunk.row_offset();
+            let local_len = batch.num_rows();
+            for col_idx in 0..batch.num_columns() {
+                let array = batch.column(col_idx);
+                for local_idx in 0..local_len {
+                    let target_index = base + local_idx;
+                    if let Some(row) = rows.get_mut(target_index) {
+                        let value = llkv_plan::plan_value_from_array(array, local_idx)?;
+                        row.push(value);
+                    }
+                }
+            }
+        }
+
+        Ok(visible_row_ids.into_iter().zip(rows).collect())
+    }
+
     fn unique_key_component(value: &PlanValue, column_name: &str) -> Result<Option<UniqueKey>> {
         match value {
             PlanValue::Null => Ok(None),
@@ -4111,6 +4461,15 @@ where
         }
 
         constraint_result?;
+
+        self.check_foreign_keys_on_insert(
+            table,
+            &display_name,
+            &canonical_name,
+            &rows,
+            &column_order,
+            snapshot,
+        )?;
 
         let row_count = rows.len();
         let mut column_values: Vec<Vec<PlanValue>> =
@@ -4442,7 +4801,14 @@ where
         self.check_not_null_constraints(table, &new_rows, &column_order)?;
         self.check_check_constraints(table, &new_rows, &column_order)?;
 
-        let _ = self.apply_delete(table, display_name.clone(), row_ids.clone(), snapshot)?;
+        let _ = self.apply_delete(
+            table,
+            display_name.clone(),
+            canonical_name.clone(),
+            row_ids.clone(),
+            snapshot,
+            false,
+        )?;
 
         let _ = self.insert_rows(
             table,
@@ -4681,7 +5047,14 @@ where
         self.check_not_null_constraints(table, &new_rows, &column_order)?;
         self.check_check_constraints(table, &new_rows, &column_order)?;
 
-        let _ = self.apply_delete(table, display_name.clone(), row_ids.clone(), snapshot)?;
+        let _ = self.apply_delete(
+            table,
+            display_name.clone(),
+            canonical_name.clone(),
+            row_ids.clone(),
+            snapshot,
+            false,
+        )?;
 
         let _ = self.insert_rows(
             table,
@@ -4702,6 +5075,7 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: String,
+        canonical_name: String,
         filter: LlkvExpr<'static, String>,
         snapshot: TransactionSnapshot,
     ) -> Result<RuntimeStatementResult<P>> {
@@ -4714,13 +5088,14 @@ where
             rows = row_ids.len(),
             "delete_filtered_rows collected row ids"
         );
-        self.apply_delete(table, display_name, row_ids, snapshot)
+        self.apply_delete(table, display_name, canonical_name, row_ids, snapshot, true)
     }
 
     fn delete_all_rows(
         &self,
         table: &ExecutorTable<P>,
         display_name: String,
+        canonical_name: String,
         snapshot: TransactionSnapshot,
     ) -> Result<RuntimeStatementResult<P>> {
         let total_rows = table.total_rows.load(Ordering::SeqCst);
@@ -4737,21 +5112,33 @@ where
         let filter_expr = full_table_scan_filter(anchor_field);
         let row_ids = table.table.filter_row_ids(&filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
-        self.apply_delete(table, display_name, row_ids, snapshot)
+        self.apply_delete(table, display_name, canonical_name, row_ids, snapshot, true)
     }
 
     fn apply_delete(
         &self,
         table: &ExecutorTable<P>,
         display_name: String,
+        canonical_name: String,
         row_ids: Vec<RowId>,
         snapshot: TransactionSnapshot,
+        enforce_foreign_keys: bool,
     ) -> Result<RuntimeStatementResult<P>> {
         if row_ids.is_empty() {
             return Ok(RuntimeStatementResult::Delete {
                 table_name: display_name,
                 rows_deleted: 0,
             });
+        }
+
+        if enforce_foreign_keys {
+            self.check_foreign_keys_on_delete(
+                table,
+                &display_name,
+                &canonical_name,
+                &row_ids,
+                snapshot,
+            )?;
         }
 
         self.detect_delete_conflicts(table, &display_name, &row_ids, snapshot)?;
@@ -4770,6 +5157,197 @@ where
             table_name: display_name,
             rows_deleted: removed,
         })
+    }
+
+    fn check_foreign_keys_on_delete(
+        &self,
+        table: &ExecutorTable<P>,
+        display_name: &str,
+        canonical_name: &str,
+        row_ids: &[RowId],
+        snapshot: TransactionSnapshot,
+    ) -> Result<()> {
+        if row_ids.is_empty() {
+            return Ok(());
+        }
+
+        let constraints = {
+            let registry = self.foreign_keys.read().unwrap();
+            registry.referencing_constraints(canonical_name)
+        };
+
+        if constraints.is_empty() {
+            return Ok(());
+        }
+
+        let mut deleting_row_ids: FxHashSet<RowId> = FxHashSet::default();
+        deleting_row_ids.extend(row_ids.iter().copied());
+
+        for (child_canonical, metadata) in constraints {
+            let parent_rows =
+                self.collect_row_values_for_ids(table, row_ids, &metadata.referenced_field_ids)?;
+
+            let mut parent_keys: Vec<Vec<PlanValue>> = Vec::new();
+            for values in parent_rows {
+                if values.len() != metadata.referenced_field_ids.len() {
+                    continue;
+                }
+                if values.iter().any(|value| matches!(value, PlanValue::Null)) {
+                    continue;
+                }
+                parent_keys.push(values);
+            }
+
+            if parent_keys.is_empty() {
+                continue;
+            }
+
+            let child_table = self.lookup_table(&child_canonical)?;
+            let child_rows = self.collect_visible_child_rows(
+                child_table.as_ref(),
+                &metadata.referencing_field_ids,
+                snapshot,
+            )?;
+
+            if child_rows.is_empty() {
+                continue;
+            }
+
+            for (child_row_id, values) in child_rows {
+                if values.len() != metadata.referencing_field_ids.len() {
+                    continue;
+                }
+                if values.iter().any(|value| matches!(value, PlanValue::Null)) {
+                    continue;
+                }
+                if !parent_keys.iter().any(|key| key == &values) {
+                    continue;
+                }
+
+                if child_canonical == canonical_name && deleting_row_ids.contains(&child_row_id) {
+                    continue;
+                }
+
+                match metadata.on_delete {
+                    ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
+                        let constraint_label =
+                            metadata.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
+                        return Err(Error::ConstraintError(format!(
+                            "Violates foreign key constraint '{}' on table '{}' referencing '{}' - row is still referenced by a foreign key in a different table",
+                            constraint_label, metadata.referencing_display, display_name,
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn check_foreign_keys_on_insert(
+        &self,
+        table: &ExecutorTable<P>,
+        display_name: &str,
+        canonical_name: &str,
+        rows: &[Vec<PlanValue>],
+        column_order: &[usize],
+        snapshot: TransactionSnapshot,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let constraints = {
+            let registry = self.foreign_keys.read().unwrap();
+            registry.child_constraints(canonical_name)
+        };
+
+        if constraints.is_empty() {
+            return Ok(());
+        }
+
+        let mut table_to_row_index: Vec<Option<usize>> = vec![None; table.schema.columns.len()];
+        for (row_pos, &schema_idx) in column_order.iter().enumerate() {
+            if let Some(slot) = table_to_row_index.get_mut(schema_idx) {
+                *slot = Some(row_pos);
+            }
+        }
+
+        for metadata in constraints {
+            if metadata.referencing_column_indices.is_empty() {
+                continue;
+            }
+
+            let mut referencing_positions =
+                Vec::with_capacity(metadata.referencing_column_indices.len());
+            for (idx, &schema_idx) in metadata.referencing_column_indices.iter().enumerate() {
+                let Some(position) = table_to_row_index.get(schema_idx).and_then(|entry| *entry)
+                else {
+                    let column_name = metadata
+                        .referencing_column_names
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or_else(|| schema_idx.to_string());
+                    return Err(Error::InvalidArgumentError(format!(
+                        "FOREIGN KEY column '{}' missing from INSERT statement",
+                        column_name
+                    )));
+                };
+                referencing_positions.push(position);
+            }
+
+            let parent_table = self.lookup_table(&metadata.referenced_table)?;
+            let parent_rows = self.scan_multi_column_values(
+                parent_table.as_ref(),
+                &metadata.referenced_field_ids,
+                snapshot,
+            )?;
+
+            let parent_keys: Vec<Vec<PlanValue>> = parent_rows
+                .into_iter()
+                .filter(|values| values.len() == metadata.referenced_field_ids.len())
+                .filter(|values| !values.iter().any(|value| matches!(value, PlanValue::Null)))
+                .collect();
+
+            for row in rows {
+                let mut key: Vec<PlanValue> = Vec::with_capacity(referencing_positions.len());
+                let mut contains_null = false;
+                for &row_pos in &referencing_positions {
+                    let value = row.get(row_pos).cloned().ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "INSERT row is missing a required column value".into(),
+                        )
+                    })?;
+                    if matches!(value, PlanValue::Null) {
+                        contains_null = true;
+                        break;
+                    }
+                    key.push(value);
+                }
+
+                if contains_null {
+                    continue;
+                }
+
+                if parent_keys.iter().any(|existing| existing == &key) {
+                    continue;
+                }
+
+                let constraint_label = metadata.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
+                let referenced_columns = if metadata.referenced_column_names.is_empty() {
+                    String::from("<unknown>")
+                } else {
+                    metadata.referenced_column_names.join(", ")
+                };
+
+                return Err(Error::ConstraintError(format!(
+                    "Violates foreign key constraint '{}' on table '{}' referencing '{}' (columns: {}) - value does not exist in the referenced table",
+                    constraint_label, display_name, metadata.referenced_display, referenced_columns,
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     fn detect_delete_conflicts(
@@ -5134,6 +5712,10 @@ where
     }
 
     fn remove_table_entry(&self, canonical_name: &str) {
+        {
+            let mut registry = self.foreign_keys.write().unwrap();
+            registry.remove_table(canonical_name);
+        }
         let mut tables = self.tables.write().unwrap();
         if tables.remove(canonical_name).is_some() {
             tracing::trace!(

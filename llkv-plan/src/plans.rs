@@ -82,6 +82,7 @@ pub struct CreateTablePlan {
     pub source: Option<CreateTableSource>,
     /// Optional storage namespace for the table.
     pub namespace: Option<String>,
+    pub foreign_keys: Vec<ForeignKeySpec>,
 }
 
 impl CreateTablePlan {
@@ -93,8 +94,35 @@ impl CreateTablePlan {
             columns: Vec::new(),
             source: None,
             namespace: None,
+            foreign_keys: Vec::new(),
         }
     }
+}
+
+// ============================================================================
+// FOREIGN KEY Plan Structures
+// ============================================================================
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForeignKeyAction {
+    NoAction,
+    Restrict,
+}
+
+impl Default for ForeignKeyAction {
+    fn default() -> Self {
+        Self::NoAction
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ForeignKeySpec {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    pub referenced_table: String,
+    pub referenced_columns: Vec<String>,
+    pub on_delete: ForeignKeyAction,
+    pub on_update: ForeignKeyAction,
 }
 
 // ============================================================================

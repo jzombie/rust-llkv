@@ -23,6 +23,7 @@ fn test_transaction_select() {
         or_replace: false,
         source: None,
         namespace: None,
+        foreign_keys: Vec::new(),
     };
     session.create_table_plan(create_plan).unwrap();
 
@@ -96,6 +97,7 @@ fn test_transaction_select_with_aggregates() {
         or_replace: false,
         source: None,
         namespace: None,
+        foreign_keys: Vec::new(),
     };
     session.create_table_plan(create_plan).unwrap();
 
