@@ -3467,7 +3467,7 @@ where
             let key = Self::build_composite_unique_key(&row_values, &pk_column_names)?;
             let key = key.ok_or_else(|| {
                 Error::ConstraintError(format!(
-                    "constraint failed: PRIMARY KEY {pk_label} '{pk_display}' cannot contain NULL"
+                    "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
                 ))
             })?;
             existing_keys.insert(key);
@@ -3486,7 +3486,7 @@ where
 
                 if matches!(value, PlanValue::Null) {
                     return Err(Error::ConstraintError(format!(
-                        "constraint failed: PRIMARY KEY column '{}' cannot be NULL",
+                        "constraint failed: NOT NULL constraint failed for PRIMARY KEY column '{}'",
                         column.name
                     )));
                 }
@@ -3497,13 +3497,13 @@ where
             let key = Self::build_composite_unique_key(&values_for_pk, &pk_column_names)?;
             let key = key.ok_or_else(|| {
                 Error::ConstraintError(format!(
-                    "constraint failed: PRIMARY KEY {pk_label} '{pk_display}' cannot contain NULL"
+                    "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
                 ))
             })?;
 
             if existing_keys.contains(&key) || !new_keys.insert(key) {
                 return Err(Error::ConstraintError(format!(
-                    "Duplicate key constraint violation on {pk_label} '{}'",
+                    "Duplicate key violates primary key constraint on {pk_label} '{}' (PRIMARY KEY or UNIQUE constraint violation)",
                     pk_display
                 )));
             }
@@ -3584,7 +3584,7 @@ where
             let key = Self::build_composite_unique_key(&values, primary_key_names)?;
             let key = key.ok_or_else(|| {
                 Error::ConstraintError(format!(
-                    "constraint failed: PRIMARY KEY {pk_label} '{pk_display}' cannot contain NULL"
+                    "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
                 ))
             })?;
 
@@ -3592,14 +3592,14 @@ where
 
             if existing_keys.contains(&key) {
                 return Err(Error::ConstraintError(format!(
-                    "Duplicate key constraint violation on {pk_label} '{}'",
+                    "Duplicate key violates primary key constraint on {pk_label} '{}' (PRIMARY KEY or UNIQUE constraint violation)",
                     pk_display
                 )));
             }
 
             if !new_seen.insert(key.clone()) {
                 return Err(Error::ConstraintError(format!(
-                    "Duplicate key constraint violation on {pk_label} '{}'",
+                    "Duplicate key violates primary key constraint on {pk_label} '{}' (PRIMARY KEY or UNIQUE constraint violation)",
                     pk_display
                 )));
             }

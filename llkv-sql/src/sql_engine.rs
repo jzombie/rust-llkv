@@ -1920,6 +1920,18 @@ where
                 .nulls_first
                 .unwrap_or(default_nulls_first_for_direction);
 
+            if let SqlExpr::Identifier(ident) = &order_expr.expr {
+                if ident.value.eq_ignore_ascii_case("ALL") && ident.quote_style.is_none() {
+                    plans.push(OrderByPlan {
+                        target: OrderTarget::All,
+                        sort_type: OrderSortType::Native,
+                        ascending,
+                        nulls_first,
+                    });
+                    continue;
+                }
+            }
+
             let (target, sort_type) = match &order_expr.expr {
                 SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => (
                     OrderTarget::Column(resolve_simple_column(&order_expr.expr)?),

@@ -613,6 +613,7 @@ pub enum OrderSortType {
 pub enum OrderTarget {
     Column(String),
     Index(usize),
+    All,
 }
 
 // ============================================================================

@@ -438,8 +438,8 @@ where
             }
         };
 
-        let order_items = plan.order_by.clone();
-        let physical_order = if let Some(first) = order_items.first() {
+        let expanded_order = expand_order_targets(&plan.order_by, &projections)?;
+        let physical_order = if let Some(first) = expanded_order.first() {
             Some(resolve_scan_order(table_ref, &projections, first)?)
         } else {
             None
@@ -473,7 +473,7 @@ where
             filter_expr,
             options,
             full_table_scan,
-            order_items,
+            expanded_order,
         ))
     }
 
@@ -1388,6 +1388,40 @@ pub struct RowBatch {
     pub rows: Vec<Vec<PlanValue>>,
 }
 
+fn expand_order_targets(
+    order_items: &[OrderByPlan],
+    projections: &[ScanProjection],
+) -> ExecutorResult<Vec<OrderByPlan>> {
+    let mut expanded = Vec::new();
+
+    for item in order_items {
+        match &item.target {
+            OrderTarget::All => {
+                if projections.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "ORDER BY ALL requires at least one projection".into(),
+                    ));
+                }
+
+                for (idx, projection) in projections.iter().enumerate() {
+                    if matches!(projection, ScanProjection::Computed { .. }) {
+                        return Err(Error::InvalidArgumentError(
+                            "ORDER BY ALL cannot reference computed projections".into(),
+                        ));
+                    }
+
+                    let mut clone = item.clone();
+                    clone.target = OrderTarget::Index(idx);
+                    expanded.push(clone);
+                }
+            }
+            _ => expanded.push(item.clone()),
+        }
+    }
+
+    Ok(expanded)
+}
+
 fn resolve_scan_order<P>(
     table: &ExecutorTable<P>,
     projections: &[ScanProjection],
@@ -1427,6 +1461,11 @@ where
                     ));
                 }
             }
+        }
+        OrderTarget::All => {
+            return Err(Error::InvalidArgumentError(
+                "ORDER BY ALL should be expanded before execution".into(),
+            ));
         }
     };
 
@@ -1551,6 +1590,11 @@ fn sort_record_batch_with_order(
                     )));
                 }
                 *idx
+            }
+            OrderTarget::All => {
+                return Err(Error::InvalidArgumentError(
+                    "ORDER BY ALL should be expanded before sorting".into(),
+                ));
             }
         };
 
