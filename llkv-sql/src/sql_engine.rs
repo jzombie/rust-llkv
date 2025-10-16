@@ -28,9 +28,9 @@ use sqlparser::ast::{
     ColumnOptionDef, DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName,
     ObjectNamePart, ObjectType, OrderBy, OrderByKind, Query, SchemaName, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableFactor, TableObject,
-    TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator, UpdateTableFromKind,
-    Value, ValueWithSpan,
+    SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableConstraint,
+    TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
+    UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -444,7 +444,6 @@ where
             None => table_name.clone(),
         };
         let canonical_name = display_name.to_ascii_lowercase();
-
         tracing::trace!(
             "\n=== HANDLE_CREATE_TABLE: table='{}' columns={} ===",
             display_name,
@@ -486,12 +485,16 @@ where
 
         validate_create_table_definition(&stmt)?;
 
-        let mut columns: Vec<ColumnSpec> = Vec::with_capacity(stmt.columns.len());
+        let column_defs_ast = std::mem::take(&mut stmt.columns);
+        let constraints = std::mem::take(&mut stmt.constraints);
+
+        let mut columns: Vec<ColumnSpec> = Vec::with_capacity(column_defs_ast.len());
+        let mut primary_key_columns: HashSet<String> = HashSet::new();
 
         // First pass: collect all column names and check for duplicates
-        let mut seen_names: HashSet<String> = HashSet::with_capacity(stmt.columns.len());
-        let mut all_column_names: Vec<String> = Vec::with_capacity(stmt.columns.len());
-        for column_def in &stmt.columns {
+        let mut seen_names: HashSet<String> = HashSet::with_capacity(column_defs_ast.len());
+        let mut all_column_names: Vec<String> = Vec::with_capacity(column_defs_ast.len());
+        for column_def in &column_defs_ast {
             let column_name = column_def.name.value.clone();
             let normalized = column_name.to_ascii_lowercase();
             if !seen_names.insert(normalized) {
@@ -504,7 +507,7 @@ where
         }
 
         // Second pass: process columns including CHECK validation
-        for column_def in stmt.columns {
+        for column_def in column_defs_ast {
             let is_nullable = column_def
                 .options
                 .iter()
@@ -565,6 +568,11 @@ where
                 .with_primary_key(is_primary_key)
                 .with_unique(has_unique_constraint)
                 .with_check(check_expr_str);
+
+            if is_primary_key {
+                column.nullable = false;
+                primary_key_columns.insert(column.name.to_ascii_lowercase());
+            }
             tracing::trace!(
                 "DEBUG ColumnSpec after with_primary_key({})/with_unique({}): primary_key={} unique={} check_expr={:?}",
                 is_primary_key,
@@ -575,6 +583,101 @@ where
             );
 
             columns.push(column);
+        }
+
+        // Apply supported table-level constraints (e.g., PRIMARY KEY)
+        if !constraints.is_empty() {
+            let mut column_lookup: HashMap<String, usize> = HashMap::with_capacity(columns.len());
+            for (idx, column) in columns.iter().enumerate() {
+                column_lookup.insert(column.name.to_ascii_lowercase(), idx);
+            }
+
+            for constraint in constraints {
+                match constraint {
+                    TableConstraint::PrimaryKey {
+                        columns: constraint_columns,
+                        ..
+                    } => {
+                        if !primary_key_columns.is_empty() {
+                            return Err(Error::InvalidArgumentError(
+                                "multiple PRIMARY KEY constraints are not supported".into(),
+                            ));
+                        }
+
+                        if constraint_columns.is_empty() {
+                            return Err(Error::InvalidArgumentError(
+                                "PRIMARY KEY requires at least one column".into(),
+                            ));
+                        }
+
+                        let mut seen_constraint_cols: HashSet<String> =
+                            HashSet::with_capacity(constraint_columns.len());
+
+                        for index_col in &constraint_columns {
+                            if index_col.operator_class.is_some() {
+                                return Err(Error::InvalidArgumentError(
+                                    "PRIMARY KEY operator classes are not supported".into(),
+                                ));
+                            }
+
+                            let order_expr = &index_col.column;
+                            if order_expr.options.asc.is_some()
+                                || order_expr.options.nulls_first.is_some()
+                                || order_expr.with_fill.is_some()
+                            {
+                                return Err(Error::InvalidArgumentError(
+                                    "PRIMARY KEY columns must be simple identifiers".into(),
+                                ));
+                            }
+
+                            let column_ident = match &order_expr.expr {
+                                SqlExpr::Identifier(ident) => ident.value.clone(),
+                                SqlExpr::CompoundIdentifier(parts) if parts.len() == 1 => {
+                                    parts[0].value.clone()
+                                }
+                                _ => {
+                                    return Err(Error::InvalidArgumentError(
+                                        "PRIMARY KEY columns must be column identifiers".into(),
+                                    ));
+                                }
+                            };
+
+                            let normalized = column_ident.to_ascii_lowercase();
+                            if !seen_constraint_cols.insert(normalized.clone()) {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "duplicate column '{}' in PRIMARY KEY constraint",
+                                    column_ident
+                                )));
+                            }
+
+                            let idx = column_lookup.get(&normalized).copied().ok_or_else(|| {
+                                Error::InvalidArgumentError(format!(
+                                    "unknown column '{}' in PRIMARY KEY constraint",
+                                    column_ident
+                                ))
+                            })?;
+
+                            let column = columns.get_mut(idx).expect("column index valid");
+                            column.primary_key = true;
+                            column.unique = true;
+                            column.nullable = false;
+
+                            primary_key_columns.insert(normalized);
+                        }
+                    }
+                    TableConstraint::Unique { .. } => {
+                        return Err(Error::InvalidArgumentError(
+                            "table-level UNIQUE constraints are not supported yet".into(),
+                        ));
+                    }
+                    unsupported => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "table-level constraint {:?} is not supported",
+                            unsupported
+                        )));
+                    }
+                }
+            }
         }
 
         let plan = CreateTablePlan {
@@ -2430,10 +2533,31 @@ fn validate_create_table_common(stmt: &sqlparser::ast::CreateTable) -> SqlResult
             "CREATE TABLE cannot combine OR REPLACE with IF NOT EXISTS".into(),
         ));
     }
-    if !stmt.constraints.is_empty() {
-        return Err(Error::InvalidArgumentError(
-            "table-level constraints are not supported".into(),
-        ));
+    use sqlparser::ast::TableConstraint;
+
+    let mut seen_primary_key = false;
+    for constraint in &stmt.constraints {
+        match constraint {
+            TableConstraint::PrimaryKey { .. } => {
+                if seen_primary_key {
+                    return Err(Error::InvalidArgumentError(
+                        "multiple PRIMARY KEY constraints are not supported".into(),
+                    ));
+                }
+                seen_primary_key = true;
+            }
+            TableConstraint::Unique { .. } => {
+                return Err(Error::InvalidArgumentError(
+                    "table-level UNIQUE constraints are not supported yet".into(),
+                ));
+            }
+            other => {
+                return Err(Error::InvalidArgumentError(format!(
+                    "table-level constraint {:?} is not supported",
+                    other
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -3110,6 +3234,9 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                     Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Integer(-v)))
                 }
                 Literal::Float(v) => Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Float(-v))),
+                Literal::Boolean(_) => Err(Error::InvalidArgumentError(
+                    "cannot negate boolean literal".into(),
+                )),
                 Literal::String(_) => Err(Error::InvalidArgumentError(
                     "cannot negate string literal".into(),
                 )),
@@ -3186,8 +3313,8 @@ fn literal_from_value(value: &ValueWithSpan) -> SqlResult<llkv_expr::expr::Scala
                 )))
             }
         }
-        Value::Boolean(_) => Err(Error::InvalidArgumentError(
-            "BOOLEAN literals are not supported yet".into(),
+        Value::Boolean(value) => Ok(llkv_expr::expr::ScalarExpr::literal(
+            Literal::Boolean(*value),
         )),
         Value::Null => Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Null)),
         other => {
@@ -3242,9 +3369,7 @@ fn arrow_type_from_sql(data_type: &SqlDataType) -> SqlResult<arrow::datatypes::D
         | SqlDataType::Uuid => Ok(DataType::Utf8),
         SqlDataType::Date => Ok(DataType::Date32),
         SqlDataType::Decimal(_) | SqlDataType::Numeric(_) => Ok(DataType::Float64),
-        SqlDataType::Boolean => Err(Error::InvalidArgumentError(
-            "BOOLEAN columns are not supported yet".into(),
-        )),
+        SqlDataType::Boolean => Ok(DataType::Boolean),
         SqlDataType::Custom(name, args) => {
             if name.0.len() == 1
                 && let ObjectNamePart::Identifier(ident) = &name.0[0]

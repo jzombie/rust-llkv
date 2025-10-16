@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Date32Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_result::Error;
@@ -538,6 +538,17 @@ pub fn plan_value_from_array(array: &ArrayRef, index: usize) -> PlanResult<PlanV
         return Ok(PlanValue::Null);
     }
     match array.data_type() {
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "expected Boolean array in INSERT SELECT".into(),
+                    )
+                })?;
+            Ok(PlanValue::Integer(if values.value(index) { 1 } else { 0 }))
+        }
         DataType::Int64 => {
             let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                 Error::InvalidArgumentError("expected Int64 array in INSERT SELECT".into())

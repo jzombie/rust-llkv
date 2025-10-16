@@ -41,6 +41,7 @@ where
                 let dtype = match expr {
                     ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
                     ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
+                    ScalarExpr::Literal(Literal::Boolean(_)) => DataType::Boolean,
                     ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
                     ScalarExpr::Literal(Literal::Null) => DataType::Null,
                     ScalarExpr::Literal(Literal::Struct(_)) => {

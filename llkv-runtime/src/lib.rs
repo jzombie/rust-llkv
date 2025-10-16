@@ -40,8 +40,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use arrow::array::{
-    Array, ArrayRef, Date32Builder, Float64Builder, Int64Builder, StringBuilder, UInt64Array,
-    UInt64Builder,
+    Array, ArrayRef, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, StringBuilder,
+    UInt64Array, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
@@ -1811,10 +1811,9 @@ where
 
             store.register_index(logical_field_id, IndexKind::Sort)?;
 
-            if let Some(updated_table) = Self::rebuild_executor_table_with_unique(
-                table.as_ref(),
-                field_id,
-            ) {
+            if let Some(updated_table) =
+                Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)
+            {
                 self.tables
                     .write()
                     .unwrap()
@@ -3425,47 +3424,74 @@ where
             return Ok(());
         }
 
-        // For each PRIMARY KEY column, check for duplicates
-        for (col_idx, column) in primary_key_columns {
-            // Get existing values for this column from the table
-            let field_id = column.field_id;
-            let existing_values = self.scan_column_values(table, field_id, snapshot)?;
-            let mut new_values: Vec<PlanValue> = Vec::new();
+        let pk_field_ids: Vec<FieldId> = primary_key_columns
+            .iter()
+            .map(|(_, col)| col.field_id)
+            .collect();
+        let pk_column_names: Vec<String> = primary_key_columns
+            .iter()
+            .map(|(_, col)| col.name.clone())
+            .collect();
+        let pk_label = if pk_column_names.len() == 1 {
+            "column"
+        } else {
+            "columns"
+        };
+        let pk_display = if pk_column_names.len() == 1 {
+            pk_column_names[0].clone()
+        } else {
+            pk_column_names.join(", ")
+        };
 
-            tracing::trace!(
-                "[PK_CHECK] snapshot(txn={}, snap_id={}) column '{}': found {} existing VISIBLE values: {:?}",
-                snapshot.txn_id,
-                snapshot.snapshot_id,
-                column.name,
-                existing_values.len(),
-                existing_values
-            );
+        let existing_rows = self.scan_multi_column_values(table, &pk_field_ids, snapshot)?;
+        let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
+        for row_values in existing_rows {
+            if row_values.len() != pk_field_ids.len() {
+                continue;
+            }
 
-            // Check each new row value against existing values
-            for row in rows {
-                // Find which position in the INSERT statement corresponds to this column
-                let insert_position = column_order
-                    .iter()
-                    .position(|&dest_idx| dest_idx == col_idx);
+            let key = Self::build_composite_unique_key(&row_values, &pk_column_names)?;
+            let key = key.ok_or_else(|| {
+                Error::ConstraintError(format!(
+                    "PRIMARY KEY {pk_label} '{pk_display}' cannot contain NULL"
+                ))
+            })?;
+            existing_keys.insert(key);
+        }
 
-                if let Some(pos) = insert_position {
-                    let new_value = &row[pos];
+        let mut new_keys: FxHashSet<UniqueKey> = FxHashSet::default();
+        for row in rows {
+            let mut values_for_pk = Vec::with_capacity(pk_field_ids.len());
+            for &(col_idx, column) in &primary_key_columns {
+                let value = if let Some(pos) = column_order.iter().position(|&dest| dest == col_idx)
+                {
+                    row[pos].clone()
+                } else {
+                    PlanValue::Null
+                };
 
-                    // Skip NULL values (PRIMARY KEY typically requires NOT NULL, but we check anyway)
-                    if matches!(new_value, PlanValue::Null) {
-                        continue;
-                    }
-
-                    // Check if this value already exists
-                    if existing_values.contains(new_value) || new_values.contains(new_value) {
-                        return Err(Error::ConstraintError(format!(
-                            "constraint violation on column '{}'",
-                            column.name
-                        )));
-                    }
-
-                    new_values.push(new_value.clone());
+                if matches!(value, PlanValue::Null) {
+                    return Err(Error::ConstraintError(format!(
+                        "PRIMARY KEY column '{}' cannot be NULL",
+                        column.name
+                    )));
                 }
+
+                values_for_pk.push(value);
+            }
+
+            let key = Self::build_composite_unique_key(&values_for_pk, &pk_column_names)?;
+            let key = key.ok_or_else(|| {
+                Error::ConstraintError(format!(
+                    "PRIMARY KEY {pk_label} '{pk_display}' cannot contain NULL"
+                ))
+            })?;
+
+            if existing_keys.contains(&key) || !new_keys.insert(key) {
+                return Err(Error::ConstraintError(format!(
+                    "constraint violation on {pk_label} '{}'",
+                    pk_display
+                )));
             }
         }
 
@@ -5122,6 +5148,35 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::String(_) | PlanValue::Struct(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert non-integer into INT column".into(),
+                        ));
+                    }
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Boolean => {
+            let mut builder = BooleanBuilder::with_capacity(values.len());
+            for value in values {
+                match value {
+                    PlanValue::Null => builder.append_null(),
+                    PlanValue::Integer(v) => builder.append_value(*v != 0),
+                    PlanValue::Float(v) => builder.append_value(*v != 0.0),
+                    PlanValue::String(s) => {
+                        let normalized = s.trim().to_ascii_lowercase();
+                        match normalized.as_str() {
+                            "true" | "t" | "1" => builder.append_value(true),
+                            "false" | "f" | "0" => builder.append_value(false),
+                            _ => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "cannot insert string '{}' into BOOLEAN column",
+                                    s
+                                )));
+                            }
+                        }
+                    }
+                    PlanValue::Struct(_) => {
+                        return Err(Error::InvalidArgumentError(
+                            "cannot insert struct into BOOLEAN column".into(),
                         ));
                     }
                 }

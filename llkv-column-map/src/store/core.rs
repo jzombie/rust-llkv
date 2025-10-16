@@ -182,11 +182,8 @@ where
             .is_none();
 
         if data_descriptor_missing {
-            let (mut descriptor, tail_page) = ColumnDescriptor::load_or_create(
-                Arc::clone(&self.pager),
-                descriptor_pk,
-                field_id,
-            )?;
+            let (mut descriptor, tail_page) =
+                ColumnDescriptor::load_or_create(Arc::clone(&self.pager), descriptor_pk, field_id)?;
             let fingerprint = DTypeCache::<P>::dtype_fingerprint(data_type);
             if fingerprint != 0 {
                 DTypeCache::<P>::set_desc_dtype_fingerprint(&mut descriptor, fingerprint);

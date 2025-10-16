@@ -9,6 +9,7 @@ pub(crate) enum SqlValue {
     Null,
     Integer(i64),
     Float(f64),
+    Boolean(bool),
     String(String),
     Struct(HashMap<String, SqlValue>),
 }
@@ -23,9 +24,12 @@ impl SqlValue {
             } => match SqlValue::try_from_expr(expr)? {
                 SqlValue::Integer(v) => Ok(SqlValue::Integer(-v)),
                 SqlValue::Float(v) => Ok(SqlValue::Float(-v)),
-                SqlValue::Null | SqlValue::String(_) | SqlValue::Struct(_) => Err(
-                    Error::InvalidArgumentError("cannot negate non-numeric literal".into()),
-                ),
+                SqlValue::Null
+                | SqlValue::Boolean(_)
+                | SqlValue::String(_)
+                | SqlValue::Struct(_) => Err(Error::InvalidArgumentError(
+                    "cannot negate non-numeric literal".into(),
+                )),
             },
             SqlExpr::UnaryOp {
                 op: UnaryOperator::Plus,
@@ -65,9 +69,7 @@ impl SqlValue {
         match &value.value {
             Value::Null => Ok(SqlValue::Null),
             Value::Number(text, _) => parse_number_literal(text),
-            Value::Boolean(_) => Err(Error::InvalidArgumentError(
-                "BOOLEAN literals are not supported yet".into(),
-            )),
+            Value::Boolean(value) => Ok(SqlValue::Boolean(*value)),
             other => {
                 if let Some(text) = other.clone().into_string() {
                     Ok(SqlValue::String(text))
@@ -101,6 +103,7 @@ impl From<SqlValue> for PlanValue {
             SqlValue::Null => PlanValue::Null,
             SqlValue::Integer(v) => PlanValue::Integer(v),
             SqlValue::Float(v) => PlanValue::Float(v),
+            SqlValue::Boolean(v) => PlanValue::Integer(if v { 1 } else { 0 }),
             SqlValue::String(s) => PlanValue::String(s),
             SqlValue::Struct(fields) => {
                 let converted: HashMap<String, PlanValue> = fields

@@ -160,6 +160,7 @@ impl NumericKernels {
             ScalarExpr::Literal(lit) => match lit {
                 llkv_expr::literal::Literal::Float(f) => Ok(Some(*f)),
                 llkv_expr::literal::Literal::Integer(i) => Ok(Some(*i as f64)),
+                llkv_expr::literal::Literal::Boolean(b) => Ok(Some(if *b { 1.0 } else { 0.0 })),
                 llkv_expr::literal::Literal::String(_) => Err(Error::InvalidArgumentError(
                     "String literals are not supported in numeric expressions".into(),
                 )),
@@ -226,6 +227,9 @@ impl NumericKernels {
                 llkv_expr::literal::Literal::Float(f) => Ok(Some(VectorizedExpr::Scalar(Some(*f)))),
                 llkv_expr::literal::Literal::Integer(i) => {
                     Ok(Some(VectorizedExpr::Scalar(Some(*i as f64))))
+                }
+                llkv_expr::literal::Literal::Boolean(b) => {
+                    Ok(Some(VectorizedExpr::Scalar(Some(if *b { 1.0 } else { 0.0 }))))
                 }
                 llkv_expr::literal::Literal::String(_) => Ok(None),
                 llkv_expr::literal::Literal::Struct(_) => Ok(None),
@@ -346,6 +350,7 @@ impl NumericKernels {
             match lit {
                 llkv_expr::literal::Literal::Float(f) => Some(*f),
                 llkv_expr::literal::Literal::Integer(i) => Some(*i as f64),
+                llkv_expr::literal::Literal::Boolean(b) => Some(if *b { 1.0 } else { 0.0 }),
                 llkv_expr::literal::Literal::String(_) => None,
                 llkv_expr::literal::Literal::Struct(_) => None,
                 llkv_expr::literal::Literal::Null => None,

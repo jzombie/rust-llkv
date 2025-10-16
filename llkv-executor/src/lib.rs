@@ -161,7 +161,8 @@ where
     /// Convert a Literal to an Arrow array (recursive for nested structs)
     fn literal_to_array(lit: &llkv_expr::literal::Literal) -> ExecutorResult<(DataType, ArrayRef)> {
         use arrow::array::{
-            ArrayRef, Float64Array, Int64Array, StringArray, StructArray, new_null_array,
+            ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, StructArray,
+            new_null_array,
         };
         use arrow::datatypes::{DataType, Field};
         use llkv_expr::literal::Literal;
@@ -177,6 +178,10 @@ where
             Literal::Float(v) => Ok((
                 DataType::Float64,
                 Arc::new(Float64Array::from(vec![*v])) as ArrayRef,
+            )),
+            Literal::Boolean(v) => Ok((
+                DataType::Boolean,
+                Arc::new(BooleanArray::from(vec![*v])) as ArrayRef,
             )),
             Literal::String(v) => Ok((
                 DataType::Utf8,
@@ -1009,6 +1014,7 @@ where
         match expr {
             ScalarExpr::Literal(Literal::Integer(v)) => Ok(*v as i64),
             ScalarExpr::Literal(Literal::Float(v)) => Ok(*v as i64),
+            ScalarExpr::Literal(Literal::Boolean(v)) => Ok(if *v { 1 } else { 0 }),
             ScalarExpr::Literal(Literal::String(_)) => Err(Error::InvalidArgumentError(
                 "String literals not supported in aggregate expressions".into(),
             )),
