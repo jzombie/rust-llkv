@@ -4449,7 +4449,7 @@ where
         table: &ExecutorTable<P>,
         display_name: String,
         canonical_name: String,
-        rows: Vec<Vec<PlanValue>>,
+        mut rows: Vec<Vec<PlanValue>>,
         columns: Vec<String>,
         snapshot: TransactionSnapshot,
     ) -> Result<RuntimeStatementResult<P>> {
@@ -4468,6 +4468,27 @@ where
                     expected_len,
                     row.len()
                 )));
+            }
+        }
+
+        for row in rows.iter_mut() {
+            for (position, value) in row.iter_mut().enumerate() {
+                let schema_index = column_order
+                    .get(position)
+                    .copied()
+                    .ok_or_else(|| Error::Internal("invalid INSERT column index mapping".into()))?;
+                let column = table
+                    .schema
+                    .columns
+                    .get(schema_index)
+                    .ok_or_else(|| {
+                        Error::Internal(format!(
+                            "INSERT column index {} out of bounds for table '{}'",
+                            schema_index, display_name
+                        ))
+                    })?;
+                let normalized = normalize_insert_value_for_column(column, value.clone())?;
+                *value = normalized;
             }
         }
 
@@ -5782,6 +5803,30 @@ where
         }
         drop(tables);
 
+        let referencing = {
+            let registry = self.foreign_keys.read().unwrap();
+            registry.referencing_constraints(&canonical_name)
+        };
+
+        let blocking: Vec<_> = referencing
+            .into_iter()
+            .filter(|(child_canonical, _)| {
+                child_canonical != &canonical_name
+                    && !self.is_table_marked_dropped(child_canonical)
+            })
+            .collect();
+
+        if let Some((_, metadata)) = blocking.first() {
+            let constraint_label = metadata
+                .constraint_name
+                .as_deref()
+                .unwrap_or("FOREIGN KEY");
+            return Err(Error::ConstraintError(format!(
+                "Cannot drop table '{}' because it is referenced by foreign key constraint '{}' on table '{}'",
+                display_name, constraint_label, metadata.referencing_display
+            )));
+        }
+
         // Don't remove from tables cache - keep it for transactions with earlier snapshots
         // self.remove_table_entry(&canonical_name);
 
@@ -6305,6 +6350,86 @@ pub fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> Re
         resolved.push(*index);
     }
     Ok(resolved)
+}
+
+fn normalize_insert_value_for_column(
+    column: &ExecutorColumn,
+    value: PlanValue,
+) -> Result<PlanValue> {
+    match (&column.data_type, value) {
+        (_, PlanValue::Null) => Ok(PlanValue::Null),
+        (DataType::Int64, PlanValue::Integer(v)) => Ok(PlanValue::Integer(v)),
+        (DataType::Int64, PlanValue::Float(v)) => Ok(PlanValue::Integer(v as i64)),
+        (DataType::Int64, other) => Err(Error::InvalidArgumentError(format!(
+            "cannot insert {other:?} into INT column '{}'",
+            column.name
+        ))),
+        (DataType::Boolean, PlanValue::Integer(v)) => {
+            Ok(PlanValue::Integer(if v != 0 { 1 } else { 0 }))
+        }
+        (DataType::Boolean, PlanValue::Float(v)) => {
+            Ok(PlanValue::Integer(if v != 0.0 { 1 } else { 0 }))
+        }
+        (DataType::Boolean, PlanValue::String(s)) => {
+            let normalized = s.trim().to_ascii_lowercase();
+            let value = match normalized.as_str() {
+                "true" | "t" | "1" => 1,
+                "false" | "f" | "0" => 0,
+                _ => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "cannot insert string '{}' into BOOLEAN column '{}'",
+                        s, column.name
+                    )))
+                }
+            };
+            Ok(PlanValue::Integer(value))
+        }
+        (DataType::Boolean, PlanValue::Struct(_)) => Err(Error::InvalidArgumentError(format!(
+            "cannot insert struct into BOOLEAN column '{}'",
+            column.name
+        ))),
+        (DataType::Float64, PlanValue::Integer(v)) => {
+            Ok(PlanValue::Float(v as f64))
+        }
+        (DataType::Float64, PlanValue::Float(v)) => Ok(PlanValue::Float(v)),
+        (DataType::Float64, other) => Err(Error::InvalidArgumentError(format!(
+            "cannot insert {other:?} into DOUBLE column '{}'",
+            column.name
+        ))),
+        (DataType::Utf8, PlanValue::Integer(v)) => Ok(PlanValue::String(v.to_string())),
+        (DataType::Utf8, PlanValue::Float(v)) => Ok(PlanValue::String(v.to_string())),
+        (DataType::Utf8, PlanValue::String(s)) => Ok(PlanValue::String(s)),
+        (DataType::Utf8, PlanValue::Struct(_)) => Err(Error::InvalidArgumentError(format!(
+            "cannot insert struct into STRING column '{}'",
+            column.name
+        ))),
+        (DataType::Date32, PlanValue::Integer(days)) => {
+            let casted = i32::try_from(days).map_err(|_| {
+                Error::InvalidArgumentError(format!(
+                    "integer literal out of range for DATE column '{}'",
+                    column.name
+                ))
+            })?;
+            Ok(PlanValue::Integer(casted as i64))
+        }
+        (DataType::Date32, PlanValue::String(text)) => {
+            let days = parse_date32_literal(&text)?;
+            Ok(PlanValue::Integer(days as i64))
+        }
+        (DataType::Date32, other) => Err(Error::InvalidArgumentError(format!(
+            "cannot insert {other:?} into DATE column '{}'",
+            column.name
+        ))),
+        (DataType::Struct(_), PlanValue::Struct(map)) => Ok(PlanValue::Struct(map)),
+        (DataType::Struct(_), other) => Err(Error::InvalidArgumentError(format!(
+            "expected struct value for struct column '{}', got {other:?}",
+            column.name
+        ))),
+        (other_type, other_value) => Err(Error::InvalidArgumentError(format!(
+            "unsupported Arrow data type {:?} for INSERT value {:?} in column '{}'",
+            other_type, other_value, column.name
+        ))),
+    }
 }
 
 pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<ArrayRef> {
