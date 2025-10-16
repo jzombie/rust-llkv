@@ -563,17 +563,9 @@ where
                     }
 
                     let referenced_table = Self::object_name_to_string(foreign_table)?;
-                    let referenced_columns = if referred_columns.is_empty() {
-                        vec![column_def.name.value.clone()]
-                    } else {
-                        referred_columns.iter().map(|c| c.value.clone()).collect()
-                    };
-
-                    if referenced_columns.len() != 1 {
-                        return Err(Error::InvalidArgumentError(
-                            "column-level FOREIGN KEY must reference exactly one column".into(),
-                        ));
-                    }
+                    // Empty referenced_columns means "use the primary key of the referenced table"
+                    // This will be resolved during table creation in the runtime
+                    let referenced_columns: Vec<String> = referred_columns.iter().map(|c| c.value.clone()).collect();
 
                     let map_action = |action: &Option<ReferentialAction>,
                                       kind: &str|
@@ -844,14 +836,9 @@ where
                             ));
                         }
 
-                        if referred_columns.is_empty() {
-                            return Err(Error::InvalidArgumentError(
-                                "FOREIGN KEY constraint requires at least one referenced column"
-                                    .into(),
-                            ));
-                        }
-
-                        if fk_columns.len() != referred_columns.len() {
+                        // If referred_columns is empty, it means "use the primary key"
+                        // This will be resolved during table creation
+                        if !referred_columns.is_empty() && fk_columns.len() != referred_columns.len() {
                             return Err(Error::InvalidArgumentError(
                                 "FOREIGN KEY referencing and referenced column counts must match"
                                     .into(),

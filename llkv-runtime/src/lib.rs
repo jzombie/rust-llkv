@@ -2568,12 +2568,16 @@ where
         }
 
         if !foreign_keys.is_empty() {
-            self.register_foreign_keys_for_table(
+            if let Err(err) = self.register_foreign_keys_for_table(
                 &display_name,
                 &canonical_name,
                 &column_defs,
                 foreign_keys,
-            )?;
+            ) {
+                self.catalog.unregister_table(&canonical_name);
+                self.remove_table_entry(&canonical_name);
+                return Err(err);
+            }
         }
 
         Ok(RuntimeStatementResult::CreateTable {
@@ -2593,11 +2597,49 @@ where
         }
 
         let mut metadata_entries = Vec::with_capacity(foreign_keys.len());
-        for spec in foreign_keys {
+        for mut spec in foreign_keys {
             if spec.columns.is_empty() {
                 return Err(Error::InvalidArgumentError(
                     "FOREIGN KEY requires at least one referencing column".into(),
                 ));
+            }
+
+            // Resolve empty referenced_columns to the primary key of the referenced table
+            if spec.referenced_columns.is_empty() {
+                let referenced_table_canonical = spec.referenced_table.to_ascii_lowercase();
+                let referenced_table = self.lookup_table(&referenced_table_canonical).map_err(|_| {
+                    Error::InvalidArgumentError(format!(
+                        "referenced table '{}' does not exist",
+                        spec.referenced_table
+                    ))
+                })?;
+
+                let primary_key_columns: Vec<&ExecutorColumn> = referenced_table
+                    .schema
+                    .columns
+                    .iter()
+                    .filter(|col| col.primary_key)
+                    .collect();
+
+                if primary_key_columns.is_empty() {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "there is no primary key for referenced table '{}'",
+                        spec.referenced_table
+                    )));
+                }
+
+                if spec.columns.len() != primary_key_columns.len() {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "number of referencing columns ({}) does not match number of referenced primary key columns ({})",
+                        spec.columns.len(),
+                        primary_key_columns.len()
+                    )));
+                }
+
+                spec.referenced_columns = primary_key_columns
+                    .iter()
+                    .map(|col| col.name.clone())
+                    .collect();
             }
 
             if spec.referenced_columns.is_empty() {
@@ -5341,7 +5383,7 @@ where
                 };
 
                 return Err(Error::ConstraintError(format!(
-                    "Violates foreign key constraint '{}' on table '{}' referencing '{}' (columns: {}) - value does not exist in the referenced table",
+                    "Violates foreign key constraint '{}' on table '{}' referencing '{}' (columns: {}) - does not exist in the referenced table",
                     constraint_label, display_name, metadata.referenced_display, referenced_columns,
                 )));
             }

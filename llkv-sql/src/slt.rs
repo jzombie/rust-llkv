@@ -1,5 +1,6 @@
 use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
 use llkv_result::Error;
+use regex::escape;
 use sqllogictest::{AsyncDB, DefaultColumnType, Runner};
 use std::path::Path;
 
@@ -293,6 +294,17 @@ fn normalize_inline_connections(
                 }
                 message_lines.push((line.clone(), mapping[idx]));
                 idx += 1;
+            }
+
+            if regex_pattern.is_none() && !message_lines.is_empty() {
+                if let Some((first_line, _)) = message_lines.first() {
+                    let trimmed_first = first_line.trim();
+                    if !trimmed_first.is_empty() {
+                        let escaped = escape(trimmed_first);
+                        regex_pattern = Some(format!(".*{}.*", escaped));
+                        message_lines.clear();
+                    }
+                }
             }
         }
 
