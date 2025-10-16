@@ -11,6 +11,7 @@ use arrow::record_batch::RecordBatch;
 use llkv_executor::SelectExecution;
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
+use llkv_runtime::storage_namespace::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan, CreateTablePlan,
     CreateTableSource, DeletePlan, IndexColumnPlan, InsertPlan, InsertSource, OrderByPlan,
@@ -412,7 +413,19 @@ where
     ) -> SqlResult<RuntimeStatementResult<P>> {
         validate_create_table_common(&stmt)?;
 
-        let (schema_name, table_name) = parse_schema_qualified_name(&stmt.name)?;
+        let (mut schema_name, table_name) = parse_schema_qualified_name(&stmt.name)?;
+
+        let namespace = if stmt.temporary {
+            if schema_name.is_some() {
+                return Err(Error::InvalidArgumentError(
+                    "temporary tables cannot specify an explicit schema".into(),
+                ));
+            }
+            schema_name = None;
+            Some(TEMPORARY_NAMESPACE_ID.to_string())
+        } else {
+            None
+        };
 
         // Validate schema exists if specified
         if let Some(ref schema) = schema_name {
@@ -451,6 +464,7 @@ where
                 &query,
                 stmt.if_not_exists,
                 stmt.or_replace,
+                namespace.clone(),
             )? {
                 return Ok(result);
             }
@@ -460,6 +474,7 @@ where
                 *query,
                 stmt.if_not_exists,
                 stmt.or_replace,
+                namespace.clone(),
             );
         }
 
@@ -568,6 +583,7 @@ where
             or_replace: stmt.or_replace,
             columns,
             source: None,
+            namespace,
         };
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
     }
@@ -807,6 +823,7 @@ where
         query: &Query,
         if_not_exists: bool,
         or_replace: bool,
+        namespace: Option<String>,
     ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
         let select = match query.body.as_ref() {
             SetExpr::Select(select) => select,
@@ -951,6 +968,7 @@ where
             or_replace,
             columns: column_specs,
             source: None,
+            namespace,
         };
         let create_result = self.execute_plan_statement(PlanStatement::CreateTable(plan))?;
 
@@ -1192,6 +1210,7 @@ where
         query: Query,
         if_not_exists: bool,
         or_replace: bool,
+        namespace: Option<String>,
     ) -> SqlResult<RuntimeStatementResult<P>> {
         let select_plan = self.build_select_plan(query)?;
 
@@ -1209,6 +1228,7 @@ where
             source: Some(CreateTableSource::Select {
                 plan: Box::new(select_plan),
             }),
+            namespace,
         };
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
     }
@@ -1517,10 +1537,11 @@ where
                     ));
                 }
 
-                let ctx = self.engine.context();
+                let session = self.engine.session();
                 for name in names {
                     let table_name = Self::object_name_to_string(&name)?;
-                    ctx.drop_table_immediate(&table_name, if_exists)
+                    session
+                        .drop_table(&table_name, if_exists)
                         .map_err(|err| Self::map_table_error(&table_name, err))?;
                 }
 

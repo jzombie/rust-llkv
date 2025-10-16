@@ -80,6 +80,8 @@ pub struct CreateTablePlan {
     pub or_replace: bool,
     pub columns: Vec<ColumnSpec>,
     pub source: Option<CreateTableSource>,
+    /// Optional storage namespace for the table.
+    pub namespace: Option<String>,
 }
 
 impl CreateTablePlan {
@@ -90,6 +92,7 @@ impl CreateTablePlan {
             or_replace: false,
             columns: Vec::new(),
             source: None,
+            namespace: None,
         }
     }
 }

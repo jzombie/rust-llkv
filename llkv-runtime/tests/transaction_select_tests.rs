@@ -22,6 +22,7 @@ fn test_transaction_select() {
         if_not_exists: false,
         or_replace: false,
         source: None,
+        namespace: None,
     };
     session.create_table_plan(create_plan).unwrap();
 
@@ -94,6 +95,7 @@ fn test_transaction_select_with_aggregates() {
         if_not_exists: false,
         or_replace: false,
         source: None,
+        namespace: None,
     };
     session.create_table_plan(create_plan).unwrap();
 

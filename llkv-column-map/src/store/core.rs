@@ -132,6 +132,127 @@ where
         self.dtype_cache.dtype_for_field(field_id)
     }
 
+    /// Ensure that catalog entries and descriptors exist for a logical column.
+    ///
+    /// This is primarily used when creating empty tables so that subsequent
+    /// operations (like `CREATE INDEX`) can resolve column metadata before any
+    /// data has been appended.
+    pub fn ensure_column_registered(
+        &self,
+        field_id: LogicalFieldId,
+        data_type: &DataType,
+    ) -> Result<()> {
+        let rid_field_id = rowid_fid(field_id);
+
+        let mut catalog_dirty = false;
+        let descriptor_pk;
+        let rid_descriptor_pk;
+
+        {
+            let mut catalog = self.catalog.write().unwrap();
+            descriptor_pk = if let Some(&pk) = catalog.map.get(&field_id) {
+                pk
+            } else {
+                let pk = self.pager.alloc_many(1)?[0];
+                catalog.map.insert(field_id, pk);
+                catalog_dirty = true;
+                pk
+            };
+
+            rid_descriptor_pk = if let Some(&pk) = catalog.map.get(&rid_field_id) {
+                pk
+            } else {
+                let pk = self.pager.alloc_many(1)?[0];
+                catalog.map.insert(rid_field_id, pk);
+                catalog_dirty = true;
+                pk
+            };
+        }
+
+        let mut puts: Vec<BatchPut> = Vec::new();
+
+        let data_descriptor_missing = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .is_none();
+
+        if data_descriptor_missing {
+            let (mut descriptor, tail_page) = ColumnDescriptor::load_or_create(
+                Arc::clone(&self.pager),
+                descriptor_pk,
+                field_id,
+            )?;
+            let fingerprint = DTypeCache::<P>::dtype_fingerprint(data_type);
+            if fingerprint != 0 {
+                DTypeCache::<P>::set_desc_dtype_fingerprint(&mut descriptor, fingerprint);
+            }
+            puts.push(BatchPut::Raw {
+                key: descriptor.tail_page_pk,
+                bytes: tail_page,
+            });
+            puts.push(BatchPut::Raw {
+                key: descriptor_pk,
+                bytes: descriptor.to_le_bytes(),
+            });
+        }
+
+        let rid_descriptor_missing = self
+            .pager
+            .batch_get(&[BatchGet::Raw {
+                key: rid_descriptor_pk,
+            }])?
+            .pop()
+            .and_then(|r| match r {
+                GetResult::Raw { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .is_none();
+
+        if rid_descriptor_missing {
+            let (mut rid_descriptor, tail_page) = ColumnDescriptor::load_or_create(
+                Arc::clone(&self.pager),
+                rid_descriptor_pk,
+                rid_field_id,
+            )?;
+            let fingerprint = DTypeCache::<P>::dtype_fingerprint(&DataType::UInt64);
+            if fingerprint != 0 {
+                DTypeCache::<P>::set_desc_dtype_fingerprint(&mut rid_descriptor, fingerprint);
+            }
+            puts.push(BatchPut::Raw {
+                key: rid_descriptor.tail_page_pk,
+                bytes: tail_page,
+            });
+            puts.push(BatchPut::Raw {
+                key: rid_descriptor_pk,
+                bytes: rid_descriptor.to_le_bytes(),
+            });
+        }
+
+        self.dtype_cache.insert(field_id, data_type.clone());
+
+        if catalog_dirty {
+            let catalog_bytes = {
+                let catalog = self.catalog.read().unwrap();
+                catalog.to_bytes()
+            };
+            puts.push(BatchPut::Raw {
+                key: CATALOG_ROOT_PKEY,
+                bytes: catalog_bytes,
+            });
+        }
+
+        if !puts.is_empty() {
+            self.pager.batch_put(&puts)?;
+        }
+
+        Ok(())
+    }
+
     /// Find all row IDs where a column satisfies a predicate.
     ///
     /// This evaluates the predicate against the column's data and returns a vector

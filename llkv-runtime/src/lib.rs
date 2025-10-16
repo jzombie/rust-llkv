@@ -27,6 +27,8 @@
 //! The runtime ensures these columns are injected and managed consistently.
 #![forbid(unsafe_code)]
 
+pub mod storage_namespace;
+
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
@@ -51,8 +53,8 @@ use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 // Literal is not used at top-level; keep it out to avoid unused import warnings.
 use llkv_result::Error;
-use llkv_storage::pager::{MemPager, Pager};
-use llkv_table::catalog::{FieldConstraints, FieldDefinition};
+use llkv_storage::pager::{BoxedPager, MemPager, Pager};
+use llkv_table::catalog::{FieldConstraints, FieldDefinition, TableCatalog};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_table::{CATALOG_TABLE_ID, ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta};
@@ -77,6 +79,10 @@ pub use llkv_plan::{
 // Execution structures from llkv-executor
 use llkv_executor::{ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema, ExecutorTable};
 pub use llkv_executor::{QueryExecutor, RowBatch, SelectExecution, TableProvider};
+
+use crate::storage_namespace::{
+    PersistentNamespace, StorageNamespace, StorageNamespaceRegistry, TemporaryNamespace,
+};
 
 // Import transaction structures from llkv-transaction for internal use.
 pub use llkv_transaction::TransactionKind;
@@ -420,6 +426,74 @@ where
     }
 }
 
+struct SessionNamespaces<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    persistent: Arc<PersistentNamespace<P>>,
+    temporary: Option<Arc<TemporaryNamespace<BoxedPager>>>,
+    registry: Arc<RwLock<StorageNamespaceRegistry>>,
+}
+
+impl<P> SessionNamespaces<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    fn new(base_context: Arc<RuntimeContext<P>>) -> Self {
+        let persistent = Arc::new(PersistentNamespace::new(
+            storage_namespace::PERSISTENT_NAMESPACE_ID.to_string(),
+            Arc::clone(&base_context),
+        ));
+
+        let mut registry = StorageNamespaceRegistry::new(persistent.namespace_id().clone());
+        registry.register_namespace(Arc::clone(&persistent), Vec::<String>::new(), false);
+
+        let temporary = {
+            let temp_pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
+            let temp_context = Arc::new(RuntimeContext::new(temp_pager));
+            let namespace = Arc::new(TemporaryNamespace::new(
+                storage_namespace::TEMPORARY_NAMESPACE_ID.to_string(),
+                temp_context,
+            ));
+            registry.register_namespace(
+                Arc::clone(&namespace),
+                vec![storage_namespace::TEMPORARY_NAMESPACE_ID.to_string()],
+                true,
+            );
+            namespace
+        };
+
+        Self {
+            persistent,
+            temporary: Some(temporary),
+            registry: Arc::new(RwLock::new(registry)),
+        }
+    }
+
+    fn persistent(&self) -> Arc<PersistentNamespace<P>> {
+        Arc::clone(&self.persistent)
+    }
+
+    fn temporary(&self) -> Option<Arc<TemporaryNamespace<BoxedPager>>> {
+        self.temporary.as_ref().map(Arc::clone)
+    }
+
+    fn registry(&self) -> Arc<RwLock<StorageNamespaceRegistry>> {
+        Arc::clone(&self.registry)
+    }
+}
+
+impl<P> Drop for SessionNamespaces<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        if let Some(temp) = &self.temporary {
+            temp.clear_tables();
+        }
+    }
+}
+
 /// A session for executing operations with optional transaction support.
 ///
 /// This is a high-level wrapper around the transaction machinery that provides
@@ -430,6 +504,7 @@ where
 {
     // TODO: Allow generic pager type
     inner: TransactionSession<RuntimeContextWrapper<P>, RuntimeContextWrapper<MemPager>>,
+    namespaces: Arc<SessionNamespaces<P>>,
 }
 
 impl<P> RuntimeSession<P>
@@ -441,7 +516,75 @@ where
     pub(crate) fn clone_session(&self) -> Self {
         Self {
             inner: self.inner.clone_session(),
+            namespaces: self.namespaces.clone(),
         }
+    }
+
+    pub fn namespace_registry(&self) -> Arc<RwLock<StorageNamespaceRegistry>> {
+        self.namespaces.registry()
+    }
+
+    fn resolve_namespace_for_table(&self, canonical: &str) -> storage_namespace::NamespaceId {
+        self.namespace_registry()
+            .read()
+            .expect("namespace registry poisoned")
+            .namespace_for_table(canonical)
+    }
+
+    fn namespace_for_select_plan(
+        &self,
+        plan: &SelectPlan,
+    ) -> Option<storage_namespace::NamespaceId> {
+        if plan.tables.len() != 1 {
+            return None;
+        }
+
+        let qualified = plan.tables[0].qualified_name();
+        let (_, canonical) = canonical_table_name(&qualified).ok()?;
+        Some(self.resolve_namespace_for_table(&canonical))
+    }
+
+    fn select_from_temporary(&self, plan: SelectPlan) -> Result<RuntimeStatementResult<P>> {
+        let temp_namespace = self
+            .temporary_namespace()
+            .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+
+        let table_name = if plan.tables.len() == 1 {
+            plan.tables[0].qualified_name()
+        } else {
+            String::new()
+        };
+
+        let execution = temp_namespace.context().execute_select(plan.clone())?;
+        let schema = execution.schema();
+        let batches = execution.collect()?;
+
+        let combined = if batches.is_empty() {
+            RecordBatch::new_empty(Arc::clone(&schema))
+        } else if batches.len() == 1 {
+            batches.into_iter().next().unwrap()
+        } else {
+            let refs: Vec<&RecordBatch> = batches.iter().collect();
+            arrow::compute::concat_batches(&schema, refs)?
+        };
+
+        let execution =
+            SelectExecution::from_batch(table_name.clone(), Arc::clone(&schema), combined);
+
+        Ok(RuntimeStatementResult::Select {
+            execution,
+            table_name,
+            schema,
+        })
+    }
+
+    fn persistent_namespace(&self) -> Arc<PersistentNamespace<P>> {
+        self.namespaces.persistent()
+    }
+
+    #[allow(dead_code)]
+    fn temporary_namespace(&self) -> Option<Arc<TemporaryNamespace<BoxedPager>>> {
+        self.namespaces.temporary()
     }
 
     /// Begin a transaction in this session.
@@ -608,37 +751,91 @@ where
 
     /// Create a table (outside or inside transaction).
     pub fn create_table_plan(&self, plan: CreateTablePlan) -> Result<RuntimeStatementResult<P>> {
-        let plan = self.materialize_create_table_plan(plan)?;
-        if self.has_active_transaction() {
-            let table_name = plan.name.clone();
-            match self
-                .inner
-                .execute_operation(PlanOperation::CreateTable(plan))
-            {
-                Ok(_) => Ok(RuntimeStatementResult::CreateTable { table_name }),
-                Err(e) => {
-                    // If an error occurs during a transaction, abort it
-                    self.abort_transaction();
-                    Err(e)
+        let mut plan = self.materialize_create_table_plan(plan)?;
+        let namespace_id = plan
+            .namespace
+            .clone()
+            .unwrap_or_else(|| storage_namespace::PERSISTENT_NAMESPACE_ID.to_string());
+        plan.namespace = Some(namespace_id.clone());
+
+        match namespace_id.as_str() {
+            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                temp_namespace.create_table(plan)?.convert_pager_type::<P>()
+            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+                if self.has_active_transaction() {
+                    let table_name = plan.name.clone();
+                    match self
+                        .inner
+                        .execute_operation(PlanOperation::CreateTable(plan))
+                    {
+                        Ok(_) => Ok(RuntimeStatementResult::CreateTable { table_name }),
+                        Err(e) => {
+                            // If an error occurs during a transaction, abort it
+                            self.abort_transaction();
+                            Err(e)
+                        }
+                    }
+                } else {
+                    self.persistent_namespace().create_table(plan)
                 }
             }
-        } else {
-            // Call via TransactionContext trait
-            let table_name = plan.name.clone();
-            TransactionContext::create_table_plan(&**self.inner.context(), plan)?;
-            Ok(RuntimeStatementResult::CreateTable { table_name })
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
+        }
+    }
+
+    pub fn drop_table(&self, name: &str, if_exists: bool) -> Result<()> {
+        let (_, canonical_table) = canonical_table_name(name)?;
+        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
+
+        match namespace_id.as_str() {
+            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                temp_namespace.drop_table(name, if_exists)
+            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+                self.persistent_namespace().drop_table(name, if_exists)
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
         }
     }
     /// Create an index (auto-commit only for now).
     pub fn create_index(&self, plan: CreateIndexPlan) -> Result<RuntimeStatementResult<P>> {
-        if self.has_active_transaction() {
-            return Err(Error::InvalidArgumentError(
-                "CREATE INDEX is not supported inside an active transaction".into(),
-            ));
-        }
+        let (_, canonical_table) = canonical_table_name(&plan.table)?;
+        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
-        let context = self.inner.context();
-        context.ctx().create_index(plan)
+        match namespace_id.as_str() {
+            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                temp_namespace.create_index(plan)?.convert_pager_type::<P>()
+            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+                if self.has_active_transaction() {
+                    return Err(Error::InvalidArgumentError(
+                        "CREATE INDEX is not supported inside an active transaction".into(),
+                    ));
+                }
+
+                self.persistent_namespace().create_index(plan)
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
+        }
     }
 
     fn normalize_insert_plan(&self, plan: InsertPlan) -> Result<(InsertPlan, usize)> {
@@ -699,45 +896,72 @@ where
         tracing::trace!("Session::insert called for table={}", plan.table);
         let (plan, rows_inserted) = self.normalize_insert_plan(plan)?;
         let table_name = plan.table.clone();
+        let (_, canonical_table) = canonical_table_name(&plan.table)?;
+        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
-        if self.has_active_transaction() {
-            match self.inner.execute_operation(PlanOperation::Insert(plan)) {
-                Ok(_) => {
-                    tracing::trace!("Session::insert succeeded for table={}", table_name);
+        match namespace_id.as_str() {
+            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                temp_namespace
+                    .context()
+                    .insert(plan)?
+                    .convert_pager_type::<P>()?;
+                Ok(RuntimeStatementResult::Insert {
+                    rows_inserted,
+                    table_name,
+                })
+            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+                if self.has_active_transaction() {
+                    match self.inner.execute_operation(PlanOperation::Insert(plan)) {
+                        Ok(_) => {
+                            tracing::trace!("Session::insert succeeded for table={}", table_name);
+                            Ok(RuntimeStatementResult::Insert {
+                                rows_inserted,
+                                table_name,
+                            })
+                        }
+                        Err(e) => {
+                            tracing::trace!(
+                                "Session::insert failed for table={}, error={:?}",
+                                table_name,
+                                e
+                            );
+                            if matches!(e, Error::ConstraintError(_)) {
+                                tracing::trace!("Transaction is_aborted=true");
+                                self.abort_transaction();
+                            }
+                            Err(e)
+                        }
+                    }
+                } else {
+                    let context = self.inner.context();
+                    let default_snapshot = context.ctx().default_snapshot();
+                    TransactionContext::set_snapshot(&**context, default_snapshot);
+                    TransactionContext::insert(&**context, plan)?;
                     Ok(RuntimeStatementResult::Insert {
                         rows_inserted,
                         table_name,
                     })
                 }
-                Err(e) => {
-                    tracing::trace!(
-                        "Session::insert failed for table={}, error={:?}",
-                        table_name,
-                        e
-                    );
-                    // Only abort transaction on constraint violations
-                    if matches!(e, Error::ConstraintError(_)) {
-                        tracing::trace!("Transaction is_aborted=true");
-                        self.abort_transaction();
-                    }
-                    Err(e)
-                }
             }
-        } else {
-            // Call via TransactionContext trait
-            let context = self.inner.context();
-            let default_snapshot = context.ctx().default_snapshot();
-            TransactionContext::set_snapshot(&**context, default_snapshot);
-            TransactionContext::insert(&**context, plan)?;
-            Ok(RuntimeStatementResult::Insert {
-                rows_inserted,
-                table_name,
-            })
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
         }
     }
 
     /// Select rows (outside or inside transaction).
     pub fn select(&self, plan: SelectPlan) -> Result<RuntimeStatementResult<P>> {
+        if let Some(namespace_id) = self.namespace_for_select_plan(&plan) {
+            if namespace_id == storage_namespace::TEMPORARY_NAMESPACE_ID {
+                return self.select_from_temporary(plan);
+            }
+        }
+
         if self.has_active_transaction() {
             let tx_result = match self
                 .inner
@@ -820,79 +1044,123 @@ where
 
     /// Update rows (outside or inside transaction).
     pub fn update(&self, plan: UpdatePlan) -> Result<RuntimeStatementResult<P>> {
-        if self.has_active_transaction() {
-            let table_name = plan.table.clone();
-            let result = match self.inner.execute_operation(PlanOperation::Update(plan)) {
-                Ok(result) => result,
-                Err(e) => {
-                    // If an error occurs during a transaction, abort it
-                    self.abort_transaction();
-                    return Err(e);
+        let (_, canonical_table) = canonical_table_name(&plan.table)?;
+        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
+
+        match namespace_id.as_str() {
+            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                temp_namespace
+                    .context()
+                    .update(plan)?
+                    .convert_pager_type::<P>()
+            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+                if self.has_active_transaction() {
+                    let table_name = plan.table.clone();
+                    let result = match self.inner.execute_operation(PlanOperation::Update(plan)) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            // If an error occurs during a transaction, abort it
+                            self.abort_transaction();
+                            return Err(e);
+                        }
+                    };
+                    match result {
+                        TransactionResult::Update {
+                            rows_matched: _,
+                            rows_updated,
+                        } => Ok(RuntimeStatementResult::Update {
+                            rows_updated,
+                            table_name,
+                        }),
+                        _ => Err(Error::Internal("expected Update result".into())),
+                    }
+                } else {
+                    // Call via TransactionContext trait
+                    let context = self.inner.context();
+                    let default_snapshot = context.ctx().default_snapshot();
+                    TransactionContext::set_snapshot(&**context, default_snapshot);
+                    let table_name = plan.table.clone();
+                    let result = TransactionContext::update(&**context, plan)?;
+                    match result {
+                        TransactionResult::Update {
+                            rows_matched: _,
+                            rows_updated,
+                        } => Ok(RuntimeStatementResult::Update {
+                            rows_updated,
+                            table_name,
+                        }),
+                        _ => Err(Error::Internal("expected Update result".into())),
+                    }
                 }
-            };
-            match result {
-                TransactionResult::Update {
-                    rows_matched: _,
-                    rows_updated,
-                } => Ok(RuntimeStatementResult::Update {
-                    rows_updated,
-                    table_name,
-                }),
-                _ => Err(Error::Internal("expected Update result".into())),
             }
-        } else {
-            // Call via TransactionContext trait
-            let context = self.inner.context();
-            let default_snapshot = context.ctx().default_snapshot();
-            TransactionContext::set_snapshot(&**context, default_snapshot);
-            let table_name = plan.table.clone();
-            let result = TransactionContext::update(&**context, plan)?;
-            match result {
-                TransactionResult::Update {
-                    rows_matched: _,
-                    rows_updated,
-                } => Ok(RuntimeStatementResult::Update {
-                    rows_updated,
-                    table_name,
-                }),
-                _ => Err(Error::Internal("expected Update result".into())),
-            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
         }
     }
 
     /// Delete rows (outside or inside transaction).
     pub fn delete(&self, plan: DeletePlan) -> Result<RuntimeStatementResult<P>> {
-        if self.has_active_transaction() {
-            let table_name = plan.table.clone();
-            let result = match self.inner.execute_operation(PlanOperation::Delete(plan)) {
-                Ok(result) => result,
-                Err(e) => {
-                    // If an error occurs during a transaction, abort it
-                    self.abort_transaction();
-                    return Err(e);
+        let (_, canonical_table) = canonical_table_name(&plan.table)?;
+        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
+
+        match namespace_id.as_str() {
+            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                temp_namespace
+                    .context()
+                    .delete(plan)?
+                    .convert_pager_type::<P>()
+            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+                if self.has_active_transaction() {
+                    let table_name = plan.table.clone();
+                    let result = match self.inner.execute_operation(PlanOperation::Delete(plan)) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            // If an error occurs during a transaction, abort it
+                            self.abort_transaction();
+                            return Err(e);
+                        }
+                    };
+                    match result {
+                        TransactionResult::Delete { rows_deleted } => {
+                            Ok(RuntimeStatementResult::Delete {
+                                rows_deleted,
+                                table_name,
+                            })
+                        }
+                        _ => Err(Error::Internal("expected Delete result".into())),
+                    }
+                } else {
+                    // Call via TransactionContext trait
+                    let context = self.inner.context();
+                    let default_snapshot = context.ctx().default_snapshot();
+                    TransactionContext::set_snapshot(&**context, default_snapshot);
+                    let table_name = plan.table.clone();
+                    let result = TransactionContext::delete(&**context, plan)?;
+                    match result {
+                        TransactionResult::Delete { rows_deleted } => {
+                            Ok(RuntimeStatementResult::Delete {
+                                rows_deleted,
+                                table_name,
+                            })
+                        }
+                        _ => Err(Error::Internal("expected Delete result".into())),
+                    }
                 }
-            };
-            match result {
-                TransactionResult::Delete { rows_deleted } => Ok(RuntimeStatementResult::Delete {
-                    rows_deleted,
-                    table_name,
-                }),
-                _ => Err(Error::Internal("expected Delete result".into())),
             }
-        } else {
-            // Call via TransactionContext trait
-            let context = self.inner.context();
-            let default_snapshot = context.ctx().default_snapshot();
-            TransactionContext::set_snapshot(&**context, default_snapshot);
-            let table_name = plan.table.clone();
-            let result = TransactionContext::delete(&**context, plan)?;
-            match result {
-                TransactionResult::Delete { rows_deleted } => Ok(RuntimeStatementResult::Delete {
-                    rows_deleted,
-                    table_name,
-                }),
-                _ => Err(Error::Internal("expected Delete result".into())),
-            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
         }
     }
 }
@@ -992,7 +1260,7 @@ where
     dropped_tables: RwLock<FxHashSet<String>>,
     multi_column_uniques: RwLock<FxHashMap<String, Vec<StoredMultiColumnUnique>>>,
     // Centralized catalog for table/field name resolution
-    catalog: Arc<llkv_table::catalog::TableCatalog>,
+    catalog: Arc<TableCatalog>,
     // Transaction manager for session-based transactions
     transaction_manager:
         TransactionManager<RuntimeContextWrapper<P>, RuntimeContextWrapper<MemPager>>,
@@ -1004,6 +1272,14 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     pub fn new(pager: Arc<P>) -> Self {
+        Self::new_with_catalog_inner(pager, None)
+    }
+
+    pub fn new_with_catalog(pager: Arc<P>, catalog: Arc<TableCatalog>) -> Self {
+        Self::new_with_catalog_inner(pager, Some(catalog))
+    }
+
+    fn new_with_catalog_inner(pager: Arc<P>, shared_catalog: Option<Arc<TableCatalog>>) -> Self {
         tracing::trace!("RuntimeContext::new called, pager={:p}", &*pager);
 
         // Load transaction state and table registry from catalog if it exists
@@ -1168,16 +1444,31 @@ where
         }
 
         // Initialize catalog and populate with existing tables
-        let catalog = Arc::new(llkv_table::catalog::TableCatalog::new());
+        let (catalog, is_shared_catalog) = match shared_catalog {
+            Some(existing) => (existing, true),
+            None => (Arc::new(TableCatalog::new()), false),
+        };
         for (_table_id, table_meta) in &loaded_tables {
             if let Some(ref table_name) = table_meta.name
                 && let Err(e) = catalog.register_table(table_name.as_str())
             {
-                tracing::warn!(
-                    "[CONTEXT] Failed to register table '{}' in catalog: {}",
-                    table_name,
-                    e
-                );
+                match e {
+                    Error::CatalogError(ref msg)
+                        if is_shared_catalog && msg.contains("already exists") =>
+                    {
+                        tracing::debug!(
+                            "[CONTEXT] Shared catalog already contains table '{}'",
+                            table_name
+                        );
+                    }
+                    other => {
+                        tracing::warn!(
+                            "[CONTEXT] Failed to register table '{}' in catalog: {}",
+                            table_name,
+                            other
+                        );
+                    }
+                }
             }
         }
         tracing::debug!(
@@ -1284,7 +1575,7 @@ where
     }
 
     /// Get the table catalog for schema and table name management.
-    pub fn table_catalog(&self) -> Arc<llkv_table::catalog::TableCatalog> {
+    pub fn table_catalog(&self) -> Arc<TableCatalog> {
         Arc::clone(&self.catalog)
     }
 
@@ -1292,12 +1583,13 @@ where
     /// Each session can have its own independent transaction.
     pub fn create_session(self: &Arc<Self>) -> RuntimeSession<P> {
         tracing::debug!("[SESSION] RuntimeContext::create_session called");
+        let namespaces = Arc::new(SessionNamespaces::new(Arc::clone(self)));
         let wrapper = RuntimeContextWrapper::new(Arc::clone(self));
         let inner = self.transaction_manager.create_session(Arc::new(wrapper));
         tracing::debug!(
             "[SESSION] Created TransactionSession with session_id (will be logged by transaction manager)"
         );
-        RuntimeSession { inner }
+        RuntimeSession { inner, namespaces }
     }
 
     /// Get a handle to an existing table by name.
@@ -1519,8 +1811,19 @@ where
 
             store.register_index(logical_field_id, IndexKind::Sort)?;
 
+            if let Some(updated_table) = Self::rebuild_executor_table_with_unique(
+                table.as_ref(),
+                field_id,
+            ) {
+                self.tables
+                    .write()
+                    .unwrap()
+                    .insert(canonical_name.clone(), Arc::clone(&updated_table));
+            } else {
+                self.remove_table_entry(&canonical_name);
+            }
+
             drop(table);
-            self.remove_table_entry(&canonical_name);
 
             return Ok(RuntimeStatementResult::CreateIndex {
                 table_name: display_name,
@@ -1956,39 +2259,8 @@ where
     }
 
     pub fn execute_select(self: &Arc<Self>, plan: SelectPlan) -> Result<SelectExecution<P>> {
-        // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
-        if plan.tables.is_empty() {
-            // No table to query - just evaluate computed expressions
-            let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
-                context: Arc::clone(self),
-            });
-            let executor = QueryExecutor::new(provider);
-            return executor.execute_select(plan);
-        }
-
-        // Resolve canonical names for all tables (don't verify existence yet - let executor do it)
-        let mut canonical_tables = Vec::new();
-        for table_ref in &plan.tables {
-            let qualified = table_ref.qualified_name();
-            let (_display, canonical) = canonical_table_name(&qualified)?;
-            // Parse canonical back into schema.table
-            let parts: Vec<&str> = canonical.split('.').collect();
-            let canon_ref = if parts.len() >= 2 {
-                llkv_plan::TableRef::new(parts[0], parts[1])
-            } else {
-                llkv_plan::TableRef::new("", &canonical)
-            };
-            canonical_tables.push(canon_ref);
-        }
-
-        let mut canonical_plan = plan.clone();
-        canonical_plan.tables = canonical_tables;
-
-        let provider: Arc<dyn TableProvider<P>> = Arc::new(ContextProvider {
-            context: Arc::clone(self),
-        });
-        let executor = QueryExecutor::new(provider);
-        executor.execute_select(canonical_plan)
+        let snapshot = self.default_snapshot();
+        self.execute_select_with_snapshot(plan, snapshot)
     }
 
     pub fn execute_select_with_snapshot(
@@ -2135,6 +2407,12 @@ where
                 flags: 0,
                 default: None,
             });
+        }
+
+        let store = ColumnStore::open(Arc::clone(&self.pager))?;
+        for column in &column_defs {
+            let logical_field_id = LogicalFieldId::for_user(table_id, column.field_id);
+            store.ensure_column_registered(logical_field_id, &column.data_type)?;
         }
 
         let schema = Arc::new(ExecutorSchema {
@@ -2960,6 +3238,41 @@ where
         }
 
         Ok(())
+    }
+
+    fn rebuild_executor_table_with_unique(
+        table: &ExecutorTable<P>,
+        field_id: FieldId,
+    ) -> Option<Arc<ExecutorTable<P>>> {
+        let mut columns = table.schema.columns.clone();
+        let mut found = false;
+        for column in &mut columns {
+            if column.field_id == field_id {
+                column.unique = true;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return None;
+        }
+
+        let schema = Arc::new(ExecutorSchema {
+            columns,
+            lookup: table.schema.lookup.clone(),
+        });
+
+        let next_row_id = table.next_row_id.load(Ordering::SeqCst);
+        let total_rows = table.total_rows.load(Ordering::SeqCst);
+        let uniques = table.multi_column_uniques();
+
+        Some(Arc::new(ExecutorTable {
+            table: Arc::clone(&table.table),
+            schema,
+            next_row_id: AtomicU64::new(next_row_id),
+            total_rows: AtomicU64::new(total_rows),
+            multi_column_uniques: RwLock::new(uniques),
+        }))
     }
 
     fn ensure_existing_rows_unique_multi(
@@ -4050,7 +4363,7 @@ where
         Ok(())
     }
 
-    fn lookup_table(&self, canonical_name: &str) -> Result<Arc<ExecutorTable<P>>> {
+    pub fn lookup_table(&self, canonical_name: &str) -> Result<Arc<ExecutorTable<P>>> {
         // Fast path: check if table is already loaded
         {
             let tables = self.tables.read().unwrap();
