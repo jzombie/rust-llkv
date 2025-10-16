@@ -507,7 +507,7 @@ where
             all_column_names.push(column_name);
         }
 
-        // Second pass: process columns including CHECK validation
+        // Second pass: process columns including CHECK validation and column-level FKs
         for column_def in column_defs_ast {
             let is_nullable = column_def
                 .options
@@ -545,6 +545,64 @@ where
             }
 
             let check_expr_str = check_expr.map(|e| e.to_string());
+
+            // Extract column-level FOREIGN KEY (REFERENCES clause)
+            for opt in &column_def.options {
+                if let ColumnOption::ForeignKey {
+                    foreign_table,
+                    referred_columns,
+                    on_delete,
+                    on_update,
+                    characteristics,
+                } = &opt.option
+                {
+                    if characteristics.is_some() {
+                        return Err(Error::InvalidArgumentError(
+                            "FOREIGN KEY constraint characteristics are not supported yet".into(),
+                        ));
+                    }
+
+                    let referenced_table = Self::object_name_to_string(foreign_table)?;
+                    let referenced_columns = if referred_columns.is_empty() {
+                        vec![column_def.name.value.clone()]
+                    } else {
+                        referred_columns.iter().map(|c| c.value.clone()).collect()
+                    };
+
+                    if referenced_columns.len() != 1 {
+                        return Err(Error::InvalidArgumentError(
+                            "column-level FOREIGN KEY must reference exactly one column".into(),
+                        ));
+                    }
+
+                    let map_action = |action: &Option<ReferentialAction>,
+                                      kind: &str|
+                     -> SqlResult<ForeignKeyAction> {
+                        match action {
+                            None | Some(ReferentialAction::NoAction) => {
+                                Ok(ForeignKeyAction::NoAction)
+                            }
+                            Some(ReferentialAction::Restrict) => Ok(ForeignKeyAction::Restrict),
+                            Some(other) => Err(Error::InvalidArgumentError(format!(
+                                "FOREIGN KEY ON {kind} {:?} is not supported yet",
+                                other
+                            ))),
+                        }
+                    };
+
+                    let on_delete_action = map_action(on_delete, "DELETE")?;
+                    let on_update_action = map_action(on_update, "UPDATE")?;
+
+                    foreign_keys.push(ForeignKeySpec {
+                        name: None,
+                        columns: vec![column_def.name.value.clone()],
+                        referenced_table,
+                        referenced_columns,
+                        on_delete: on_delete_action,
+                        on_update: on_update_action,
+                    });
+                }
+            }
 
             tracing::trace!(
                 "DEBUG CREATE TABLE column '{}' is_primary_key={} has_unique={} check_expr={:?}",
@@ -2951,7 +3009,8 @@ fn validate_create_table_definition(stmt: &sqlparser::ast::CreateTable) -> SqlRe
                 ColumnOption::Null
                 | ColumnOption::NotNull
                 | ColumnOption::Unique { .. }
-                | ColumnOption::Check(_) => {}
+                | ColumnOption::Check(_)
+                | ColumnOption::ForeignKey { .. } => {}
                 ColumnOption::Default(_) => {
                     return Err(Error::InvalidArgumentError(format!(
                         "DEFAULT values are not supported for column '{}'",
