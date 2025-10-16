@@ -3,6 +3,7 @@ pub mod plan_graph;
 use std::cell::RefCell;
 use std::cmp::{self, Ordering};
 use std::convert::TryFrom;
+use std::mem;
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -12,11 +13,23 @@ use arrow::array::{
 };
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOutcome {
+    Handled,
+    Fallback,
+}
+
+impl StreamOutcome {
+    #[inline]
+    fn is_handled(self) -> bool {
+        matches!(self, StreamOutcome::Handled)
+    }
+}
+
 use llkv_column_map::ScanBuilder;
-use llkv_column_map::parallel;
 use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
-use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::store::scan::ScanOptions;
+use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_column_map::{llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric};
 use llkv_expr::literal::{FromLiteral, Literal};
@@ -29,19 +42,20 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use llkv_storage::pager::Pager;
-use rayon::prelude::*;
 
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::scalar_eval::{NumericArrayMap, NumericKernels};
+use crate::schema_ext::CachedSchema;
 use crate::table::{
     ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
 };
-use crate::types::{FieldId, ROW_ID_FIELD_ID, TableId};
+use crate::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 
 use self::plan_graph::{
     PlanEdge, PlanExpression, PlanField, PlanGraph, PlanGraphBuilder, PlanGraphError, PlanNode,
     PlanNodeId, PlanOperator,
 };
+use crate::stream::{RowStream, RowStreamBuilder};
 
 // TODO: Refactor into executor and potentially migrate any remnants to `llkv-plan`
 
@@ -82,7 +96,6 @@ macro_rules! impl_single_column_reject_chunk_with_rids {
         }
     };
 }
-
 macro_rules! impl_single_column_emit_sorted_run {
     (
         $_base:ident,
@@ -403,21 +416,65 @@ macro_rules! impl_row_id_collect_sorted_run_with_rids {
     };
 }
 
+macro_rules! impl_row_id_stream_chunk_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $chunk_with_rids:ident,
+        $_run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $chunk_with_rids(&mut self, _: &$array_ty, row_ids: &UInt64Array) {
+            self.extend_from_array(row_ids);
+        }
+    };
+}
+
+macro_rules! impl_row_id_stream_sorted_run_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $_chunk_with_rids:ident,
+        $_run:ident,
+        $run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $run_with_rids(
+            &mut self,
+            _: &$array_ty,
+            row_ids: &UInt64Array,
+            start: usize,
+            len: usize,
+        ) {
+            self.extend_from_slice(row_ids, start, len);
+        }
+    };
+}
+
 #[derive(Clone)]
-struct ColumnProjectionInfo {
+pub(crate) struct ColumnProjectionInfo {
     logical_field_id: LogicalFieldId,
     data_type: DataType,
     output_name: String,
 }
 
 #[derive(Clone)]
-struct ComputedProjectionInfo {
+pub(crate) struct ComputedProjectionInfo {
     expr: ScalarExpr<FieldId>,
     alias: String,
 }
 
 #[derive(Clone)]
-enum ProjectionEval {
+pub(crate) enum ProjectionEval {
     Column(ColumnProjectionInfo),
     Computed(ComputedProjectionInfo),
 }
@@ -486,7 +543,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     table: &'a Table<P>,
-    row_id_cache: RefCell<Option<Vec<u64>>>,
+    row_id_cache: RefCell<Option<Vec<RowId>>>,
 }
 
 pub(crate) struct TablePlanner<'a, P>
@@ -518,6 +575,7 @@ where
         TableExecutor::new(self.table).execute(plan, on_batch)
     }
 
+    // TODO: Make streamable. Don't pre-buffer all row ids in memory at once.
     // TODO: Return `LlkvResult<Vec<RowId>>`
     fn plan_scan<'expr>(
         &self,
@@ -643,7 +701,7 @@ where
         }
     }
 
-    fn table_row_ids(&self) -> LlkvResult<Vec<u64>> {
+    fn table_row_ids(&self) -> LlkvResult<Vec<RowId>> {
         if let Some(cached) = self.row_id_cache.borrow().as_ref() {
             return Ok(cached.clone());
         }
@@ -652,7 +710,7 @@ where
         Ok(computed)
     }
 
-    fn compute_table_row_ids(&self) -> LlkvResult<Vec<u64>> {
+    fn compute_table_row_ids(&self) -> LlkvResult<Vec<RowId>> {
         use llkv_column_map::store::rowid_fid;
 
         let fields = self
@@ -722,8 +780,8 @@ where
             .total_rows_for_table(self.table.table_id())
             .unwrap_or_default();
 
-        let mut seen: FxHashSet<u64> = FxHashSet::default();
-        let mut collected: Vec<u64> = Vec::new();
+        let mut seen: FxHashSet<RowId> = FxHashSet::default();
+        let mut collected: Vec<RowId> = Vec::new();
 
         for lfid in fields {
             let mut collector = RowIdScanCollector::default();
@@ -752,7 +810,149 @@ where
         Ok(collected)
     }
 
-    fn collect_row_ids_for_rowid_filter(&self, op: &Operator<'_>) -> LlkvResult<Vec<u64>> {
+    fn stream_table_row_ids<F>(
+        &self,
+        chunk_size: usize,
+        on_chunk: &mut F,
+    ) -> LlkvResult<StreamOutcome>
+    where
+        F: FnMut(Vec<RowId>) -> LlkvResult<()>,
+    {
+        use llkv_column_map::store::rowid_fid;
+
+        let fields = self
+            .table
+            .store()
+            .user_field_ids_for_table(self.table.table_id());
+        if fields.is_empty() {
+            return Ok(StreamOutcome::Handled);
+        }
+
+        let Some(&first_field) = fields.first() else {
+            return Ok(StreamOutcome::Handled);
+        };
+
+        let rid_shadow = rowid_fid(first_field);
+        let store = self.table.store();
+        let mut emitter = RowIdChunkEmitter::new(chunk_size, on_chunk);
+        let scan_result = ScanBuilder::new(store, rid_shadow)
+            .options(ScanOptions {
+                with_row_ids: true,
+                ..Default::default()
+            })
+            .run(&mut emitter);
+
+        match scan_result {
+            Ok(()) => {
+                emitter.finish()?;
+                Ok(StreamOutcome::Handled)
+            }
+            Err(Error::NotFound) => Ok(StreamOutcome::Fallback),
+            Err(err) => {
+                let _ = emitter.finish();
+                Err(err)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_stream_full_table_scan<F>(
+        &self,
+        unique_lfids: &[LogicalFieldId],
+        projection_evals: &[ProjectionEval],
+        passthrough_fields: &[Option<FieldId>],
+        unique_index: &FxHashMap<LogicalFieldId, usize>,
+        numeric_fields: &FxHashSet<FieldId>,
+        requires_numeric: bool,
+        null_policy: GatherNullPolicy,
+        options: &ScanStreamOptions<P>,
+        out_schema: &Arc<Schema>,
+        on_batch: &mut F,
+    ) -> LlkvResult<StreamOutcome>
+    where
+        F: FnMut(RecordBatch),
+    {
+        if options.order.is_some() {
+            return Ok(StreamOutcome::Fallback);
+        }
+
+        let store = self.table.store();
+        let table_id = self.table.table_id();
+        let mut gather_ctx = if unique_lfids.is_empty() {
+            None
+        } else {
+            Some(store.prepare_gather_context(unique_lfids)?)
+        };
+
+        let unique_lfids_arc = Arc::new(unique_lfids.to_vec());
+        let projection_evals_arc = Arc::new(projection_evals.to_vec());
+        let passthrough_fields_arc = Arc::new(passthrough_fields.to_vec());
+        let unique_index_arc = Arc::new(unique_index.clone());
+        let numeric_fields_arc = Arc::new(numeric_fields.clone());
+
+        let mut any_emitted = false;
+
+        let mut process_chunk = |mut chunk: Vec<RowId>| -> LlkvResult<()> {
+            if let Some(filter) = options.row_id_filter.as_ref() {
+                chunk = filter.filter(self.table, chunk)?;
+            }
+            if chunk.is_empty() {
+                return Ok(());
+            }
+
+            let mut builder = RowStreamBuilder::new(
+                store,
+                table_id,
+                Arc::clone(out_schema),
+                Arc::clone(&unique_lfids_arc),
+                Arc::clone(&projection_evals_arc),
+                Arc::clone(&passthrough_fields_arc),
+                Arc::clone(&unique_index_arc),
+                Arc::clone(&numeric_fields_arc),
+                requires_numeric,
+                null_policy,
+                chunk,
+                STREAM_BATCH_ROWS,
+            );
+
+            if let Some(ctx) = gather_ctx.take() {
+                builder = builder.with_gather_context(ctx);
+            }
+
+            let mut stream = builder.build()?;
+            let expected_columns = stream.schema().fields().len();
+
+            while let Some(chunk) = stream.next_chunk()? {
+                let batch = chunk.to_record_batch();
+                debug_assert_eq!(batch.num_columns(), expected_columns);
+                if batch.num_rows() > 0 {
+                    any_emitted = true;
+                    on_batch(batch);
+                }
+            }
+
+            gather_ctx = stream.into_gather_context();
+            Ok(())
+        };
+        if !self
+            .stream_table_row_ids(STREAM_BATCH_ROWS, &mut process_chunk)?
+            .is_handled()
+        {
+            return Ok(StreamOutcome::Fallback);
+        }
+
+        if !any_emitted && options.row_id_filter.is_none() {
+            let total_rows = self.table.total_rows()?;
+            let row_count = usize::try_from(total_rows).map_err(|_| {
+                Error::InvalidArgumentError("table row count exceeds supported range".into())
+            })?;
+            emit_synthetic_null_batch(projection_evals, out_schema, row_count, on_batch)?;
+        }
+
+        Ok(StreamOutcome::Handled)
+    }
+
+    fn collect_row_ids_for_rowid_filter(&self, op: &Operator<'_>) -> LlkvResult<Vec<RowId>> {
         let all_row_ids = self.table_row_ids()?;
         if all_row_ids.is_empty() {
             return Ok(Vec::new());
@@ -771,12 +971,15 @@ where
             plan_graph: _plan_graph,
         } = plan;
 
-        if self.try_single_column_direct_scan(
-            &projections,
-            &filter_expr,
-            options.clone(),
-            &mut on_batch,
-        )? {
+        if self
+            .try_single_column_direct_scan(
+                &projections,
+                &filter_expr,
+                options.clone(),
+                &mut on_batch,
+            )?
+            .is_handled()
+        {
             return Ok(());
         }
 
@@ -865,6 +1068,17 @@ where
             })
             .collect();
 
+        let null_policy = if options.include_nulls {
+            GatherNullPolicy::IncludeNulls
+        } else {
+            GatherNullPolicy::DropNulls
+        };
+
+        let requires_numeric = projection_evals.iter().enumerate().any(|(idx, eval)| {
+            matches!(eval, ProjectionEval::Computed(info) if passthrough_fields[idx].is_none()
+                    && computed_expr_requires_numeric(&info.expr))
+        });
+
         let mut schema_fields: Vec<Field> = Vec::with_capacity(projection_evals.len());
         for (idx, eval) in projection_evals.iter().enumerate() {
             match eval {
@@ -885,6 +1099,7 @@ where
                             ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
                             ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
                             ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
+                            ScalarExpr::Literal(Literal::Null) => DataType::Null,
                             ScalarExpr::Literal(Literal::Struct(fields)) => {
                                 // Infer struct type from the literal fields
                                 let struct_fields = fields
@@ -971,8 +1186,28 @@ where
         }
         let out_schema = Arc::new(Schema::new(schema_fields));
 
+        if options.order.is_none()
+            && is_trivial_filter(&filter_expr)
+            && self
+                .try_stream_full_table_scan(
+                    unique_lfids.as_slice(),
+                    &projection_evals,
+                    &passthrough_fields,
+                    &unique_index,
+                    &numeric_fields,
+                    requires_numeric,
+                    null_policy,
+                    &options,
+                    &out_schema,
+                    &mut on_batch,
+                )?
+                .is_handled()
+        {
+            return Ok(());
+        }
+
         let fusion_cache = PredicateFusionCache::from_expr(&filter_expr);
-        let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
+        let mut all_rows_cache: FxHashMap<FieldId, Vec<RowId>> = FxHashMap::default();
 
         // When we have a trivial filter (no predicates), enumerate ALL row IDs.
         // This is necessary for:
@@ -1016,31 +1251,16 @@ where
             // The old optimization of creating NULL rows for trivial filters breaks MVCC visibility.
             // An empty row_ids list means NO visible rows, so we should return empty results.
             if options.row_id_filter.is_none() && is_trivial_filter(&filter_expr) {
-                tracing::trace!("[SCAN_STREAM] would create synthetic batch but skipping");
-                // Only use the synthetic batch optimization when there's NO MVCC filtering
                 let total_rows = self.table.total_rows()?;
                 let row_count = usize::try_from(total_rows).map_err(|_| {
                     Error::InvalidArgumentError("table row count exceeds supported range".into())
                 })?;
-                if row_count == 0 {
-                    return Ok(());
-                }
-
-                let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
-                for (idx, eval) in projection_evals.iter().enumerate() {
-                    let array = match eval {
-                        ProjectionEval::Column(info) => new_null_array(&info.data_type, row_count),
-                        ProjectionEval::Computed(info) => synthesize_computed_literal_array(
-                            info,
-                            out_schema.field(idx).data_type(),
-                            row_count,
-                        )?,
-                    };
-                    columns.push(array);
-                }
-
-                let batch = RecordBatch::try_new(Arc::clone(&out_schema), columns)?;
-                on_batch(batch);
+                emit_synthetic_null_batch(
+                    &projection_evals,
+                    &out_schema,
+                    row_count,
+                    &mut on_batch,
+                )?;
             }
             return Ok(());
         }
@@ -1048,18 +1268,6 @@ where
         if let Some(order_spec) = options.order {
             row_ids = self.sort_row_ids_with_order(row_ids, order_spec)?;
         }
-
-        let null_policy = if options.include_nulls {
-            GatherNullPolicy::IncludeNulls
-        } else {
-            GatherNullPolicy::DropNulls
-        };
-
-        let requires_numeric = projection_evals.iter().enumerate().any(|(idx, eval)| {
-            matches!(eval, ProjectionEval::Computed(info)
-                if passthrough_fields[idx].is_none()
-                    && computed_expr_requires_numeric(&info.expr))
-        });
 
         let table_id = self.table.table_id();
         let store = self.table.store();
@@ -1069,212 +1277,33 @@ where
         let unique_index = Arc::new(unique_index);
         let numeric_fields = Arc::new(numeric_fields);
 
-        let chunk_ranges: Vec<(usize, usize)> = (0..row_ids.len())
-            .step_by(STREAM_BATCH_ROWS)
-            .map(|start| {
-                let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
-                (start, end)
-            })
-            .collect();
+        let mut row_stream = RowStreamBuilder::new(
+            store,
+            table_id,
+            Arc::clone(&out_schema),
+            Arc::clone(&unique_lfids),
+            Arc::clone(&projection_evals),
+            Arc::clone(&passthrough_fields),
+            Arc::clone(&unique_index),
+            Arc::clone(&numeric_fields),
+            requires_numeric,
+            null_policy,
+            row_ids,
+            STREAM_BATCH_ROWS,
+        )
+        .build()?;
 
-        let chunk_batches: Vec<LlkvResult<Option<RecordBatch>>> = parallel::with_thread_pool(
-            move || {
-                chunk_ranges
-                    .into_par_iter()
-                    .map(|(start, end)| -> LlkvResult<Option<RecordBatch>> {
-                        let window = &row_ids[start..end];
-                        if window.is_empty() {
-                            return Ok(None);
-                        }
+        let expected_columns = row_stream.schema().fields().len();
 
-                        let unique_lfids = Arc::clone(&unique_lfids);
-                        let projection_evals = Arc::clone(&projection_evals);
-                        let passthrough_fields = Arc::clone(&passthrough_fields);
-                        let unique_index = Arc::clone(&unique_index);
-                        let numeric_fields = Arc::clone(&numeric_fields);
-
-                        let (batch_len, unique_arrays_owned, numeric_arrays): (
-                            usize,
-                            Vec<ArrayRef>,
-                            Option<NumericArrayMap>,
-                        ) = if unique_lfids.is_empty() {
-                            let numeric_arrays = if requires_numeric {
-                                Some(Default::default())
-                            } else {
-                                None
-                            };
-                            (window.len(), Vec::new(), numeric_arrays)
-                        } else {
-                            let mut gather_ctx =
-                                match store.prepare_gather_context(unique_lfids.as_ref()) {
-                                    Ok(ctx) => ctx,
-                                    Err(e) => {
-                                        tracing::debug!(
-                                            ?unique_lfids,
-                                            error = %e,
-                                            "prepare_gather_context failed"
-                                        );
-                                        return Err(e);
-                                    }
-                                };
-                            let batch = store.gather_rows_with_reusable_context(
-                                &mut gather_ctx,
-                                window,
-                                null_policy,
-                            )?;
-                            if batch.num_rows() == 0 {
-                                return Ok(None);
-                            }
-
-                            let unique_arrays_owned: Vec<ArrayRef> =
-                                batch.columns().iter().map(Arc::clone).collect();
-                            let numeric_arrays = if requires_numeric {
-                                Some(NumericKernels::prepare_numeric_arrays(
-                                    unique_lfids.as_ref(),
-                                    unique_arrays_owned.as_slice(),
-                                    numeric_fields.as_ref(),
-                                )?)
-                            } else {
-                                None
-                            };
-                            (batch.num_rows(), unique_arrays_owned, numeric_arrays)
-                        };
-
-                        if batch_len == 0 {
-                            return Ok(None);
-                        }
-
-                        let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
-                        for (idx, eval) in projection_evals.iter().enumerate() {
-                            match eval {
-                                ProjectionEval::Column(info) => {
-                                    let arr_idx = *unique_index
-                                        .get(&info.logical_field_id)
-                                        .expect("logical field id missing from index");
-                                    columns.push(Arc::clone(&unique_arrays_owned[arr_idx]));
-                                }
-                                ProjectionEval::Computed(info) => {
-                                    if let Some(fid) = passthrough_fields[idx] {
-                                        let lfid = LogicalFieldId::for_user(table_id, fid);
-                                        let arr_idx = *unique_index
-                                            .get(&lfid)
-                                            .expect("passthrough field missing from index");
-                                        columns.push(Arc::clone(&unique_arrays_owned[arr_idx]));
-                                    } else {
-                                        let array: ArrayRef = match &info.expr {
-                                            ScalarExpr::Literal(Literal::Integer(value)) => {
-                                                let cast = i64::try_from(*value).map_err(|_| {
-                                                    Error::InvalidArgumentError(
-                                                        "integer literal exceeds 64-bit range"
-                                                            .into(),
-                                                    )
-                                                })?;
-                                                Arc::new(Int64Array::from(vec![cast; batch_len]))
-                                                    as ArrayRef
-                                            }
-                                            ScalarExpr::Literal(Literal::Float(value)) => {
-                                                Arc::new(Float64Array::from(vec![
-                                                    *value;
-                                                    batch_len
-                                                ])) as ArrayRef
-                                            }
-                                            ScalarExpr::Literal(Literal::String(value)) => {
-                                                Arc::new(StringArray::from(vec![
-                                                    value.clone();
-                                                    batch_len
-                                                ])) as ArrayRef
-                                            }
-                                            ScalarExpr::GetField { base, field_name } => {
-                                                // Recursively evaluate GetField expressions
-                                                fn eval_get_field(
-                                                    expr: &ScalarExpr<FieldId>,
-                                                    field_name: &str,
-                                                    unique_arrays_owned: &[ArrayRef],
-                                                    unique_index: &FxHashMap<LogicalFieldId, usize>,
-                                                    table_id: TableId,
-                                                ) -> LlkvResult<ArrayRef> {
-                                                    // Evaluate base expression to get the struct array
-                                                    let base_array = match expr {
-                                                        ScalarExpr::Column(fid) => {
-                                                            let lfid = LogicalFieldId::for_user(table_id, *fid);
-                                                            let arr_idx = *unique_index
-                                                                .get(&lfid)
-                                                                .ok_or_else(|| Error::Internal(
-                                                                    format!("field {} not found in unique arrays", fid)
-                                                                ))?;
-                                                            Arc::clone(&unique_arrays_owned[arr_idx])
-                                                        }
-                                                        ScalarExpr::GetField { base: inner_base, field_name: inner_field } => {
-                                                            eval_get_field(
-                                                                inner_base,
-                                                                inner_field,
-                                                                unique_arrays_owned,
-                                                                unique_index,
-                                                                table_id,
-                                                            )?
-                                                        }
-                                                        _ => return Err(Error::InvalidArgumentError(
-                                                            "GetField base must be a column or another GetField".into()
-                                                        )),
-                                                    };
-
-                                                    // Extract the field from the struct array
-                                                    let struct_array = base_array
-                                                        .as_any()
-                                                        .downcast_ref::<arrow::array::StructArray>()
-                                                        .ok_or_else(|| Error::InvalidArgumentError(
-                                                            "GetField can only be applied to struct types".into()
-                                                        ))?;
-
-                                                    struct_array
-                                                        .column_by_name(field_name)
-                                                        .ok_or_else(|| Error::InvalidArgumentError(
-                                                            format!("Field '{}' not found in struct", field_name)
-                                                        ))
-                                                        .map(Arc::clone)
-                                                }
-
-                                                eval_get_field(
-                                                    base,
-                                                    field_name,
-                                                    &unique_arrays_owned,
-                                                    &unique_index,
-                                                    table_id,
-                                                )?
-                                            }
-                                            _ => {
-                                                let numeric_arrays = numeric_arrays.as_ref().expect(
-                                                    "numeric arrays should exist for computed projection",
-                                                );
-                                                NumericKernels::evaluate_batch(
-                                                    &info.expr,
-                                                    batch_len,
-                                                    numeric_arrays,
-                                                )?
-                                            }
-                                        };
-                                        columns.push(array);
-                                    }
-                                }
-                            }
-                        }
-
-                        let output_batch = RecordBatch::try_new(Arc::clone(&out_schema), columns)?;
-                        Ok(Some(output_batch))
-                    })
-                    .collect()
-            },
-        );
-
-        for batch_result in chunk_batches {
-            if let Some(batch) = batch_result? {
-                tracing::debug!(
-                    rows = batch.num_rows(),
-                    columns = batch.num_columns(),
-                    "TableExecutor produced batch"
-                );
-                on_batch(batch);
-            }
+        while let Some(chunk) = row_stream.next_chunk()? {
+            let batch = chunk.to_record_batch();
+            debug_assert_eq!(batch.num_columns(), expected_columns);
+            tracing::debug!(
+                rows = batch.num_rows(),
+                columns = batch.num_columns(),
+                "TableExecutor produced batch"
+            );
+            on_batch(batch);
         }
 
         Ok(())
@@ -1286,12 +1315,12 @@ where
         filter_expr: &Expr<'expr, FieldId>,
         options: ScanStreamOptions<P>,
         on_batch: &mut F,
-    ) -> LlkvResult<bool>
+    ) -> LlkvResult<StreamOutcome>
     where
         F: FnMut(RecordBatch),
     {
         if options.include_nulls || projections.len() != 1 {
-            return Ok(false);
+            return Ok(StreamOutcome::Fallback);
         }
 
         match &projections[0] {
@@ -1305,12 +1334,12 @@ where
                 }
 
                 if !is_full_range_filter(filter_expr, p.logical_field_id.field_id()) {
-                    return Ok(false);
+                    return Ok(StreamOutcome::Fallback);
                 }
 
                 let dtype = self.table.store().data_type(p.logical_field_id)?;
                 if matches!(dtype, DataType::Utf8 | DataType::LargeUtf8) {
-                    return Ok(false);
+                    return Ok(StreamOutcome::Fallback);
                 }
                 let field_name = p
                     .alias
@@ -1327,20 +1356,20 @@ where
                     .options(ScanOptions::default())
                     .run(&mut visitor)?;
                 visitor.finish()?;
-                Ok(true)
+                Ok(StreamOutcome::Handled)
             }
             ScanProjection::Computed { expr, alias } => {
                 let simplified = NumericKernels::simplify(expr);
                 let mut fields_set: FxHashSet<FieldId> = FxHashSet::default();
                 NumericKernels::collect_fields(&simplified, &mut fields_set);
                 if fields_set.len() != 1 {
-                    return Ok(false);
+                    return Ok(StreamOutcome::Fallback);
                 }
 
                 let field_id = *fields_set.iter().next().unwrap();
                 let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
                 if !is_full_range_filter(filter_expr, field_id) {
-                    return Ok(false);
+                    return Ok(StreamOutcome::Fallback);
                 }
 
                 if lfid.namespace() != Namespace::UserData {
@@ -1369,7 +1398,7 @@ where
                         .options(ScanOptions::default())
                         .run(&mut visitor)?;
                     visitor.finish()?;
-                    return Ok(true);
+                    return Ok(StreamOutcome::Handled);
                 }
 
                 if let Some(affine) = NumericKernels::extract_affine(&simplified) {
@@ -1379,7 +1408,7 @@ where
                         ));
                     }
                     if !is_supported_numeric(&dtype) {
-                        return Ok(false);
+                        return Ok(StreamOutcome::Fallback);
                     }
                     let schema = Arc::new(Schema::new(vec![Field::new(
                         field_alias.clone(),
@@ -1396,7 +1425,7 @@ where
                         .options(ScanOptions::default())
                         .run(&mut visitor)?;
                     visitor.finish()?;
-                    return Ok(true);
+                    return Ok(StreamOutcome::Handled);
                 }
 
                 let mut numeric_fields: FxHashSet<FieldId> = FxHashSet::default();
@@ -1417,7 +1446,7 @@ where
                     .options(ScanOptions::default())
                     .run(&mut visitor)?;
                 visitor.finish()?;
-                Ok(true)
+                Ok(StreamOutcome::Handled)
             }
         }
     }
@@ -1426,8 +1455,8 @@ where
         &self,
         expr: &Expr<'_, FieldId>,
         fusion_cache: &PredicateFusionCache,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
-    ) -> LlkvResult<Vec<u64>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
+    ) -> LlkvResult<Vec<RowId>> {
         match expr {
             Expr::Pred(filter) => self.collect_row_ids_for_filter(filter),
             Expr::Compare { left, op, right } => {
@@ -1465,16 +1494,20 @@ where
                     let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
                     let dtype = self.table.store().data_type(filter_lfid)?;
 
-                    if fusion_cache.should_fuse(fid, &dtype) {
-                        // Collect operator list
-                        let ops: Vec<Operator<'_>> = children
-                            .iter()
-                            .map(|c| match c {
-                                Expr::Pred(f) => f.op.clone(),
-                                _ => unreachable!(),
-                            })
-                            .collect();
+                    // Collect operator list once so we can inspect support for fusion
+                    let ops: Vec<Operator<'_>> = children
+                        .iter()
+                        .map(|c| match c {
+                            Expr::Pred(f) => f.op.clone(),
+                            _ => unreachable!(),
+                        })
+                        .collect();
 
+                    let supports_fused = ops
+                        .iter()
+                        .all(|op| !matches!(op, Operator::IsNull | Operator::IsNotNull));
+
+                    if supports_fused && fusion_cache.should_fuse(fid, &dtype) {
                         let row_ids = match &dtype {
                             DataType::Utf8 => {
                                 self.collect_matching_row_ids_string_fused::<i32>(filter_lfid, &ops)
@@ -1549,7 +1582,7 @@ where
         }
     }
 
-    fn collect_row_ids_for_filter(&self, filter: &Filter<'_, FieldId>) -> LlkvResult<Vec<u64>> {
+    fn collect_row_ids_for_filter(&self, filter: &Filter<'_, FieldId>) -> LlkvResult<Vec<RowId>> {
         if filter.field_id == ROW_ID_FIELD_ID {
             let row_ids = self.collect_row_ids_for_rowid_filter(&filter.op)?;
             tracing::debug!(
@@ -1562,6 +1595,35 @@ where
 
         let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), filter.field_id);
         let dtype = self.table.store().data_type(filter_lfid)?;
+
+        match &filter.op {
+            Operator::IsNotNull => {
+                let mut cache = FxHashMap::default();
+                let non_null = self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
+                tracing::debug!(
+                    field = ?filter_lfid,
+                    row_count = non_null.len(),
+                    "collect_row_ids_for_filter NOT NULL fast path"
+                );
+                return Ok(non_null);
+            }
+            Operator::IsNull => {
+                let all_row_ids = self.table_row_ids()?;
+                if all_row_ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let mut cache = FxHashMap::default();
+                let non_null = self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
+                let null_ids = difference_sorted(all_row_ids, non_null);
+                tracing::debug!(
+                    field = ?filter_lfid,
+                    row_count = null_ids.len(),
+                    "collect_row_ids_for_filter NULL fast path"
+                );
+                return Ok(null_ids);
+            }
+            _ => {}
+        }
 
         if let Operator::Range {
             lower: Bound::Unbounded,
@@ -1607,8 +1669,8 @@ where
         left: &ScalarExpr<FieldId>,
         op: CompareOp,
         right: &ScalarExpr<FieldId>,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
-    ) -> LlkvResult<Vec<u64>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
+    ) -> LlkvResult<Vec<RowId>> {
         let mut fields = FxHashSet::default();
         NumericKernels::collect_fields(left, &mut fields);
         NumericKernels::collect_fields(right, &mut fields);
@@ -1617,7 +1679,7 @@ where
                 "Comparison expression must reference at least one column".into(),
             ));
         }
-        let mut domain: Option<Vec<u64>> = None;
+        let mut domain: Option<Vec<RowId>> = None;
         let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
         ordered_fields.sort_unstable();
         for fid in &ordered_fields {
@@ -1641,47 +1703,90 @@ where
 
     fn evaluate_compare_over_rows(
         &self,
-        row_ids: &[u64],
+        row_ids: &[RowId],
         fields: &[FieldId],
         left: &ScalarExpr<FieldId>,
         op: CompareOp,
         right: &ScalarExpr<FieldId>,
-    ) -> LlkvResult<Vec<u64>> {
+    ) -> LlkvResult<Vec<RowId>> {
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
         let mut numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
         let has_row_id = numeric_fields.remove(&ROW_ID_FIELD_ID);
-        let lfids: Vec<LogicalFieldId> = fields
+
+        let table_id = self.table.table_id();
+        let store = self.table.store();
+
+        let physical_fields: Vec<FieldId> = fields
             .iter()
             .copied()
             .filter(|fid| *fid != ROW_ID_FIELD_ID)
-            .map(|fid| LogicalFieldId::for_user(self.table.table_id(), fid))
             .collect();
-        let mut result = Vec::new();
-        let mut start = 0usize;
-        while start < row_ids.len() {
-            let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
-            let window = &row_ids[start..end];
-            let mut numeric_arrays: NumericArrayMap = if lfids.is_empty() {
-                NumericKernels::prepare_numeric_arrays(&[], &[], &numeric_fields)?
+
+        let schema = self.table.schema()?;
+        let cached_schema = CachedSchema::new(Arc::clone(&schema));
+
+        let mut projection_evals: Vec<ProjectionEval> = Vec::with_capacity(physical_fields.len());
+        let mut output_fields: Vec<Field> = Vec::with_capacity(physical_fields.len());
+        let mut unique_index: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();
+
+        for (idx, field_id) in physical_fields.iter().copied().enumerate() {
+            let schema_idx = cached_schema.index_of_field_id(field_id).ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "field_id {} missing from table schema",
+                    field_id
+                ))
+            })?;
+            let field = schema.field(schema_idx).clone();
+            let lfid = LogicalFieldId::for_user(table_id, field_id);
+
+            projection_evals.push(ProjectionEval::Column(ColumnProjectionInfo {
+                logical_field_id: lfid,
+                data_type: field.data_type().clone(),
+                output_name: field.name().to_string(),
+            }));
+            output_fields.push(field);
+            unique_index.insert(lfid, idx);
+        }
+
+        let logical_fields: Vec<LogicalFieldId> = physical_fields
+            .iter()
+            .map(|&fid| LogicalFieldId::for_user(table_id, fid))
+            .collect();
+        let logical_fields_for_arrays = logical_fields.clone();
+
+        let requires_numeric = !numeric_fields.is_empty();
+        let numeric_fields_arc = Arc::new(numeric_fields);
+
+        let out_schema = Arc::new(Schema::new(output_fields));
+        let unique_lfids_arc = Arc::new(logical_fields.clone());
+        let projection_evals_arc = Arc::new(projection_evals);
+        let passthrough_fields_arc = Arc::new(vec![None; projection_evals_arc.len()]);
+        let unique_index_arc = Arc::new(unique_index);
+
+        let mut result: Vec<RowId> = Vec::with_capacity(row_ids.len());
+
+        let mut process_chunk = |window: &[RowId], columns: &[ArrayRef]| -> LlkvResult<()> {
+            if window.is_empty() {
+                return Ok(());
+            }
+
+            let mut numeric_arrays: NumericArrayMap = if columns.is_empty() {
+                NumericKernels::prepare_numeric_arrays(&[], &[], numeric_fields_arc.as_ref())?
             } else {
-                let gathered = self.table.store().gather_rows(
-                    &lfids,
-                    window,
-                    GatherNullPolicy::IncludeNulls,
-                )?;
-                if gathered.num_rows() == 0 {
-                    start = end;
-                    continue;
-                }
-                let arrays = gathered.columns();
-                NumericKernels::prepare_numeric_arrays(&lfids, arrays, &numeric_fields)?
+                NumericKernels::prepare_numeric_arrays(
+                    &logical_fields_for_arrays,
+                    columns,
+                    numeric_fields_arc.as_ref(),
+                )?
             };
+
             if has_row_id {
                 let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
                 numeric_arrays.insert(ROW_ID_FIELD_ID, Arc::new(Float64Array::from(rid_values)));
             }
+
             for (offset, &row_id) in window.iter().enumerate() {
                 let left_val = NumericKernels::evaluate_value(left, offset, &numeric_arrays)?;
                 let right_val = NumericKernels::evaluate_value(right, offset, &numeric_arrays)?;
@@ -1691,16 +1796,50 @@ where
                     result.push(row_id);
                 }
             }
-            start = end;
+
+            Ok(())
+        };
+
+        if logical_fields_for_arrays.is_empty() {
+            let mut start = 0usize;
+            while start < row_ids.len() {
+                let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
+                process_chunk(&row_ids[start..end], &[])?;
+                start = end;
+            }
+            return Ok(result);
         }
+
+        let mut row_stream = RowStreamBuilder::new(
+            store,
+            table_id,
+            Arc::clone(&out_schema),
+            Arc::clone(&unique_lfids_arc),
+            Arc::clone(&projection_evals_arc),
+            Arc::clone(&passthrough_fields_arc),
+            Arc::clone(&unique_index_arc),
+            Arc::clone(&numeric_fields_arc),
+            requires_numeric,
+            GatherNullPolicy::IncludeNulls,
+            row_ids.to_vec(),
+            STREAM_BATCH_ROWS,
+        )
+        .build()?;
+
+        while let Some(chunk) = row_stream.next_chunk()? {
+            let window = chunk.row_ids.values();
+            let batch = chunk.to_record_batch();
+            process_chunk(window, batch.columns())?;
+        }
+
         Ok(result)
     }
 
     fn collect_row_ids_domain(
         &self,
         expr: &Expr<'_, FieldId>,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<u64>>,
-    ) -> LlkvResult<Vec<u64>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
+    ) -> LlkvResult<Vec<RowId>> {
         match expr {
             Expr::Pred(filter) => {
                 self.collect_all_row_ids_for_field(filter.field_id, all_rows_cache)
@@ -1714,7 +1853,7 @@ where
                         "Comparison expression must reference at least one column".into(),
                     ));
                 }
-                let mut domain: Option<Vec<u64>> = None;
+                let mut domain: Option<Vec<RowId>> = None;
                 let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
                 ordered_fields.sort_unstable();
                 for fid in ordered_fields {
@@ -1749,47 +1888,113 @@ where
 
     fn sort_row_ids_with_order(
         &self,
-        mut row_ids: Vec<u64>,
+        mut row_ids: Vec<RowId>,
         order: ScanOrderSpec,
-    ) -> LlkvResult<Vec<u64>> {
+    ) -> LlkvResult<Vec<RowId>> {
         if row_ids.len() <= 1 {
             return Ok(row_ids);
         }
 
         let lfid = LogicalFieldId::for_user(self.table.table_id(), order.field_id);
-        let batch =
-            self.table
-                .store()
-                .gather_rows(&[lfid], &row_ids, GatherNullPolicy::IncludeNulls)?;
-
-        if batch.num_columns() != 1 || batch.num_rows() != row_ids.len() {
-            return Err(Error::Internal(
-                "ORDER BY gather produced unexpected column count".into(),
-            ));
-        }
-
+        let store = self.table.store();
         let ascending = matches!(order.direction, ScanOrderDirection::Ascending);
+        let schema = self.table.schema()?;
+        let cached_schema = CachedSchema::new(Arc::clone(&schema));
+        let schema_index = cached_schema
+            .index_of_field_id(order.field_id)
+            .ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "ORDER BY field {} missing from table schema",
+                    order.field_id
+                ))
+            })?;
+        let field = schema.field(schema_index).clone();
+
+        let out_schema = Arc::new(Schema::new(vec![field.clone()]));
+        let projection_evals_arc = Arc::new(vec![ProjectionEval::Column(ColumnProjectionInfo {
+            logical_field_id: lfid,
+            data_type: field.data_type().clone(),
+            output_name: field.name().to_string(),
+        })]);
+        let passthrough_fields_arc = Arc::new(vec![None]);
+        let mut unique_index_map = FxHashMap::default();
+        unique_index_map.insert(lfid, 0usize);
+        let unique_index_arc = Arc::new(unique_index_map);
+        let logical_fields_arc = Arc::new(vec![lfid]);
+        let numeric_fields_arc = Arc::new(FxHashSet::default());
 
         match order.transform {
             ScanOrderTransform::IdentityInteger => {
-                let array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError("ORDER BY integer expects Int64 column".into())
-                    })?;
-                let mut indices: Vec<(usize, u64)> = row_ids.iter().copied().enumerate().collect();
+                let mut row_stream = RowStreamBuilder::new(
+                    store,
+                    self.table.table_id(),
+                    Arc::clone(&out_schema),
+                    Arc::clone(&logical_fields_arc),
+                    Arc::clone(&projection_evals_arc),
+                    Arc::clone(&passthrough_fields_arc),
+                    Arc::clone(&unique_index_arc),
+                    Arc::clone(&numeric_fields_arc),
+                    false,
+                    GatherNullPolicy::IncludeNulls,
+                    row_ids.clone(),
+                    STREAM_BATCH_ROWS,
+                )
+                .build()?;
+
+                let mut chunks: Vec<Int64Array> = Vec::new();
+                let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len());
+
+                while let Some(chunk) = row_stream.next_chunk()? {
+                    let batch = chunk.to_record_batch();
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    if batch.num_columns() != 1 {
+                        return Err(Error::Internal(
+                            "ORDER BY gather produced unexpected column count".into(),
+                        ));
+                    }
+                    let array = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| {
+                            Error::InvalidArgumentError(
+                                "ORDER BY integer expects Int64 column".into(),
+                            )
+                        })?
+                        .clone();
+
+                    let chunk_idx = chunks.len();
+                    let row_count = batch.num_rows();
+                    chunks.push(array);
+                    for offset in 0..row_count {
+                        positions.push((chunk_idx, offset));
+                    }
+                }
+
+                if positions.len() != row_ids.len() {
+                    return Err(Error::Internal(
+                        "ORDER BY gather produced inconsistent row counts".into(),
+                    ));
+                }
+
+                let mut indices: Vec<(usize, RowId)> =
+                    row_ids.iter().copied().enumerate().collect();
                 indices.sort_by(|(ai, arid), (bi, brid)| {
-                    let left = if array.is_null(*ai) {
+                    let (chunk_a, offset_a) = positions[*ai];
+                    let (chunk_b, offset_b) = positions[*bi];
+                    let array_a = &chunks[chunk_a];
+                    let array_b = &chunks[chunk_b];
+                    let left = if array_a.is_null(offset_a) {
                         None
                     } else {
-                        Some(array.value(*ai))
+                        Some(array_a.value(offset_a))
                     };
-                    let right = if array.is_null(*bi) {
+                    let right = if array_b.is_null(offset_b) {
                         None
                     } else {
-                        Some(array.value(*bi))
+                        Some(array_b.value(offset_b))
                     };
                     let ord = compare_option_values(left, right, ascending, order.nulls_first);
                     if ord == Ordering::Equal {
@@ -1801,24 +2006,74 @@ where
                 row_ids = indices.into_iter().map(|(_, rid)| rid).collect();
             }
             ScanOrderTransform::IdentityUtf8 => {
-                let array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError("ORDER BY text expects Utf8 column".into())
-                    })?;
-                let mut indices: Vec<(usize, u64)> = row_ids.iter().copied().enumerate().collect();
+                let mut row_stream = RowStreamBuilder::new(
+                    store,
+                    self.table.table_id(),
+                    Arc::clone(&out_schema),
+                    Arc::clone(&logical_fields_arc),
+                    Arc::clone(&projection_evals_arc),
+                    Arc::clone(&passthrough_fields_arc),
+                    Arc::clone(&unique_index_arc),
+                    Arc::clone(&numeric_fields_arc),
+                    false,
+                    GatherNullPolicy::IncludeNulls,
+                    row_ids.clone(),
+                    STREAM_BATCH_ROWS,
+                )
+                .build()?;
+
+                let mut chunks: Vec<StringArray> = Vec::new();
+                let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len());
+
+                while let Some(chunk) = row_stream.next_chunk()? {
+                    let batch = chunk.to_record_batch();
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    if batch.num_columns() != 1 {
+                        return Err(Error::Internal(
+                            "ORDER BY gather produced unexpected column count".into(),
+                        ));
+                    }
+                    let array = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| {
+                            Error::InvalidArgumentError("ORDER BY text expects Utf8 column".into())
+                        })?
+                        .clone();
+
+                    let chunk_idx = chunks.len();
+                    let row_count = batch.num_rows();
+                    chunks.push(array);
+                    for offset in 0..row_count {
+                        positions.push((chunk_idx, offset));
+                    }
+                }
+
+                if positions.len() != row_ids.len() {
+                    return Err(Error::Internal(
+                        "ORDER BY gather produced inconsistent row counts".into(),
+                    ));
+                }
+
+                let mut indices: Vec<(usize, RowId)> =
+                    row_ids.iter().copied().enumerate().collect();
                 indices.sort_by(|(ai, arid), (bi, brid)| {
-                    let left = if array.is_null(*ai) {
+                    let (chunk_a, offset_a) = positions[*ai];
+                    let (chunk_b, offset_b) = positions[*bi];
+                    let array_a = &chunks[chunk_a];
+                    let array_b = &chunks[chunk_b];
+                    let left = if array_a.is_null(offset_a) {
                         None
                     } else {
-                        Some(array.value(*ai))
+                        Some(array_a.value(offset_a))
                     };
-                    let right = if array.is_null(*bi) {
+                    let right = if array_b.is_null(offset_b) {
                         None
                     } else {
-                        Some(array.value(*bi))
+                        Some(array_b.value(offset_b))
                     };
                     let ord = compare_option_values(left, right, ascending, order.nulls_first);
                     if ord == Ordering::Equal {
@@ -1830,23 +2085,60 @@ where
                 row_ids = indices.into_iter().map(|(_, rid)| rid).collect();
             }
             ScanOrderTransform::CastUtf8ToInteger => {
-                let array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError("ORDER BY CAST expects Utf8 column".into())
-                    })?;
+                let mut row_stream = RowStreamBuilder::new(
+                    store,
+                    self.table.table_id(),
+                    Arc::clone(&out_schema),
+                    Arc::clone(&logical_fields_arc),
+                    Arc::clone(&projection_evals_arc),
+                    Arc::clone(&passthrough_fields_arc),
+                    Arc::clone(&unique_index_arc),
+                    Arc::clone(&numeric_fields_arc),
+                    false,
+                    GatherNullPolicy::IncludeNulls,
+                    row_ids.clone(),
+                    STREAM_BATCH_ROWS,
+                )
+                .build()?;
+
                 let mut keys: Vec<Option<i64>> = Vec::with_capacity(row_ids.len());
-                for idx in 0..row_ids.len() {
-                    let key = if array.is_null(idx) {
-                        None
-                    } else {
-                        array.value(idx).parse::<i64>().ok()
-                    };
-                    keys.push(key);
+
+                while let Some(chunk) = row_stream.next_chunk()? {
+                    let batch = chunk.to_record_batch();
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    if batch.num_columns() != 1 {
+                        return Err(Error::Internal(
+                            "ORDER BY gather produced unexpected column count".into(),
+                        ));
+                    }
+                    let array = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| {
+                            Error::InvalidArgumentError("ORDER BY CAST expects Utf8 column".into())
+                        })?;
+
+                    for offset in 0..batch.num_rows() {
+                        let key = if array.is_null(offset) {
+                            None
+                        } else {
+                            array.value(offset).parse::<i64>().ok()
+                        };
+                        keys.push(key);
+                    }
                 }
-                let mut indices: Vec<(usize, u64)> = row_ids.iter().copied().enumerate().collect();
+
+                if keys.len() != row_ids.len() {
+                    return Err(Error::Internal(
+                        "ORDER BY gather produced inconsistent row counts".into(),
+                    ));
+                }
+
+                let mut indices: Vec<(usize, RowId)> =
+                    row_ids.iter().copied().enumerate().collect();
                 indices.sort_by(|(ai, arid), (bi, brid)| {
                     let left = keys[*ai];
                     let right = keys[*bi];
@@ -1867,8 +2159,8 @@ where
     fn collect_all_row_ids_for_field(
         &self,
         field_id: FieldId,
-        cache: &mut FxHashMap<FieldId, Vec<u64>>,
-    ) -> LlkvResult<Vec<u64>> {
+        cache: &mut FxHashMap<FieldId, Vec<RowId>>,
+    ) -> LlkvResult<Vec<RowId>> {
         if let Some(existing) = cache.get(&field_id) {
             return Ok(existing.clone());
         }
@@ -1890,7 +2182,7 @@ where
         &self,
         field_id: LogicalFieldId,
         op: &Operator<'_>,
-    ) -> LlkvResult<Vec<u64>>
+    ) -> LlkvResult<Vec<RowId>>
     where
         T: FilterPrimitive<Native = <T as ArrowPrimitiveType>::Native> + ArrowPrimitiveType,
         <T as ArrowPrimitiveType>::Native: FromLiteral + Copy + PredicateValue,
@@ -1903,7 +2195,7 @@ where
         &self,
         field_id: LogicalFieldId,
         op: &Operator<'_>,
-    ) -> LlkvResult<Vec<u64>>
+    ) -> LlkvResult<Vec<RowId>>
     where
         O: OffsetSizeTrait + llkv_column_map::store::scan::filter::StringContainsKernel,
     {
@@ -1919,7 +2211,7 @@ where
         &self,
         field_id: LogicalFieldId,
         ops: &[Operator<'_>],
-    ) -> LlkvResult<Vec<u64>>
+    ) -> LlkvResult<Vec<RowId>>
     where
         O: OffsetSizeTrait + llkv_column_map::store::scan::filter::StringContainsKernel,
     {
@@ -1943,7 +2235,7 @@ where
         &self,
         field_id: LogicalFieldId,
         op: &Operator<'_>,
-    ) -> LlkvResult<Vec<u64>> {
+    ) -> LlkvResult<Vec<RowId>> {
         let predicate = build_bool_predicate(op).map_err(Error::predicate_build)?;
         self.table
             .store()
@@ -1954,7 +2246,7 @@ where
         &self,
         field_id: LogicalFieldId,
         ops: &[Operator<'_>],
-    ) -> LlkvResult<Vec<u64>> {
+    ) -> LlkvResult<Vec<RowId>> {
         let mut preds: Vec<llkv_expr::typed_predicate::Predicate<bool>> =
             Vec::with_capacity(ops.len());
         for op in ops {
@@ -1973,7 +2265,7 @@ where
         &self,
         field_id: LogicalFieldId,
         ops: &[Operator<'_>],
-    ) -> LlkvResult<Vec<u64>>
+    ) -> LlkvResult<Vec<RowId>>
     where
         T: FilterPrimitive<Native = <T as ArrowPrimitiveType>::Native> + ArrowPrimitiveType,
         <T as ArrowPrimitiveType>::Native: FromLiteral + Copy + PredicateValue,
@@ -1995,17 +2287,16 @@ where
     }
 }
 
-// TODO: Return `LlkvResult<Vec<RowId>>`
 pub(crate) fn collect_row_ids_for_table<'expr, P>(
     table: &Table<P>,
     filter_expr: &Expr<'expr, FieldId>,
-) -> LlkvResult<Vec<u64>>
+) -> LlkvResult<Vec<RowId>>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     let executor = TableExecutor::new(table);
     let fusion_cache = PredicateFusionCache::from_expr(filter_expr);
-    let mut all_rows_cache: FxHashMap<FieldId, Vec<u64>> = FxHashMap::default();
+    let mut all_rows_cache: FxHashMap<FieldId, Vec<RowId>> = FxHashMap::default();
     executor.collect_row_ids_for_expr(filter_expr, &fusion_cache, &mut all_rows_cache)
 }
 
@@ -2024,6 +2315,7 @@ fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
         Literal::Integer(_) => Ok(DataType::Int64),
         Literal::Float(_) => Ok(DataType::Float64),
         Literal::String(_) => Ok(DataType::Utf8),
+        Literal::Null => Ok(DataType::Null),
         Literal::Struct(fields) => {
             let inferred_fields = fields
                 .iter()
@@ -2061,6 +2353,7 @@ fn synthesize_computed_literal_array(
         ScalarExpr::Literal(Literal::String(value)) => {
             Ok(Arc::new(StringArray::from(vec![value.clone(); row_count])) as ArrayRef)
         }
+        ScalarExpr::Literal(Literal::Null) => Ok(new_null_array(data_type, row_count)),
         ScalarExpr::Literal(Literal::Struct(fields)) => {
             // Build a struct array from the literal fields
             use arrow::array::StructArray;
@@ -2086,6 +2379,7 @@ fn synthesize_computed_literal_array(
                     Literal::String(v) => {
                         Arc::new(StringArray::from(vec![v.clone(); row_count])) as ArrayRef
                     }
+                    Literal::Null => new_null_array(&field_dtype, row_count),
                     Literal::Struct(nested_fields) => {
                         // Recursively build nested struct
                         // Create a temporary ComputedProjectionInfo for nested struct
@@ -2200,6 +2494,8 @@ fn format_operator(op: &Operator<'_>) -> String {
             pattern,
             case_sensitive,
         } => format_pattern_op("CONTAINS", pattern, *case_sensitive),
+        Operator::IsNull => "IS NULL".to_string(),
+        Operator::IsNotNull => "IS NOT NULL".to_string(),
     }
 }
 
@@ -2270,6 +2566,7 @@ fn format_literal(lit: &Literal) -> String {
         Literal::Integer(i) => i.to_string(),
         Literal::Float(f) => f.to_string(),
         Literal::String(s) => format!("\"{}\"", escape_string(s)),
+        Literal::Null => "NULL".to_string(),
         Literal::Struct(fields) => {
             let field_strs: Vec<_> = fields
                 .iter()
@@ -2670,7 +2967,7 @@ where
 
 #[derive(Default)]
 struct RowIdScanCollector {
-    row_ids: Vec<u64>,
+    row_ids: Vec<RowId>,
 }
 
 impl RowIdScanCollector {
@@ -2690,7 +2987,7 @@ impl RowIdScanCollector {
         }
     }
 
-    fn into_inner(self) -> Vec<u64> {
+    fn into_inner(self) -> Vec<RowId> {
         self.row_ids
     }
 }
@@ -2719,10 +3016,317 @@ impl llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor for RowIdScanCollec
     }
 }
 
-fn normalize_row_ids(mut row_ids: Vec<u64>) -> Vec<u64> {
+struct RowIdChunkEmitter<'a, F>
+where
+    F: FnMut(Vec<RowId>) -> LlkvResult<()>,
+{
+    chunk_size: usize,
+    buffer: Vec<RowId>,
+    on_chunk: &'a mut F,
+    error: Option<Error>,
+}
+
+impl<'a, F> RowIdChunkEmitter<'a, F>
+where
+    F: FnMut(Vec<RowId>) -> LlkvResult<()>,
+{
+    fn new(chunk_size: usize, on_chunk: &'a mut F) -> Self {
+        let chunk_size = cmp::max(1, chunk_size);
+        Self {
+            chunk_size,
+            buffer: Vec::with_capacity(chunk_size),
+            on_chunk,
+            error: None,
+        }
+    }
+
+    fn extend_from_array(&mut self, row_ids: &UInt64Array) {
+        if self.error.is_some() {
+            return;
+        }
+        for idx in 0..row_ids.len() {
+            self.push(row_ids.value(idx));
+        }
+    }
+
+    fn extend_from_slice(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
+        if self.error.is_some() || len == 0 {
+            return;
+        }
+        let end = (start + len).min(row_ids.len());
+        for idx in start..end {
+            self.push(row_ids.value(idx));
+        }
+    }
+
+    fn push(&mut self, value: u64) {
+        if self.error.is_some() {
+            return;
+        }
+        self.buffer.push(value);
+        if self.buffer.len() >= self.chunk_size {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.error.is_some() || self.buffer.is_empty() {
+            return;
+        }
+        let chunk = mem::take(&mut self.buffer);
+        match (self.on_chunk)(chunk) {
+            Ok(_) => {}
+            Err(err) => self.error = Some(err),
+        }
+    }
+
+    fn finish(mut self) -> LlkvResult<()> {
+        self.flush();
+        match self.error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveVisitor for RowIdChunkEmitter<'a, F>
+where
+    F: FnMut(Vec<RowId>) -> LlkvResult<()>,
+{
+    llkv_for_each_arrow_numeric!(impl_row_id_ignore_chunk);
+    llkv_for_each_arrow_boolean!(impl_row_id_ignore_chunk);
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveSortedVisitor for RowIdChunkEmitter<'a, F>
+where
+    F: FnMut(Vec<RowId>) -> LlkvResult<()>,
+{
+    llkv_for_each_arrow_numeric!(impl_row_id_ignore_sorted_run);
+    llkv_for_each_arrow_boolean!(impl_row_id_ignore_sorted_run);
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveWithRowIdsVisitor for RowIdChunkEmitter<'a, F>
+where
+    F: FnMut(Vec<RowId>) -> LlkvResult<()>,
+{
+    llkv_for_each_arrow_numeric!(impl_row_id_stream_chunk_with_rids);
+    llkv_for_each_arrow_boolean!(impl_row_id_stream_chunk_with_rids);
+}
+
+impl<'a, F> llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor for RowIdChunkEmitter<'a, F>
+where
+    F: FnMut(Vec<RowId>) -> LlkvResult<()>,
+{
+    llkv_for_each_arrow_numeric!(impl_row_id_stream_sorted_run_with_rids);
+    llkv_for_each_arrow_boolean!(impl_row_id_stream_sorted_run_with_rids);
+
+    fn null_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
+        self.extend_from_slice(row_ids, start, len);
+    }
+}
+
+fn normalize_row_ids(mut row_ids: Vec<RowId>) -> Vec<RowId> {
     row_ids.sort_unstable();
     row_ids.dedup();
     row_ids
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn materialize_row_window<P>(
+    store: &llkv_column_map::store::ColumnStore<P>,
+    table_id: TableId,
+    unique_lfids: &[LogicalFieldId],
+    projection_evals: &[ProjectionEval],
+    passthrough_fields: &[Option<FieldId>],
+    unique_index: &FxHashMap<LogicalFieldId, usize>,
+    numeric_fields: &FxHashSet<FieldId>,
+    requires_numeric: bool,
+    null_policy: GatherNullPolicy,
+    out_schema: &Arc<Schema>,
+    window: &[RowId],
+    mut gather_ctx: Option<&mut MultiGatherContext>,
+) -> LlkvResult<Option<RecordBatch>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    if window.is_empty() {
+        return Ok(None);
+    }
+
+    let mut gathered_batch: Option<RecordBatch> = None;
+    let (batch_len, numeric_arrays) = if unique_lfids.is_empty() {
+        let numeric_arrays = if requires_numeric {
+            Some(NumericKernels::prepare_numeric_arrays(
+                &[],
+                &[],
+                numeric_fields,
+            )?)
+        } else {
+            None
+        };
+        (window.len(), numeric_arrays)
+    } else {
+        let mut local_ctx;
+        let ctx = match gather_ctx.as_mut() {
+            Some(ctx) => ctx,
+            None => {
+                local_ctx = store.prepare_gather_context(unique_lfids)?;
+                &mut local_ctx
+            }
+        };
+        let batch = store.gather_rows_with_reusable_context(ctx, window, null_policy)?;
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        let batch_len = batch.num_rows();
+        let numeric_arrays = if requires_numeric {
+            Some(NumericKernels::prepare_numeric_arrays(
+                unique_lfids,
+                batch.columns(),
+                numeric_fields,
+            )?)
+        } else {
+            None
+        };
+        gathered_batch = Some(batch);
+        (batch_len, numeric_arrays)
+    };
+
+    if batch_len == 0 {
+        return Ok(None);
+    }
+
+    let gathered_columns: &[ArrayRef] = if let Some(batch) = gathered_batch.as_ref() {
+        batch.columns()
+    } else {
+        &[]
+    };
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
+    for (idx, eval) in projection_evals.iter().enumerate() {
+        match eval {
+            ProjectionEval::Column(info) => {
+                let arr_idx = *unique_index
+                    .get(&info.logical_field_id)
+                    .expect("logical field id missing from index");
+                columns.push(Arc::clone(&gathered_columns[arr_idx]));
+            }
+            ProjectionEval::Computed(info) => {
+                if let Some(fid) = passthrough_fields[idx] {
+                    let lfid = LogicalFieldId::for_user(table_id, fid);
+                    let arr_idx = *unique_index
+                        .get(&lfid)
+                        .expect("passthrough field missing from index");
+                    columns.push(Arc::clone(&gathered_columns[arr_idx]));
+                    continue;
+                }
+
+                let array: ArrayRef = match &info.expr {
+                    ScalarExpr::Literal(_) => synthesize_computed_literal_array(
+                        info,
+                        out_schema.field(idx).data_type(),
+                        batch_len,
+                    )?,
+                    ScalarExpr::GetField { base, field_name } => {
+                        fn eval_get_field(
+                            expr: &ScalarExpr<FieldId>,
+                            field_name: &str,
+                            gathered_columns: &[ArrayRef],
+                            unique_index: &FxHashMap<LogicalFieldId, usize>,
+                            table_id: TableId,
+                        ) -> LlkvResult<ArrayRef> {
+                            let base_array = match expr {
+                                ScalarExpr::Column(fid) => {
+                                    let lfid = LogicalFieldId::for_user(table_id, *fid);
+                                    let arr_idx = *unique_index.get(&lfid).ok_or_else(|| {
+                                        Error::Internal("field missing from unique arrays".into())
+                                    })?;
+                                    Arc::clone(&gathered_columns[arr_idx])
+                                }
+                                ScalarExpr::GetField {
+                                    base: inner_base,
+                                    field_name: inner_field,
+                                } => eval_get_field(
+                                    inner_base,
+                                    inner_field,
+                                    gathered_columns,
+                                    unique_index,
+                                    table_id,
+                                )?,
+                                _ => {
+                                    return Err(Error::InvalidArgumentError(
+                                        "GetField base must be a column or another GetField".into(),
+                                    ));
+                                }
+                            };
+
+                            let struct_array = base_array
+                                .as_any()
+                                .downcast_ref::<arrow::array::StructArray>()
+                                .ok_or_else(|| {
+                                    Error::InvalidArgumentError(
+                                        "GetField can only be applied to struct types".into(),
+                                    )
+                                })?;
+
+                            struct_array
+                                .column_by_name(field_name)
+                                .ok_or_else(|| {
+                                    Error::InvalidArgumentError(format!(
+                                        "Field '{}' not found in struct",
+                                        field_name
+                                    ))
+                                })
+                                .map(Arc::clone)
+                        }
+
+                        eval_get_field(base, field_name, gathered_columns, unique_index, table_id)?
+                    }
+                    _ => {
+                        let numeric_arrays = numeric_arrays
+                            .as_ref()
+                            .expect("numeric arrays should exist for computed projection");
+                        NumericKernels::evaluate_batch(&info.expr, batch_len, numeric_arrays)?
+                    }
+                };
+                columns.push(array);
+            }
+        }
+    }
+
+    let batch = RecordBatch::try_new(Arc::clone(out_schema), columns)?;
+    Ok(Some(batch))
+}
+
+fn emit_synthetic_null_batch<F>(
+    projection_evals: &[ProjectionEval],
+    out_schema: &Arc<Schema>,
+    row_count: usize,
+    on_batch: &mut F,
+) -> LlkvResult<()>
+where
+    F: FnMut(RecordBatch),
+{
+    if row_count == 0 {
+        return Ok(());
+    }
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
+    for (idx, eval) in projection_evals.iter().enumerate() {
+        let array = match eval {
+            ProjectionEval::Column(info) => new_null_array(&info.data_type, row_count),
+            ProjectionEval::Computed(info) => synthesize_computed_literal_array(
+                info,
+                out_schema.field(idx).data_type(),
+                row_count,
+            )?,
+        };
+        columns.push(array);
+    }
+
+    let batch = RecordBatch::try_new(Arc::clone(out_schema), columns)?;
+    on_batch(batch);
+    Ok(())
 }
 
 fn literal_to_u64(lit: &Literal) -> LlkvResult<u64> {
@@ -2730,7 +3334,7 @@ fn literal_to_u64(lit: &Literal) -> LlkvResult<u64> {
         .map_err(|err| Error::InvalidArgumentError(format!("rowid literal cast failed: {err}")))
 }
 
-fn lower_bound_index(row_ids: &[u64], bound: &Bound<Literal>) -> LlkvResult<usize> {
+fn lower_bound_index(row_ids: &[RowId], bound: &Bound<Literal>) -> LlkvResult<usize> {
     Ok(match bound {
         Bound::Unbounded => 0,
         Bound::Included(lit) => {
@@ -2744,7 +3348,7 @@ fn lower_bound_index(row_ids: &[u64], bound: &Bound<Literal>) -> LlkvResult<usiz
     })
 }
 
-fn upper_bound_index(row_ids: &[u64], bound: &Bound<Literal>) -> LlkvResult<usize> {
+fn upper_bound_index(row_ids: &[RowId], bound: &Bound<Literal>) -> LlkvResult<usize> {
     Ok(match bound {
         Bound::Unbounded => row_ids.len(),
         Bound::Included(lit) => {
@@ -2758,7 +3362,7 @@ fn upper_bound_index(row_ids: &[u64], bound: &Bound<Literal>) -> LlkvResult<usiz
     })
 }
 
-fn filter_row_ids_by_operator(row_ids: &[u64], op: &Operator<'_>) -> LlkvResult<Vec<u64>> {
+fn filter_row_ids_by_operator(row_ids: &[RowId], op: &Operator<'_>) -> LlkvResult<Vec<RowId>> {
     use Operator::*;
 
     match op {
@@ -2823,10 +3427,13 @@ fn filter_row_ids_by_operator(row_ids: &[u64], op: &Operator<'_>) -> LlkvResult<
         StartsWith { .. } | EndsWith { .. } | Contains { .. } => Err(Error::InvalidArgumentError(
             "rowid predicates do not support string pattern matching".into(),
         )),
+        IsNull | IsNotNull => Err(Error::InvalidArgumentError(
+            "rowid predicates do not support null checks".into(),
+        )),
     }
 }
 
-fn intersect_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
+fn intersect_sorted(left: Vec<RowId>, right: Vec<RowId>) -> Vec<RowId> {
     let mut result = Vec::with_capacity(left.len().min(right.len()));
     let mut i = 0;
     let mut j = 0;
@@ -2846,7 +3453,7 @@ fn intersect_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
     result
 }
 
-fn union_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
+fn union_sorted(left: Vec<RowId>, right: Vec<RowId>) -> Vec<RowId> {
     if left.is_empty() {
         return right;
     }
@@ -2886,7 +3493,7 @@ fn union_sorted(left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
     result
 }
 
-fn difference_sorted(base: Vec<u64>, subtract: Vec<u64>) -> Vec<u64> {
+fn difference_sorted(base: Vec<RowId>, subtract: Vec<RowId>) -> Vec<RowId> {
     if base.is_empty() || subtract.is_empty() {
         return base;
     }
@@ -2914,7 +3521,7 @@ fn difference_sorted(base: Vec<u64>, subtract: Vec<u64>) -> Vec<u64> {
     result
 }
 
-fn expand_filter_runs(runs: &[FilterRun]) -> Vec<u64> {
+fn expand_filter_runs(runs: &[FilterRun]) -> Vec<RowId> {
     let total: usize = runs.iter().map(|r| r.len).sum();
     let mut row_ids = Vec::with_capacity(total);
     for run in runs {

@@ -13,6 +13,7 @@ use crate::types::FieldId;
 /// Mapping from field identifiers to the numeric Arrow array used for evaluation.
 pub type NumericArrayMap = FxHashMap<FieldId, Arc<Float64Array>>;
 
+// TODO: Document
 #[derive(Clone, Copy, Debug)]
 pub struct AffineExpr {
     pub field: FieldId,
@@ -20,6 +21,7 @@ pub struct AffineExpr {
     pub offset: f64,
 }
 
+// TODO: Document
 #[derive(Clone, Copy, Debug)]
 struct AffineState {
     field: Option<FieldId>,
@@ -27,6 +29,7 @@ struct AffineState {
     offset: f64,
 }
 
+// TODO: Place in impl?
 fn merge_field(lhs: Option<FieldId>, rhs: Option<FieldId>) -> Option<Option<FieldId>> {
     match (lhs, rhs) {
         (Some(a), Some(b)) => {
@@ -42,6 +45,7 @@ fn merge_field(lhs: Option<FieldId>, rhs: Option<FieldId>) -> Option<Option<Fiel
     }
 }
 
+// TODO: Document
 enum VectorizedExpr {
     Array(Arc<Float64Array>),
     Scalar(Option<f64>),
@@ -162,6 +166,7 @@ impl NumericKernels {
                 llkv_expr::literal::Literal::Struct(_) => Err(Error::InvalidArgumentError(
                     "Struct literals are not supported in numeric expressions".into(),
                 )),
+                llkv_expr::literal::Literal::Null => Ok(None),
             },
             ScalarExpr::Binary { left, op, right } => {
                 let l = Self::evaluate_value(left, idx, arrays)?;
@@ -224,6 +229,7 @@ impl NumericKernels {
                 }
                 llkv_expr::literal::Literal::String(_) => Ok(None),
                 llkv_expr::literal::Literal::Struct(_) => Ok(None),
+                llkv_expr::literal::Literal::Null => Ok(Some(VectorizedExpr::Scalar(None))),
             },
             ScalarExpr::Binary { left, op, right } => {
                 let left_vec = Self::try_evaluate_vectorized(left, len, arrays)?;
@@ -342,6 +348,7 @@ impl NumericKernels {
                 llkv_expr::literal::Literal::Integer(i) => Some(*i as f64),
                 llkv_expr::literal::Literal::String(_) => None,
                 llkv_expr::literal::Literal::Struct(_) => None,
+                llkv_expr::literal::Literal::Null => None,
             }
         } else {
             None

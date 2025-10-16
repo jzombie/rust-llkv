@@ -94,6 +94,76 @@ impl CreateTablePlan {
     }
 }
 
+// ============================================================================
+// CREATE INDEX Plan
+// ============================================================================
+
+/// Column specification for CREATE INDEX statements.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexColumnPlan {
+    pub name: String,
+    pub ascending: bool,
+    pub nulls_first: bool,
+}
+
+impl IndexColumnPlan {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ascending: true,
+            nulls_first: false,
+        }
+    }
+
+    pub fn with_sort(mut self, ascending: bool, nulls_first: bool) -> Self {
+        self.ascending = ascending;
+        self.nulls_first = nulls_first;
+        self
+    }
+}
+
+/// Plan for creating an index on a table.
+#[derive(Clone, Debug)]
+pub struct CreateIndexPlan {
+    pub name: Option<String>,
+    pub table: String,
+    pub unique: bool,
+    pub if_not_exists: bool,
+    pub columns: Vec<IndexColumnPlan>,
+}
+
+impl CreateIndexPlan {
+    pub fn new(table: impl Into<String>) -> Self {
+        Self {
+            name: None,
+            table: table.into(),
+            unique: false,
+            if_not_exists: false,
+            columns: Vec::new(),
+        }
+    }
+
+    pub fn with_name(mut self, name: Option<String>) -> Self {
+        self.name = name;
+        self
+    }
+
+    pub fn with_unique(mut self, unique: bool) -> Self {
+        self.unique = unique;
+        self
+    }
+
+    pub fn with_if_not_exists(mut self, if_not_exists: bool) -> Self {
+        self.if_not_exists = if_not_exists;
+        self
+    }
+
+    pub fn with_columns(mut self, columns: Vec<IndexColumnPlan>) -> Self {
+        self.columns = columns;
+        self
+    }
+}
+
 /// Column specification for CREATE TABLE.
 #[derive(Clone, Debug)]
 pub struct ColumnSpec {
@@ -101,6 +171,7 @@ pub struct ColumnSpec {
     pub data_type: DataType,
     pub nullable: bool,
     pub primary_key: bool,
+    pub unique: bool,
     /// Optional CHECK constraint expression (SQL string).
     /// Example: "t.t=42" for CHECK(t.t=42)
     pub check_expr: Option<String>,
@@ -113,12 +184,23 @@ impl ColumnSpec {
             data_type,
             nullable,
             primary_key: false,
+            unique: false,
             check_expr: None,
         }
     }
 
     pub fn with_primary_key(mut self, primary_key: bool) -> Self {
         self.primary_key = primary_key;
+        if primary_key {
+            self.unique = true;
+        }
+        self
+    }
+
+    pub fn with_unique(mut self, unique: bool) -> Self {
+        if unique {
+            self.unique = true;
+        }
         self
     }
 
@@ -294,7 +376,7 @@ pub struct SelectPlan {
     pub projections: Vec<SelectProjection>,
     pub filter: Option<llkv_expr::expr::Expr<'static, String>>,
     pub aggregates: Vec<AggregateExpr>,
-    pub order_by: Option<OrderByPlan>,
+    pub order_by: Vec<OrderByPlan>,
 }
 
 impl SelectPlan {
@@ -319,7 +401,7 @@ impl SelectPlan {
             projections: Vec::new(),
             filter: None,
             aggregates: Vec::new(),
-            order_by: None,
+            order_by: Vec::new(),
         }
     }
 
@@ -330,7 +412,7 @@ impl SelectPlan {
             projections: Vec::new(),
             filter: None,
             aggregates: Vec::new(),
-            order_by: None,
+            order_by: Vec::new(),
         }
     }
 
@@ -349,7 +431,7 @@ impl SelectPlan {
         self
     }
 
-    pub fn with_order_by(mut self, order_by: Option<OrderByPlan>) -> Self {
+    pub fn with_order_by(mut self, order_by: Vec<OrderByPlan>) -> Self {
         self.order_by = order_by;
         self
     }
@@ -540,6 +622,7 @@ pub enum PlanStatement {
     CommitTransaction,
     RollbackTransaction,
     CreateTable(CreateTablePlan),
+    CreateIndex(CreateIndexPlan),
     Insert(InsertPlan),
     Update(UpdatePlan),
     Delete(DeletePlan),

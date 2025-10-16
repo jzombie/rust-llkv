@@ -45,7 +45,7 @@ use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{
-    CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME, GatherNullPolicy, ROW_ID_COLUMN_NAME,
+    CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME, GatherNullPolicy, IndexKind, ROW_ID_COLUMN_NAME,
 };
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
@@ -55,7 +55,7 @@ use llkv_storage::pager::{MemPager, Pager};
 use llkv_table::catalog::{FieldConstraints, FieldDefinition};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
-use llkv_table::{CATALOG_TABLE_ID, ColMeta, SysCatalog, TableMeta};
+use llkv_table::{CATALOG_TABLE_ID, ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta};
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName, ObjectNamePart, Select,
@@ -69,13 +69,13 @@ pub type Result<T> = llkv_result::Result<T>;
 // Re-export plan structures from llkv-plan
 pub use llkv_plan::{
     AggregateExpr, AggregateFunction, AssignmentValue, ColumnAssignment, ColumnNullability,
-    ColumnSpec, CreateTablePlan, CreateTableSource, DeletePlan, InsertPlan, InsertSource,
-    IntoColumnSpec, NotNull, Nullable, OrderByPlan, OrderSortType, OrderTarget, PlanOperation,
-    PlanStatement, PlanValue, SelectPlan, SelectProjection, UpdatePlan,
+    ColumnSpec, CreateIndexPlan, CreateTablePlan, CreateTableSource, DeletePlan, IndexColumnPlan,
+    InsertPlan, InsertSource, IntoColumnSpec, NotNull, Nullable, OrderByPlan, OrderSortType,
+    OrderTarget, PlanOperation, PlanStatement, PlanValue, SelectPlan, SelectProjection, UpdatePlan,
 };
 
 // Execution structures from llkv-executor
-use llkv_executor::{ExecutorColumn, ExecutorSchema, ExecutorTable};
+use llkv_executor::{ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema, ExecutorTable};
 pub use llkv_executor::{QueryExecutor, RowBatch, SelectExecution, TableProvider};
 
 // Import transaction structures from llkv-transaction for internal use.
@@ -156,7 +156,7 @@ mod mvcc_columns {
     ///
     /// This creates a minimal RecordBatch for marking rows as deleted.
     pub(crate) fn build_delete_batch(
-        row_ids: Vec<u64>,
+        row_ids: Vec<RowId>,
         deleted_by_txn_id: TxnId,
     ) -> llkv_result::Result<RecordBatch> {
         let row_count = row_ids.len();
@@ -175,6 +175,20 @@ mod mvcc_columns {
     }
 }
 
+#[derive(Hash, Eq, PartialEq, Debug)]
+enum UniqueKey {
+    Int(i64),
+    Float(u64),
+    Str(String),
+    Composite(Vec<UniqueKey>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoredMultiColumnUnique {
+    index_name: Option<String>,
+    field_ids: Vec<FieldId>,
+}
+
 /// Result of running a plan statement.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
@@ -184,6 +198,10 @@ where
 {
     CreateTable {
         table_name: String,
+    },
+    CreateIndex {
+        table_name: String,
+        index_name: Option<String>,
     },
     NoOp,
     Insert {
@@ -217,6 +235,14 @@ where
             RuntimeStatementResult::CreateTable { table_name } => f
                 .debug_struct("CreateTable")
                 .field("table_name", table_name)
+                .finish(),
+            RuntimeStatementResult::CreateIndex {
+                table_name,
+                index_name,
+            } => f
+                .debug_struct("CreateIndex")
+                .field("table_name", table_name)
+                .field("index_name", index_name)
                 .finish(),
             RuntimeStatementResult::NoOp => f.debug_struct("NoOp").finish(),
             RuntimeStatementResult::Insert {
@@ -272,6 +298,13 @@ where
             RuntimeStatementResult::CreateTable { table_name } => {
                 Ok(RuntimeStatementResult::CreateTable { table_name })
             }
+            RuntimeStatementResult::CreateIndex {
+                table_name,
+                index_name,
+            } => Ok(RuntimeStatementResult::CreateIndex {
+                table_name,
+                index_name,
+            }),
             RuntimeStatementResult::NoOp => Ok(RuntimeStatementResult::NoOp),
             RuntimeStatementResult::Insert {
                 table_name,
@@ -313,6 +346,7 @@ where
 pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
     match statement {
         PlanStatement::CreateTable(plan) => Some(&plan.name),
+        PlanStatement::CreateIndex(plan) => Some(&plan.table),
         PlanStatement::Insert(plan) => Some(&plan.table),
         PlanStatement::Update(plan) => Some(&plan.table),
         PlanStatement::Delete(plan) => Some(&plan.table),
@@ -594,6 +628,17 @@ where
             TransactionContext::create_table_plan(&**self.inner.context(), plan)?;
             Ok(RuntimeStatementResult::CreateTable { table_name })
         }
+    }
+    /// Create an index (auto-commit only for now).
+    pub fn create_index(&self, plan: CreateIndexPlan) -> Result<RuntimeStatementResult<P>> {
+        if self.has_active_transaction() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX is not supported inside an active transaction".into(),
+            ));
+        }
+
+        let context = self.inner.context();
+        context.ctx().create_index(plan)
     }
 
     fn normalize_insert_plan(&self, plan: InsertPlan) -> Result<(InsertPlan, usize)> {
@@ -905,6 +950,7 @@ where
             PlanStatement::CommitTransaction => self.session.commit_transaction(),
             PlanStatement::RollbackTransaction => self.session.rollback_transaction(),
             PlanStatement::CreateTable(plan) => self.session.create_table_plan(plan),
+            PlanStatement::CreateIndex(plan) => self.session.create_index(plan),
             PlanStatement::Insert(plan) => self.session.insert(plan),
             PlanStatement::Update(plan) => self.session.update(plan),
             PlanStatement::Delete(plan) => self.session.delete(plan),
@@ -944,6 +990,7 @@ where
     pager: Arc<P>,
     tables: RwLock<FxHashMap<String, Arc<ExecutorTable<P>>>>,
     dropped_tables: RwLock<FxHashSet<String>>,
+    multi_column_uniques: RwLock<FxHashMap<String, Vec<StoredMultiColumnUnique>>>,
     // Centralized catalog for table/field name resolution
     catalog: Arc<llkv_table::catalog::TableCatalog>,
     // Transaction manager for session-based transactions
@@ -960,75 +1007,98 @@ where
         tracing::trace!("RuntimeContext::new called, pager={:p}", &*pager);
 
         // Load transaction state and table registry from catalog if it exists
-        let (next_txn_id, last_committed, loaded_tables) = match ColumnStore::open(Arc::clone(
-            &pager,
-        )) {
-            Ok(store) => {
-                let catalog = SysCatalog::new(&store);
-                let next_txn_id = match catalog.get_next_txn_id() {
-                    Ok(Some(id)) => {
-                        tracing::debug!("[CONTEXT] Loaded next_txn_id={} from catalog", id);
-                        id
-                    }
-                    Ok(None) => {
-                        tracing::debug!(
-                            "[CONTEXT] No persisted next_txn_id found, starting from default"
-                        );
-                        TXN_ID_AUTO_COMMIT + 1
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "[CONTEXT] Failed to load next_txn_id: {}, using default",
-                            e
-                        );
-                        TXN_ID_AUTO_COMMIT + 1
-                    }
-                };
-                let last_committed = match catalog.get_last_committed_txn_id() {
-                    Ok(Some(id)) => {
-                        tracing::debug!("[CONTEXT] Loaded last_committed={} from catalog", id);
-                        id
-                    }
-                    Ok(None) => {
-                        tracing::debug!(
-                            "[CONTEXT] No persisted last_committed found, starting from default"
-                        );
-                        TXN_ID_AUTO_COMMIT
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "[CONTEXT] Failed to load last_committed: {}, using default",
-                            e
-                        );
-                        TXN_ID_AUTO_COMMIT
-                    }
-                };
+        let (next_txn_id, last_committed, loaded_tables, persisted_unique_metas) =
+            match ColumnStore::open(Arc::clone(&pager)) {
+                Ok(store) => {
+                    let catalog = SysCatalog::new(&store);
+                    let next_txn_id = match catalog.get_next_txn_id() {
+                        Ok(Some(id)) => {
+                            tracing::debug!("[CONTEXT] Loaded next_txn_id={} from catalog", id);
+                            id
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                "[CONTEXT] No persisted next_txn_id found, starting from default"
+                            );
+                            TXN_ID_AUTO_COMMIT + 1
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[CONTEXT] Failed to load next_txn_id: {}, using default",
+                                e
+                            );
+                            TXN_ID_AUTO_COMMIT + 1
+                        }
+                    };
+                    let last_committed = match catalog.get_last_committed_txn_id() {
+                        Ok(Some(id)) => {
+                            tracing::debug!("[CONTEXT] Loaded last_committed={} from catalog", id);
+                            id
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                "[CONTEXT] No persisted last_committed found, starting from default"
+                            );
+                            TXN_ID_AUTO_COMMIT
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[CONTEXT] Failed to load last_committed: {}, using default",
+                                e
+                            );
+                            TXN_ID_AUTO_COMMIT
+                        }
+                    };
 
-                // Load table registry from catalog
-                let loaded_tables = match catalog.all_table_metas() {
-                    Ok(metas) => {
-                        tracing::debug!("[CONTEXT] Loaded {} table(s) from catalog", metas.len());
-                        metas
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "[CONTEXT] Failed to load table metas: {}, starting with empty registry",
-                            e
-                        );
-                        Vec::new()
-                    }
-                };
+                    // Load table registry from catalog
+                    let loaded_tables = match catalog.all_table_metas() {
+                        Ok(metas) => {
+                            tracing::debug!(
+                                "[CONTEXT] Loaded {} table(s) from catalog",
+                                metas.len()
+                            );
+                            metas
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[CONTEXT] Failed to load table metas: {}, starting with empty registry",
+                                e
+                            );
+                            Vec::new()
+                        }
+                    };
 
-                (next_txn_id, last_committed, loaded_tables)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "[CONTEXT] Failed to open ColumnStore: {}, using default state",
-                    e
-                );
-                (TXN_ID_AUTO_COMMIT + 1, TXN_ID_AUTO_COMMIT, Vec::new())
-            }
-        };
+                    let persisted_unique_metas = match catalog.all_multi_column_unique_metas() {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            tracing::warn!(
+                                "[CONTEXT] Failed to load multi-column unique metas: {}, starting with empty set",
+                                e
+                            );
+                            Vec::new()
+                        }
+                    };
+
+                    (
+                        next_txn_id,
+                        last_committed,
+                        loaded_tables,
+                        persisted_unique_metas,
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[CONTEXT] Failed to open ColumnStore: {}, using default state",
+                        e
+                    );
+                    (
+                        TXN_ID_AUTO_COMMIT + 1,
+                        TXN_ID_AUTO_COMMIT,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                }
+            };
 
         let transaction_manager =
             TransactionManager::new_with_initial_state(next_txn_id, last_committed);
@@ -1060,6 +1130,43 @@ where
             loaded_tables.len()
         );
 
+        let mut canonical_by_id: FxHashMap<TableId, String> = FxHashMap::default();
+        for (table_id, table_meta) in &loaded_tables {
+            if let Some(ref table_name) = table_meta.name {
+                canonical_by_id.insert(*table_id, table_name.to_ascii_lowercase());
+            }
+        }
+
+        let mut persisted_multi: FxHashMap<String, Vec<StoredMultiColumnUnique>> =
+            FxHashMap::default();
+        for meta in persisted_unique_metas {
+            if meta.uniques.is_empty() {
+                continue;
+            }
+            let Some(canonical_name) = canonical_by_id.get(&meta.table_id) else {
+                tracing::debug!(
+                    "[CONTEXT] Skipping persisted multi-column UNIQUE metadata for unknown table_id={}",
+                    meta.table_id
+                );
+                continue;
+            };
+
+            let mut stored_entries = Vec::with_capacity(meta.uniques.len());
+            for entry in meta.uniques {
+                if entry.column_ids.is_empty() {
+                    continue;
+                }
+                stored_entries.push(StoredMultiColumnUnique {
+                    index_name: entry.index_name,
+                    field_ids: entry.column_ids,
+                });
+            }
+
+            if !stored_entries.is_empty() {
+                persisted_multi.insert(canonical_name.clone(), stored_entries);
+            }
+        }
+
         // Initialize catalog and populate with existing tables
         let catalog = Arc::new(llkv_table::catalog::TableCatalog::new());
         for (_table_id, table_meta) in &loaded_tables {
@@ -1082,6 +1189,7 @@ where
             pager,
             tables: RwLock::new(FxHashMap::default()), // Start with empty table cache
             dropped_tables: RwLock::new(FxHashSet::default()),
+            multi_column_uniques: RwLock::new(persisted_multi),
             catalog,
             transaction_manager,
             txn_manager,
@@ -1106,6 +1214,65 @@ where
             last_committed
         );
         Ok(())
+    }
+
+    fn persist_multi_column_uniques(
+        &self,
+        table_id: TableId,
+        entries: &[StoredMultiColumnUnique],
+    ) -> Result<()> {
+        let store = ColumnStore::open(Arc::clone(&self.pager))?;
+        let catalog = SysCatalog::new(&store);
+        let metas: Vec<MultiColumnUniqueEntryMeta> = entries
+            .iter()
+            .map(|entry| MultiColumnUniqueEntryMeta {
+                index_name: entry.index_name.clone(),
+                column_ids: entry.field_ids.clone(),
+            })
+            .collect();
+        catalog.put_multi_column_uniques(table_id, &metas)?;
+        Ok(())
+    }
+
+    fn build_executor_multi_column_uniques(
+        table: &ExecutorTable<P>,
+        stored: &[StoredMultiColumnUnique],
+    ) -> Vec<ExecutorMultiColumnUnique> {
+        let mut results = Vec::with_capacity(stored.len());
+
+        'outer: for entry in stored {
+            if entry.field_ids.is_empty() {
+                continue;
+            }
+
+            let mut column_indices = Vec::with_capacity(entry.field_ids.len());
+            for field_id in &entry.field_ids {
+                if let Some((idx, _)) = table
+                    .schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, col)| &col.field_id == field_id)
+                {
+                    column_indices.push(idx);
+                } else {
+                    tracing::warn!(
+                        "[CATALOG] Skipping persisted multi-column UNIQUE {:?} for table_id={} missing field_id {}",
+                        entry.index_name,
+                        table.table.table_id(),
+                        field_id
+                    );
+                    continue 'outer;
+                }
+            }
+
+            results.push(ExecutorMultiColumnUnique {
+                index_name: entry.index_name.clone(),
+                column_indices,
+            });
+        }
+
+        results
     }
 
     /// Construct the default snapshot for auto-commit operations.
@@ -1211,6 +1378,10 @@ where
         if is_dropped {
             self.remove_table_entry(&canonical_name);
             self.dropped_tables.write().unwrap().remove(&canonical_name);
+            self.multi_column_uniques
+                .write()
+                .unwrap()
+                .remove(&canonical_name);
         }
 
         if exists {
@@ -1220,6 +1391,10 @@ where
                     display_name
                 );
                 self.remove_table_entry(&canonical_name);
+                self.multi_column_uniques
+                    .write()
+                    .unwrap()
+                    .remove(&canonical_name);
             } else if plan.if_not_exists {
                 tracing::trace!(
                     "DEBUG create_table_plan: table '{}' exists and if_not_exists=true, returning early WITHOUT creating",
@@ -1257,6 +1432,185 @@ where
         }
     }
 
+    pub fn create_index(&self, plan: CreateIndexPlan) -> Result<RuntimeStatementResult<P>> {
+        if plan.columns.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX requires at least one column".into(),
+            ));
+        }
+
+        for column_plan in &plan.columns {
+            if !column_plan.ascending || column_plan.nulls_first {
+                return Err(Error::InvalidArgumentError(
+                    "only ASC indexes with NULLS LAST are supported".into(),
+                ));
+            }
+        }
+
+        let index_name = plan.name.clone();
+        let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
+        let table = self.lookup_table(&canonical_name)?;
+
+        let mut column_indices = Vec::with_capacity(plan.columns.len());
+        let mut field_ids = Vec::with_capacity(plan.columns.len());
+        let mut column_names = Vec::with_capacity(plan.columns.len());
+        let mut seen_column_indices = FxHashSet::default();
+
+        for column_plan in &plan.columns {
+            let normalized = column_plan.name.to_ascii_lowercase();
+            let col_idx = table
+                .schema
+                .lookup
+                .get(&normalized)
+                .copied()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "column '{}' does not exist in table '{}'",
+                        column_plan.name, display_name
+                    ))
+                })?;
+            if !seen_column_indices.insert(col_idx) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "duplicate column '{}' in CREATE INDEX",
+                    column_plan.name
+                )));
+            }
+
+            let column = &table.schema.columns[col_idx];
+            column_indices.push(col_idx);
+            field_ids.push(column.field_id);
+            column_names.push(column.name.clone());
+        }
+
+        if plan.columns.len() == 1 {
+            let field_id = field_ids[0];
+            let column_name = column_names[0].clone();
+            let table_id = table.table.table_id();
+            let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
+            let store = ColumnStore::open(Arc::clone(&self.pager))?;
+            let existing_indexes = match store.list_persisted_indexes(logical_field_id) {
+                Ok(kinds) => kinds,
+                Err(Error::NotFound) => Vec::new(),
+                Err(err) => return Err(err),
+            };
+
+            if existing_indexes.contains(&IndexKind::Sort) {
+                if plan.if_not_exists {
+                    return Ok(RuntimeStatementResult::CreateIndex {
+                        table_name: display_name,
+                        index_name,
+                    });
+                }
+
+                return Err(Error::CatalogError(format!(
+                    "Index already exists on column '{}'",
+                    column_name
+                )));
+            }
+
+            if plan.unique {
+                self.ensure_existing_rows_unique(table.as_ref(), field_id, &column_name)?;
+                if let Some(table_id) = self.catalog.table_id(&canonical_name)
+                    && let Some(resolver) = self.catalog.field_resolver(table_id)
+                {
+                    resolver.set_field_unique(&column_name, true)?;
+                }
+            }
+
+            store.register_index(logical_field_id, IndexKind::Sort)?;
+
+            drop(table);
+            self.remove_table_entry(&canonical_name);
+
+            return Ok(RuntimeStatementResult::CreateIndex {
+                table_name: display_name,
+                index_name,
+            });
+        }
+
+        if !plan.unique {
+            return Err(Error::InvalidArgumentError(
+                "multi-column CREATE INDEX currently supports UNIQUE indexes only".into(),
+            ));
+        }
+
+        if let Some(existing) = self
+            .multi_column_uniques
+            .read()
+            .unwrap()
+            .get(&canonical_name)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.field_ids == field_ids)
+                    .cloned()
+            })
+        {
+            if plan.if_not_exists {
+                drop(table);
+                return Ok(RuntimeStatementResult::CreateIndex {
+                    table_name: display_name,
+                    index_name: existing.index_name.clone(),
+                });
+            }
+
+            return Err(Error::CatalogError(format!(
+                "Index already exists on columns '{}'",
+                column_names.join(", ")
+            )));
+        }
+
+        self.ensure_existing_rows_unique_multi(table.as_ref(), &field_ids, &column_names)?;
+
+        let executor_entry = ExecutorMultiColumnUnique {
+            index_name: index_name.clone(),
+            column_indices: column_indices.clone(),
+        };
+
+        let mut entries_to_persist = {
+            let guard = self.multi_column_uniques.read().unwrap();
+            guard.get(&canonical_name).cloned().unwrap_or_default()
+        };
+
+        if entries_to_persist
+            .iter()
+            .any(|existing| existing.field_ids == field_ids)
+        {
+            // Race condition guard: another thread inserted the same index after the initial check.
+            if plan.if_not_exists {
+                drop(table);
+                return Ok(RuntimeStatementResult::CreateIndex {
+                    table_name: display_name,
+                    index_name: index_name.clone(),
+                });
+            }
+            return Err(Error::CatalogError(format!(
+                "Index already exists on columns '{}'",
+                column_names.join(", ")
+            )));
+        }
+
+        let stored_entry = StoredMultiColumnUnique {
+            index_name: index_name.clone(),
+            field_ids: field_ids.clone(),
+        };
+        entries_to_persist.push(stored_entry.clone());
+
+        self.persist_multi_column_uniques(table.table.table_id(), &entries_to_persist)?;
+
+        {
+            let mut guard = self.multi_column_uniques.write().unwrap();
+            guard.insert(canonical_name.clone(), entries_to_persist);
+        }
+
+        table.add_multi_column_unique(executor_entry);
+
+        Ok(RuntimeStatementResult::CreateIndex {
+            table_name: display_name,
+            index_name,
+        })
+    }
+
     pub fn table_names(self: &Arc<Self>) -> Vec<String> {
         // Use catalog for table names (single source of truth)
         self.catalog.table_names()
@@ -1265,16 +1619,10 @@ where
     fn filter_visible_row_ids(
         &self,
         table: &ExecutorTable<P>,
-        row_ids: Vec<u64>,
+        row_ids: Vec<RowId>,
         snapshot: TransactionSnapshot,
-    ) -> Result<Vec<u64>> {
-        filter_row_ids_for_snapshot(
-            table.table.store(),
-            table.table.table_id(),
-            row_ids,
-            &self.txn_manager,
-            snapshot,
-        )
+    ) -> Result<Vec<RowId>> {
+        filter_row_ids_for_snapshot(table.table.as_ref(), row_ids, &self.txn_manager, snapshot)
     }
 
     pub fn create_table_builder(&self, name: &str) -> RuntimeCreateTableBuilder<'_, P> {
@@ -1298,6 +1646,8 @@ where
                     column.nullable,
                 )
                 .with_primary_key(column.primary_key)
+                .with_unique(column.unique)
+                .with_check(column.check_expr.clone())
             })
             .collect())
     }
@@ -1452,22 +1802,18 @@ where
             return Ok(Vec::new());
         }
 
-        // Scan to get the column data
+        // Scan to get the column data without materializing full columns
         let table_id = table.table.table_id();
 
         let mut fields: Vec<Field> = Vec::with_capacity(table.schema.columns.len() + 1);
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(table.schema.columns.len() + 1);
+        let mut logical_fields: Vec<LogicalFieldId> =
+            Vec::with_capacity(table.schema.columns.len());
 
         fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
-        arrays.push(Arc::new(UInt64Array::from(visible_row_ids.clone())));
 
         for column in &table.schema.columns {
             let logical_field_id = LogicalFieldId::for_user(table_id, column.field_id);
-            let gathered = table.table.store().gather_rows(
-                &[logical_field_id],
-                &visible_row_ids,
-                GatherNullPolicy::IncludeNulls,
-            )?;
+            logical_fields.push(logical_field_id);
             let field = mvcc_columns::build_field_with_metadata(
                 &column.name,
                 column.data_type.clone(),
@@ -1475,11 +1821,47 @@ where
                 column.field_id,
             );
             fields.push(field);
-            arrays.push(gathered.column(0).clone());
         }
 
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
-        Ok(vec![batch])
+        let schema = Arc::new(Schema::new(fields));
+
+        if logical_fields.is_empty() {
+            // Tables without user columns should still return row_id batches.
+            let mut row_id_builder = UInt64Builder::with_capacity(visible_row_ids.len());
+            for row_id in &visible_row_ids {
+                row_id_builder.append_value(*row_id);
+            }
+            let arrays: Vec<ArrayRef> = vec![Arc::new(row_id_builder.finish()) as ArrayRef];
+            let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+            return Ok(vec![batch]);
+        }
+
+        let mut stream = table.table.stream_columns(
+            Arc::from(logical_fields),
+            visible_row_ids,
+            GatherNullPolicy::IncludeNulls,
+        )?;
+
+        let mut batches = Vec::new();
+        while let Some(chunk) = stream.next_batch()? {
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(chunk.batch().num_columns() + 1);
+
+            let mut row_id_builder = UInt64Builder::with_capacity(chunk.len());
+            for row_id in chunk.row_ids() {
+                row_id_builder.append_value(*row_id);
+            }
+            arrays.push(Arc::new(row_id_builder.finish()) as ArrayRef);
+
+            let chunk_batch = chunk.into_batch();
+            for column_array in chunk_batch.columns() {
+                arrays.push(column_array.clone());
+            }
+
+            let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+            batches.push(batch);
+        }
+
+        Ok(batches)
     }
 
     /// Append batches directly to a table, preserving row_ids from the batches.
@@ -1687,6 +2069,11 @@ where
             ));
         }
 
+        self.multi_column_uniques
+            .write()
+            .unwrap()
+            .remove(&canonical_name);
+
         let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(columns.len());
         let mut lookup = FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
         for (idx, column) in columns.iter().enumerate() {
@@ -1698,27 +2085,30 @@ where
                 )));
             }
             tracing::trace!(
-                "DEBUG create_table_from_columns[{}]: name='{}' data_type={:?} nullable={} primary_key={}",
+                "DEBUG create_table_from_columns[{}]: name='{}' data_type={:?} nullable={} primary_key={} unique={}",
                 idx,
                 column.name,
                 column.data_type,
                 column.nullable,
-                column.primary_key
+                column.primary_key,
+                column.unique
             );
             column_defs.push(ExecutorColumn {
                 name: column.name.clone(),
                 data_type: column.data_type.clone(),
                 nullable: column.nullable,
                 primary_key: column.primary_key,
+                unique: column.unique,
                 field_id: (idx + 1) as FieldId,
                 check_expr: column.check_expr.clone(),
             });
             let pushed = column_defs.last().unwrap();
             tracing::trace!(
-                "DEBUG create_table_from_columns[{}]: pushed ExecutorColumn name='{}' primary_key={}",
+                "DEBUG create_table_from_columns[{}]: pushed ExecutorColumn name='{}' primary_key={} unique={}",
                 idx,
                 pushed.name,
-                pushed.primary_key
+                pushed.primary_key,
+                pushed.unique
             );
         }
 
@@ -1756,6 +2146,7 @@ where
             schema,
             next_row_id: AtomicU64::new(0),
             total_rows: AtomicU64::new(0),
+            multi_column_uniques: RwLock::new(Vec::new()),
         });
 
         let mut tables = self.tables.write().unwrap();
@@ -1786,6 +2177,7 @@ where
             for column in &column_defs {
                 let definition = FieldDefinition::new(&column.name)
                     .with_primary_key(column.primary_key)
+                    .with_unique(column.unique)
                     .with_check_expr(column.check_expr.clone());
                 if let Err(e) = field_resolver.register_field(definition) {
                     tracing::warn!(
@@ -1821,6 +2213,10 @@ where
                 "CREATE TABLE AS SELECT requires at least one column".into(),
             ));
         }
+        self.multi_column_uniques
+            .write()
+            .unwrap()
+            .remove(&canonical_name);
         let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(schema.fields().len());
         let mut lookup =
             FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
@@ -1849,6 +2245,7 @@ where
                 data_type,
                 nullable: field.is_nullable(),
                 primary_key: false, // CTAS does not preserve PRIMARY KEY constraints
+                unique: false,      // CTAS does not preserve UNIQUE constraints
                 field_id: (idx + 1) as FieldId,
                 check_expr: None, // CTAS does not preserve CHECK constraints
             });
@@ -1882,6 +2279,7 @@ where
             schema: schema_arc,
             next_row_id: AtomicU64::new(0),
             total_rows: AtomicU64::new(0),
+            multi_column_uniques: RwLock::new(Vec::new()),
         });
 
         let mut next_row_id: RowId = 0;
@@ -1955,10 +2353,11 @@ where
         );
         for (idx, col) in table_entry.schema.columns.iter().enumerate() {
             tracing::trace!(
-                "  inserting column[{}]: name='{}' primary_key={}",
+                "  inserting column[{}]: name='{}' primary_key={} unique={}",
                 idx,
                 col.name,
-                col.primary_key
+                col.primary_key,
+                col.unique
             );
         }
         tables.insert(canonical_name.clone(), table_entry);
@@ -1977,6 +2376,7 @@ where
             for column in &column_defs {
                 let definition = FieldDefinition::new(&column.name)
                     .with_primary_key(column.primary_key)
+                    .with_unique(column.unique)
                     .with_check_expr(column.check_expr.clone());
                 if let Err(e) = field_resolver.register_field(definition) {
                     tracing::warn!(
@@ -2107,6 +2507,48 @@ where
         Ok(())
     }
 
+    fn check_not_null_constraints(
+        &self,
+        table: &ExecutorTable<P>,
+        rows: &[Vec<PlanValue>],
+        column_order: &[usize],
+    ) -> Result<()> {
+        let not_null_columns: Vec<(usize, &ExecutorColumn)> = table
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| !column.nullable)
+            .collect();
+
+        if not_null_columns.is_empty() {
+            return Ok(());
+        }
+
+        for (col_idx, column) in not_null_columns {
+            let insert_pos = column_order
+                .iter()
+                .position(|&dest_idx| dest_idx == col_idx)
+                .ok_or_else(|| {
+                    Error::ConstraintError(format!(
+                        "NOT NULL column '{}' missing from INSERT/UPDATE",
+                        column.name
+                    ))
+                })?;
+
+            for row in rows {
+                if matches!(row.get(insert_pos), Some(PlanValue::Null)) {
+                    return Err(Error::ConstraintError(format!(
+                        "NOT NULL constraint failed for column '{}'",
+                        column.name
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn evaluate_check_expression(
         expr: &sqlparser::ast::Expr,
         row: &[PlanValue],
@@ -2207,6 +2649,14 @@ where
                         op
                     ))),
                 }
+            }
+            SqlExpr::IsNull(inner) => {
+                let value = Self::evaluate_check_expr_value(inner, row, column_order, table)?;
+                Ok(matches!(value, PlanValue::Null))
+            }
+            SqlExpr::IsNotNull(inner) => {
+                let value = Self::evaluate_check_expr_value(inner, row, column_order, table)?;
+                Ok(!matches!(value, PlanValue::Null))
             }
             _ => Err(Error::InvalidArgumentError(format!(
                 "Unsupported expression in CHECK constraint: {:?}",
@@ -2484,6 +2934,163 @@ where
         }
     }
 
+    fn ensure_existing_rows_unique(
+        &self,
+        table: &ExecutorTable<P>,
+        field_id: FieldId,
+        column_name: &str,
+    ) -> Result<()> {
+        let snapshot = self.default_snapshot();
+        let values = self.scan_column_values(table, field_id, snapshot)?;
+
+        // TODO: This is inefficient for large datasets; consider a more efficient approach
+        let mut seen: FxHashSet<UniqueKey> = FxHashSet::default();
+
+        for value in values {
+            let Some(key) = Self::unique_key_component(&value, column_name)? else {
+                continue;
+            };
+
+            if !seen.insert(key) {
+                return Err(Error::ConstraintError(format!(
+                    "constraint violation on column '{}'",
+                    column_name
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ensure_existing_rows_unique_multi(
+        &self,
+        table: &ExecutorTable<P>,
+        field_ids: &[FieldId],
+        column_names: &[String],
+    ) -> Result<()> {
+        if field_ids.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot = self.default_snapshot();
+        let rows = self.scan_multi_column_values(table, field_ids, snapshot)?;
+        let mut seen: FxHashSet<UniqueKey> = FxHashSet::default();
+
+        for values in rows {
+            if values.len() != field_ids.len() {
+                continue;
+            }
+
+            if let Some(key) = Self::build_composite_unique_key(&values, column_names)?
+                && !seen.insert(key)
+            {
+                return Err(Error::ConstraintError(format!(
+                    "constraint violation on columns '{}'",
+                    column_names.join(", ")
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn check_unique_constraints(
+        &self,
+        table: &ExecutorTable<P>,
+        rows: &[Vec<PlanValue>],
+        column_order: &[usize],
+        snapshot: TransactionSnapshot,
+    ) -> Result<()> {
+        let unique_columns: Vec<(usize, &ExecutorColumn)> = table
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, col)| col.unique && !col.primary_key)
+            .collect();
+
+        for (col_idx, column) in unique_columns {
+            let existing_values = self.scan_column_values(table, column.field_id, snapshot)?;
+            let mut new_values: Vec<PlanValue> = Vec::new();
+
+            for row in rows {
+                let Some(insert_position) = column_order.iter().position(|&dest| dest == col_idx)
+                else {
+                    continue;
+                };
+                let value = row[insert_position].clone();
+
+                if matches!(value, PlanValue::Null) {
+                    continue;
+                }
+
+                if existing_values.contains(&value) || new_values.contains(&value) {
+                    return Err(Error::ConstraintError(format!(
+                        "constraint violation on column '{}'",
+                        column.name
+                    )));
+                }
+
+                new_values.push(value);
+            }
+        }
+
+        let multi_uniques = table.multi_column_uniques();
+        for constraint in multi_uniques {
+            if constraint.column_indices.is_empty() {
+                continue;
+            }
+
+            let mut constraint_column_names = Vec::with_capacity(constraint.column_indices.len());
+            let mut field_ids = Vec::with_capacity(constraint.column_indices.len());
+            for &col_idx in &constraint.column_indices {
+                let Some(column) = table.schema.columns.get(col_idx) else {
+                    return Err(Error::Internal(format!(
+                        "multi-column UNIQUE constraint references invalid column index {}",
+                        col_idx
+                    )));
+                };
+                constraint_column_names.push(column.name.clone());
+                field_ids.push(column.field_id);
+            }
+
+            let existing_rows = self.scan_multi_column_values(table, &field_ids, snapshot)?;
+            let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
+            for row_values in existing_rows {
+                if let Some(key) =
+                    Self::build_composite_unique_key(&row_values, &constraint_column_names)?
+                {
+                    existing_keys.insert(key);
+                }
+            }
+
+            let mut new_keys: FxHashSet<UniqueKey> = FxHashSet::default();
+            for row in rows {
+                let mut values_for_constraint = Vec::with_capacity(constraint.column_indices.len());
+                for &col_idx in &constraint.column_indices {
+                    if let Some(pos) = column_order.iter().position(|&dest| dest == col_idx) {
+                        values_for_constraint.push(row[pos].clone());
+                    } else {
+                        values_for_constraint.push(PlanValue::Null);
+                    }
+                }
+
+                if let Some(key) = Self::build_composite_unique_key(
+                    &values_for_constraint,
+                    &constraint_column_names,
+                )? && (existing_keys.contains(&key) || !new_keys.insert(key))
+                {
+                    return Err(Error::ConstraintError(format!(
+                        "constraint violation on columns '{}'",
+                        constraint_column_names.join(", ")
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn check_primary_key_constraints(
         &self,
         table: &ExecutorTable<P>,
@@ -2510,6 +3117,7 @@ where
             // Get existing values for this column from the table
             let field_id = column.field_id;
             let existing_values = self.scan_column_values(table, field_id, snapshot)?;
+            let mut new_values: Vec<PlanValue> = Vec::new();
 
             tracing::trace!(
                 "[PK_CHECK] snapshot(txn={}, snap_id={}) column '{}': found {} existing VISIBLE values: {:?}",
@@ -2536,12 +3144,14 @@ where
                     }
 
                     // Check if this value already exists
-                    if existing_values.contains(new_value) {
+                    if existing_values.contains(new_value) || new_values.contains(new_value) {
                         return Err(Error::ConstraintError(format!(
                             "constraint violation on column '{}'",
                             column.name
                         )));
                     }
+
+                    new_values.push(new_value.clone());
                 }
             }
         }
@@ -2549,6 +3159,7 @@ where
         Ok(())
     }
 
+    // TODO: Make streamable; don't buffer all values in memory at once
     fn scan_column_values(
         &self,
         table: &ExecutorTable<P>,
@@ -2578,8 +3189,7 @@ where
 
         // Apply MVCC filtering manually using filter_row_ids_for_snapshot
         let row_ids = filter_row_ids_for_snapshot(
-            table.table.store(),
-            table_id,
+            table.table.as_ref(),
             row_ids,
             &self.txn_manager,
             snapshot,
@@ -2591,18 +3201,24 @@ where
 
         // Gather the column values for visible rows
         let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
-        let batch = match table.table.store().gather_rows(
-            &[logical_field_id],
-            &row_ids,
+        let row_count = row_ids.len();
+        let mut stream = match table.table.stream_columns(
+            vec![logical_field_id],
+            row_ids,
             GatherNullPolicy::IncludeNulls,
         ) {
-            Ok(b) => b,
+            Ok(stream) => stream,
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
 
-        let mut values = Vec::with_capacity(row_ids.len());
-        if batch.num_columns() > 0 {
+        // TODO: Don't buffer all values; make this streamable
+        let mut values = Vec::with_capacity(row_count);
+        while let Some(chunk) = stream.next_batch()? {
+            let batch = chunk.batch();
+            if batch.num_columns() == 0 {
+                continue;
+            }
             let array = batch.column(0);
             for row_idx in 0..batch.num_rows() {
                 if let Ok(value) = llkv_plan::plan_value_from_array(array, row_idx) {
@@ -2612,6 +3228,125 @@ where
         }
 
         Ok(values)
+    }
+
+    // TODO: Make streamable; don't buffer all values in memory at once
+    fn scan_multi_column_values(
+        &self,
+        table: &ExecutorTable<P>,
+        field_ids: &[FieldId],
+        snapshot: TransactionSnapshot,
+    ) -> Result<Vec<Vec<PlanValue>>> {
+        if field_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table_id = table.table.table_id();
+        use llkv_expr::{Expr, Filter, Operator};
+        use std::ops::Bound;
+
+        let match_all_filter = Filter {
+            field_id: field_ids[0],
+            op: Operator::Range {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+        };
+        let filter_expr = Expr::Pred(match_all_filter);
+
+        let row_ids = match table.table.filter_row_ids(&filter_expr) {
+            Ok(ids) => ids,
+            Err(Error::NotFound) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let row_ids = filter_row_ids_for_snapshot(
+            table.table.as_ref(),
+            row_ids,
+            &self.txn_manager,
+            snapshot,
+        )?;
+
+        if row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let logical_field_ids: Vec<_> = field_ids
+            .iter()
+            .map(|&fid| LogicalFieldId::for_user(table_id, fid))
+            .collect();
+
+        let total_rows = row_ids.len();
+        let mut stream = match table.table.stream_columns(
+            logical_field_ids,
+            row_ids,
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(stream) => stream,
+            Err(Error::NotFound) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let mut rows = vec![Vec::with_capacity(field_ids.len()); total_rows];
+        while let Some(chunk) = stream.next_batch()? {
+            let batch = chunk.batch();
+            if batch.num_columns() == 0 {
+                continue;
+            }
+
+            let base = chunk.row_offset();
+            let local_len = batch.num_rows();
+            for col_idx in 0..batch.num_columns() {
+                let array = batch.column(col_idx);
+                for local_idx in 0..local_len {
+                    let target_index = base + local_idx;
+                    debug_assert!(
+                        target_index < rows.len(),
+                        "stream chunk produced out-of-bounds row index"
+                    );
+                    if let Some(row) = rows.get_mut(target_index) {
+                        match llkv_plan::plan_value_from_array(array, local_idx) {
+                            Ok(value) => row.push(value),
+                            Err(_) => row.push(PlanValue::Null),
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+
+    fn unique_key_component(value: &PlanValue, column_name: &str) -> Result<Option<UniqueKey>> {
+        match value {
+            PlanValue::Null => Ok(None),
+            PlanValue::Integer(v) => Ok(Some(UniqueKey::Int(*v))),
+            PlanValue::Float(v) => Ok(Some(UniqueKey::Float(v.to_bits()))),
+            PlanValue::String(s) => Ok(Some(UniqueKey::Str(s.clone()))),
+            PlanValue::Struct(_) => Err(Error::InvalidArgumentError(format!(
+                "UNIQUE index is not supported on struct column '{}'",
+                column_name
+            ))),
+        }
+    }
+
+    fn build_composite_unique_key(
+        values: &[PlanValue],
+        column_names: &[String],
+    ) -> Result<Option<UniqueKey>> {
+        if values.is_empty() {
+            return Ok(None);
+        }
+
+        let mut components = Vec::with_capacity(values.len());
+        for (value, column_name) in values.iter().zip(column_names) {
+            match Self::unique_key_component(value, column_name)? {
+                Some(component) => components.push(component),
+                None => return Ok(None),
+            }
+        }
+
+        Ok(Some(UniqueKey::Composite(components)))
     }
 
     fn insert_rows(
@@ -2640,11 +3375,11 @@ where
             }
         }
 
+        self.check_not_null_constraints(table, &rows, &column_order)?;
         // Check CHECK constraints
         self.check_check_constraints(table, &rows, &column_order)?;
-
-        // Check PRIMARY KEY constraints
-        self.check_primary_key_constraints(table, &rows, &column_order, snapshot)?;
+        // Check UNIQUE constraints
+        self.check_unique_constraints(table, &rows, &column_order, snapshot)?;
 
         if display_name == "keys" {
             tracing::trace!(
@@ -2853,21 +3588,38 @@ where
             .map(|column| LogicalFieldId::for_user(table_id, column.field_id))
             .collect();
 
-        let gathered = table.table.store().gather_rows(
-            &logical_fields,
-            &row_ids,
+        let mut stream = table.table.stream_columns(
+            logical_fields.clone(),
+            row_ids.clone(),
             GatherNullPolicy::IncludeNulls,
         )?;
 
         let mut new_rows: Vec<Vec<PlanValue>> =
             vec![Vec::with_capacity(table.schema.columns.len()); row_count];
-        for (col_idx, _column) in table.schema.columns.iter().enumerate() {
-            let array = gathered.column(col_idx);
-            for (row_idx, row) in new_rows.iter_mut().enumerate().take(row_count) {
-                let value = llkv_plan::plan_value_from_array(array, row_idx)?;
-                row.push(value);
+        while let Some(chunk) = stream.next_batch()? {
+            let batch = chunk.batch();
+            let base = chunk.row_offset();
+            let local_len = batch.num_rows();
+            for col_idx in 0..batch.num_columns() {
+                let array = batch.column(col_idx);
+                for local_idx in 0..local_len {
+                    let target_index = base + local_idx;
+                    debug_assert!(
+                        target_index < new_rows.len(),
+                        "column stream produced out-of-range row index"
+                    );
+                    if let Some(row) = new_rows.get_mut(target_index) {
+                        let value = llkv_plan::plan_value_from_array(array, local_idx)?;
+                        row.push(value);
+                    }
+                }
             }
         }
+        debug_assert!(
+            new_rows
+                .iter()
+                .all(|row| row.len() == table.schema.columns.len())
+        );
 
         let column_positions: FxHashMap<FieldId, usize> = FxHashMap::from_iter(
             table
@@ -2914,19 +3666,22 @@ where
             }
         }
 
-        let _ = self.apply_delete(
-            table,
-            display_name.clone(),
-            row_ids.clone(),
-            snapshot.txn_id,
-        )?;
-
         let column_names: Vec<String> = table
             .schema
             .columns
             .iter()
             .map(|column| column.name.clone())
             .collect();
+        let column_order = resolve_insert_columns(&column_names, table.schema.as_ref())?;
+        self.check_not_null_constraints(table, &new_rows, &column_order)?;
+        self.check_check_constraints(table, &new_rows, &column_order)?;
+
+        let _ = self.apply_delete(
+            table,
+            display_name.clone(),
+            row_ids.clone(),
+            snapshot.txn_id,
+        )?;
 
         let _ = self.insert_rows(
             table,
@@ -3036,21 +3791,38 @@ where
             .map(|column| LogicalFieldId::for_user(table_id, column.field_id))
             .collect();
 
-        let gathered = table.table.store().gather_rows(
-            &logical_fields,
-            &row_ids,
+        let mut stream = table.table.stream_columns(
+            logical_fields.clone(),
+            row_ids.clone(),
             GatherNullPolicy::IncludeNulls,
         )?;
 
         let mut new_rows: Vec<Vec<PlanValue>> =
             vec![Vec::with_capacity(table.schema.columns.len()); row_count];
-        for (col_idx, _column) in table.schema.columns.iter().enumerate() {
-            let array = gathered.column(col_idx);
-            for (row_idx, row) in new_rows.iter_mut().enumerate().take(row_count) {
-                let value = llkv_plan::plan_value_from_array(array, row_idx)?;
-                row.push(value);
+        while let Some(chunk) = stream.next_batch()? {
+            let batch = chunk.batch();
+            let base = chunk.row_offset();
+            let local_len = batch.num_rows();
+            for col_idx in 0..batch.num_columns() {
+                let array = batch.column(col_idx);
+                for local_idx in 0..local_len {
+                    let target_index = base + local_idx;
+                    debug_assert!(
+                        target_index < new_rows.len(),
+                        "column stream produced out-of-range row index"
+                    );
+                    if let Some(row) = new_rows.get_mut(target_index) {
+                        let value = llkv_plan::plan_value_from_array(array, local_idx)?;
+                        row.push(value);
+                    }
+                }
             }
         }
+        debug_assert!(
+            new_rows
+                .iter()
+                .all(|row| row.len() == table.schema.columns.len())
+        );
 
         let column_positions: FxHashMap<FieldId, usize> = FxHashMap::from_iter(
             table
@@ -3097,19 +3869,22 @@ where
             }
         }
 
-        let _ = self.apply_delete(
-            table,
-            display_name.clone(),
-            row_ids.clone(),
-            snapshot.txn_id,
-        )?;
-
         let column_names: Vec<String> = table
             .schema
             .columns
             .iter()
             .map(|column| column.name.clone())
             .collect();
+        let column_order = resolve_insert_columns(&column_names, table.schema.as_ref())?;
+        self.check_not_null_constraints(table, &new_rows, &column_order)?;
+        self.check_check_constraints(table, &new_rows, &column_order)?;
+
+        let _ = self.apply_delete(
+            table,
+            display_name.clone(),
+            row_ids.clone(),
+            snapshot.txn_id,
+        )?;
 
         let _ = self.insert_rows(
             table,
@@ -3173,7 +3948,7 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: String,
-        row_ids: Vec<u64>,
+        row_ids: Vec<RowId>,
         txn_id: TxnId,
     ) -> Result<RuntimeStatementResult<P>> {
         if row_ids.is_empty() {
@@ -3205,7 +3980,7 @@ where
         filter_expr: &LlkvExpr<'static, FieldId>,
         expressions: &[ScalarExpr<FieldId>],
         snapshot: TransactionSnapshot,
-    ) -> Result<(Vec<u64>, Vec<Vec<PlanValue>>)> {
+    ) -> Result<(Vec<RowId>, Vec<Vec<PlanValue>>)> {
         let row_ids = table.table.filter_row_ids(filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         if row_ids.is_empty() {
@@ -3356,6 +4131,7 @@ where
                 data_type: field.data_type().clone(),
                 nullable: field.is_nullable(),
                 primary_key: constraints.primary_key,
+                unique: constraints.primary_key || constraints.unique,
                 field_id,
                 check_expr: constraints.check_expr.clone(),
             });
@@ -3431,7 +4207,20 @@ where
             schema: exec_schema,
             next_row_id: AtomicU64::new(next_row_id),
             total_rows: AtomicU64::new(total_rows),
+            multi_column_uniques: RwLock::new(Vec::new()),
         });
+
+        if let Some(stored) = self
+            .multi_column_uniques
+            .read()
+            .unwrap()
+            .get(canonical_name)
+            .cloned()
+        {
+            let executor_uniques =
+                Self::build_executor_multi_column_uniques(&executor_table, &stored);
+            executor_table.set_multi_column_uniques(executor_uniques);
+        }
 
         // Cache the loaded table
         {
@@ -3444,6 +4233,7 @@ where
             for col in &executor_table.schema.columns {
                 let definition = FieldDefinition::new(&col.name)
                     .with_primary_key(col.primary_key)
+                    .with_unique(col.unique)
                     .with_check_expr(col.check_expr.clone());
                 let _ = field_resolver.register_field(definition); // Ignore "already exists" errors
             }
@@ -3504,6 +4294,10 @@ where
             .write()
             .unwrap()
             .insert(canonical_name.clone());
+        self.multi_column_uniques
+            .write()
+            .unwrap()
+            .remove(&canonical_name);
         Ok(())
     }
 
@@ -3644,6 +4438,11 @@ where
         Ok(convert_statement_result(result))
     }
 
+    fn create_index(&self, plan: CreateIndexPlan) -> llkv_result::Result<TransactionResult<P>> {
+        let result = RuntimeContext::create_index(self.context(), plan)?;
+        Ok(convert_statement_result(result))
+    }
+
     fn append_batches_with_row_ids(
         &self,
         table_name: &str,
@@ -3685,6 +4484,13 @@ where
     use llkv_transaction::TransactionResult as TxResult;
     match result {
         RuntimeStatementResult::CreateTable { table_name } => TxResult::CreateTable { table_name },
+        RuntimeStatementResult::CreateIndex {
+            table_name,
+            index_name,
+        } => TxResult::CreateIndex {
+            table_name,
+            index_name,
+        },
         RuntimeStatementResult::Insert { rows_inserted, .. } => TxResult::Insert { rows_inserted },
         RuntimeStatementResult::Update { rows_updated, .. } => TxResult::Update {
             rows_matched: rows_updated,
@@ -3697,12 +4503,11 @@ where
 }
 
 fn filter_row_ids_for_snapshot<P>(
-    store: &ColumnStore<P>,
-    table_id: TableId,
-    row_ids: Vec<u64>,
+    table: &Table<P>,
+    row_ids: Vec<RowId>,
     txn_manager: &TxnIdManager,
     snapshot: TransactionSnapshot,
-) -> Result<Vec<u64>>
+) -> Result<Vec<RowId>>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -3717,89 +4522,109 @@ where
         return Ok(row_ids);
     }
 
+    let table_id = table.table_id();
     let created_lfid = LogicalFieldId::for_mvcc_created_by(table_id);
     let deleted_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
+    let logical_fields: Arc<[LogicalFieldId]> = Arc::from([created_lfid, deleted_lfid]);
 
-    let version_batch = match store.gather_rows(
-        &[created_lfid, deleted_lfid],
-        &row_ids,
+    if let Err(err) = table
+        .store()
+        .prepare_gather_context(logical_fields.as_ref())
+    {
+        match err {
+            Error::NotFound => {
+                tracing::trace!(
+                    "[FILTER_ROWS] MVCC columns not found for table_id={}, treating all rows as visible",
+                    table_id
+                );
+                return Ok(row_ids);
+            }
+            other => {
+                tracing::error!(
+                    "[FILTER_ROWS] Failed to prepare gather context: {:?}",
+                    other
+                );
+                return Err(other);
+            }
+        }
+    }
+
+    let total_rows = row_ids.len();
+    let mut stream = match table.stream_columns(
+        Arc::clone(&logical_fields),
+        row_ids,
         GatherNullPolicy::IncludeNulls,
     ) {
-        Ok(batch) => batch,
-        Err(Error::NotFound) => {
-            tracing::trace!(
-                "[FILTER_ROWS] gather_rows returned NotFound for MVCC columns, treating all {} rows as visible (committed)",
-                row_ids.len()
-            );
-            return Ok(row_ids);
-        }
+        Ok(stream) => stream,
         Err(err) => {
-            tracing::error!("[FILTER_ROWS] gather_rows error: {:?}", err);
+            tracing::error!("[FILTER_ROWS] stream_columns error: {:?}", err);
             return Err(err);
         }
     };
 
-    if version_batch.num_columns() < 2 {
-        tracing::debug!(
-            "[FILTER_ROWS] version_batch has < 2 columns, returning all {} rows",
-            row_ids.len()
-        );
-        return Ok(row_ids);
-    }
+    let mut visible = Vec::with_capacity(total_rows);
 
-    let created_column = version_batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<UInt64Array>();
-    let deleted_column = version_batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<UInt64Array>();
+    while let Some(chunk) = stream.next_batch()? {
+        let batch = chunk.batch();
+        let window = chunk.row_ids();
 
-    if created_column.is_none() || deleted_column.is_none() {
-        tracing::debug!(
-            "[FILTER_ROWS] Failed to downcast columns, returning all {} rows",
-            row_ids.len()
-        );
-        return Ok(row_ids);
-    }
+        if batch.num_columns() < 2 {
+            tracing::debug!(
+                "[FILTER_ROWS] version_batch has < 2 columns for table_id={}, returning window rows unfiltered",
+                table_id
+            );
+            visible.extend_from_slice(window);
+            continue;
+        }
 
-    let created_column = created_column.unwrap();
-    let deleted_column = deleted_column.unwrap();
+        let created_column = batch.column(0).as_any().downcast_ref::<UInt64Array>();
+        let deleted_column = batch.column(1).as_any().downcast_ref::<UInt64Array>();
 
-    let mut visible = Vec::with_capacity(row_ids.len());
-    for (idx, row_id) in row_ids.iter().enumerate() {
-        let created_by = if created_column.is_null(idx) {
-            TXN_ID_AUTO_COMMIT
-        } else {
-            created_column.value(idx)
-        };
-        let deleted_by = if deleted_column.is_null(idx) {
-            TXN_ID_NONE
-        } else {
-            deleted_column.value(idx)
-        };
+        if created_column.is_none() || deleted_column.is_none() {
+            tracing::debug!(
+                "[FILTER_ROWS] Failed to downcast MVCC columns for table_id={}, returning window rows unfiltered",
+                table_id
+            );
+            visible.extend_from_slice(window);
+            continue;
+        }
 
-        let version = RowVersion {
-            created_by,
-            deleted_by,
-        };
-        let is_visible = version.is_visible_for(txn_manager, snapshot);
-        tracing::trace!(
-            "[FILTER_ROWS] row_id={}: created_by={}, deleted_by={}, is_visible={}",
-            row_id,
-            created_by,
-            deleted_by,
-            is_visible
-        );
-        if is_visible {
-            visible.push(*row_id);
+        let created_column = created_column.unwrap();
+        let deleted_column = deleted_column.unwrap();
+
+        for (idx, row_id) in window.iter().enumerate() {
+            let created_by = if created_column.is_null(idx) {
+                TXN_ID_AUTO_COMMIT
+            } else {
+                created_column.value(idx)
+            };
+            let deleted_by = if deleted_column.is_null(idx) {
+                TXN_ID_NONE
+            } else {
+                deleted_column.value(idx)
+            };
+
+            let version = RowVersion {
+                created_by,
+                deleted_by,
+            };
+            let is_visible = version.is_visible_for(txn_manager, snapshot);
+            tracing::trace!(
+                "[FILTER_ROWS] row_id={}: created_by={}, deleted_by={}, is_visible={}",
+                row_id,
+                created_by,
+                deleted_by,
+                is_visible
+            );
+            if is_visible {
+                visible.push(*row_id);
+            }
         }
     }
 
     tracing::debug!(
         "[FILTER_ROWS] Filtered from {} to {} visible rows",
-        row_ids.len(),
+        total_rows,
         visible.len()
     );
     Ok(visible)
@@ -3831,20 +4656,14 @@ impl<P> RowIdFilter<P> for MvccRowIdFilter<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn filter(&self, table: &Table<P>, row_ids: Vec<u64>) -> Result<Vec<u64>> {
+    fn filter(&self, table: &Table<P>, row_ids: Vec<RowId>) -> Result<Vec<RowId>> {
         tracing::trace!(
             "[MVCC_FILTER] filter() called with row_ids {:?}, snapshot txn={}, snapshot_id={}",
             row_ids,
             self.snapshot.txn_id,
             self.snapshot.snapshot_id
         );
-        let result = filter_row_ids_for_snapshot(
-            table.store(),
-            table.table_id(),
-            row_ids,
-            &self.txn_manager,
-            self.snapshot,
-        );
+        let result = filter_row_ids_for_snapshot(table, row_ids, &self.txn_manager, self.snapshot);
         if let Ok(ref visible) = result {
             tracing::trace!(
                 "[MVCC_FILTER] filter() returning visible row_ids: {:?}",

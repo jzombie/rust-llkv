@@ -398,6 +398,7 @@ pub fn ensure_supported_arrow_type(dtype: &arrow::datatypes::DataType) -> Result
     )))
 }
 
+pub mod gather;
 pub mod parallel;
 pub mod store;
 pub mod types;

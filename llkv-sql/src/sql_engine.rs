@@ -12,10 +12,11 @@ use llkv_executor::SelectExecution;
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
 use llkv_runtime::{
-    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateTablePlan,
-    CreateTableSource, DeletePlan, InsertPlan, InsertSource, OrderByPlan, OrderSortType,
-    OrderTarget, PlanStatement, PlanValue, RuntimeContext, RuntimeEngine, RuntimeSession,
-    RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
+    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan, CreateTablePlan,
+    CreateTableSource, DeletePlan, IndexColumnPlan, InsertPlan, InsertSource, OrderByPlan,
+    OrderSortType, OrderTarget, PlanStatement, PlanValue, RuntimeContext, RuntimeEngine,
+    RuntimeSession, RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan,
+    extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
 use llkv_table::catalog::{IdentifierContext, IdentifierResolver};
@@ -25,10 +26,10 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
     ColumnOptionDef, DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName,
-    ObjectNamePart, ObjectType, OrderBy, OrderByExpr, OrderByKind, Query, SchemaName, Select,
-    SelectItem, SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableFactor,
-    TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
-    UpdateTableFromKind, Value, ValueWithSpan,
+    ObjectNamePart, ObjectType, OrderBy, OrderByKind, Query, SchemaName, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableFactor, TableObject,
+    TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator, UpdateTableFromKind,
+    Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -238,6 +239,10 @@ where
             Statement::CreateTable(stmt) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateTable");
                 self.handle_create_table(stmt)
+            }
+            Statement::CreateIndex(stmt) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateIndex");
+                self.handle_create_index(stmt)
             }
             Statement::CreateSchema {
                 schema_name,
@@ -500,6 +505,11 @@ where
                 )
             });
 
+            let has_unique_constraint = column_def
+                .options
+                .iter()
+                .any(|opt| matches!(opt.option, ColumnOption::Unique { .. }));
+
             // Extract CHECK constraint if present and validate it
             let check_expr = column_def.options.iter().find_map(|opt| {
                 if let ColumnOption::Check(expr) = &opt.option {
@@ -518,9 +528,10 @@ where
             let check_expr_str = check_expr.map(|e| e.to_string());
 
             tracing::trace!(
-                "DEBUG CREATE TABLE column '{}' is_primary_key={} check_expr={:?}",
+                "DEBUG CREATE TABLE column '{}' is_primary_key={} has_unique={} check_expr={:?}",
                 column_def.name.value,
                 is_primary_key,
+                has_unique_constraint,
                 check_expr_str
             );
 
@@ -530,17 +541,21 @@ where
                 is_nullable,
             );
             tracing::trace!(
-                "DEBUG ColumnSpec after new(): primary_key={}",
-                column.primary_key
+                "DEBUG ColumnSpec after new(): primary_key={} unique={}",
+                column.primary_key,
+                column.unique
             );
 
             column = column
                 .with_primary_key(is_primary_key)
+                .with_unique(has_unique_constraint)
                 .with_check(check_expr_str);
             tracing::trace!(
-                "DEBUG ColumnSpec after with_primary_key({}): primary_key={} check_expr={:?}",
+                "DEBUG ColumnSpec after with_primary_key({})/with_unique({}): primary_key={} unique={} check_expr={:?}",
                 is_primary_key,
+                has_unique_constraint,
                 column.primary_key,
+                column.unique,
                 column.check_expr
             );
 
@@ -555,6 +570,171 @@ where
             source: None,
         };
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
+    }
+
+    fn handle_create_index(
+        &self,
+        stmt: sqlparser::ast::CreateIndex,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        use sqlparser::ast::Expr as SqlExpr;
+
+        let sqlparser::ast::CreateIndex {
+            name,
+            table_name,
+            using,
+            columns,
+            unique,
+            concurrently,
+            if_not_exists,
+            include,
+            nulls_distinct,
+            with,
+            predicate,
+            index_options,
+            alter_options,
+            ..
+        } = stmt;
+
+        if concurrently {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX CONCURRENTLY is not supported".into(),
+            ));
+        }
+        if using.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX USING clauses are not supported".into(),
+            ));
+        }
+        if !include.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX INCLUDE columns are not supported".into(),
+            ));
+        }
+        if nulls_distinct.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX NULLS DISTINCT is not supported".into(),
+            ));
+        }
+        if !with.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX WITH options are not supported".into(),
+            ));
+        }
+        if predicate.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "partial CREATE INDEX is not supported".into(),
+            ));
+        }
+        if !index_options.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX options are not supported".into(),
+            ));
+        }
+        if !alter_options.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX ALTER options are not supported".into(),
+            ));
+        }
+        if columns.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX requires at least one column".into(),
+            ));
+        }
+
+        let (schema_name, base_table_name) = parse_schema_qualified_name(&table_name)?;
+        if let Some(ref schema) = schema_name {
+            let catalog = self.engine.context().table_catalog();
+            if !catalog.schema_exists(schema) {
+                return Err(Error::CatalogError(format!(
+                    "Schema '{}' does not exist",
+                    schema
+                )));
+            }
+        }
+
+        let display_table_name = schema_name
+            .as_ref()
+            .map(|schema| format!("{}.{}", schema, base_table_name))
+            .unwrap_or_else(|| base_table_name.clone());
+
+        let index_name = match name {
+            Some(name_obj) => Some(Self::object_name_to_string(&name_obj)?),
+            None => None,
+        };
+
+        let mut index_columns: Vec<IndexColumnPlan> = Vec::with_capacity(columns.len());
+        let mut seen_column_names: HashSet<String> = HashSet::new();
+        for item in columns {
+            if item.operator_class.is_some() {
+                return Err(Error::InvalidArgumentError(
+                    "CREATE INDEX operator classes are not supported".into(),
+                ));
+            }
+
+            let order_expr = item.column;
+
+            if order_expr.with_fill.is_some() {
+                return Err(Error::InvalidArgumentError(
+                    "CREATE INDEX column WITH FILL is not supported".into(),
+                ));
+            }
+
+            let column_name = match order_expr.expr {
+                SqlExpr::Identifier(ident) => ident.value,
+                SqlExpr::CompoundIdentifier(idents) => idents
+                    .last()
+                    .map(|ident| ident.value.clone())
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "invalid column reference in CREATE INDEX".into(),
+                        )
+                    })?,
+                other => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "CREATE INDEX only supports column references, found {other:?}",
+                    )));
+                }
+            };
+
+            let ascending = order_expr.options.asc.unwrap_or(true);
+            let nulls_first = order_expr.options.nulls_first.unwrap_or(false);
+
+            if !ascending {
+                return Err(Error::InvalidArgumentError(
+                    "CREATE INDEX DESC ordering is not supported".into(),
+                ));
+            }
+            if nulls_first {
+                return Err(Error::InvalidArgumentError(
+                    "CREATE INDEX NULLS FIRST ordering is not supported".into(),
+                ));
+            }
+
+            let normalized = column_name.to_ascii_lowercase();
+            if !seen_column_names.insert(normalized) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "duplicate column '{}' in CREATE INDEX",
+                    column_name
+                )));
+            }
+
+            let column_plan = IndexColumnPlan::new(column_name).with_sort(ascending, nulls_first);
+            index_columns.push(column_plan);
+        }
+
+        if index_columns.len() > 1 && !unique {
+            return Err(Error::InvalidArgumentError(
+                "multi-column CREATE INDEX currently supports UNIQUE indexes only".into(),
+            ));
+        }
+
+        let plan = CreateIndexPlan::new(display_table_name)
+            .with_name(index_name)
+            .with_unique(unique)
+            .with_if_not_exists(if_not_exists)
+            .with_columns(index_columns);
+
+        self.execute_plan_statement(PlanStatement::CreateIndex(plan))
     }
 
     fn handle_create_schema(
@@ -1449,7 +1629,7 @@ where
                 ));
             }
             let order_plan = self.translate_order_by(&resolver, select_context, order_by)?;
-            select_plan = select_plan.with_order_by(Some(order_plan));
+            select_plan = select_plan.with_order_by(order_plan);
         }
         Ok(select_plan)
     }
@@ -1581,7 +1761,7 @@ where
         resolver: &IdentifierResolver<'_>,
         id_context: IdentifierContext,
         order_by: &OrderBy,
-    ) -> SqlResult<OrderByPlan> {
+    ) -> SqlResult<Vec<OrderByPlan>> {
         let exprs = match &order_by.kind {
             OrderByKind::Expressions(exprs) => exprs,
             _ => {
@@ -1591,24 +1771,7 @@ where
             }
         };
 
-        if exprs.len() != 1 {
-            return Err(Error::InvalidArgumentError(
-                "ORDER BY currently supports a single expression".into(),
-            ));
-        }
-
-        let order_expr: &OrderByExpr = &exprs[0];
-        let ascending = order_expr.options.asc.unwrap_or(true);
         let base_nulls_first = self.default_nulls_first.load(AtomicOrdering::Relaxed);
-        let default_nulls_first_for_direction = if ascending {
-            base_nulls_first
-        } else {
-            !base_nulls_first
-        };
-        let nulls_first = order_expr
-            .options
-            .nulls_first
-            .unwrap_or(default_nulls_first_for_direction);
 
         let resolve_simple_column = |expr: &SqlExpr| -> SqlResult<String> {
             let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
@@ -1620,64 +1783,80 @@ where
             }
         };
 
-        let (target, sort_type) = match &order_expr.expr {
-            SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => (
-                OrderTarget::Column(resolve_simple_column(&order_expr.expr)?),
-                OrderSortType::Native,
-            ),
-            SqlExpr::Cast {
-                expr,
-                data_type:
-                    SqlDataType::Int(_)
-                    | SqlDataType::Integer(_)
-                    | SqlDataType::BigInt(_)
-                    | SqlDataType::SmallInt(_)
-                    | SqlDataType::TinyInt(_),
-                ..
-            } => (
-                OrderTarget::Column(resolve_simple_column(expr)?),
-                OrderSortType::CastTextToInteger,
-            ),
-            SqlExpr::Cast { data_type, .. } => {
-                return Err(Error::InvalidArgumentError(format!(
-                    "ORDER BY CAST target type {:?} is not supported",
-                    data_type
-                )));
-            }
-            SqlExpr::Value(value_with_span) => match &value_with_span.value {
-                Value::Number(raw, _) => {
-                    let position: usize = raw.parse().map_err(|_| {
-                        Error::InvalidArgumentError(format!(
-                            "ORDER BY position '{}' is not a valid positive integer",
-                            raw
-                        ))
-                    })?;
-                    if position == 0 {
-                        return Err(Error::InvalidArgumentError(
-                            "ORDER BY position must be at least 1".into(),
-                        ));
-                    }
-                    (OrderTarget::Index(position - 1), OrderSortType::Native)
-                }
-                other => {
+        let mut plans = Vec::with_capacity(exprs.len());
+        for order_expr in exprs {
+            let ascending = order_expr.options.asc.unwrap_or(true);
+            let default_nulls_first_for_direction = if ascending {
+                base_nulls_first
+            } else {
+                !base_nulls_first
+            };
+            let nulls_first = order_expr
+                .options
+                .nulls_first
+                .unwrap_or(default_nulls_first_for_direction);
+
+            let (target, sort_type) = match &order_expr.expr {
+                SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => (
+                    OrderTarget::Column(resolve_simple_column(&order_expr.expr)?),
+                    OrderSortType::Native,
+                ),
+                SqlExpr::Cast {
+                    expr,
+                    data_type:
+                        SqlDataType::Int(_)
+                        | SqlDataType::Integer(_)
+                        | SqlDataType::BigInt(_)
+                        | SqlDataType::SmallInt(_)
+                        | SqlDataType::TinyInt(_),
+                    ..
+                } => (
+                    OrderTarget::Column(resolve_simple_column(expr)?),
+                    OrderSortType::CastTextToInteger,
+                ),
+                SqlExpr::Cast { data_type, .. } => {
                     return Err(Error::InvalidArgumentError(format!(
-                        "unsupported ORDER BY literal expression: {other:?}"
+                        "ORDER BY CAST target type {:?} is not supported",
+                        data_type
                     )));
                 }
-            },
-            other => {
-                return Err(Error::InvalidArgumentError(format!(
-                    "unsupported ORDER BY expression: {other:?}"
-                )));
-            }
-        };
+                SqlExpr::Value(value_with_span) => match &value_with_span.value {
+                    Value::Number(raw, _) => {
+                        let position: usize = raw.parse().map_err(|_| {
+                            Error::InvalidArgumentError(format!(
+                                "ORDER BY position '{}' is not a valid positive integer",
+                                raw
+                            ))
+                        })?;
+                        if position == 0 {
+                            return Err(Error::InvalidArgumentError(
+                                "ORDER BY position must be at least 1".into(),
+                            ));
+                        }
+                        (OrderTarget::Index(position - 1), OrderSortType::Native)
+                    }
+                    other => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "unsupported ORDER BY literal expression: {other:?}"
+                        )));
+                    }
+                },
+                other => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported ORDER BY expression: {other:?}"
+                    )));
+                }
+            };
 
-        Ok(OrderByPlan {
-            target,
-            sort_type,
-            ascending,
-            nulls_first,
-        })
+            plans.push(OrderByPlan {
+                target,
+                sort_type,
+                ascending,
+                nulls_first,
+            });
+        }
+
+        Ok(plans)
     }
 
     fn detect_simple_aggregates(
@@ -2688,6 +2867,34 @@ fn translate_condition_with_context(
     expr: &SqlExpr,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     match expr {
+        SqlExpr::IsNull(inner) => {
+            let scalar = translate_scalar_with_context(resolver, context, inner)?;
+            match scalar {
+                llkv_expr::expr::ScalarExpr::Column(column) => {
+                    Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
+                        field_id: column,
+                        op: llkv_expr::expr::Operator::IsNull,
+                    }))
+                }
+                _ => Err(Error::InvalidArgumentError(
+                    "IS NULL predicates currently support column references only".into(),
+                )),
+            }
+        }
+        SqlExpr::IsNotNull(inner) => {
+            let scalar = translate_scalar_with_context(resolver, context, inner)?;
+            match scalar {
+                llkv_expr::expr::ScalarExpr::Column(column) => {
+                    Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
+                        field_id: column,
+                        op: llkv_expr::expr::Operator::IsNotNull,
+                    }))
+                }
+                _ => Err(Error::InvalidArgumentError(
+                    "IS NOT NULL predicates currently support column references only".into(),
+                )),
+            }
+        }
         SqlExpr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => Ok(llkv_expr::expr::Expr::And(vec![
                 translate_condition_with_context(resolver, context, left)?,
@@ -2888,6 +3095,9 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                 Literal::Struct(_) => Err(Error::InvalidArgumentError(
                     "cannot negate struct literal".into(),
                 )),
+                Literal::Null => Err(Error::InvalidArgumentError(
+                    "cannot negate null literal".into(),
+                )),
             },
             _ => Err(Error::InvalidArgumentError(
                 "cannot negate non-literal expression".into(),
@@ -2958,9 +3168,7 @@ fn literal_from_value(value: &ValueWithSpan) -> SqlResult<llkv_expr::expr::Scala
         Value::Boolean(_) => Err(Error::InvalidArgumentError(
             "BOOLEAN literals are not supported yet".into(),
         )),
-        Value::Null => Err(Error::InvalidArgumentError(
-            "NULL literal is not supported in comparisons; use IS NULL".into(),
-        )),
+        Value::Null => Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Null)),
         other => {
             if let Some(text) = other.clone().into_string() {
                 Ok(llkv_expr::expr::ScalarExpr::literal(Literal::String(text)))

@@ -50,8 +50,8 @@ pub type SessionId = u64;
 
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
-    ColumnSpec, CreateTablePlan, DeletePlan, InsertPlan, PlanOperation, PlanValue, SelectPlan,
-    UpdatePlan,
+    ColumnSpec, CreateIndexPlan, CreateTablePlan, DeletePlan, InsertPlan, PlanOperation, PlanValue,
+    SelectPlan, UpdatePlan,
 };
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
@@ -106,6 +106,10 @@ where
     Delete {
         rows_deleted: usize,
     },
+    CreateIndex {
+        table_name: String,
+        index_name: Option<String>,
+    },
     Select {
         table_name: String,
         schema: Arc<Schema>,
@@ -142,6 +146,13 @@ where
             TransactionResult::Delete { rows_deleted } => {
                 Ok(TransactionResult::Delete { rows_deleted })
             }
+            TransactionResult::CreateIndex {
+                table_name,
+                index_name,
+            } => Ok(TransactionResult::CreateIndex {
+                table_name,
+                index_name,
+            }),
             TransactionResult::Transaction { kind } => Ok(TransactionResult::Transaction { kind }),
             TransactionResult::Select { .. } => Err(Error::Internal(
                 "cannot convert SELECT TransactionResult between pager types".into(),
@@ -197,6 +208,9 @@ pub trait TransactionContext: Send + Sync {
 
     /// Delete rows
     fn delete(&self, plan: DeletePlan) -> LlkvResult<TransactionResult<Self::Pager>>;
+
+    /// Create an index
+    fn create_index(&self, plan: CreateIndexPlan) -> LlkvResult<TransactionResult<Self::Pager>>;
 
     /// Append batches with row IDs
     fn append_batches_with_row_ids(
