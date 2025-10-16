@@ -88,7 +88,8 @@ use crate::storage_namespace::{
 pub use llkv_transaction::TransactionKind;
 use llkv_transaction::{
     RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TransactionContext, TransactionManager,
-    TransactionResult, TxnId, TxnIdManager, mvcc::TransactionSnapshot,
+    TransactionResult, TxnId, TxnIdManager,
+    mvcc::TransactionSnapshot,
 };
 
 // Internal low-level transaction session type (from llkv-transaction)
@@ -2199,9 +2200,16 @@ where
 
     pub fn update(&self, plan: UpdatePlan) -> Result<RuntimeStatementResult<P>> {
         let snapshot = self.txn_manager.begin_transaction();
-        let result = self.update_with_snapshot(plan, snapshot)?;
-        self.txn_manager.mark_committed(snapshot.txn_id);
-        Ok(result)
+        match self.update_with_snapshot(plan, snapshot) {
+            Ok(result) => {
+                self.txn_manager.mark_committed(snapshot.txn_id);
+                Ok(result)
+            }
+            Err(err) => {
+                self.txn_manager.mark_aborted(snapshot.txn_id);
+                Err(err)
+            }
+        }
     }
 
     pub fn update_with_snapshot(
@@ -2225,9 +2233,16 @@ where
 
     pub fn delete(&self, plan: DeletePlan) -> Result<RuntimeStatementResult<P>> {
         let snapshot = self.txn_manager.begin_transaction();
-        let result = self.delete_with_snapshot(plan, snapshot)?;
-        self.txn_manager.mark_committed(snapshot.txn_id);
-        Ok(result)
+        match self.delete_with_snapshot(plan, snapshot) {
+            Ok(result) => {
+                self.txn_manager.mark_committed(snapshot.txn_id);
+                Ok(result)
+            }
+            Err(err) => {
+                self.txn_manager.mark_aborted(snapshot.txn_id);
+                Err(err)
+            }
+        }
     }
 
     pub fn delete_with_snapshot(
@@ -2247,9 +2262,8 @@ where
                 display_name,
                 filter,
                 snapshot,
-                snapshot.txn_id,
             ),
-            None => self.delete_all_rows(table.as_ref(), display_name, snapshot, snapshot.txn_id),
+            None => self.delete_all_rows(table.as_ref(), display_name, snapshot),
         }
     }
 
@@ -4019,7 +4033,7 @@ where
             table,
             display_name.clone(),
             row_ids.clone(),
-            snapshot.txn_id,
+            snapshot,
         )?;
 
         let _ = self.insert_rows(
@@ -4222,7 +4236,7 @@ where
             table,
             display_name.clone(),
             row_ids.clone(),
-            snapshot.txn_id,
+            snapshot,
         )?;
 
         let _ = self.insert_rows(
@@ -4245,7 +4259,6 @@ where
         display_name: String,
         filter: LlkvExpr<'static, String>,
         snapshot: TransactionSnapshot,
-        txn_id: TxnId,
     ) -> Result<RuntimeStatementResult<P>> {
         let schema = table.schema.as_ref();
         let filter_expr = translate_predicate(filter, schema)?;
@@ -4256,7 +4269,7 @@ where
             rows = row_ids.len(),
             "delete_filtered_rows collected row ids"
         );
-        self.apply_delete(table, display_name, row_ids, txn_id)
+        self.apply_delete(table, display_name, row_ids, snapshot)
     }
 
     fn delete_all_rows(
@@ -4264,7 +4277,6 @@ where
         table: &ExecutorTable<P>,
         display_name: String,
         snapshot: TransactionSnapshot,
-        txn_id: TxnId,
     ) -> Result<RuntimeStatementResult<P>> {
         let total_rows = table.total_rows.load(Ordering::SeqCst);
         if total_rows == 0 {
@@ -4280,7 +4292,7 @@ where
         let filter_expr = full_table_scan_filter(anchor_field);
         let row_ids = table.table.filter_row_ids(&filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
-        self.apply_delete(table, display_name, row_ids, txn_id)
+        self.apply_delete(table, display_name, row_ids, snapshot)
     }
 
     fn apply_delete(
@@ -4288,7 +4300,7 @@ where
         table: &ExecutorTable<P>,
         display_name: String,
         row_ids: Vec<RowId>,
-        txn_id: TxnId,
+        snapshot: TransactionSnapshot,
     ) -> Result<RuntimeStatementResult<P>> {
         if row_ids.is_empty() {
             return Ok(RuntimeStatementResult::Delete {
@@ -4297,10 +4309,12 @@ where
             });
         }
 
+        self.detect_delete_conflicts(table, &display_name, &row_ids, snapshot)?;
+
         let removed = row_ids.len();
 
         // Build DELETE batch using helper
-        let batch = mvcc_columns::build_delete_batch(row_ids.clone(), txn_id)?;
+        let batch = mvcc_columns::build_delete_batch(row_ids.clone(), snapshot.txn_id)?;
         table.table.append(&batch)?;
 
         let removed_u64 = u64::try_from(removed)
@@ -4311,6 +4325,89 @@ where
             table_name: display_name,
             rows_deleted: removed,
         })
+    }
+
+    fn detect_delete_conflicts(
+        &self,
+        table: &ExecutorTable<P>,
+        display_name: &str,
+        row_ids: &[RowId],
+        snapshot: TransactionSnapshot,
+    ) -> Result<()> {
+        if row_ids.is_empty() {
+            return Ok(());
+        }
+
+        let table_id = table.table.table_id();
+        let deleted_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
+        let logical_fields: Arc<[LogicalFieldId]> = Arc::from([deleted_lfid]);
+
+        if let Err(err) = table
+            .table
+            .store()
+            .prepare_gather_context(logical_fields.as_ref())
+        {
+            match err {
+                Error::NotFound => return Ok(()),
+                other => return Err(other),
+            }
+        }
+
+        let mut stream = table.table.stream_columns(
+            Arc::clone(&logical_fields),
+            row_ids.to_vec(),
+            GatherNullPolicy::IncludeNulls,
+        )?;
+
+        while let Some(chunk) = stream.next_batch()? {
+            let batch = chunk.batch();
+            let window = chunk.row_ids();
+            let deleted_column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    Error::Internal(
+                        "failed to read MVCC deleted_by column for conflict detection".into(),
+                    )
+                })?;
+
+            for (idx, row_id) in window.iter().enumerate() {
+                let deleted_by = if deleted_column.is_null(idx) {
+                    TXN_ID_NONE
+                } else {
+                    deleted_column.value(idx)
+                };
+
+                if deleted_by == TXN_ID_NONE || deleted_by == snapshot.txn_id {
+                    continue;
+                }
+
+                let status = self.txn_manager.status(deleted_by);
+                if !status.is_active() {
+                    continue;
+                }
+
+                tracing::debug!(
+                    "[MVCC] delete conflict: table='{}' row_id={} deleted_by={} status={:?} current_txn={}",
+                    display_name,
+                    row_id,
+                    deleted_by,
+                    status,
+                    snapshot.txn_id
+                );
+
+                return Err(Error::TransactionContextError(format!(
+                    "transaction conflict on table '{}' for row {}: row locked by transaction {} ({:?})",
+                    display_name,
+                    row_id,
+                    deleted_by,
+                    status
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     fn collect_update_rows(
