@@ -58,3 +58,52 @@ fn create_table_with_double_precision_row_field() {
         RuntimeStatementResult::CreateTable { .. }
     ));
 }
+
+#[test]
+fn create_table_with_table_level_primary_key() {
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+
+    // Accept table-level PRIMARY KEY constraints (single and composite)
+    let mut results = engine
+        .execute("CREATE TABLE pk_combo(a INTEGER, b INTEGER, PRIMARY KEY (a, b));")
+        .expect("create table with table-level PRIMARY KEY succeeds");
+    assert_eq!(results.len(), 1);
+    assert!(matches!(
+        results.remove(0),
+        RuntimeStatementResult::CreateTable { .. }
+    ));
+
+    // Insert distinct composite keys succeeds
+    let mut insert1 = engine
+        .execute("INSERT INTO pk_combo VALUES (1, 1);")
+        .expect("first insert succeeds");
+    assert!(matches!(
+        insert1.remove(0),
+        RuntimeStatementResult::Insert { .. }
+    ));
+
+    let mut insert2 = engine
+        .execute("INSERT INTO pk_combo VALUES (1, 2);")
+        .expect("second insert succeeds");
+    assert!(matches!(
+        insert2.remove(0),
+        RuntimeStatementResult::Insert { .. }
+    ));
+
+    // Duplicate composite key should fail
+    let err = engine
+        .execute("INSERT INTO pk_combo VALUES (1, 1);")
+        .expect_err("duplicate primary key should error");
+    let err_str = format!("{err}").to_ascii_lowercase();
+    assert!(
+        err_str.contains("constraint violation"),
+        "unexpected error: {err_str}"
+    );
+
+    // PRIMARY KEY columns may not accept NULL
+    let err = engine
+        .execute("INSERT INTO pk_combo VALUES (NULL, 3);")
+        .expect_err("primary key NULL should error");
+    let err_str = format!("{err}").to_ascii_lowercase();
+    assert!(err_str.contains("null"), "unexpected error: {err_str}");
+}

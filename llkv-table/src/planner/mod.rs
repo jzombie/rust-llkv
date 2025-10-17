@@ -8,8 +8,8 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, OffsetSizeTrait, RecordBatch, StringArray,
-    UInt64Array, new_null_array,
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, OffsetSizeTrait, RecordBatch,
+    StringArray, UInt64Array, new_null_array,
 };
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
@@ -1098,6 +1098,7 @@ where
                         let dtype = match &info.expr {
                             ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
                             ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
+                            ScalarExpr::Literal(Literal::Boolean(_)) => DataType::Boolean,
                             ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
                             ScalarExpr::Literal(Literal::Null) => DataType::Null,
                             ScalarExpr::Literal(Literal::Struct(fields)) => {
@@ -2314,6 +2315,7 @@ fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
     match literal {
         Literal::Integer(_) => Ok(DataType::Int64),
         Literal::Float(_) => Ok(DataType::Float64),
+        Literal::Boolean(_) => Ok(DataType::Boolean),
         Literal::String(_) => Ok(DataType::Utf8),
         Literal::Null => Ok(DataType::Null),
         Literal::Struct(fields) => {
@@ -2350,6 +2352,9 @@ fn synthesize_computed_literal_array(
         ScalarExpr::Literal(Literal::Float(value)) => {
             Ok(Arc::new(Float64Array::from(vec![*value; row_count])) as ArrayRef)
         }
+        ScalarExpr::Literal(Literal::Boolean(value)) => {
+            Ok(Arc::new(BooleanArray::from(vec![*value; row_count])) as ArrayRef)
+        }
         ScalarExpr::Literal(Literal::String(value)) => {
             Ok(Arc::new(StringArray::from(vec![value.clone(); row_count])) as ArrayRef)
         }
@@ -2375,6 +2380,9 @@ fn synthesize_computed_literal_array(
                     }
                     Literal::Float(v) => {
                         Arc::new(Float64Array::from(vec![*v; row_count])) as ArrayRef
+                    }
+                    Literal::Boolean(v) => {
+                        Arc::new(BooleanArray::from(vec![*v; row_count])) as ArrayRef
                     }
                     Literal::String(v) => {
                         Arc::new(StringArray::from(vec![v.clone(); row_count])) as ArrayRef
@@ -2565,6 +2573,7 @@ fn format_literal(lit: &Literal) -> String {
     match lit {
         Literal::Integer(i) => i.to_string(),
         Literal::Float(f) => f.to_string(),
+        Literal::Boolean(b) => b.to_string(),
         Literal::String(s) => format!("\"{}\"", escape_string(s)),
         Literal::Null => "NULL".to_string(),
         Literal::Struct(fields) => {

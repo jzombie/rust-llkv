@@ -1,5 +1,6 @@
 use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
 use llkv_result::Error;
+use regex::escape;
 use sqllogictest::{AsyncDB, DefaultColumnType, Runner};
 use std::path::Path;
 
@@ -60,6 +61,11 @@ where
             .await
             .map_err(|e| Error::Internal(format!("factory error: {:?}", e)))
     });
+    
+    // Align with the canonical sqllogictest harness default (256 values) so large
+    // result sets compare by MD5 digest instead of dumping every row.
+    runner.with_hash_threshold(256);
+
     if let Err(e) = runner.run_file_async(&tmp).await {
         let (mapped, opt_orig_line) =
             map_temp_error_message(&format!("{}", e), &tmp, &normalized_lines, &mapping, path);
@@ -217,8 +223,10 @@ pub fn expand_loops_with_mapping(
 
             for k in 0..count {
                 let val = (start + k).to_string();
+                let token_plain = format!("${}", var);
+                let token_braced = format!("${{{}}}", var);
                 for (s, &orig_line) in expanded_inner.iter().zip(inner_map.iter()) {
-                    let substituted = s.replace(&format!("${}", var), &val);
+                    let substituted = s.replace(&token_braced, &val).replace(&token_plain, &val);
                     out_lines.push(substituted);
                     out_map.push(orig_line);
                 }
@@ -291,6 +299,18 @@ fn normalize_inline_connections(
                 }
                 message_lines.push((line.clone(), mapping[idx]));
                 idx += 1;
+            }
+
+            if regex_pattern.is_none()
+                && !message_lines.is_empty()
+                && let Some((first_line, _)) = message_lines.first()
+            {
+                let trimmed_first = first_line.trim();
+                if !trimmed_first.is_empty() {
+                    let escaped = escape(trimmed_first);
+                    regex_pattern = Some(format!(".*{}.*", escaped));
+                    message_lines.clear();
+                }
             }
         }
 

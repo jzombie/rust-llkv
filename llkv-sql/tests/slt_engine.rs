@@ -60,6 +60,19 @@ fn format_struct_value(struct_array: &arrow::array::StructArray, row_idx: usize)
                     a.value(row_idx).to_string()
                 }
             }
+            arrow::datatypes::DataType::Boolean => {
+                let a = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .unwrap();
+                if a.is_null(row_idx) {
+                    "NULL".to_string()
+                } else if a.value(row_idx) {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
             arrow::datatypes::DataType::Struct(_) => {
                 // Recursively format nested struct
                 let a = column
@@ -184,6 +197,19 @@ impl AsyncDB for EngineHarness {
                                                 "NULL".to_string()
                                             } else {
                                                 a.value(row_idx).to_string()
+                                            }
+                                        }
+                                        arrow::datatypes::DataType::Boolean => {
+                                            let a = array
+                                                .as_any()
+                                                .downcast_ref::<arrow::array::BooleanArray>()
+                                                .unwrap();
+                                            if a.is_null(row_idx) {
+                                                "NULL".to_string()
+                                            } else if a.value(row_idx) {
+                                                "1".to_string()
+                                            } else {
+                                                "0".to_string()
                                             }
                                         }
                                         arrow::datatypes::DataType::Struct(_) => {
