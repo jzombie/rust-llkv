@@ -60,9 +60,9 @@ use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_table::{
     CATALOG_TABLE_ID, ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta,
     constraints::{
-    ConstraintKind, ConstraintRecord, ConstraintState,
-    ForeignKeyAction as CatalogForeignKeyAction, ForeignKeyConstraint, PrimaryKeyConstraint,
-    UniqueConstraint,
+        ConstraintKind, ConstraintRecord, ConstraintState,
+        ForeignKeyAction as CatalogForeignKeyAction, ForeignKeyConstraint, PrimaryKeyConstraint,
+        UniqueConstraint,
     },
     metadata::MetadataManager,
 };
@@ -75,6 +75,9 @@ use sqlparser::ast::{
 use time::{Date, Month};
 
 pub type Result<T> = llkv_result::Result<T>;
+
+/// Type alias for child table references: (name, canonical_name, table)
+type ChildTableRefs<P> = Vec<(String, String, Arc<ExecutorTable<P>>)>;
 
 // Re-export plan structures from llkv-plan
 pub use llkv_plan::{
@@ -1826,7 +1829,8 @@ where
                 }
             }
 
-            self.store.register_index(logical_field_id, IndexKind::Sort)?;
+            self.store
+                .register_index(logical_field_id, IndexKind::Sort)?;
 
             if let Some(updated_table) =
                 Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)
@@ -2450,9 +2454,7 @@ where
             epoch: 0,
         };
         table.put_table_meta(&table_meta);
-        self.metadata
-            .set_table_meta(table_id, table_meta)
-            .map_err(Error::from)?;
+        self.metadata.set_table_meta(table_id, table_meta)?;
 
         for column in &column_defs {
             let column_meta = ColMeta {
@@ -2462,9 +2464,7 @@ where
                 default: None,
             };
             table.put_col_meta(&column_meta);
-            self.metadata
-                .set_column_meta(table_id, column_meta)
-                .map_err(Error::from)?;
+            self.metadata.set_column_meta(table_id, column_meta)?;
         }
 
         {
@@ -2481,18 +2481,36 @@ where
                 // Sanity check: the descriptor should now be readable.
                 store.data_type(logical_field_id)?;
             }
-            
+
             // Register MVCC columns (created_by, deleted_by)
             let created_by_lfid = LogicalFieldId::for_mvcc_created_by(table_id);
-            tracing::trace!(table_id, ?created_by_lfid, "Registering created_by MVCC column");
+            tracing::trace!(
+                table_id,
+                ?created_by_lfid,
+                "Registering created_by MVCC column"
+            );
             store.ensure_column_registered(created_by_lfid, &DataType::UInt64)?;
-            tracing::trace!(table_id, ?created_by_lfid, has_field = store.has_field(created_by_lfid), "Verified created_by in catalog");
-            
+            tracing::trace!(
+                table_id,
+                ?created_by_lfid,
+                has_field = store.has_field(created_by_lfid),
+                "Verified created_by in catalog"
+            );
+
             let deleted_by_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
-            tracing::trace!(table_id, ?deleted_by_lfid, "Registering deleted_by MVCC column");
+            tracing::trace!(
+                table_id,
+                ?deleted_by_lfid,
+                "Registering deleted_by MVCC column"
+            );
             store.ensure_column_registered(deleted_by_lfid, &DataType::UInt64)?;
-            tracing::trace!(table_id, ?deleted_by_lfid, has_field = store.has_field(deleted_by_lfid), "Verified deleted_by in catalog");
-            
+            tracing::trace!(
+                table_id,
+                ?deleted_by_lfid,
+                has_field = store.has_field(deleted_by_lfid),
+                "Verified deleted_by in catalog"
+            );
+
             // Verify that we can actually read the descriptors back
             for column in &column_defs {
                 let logical_field_id = LogicalFieldId::for_user(table_id, column.field_id);
@@ -2501,14 +2519,11 @@ where
                     return Err(e);
                 }
             }
-            
+
             tracing::trace!(table_id, "All columns registered and verified in catalog");
         }
 
-        let existing_constraints = self
-            .metadata
-            .constraint_record_map(table_id)
-            .map_err(Error::from)?;
+        let existing_constraints = self.metadata.constraint_record_map(table_id)?;
         let mut next_constraint_id = existing_constraints
             .keys()
             .copied()
@@ -2555,11 +2570,10 @@ where
 
         if !constraint_records.is_empty() {
             self.metadata
-                .put_constraint_records(table_id, &constraint_records)
-                .map_err(Error::from)?;
+                .put_constraint_records(table_id, &constraint_records)?;
         }
 
-        self.metadata.flush_table(table_id).map_err(Error::from)?;
+        self.metadata.flush_table(table_id)?;
 
         let schema = Arc::new(ExecutorSchema {
             columns: column_defs.clone(), // Clone for catalog registration below
@@ -2870,10 +2884,7 @@ where
         table: &ExecutorTable<P>,
         display_name: &str,
     ) -> Result<Vec<ForeignKeyMetadata>> {
-        let constraint_records = self
-            .metadata
-            .constraint_records(table.table.table_id())
-            .map_err(Error::from)?;
+        let constraint_records = self.metadata.constraint_records(table.table.table_id())?;
         self.build_foreign_key_metadata(table, display_name, &constraint_records)
     }
 
@@ -2967,15 +2978,11 @@ where
             return Ok((display, canonical));
         }
 
-        if let Some(meta) = self
-            .metadata
-            .table_meta(table_id)
-            .map_err(Error::from)?
+        if let Some(meta) = self.metadata.table_meta(table_id)?
+            && let Some(name) = meta.name
         {
-            if let Some(name) = meta.name {
-                let canonical = name.to_ascii_lowercase();
-                return Ok((name, canonical));
-            }
+            let canonical = name.to_ascii_lowercase();
+            return Ok((name, canonical));
         }
 
         let fallback = table_id.to_string();
@@ -2986,11 +2993,8 @@ where
         &self,
         parent_table_id: TableId,
         parent_canonical: &str,
-    ) -> Result<Vec<(String, String, Arc<ExecutorTable<P>>)>> {
-        let referencing = self
-            .metadata
-            .foreign_keys_referencing(parent_table_id)
-            .map_err(Error::from)?;
+    ) -> Result<ChildTableRefs<P>> {
+        let referencing = self.metadata.foreign_keys_referencing(parent_table_id)?;
 
         if referencing.is_empty() {
             return Ok(Vec::new());
@@ -3023,7 +3027,6 @@ where
 
         Ok(out)
     }
-
 
     fn create_table_from_batches(
         &self,
@@ -3086,9 +3089,7 @@ where
             epoch: 0,
         };
         table.put_table_meta(&table_meta);
-        self.metadata
-            .set_table_meta(table_id, table_meta)
-            .map_err(Error::from)?;
+        self.metadata.set_table_meta(table_id, table_meta)?;
 
         for column in &column_defs {
             let column_meta = ColMeta {
@@ -3098,12 +3099,10 @@ where
                 default: None,
             };
             table.put_col_meta(&column_meta);
-            self.metadata
-                .set_column_meta(table_id, column_meta)
-                .map_err(Error::from)?;
+            self.metadata.set_column_meta(table_id, column_meta)?;
         }
 
-        self.metadata.flush_table(table_id).map_err(Error::from)?;
+        self.metadata.flush_table(table_id)?;
 
         // Register all columns in the ColumnStore catalog before appending data
         {
@@ -3112,11 +3111,11 @@ where
                 let logical_field_id = LogicalFieldId::for_user(table_id, column.field_id);
                 store.ensure_column_registered(logical_field_id, &column.data_type)?;
             }
-            
+
             // Register MVCC columns
             let created_by_lfid = LogicalFieldId::for_mvcc_created_by(table_id);
             store.ensure_column_registered(created_by_lfid, &DataType::UInt64)?;
-            
+
             let deleted_by_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
             store.ensure_column_registered(deleted_by_lfid, &DataType::UInt64)?;
         }
@@ -4753,11 +4752,11 @@ where
             }
         }
 
-    self.check_not_null_constraints(table, &rows, &column_order)?;
+        self.check_not_null_constraints(table, &rows, &column_order)?;
         // Check CHECK constraints
-    self.check_check_constraints(table, &rows, &column_order)?;
+        self.check_check_constraints(table, &rows, &column_order)?;
         // Check UNIQUE constraints
-    self.check_unique_constraints(table, &rows, &column_order, snapshot)?;
+        self.check_unique_constraints(table, &rows, &column_order, snapshot)?;
 
         if display_name == "keys" {
             tracing::trace!(
@@ -4786,13 +4785,7 @@ where
 
         constraint_result?;
 
-        self.check_foreign_keys_on_insert(
-            table,
-            &display_name,
-            &rows,
-            &column_order,
-            snapshot,
-        )?;
+        self.check_foreign_keys_on_insert(table, &display_name, &rows, &column_order, snapshot)?;
 
         let row_count = rows.len();
         let mut column_values: Vec<Vec<PlanValue>> =
@@ -5514,15 +5507,18 @@ where
         deleting_row_ids.extend(row_ids.iter().copied());
 
         for (child_canonical, child_display, child_table) in referencing_children {
-            let child_metadata = self
-                .foreign_keys_for_table(child_table.as_ref(), &child_display)?;
+            let child_metadata =
+                self.foreign_keys_for_table(child_table.as_ref(), &child_display)?;
 
             for metadata in child_metadata
                 .into_iter()
                 .filter(|meta| meta.referenced_table == canonical_name)
             {
-                let parent_rows =
-                    self.collect_row_values_for_ids(table, row_ids, &metadata.referenced_field_ids)?;
+                let parent_rows = self.collect_row_values_for_ids(
+                    table,
+                    row_ids,
+                    &metadata.referenced_field_ids,
+                )?;
 
                 let mut parent_keys: Vec<Vec<PlanValue>> = Vec::new();
                 for values in parent_rows {
@@ -5560,8 +5556,7 @@ where
                         continue;
                     }
 
-                    if child_canonical == canonical_name
-                        && deleting_row_ids.contains(&child_row_id)
+                    if child_canonical == canonical_name && deleting_row_ids.contains(&child_row_id)
                     {
                         continue;
                     }
@@ -5876,17 +5871,13 @@ where
         // Retrieve table metadata from the metadata manager
         let table_meta = self
             .metadata
-            .table_meta(_catalog_table_id)
-            .map_err(Error::from)?
+            .table_meta(_catalog_table_id)?
             .ok_or_else(|| {
                 Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
             })?;
 
         // Fetch persisted constraint records and open the table
-        let constraint_records = self
-            .metadata
-            .constraint_records(table_meta.table_id)
-            .map_err(Error::from)?;
+        let constraint_records = self.metadata.constraint_records(table_meta.table_id)?;
 
         let table = Table::new_with_store(table_meta.table_id, Arc::clone(&self.store))?;
         let store = table.store();
@@ -5895,8 +5886,7 @@ where
         let field_ids: Vec<FieldId> = logical_fields.iter().map(|lfid| lfid.field_id()).collect();
         let column_metas = self
             .metadata
-            .column_metas(table_meta.table_id, &field_ids)
-            .map_err(Error::from)?;
+            .column_metas(table_meta.table_id, &field_ids)?;
         let catalog_field_resolver = self.catalog.field_resolver(_catalog_table_id);
         let mut metadata_primary_keys: FxHashSet<FieldId> = FxHashSet::default();
         let mut metadata_unique_fields: FxHashSet<FieldId> = FxHashSet::default();
@@ -5962,7 +5952,7 @@ where
             };
 
             let data_type = store.data_type(*lfid)?;
-            let nullable = if primary_key { false } else { true };
+            let nullable = !primary_key;
 
             executor_columns.push(ExecutorColumn {
                 name: column_name,
@@ -6127,25 +6117,20 @@ where
             (entry.table.table_id(), field_ids)
         };
 
-        let referencing_children =
-            self.referencing_child_tables(table_id, &canonical_name)?;
+        let referencing_children = self.referencing_child_tables(table_id, &canonical_name)?;
 
         for (child_canonical, child_display, child_table) in &referencing_children {
             if child_canonical == &canonical_name {
                 continue;
             }
 
-            let foreign_keys =
-                self.foreign_keys_for_table(child_table.as_ref(), &child_display)?;
+            let foreign_keys = self.foreign_keys_for_table(child_table.as_ref(), child_display)?;
 
             if let Some(metadata) = foreign_keys
                 .into_iter()
                 .find(|meta| meta.referenced_table == canonical_name)
             {
-                let constraint_label = metadata
-                    .constraint_name
-                    .as_deref()
-                    .unwrap_or("FOREIGN KEY");
+                let constraint_label = metadata.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
                 return Err(Error::ConstraintError(format!(
                     "Cannot drop table '{}' because it is referenced by foreign key constraint '{}' on table '{}'",
                     display_name, constraint_label, child_display
@@ -6154,9 +6139,8 @@ where
         }
 
         self.metadata
-            .prepare_table_drop(table_id, &column_field_ids)
-            .map_err(Error::from)?;
-        self.metadata.flush_table(table_id).map_err(Error::from)?;
+            .prepare_table_drop(table_id, &column_field_ids)?;
+        self.metadata.flush_table(table_id)?;
         self.metadata.remove_table_state(table_id);
 
         // Unregister from catalog

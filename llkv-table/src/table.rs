@@ -522,27 +522,31 @@ where
 
         let new_schema = Arc::new(Schema::new(new_fields));
         let namespaced_batch = RecordBatch::try_new(new_schema, new_columns)?;
-        
+
         tracing::trace!(
             table_id = self.table_id,
             num_columns = namespaced_batch.num_columns(),
             num_rows = namespaced_batch.num_rows(),
             "Attempting append to table"
         );
-        
+
         if let Err(err) = self.store.append(&namespaced_batch) {
-            let batch_field_ids: Vec<LogicalFieldId> = namespaced_batch.schema().fields().iter()
+            let batch_field_ids: Vec<LogicalFieldId> = namespaced_batch
+                .schema()
+                .fields()
+                .iter()
                 .filter_map(|f| f.metadata().get(crate::constants::FIELD_ID_META_KEY))
                 .filter_map(|s| s.parse::<u64>().ok())
                 .map(LogicalFieldId::from)
                 .collect();
-            
+
             // Check which fields are missing from the catalog
-            let missing_fields: Vec<LogicalFieldId> = batch_field_ids.iter()
+            let missing_fields: Vec<LogicalFieldId> = batch_field_ids
+                .iter()
                 .filter(|&&field_id| !self.store.has_field(field_id))
                 .copied()
                 .collect();
-            
+
             tracing::error!(
                 table_id = self.table_id,
                 error = ?err,

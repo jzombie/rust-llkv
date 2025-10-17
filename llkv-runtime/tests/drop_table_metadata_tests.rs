@@ -29,24 +29,30 @@ fn drop_table_removes_persisted_metadata() {
 
     let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("open column store"));
     let metadata_view = MetadataManager::new(Arc::clone(&store));
-    assert!(metadata_view
-        .table_meta(table_id)
-        .expect("load table meta")
-        .is_some());
-    assert!(!metadata_view
-        .constraint_records(table_id)
-        .expect("constraint records before drop")
-        .is_empty());
+    assert!(
+        metadata_view
+            .table_meta(table_id)
+            .expect("load table meta")
+            .is_some()
+    );
+    assert!(
+        !metadata_view
+            .constraint_records(table_id)
+            .expect("constraint records before drop")
+            .is_empty()
+    );
 
     context
         .drop_table_immediate("drop_test", false)
         .expect("drop table succeeds");
 
     let metadata_after = MetadataManager::new(Arc::clone(&store));
-    assert!(metadata_after
-        .table_meta(table_id)
-        .expect("table meta after drop")
-        .is_none());
+    assert!(
+        metadata_after
+            .table_meta(table_id)
+            .expect("table meta after drop")
+            .is_none()
+    );
 
     let constraint_records = metadata_after
         .constraint_records(table_id)
@@ -68,9 +74,7 @@ fn drop_table_respects_foreign_keys_after_restart() {
 
         context
             .create_table_builder("parents")
-            .with_column_spec(
-                ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true),
-            )
+            .with_column_spec(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
             .finish()
             .expect("create parents");
 

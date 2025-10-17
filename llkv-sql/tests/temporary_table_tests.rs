@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 use llkv_plan::{InsertPlan, InsertSource, PlanValue};
-use llkv_runtime::{RuntimeStatementResult, storage_namespace, storage_namespace::TemporaryNamespace};
-use llkv_storage::pager::BoxedPager;
+use llkv_runtime::{
+    RuntimeStatementResult, storage_namespace, storage_namespace::TemporaryNamespace,
+};
 use llkv_sql::SqlEngine;
+use llkv_storage::pager::BoxedPager;
 use llkv_storage::pager::MemPager;
 
 #[test]
@@ -114,7 +116,10 @@ fn temporary_tables_allow_inserts_after_unique_index() {
         .execute("SELECT * FROM numbers;")
         .expect("select from empty temp table succeeds");
     assert_eq!(results.len(), 1);
-    assert!(matches!(results.remove(0), RuntimeStatementResult::Select { .. }));
+    assert!(matches!(
+        results.remove(0),
+        RuntimeStatementResult::Select { .. }
+    ));
 
     let temp_namespace = engine
         .session()
@@ -135,7 +140,10 @@ fn temporary_tables_allow_inserts_after_unique_index() {
         .find(|col| col.name.eq_ignore_ascii_case("j"))
         .map(|col| col.unique)
         .unwrap_or_default();
-    assert!(unique_flag, "unique index updates executor schema for column j");
+    assert!(
+        unique_flag,
+        "unique index updates executor schema for column j"
+    );
 
     let insert_plan = InsertPlan {
         table: "numbers".to_string(),
@@ -151,6 +159,8 @@ fn temporary_tables_allow_inserts_after_unique_index() {
         .insert(insert_plan)
         .expect("insert now succeeds after catalog synchronization fix");
 
-    assert!(matches!(result, RuntimeStatementResult::Insert { table_name, rows_inserted: 2 } 
-        if table_name.eq_ignore_ascii_case("numbers")));
+    assert!(
+        matches!(result, RuntimeStatementResult::Insert { table_name, rows_inserted: 2 }
+        if table_name.eq_ignore_ascii_case("numbers"))
+    );
 }

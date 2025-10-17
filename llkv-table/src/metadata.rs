@@ -77,11 +77,11 @@ impl ReferencingIndex {
     fn insert(&mut self, parent_id: TableId, child_id: TableId, constraint_id: ConstraintId) {
         self.parent_to_children
             .entry(parent_id)
-            .or_insert_with(FxHashSet::default)
+            .or_default()
             .insert((child_id, constraint_id));
         self.child_to_parents
             .entry(child_id)
-            .or_insert_with(FxHashSet::default)
+            .or_default()
             .insert(parent_id);
         self.initialized = true;
     }
@@ -285,11 +285,7 @@ where
     ///
     /// Column metadata is loaded eagerly for the provided field identifiers so deletions
     /// are persisted on the next flush.
-    pub fn prepare_table_drop(
-        &self,
-        table_id: TableId,
-        column_ids: &[FieldId],
-    ) -> LlkvResult<()> {
+    pub fn prepare_table_drop(&self, table_id: TableId, column_ids: &[FieldId]) -> LlkvResult<()> {
         if !column_ids.is_empty() {
             let _ = self.column_metas(table_id, column_ids)?;
         } else {
@@ -310,7 +306,10 @@ where
     /// Remove any cached snapshots for the specified table.
     pub fn remove_table_state(&self, table_id: TableId) {
         self.tables.write().unwrap().remove(&table_id);
-        self.referencing_index.write().unwrap().remove_child(table_id);
+        self.referencing_index
+            .write()
+            .unwrap()
+            .remove_child(table_id);
     }
 
     /// Delete persisted multi-column UNIQUE metadata for a table.
@@ -476,13 +475,13 @@ where
     /// Return all persisted table metadata.
     pub fn all_table_metas(&self) -> LlkvResult<Vec<(TableId, TableMeta)>> {
         let catalog = SysCatalog::new(&self.store);
-        catalog.all_table_metas().map_err(Into::into)
+        catalog.all_table_metas()
     }
 
     /// Return all persisted multi-column unique metadata.
     pub fn all_multi_column_unique_metas(&self) -> LlkvResult<Vec<TableMultiColumnUniqueMeta>> {
         let catalog = SysCatalog::new(&self.store);
-        catalog.all_multi_column_unique_metas().map_err(Into::into)
+        catalog.all_multi_column_unique_metas()
     }
 }
 
@@ -538,7 +537,7 @@ mod tests {
             last_modified_micros: 456,
         };
         manager
-            .put_constraint_records(table_id, &[constraint.clone()])
+            .put_constraint_records(table_id, std::slice::from_ref(&constraint))
             .unwrap();
 
         assert_eq!(
@@ -597,7 +596,7 @@ mod tests {
             last_modified_micros: 0,
         };
         initial_catalog
-            .put_constraint_records(table_id, &[constraint.clone()])
+            .put_constraint_records(table_id, std::slice::from_ref(&constraint))
             .unwrap();
 
         let columns = manager

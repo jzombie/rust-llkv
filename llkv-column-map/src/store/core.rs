@@ -612,7 +612,7 @@ where
         };
 
         tracing::trace!("ColumnStore::append PHASE 1 complete - batch preprocessed");
-        
+
         // --- PHASE 2: LAST-WRITER-WINS (LWW) REWRITE ---
         // This phase handles updates. It identifies any rows in the incoming batch that
         // already exist in the store and rewrites them in-place. This is a separate
@@ -671,7 +671,7 @@ where
         if !puts_rewrites.is_empty() {
             self.pager.batch_put(&puts_rewrites)?;
         }
-        
+
         tracing::trace!("ColumnStore::append PHASE 2 complete - LWW rewrites done");
 
         // --- PHASE 3: FILTERING FOR NEW ROWS ---
@@ -692,7 +692,7 @@ where
             tracing::trace!("ColumnStore::append early exit - no new rows to append");
             return Ok(());
         }
-        
+
         tracing::trace!("ColumnStore::append PHASE 3 complete - filtered for new rows");
 
         // --- PHASE 4: APPENDING NEW DATA ---
@@ -758,20 +758,22 @@ where
             // Load the descriptors and their tail metadata pages into memory.
             // If they don't exist, `load_or_create` will initialize new ones.
             let (mut data_descriptor, mut data_tail_page) =
-                ColumnDescriptor::load_or_create(Arc::clone(&self.pager), descriptor_pk, field_id).map_err(|e| {
-                    tracing::error!(
-                        ?field_id,
-                        descriptor_pk,
-                        error = ?e,
-                        "append: load_or_create failed for data descriptor"
-                    );
-                    e
-                })?;
+                ColumnDescriptor::load_or_create(Arc::clone(&self.pager), descriptor_pk, field_id)
+                    .map_err(|e| {
+                        tracing::error!(
+                            ?field_id,
+                            descriptor_pk,
+                            error = ?e,
+                            "append: load_or_create failed for data descriptor"
+                        );
+                        e
+                    })?;
             let (mut rid_descriptor, mut rid_tail_page) = ColumnDescriptor::load_or_create(
                 Arc::clone(&self.pager),
                 rid_descriptor_pk,
                 rid_fid,
-            ).map_err(|e| {
+            )
+            .map_err(|e| {
                 tracing::error!(
                     ?rid_fid,
                     rid_descriptor_pk,
@@ -1004,9 +1006,13 @@ where
                 e
             })?);
         }
-        
-        tracing::trace!(?field_id, data_chunks = metas_data.len(), rid_chunks = metas_rid.len(), "lww_rewrite: chunk metadata collected");
 
+        tracing::trace!(
+            ?field_id,
+            data_chunks = metas_data.len(),
+            rid_chunks = metas_rid.len(),
+            "lww_rewrite: chunk metadata collected"
+        );
 
         // Classify incoming rows: delete vs upsert.
         let rid_in = incoming_row_ids

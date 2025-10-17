@@ -192,11 +192,11 @@ where
                 continue;
             }
             self.buffer.push(row_id);
-            if self.buffer.len() >= CONSTRAINT_SCAN_CHUNK {
-                if let Err(err) = self.flush_buffer() {
-                    self.error = Some(err);
-                    return;
-                }
+            if self.buffer.len() >= CONSTRAINT_SCAN_CHUNK
+                && let Err(err) = self.flush_buffer()
+            {
+                self.error = Some(err);
+                return;
             }
         }
     }
@@ -311,11 +311,7 @@ impl<'a, P> SysCatalog<'a, P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn write_null_entries(
-        &self,
-        meta_field: LogicalFieldId,
-        row_ids: &[RowId],
-    ) -> LlkvResult<()> {
+    fn write_null_entries(&self, meta_field: LogicalFieldId, row_ids: &[RowId]) -> LlkvResult<()> {
         if row_ids.is_empty() {
             return Ok(());
         }
@@ -675,7 +671,7 @@ where
 
         let row_ids_array = Arc::new(UInt64Array::from(row_ids));
         let payload_array = Arc::new(BinaryArray::from_iter_values(
-            records.iter().map(|record| bitcode::encode(record)),
+            records.iter().map(bitcode::encode),
         ));
 
         let batch = RecordBatch::try_new(schema, vec![row_ids_array, payload_array])?;
