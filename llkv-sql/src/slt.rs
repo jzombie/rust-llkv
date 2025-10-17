@@ -61,7 +61,7 @@ where
             .await
             .map_err(|e| Error::Internal(format!("factory error: {:?}", e)))
     });
-    
+
     // Align with the canonical sqllogictest harness default (256 values) so large
     // result sets compare by MD5 digest instead of dumping every row.
     runner.with_hash_threshold(256);
