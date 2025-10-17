@@ -107,7 +107,7 @@ pub struct MetadataManager<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    pager: Arc<P>,
+    store: Arc<ColumnStore<P>>,
     tables: RwLock<FxHashMap<TableId, TableState>>,
     referencing_index: RwLock<ReferencingIndex>,
 }
@@ -116,10 +116,10 @@ impl<P> MetadataManager<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    /// Create a new metadata manager backed by the provided pager.
-    pub fn new(pager: Arc<P>) -> Self {
+    /// Create a new metadata manager backed by the provided column store.
+    pub fn new(store: Arc<ColumnStore<P>>) -> Self {
         Self {
-            pager,
+            store,
             tables: RwLock::new(FxHashMap::default()),
             referencing_index: RwLock::new(ReferencingIndex::default()),
         }
@@ -140,8 +140,7 @@ where
     }
 
     fn load_table_state(&self, table_id: TableId) -> LlkvResult<TableState> {
-        let store = ColumnStore::open(Arc::clone(&self.pager))?;
-        let catalog = SysCatalog::new(&store);
+        let catalog = SysCatalog::new(&self.store);
         let table_meta = catalog.get_table_meta(table_id);
         let constraint_records = catalog.constraint_records_for_table(table_id)?;
         let mut constraints = FxHashMap::default();
@@ -249,8 +248,7 @@ where
         };
 
         if !missing_ids.is_empty() {
-            let store = ColumnStore::open(Arc::clone(&self.pager))?;
-            let catalog = SysCatalog::new(&store);
+            let catalog = SysCatalog::new(&self.store);
             let fetched = catalog.get_cols_meta(table_id, &missing_ids);
             let mut tables = self.tables.write().unwrap();
             let state = tables.get_mut(&table_id).unwrap();
@@ -317,8 +315,7 @@ where
 
     /// Delete persisted multi-column UNIQUE metadata for a table.
     pub fn delete_multi_column_uniques(&self, table_id: TableId) -> LlkvResult<()> {
-        let store = ColumnStore::open(Arc::clone(&self.pager))?;
-        let catalog = SysCatalog::new(&store);
+        let catalog = SysCatalog::new(&self.store);
         catalog.delete_multi_column_uniques(table_id)?;
         Ok(())
     }
@@ -383,8 +380,7 @@ where
         let mut tables = self.tables.write().unwrap();
         let state = tables.get_mut(&table_id).unwrap();
 
-        let store = ColumnStore::open(Arc::clone(&self.pager))?;
-        let catalog = SysCatalog::new(&store);
+        let catalog = SysCatalog::new(&self.store);
 
         match (
             state.current.table_meta.as_ref(),
@@ -479,15 +475,13 @@ where
 
     /// Return all persisted table metadata.
     pub fn all_table_metas(&self) -> LlkvResult<Vec<(TableId, TableMeta)>> {
-        let store = ColumnStore::open(Arc::clone(&self.pager))?;
-        let catalog = SysCatalog::new(&store);
+        let catalog = SysCatalog::new(&self.store);
         catalog.all_table_metas().map_err(Into::into)
     }
 
     /// Return all persisted multi-column unique metadata.
     pub fn all_multi_column_unique_metas(&self) -> LlkvResult<Vec<TableMultiColumnUniqueMeta>> {
-        let store = ColumnStore::open(Arc::clone(&self.pager))?;
-        let catalog = SysCatalog::new(&store);
+        let catalog = SysCatalog::new(&self.store);
         catalog.all_multi_column_unique_metas().map_err(Into::into)
     }
 }
@@ -503,7 +497,8 @@ mod tests {
     #[test]
     fn metadata_manager_persists_and_loads() {
         let pager = Arc::new(MemPager::default());
-        let manager = MetadataManager::new(Arc::clone(&pager));
+        let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).unwrap());
+        let manager = MetadataManager::new(Arc::clone(&store));
 
         let table_id: TableId = 42;
         let table_meta = TableMeta {
@@ -553,8 +548,7 @@ mod tests {
 
         manager.flush_table(table_id).unwrap();
 
-        let verify_store = ColumnStore::open(Arc::clone(&pager)).unwrap();
-        let verify_catalog = SysCatalog::new(&verify_store);
+        let verify_catalog = SysCatalog::new(&store);
         let column_roundtrip = verify_catalog.get_cols_meta(table_id, &[column_meta.col_id]);
         assert_eq!(column_roundtrip[0].as_ref(), Some(&column_meta));
         let constraints = verify_catalog
@@ -580,7 +574,8 @@ mod tests {
     #[test]
     fn metadata_manager_lazy_loads_columns_and_constraints() {
         let pager = Arc::new(MemPager::default());
-        let manager = MetadataManager::new(Arc::clone(&pager));
+        let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).unwrap());
+        let manager = MetadataManager::new(Arc::clone(&store));
 
         let table_id: TableId = 99;
         let column_meta = ColMeta {
@@ -589,8 +584,7 @@ mod tests {
             flags: 0,
             default: None,
         };
-        let initial_store = ColumnStore::open(Arc::clone(&pager)).unwrap();
-        let initial_catalog = SysCatalog::new(&initial_store);
+        let initial_catalog = SysCatalog::new(&store);
         initial_catalog.put_col_meta(table_id, &column_meta);
 
         let constraint = ConstraintRecord {

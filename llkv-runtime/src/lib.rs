@@ -1291,6 +1291,9 @@ where
     metadata: Arc<MetadataManager<P>>,
     // Centralized catalog for table/field name resolution
     catalog: Arc<TableCatalog>,
+    // Shared column store for all tables in this context
+    // This ensures catalog state is synchronized across all tables
+    store: Arc<ColumnStore<P>>,
     // Transaction manager for session-based transactions
     transaction_manager:
         TransactionManager<RuntimeContextWrapper<P>, RuntimeContextWrapper<MemPager>>,
@@ -1351,7 +1354,8 @@ where
             }
         };
 
-        let metadata = Arc::new(MetadataManager::new(Arc::clone(&pager)));
+        let store_arc = Arc::new(store);
+        let metadata = Arc::new(MetadataManager::new(Arc::clone(&store_arc)));
 
         let loaded_tables = match metadata.all_table_metas() {
             Ok(metas) => {
@@ -1485,6 +1489,7 @@ where
             multi_column_uniques: RwLock::new(persisted_multi),
             metadata,
             catalog,
+            store: store_arc,
             transaction_manager,
             txn_manager,
             txn_tables_with_new_rows: RwLock::new(FxHashMap::default()),
@@ -1498,8 +1503,7 @@ where
 
     /// Persist the next_txn_id to the catalog.
     pub fn persist_next_txn_id(&self, next_txn_id: TxnId) -> Result<()> {
-        let store = ColumnStore::open(Arc::clone(&self.pager))?;
-        let catalog = SysCatalog::new(&store);
+        let catalog = SysCatalog::new(&self.store);
         catalog.put_next_txn_id(next_txn_id)?;
         let last_committed = self.txn_manager.last_committed();
         catalog.put_last_committed_txn_id(last_committed)?;
@@ -1516,8 +1520,7 @@ where
         table_id: TableId,
         entries: &[StoredMultiColumnUnique],
     ) -> Result<()> {
-        let store = ColumnStore::open(Arc::clone(&self.pager))?;
-        let catalog = SysCatalog::new(&store);
+        let catalog = SysCatalog::new(&self.store);
         let metas: Vec<MultiColumnUniqueEntryMeta> = entries
             .iter()
             .map(|entry| MultiColumnUniqueEntryMeta {
@@ -1794,8 +1797,7 @@ where
             let column_name = column_names[0].clone();
             let table_id = table.table.table_id();
             let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
-            let store = ColumnStore::open(Arc::clone(&self.pager))?;
-            let existing_indexes = match store.list_persisted_indexes(logical_field_id) {
+            let existing_indexes = match self.store.list_persisted_indexes(logical_field_id) {
                 Ok(kinds) => kinds,
                 Err(Error::NotFound) => Vec::new(),
                 Err(err) => return Err(err),
@@ -1824,7 +1826,7 @@ where
                 }
             }
 
-            store.register_index(logical_field_id, IndexKind::Sort)?;
+            self.store.register_index(logical_field_id, IndexKind::Sort)?;
 
             if let Some(updated_table) =
                 Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)
@@ -2074,6 +2076,10 @@ where
                     .map(|_| "OK")
                     .map_err(|e| format!("{:?}", e))
             );
+        }
+
+        if matches!(result, Err(Error::NotFound)) {
+            panic!("insert yielded Error::NotFound for table {}", display_name);
         }
 
         result
@@ -2435,7 +2441,7 @@ where
             table_id,
             &*self.pager
         );
-        let table = Table::new(table_id, Arc::clone(&self.pager))?;
+        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
         let table_meta = TableMeta {
             table_id,
             name: Some(display_name.clone()),
@@ -2463,12 +2469,40 @@ where
 
         {
             let store = table.store();
+            tracing::trace!(
+                table_id,
+                store_ptr = ?std::ptr::addr_of!(*store),
+                "Registering columns in ColumnStore"
+            );
             for column in &column_defs {
                 let logical_field_id = LogicalFieldId::for_user(table_id, column.field_id);
+                tracing::trace!(table_id, ?logical_field_id, "Registering user column");
                 store.ensure_column_registered(logical_field_id, &column.data_type)?;
                 // Sanity check: the descriptor should now be readable.
                 store.data_type(logical_field_id)?;
             }
+            
+            // Register MVCC columns (created_by, deleted_by)
+            let created_by_lfid = LogicalFieldId::for_mvcc_created_by(table_id);
+            tracing::trace!(table_id, ?created_by_lfid, "Registering created_by MVCC column");
+            store.ensure_column_registered(created_by_lfid, &DataType::UInt64)?;
+            tracing::trace!(table_id, ?created_by_lfid, has_field = store.has_field(created_by_lfid), "Verified created_by in catalog");
+            
+            let deleted_by_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
+            tracing::trace!(table_id, ?deleted_by_lfid, "Registering deleted_by MVCC column");
+            store.ensure_column_registered(deleted_by_lfid, &DataType::UInt64)?;
+            tracing::trace!(table_id, ?deleted_by_lfid, has_field = store.has_field(deleted_by_lfid), "Verified deleted_by in catalog");
+            
+            // Verify that we can actually read the descriptors back
+            for column in &column_defs {
+                let logical_field_id = LogicalFieldId::for_user(table_id, column.field_id);
+                if let Err(e) = store.data_type(logical_field_id) {
+                    tracing::error!(table_id, ?logical_field_id, error = ?e, "VERIFICATION FAILED: Cannot read data_type for registered column!");
+                    return Err(e);
+                }
+            }
+            
+            tracing::trace!(table_id, "All columns registered and verified in catalog");
         }
 
         let existing_constraints = self
@@ -3043,7 +3077,7 @@ where
         }
 
         let table_id = self.reserve_table_id()?;
-        let table = Table::new(table_id, Arc::clone(&self.pager))?;
+        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
         let table_meta = TableMeta {
             table_id,
             name: Some(display_name.clone()),
@@ -3070,6 +3104,22 @@ where
         }
 
         self.metadata.flush_table(table_id).map_err(Error::from)?;
+
+        // Register all columns in the ColumnStore catalog before appending data
+        {
+            let store = table.store();
+            for column in &column_defs {
+                let logical_field_id = LogicalFieldId::for_user(table_id, column.field_id);
+                store.ensure_column_registered(logical_field_id, &column.data_type)?;
+            }
+            
+            // Register MVCC columns
+            let created_by_lfid = LogicalFieldId::for_mvcc_created_by(table_id);
+            store.ensure_column_registered(created_by_lfid, &DataType::UInt64)?;
+            
+            let deleted_by_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
+            store.ensure_column_registered(deleted_by_lfid, &DataType::UInt64)?;
+        }
 
         let schema_arc = Arc::new(ExecutorSchema {
             columns: column_defs.clone(),
@@ -4703,11 +4753,11 @@ where
             }
         }
 
-        self.check_not_null_constraints(table, &rows, &column_order)?;
+    self.check_not_null_constraints(table, &rows, &column_order)?;
         // Check CHECK constraints
-        self.check_check_constraints(table, &rows, &column_order)?;
+    self.check_check_constraints(table, &rows, &column_order)?;
         // Check UNIQUE constraints
-        self.check_unique_constraints(table, &rows, &column_order, snapshot)?;
+    self.check_unique_constraints(table, &rows, &column_order, snapshot)?;
 
         if display_name == "keys" {
             tracing::trace!(
@@ -4781,6 +4831,11 @@ where
         }
 
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
+        tracing::trace!(
+            table_name = %display_name,
+            store_ptr = ?std::ptr::addr_of!(*table.table.store()),
+            "About to call table.append"
+        );
         table.table.append(&batch)?;
         table
             .next_row_id
@@ -5833,7 +5888,7 @@ where
             .constraint_records(table_meta.table_id)
             .map_err(Error::from)?;
 
-        let table = Table::new(table_meta.table_id, Arc::clone(&self.pager))?;
+        let table = Table::new_with_store(table_meta.table_id, Arc::clone(&self.store))?;
         let store = table.store();
         let mut logical_fields = store.user_field_ids_for_table(table_meta.table_id);
         logical_fields.sort_by_key(|lfid| lfid.field_id());
@@ -6140,8 +6195,7 @@ where
     }
 
     fn reserve_table_id(&self) -> Result<TableId> {
-        let store = ColumnStore::open(Arc::clone(&self.pager))?;
-        let catalog = SysCatalog::new(&store);
+        let catalog = SysCatalog::new(&self.store);
 
         let mut next = match catalog.get_next_table_id()? {
             Some(value) => value,

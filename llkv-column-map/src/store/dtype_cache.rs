@@ -19,6 +19,19 @@ pub struct DTypeCache<P: Pager> {
     cache: RwLock<FxHashMap<LogicalFieldId, DataType>>,
 }
 
+impl<P> Clone for DTypeCache<P>
+where
+    P: Pager,
+{
+    fn clone(&self) -> Self {
+        Self {
+            pager: Arc::clone(&self.pager),
+            catalog: Arc::clone(&self.catalog),
+            cache: RwLock::new(FxHashMap::default()),
+        }
+    }
+}
+
 impl<P> DTypeCache<P>
 where
     P: Pager<Blob = EntryHandle>,

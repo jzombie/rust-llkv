@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
+use llkv_column_map::store::ColumnStore;
 use llkv_runtime::{ColumnSpec, RuntimeContext, RuntimeStatementResult};
 use llkv_storage::pager::MemPager;
 use llkv_table::{ConstraintKind, MetadataManager, PrimaryKeyConstraint, Table, UniqueConstraint};
@@ -52,13 +53,14 @@ fn primary_key_and_unique_constraints_reload_from_metadata() {
 }
 
 fn assert_accounts_constraints(pager: &Arc<MemPager>) {
-    let metadata = MetadataManager::new(Arc::clone(pager));
+    let store = Arc::new(ColumnStore::open(Arc::clone(pager)).expect("open column store"));
+    let metadata = MetadataManager::new(Arc::clone(&store));
     let tables = metadata.all_table_metas().expect("all table metas");
     let (table_id, _) = tables
         .into_iter()
         .find(|(_, meta)| meta.name.as_deref() == Some("accounts"))
         .expect("accounts table meta");
-    let table = Table::new(table_id, Arc::clone(pager)).expect("open table succeeds");
+    let table = Table::new_with_store(table_id, Arc::clone(&store)).expect("open table succeeds");
     table.schema().expect("load schema succeeds");
     let records = metadata
         .constraint_records(table_id)

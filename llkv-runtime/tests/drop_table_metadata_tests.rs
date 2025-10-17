@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
+use llkv_column_map::store::ColumnStore;
 use llkv_result::Error;
 use llkv_runtime::{ColumnSpec, RuntimeContext};
 use llkv_storage::pager::MemPager;
@@ -26,7 +27,8 @@ fn drop_table_removes_persisted_metadata() {
         .table_id("drop_test")
         .expect("table id registered");
 
-    let metadata_view = MetadataManager::new(Arc::clone(&pager));
+    let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("open column store"));
+    let metadata_view = MetadataManager::new(Arc::clone(&store));
     assert!(metadata_view
         .table_meta(table_id)
         .expect("load table meta")
@@ -40,7 +42,7 @@ fn drop_table_removes_persisted_metadata() {
         .drop_table_immediate("drop_test", false)
         .expect("drop table succeeds");
 
-    let metadata_after = MetadataManager::new(Arc::clone(&pager));
+    let metadata_after = MetadataManager::new(Arc::clone(&store));
     assert!(metadata_after
         .table_meta(table_id)
         .expect("table meta after drop")
@@ -87,7 +89,8 @@ fn drop_table_respects_foreign_keys_after_restart() {
             .table_id("children")
             .expect("child table id registered");
 
-        let metadata = MetadataManager::new(Arc::clone(&pager));
+        let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("open column store"));
+        let metadata = MetadataManager::new(Arc::clone(&store));
         let record = ConstraintRecord {
             constraint_id: 1,
             kind: ConstraintKind::ForeignKey(ForeignKeyConstraint {
