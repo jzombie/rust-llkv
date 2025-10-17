@@ -61,6 +61,11 @@ where
             .await
             .map_err(|e| Error::Internal(format!("factory error: {:?}", e)))
     });
+    
+    // Align with the canonical sqllogictest harness default (256 values) so large
+    // result sets compare by MD5 digest instead of dumping every row.
+    runner.with_hash_threshold(256);
+
     if let Err(e) = runner.run_file_async(&tmp).await {
         let (mapped, opt_orig_line) =
             map_temp_error_message(&format!("{}", e), &tmp, &normalized_lines, &mapping, path);
