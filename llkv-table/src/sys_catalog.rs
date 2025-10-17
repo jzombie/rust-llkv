@@ -24,14 +24,18 @@
 //! field IDs, and enforce table constraints.
 
 use std::collections::HashMap;
+use std::mem;
 use std::sync::Arc;
 
-use arrow::array::{Array, BinaryArray, UInt64Array};
+use arrow::array::{Array, BinaryArray, BinaryBuilder, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bitcode::{Decode, Encode};
 
-use crate::types::{RowId, TableId};
+use crate::constraints::{
+    ConstraintId, ConstraintRecord, decode_constraint_row_id, encode_constraint_row_id,
+};
+use crate::types::{FieldId, RowId, TableId};
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
@@ -75,6 +79,148 @@ fn rid_table(table_id: TableId) -> u64 {
 #[inline]
 fn rid_col(table_id: TableId, col_id: u32) -> u64 {
     lfid(table_id, col_id).into()
+}
+
+const CONSTRAINT_SCAN_CHUNK: usize = 256;
+
+#[inline]
+fn constraint_meta_lfid() -> LogicalFieldId {
+    lfid(CATALOG_TABLE_ID, CATALOG_FIELD_CONSTRAINT_META_ID)
+}
+
+#[inline]
+fn constraint_row_lfid() -> LogicalFieldId {
+    rowid_fid(constraint_meta_lfid())
+}
+
+fn decode_constraint_record(bytes: &[u8]) -> LlkvResult<ConstraintRecord> {
+    bitcode::decode(bytes).map_err(|err| {
+        llkv_result::Error::Internal(format!("failed to decode constraint metadata: {err}"))
+    })
+}
+
+struct ConstraintRowCollector<'a, P, F>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    F: FnMut(Vec<ConstraintRecord>),
+{
+    store: &'a ColumnStore<P>,
+    lfid: LogicalFieldId,
+    table_id: TableId,
+    on_batch: &'a mut F,
+    buffer: Vec<RowId>,
+    error: Option<llkv_result::Error>,
+}
+
+impl<'a, P, F> ConstraintRowCollector<'a, P, F>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    F: FnMut(Vec<ConstraintRecord>),
+{
+    fn flush_buffer(&mut self) -> LlkvResult<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let row_ids = mem::take(&mut self.buffer);
+        let batch =
+            self.store
+                .gather_rows(&[self.lfid], &row_ids, GatherNullPolicy::IncludeNulls)?;
+
+        if batch.num_columns() == 0 {
+            return Ok(());
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal(
+                    "constraint metadata column stored unexpected type".into(),
+                )
+            })?;
+
+        let mut records = Vec::with_capacity(row_ids.len());
+        for (idx, row_id) in row_ids.into_iter().enumerate() {
+            if array.is_null(idx) {
+                continue;
+            }
+
+            let record = decode_constraint_record(array.value(idx))?;
+            let (table_from_id, constraint_id) = decode_constraint_row_id(row_id);
+            if table_from_id != self.table_id {
+                continue;
+            }
+            if record.constraint_id != constraint_id {
+                return Err(llkv_result::Error::Internal(
+                    "constraint metadata id mismatch".into(),
+                ));
+            }
+            records.push(record);
+        }
+
+        if !records.is_empty() {
+            (self.on_batch)(records);
+        }
+
+        Ok(())
+    }
+
+    fn finish(&mut self) -> LlkvResult<()> {
+        if let Some(err) = self.error.take() {
+            return Err(err);
+        }
+        self.flush_buffer()
+    }
+}
+
+impl<'a, P, F> PrimitiveVisitor for ConstraintRowCollector<'a, P, F>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    F: FnMut(Vec<ConstraintRecord>),
+{
+    fn u64_chunk(&mut self, values: &UInt64Array) {
+        if self.error.is_some() {
+            return;
+        }
+
+        for idx in 0..values.len() {
+            let row_id = values.value(idx);
+            let (table_id, _) = decode_constraint_row_id(row_id);
+            if table_id != self.table_id {
+                continue;
+            }
+            self.buffer.push(row_id);
+            if self.buffer.len() >= CONSTRAINT_SCAN_CHUNK {
+                if let Err(err) = self.flush_buffer() {
+                    self.error = Some(err);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+impl<'a, P, F> PrimitiveWithRowIdsVisitor for ConstraintRowCollector<'a, P, F>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    F: FnMut(Vec<ConstraintRecord>),
+{
+}
+
+impl<'a, P, F> PrimitiveSortedVisitor for ConstraintRowCollector<'a, P, F>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    F: FnMut(Vec<ConstraintRecord>),
+{
+}
+
+impl<'a, P, F> PrimitiveSortedWithRowIdsVisitor for ConstraintRowCollector<'a, P, F>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    F: FnMut(Vec<ConstraintRecord>),
+{
 }
 
 // ----- Public catalog types -----
@@ -165,6 +311,36 @@ impl<'a, P> SysCatalog<'a, P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    fn write_null_entries(
+        &self,
+        meta_field: LogicalFieldId,
+        row_ids: &[RowId],
+    ) -> LlkvResult<()> {
+        if row_ids.is_empty() {
+            return Ok(());
+        }
+
+        let lfid_val: u64 = meta_field.into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("meta", DataType::Binary, true).with_metadata(HashMap::from([(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            )])),
+        ]));
+
+        let row_array = Arc::new(UInt64Array::from(row_ids.to_vec()));
+        let mut builder = BinaryBuilder::new();
+        for _ in row_ids {
+            builder.append_null();
+        }
+        let meta_array = Arc::new(builder.finish());
+
+        let batch = RecordBatch::try_new(schema, vec![row_array, meta_array])?;
+        self.store.append(&batch)?;
+        Ok(())
+    }
+
     /// Create a new system catalog interface using the provided column store.
     pub fn new(store: &'a ColumnStore<P>) -> Self {
         Self { store }
@@ -196,46 +372,28 @@ where
     ///
     /// Returns `None` if no metadata exists for the given table ID.
     pub fn get_table_meta(&self, table_id: TableId) -> Option<TableMeta> {
-        struct MetaVisitor {
-            target_rid: u64,
-            meta: Option<TableMeta>,
-        }
-        impl PrimitiveVisitor for MetaVisitor {}
-        impl PrimitiveWithRowIdsVisitor for MetaVisitor {
-            fn u64_chunk_with_rids(&mut self, v: &UInt64Array, r: &UInt64Array) {
-                for i in 0..r.len() {
-                    if r.value(i) == self.target_rid {
-                        // This logic assumes the 'meta' column is u64. It needs to be Binary.
-                        // This scan implementation is a placeholder and needs to be updated
-                        // to correctly handle BinaryArray for the metadata.
-                        // For now, this lets the code compile.
-                        let _bytes = v.value(i);
-                        // self.meta = Some(bitcode::decode(&bytes.to_be_bytes()).unwrap());
-                        break;
-                    }
-                }
-            }
-        }
-        impl PrimitiveSortedVisitor for MetaVisitor {}
-        impl PrimitiveSortedWithRowIdsVisitor for MetaVisitor {}
+        let row_id = rid_table(table_id);
+        let catalog_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_TABLE_META_ID);
+        let batch = self
+            .store
+            .gather_rows(&[catalog_field], &[row_id], GatherNullPolicy::IncludeNulls)
+            .ok()?;
 
-        let mut visitor = MetaVisitor {
-            target_rid: rid_table(table_id),
-            meta: None,
-        };
-        // Note: The scan needs `with_row_ids` to be true for `u64_chunk_with_rids` to be called.
-        // A full implementation would require passing ScanOptions.
-        let scan_opts = llkv_column_map::store::scan::ScanOptions {
-            with_row_ids: true,
-            ..Default::default()
-        };
+        if batch.num_rows() == 0 || batch.num_columns() == 0 {
+            return None;
+        }
 
-        let _ = self.store.scan(
-            lfid(CATALOG_TABLE_ID, CATALOG_FIELD_TABLE_META_ID),
-            scan_opts,
-            &mut visitor,
-        );
-        visitor.meta
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("table meta column must be BinaryArray");
+
+        if array.is_null(0) {
+            return None;
+        }
+
+        bitcode::decode(array.value(0)).ok()
     }
 
     /// Upsert a single column’s metadata.
@@ -293,6 +451,52 @@ where
                 }
             })
             .collect()
+    }
+
+    /// Delete metadata rows for the specified column identifiers.
+    pub fn delete_col_meta(&self, table_id: TableId, col_ids: &[FieldId]) -> LlkvResult<()> {
+        if col_ids.is_empty() {
+            return Ok(());
+        }
+
+        let meta_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_COL_META_ID);
+        let row_ids: Vec<RowId> = col_ids
+            .iter()
+            .map(|&col_id| rid_col(table_id, col_id))
+            .collect();
+        self.write_null_entries(meta_field, &row_ids)
+    }
+
+    /// Remove the persisted table metadata record, if present.
+    pub fn delete_table_meta(&self, table_id: TableId) -> LlkvResult<()> {
+        let meta_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_TABLE_META_ID);
+        let row_id = rid_table(table_id);
+        self.write_null_entries(meta_field, &[row_id])
+    }
+
+    /// Delete constraint records for the provided identifiers.
+    pub fn delete_constraint_records(
+        &self,
+        table_id: TableId,
+        constraint_ids: &[ConstraintId],
+    ) -> LlkvResult<()> {
+        if constraint_ids.is_empty() {
+            return Ok(());
+        }
+
+        let meta_field = constraint_meta_lfid();
+        let row_ids: Vec<RowId> = constraint_ids
+            .iter()
+            .map(|&constraint_id| encode_constraint_row_id(table_id, constraint_id))
+            .collect();
+        self.write_null_entries(meta_field, &row_ids)
+    }
+
+    /// Delete the multi-column UNIQUE metadata record for a table, if any.
+    pub fn delete_multi_column_uniques(&self, table_id: TableId) -> LlkvResult<()> {
+        let meta_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID);
+        let row_id = rid_table(table_id);
+        self.write_null_entries(meta_field, &[row_id])
     }
 
     /// Persist the complete set of multi-column UNIQUE definitions for a table.
@@ -442,6 +646,143 @@ where
         }
 
         Ok(metas)
+    }
+
+    // TODO: Use batch APIs for better performance.
+    /// Persist or update multiple constraint records for a table in a single batch.
+    pub fn put_constraint_records(
+        &self,
+        table_id: TableId,
+        records: &[ConstraintRecord],
+    ) -> LlkvResult<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let lfid_val: u64 = constraint_meta_lfid().into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("constraint", DataType::Binary, false).with_metadata(HashMap::from([(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            )])),
+        ]));
+
+        let row_ids: Vec<RowId> = records
+            .iter()
+            .map(|record| encode_constraint_row_id(table_id, record.constraint_id))
+            .collect();
+
+        let row_ids_array = Arc::new(UInt64Array::from(row_ids));
+        let payload_array = Arc::new(BinaryArray::from_iter_values(
+            records.iter().map(|record| bitcode::encode(record)),
+        ));
+
+        let batch = RecordBatch::try_new(schema, vec![row_ids_array, payload_array])?;
+        self.store.append(&batch)?;
+        Ok(())
+    }
+
+    /// Fetch multiple constraint records for a table in a single batch.
+    pub fn get_constraint_records(
+        &self,
+        table_id: TableId,
+        constraint_ids: &[ConstraintId],
+    ) -> LlkvResult<Vec<Option<ConstraintRecord>>> {
+        if constraint_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let lfid = constraint_meta_lfid();
+        let row_ids: Vec<RowId> = constraint_ids
+            .iter()
+            .map(|&constraint_id| encode_constraint_row_id(table_id, constraint_id))
+            .collect();
+
+        let batch = match self
+            .store
+            .gather_rows(&[lfid], &row_ids, GatherNullPolicy::IncludeNulls)
+        {
+            Ok(batch) => batch,
+            Err(llkv_result::Error::NotFound) => {
+                return Ok(vec![None; constraint_ids.len()]);
+            }
+            Err(err) => return Err(err),
+        };
+
+        if batch.num_columns() == 0 || batch.num_rows() == 0 {
+            return Ok(vec![None; constraint_ids.len()]);
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal(
+                    "constraint metadata column stored unexpected type".into(),
+                )
+            })?;
+
+        let mut results = Vec::with_capacity(constraint_ids.len());
+        for (idx, &constraint_id) in constraint_ids.iter().enumerate() {
+            if array.is_null(idx) {
+                results.push(None);
+                continue;
+            }
+            let record = decode_constraint_record(array.value(idx))?;
+            if record.constraint_id != constraint_id {
+                return Err(llkv_result::Error::Internal(
+                    "constraint metadata id mismatch".into(),
+                ));
+            }
+            results.push(Some(record));
+        }
+
+        Ok(results)
+    }
+
+    /// Stream constraint records for a table in batches.
+    pub fn scan_constraint_records_for_table<F>(
+        &self,
+        table_id: TableId,
+        mut on_batch: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(Vec<ConstraintRecord>),
+    {
+        let row_field = constraint_row_lfid();
+        let mut visitor = ConstraintRowCollector {
+            store: self.store,
+            lfid: constraint_meta_lfid(),
+            table_id,
+            on_batch: &mut on_batch,
+            buffer: Vec::with_capacity(CONSTRAINT_SCAN_CHUNK),
+            error: None,
+        };
+
+        match ScanBuilder::new(self.store, row_field)
+            .options(ScanOptions::default())
+            .run(&mut visitor)
+        {
+            Ok(()) => {}
+            Err(llkv_result::Error::NotFound) => return Ok(()),
+            Err(err) => return Err(err),
+        }
+
+        visitor.finish()
+    }
+
+    /// Load all constraint records for a table into a vector.
+    pub fn constraint_records_for_table(
+        &self,
+        table_id: TableId,
+    ) -> LlkvResult<Vec<ConstraintRecord>> {
+        let mut all = Vec::new();
+        self.scan_constraint_records_for_table(table_id, |mut chunk| {
+            all.append(&mut chunk);
+        })?;
+        Ok(all)
     }
 
     pub fn put_next_table_id(&self, next_id: TableId) -> LlkvResult<()> {
@@ -932,3 +1273,69 @@ impl PrimitiveVisitor for MaxRowIdCollector {
 impl PrimitiveWithRowIdsVisitor for MaxRowIdCollector {}
 impl PrimitiveSortedVisitor for MaxRowIdCollector {}
 impl PrimitiveSortedWithRowIdsVisitor for MaxRowIdCollector {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constraints::{
+        ConstraintKind, ConstraintState, PrimaryKeyConstraint, UniqueConstraint,
+    };
+    use llkv_column_map::ColumnStore;
+    use std::sync::Arc;
+
+    #[test]
+    fn constraint_records_roundtrip() {
+        let pager = Arc::new(MemPager::default());
+        let store = ColumnStore::open(Arc::clone(&pager)).unwrap();
+        let catalog = SysCatalog::new(&store);
+
+        let table_id: TableId = 42;
+        let record1 = ConstraintRecord {
+            constraint_id: 1,
+            kind: ConstraintKind::PrimaryKey(PrimaryKeyConstraint {
+                field_ids: vec![1, 2],
+            }),
+            state: ConstraintState::Active,
+            revision: 1,
+            last_modified_micros: 100,
+        };
+        let record2 = ConstraintRecord {
+            constraint_id: 2,
+            kind: ConstraintKind::Unique(UniqueConstraint { field_ids: vec![3] }),
+            state: ConstraintState::Active,
+            revision: 2,
+            last_modified_micros: 200,
+        };
+        catalog
+            .put_constraint_records(table_id, &[record1.clone(), record2.clone()])
+            .unwrap();
+
+        let other_table_record = ConstraintRecord {
+            constraint_id: 1,
+            kind: ConstraintKind::Unique(UniqueConstraint { field_ids: vec![5] }),
+            state: ConstraintState::Active,
+            revision: 1,
+            last_modified_micros: 150,
+        };
+        catalog
+            .put_constraint_records(7, &[other_table_record])
+            .unwrap();
+
+        let mut fetched = catalog.constraint_records_for_table(table_id).unwrap();
+        fetched.sort_by_key(|record| record.constraint_id);
+
+        assert_eq!(fetched.len(), 2);
+        assert_eq!(fetched[0], record1);
+        assert_eq!(fetched[1], record2);
+
+        let single = catalog
+            .get_constraint_records(table_id, &[record1.constraint_id])
+            .unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].as_ref(), Some(&record1));
+
+        let missing = catalog.get_constraint_records(table_id, &[999]).unwrap();
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].is_none());
+    }
+}

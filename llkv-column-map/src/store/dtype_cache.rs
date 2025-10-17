@@ -124,6 +124,26 @@ where
                 self.cache.write().unwrap().insert(field_id, dt.clone());
                 return Ok(dt);
             }
+            if fp == Self::dtype_fingerprint(&DataType::Int64) {
+                let dt = DataType::Int64;
+                self.cache.write().unwrap().insert(field_id, dt.clone());
+                return Ok(dt);
+            }
+            if fp == Self::dtype_fingerprint(&DataType::Float64) {
+                let dt = DataType::Float64;
+                self.cache.write().unwrap().insert(field_id, dt.clone());
+                return Ok(dt);
+            }
+            if fp == Self::dtype_fingerprint(&DataType::Utf8) {
+                let dt = DataType::Utf8;
+                self.cache.write().unwrap().insert(field_id, dt.clone());
+                return Ok(dt);
+            }
+            if fp == Self::dtype_fingerprint(&DataType::Date32) {
+                let dt = DataType::Date32;
+                self.cache.write().unwrap().insert(field_id, dt.clone());
+                return Ok(dt);
+            }
             // Unknown fingerprint; fall back to peeking one chunk to get exact DataType.
         }
 

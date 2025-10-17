@@ -172,6 +172,9 @@ pub const CATALOG_FIELD_SCHEMA_META_ID: u32 = 104;
 /// Catalog field for multi-column unique index metadata (Binary-encoded TableMultiColumnUniqueMeta).
 pub const CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID: u32 = 105;
 
+/// Catalog field for constraint metadata (Binary-encoded ConstraintRecord).
+pub const CATALOG_FIELD_CONSTRAINT_META_ID: u32 = 106;
+
 /// Check if a field ID is used by the catalog's internal structure.
 #[inline]
 pub fn is_catalog_internal_field(id: u32) -> bool {
@@ -185,6 +188,7 @@ pub fn is_catalog_internal_field(id: u32) -> bool {
             | CATALOG_FIELD_CATALOG_STATE
             | CATALOG_FIELD_SCHEMA_META_ID
             | CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID
+            | CATALOG_FIELD_CONSTRAINT_META_ID
     )
 }
 
@@ -303,6 +307,10 @@ mod tests {
         ));
         assert!(is_catalog_internal_field(CATALOG_FIELD_CATALOG_STATE));
         assert!(is_catalog_internal_field(CATALOG_FIELD_SCHEMA_META_ID));
+        assert!(is_catalog_internal_field(
+            CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID
+        ));
+        assert!(is_catalog_internal_field(CATALOG_FIELD_CONSTRAINT_META_ID));
         assert!(!is_catalog_internal_field(2));
         assert!(!is_catalog_internal_field(200));
     }
