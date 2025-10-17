@@ -15,7 +15,7 @@ fn temporary_tables_support_core_dml() {
     assert!(matches!(
         results.remove(0),
         RuntimeStatementResult::CreateTable { table_name }
-        if table_name.to_ascii_lowercase() == "integers"
+        if table_name.eq_ignore_ascii_case("integers")
     ));
 
     let mut results = engine
@@ -28,7 +28,7 @@ fn temporary_tables_support_core_dml() {
             table_name,
             rows_inserted
         }
-        if table_name.to_ascii_lowercase() == "integers" && rows_inserted == 2
+        if table_name.eq_ignore_ascii_case("integers") && rows_inserted == 2
     ));
 
     let registry = engine.session().namespace_registry();
@@ -48,7 +48,7 @@ fn temporary_tables_support_core_dml() {
     assert!(matches!(
         results.remove(0),
         RuntimeStatementResult::CreateIndex { table_name, .. }
-        if table_name.to_ascii_lowercase() == "integers"
+        if table_name.eq_ignore_ascii_case("integers")
     ));
 
     let mut results = engine
@@ -61,7 +61,7 @@ fn temporary_tables_support_core_dml() {
             table_name,
             rows_updated
         }
-        if table_name.to_ascii_lowercase() == "integers" && rows_updated == 1
+        if table_name.eq_ignore_ascii_case("integers") && rows_updated == 1
     ));
 
     let mut results = engine
@@ -74,7 +74,7 @@ fn temporary_tables_support_core_dml() {
             table_name,
             rows_deleted
         }
-        if table_name.to_ascii_lowercase() == "integers" && rows_deleted == 1
+        if table_name.eq_ignore_ascii_case("integers") && rows_deleted == 1
     ));
 
     let mut results = engine

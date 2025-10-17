@@ -196,6 +196,13 @@ struct StoredMultiColumnUnique {
     field_ids: Vec<FieldId>,
 }
 
+struct PrimaryKeyUpdateContext<'a> {
+    indices: &'a [usize],
+    names: &'a [String],
+    original_keys: &'a [Option<UniqueKey>],
+    new_rows: &'a [Vec<PlanValue>],
+}
+
 #[derive(Clone, Debug)]
 struct ForeignKeyMetadata {
     constraint_name: Option<String>,
@@ -1006,10 +1013,10 @@ where
 
     /// Select rows (outside or inside transaction).
     pub fn select(&self, plan: SelectPlan) -> Result<RuntimeStatementResult<P>> {
-        if let Some(namespace_id) = self.namespace_for_select_plan(&plan) {
-            if namespace_id == storage_namespace::TEMPORARY_NAMESPACE_ID {
-                return self.select_from_temporary(plan);
-            }
+        if let Some(namespace_id) = self.namespace_for_select_plan(&plan)
+            && namespace_id == storage_namespace::TEMPORARY_NAMESPACE_ID
+        {
+            return self.select_from_temporary(plan);
         }
 
         if self.has_active_transaction() {
@@ -2567,17 +2574,17 @@ where
             );
         }
 
-        if !foreign_keys.is_empty() {
-            if let Err(err) = self.register_foreign_keys_for_table(
+        if !foreign_keys.is_empty()
+            && let Err(err) = self.register_foreign_keys_for_table(
                 &display_name,
                 &canonical_name,
                 &column_defs,
                 foreign_keys,
-            ) {
-                self.catalog.unregister_table(&canonical_name);
-                self.remove_table_entry(&canonical_name);
-                return Err(err);
-            }
+            )
+        {
+            self.catalog.unregister_table(&canonical_name);
+            self.remove_table_entry(&canonical_name);
+            return Err(err);
         }
 
         Ok(RuntimeStatementResult::CreateTable {
@@ -2607,12 +2614,14 @@ where
             // Resolve empty referenced_columns to the primary key of the referenced table
             if spec.referenced_columns.is_empty() {
                 let referenced_table_canonical = spec.referenced_table.to_ascii_lowercase();
-                let referenced_table = self.lookup_table(&referenced_table_canonical).map_err(|_| {
-                    Error::InvalidArgumentError(format!(
-                        "referenced table '{}' does not exist",
-                        spec.referenced_table
-                    ))
-                })?;
+                let referenced_table =
+                    self.lookup_table(&referenced_table_canonical)
+                        .map_err(|_| {
+                            Error::InvalidArgumentError(format!(
+                                "referenced table '{}' does not exist",
+                                spec.referenced_table
+                            ))
+                        })?;
 
                 let primary_key_columns: Vec<&ExecutorColumn> = referenced_table
                     .schema
@@ -3813,10 +3822,7 @@ where
         }
 
         let mut guard = self.txn_tables_with_new_rows.write().unwrap();
-        guard
-            .entry(txn_id)
-            .or_insert_with(FxHashSet::default)
-            .insert(canonical_name);
+        guard.entry(txn_id).or_default().insert(canonical_name);
     }
 
     fn collect_rows_created_by_txn(
@@ -3968,19 +3974,23 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: &str,
-        primary_key_indices: &[usize],
-        primary_key_names: &[String],
-        original_keys: &[Option<UniqueKey>],
-        new_rows: &[Vec<PlanValue>],
+        pk_context: PrimaryKeyUpdateContext<'_>,
         snapshot: TransactionSnapshot,
     ) -> Result<()> {
-        if primary_key_indices.is_empty() {
+        let PrimaryKeyUpdateContext {
+            indices,
+            names,
+            original_keys,
+            new_rows,
+        } = pk_context;
+
+        if indices.is_empty() {
             return Ok(());
         }
 
         debug_assert_eq!(original_keys.len(), new_rows.len());
 
-        let pk_field_ids: Vec<FieldId> = primary_key_indices
+        let pk_field_ids: Vec<FieldId> = indices
             .iter()
             .map(|&idx| {
                 table
@@ -3995,47 +4005,45 @@ where
         let mut existing_rows = self.scan_multi_column_values(table, &pk_field_ids, snapshot)?;
         let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
         for row_values in existing_rows.drain(..) {
-            if let Some(key) = Self::build_composite_unique_key(&row_values, primary_key_names)? {
+            if let Some(key) = Self::build_composite_unique_key(&row_values, names)? {
                 tracing::trace!(table = %display_name, ?key, "existing primary key");
                 existing_keys.insert(key);
             }
         }
 
-        for original in original_keys {
-            if let Some(key) = original {
-                tracing::trace!(table = %display_name, ?key, "removing original key");
-                existing_keys.remove(key);
-            }
+        for key in original_keys.iter().flatten() {
+            tracing::trace!(table = %display_name, ?key, "removing original key");
+            existing_keys.remove(key);
         }
 
         tracing::trace!(
             table = %display_name,
-            pk_columns = ?primary_key_names,
+            pk_columns = ?names,
             existing_keys = existing_keys.len(),
             pending_rows = new_rows.len(),
             "validating primary key uniqueness for update"
         );
 
-        let pk_label = if primary_key_names.len() == 1 {
+        let pk_label = if names.len() == 1 {
             "column"
         } else {
             "columns"
         };
-        let pk_display = if primary_key_names.len() == 1 {
-            primary_key_names[0].clone()
+        let pk_display = if names.len() == 1 {
+            names[0].clone()
         } else {
-            primary_key_names.join(", ")
+            names.join(", ")
         };
 
         let mut new_seen: FxHashSet<UniqueKey> = FxHashSet::default();
 
         for row in new_rows {
-            let mut values = Vec::with_capacity(primary_key_indices.len());
-            for &idx in primary_key_indices {
+            let mut values = Vec::with_capacity(indices.len());
+            for &idx in indices {
                 values.push(row[idx].clone());
             }
 
-            let key = Self::build_composite_unique_key(&values, primary_key_names)?;
+            let key = Self::build_composite_unique_key(&values, names)?;
             let key = key.ok_or_else(|| {
                 Error::ConstraintError(format!(
                     "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
@@ -4477,16 +4485,12 @@ where
                     .get(position)
                     .copied()
                     .ok_or_else(|| Error::Internal("invalid INSERT column index mapping".into()))?;
-                let column = table
-                    .schema
-                    .columns
-                    .get(schema_index)
-                    .ok_or_else(|| {
-                        Error::Internal(format!(
-                            "INSERT column index {} out of bounds for table '{}'",
-                            schema_index, display_name
-                        ))
-                    })?;
+                let column = table.schema.columns.get(schema_index).ok_or_else(|| {
+                    Error::Internal(format!(
+                        "INSERT column index {} out of bounds for table '{}'",
+                        schema_index, display_name
+                    ))
+                })?;
                 let normalized = normalize_insert_value_for_column(column, value.clone())?;
                 *value = normalized;
             }
@@ -4846,10 +4850,12 @@ where
             self.validate_primary_keys_for_update(
                 table,
                 &display_name,
-                &primary_key_indices,
-                &primary_key_names,
-                &original_primary_key_keys,
-                &new_rows,
+                PrimaryKeyUpdateContext {
+                    indices: &primary_key_indices,
+                    names: &primary_key_names,
+                    original_keys: &original_primary_key_keys,
+                    new_rows: &new_rows,
+                },
                 snapshot,
             )?;
         }
@@ -5092,10 +5098,12 @@ where
             self.validate_primary_keys_for_update(
                 table,
                 &display_name,
-                &primary_key_indices,
-                &primary_key_names,
-                &original_primary_key_keys,
-                &new_rows,
+                PrimaryKeyUpdateContext {
+                    indices: &primary_key_indices,
+                    names: &primary_key_names,
+                    original_keys: &original_primary_key_keys,
+                    new_rows: &new_rows,
+                },
                 snapshot,
             )?;
         }
@@ -5811,16 +5819,12 @@ where
         let blocking: Vec<_> = referencing
             .into_iter()
             .filter(|(child_canonical, _)| {
-                child_canonical != &canonical_name
-                    && !self.is_table_marked_dropped(child_canonical)
+                child_canonical != &canonical_name && !self.is_table_marked_dropped(child_canonical)
             })
             .collect();
 
         if let Some((_, metadata)) = blocking.first() {
-            let constraint_label = metadata
-                .constraint_name
-                .as_deref()
-                .unwrap_or("FOREIGN KEY");
+            let constraint_label = metadata.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
             return Err(Error::ConstraintError(format!(
                 "Cannot drop table '{}' because it is referenced by foreign key constraint '{}' on table '{}'",
                 display_name, constraint_label, metadata.referencing_display
@@ -6379,7 +6383,7 @@ fn normalize_insert_value_for_column(
                     return Err(Error::InvalidArgumentError(format!(
                         "cannot insert string '{}' into BOOLEAN column '{}'",
                         s, column.name
-                    )))
+                    )));
                 }
             };
             Ok(PlanValue::Integer(value))
@@ -6388,9 +6392,7 @@ fn normalize_insert_value_for_column(
             "cannot insert struct into BOOLEAN column '{}'",
             column.name
         ))),
-        (DataType::Float64, PlanValue::Integer(v)) => {
-            Ok(PlanValue::Float(v as f64))
-        }
+        (DataType::Float64, PlanValue::Integer(v)) => Ok(PlanValue::Float(v as f64)),
         (DataType::Float64, PlanValue::Float(v)) => Ok(PlanValue::Float(v)),
         (DataType::Float64, other) => Err(Error::InvalidArgumentError(format!(
             "cannot insert {other:?} into DOUBLE column '{}'",

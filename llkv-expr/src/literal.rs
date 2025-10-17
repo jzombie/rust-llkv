@@ -260,35 +260,6 @@ where
     T::from_literal(lit)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn boolean_literal_roundtrip() {
-        let lit = Literal::from(true);
-        assert_eq!(lit, Literal::Boolean(true));
-        assert_eq!(literal_to_native::<bool>(&lit).unwrap(), true);
-        assert_eq!(
-            literal_to_native::<bool>(&Literal::Boolean(false)).unwrap(),
-            false
-        );
-    }
-
-    #[test]
-    fn boolean_literal_rejects_integer_cast() {
-        let lit = Literal::Boolean(true);
-        let err = literal_to_native::<i32>(&lit).unwrap_err();
-        assert!(matches!(
-            err,
-            LiteralCastError::TypeMismatch {
-                expected: "integer",
-                got: "boolean",
-            }
-        ));
-    }
-}
-
 /// Convert a bound of `Literal` into a bound of `T::Native`.
 ///
 /// Kept generic over `T: ArrowPrimitiveType` so callers (like the table
@@ -305,4 +276,30 @@ where
         Bound::Included(l) => Bound::Included(literal_to_native::<T::Native>(l)?),
         Bound::Excluded(l) => Bound::Excluded(literal_to_native::<T::Native>(l)?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boolean_literal_roundtrip() {
+        let lit = Literal::from(true);
+        assert_eq!(lit, Literal::Boolean(true));
+        assert!(literal_to_native::<bool>(&lit).unwrap());
+        assert!(!literal_to_native::<bool>(&Literal::Boolean(false)).unwrap());
+    }
+
+    #[test]
+    fn boolean_literal_rejects_integer_cast() {
+        let lit = Literal::Boolean(true);
+        let err = literal_to_native::<i32>(&lit).unwrap_err();
+        assert!(matches!(
+            err,
+            LiteralCastError::TypeMismatch {
+                expected: "integer",
+                got: "boolean",
+            }
+        ));
+    }
 }

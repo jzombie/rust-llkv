@@ -565,7 +565,8 @@ where
                     let referenced_table = Self::object_name_to_string(foreign_table)?;
                     // Empty referenced_columns means "use the primary key of the referenced table"
                     // This will be resolved during table creation in the runtime
-                    let referenced_columns: Vec<String> = referred_columns.iter().map(|c| c.value.clone()).collect();
+                    let referenced_columns: Vec<String> =
+                        referred_columns.iter().map(|c| c.value.clone()).collect();
 
                     let map_action = |action: &Option<ReferentialAction>,
                                       kind: &str|
@@ -838,7 +839,9 @@ where
 
                         // If referred_columns is empty, it means "use the primary key"
                         // This will be resolved during table creation
-                        if !referred_columns.is_empty() && fk_columns.len() != referred_columns.len() {
+                        if !referred_columns.is_empty()
+                            && fk_columns.len() != referred_columns.len()
+                        {
                             return Err(Error::InvalidArgumentError(
                                 "FOREIGN KEY referencing and referenced column counts must match"
                                     .into(),
@@ -2167,16 +2170,17 @@ where
                 .nulls_first
                 .unwrap_or(default_nulls_first_for_direction);
 
-            if let SqlExpr::Identifier(ident) = &order_expr.expr {
-                if ident.value.eq_ignore_ascii_case("ALL") && ident.quote_style.is_none() {
-                    plans.push(OrderByPlan {
-                        target: OrderTarget::All,
-                        sort_type: OrderSortType::Native,
-                        ascending,
-                        nulls_first,
-                    });
-                    continue;
-                }
+            if let SqlExpr::Identifier(ident) = &order_expr.expr
+                && ident.value.eq_ignore_ascii_case("ALL")
+                && ident.quote_style.is_none()
+            {
+                plans.push(OrderByPlan {
+                    target: OrderTarget::All,
+                    sort_type: OrderSortType::Native,
+                    ascending,
+                    nulls_first,
+                });
+                continue;
             }
 
             let (target, sort_type) = match &order_expr.expr {

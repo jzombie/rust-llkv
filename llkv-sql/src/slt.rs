@@ -296,14 +296,15 @@ fn normalize_inline_connections(
                 idx += 1;
             }
 
-            if regex_pattern.is_none() && !message_lines.is_empty() {
-                if let Some((first_line, _)) = message_lines.first() {
-                    let trimmed_first = first_line.trim();
-                    if !trimmed_first.is_empty() {
-                        let escaped = escape(trimmed_first);
-                        regex_pattern = Some(format!(".*{}.*", escaped));
-                        message_lines.clear();
-                    }
+            if regex_pattern.is_none()
+                && !message_lines.is_empty()
+                && let Some((first_line, _)) = message_lines.first()
+            {
+                let trimmed_first = first_line.trim();
+                if !trimmed_first.is_empty() {
+                    let escaped = escape(trimmed_first);
+                    regex_pattern = Some(format!(".*{}.*", escaped));
+                    message_lines.clear();
                 }
             }
         }
