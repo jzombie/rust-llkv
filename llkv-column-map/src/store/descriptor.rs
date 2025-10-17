@@ -128,7 +128,11 @@ impl ColumnDescriptor {
                         _ => None,
                     })
                     .ok_or_else(|| {
-                        dbg!("missing tail page", descriptor_pk, descriptor.tail_page_pk);
+                        tracing::error!(
+                            descriptor_pk,
+                            tail_page_pk = descriptor.tail_page_pk,
+                            "load_or_create: missing tail page"
+                        );
                         Error::NotFound
                     })?
                     .as_ref()
