@@ -1189,6 +1189,7 @@ dependencies = [
  "llkv-plan",
  "llkv-result",
  "llkv-table",
+ "rustc-hash",
 ]
 
 [[package]]

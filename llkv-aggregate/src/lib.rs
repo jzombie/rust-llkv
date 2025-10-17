@@ -1,7 +1,11 @@
-use arrow::array::{Array, ArrayRef, Int64Array, Int64Builder, RecordBatch};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, Int64Builder,
+    RecordBatch, StringArray,
+};
 use arrow::datatypes::{DataType, Field};
 use llkv_result::Error;
 use llkv_table::types::FieldId;
+use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 pub use llkv_plan::{AggregateExpr, AggregateFunction};
@@ -19,6 +23,7 @@ pub struct AggregateSpec {
 pub enum AggregateKind {
     CountStar,
     CountField { field_id: FieldId },
+    CountDistinctField { field_id: FieldId },
     SumInt64 { field_id: FieldId },
     MinInt64 { field_id: FieldId },
     MaxInt64 { field_id: FieldId },
@@ -31,6 +36,7 @@ impl AggregateKind {
         match self {
             AggregateKind::CountStar => None,
             AggregateKind::CountField { field_id }
+            | AggregateKind::CountDistinctField { field_id, .. }
             | AggregateKind::SumInt64 { field_id }
             | AggregateKind::MinInt64 { field_id }
             | AggregateKind::MaxInt64 { field_id }
@@ -55,6 +61,10 @@ pub enum AggregateAccumulator {
         column_index: usize,
         value: i64,
     },
+    CountDistinctColumn {
+        column_index: usize,
+        seen: FxHashSet<DistinctKey>,
+    },
     SumInt64 {
         column_index: usize,
         value: i64,
@@ -75,6 +85,77 @@ pub enum AggregateAccumulator {
     },
 }
 
+#[derive(Hash, Eq, PartialEq, Clone)]
+pub enum DistinctKey {
+    Int(i64),
+    Float(u64),
+    Str(String),
+    Bool(bool),
+    Date(i32),
+}
+
+impl DistinctKey {
+    fn from_array(array: &ArrayRef, index: usize) -> AggregateResult<Self> {
+        match array.data_type() {
+            DataType::Int64 => {
+                let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "COUNT(DISTINCT) expected an INT64 column in execution".into(),
+                    )
+                })?;
+                Ok(DistinctKey::Int(values.value(index)))
+            }
+            DataType::Float64 => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "COUNT(DISTINCT) expected a FLOAT64 column in execution".into(),
+                        )
+                    })?;
+                Ok(DistinctKey::Float(values.value(index).to_bits()))
+            }
+            DataType::Utf8 => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "COUNT(DISTINCT) expected a UTF8 column in execution".into(),
+                        )
+                    })?;
+                Ok(DistinctKey::Str(values.value(index).to_owned()))
+            }
+            DataType::Boolean => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "COUNT(DISTINCT) expected a BOOLEAN column in execution".into(),
+                        )
+                    })?;
+                Ok(DistinctKey::Bool(values.value(index)))
+            }
+            DataType::Date32 => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "COUNT(DISTINCT) expected a DATE32 column in execution".into(),
+                        )
+                    })?;
+                Ok(DistinctKey::Date(values.value(index)))
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "COUNT(DISTINCT) is not supported for column type {other:?}"
+            ))),
+        }
+    }
+}
+
 impl AggregateAccumulator {
     /// Create accumulator using projection index (position in the batch columns)
     /// instead of table schema position. projection_idx is None for CountStar.
@@ -92,6 +173,15 @@ impl AggregateAccumulator {
                 Ok(AggregateAccumulator::CountColumn {
                     column_index: idx,
                     value: 0,
+                })
+            }
+            AggregateKind::CountDistinctField { .. } => {
+                let idx = projection_idx.ok_or_else(|| {
+                    Error::Internal("CountDistinctField aggregate requires projection index".into())
+                })?;
+                Ok(AggregateAccumulator::CountDistinctColumn {
+                    column_index: idx,
+                    seen: FxHashSet::default(),
                 })
             }
             AggregateKind::SumInt64 { .. } => {
@@ -159,6 +249,16 @@ impl AggregateAccumulator {
                 *value = value.checked_add(non_null).ok_or_else(|| {
                     Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
                 })?;
+            }
+            AggregateAccumulator::CountDistinctColumn { column_index, seen } => {
+                let array = batch.column(*column_index);
+                for i in 0..array.len() {
+                    if !array.is_valid(i) {
+                        continue;
+                    }
+                    let value = DistinctKey::from_array(array, i)?;
+                    seen.insert(value);
+                }
             }
             AggregateAccumulator::SumInt64 {
                 column_index,
@@ -261,6 +361,15 @@ impl AggregateAccumulator {
                 builder.append_value(value);
                 let array = Arc::new(builder.finish()) as ArrayRef;
                 Ok((Field::new("count", DataType::Int64, false), array))
+            }
+            AggregateAccumulator::CountDistinctColumn { seen, .. } => {
+                let mut builder = Int64Builder::with_capacity(1);
+                let count = i64::try_from(seen.len()).map_err(|_| {
+                    Error::InvalidArgumentError("COUNT(DISTINCT) result exceeds i64 range".into())
+                })?;
+                builder.append_value(count);
+                let array = Arc::new(builder.finish()) as ArrayRef;
+                Ok((Field::new("count_distinct", DataType::Int64, false), array))
             }
             AggregateAccumulator::SumInt64 {
                 value, saw_value, ..

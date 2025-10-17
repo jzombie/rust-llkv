@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Date32Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_result::Error;
@@ -80,6 +80,9 @@ pub struct CreateTablePlan {
     pub or_replace: bool,
     pub columns: Vec<ColumnSpec>,
     pub source: Option<CreateTableSource>,
+    /// Optional storage namespace for the table.
+    pub namespace: Option<String>,
+    pub foreign_keys: Vec<ForeignKeySpec>,
 }
 
 impl CreateTablePlan {
@@ -90,8 +93,36 @@ impl CreateTablePlan {
             or_replace: false,
             columns: Vec::new(),
             source: None,
+            namespace: None,
+            foreign_keys: Vec::new(),
         }
     }
+}
+
+// ============================================================================
+// FOREIGN KEY Plan Structures
+// ============================================================================
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForeignKeyAction {
+    NoAction,
+    Restrict,
+}
+
+impl Default for ForeignKeyAction {
+    fn default() -> Self {
+        Self::NoAction
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ForeignKeySpec {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    pub referenced_table: String,
+    pub referenced_columns: Vec<String>,
+    pub on_delete: ForeignKeyAction,
+    pub on_update: ForeignKeyAction,
 }
 
 // ============================================================================
@@ -468,6 +499,7 @@ pub enum AggregateExpr {
         column: String,
         alias: String,
         function: AggregateFunction,
+        distinct: bool,
     },
 }
 
@@ -493,6 +525,16 @@ impl AggregateExpr {
             column: column.into(),
             alias: alias.into(),
             function: AggregateFunction::Count,
+            distinct: false,
+        }
+    }
+
+    pub fn count_distinct_column(column: impl Into<String>, alias: impl Into<String>) -> Self {
+        Self::Column {
+            column: column.into(),
+            alias: alias.into(),
+            function: AggregateFunction::Count,
+            distinct: true,
         }
     }
 
@@ -501,6 +543,7 @@ impl AggregateExpr {
             column: column.into(),
             alias: alias.into(),
             function: AggregateFunction::SumInt64,
+            distinct: false,
         }
     }
 
@@ -509,6 +552,7 @@ impl AggregateExpr {
             column: column.into(),
             alias: alias.into(),
             function: AggregateFunction::MinInt64,
+            distinct: false,
         }
     }
 
@@ -517,6 +561,7 @@ impl AggregateExpr {
             column: column.into(),
             alias: alias.into(),
             function: AggregateFunction::MaxInt64,
+            distinct: false,
         }
     }
 
@@ -525,6 +570,7 @@ impl AggregateExpr {
             column: column.into(),
             alias: alias.into(),
             function: AggregateFunction::CountNulls,
+            distinct: false,
         }
     }
 }
@@ -535,6 +581,15 @@ pub fn plan_value_from_array(array: &ArrayRef, index: usize) -> PlanResult<PlanV
         return Ok(PlanValue::Null);
     }
     match array.data_type() {
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("expected Boolean array in INSERT SELECT".into())
+                })?;
+            Ok(PlanValue::Integer(if values.value(index) { 1 } else { 0 }))
+        }
         DataType::Int64 => {
             let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                 Error::InvalidArgumentError("expected Int64 array in INSERT SELECT".into())
@@ -599,6 +654,7 @@ pub enum OrderSortType {
 pub enum OrderTarget {
     Column(String),
     Index(usize),
+    All,
 }
 
 // ============================================================================

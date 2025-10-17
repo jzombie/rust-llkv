@@ -227,6 +227,14 @@ pub trait TransactionContext: Send + Sync {
 
     /// Get an immutable catalog snapshot for transaction isolation
     fn catalog_snapshot(&self) -> llkv_table::catalog::TableCatalogSnapshot;
+
+    /// Validate any pending commit-time constraints for this transaction.
+    fn validate_commit_constraints(&self, _txn_id: TxnId) -> LlkvResult<()> {
+        Ok(())
+    }
+
+    /// Clear any transaction-scoped state retained by the context.
+    fn clear_transaction_state(&self, _txn_id: TxnId) {}
 }
 
 /// Transaction state for the runtime context.
@@ -824,6 +832,8 @@ where
         // If transaction is aborted, commit becomes a rollback (no operations to replay)
         if tx.is_aborted {
             tx.txn_manager.mark_aborted(tx.snapshot.txn_id);
+            tx.base_context.clear_transaction_state(tx.snapshot.txn_id);
+            tx.staging.clear_transaction_state(tx.snapshot.txn_id);
             // Reset context snapshot to auto-commit view (aborted txn's writes should be invisible)
             let auto_commit_snapshot = TransactionSnapshot {
                 txn_id: TXN_ID_AUTO_COMMIT,
@@ -859,6 +869,8 @@ where
                         // If table ID changed, it was dropped and recreated
                         if current_table_id != snapshot_table_id {
                             tx.txn_manager.mark_aborted(tx.snapshot.txn_id);
+                            tx.base_context.clear_transaction_state(tx.snapshot.txn_id);
+                            tx.staging.clear_transaction_state(tx.snapshot.txn_id);
                             let auto_commit_snapshot = TransactionSnapshot {
                                 txn_id: TXN_ID_AUTO_COMMIT,
                                 snapshot_id: tx.txn_manager.last_committed(),
@@ -872,6 +884,8 @@ where
                     Err(_) => {
                         // Table no longer exists - it was dropped
                         tx.txn_manager.mark_aborted(tx.snapshot.txn_id);
+                        tx.base_context.clear_transaction_state(tx.snapshot.txn_id);
+                        tx.staging.clear_transaction_state(tx.snapshot.txn_id);
                         let auto_commit_snapshot = TransactionSnapshot {
                             txn_id: TXN_ID_AUTO_COMMIT,
                             snapshot_id: tx.txn_manager.last_committed(),
@@ -885,6 +899,27 @@ where
             }
         }
 
+        if let Err(err) = tx
+            .base_context
+            .validate_commit_constraints(tx.snapshot.txn_id)
+        {
+            tx.txn_manager.mark_aborted(tx.snapshot.txn_id);
+            tx.base_context.clear_transaction_state(tx.snapshot.txn_id);
+            tx.staging.clear_transaction_state(tx.snapshot.txn_id);
+            let auto_commit_snapshot = TransactionSnapshot {
+                txn_id: TXN_ID_AUTO_COMMIT,
+                snapshot_id: tx.txn_manager.last_committed(),
+            };
+            TransactionContext::set_snapshot(&*self.context, auto_commit_snapshot);
+            let wrapped = match err {
+                Error::ConstraintError(msg) => Error::TransactionContextError(format!(
+                    "TransactionContext Error: constraint violation: {msg}"
+                )),
+                other => other,
+            };
+            return Err(wrapped);
+        }
+
         let operations = tx.operations;
         tracing::trace!(
             "DEBUG commit_transaction: returning Commit with {} operations",
@@ -892,6 +927,8 @@ where
         );
 
         tx.txn_manager.mark_committed(tx.snapshot.txn_id);
+        tx.base_context.clear_transaction_state(tx.snapshot.txn_id);
+        tx.staging.clear_transaction_state(tx.snapshot.txn_id);
         TransactionContext::set_snapshot(&*self.context, tx.snapshot);
 
         Ok((
@@ -910,6 +947,8 @@ where
             .expect("transactions lock poisoned");
         if let Some(tx) = guard.remove(&self.session_id) {
             tx.txn_manager.mark_aborted(tx.snapshot.txn_id);
+            tx.base_context.clear_transaction_state(tx.snapshot.txn_id);
+            tx.staging.clear_transaction_state(tx.snapshot.txn_id);
             // Reset context snapshot to auto-commit view (rolled-back txn's writes should be invisible)
             let auto_commit_snapshot = TransactionSnapshot {
                 txn_id: TXN_ID_AUTO_COMMIT,

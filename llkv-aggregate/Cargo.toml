@@ -13,3 +13,4 @@ arrow = { workspace = true, default-features = false }
 llkv-result.workspace = true
 llkv-table.workspace = true
 llkv-plan.workspace = true
+rustc-hash.workspace = true

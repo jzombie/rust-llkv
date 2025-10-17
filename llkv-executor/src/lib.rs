@@ -161,7 +161,8 @@ where
     /// Convert a Literal to an Arrow array (recursive for nested structs)
     fn literal_to_array(lit: &llkv_expr::literal::Literal) -> ExecutorResult<(DataType, ArrayRef)> {
         use arrow::array::{
-            ArrayRef, Float64Array, Int64Array, StringArray, StructArray, new_null_array,
+            ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, StructArray,
+            new_null_array,
         };
         use arrow::datatypes::{DataType, Field};
         use llkv_expr::literal::Literal;
@@ -177,6 +178,10 @@ where
             Literal::Float(v) => Ok((
                 DataType::Float64,
                 Arc::new(Float64Array::from(vec![*v])) as ArrayRef,
+            )),
+            Literal::Boolean(v) => Ok((
+                DataType::Boolean,
+                Arc::new(BooleanArray::from(vec![*v])) as ArrayRef,
             )),
             Literal::String(v) => Ok((
                 DataType::Utf8,
@@ -433,8 +438,8 @@ where
             }
         };
 
-        let order_items = plan.order_by.clone();
-        let physical_order = if let Some(first) = order_items.first() {
+        let expanded_order = expand_order_targets(&plan.order_by, &projections)?;
+        let physical_order = if let Some(first) = expanded_order.first() {
             Some(resolve_scan_order(table_ref, &projections, first)?)
         } else {
             None
@@ -468,7 +473,7 @@ where
             filter_expr,
             options,
             full_table_scan,
-            order_items,
+            expanded_order,
         ))
     }
 
@@ -493,6 +498,7 @@ where
                     column,
                     alias,
                     function,
+                    distinct,
                 } => {
                     let col = table_ref.schema.resolve(&column).ok_or_else(|| {
                         Error::InvalidArgumentError(format!(
@@ -501,9 +507,17 @@ where
                         ))
                     })?;
                     let kind = match function {
-                        AggregateFunction::Count => AggregateKind::CountField {
-                            field_id: col.field_id,
-                        },
+                        AggregateFunction::Count => {
+                            if distinct {
+                                AggregateKind::CountDistinctField {
+                                    field_id: col.field_id,
+                                }
+                            } else {
+                                AggregateKind::CountField {
+                                    field_id: col.field_id,
+                                }
+                            }
+                        }
                         AggregateFunction::SumInt64 => {
                             if col.data_type != DataType::Int64 {
                                 return Err(Error::InvalidArgumentError(
@@ -534,9 +548,16 @@ where
                                 field_id: col.field_id,
                             }
                         }
-                        AggregateFunction::CountNulls => AggregateKind::CountNulls {
-                            field_id: col.field_id,
-                        },
+                        AggregateFunction::CountNulls => {
+                            if distinct {
+                                return Err(Error::InvalidArgumentError(
+                                    "DISTINCT is not supported for COUNT_NULLS".into(),
+                                ));
+                            }
+                            AggregateKind::CountNulls {
+                                field_id: col.field_id,
+                            }
+                        }
                     };
                     specs.push(AggregateSpec { alias, kind });
                 }
@@ -1009,6 +1030,7 @@ where
         match expr {
             ScalarExpr::Literal(Literal::Integer(v)) => Ok(*v as i64),
             ScalarExpr::Literal(Literal::Float(v)) => Ok(*v as i64),
+            ScalarExpr::Literal(Literal::Boolean(v)) => Ok(if *v { 1 } else { 0 }),
             ScalarExpr::Literal(Literal::String(_)) => Err(Error::InvalidArgumentError(
                 "String literals not supported in aggregate expressions".into(),
             )),
@@ -1382,6 +1404,40 @@ pub struct RowBatch {
     pub rows: Vec<Vec<PlanValue>>,
 }
 
+fn expand_order_targets(
+    order_items: &[OrderByPlan],
+    projections: &[ScanProjection],
+) -> ExecutorResult<Vec<OrderByPlan>> {
+    let mut expanded = Vec::new();
+
+    for item in order_items {
+        match &item.target {
+            OrderTarget::All => {
+                if projections.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "ORDER BY ALL requires at least one projection".into(),
+                    ));
+                }
+
+                for (idx, projection) in projections.iter().enumerate() {
+                    if matches!(projection, ScanProjection::Computed { .. }) {
+                        return Err(Error::InvalidArgumentError(
+                            "ORDER BY ALL cannot reference computed projections".into(),
+                        ));
+                    }
+
+                    let mut clone = item.clone();
+                    clone.target = OrderTarget::Index(idx);
+                    expanded.push(clone);
+                }
+            }
+            _ => expanded.push(item.clone()),
+        }
+    }
+
+    Ok(expanded)
+}
+
 fn resolve_scan_order<P>(
     table: &ExecutorTable<P>,
     projections: &[ScanProjection],
@@ -1421,6 +1477,11 @@ where
                     ));
                 }
             }
+        }
+        OrderTarget::All => {
+            return Err(Error::InvalidArgumentError(
+                "ORDER BY ALL should be expanded before execution".into(),
+            ));
         }
     };
 
@@ -1545,6 +1606,11 @@ fn sort_record_batch_with_order(
                     )));
                 }
                 *idx
+            }
+            OrderTarget::All => {
+                return Err(Error::InvalidArgumentError(
+                    "ORDER BY ALL should be expanded before sorting".into(),
+                ));
             }
         };
 

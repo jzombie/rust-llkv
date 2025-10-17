@@ -10,6 +10,7 @@ pub enum Literal {
     Integer(i128),
     Float(f64),
     String(String),
+    Boolean(bool),
     /// Struct literal with field names and nested literals
     Struct(Vec<(String, Box<Literal>)>),
     // Other types like Bool, Bytes can be added here.
@@ -33,6 +34,12 @@ impl_from_for_literal!(Float, f32, f64);
 impl From<&str> for Literal {
     fn from(v: &str) -> Self {
         Literal::String(v.to_string())
+    }
+}
+
+impl From<bool> for Literal {
+    fn from(v: bool) -> Self {
+        Literal::Boolean(v)
     }
 }
 
@@ -89,6 +96,10 @@ macro_rules! impl_from_literal_int {
                             expected: "integer",
                             got: "float",
                         }),
+                        Literal::Boolean(_) => Err(LiteralCastError::TypeMismatch {
+                            expected: "integer",
+                            got: "boolean",
+                        }),
                         Literal::String(_) => Err(LiteralCastError::TypeMismatch {
                             expected: "integer",
                             got: "string",
@@ -115,6 +126,12 @@ impl FromLiteral for f32 {
         let value = match lit {
             Literal::Float(f) => *f,
             Literal::Integer(i) => *i as f64,
+            Literal::Boolean(_) => {
+                return Err(LiteralCastError::TypeMismatch {
+                    expected: "float",
+                    got: "boolean",
+                });
+            }
             Literal::String(_) => {
                 return Err(LiteralCastError::TypeMismatch {
                     expected: "float",
@@ -148,6 +165,7 @@ impl FromLiteral for f32 {
 impl FromLiteral for bool {
     fn from_literal(lit: &Literal) -> Result<Self, LiteralCastError> {
         match lit {
+            Literal::Boolean(b) => Ok(*b),
             Literal::Integer(i) => match *i {
                 0 => Ok(false),
                 1 => Ok(true),
@@ -188,6 +206,10 @@ impl FromLiteral for f64 {
         match lit {
             Literal::Float(f) => Ok(*f),
             Literal::Integer(i) => Ok(*i as f64),
+            Literal::Boolean(_) => Err(LiteralCastError::TypeMismatch {
+                expected: "float",
+                got: "boolean",
+            }),
             Literal::String(_) => Err(LiteralCastError::TypeMismatch {
                 expected: "float",
                 got: "string",
@@ -209,6 +231,7 @@ fn literal_type_name(lit: &Literal) -> &'static str {
         Literal::Integer(_) => "integer",
         Literal::Float(_) => "float",
         Literal::String(_) => "string",
+        Literal::Boolean(_) => "boolean",
         Literal::Null => "null",
         Literal::Struct(_) => "struct",
     }
@@ -253,4 +276,30 @@ where
         Bound::Included(l) => Bound::Included(literal_to_native::<T::Native>(l)?),
         Bound::Excluded(l) => Bound::Excluded(literal_to_native::<T::Native>(l)?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boolean_literal_roundtrip() {
+        let lit = Literal::from(true);
+        assert_eq!(lit, Literal::Boolean(true));
+        assert!(literal_to_native::<bool>(&lit).unwrap());
+        assert!(!literal_to_native::<bool>(&Literal::Boolean(false)).unwrap());
+    }
+
+    #[test]
+    fn boolean_literal_rejects_integer_cast() {
+        let lit = Literal::Boolean(true);
+        let err = literal_to_native::<i32>(&lit).unwrap_err();
+        assert!(matches!(
+            err,
+            LiteralCastError::TypeMismatch {
+                expected: "integer",
+                got: "boolean",
+            }
+        ));
+    }
 }
