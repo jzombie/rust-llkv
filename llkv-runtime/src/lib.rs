@@ -1710,6 +1710,7 @@ where
         if plan.columns.len() == 1 {
             let field_id = field_ids[0];
             let column_name = column_names[0].clone();
+            let table_id = table.table.table_id();
             let existing_indexes = table.table.list_registered_indexes(field_id)?;
 
             if existing_indexes.contains(&IndexKind::Sort) {
@@ -1735,7 +1736,8 @@ where
                 }
             }
 
-            table.table.register_sort_index(field_id)?;
+            self.metadata.register_sort_index(table_id, field_id)?;
+            self.metadata.flush_table(table_id)?;
 
             if let Some(updated_table) =
                 Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)

@@ -8,9 +8,11 @@
 
 use crate::constraints::{ConstraintId, ConstraintKind, ConstraintRecord, ForeignKeyAction};
 use crate::sys_catalog::SysCatalog;
+use crate::table::Table;
 use crate::types::{FieldId, TableId};
 use crate::{ColMeta, MultiColumnUniqueEntryMeta, TableMeta, TableMultiColumnUniqueMeta};
 use llkv_column_map::ColumnStore;
+use llkv_column_map::store::IndexKind;
 use llkv_result::Result as LlkvResult;
 use llkv_storage::pager::Pager;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -23,6 +25,7 @@ struct TableSnapshot {
     column_metas: FxHashMap<FieldId, ColMeta>,
     constraints: FxHashMap<ConstraintId, ConstraintRecord>,
     multi_uniques: Vec<MultiColumnUniqueEntryMeta>,
+    sort_indexes: FxHashSet<FieldId>,
 }
 
 impl TableSnapshot {
@@ -37,6 +40,7 @@ impl TableSnapshot {
             column_metas,
             constraints,
             multi_uniques,
+            sort_indexes: FxHashSet::default(),
         }
     }
 }
@@ -310,6 +314,55 @@ where
         Ok(())
     }
 
+    /// Register a sort index for a column at the metadata level, staging the change for the next flush.
+    pub fn register_sort_index(&self, table_id: TableId, field_id: FieldId) -> LlkvResult<()> {
+        self.ensure_table_state(table_id)?;
+
+        {
+            let mut tables = self.tables.write().unwrap();
+            let state = tables.get_mut(&table_id).unwrap();
+            if state.persisted.sort_indexes.contains(&field_id)
+                || state.current.sort_indexes.contains(&field_id)
+            {
+                state.current.sort_indexes.insert(field_id);
+                return Ok(());
+            }
+        }
+
+        if self.field_has_sort_index(table_id, field_id)? {
+            let mut tables = self.tables.write().unwrap();
+            let state = tables.get_mut(&table_id).unwrap();
+            state.persisted.sort_indexes.insert(field_id);
+            state.current.sort_indexes.insert(field_id);
+            return Ok(());
+        }
+
+        let mut tables = self.tables.write().unwrap();
+        let state = tables.get_mut(&table_id).unwrap();
+        state.current.sort_indexes.insert(field_id);
+        Ok(())
+    }
+
+    /// Unregister a sort index for a column, staging removal for the next flush.
+    pub fn unregister_sort_index(&self, table_id: TableId, field_id: FieldId) -> LlkvResult<()> {
+        self.ensure_table_state(table_id)?;
+
+        let mut tables = self.tables.write().unwrap();
+        let state = tables.get_mut(&table_id).unwrap();
+        state.current.sort_indexes.remove(&field_id);
+
+        if !state.persisted.sort_indexes.contains(&field_id) {
+            drop(tables);
+            if self.field_has_sort_index(table_id, field_id)? {
+                let mut tables = self.tables.write().unwrap();
+                let state = tables.get_mut(&table_id).unwrap();
+                state.persisted.sort_indexes.insert(field_id);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Mutate the cached multi-column UNIQUE definitions for a table in-place.
     pub fn update_multi_column_uniques<F, T>(&self, table_id: TableId, f: F) -> LlkvResult<T>
     where
@@ -339,6 +392,7 @@ where
             state.current.column_metas.clear();
             state.current.constraints.clear();
             state.current.multi_uniques.clear();
+            state.current.sort_indexes.clear();
         }
         drop(tables);
         self.refresh_referencing_index_for_table(table_id);
@@ -502,6 +556,32 @@ where
             }
         }
 
+        let sort_adds: Vec<FieldId> = state
+            .current
+            .sort_indexes
+            .iter()
+            .copied()
+            .filter(|field_id| !state.persisted.sort_indexes.contains(field_id))
+            .collect();
+        let sort_removes: Vec<FieldId> = state
+            .persisted
+            .sort_indexes
+            .iter()
+            .copied()
+            .filter(|field_id| !state.current.sort_indexes.contains(field_id))
+            .collect();
+        if !sort_adds.is_empty() || !sort_removes.is_empty() {
+            let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
+            for field_id in &sort_adds {
+                table.register_sort_index(*field_id)?;
+                state.persisted.sort_indexes.insert(*field_id);
+            }
+            for field_id in &sort_removes {
+                table.unregister_sort_index(*field_id)?;
+                state.persisted.sort_indexes.remove(field_id);
+            }
+        }
+
         Ok(())
     }
 
@@ -590,14 +670,21 @@ where
         }
         Ok(names)
     }
+
+    fn field_has_sort_index(&self, table_id: TableId, field_id: FieldId) -> LlkvResult<bool> {
+        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
+        let indexes = table.list_registered_indexes(field_id)?;
+        Ok(indexes.contains(&IndexKind::Sort))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MultiColumnUniqueEntryMeta;
     use crate::constraints::{ConstraintKind, ConstraintState, PrimaryKeyConstraint};
+    use crate::{MultiColumnUniqueEntryMeta, Table};
     use llkv_column_map::ColumnStore;
+    use llkv_column_map::store::IndexKind;
     use llkv_storage::pager::MemPager;
     use std::sync::Arc;
 
@@ -635,6 +722,15 @@ mod tests {
             .set_column_meta(table_id, column_meta.clone())
             .unwrap();
 
+        let logical_field_id = llkv_column_map::types::LogicalFieldId::for_user(table_id, column_meta.col_id);
+        store
+            .ensure_column_registered(logical_field_id, &arrow::datatypes::DataType::Utf8)
+            .unwrap();
+
+        manager
+            .register_sort_index(table_id, column_meta.col_id)
+            .unwrap();
+
         let constraint = ConstraintRecord {
             constraint_id: 7,
             kind: ConstraintKind::PrimaryKey(PrimaryKeyConstraint {
@@ -662,6 +758,10 @@ mod tests {
         );
 
         manager.flush_table(table_id).unwrap();
+
+        let table = Table::new_with_store(table_id, Arc::clone(&store)).unwrap();
+        let indexes = table.list_registered_indexes(column_meta.col_id).unwrap();
+        assert!(indexes.contains(&IndexKind::Sort));
 
         let verify_catalog = SysCatalog::new(&store);
         let column_roundtrip = verify_catalog.get_cols_meta(table_id, &[column_meta.col_id]);
