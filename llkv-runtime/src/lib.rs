@@ -59,13 +59,14 @@ use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_table::{
     CATALOG_TABLE_ID, ColMeta, ConstraintColumnInfo, MetadataManager, MultiColumnUniqueEntryMeta,
-    SysCatalog, TableMeta, UniqueKey, build_composite_unique_key,
+    SysCatalog, TableMeta, UniqueKey, build_composite_unique_key, canonical_table_name,
     constraints::{
         ConstraintKind, ConstraintRecord, ConstraintState,
         ForeignKeyAction as CatalogForeignKeyAction, ForeignKeyConstraint, PrimaryKeyConstraint,
         UniqueConstraint,
     },
-    ensure_multi_column_unique, unique_key_component, validate_check_constraints,
+    ensure_multi_column_unique, resolve_table_name, unique_key_component,
+    validate_check_constraints,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -2810,8 +2811,11 @@ where
                 }
             }
 
-            let (referenced_display, referenced_canonical) =
-                self.resolve_table_name(descriptor.referenced_table_id)?;
+            let (referenced_display, referenced_canonical) = resolve_table_name(
+                &self.catalog,
+                &self.metadata,
+                descriptor.referenced_table_id,
+            )?;
 
             entries.push(ForeignKeyMetadata {
                 constraint_name: None,
@@ -2832,24 +2836,6 @@ where
         Ok(entries)
     }
 
-    fn resolve_table_name(&self, table_id: TableId) -> Result<(String, String)> {
-        if let Some(qt) = self.catalog.table_name(table_id) {
-            let display = qt.to_display_string();
-            let canonical = display.to_ascii_lowercase();
-            return Ok((display, canonical));
-        }
-
-        if let Some(meta) = self.metadata.table_meta(table_id)?
-            && let Some(name) = meta.name
-        {
-            let canonical = name.to_ascii_lowercase();
-            return Ok((name, canonical));
-        }
-
-        let fallback = table_id.to_string();
-        Ok((fallback.clone(), fallback))
-    }
-
     fn referencing_child_tables(
         &self,
         parent_table_id: TableId,
@@ -2865,7 +2851,8 @@ where
         let mut out = Vec::new();
 
         for (child_table_id, _) in referencing {
-            let (display_name, canonical_name) = self.resolve_table_name(child_table_id)?;
+            let (display_name, canonical_name) =
+                resolve_table_name(&self.catalog, &self.metadata, child_table_id)?;
 
             if canonical_name == parent_canonical && child_table_id != parent_table_id {
                 // Same canonical but different id (unlikely); still consider.
@@ -5973,17 +5960,6 @@ where
     pub fn collect_rows_vec(self) -> Result<Vec<Vec<PlanValue>>> {
         Ok(self.collect_rows()?.rows)
     }
-}
-
-pub fn canonical_table_name(name: &str) -> Result<(String, String)> {
-    if name.is_empty() {
-        return Err(Error::InvalidArgumentError(
-            "table name must not be empty".into(),
-        ));
-    }
-    let display = name.to_string();
-    let canonical = display.to_ascii_lowercase();
-    Ok((display, canonical))
 }
 
 fn current_time_micros() -> u64 {

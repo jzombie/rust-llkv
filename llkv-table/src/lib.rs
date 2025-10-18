@@ -39,6 +39,7 @@ pub mod gather;
 pub mod metadata;
 mod planner;
 pub mod reserved;
+pub mod resolvers;
 mod scalar_eval;
 pub mod schema_ext;
 mod sys_catalog;
@@ -62,6 +63,7 @@ pub use constraints::{
 };
 pub use metadata::{ForeignKeyDescriptor, MetadataManager};
 pub use reserved::CATALOG_TABLE_ID;
+pub use resolvers::{canonical_table_name, resolve_table_name};
 pub use stream::{ColumnStream, ColumnStreamBatch};
 pub use sys_catalog::{
     ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta, TableMultiColumnUniqueMeta,
