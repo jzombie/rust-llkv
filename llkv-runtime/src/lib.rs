@@ -58,15 +58,16 @@ use llkv_table::catalog::{FieldConstraints, FieldDefinition, TableCatalog};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_table::{
-    CATALOG_TABLE_ID, ColMeta, ConstraintColumnInfo, MetadataManager, MultiColumnUniqueEntryMeta,
-    SysCatalog, TableMeta, UniqueKey, build_composite_unique_key, canonical_table_name,
+    CATALOG_TABLE_ID, ColMeta, ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo,
+    MetadataManager, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta, UniqueKey,
+    ValidatedForeignKey, build_composite_unique_key, canonical_table_name,
     constraints::{
         ConstraintKind, ConstraintRecord, ConstraintState,
         ForeignKeyAction as CatalogForeignKeyAction, ForeignKeyConstraint, PrimaryKeyConstraint,
         UniqueConstraint,
     },
     ensure_multi_column_unique, resolve_table_name, unique_key_component,
-    validate_check_constraints,
+    validate_check_constraints, validate_foreign_keys,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -2527,6 +2528,7 @@ where
         if !foreign_keys.is_empty()
             && let Err(err) = self.register_foreign_keys_for_table(
                 &display_name,
+                &canonical_name,
                 registered_table_id,
                 &column_defs,
                 foreign_keys,
@@ -2545,6 +2547,7 @@ where
     fn register_foreign_keys_for_table(
         &self,
         display_name: &str,
+        canonical_name: &str,
         table_id: TableId,
         column_defs: &[ExecutorColumn],
         foreign_keys: Vec<ForeignKeySpec>,
@@ -2553,219 +2556,62 @@ where
             return Ok(());
         }
 
-        let mut metadata_entries = Vec::with_capacity(foreign_keys.len());
-        for mut spec in foreign_keys {
-            if spec.columns.is_empty() {
-                return Err(Error::InvalidArgumentError(
-                    "FOREIGN KEY requires at least one referencing column".into(),
-                ));
-            }
+        let referencing_columns: Vec<ForeignKeyColumn> = column_defs
+            .iter()
+            .map(|column| ForeignKeyColumn {
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                primary_key: column.primary_key,
+                unique: column.unique,
+                field_id: column.field_id,
+            })
+            .collect();
 
-            // Resolve empty referenced_columns to the primary key of the referenced table
-            if spec.referenced_columns.is_empty() {
-                let referenced_table_canonical = spec.referenced_table.to_ascii_lowercase();
-                let referenced_table =
-                    self.lookup_table(&referenced_table_canonical)
-                        .map_err(|_| {
-                            Error::InvalidArgumentError(format!(
-                                "referenced table '{}' does not exist",
-                                spec.referenced_table
-                            ))
-                        })?;
+        let referencing_table = ForeignKeyTableInfo {
+            display_name: display_name.to_string(),
+            canonical_name: canonical_name.to_string(),
+            table_id,
+            columns: referencing_columns,
+        };
 
-                let primary_key_columns: Vec<&ExecutorColumn> = referenced_table
-                    .schema
-                    .columns
-                    .iter()
-                    .filter(|col| col.primary_key)
-                    .collect();
+        let validated = validate_foreign_keys(&referencing_table, &foreign_keys, |table_name| {
+            let (display, canonical) = canonical_table_name(table_name)?;
+            let referenced_table = self.lookup_table(&canonical).map_err(|_| {
+                Error::InvalidArgumentError(format!(
+                    "referenced table '{}' does not exist",
+                    table_name
+                ))
+            })?;
 
-                if primary_key_columns.is_empty() {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "there is no primary key for referenced table '{}'",
-                        spec.referenced_table
-                    )));
-                }
+            let columns = referenced_table
+                .schema
+                .columns
+                .iter()
+                .map(|column| ForeignKeyColumn {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                    primary_key: column.primary_key,
+                    unique: column.unique,
+                    field_id: column.field_id,
+                })
+                .collect();
 
-                if spec.columns.len() != primary_key_columns.len() {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "number of referencing columns ({}) does not match number of referenced primary key columns ({})",
-                        spec.columns.len(),
-                        primary_key_columns.len()
-                    )));
-                }
+            Ok(ForeignKeyTableInfo {
+                display_name: display,
+                canonical_name: canonical,
+                table_id: referenced_table.table.table_id(),
+                columns,
+            })
+        })?;
 
-                spec.referenced_columns = primary_key_columns
-                    .iter()
-                    .map(|col| col.name.clone())
-                    .collect();
-            }
-
-            if spec.referenced_columns.is_empty() {
-                return Err(Error::InvalidArgumentError(
-                    "FOREIGN KEY requires at least one referenced column".into(),
-                ));
-            }
-
-            if spec.columns.len() != spec.referenced_columns.len() {
-                return Err(Error::InvalidArgumentError(
-                    "FOREIGN KEY must reference the same number of columns".into(),
-                ));
-            }
-
-            let mut seen_referencing = FxHashSet::default();
-            for column_name in &spec.columns {
-                let normalized = column_name.to_ascii_lowercase();
-                if !seen_referencing.insert(normalized.clone()) {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "duplicate column '{}' in FOREIGN KEY constraint",
-                        column_name
-                    )));
-                }
-
-                if !column_defs
-                    .iter()
-                    .any(|col| col.name.eq_ignore_ascii_case(column_name))
-                {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "unknown column '{}' in FOREIGN KEY constraint on table '{}'",
-                        column_name, display_name
-                    )));
-                }
-            }
-
-            let mut seen_referenced = FxHashSet::default();
-            for column_name in &spec.referenced_columns {
-                let normalized = column_name.to_ascii_lowercase();
-                if !seen_referenced.insert(normalized.clone()) {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "duplicate referenced column '{}' in FOREIGN KEY constraint",
-                        column_name
-                    )));
-                }
-            }
-
-            let mut referencing_indices = Vec::with_capacity(spec.columns.len());
-            let mut referencing_field_ids = Vec::with_capacity(spec.columns.len());
-            let mut referencing_column_names = Vec::with_capacity(spec.columns.len());
-            for column_name in &spec.columns {
-                let (idx, column) = column_defs
-                    .iter()
-                    .enumerate()
-                    .find(|(_, col)| col.name.eq_ignore_ascii_case(column_name))
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "unknown column '{}' in FOREIGN KEY constraint",
-                            column_name
-                        ))
-                    })?;
-                referencing_indices.push(idx);
-                referencing_field_ids.push(column.field_id);
-                referencing_column_names.push(column.name.clone());
-            }
-
-            let (referenced_display, referenced_canonical) =
-                canonical_table_name(&spec.referenced_table)?;
-            let referenced_table = self.lookup_table(&referenced_canonical)?;
-
-            let mut referenced_field_ids = Vec::with_capacity(spec.referenced_columns.len());
-            let mut referenced_column_names = Vec::with_capacity(spec.referenced_columns.len());
-            for column_name in &spec.referenced_columns {
-                let column = referenced_table
-                    .schema
-                    .columns
-                    .iter()
-                    .find(|col| col.name.eq_ignore_ascii_case(column_name))
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "unknown referenced column '{}' in table '{}'",
-                            column_name, referenced_display
-                        ))
-                    })?;
-
-                if !column.primary_key && !column.unique {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "FOREIGN KEY references column '{}' in table '{}' that is not UNIQUE or PRIMARY KEY",
-                        column_name, referenced_display
-                    )));
-                }
-
-                referenced_field_ids.push(column.field_id);
-                referenced_column_names.push(column.name.clone());
-            }
-
-            for (&child_idx, &parent_field_id) in
-                referencing_indices.iter().zip(&referenced_field_ids)
-            {
-                let child_col = &column_defs[child_idx];
-                let parent_col = referenced_table
-                    .schema
-                    .columns
-                    .iter()
-                    .find(|col| col.field_id == parent_field_id)
-                    .expect("referenced column field id must exist");
-
-                if child_col.data_type != parent_col.data_type {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "FOREIGN KEY column '{}' type {:?} does not match referenced column '{}' type {:?}",
-                        child_col.name, child_col.data_type, parent_col.name, parent_col.data_type
-                    )));
-                }
-
-                if child_col.nullable && !parent_col.nullable {
-                    // allowed; child nullable referencing non-null parent is okay
-                }
-            }
-
-            metadata_entries.push(ForeignKeyMetadata {
-                constraint_name: spec.name.clone(),
-                referencing_display: display_name.to_string(),
-                referencing_column_indices: referencing_indices,
-                referencing_field_ids,
-                referencing_column_names,
-                referenced_table: referenced_canonical,
-                referenced_display,
-                referenced_field_ids,
-                referenced_column_names,
-                referenced_table_id: referenced_table.table.table_id(),
-                on_delete: spec.on_delete.clone(),
-                on_update: spec.on_update.clone(),
-            });
-        }
-
-        if metadata_entries.is_empty() {
+        if validated.is_empty() {
             return Ok(());
         }
 
-        let existing_constraints = self.metadata.constraint_record_map(table_id)?;
-        let mut next_constraint_id = existing_constraints.keys().copied().max().unwrap_or(0) + 1;
-        let mut constraint_records = Vec::with_capacity(metadata_entries.len());
-
-        let map_action = |action: ForeignKeyAction| match action {
-            ForeignKeyAction::NoAction => CatalogForeignKeyAction::NoAction,
-            ForeignKeyAction::Restrict => CatalogForeignKeyAction::Restrict,
-        };
-
-        for entry in &metadata_entries {
-            constraint_records.push(ConstraintRecord {
-                constraint_id: next_constraint_id,
-                kind: ConstraintKind::ForeignKey(ForeignKeyConstraint {
-                    referencing_field_ids: entry.referencing_field_ids.clone(),
-                    referenced_table: entry.referenced_table_id,
-                    referenced_field_ids: entry.referenced_field_ids.clone(),
-                    on_delete: map_action(entry.on_delete.clone()),
-                    on_update: map_action(entry.on_update.clone()),
-                }),
-                state: ConstraintState::Active,
-                revision: 1,
-                last_modified_micros: current_time_micros(),
-            });
-            next_constraint_id = next_constraint_id.saturating_add(1);
-        }
-
         self.metadata
-            .put_constraint_records(table_id, &constraint_records)?;
-        self.metadata.flush_table(table_id)?;
+            .register_foreign_keys(table_id, &validated, current_time_micros())?;
 
         Ok(())
     }

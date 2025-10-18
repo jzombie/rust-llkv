@@ -53,8 +53,9 @@ pub mod types;
 pub mod stream;
 
 pub use constraint_validation::{
-    ConstraintColumnInfo, UniqueKey, build_composite_unique_key, ensure_multi_column_unique,
-    unique_key_component, validate_check_constraints,
+    ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo, UniqueKey, ValidatedForeignKey,
+    build_composite_unique_key, ensure_multi_column_unique, unique_key_component,
+    validate_check_constraints, validate_foreign_keys,
 };
 pub use constraints::{
     CheckConstraint, ConstraintExpressionRef, ConstraintId, ConstraintKind, ConstraintRecord,

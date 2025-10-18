@@ -1,13 +1,13 @@
 use arrow::datatypes::DataType;
-use llkv_plan::PlanValue;
+use llkv_plan::{ForeignKeyAction as PlanForeignKeyAction, ForeignKeySpec, PlanValue};
 use llkv_result::{Error, Result as LlkvResult};
-use rustc_hash::FxHashMap;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use sqlparser::ast::{self, Expr as SqlExpr};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::types::FieldId;
+use crate::constraints::ForeignKeyAction;
+use crate::types::{FieldId, TableId};
 
 /// Lightweight column descriptor used for constraint validation.
 #[derive(Clone, Debug)]
@@ -477,5 +477,206 @@ fn divide_numeric(left: PlanValue, right: PlanValue) -> LlkvResult<PlanValue> {
         _ => Err(Error::InvalidArgumentError(
             "CHECK constraint / operator requires numeric values".into(),
         )),
+    }
+}
+
+// ============================================================================
+// Foreign key validation
+// ============================================================================
+
+/// Column metadata used when validating foreign key definitions.
+#[derive(Clone, Debug)]
+pub struct ForeignKeyColumn {
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
+    pub primary_key: bool,
+    pub unique: bool,
+    pub field_id: FieldId,
+}
+
+/// Table metadata used when validating foreign key definitions.
+#[derive(Clone, Debug)]
+pub struct ForeignKeyTableInfo {
+    pub display_name: String,
+    pub canonical_name: String,
+    pub table_id: TableId,
+    pub columns: Vec<ForeignKeyColumn>,
+}
+
+/// Result of validating a foreign key specification.
+#[derive(Clone, Debug)]
+pub struct ValidatedForeignKey {
+    pub name: Option<String>,
+    pub referencing_indices: Vec<usize>,
+    pub referencing_field_ids: Vec<FieldId>,
+    pub referencing_column_names: Vec<String>,
+    pub referenced_table_id: TableId,
+    pub referenced_table_display: String,
+    pub referenced_table_canonical: String,
+    pub referenced_field_ids: Vec<FieldId>,
+    pub referenced_column_names: Vec<String>,
+    pub on_delete: ForeignKeyAction,
+    pub on_update: ForeignKeyAction,
+}
+
+/// Validate a set of foreign key specifications against the provided table schemas.
+pub fn validate_foreign_keys<F>(
+    referencing_table: &ForeignKeyTableInfo,
+    specs: &[ForeignKeySpec],
+    mut lookup_table: F,
+) -> LlkvResult<Vec<ValidatedForeignKey>>
+where
+    F: FnMut(&str) -> LlkvResult<ForeignKeyTableInfo>,
+{
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut referencing_lookup: FxHashMap<String, (usize, &ForeignKeyColumn)> =
+        FxHashMap::default();
+    for (idx, column) in referencing_table.columns.iter().enumerate() {
+        referencing_lookup.insert(column.name.to_ascii_lowercase(), (idx, column));
+    }
+
+    let mut results = Vec::with_capacity(specs.len());
+
+    for spec in specs {
+        if spec.columns.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "FOREIGN KEY requires at least one referencing column".into(),
+            ));
+        }
+
+        let mut seen_referencing = FxHashSet::default();
+        let mut referencing_indices = Vec::with_capacity(spec.columns.len());
+        let mut referencing_field_ids = Vec::with_capacity(spec.columns.len());
+        let mut referencing_column_defs = Vec::with_capacity(spec.columns.len());
+        let mut referencing_column_names = Vec::with_capacity(spec.columns.len());
+
+        for column_name in &spec.columns {
+            let normalized = column_name.to_ascii_lowercase();
+            if !seen_referencing.insert(normalized.clone()) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "duplicate column '{}' in FOREIGN KEY constraint",
+                    column_name
+                )));
+            }
+
+            let (idx, column) = referencing_lookup.get(&normalized).ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "unknown column '{}' in FOREIGN KEY constraint",
+                    column_name
+                ))
+            })?;
+
+            referencing_indices.push(*idx);
+            referencing_field_ids.push(column.field_id);
+            referencing_column_defs.push((*column).clone());
+            referencing_column_names.push(column.name.clone());
+        }
+
+        let referenced_table_info = lookup_table(&spec.referenced_table)?;
+
+        let referenced_columns = if spec.referenced_columns.is_empty() {
+            referenced_table_info
+                .columns
+                .iter()
+                .filter(|col| col.primary_key)
+                .map(|col| col.name.clone())
+                .collect::<Vec<_>>()
+        } else {
+            spec.referenced_columns.clone()
+        };
+
+        if referenced_columns.is_empty() {
+            return Err(Error::InvalidArgumentError(format!(
+                "there is no primary key for referenced table '{}'",
+                spec.referenced_table
+            )));
+        }
+
+        if spec.columns.len() != referenced_columns.len() {
+            return Err(Error::InvalidArgumentError(format!(
+                "number of referencing columns ({}) does not match number of referenced columns ({})",
+                spec.columns.len(),
+                referenced_columns.len()
+            )));
+        }
+
+        let mut seen_referenced = FxHashSet::default();
+        let mut referenced_lookup: FxHashMap<String, &ForeignKeyColumn> = FxHashMap::default();
+        for column in &referenced_table_info.columns {
+            referenced_lookup.insert(column.name.to_ascii_lowercase(), column);
+        }
+
+        let mut referenced_field_ids = Vec::with_capacity(referenced_columns.len());
+        let mut referenced_column_defs = Vec::with_capacity(referenced_columns.len());
+        let mut referenced_column_names = Vec::with_capacity(referenced_columns.len());
+
+        for column_name in referenced_columns.iter().cloned() {
+            let normalized = column_name.to_ascii_lowercase();
+            if !seen_referenced.insert(normalized.clone()) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "duplicate referenced column '{}' in FOREIGN KEY constraint",
+                    column_name
+                )));
+            }
+
+            let column = referenced_lookup.get(&normalized).ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "unknown referenced column '{}' in table '{}'",
+                    column_name, referenced_table_info.display_name
+                ))
+            })?;
+
+            if !column.primary_key && !column.unique {
+                return Err(Error::InvalidArgumentError(format!(
+                    "FOREIGN KEY references column '{}' in table '{}' that is not UNIQUE or PRIMARY KEY",
+                    column_name, referenced_table_info.display_name
+                )));
+            }
+
+            referenced_field_ids.push(column.field_id);
+            referenced_column_defs.push((*column).clone());
+            referenced_column_names.push(column.name.clone());
+        }
+
+        for (child_col, parent_col) in referencing_column_defs
+            .iter()
+            .zip(referenced_column_defs.iter())
+        {
+            if child_col.data_type != parent_col.data_type {
+                return Err(Error::InvalidArgumentError(format!(
+                    "FOREIGN KEY column '{}' type {:?} does not match referenced column '{}' type {:?}",
+                    child_col.name, child_col.data_type, parent_col.name, parent_col.data_type
+                )));
+            }
+
+            // Nullable child referencing non-null parent is allowed; no additional action required.
+        }
+
+        results.push(ValidatedForeignKey {
+            name: spec.name.clone(),
+            referencing_indices,
+            referencing_field_ids,
+            referencing_column_names,
+            referenced_table_id: referenced_table_info.table_id,
+            referenced_table_display: referenced_table_info.display_name.clone(),
+            referenced_table_canonical: referenced_table_info.canonical_name.clone(),
+            referenced_field_ids,
+            referenced_column_names,
+            on_delete: map_plan_action(spec.on_delete.clone()),
+            on_update: map_plan_action(spec.on_update.clone()),
+        });
+    }
+
+    Ok(results)
+}
+
+fn map_plan_action(action: PlanForeignKeyAction) -> ForeignKeyAction {
+    match action {
+        PlanForeignKeyAction::NoAction => ForeignKeyAction::NoAction,
+        PlanForeignKeyAction::Restrict => ForeignKeyAction::Restrict,
     }
 }

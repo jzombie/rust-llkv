@@ -7,7 +7,11 @@
 #![forbid(unsafe_code)]
 
 use crate::catalog::TableCatalog;
-use crate::constraints::{ConstraintId, ConstraintKind, ConstraintRecord, ForeignKeyAction};
+use crate::constraint_validation::ValidatedForeignKey;
+use crate::constraints::{
+    ConstraintId, ConstraintKind, ConstraintRecord, ConstraintState, ForeignKeyAction,
+    ForeignKeyConstraint,
+};
 use crate::resolvers::resolve_table_name;
 use crate::sys_catalog::SysCatalog;
 use crate::table::Table;
@@ -686,6 +690,50 @@ where
         }
 
         Ok(details)
+    }
+
+    /// Register validated foreign key definitions for a table.
+    pub fn register_foreign_keys(
+        &self,
+        table_id: TableId,
+        foreign_keys: &[ValidatedForeignKey],
+        timestamp_micros: u64,
+    ) -> LlkvResult<()> {
+        if foreign_keys.is_empty() {
+            return Ok(());
+        }
+
+        let existing_constraints = self.constraint_record_map(table_id)?;
+        let mut next_constraint_id = existing_constraints
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+
+        let mut constraint_records = Vec::with_capacity(foreign_keys.len());
+
+        for fk in foreign_keys {
+            constraint_records.push(ConstraintRecord {
+                constraint_id: next_constraint_id,
+                kind: ConstraintKind::ForeignKey(ForeignKeyConstraint {
+                    referencing_field_ids: fk.referencing_field_ids.clone(),
+                    referenced_table: fk.referenced_table_id,
+                    referenced_field_ids: fk.referenced_field_ids.clone(),
+                    on_delete: fk.on_delete,
+                    on_update: fk.on_update,
+                }),
+                state: ConstraintState::Active,
+                revision: 1,
+                last_modified_micros: timestamp_micros,
+            });
+            next_constraint_id = next_constraint_id.saturating_add(1);
+        }
+
+        self.put_constraint_records(table_id, &constraint_records)?;
+        self.flush_table(table_id)?;
+
+        Ok(())
     }
 
     fn column_names(&self, table_id: TableId, field_ids: &[FieldId]) -> LlkvResult<Vec<String>> {
