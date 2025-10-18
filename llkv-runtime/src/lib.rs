@@ -61,7 +61,7 @@ use llkv_table::{
     ConstraintColumnInfo, ConstraintService, ForeignKeyColumn, ForeignKeyTableInfo,
     MetadataManager, MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, SysCatalog,
     TableColumn, TableMeta, UniqueKey, build_composite_unique_key, canonical_table_name,
-    constraints::{ConstraintKind, ForeignKeyAction as CatalogForeignKeyAction},
+    constraints::ConstraintKind,
     ensure_multi_column_unique, ensure_primary_key, ensure_single_column_unique,
     resolve_table_name, validate_check_constraints,
 };
@@ -199,11 +199,7 @@ struct PrimaryKeyUpdateContext<'a> {
 #[derive(Clone, Debug)]
 struct ForeignKeyMetadata {
     constraint_name: Option<String>,
-    referencing_display: String,
-    referencing_field_ids: Vec<FieldId>,
     referenced_table: String,
-    referenced_field_ids: Vec<FieldId>,
-    on_delete: ForeignKeyAction,
 }
 
 /// Result of running a plan statement.
@@ -2480,11 +2476,6 @@ where
             return Ok(Vec::new());
         }
 
-        let convert_action = |action: CatalogForeignKeyAction| match action {
-            CatalogForeignKeyAction::NoAction => ForeignKeyAction::NoAction,
-            CatalogForeignKeyAction::Restrict => ForeignKeyAction::Restrict,
-        };
-
         let mut entries = Vec::new();
 
         for detail in details {
@@ -2504,11 +2495,7 @@ where
 
             entries.push(ForeignKeyMetadata {
                 constraint_name: None,
-                referencing_display: detail.referencing_table_display.clone(),
-                referencing_field_ids: detail.referencing_field_ids.clone(),
                 referenced_table: detail.referenced_table_canonical.clone(),
-                referenced_field_ids: detail.referenced_field_ids.clone(),
-                on_delete: convert_action(detail.on_delete),
             });
         }
 
@@ -4377,8 +4364,8 @@ where
     fn check_foreign_keys_on_delete(
         &self,
         table: &ExecutorTable<P>,
-        display_name: &str,
-        canonical_name: &str,
+        _display_name: &str,
+        _canonical_name: &str,
         row_ids: &[RowId],
         snapshot: TransactionSnapshot,
     ) -> Result<()> {
@@ -4386,86 +4373,25 @@ where
             return Ok(());
         }
 
-        let referencing_children =
-            self.referencing_child_tables(table.table.table_id(), canonical_name)?;
-
-        if referencing_children.is_empty() {
-            return Ok(());
-        }
-
-        let mut deleting_row_ids: FxHashSet<RowId> = FxHashSet::default();
-        deleting_row_ids.extend(row_ids.iter().copied());
-
-        for (child_canonical, child_display, child_table) in referencing_children {
-            let child_metadata =
-                self.foreign_keys_for_table(child_table.as_ref(), &child_display)?;
-
-            for metadata in child_metadata
-                .into_iter()
-                .filter(|meta| meta.referenced_table == canonical_name)
-            {
-                let parent_rows = self.collect_row_values_for_ids(
+        self.constraint_service.validate_delete_foreign_keys(
+            table.table.table_id(),
+            row_ids,
+            |request| {
+                self.collect_row_values_for_ids(
                     table,
-                    row_ids,
-                    &metadata.referenced_field_ids,
-                )?;
-
-                let mut parent_keys: Vec<Vec<PlanValue>> = Vec::new();
-                for values in parent_rows {
-                    if values.len() != metadata.referenced_field_ids.len() {
-                        continue;
-                    }
-                    if values.iter().any(|value| matches!(value, PlanValue::Null)) {
-                        continue;
-                    }
-                    parent_keys.push(values);
-                }
-
-                if parent_keys.is_empty() {
-                    continue;
-                }
-
-                let child_rows = self.collect_visible_child_rows(
+                    request.referenced_row_ids,
+                    request.referenced_field_ids,
+                )
+            },
+            |request| {
+                let child_table = self.lookup_table(request.referencing_table_canonical)?;
+                self.collect_visible_child_rows(
                     child_table.as_ref(),
-                    &metadata.referencing_field_ids,
+                    request.referencing_field_ids,
                     snapshot,
-                )?;
-
-                if child_rows.is_empty() {
-                    continue;
-                }
-
-                for (child_row_id, values) in child_rows {
-                    if values.len() != metadata.referencing_field_ids.len() {
-                        continue;
-                    }
-                    if values.iter().any(|value| matches!(value, PlanValue::Null)) {
-                        continue;
-                    }
-                    if !parent_keys.iter().any(|key| key == &values) {
-                        continue;
-                    }
-
-                    if child_canonical == canonical_name && deleting_row_ids.contains(&child_row_id)
-                    {
-                        continue;
-                    }
-
-                    match metadata.on_delete {
-                        ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
-                            let constraint_label =
-                                metadata.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
-                            return Err(Error::ConstraintError(format!(
-                                "Violates foreign key constraint '{}' on table '{}' referencing '{}' - row is still referenced by a foreign key in a different table",
-                                constraint_label, metadata.referencing_display, display_name,
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
+                )
+            },
+        )
     }
 
     fn check_foreign_keys_on_insert(

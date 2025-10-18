@@ -6,12 +6,13 @@
 
 use crate::catalog::TableCatalog;
 use crate::constraint_validation::validate_foreign_key_rows;
+use crate::constraints::ForeignKeyAction;
 use crate::metadata::{ForeignKeyDetail, MetadataManager};
-use crate::types::{FieldId, TableId};
+use crate::types::{FieldId, RowId, TableId};
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 
@@ -20,6 +21,20 @@ pub struct ForeignKeyRowFetch<'a> {
     pub referenced_table_id: TableId,
     pub referenced_table_canonical: &'a str,
     pub referenced_field_ids: &'a [FieldId],
+}
+
+/// Context for collecting parent row values involved in a DELETE operation.
+pub struct ForeignKeyParentRowsFetch<'a> {
+    pub referenced_table_id: TableId,
+    pub referenced_row_ids: &'a [RowId],
+    pub referenced_field_ids: &'a [FieldId],
+}
+
+/// Context for fetching visible child rows that might reference deleted parents.
+pub struct ForeignKeyChildRowsFetch<'a> {
+    pub referencing_table_id: TableId,
+    pub referencing_table_canonical: &'a str,
+    pub referencing_field_ids: &'a [FieldId],
 }
 
 /// High-level constraint service API intended for runtime consumers.
@@ -101,6 +116,103 @@ where
                 &parent_keys,
                 &candidate_keys,
             )?;
+        }
+
+        Ok(())
+    }
+
+    /// Validate that deleting the given rows will not violate foreign key constraints.
+    pub fn validate_delete_foreign_keys<FParents, FChildren>(
+        &self,
+        referenced_table_id: TableId,
+        referenced_row_ids: &[RowId],
+        mut fetch_parent_rows: FParents,
+        mut fetch_child_rows: FChildren,
+    ) -> LlkvResult<()>
+    where
+        FParents: FnMut(ForeignKeyParentRowsFetch<'_>) -> LlkvResult<Vec<Vec<PlanValue>>>,
+        FChildren: FnMut(ForeignKeyChildRowsFetch<'_>) -> LlkvResult<Vec<(RowId, Vec<PlanValue>)>>,
+    {
+        if referenced_row_ids.is_empty() {
+            return Ok(());
+        }
+
+        let referencing = self
+            .metadata
+            .foreign_keys_referencing(referenced_table_id)?;
+        if referencing.is_empty() {
+            return Ok(());
+        }
+
+        let deleting_row_ids: FxHashSet<RowId> = referenced_row_ids.iter().copied().collect();
+
+        for (child_table_id, constraint_id) in referencing {
+            let details = self
+                .metadata
+                .foreign_key_details(self.catalog.as_ref(), child_table_id)?;
+
+            let Some(detail) = details
+                .into_iter()
+                .find(|detail| detail.constraint_id == constraint_id)
+            else {
+                continue;
+            };
+
+            if detail.referenced_field_ids.is_empty() || detail.referencing_field_ids.is_empty() {
+                continue;
+            }
+
+            let parent_rows = fetch_parent_rows(ForeignKeyParentRowsFetch {
+                referenced_table_id,
+                referenced_row_ids,
+                referenced_field_ids: &detail.referenced_field_ids,
+            })?;
+
+            let parent_keys = canonical_parent_keys(&detail, parent_rows);
+            if parent_keys.is_empty() {
+                continue;
+            }
+
+            let child_rows = fetch_child_rows(ForeignKeyChildRowsFetch {
+                referencing_table_id: detail.referencing_table_id,
+                referencing_table_canonical: &detail.referencing_table_canonical,
+                referencing_field_ids: &detail.referencing_field_ids,
+            })?;
+
+            if child_rows.is_empty() {
+                continue;
+            }
+
+            for (child_row_id, values) in child_rows {
+                if values.len() != detail.referencing_field_ids.len() {
+                    continue;
+                }
+
+                if values.iter().any(|value| matches!(value, PlanValue::Null)) {
+                    continue;
+                }
+
+                if parent_keys.iter().all(|key| key != &values) {
+                    continue;
+                }
+
+                if detail.referencing_table_id == detail.referenced_table_id
+                    && deleting_row_ids.contains(&child_row_id)
+                {
+                    continue;
+                }
+
+                match detail.on_delete {
+                    ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
+                        return Err(Error::ConstraintError(format!(
+                            "Violates foreign key constraint '{}' on table '{}' referencing '{}' - row is still referenced by a foreign key in a different table",
+                            "FOREIGN KEY",
+                            detail.referencing_table_display,
+                            detail.referenced_table_display,
+                        )));
+                    }
+                }
+            }
         }
 
         Ok(())
