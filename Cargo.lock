@@ -1381,6 +1381,7 @@ dependencies = [
  "rayon",
  "rustc-hash",
  "simd-r-drive-entry-handle",
+ "sqlparser",
  "tempfile",
  "tracing",
 ]

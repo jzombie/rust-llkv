@@ -33,6 +33,7 @@
 
 pub mod catalog;
 pub mod constants;
+pub mod constraint_validation;
 pub mod constraints;
 pub mod gather;
 pub mod metadata;
@@ -50,12 +51,16 @@ pub mod types;
 
 pub mod stream;
 
+pub use constraint_validation::{
+    ConstraintColumnInfo, UniqueKey, build_composite_unique_key, ensure_multi_column_unique,
+    unique_key_component, validate_check_constraints,
+};
 pub use constraints::{
     CheckConstraint, ConstraintExpressionRef, ConstraintId, ConstraintKind, ConstraintRecord,
     ConstraintState, ForeignKeyAction, ForeignKeyConstraint, PrimaryKeyConstraint,
     UniqueConstraint, decode_constraint_row_id, encode_constraint_row_id,
 };
-pub use metadata::MetadataManager;
+pub use metadata::{ForeignKeyDescriptor, MetadataManager};
 pub use reserved::CATALOG_TABLE_ID;
 pub use stream::{ColumnStream, ColumnStreamBatch};
 pub use sys_catalog::{

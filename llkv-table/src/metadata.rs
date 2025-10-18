@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::constraints::{ConstraintId, ConstraintKind, ConstraintRecord};
+use crate::constraints::{ConstraintId, ConstraintKind, ConstraintRecord, ForeignKeyAction};
 use crate::sys_catalog::SysCatalog;
 use crate::types::{FieldId, TableId};
 use crate::{ColMeta, MultiColumnUniqueEntryMeta, TableMeta, TableMultiColumnUniqueMeta};
@@ -528,6 +528,68 @@ where
         let catalog = SysCatalog::new(&self.store);
         catalog.all_multi_column_unique_metas()
     }
+
+    /// Assemble foreign key descriptors for the table using cached metadata.
+    pub fn foreign_key_descriptors(
+        &self,
+        table_id: TableId,
+    ) -> LlkvResult<Vec<ForeignKeyDescriptor>> {
+        let records = self.constraint_records(table_id)?;
+        let mut descriptors = Vec::new();
+
+        for record in records {
+            if !record.is_active() {
+                continue;
+            }
+
+            let ConstraintKind::ForeignKey(fk) = record.kind else {
+                continue;
+            };
+
+            let referencing_names = self.column_names(table_id, &fk.referencing_field_ids)?;
+            let referenced_names =
+                self.column_names(fk.referenced_table, &fk.referenced_field_ids)?;
+
+            let referencing_table_name = self.table_meta(table_id)?.and_then(|meta| meta.name);
+            let referenced_table_name = self
+                .table_meta(fk.referenced_table)?
+                .and_then(|meta| meta.name);
+
+            descriptors.push(ForeignKeyDescriptor {
+                constraint_id: record.constraint_id,
+                referencing_table_id: table_id,
+                referencing_table_name,
+                referencing_field_ids: fk.referencing_field_ids.clone(),
+                referencing_column_names: referencing_names,
+                referenced_table_id: fk.referenced_table,
+                referenced_table_name,
+                referenced_field_ids: fk.referenced_field_ids.clone(),
+                referenced_column_names: referenced_names,
+                on_delete: fk.on_delete,
+                on_update: fk.on_update,
+            });
+        }
+
+        Ok(descriptors)
+    }
+
+    fn column_names(&self, table_id: TableId, field_ids: &[FieldId]) -> LlkvResult<Vec<String>> {
+        if field_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let metas = self.column_metas(table_id, field_ids)?;
+        let mut names = Vec::with_capacity(field_ids.len());
+        for (idx, field_id) in field_ids.iter().enumerate() {
+            let name = metas
+                .get(idx)
+                .and_then(|meta| meta.as_ref())
+                .and_then(|meta| meta.name.clone())
+                .unwrap_or_else(|| format!("col_{}", field_id));
+            names.push(name);
+        }
+        Ok(names)
+    }
 }
 
 #[cfg(test)]
@@ -676,4 +738,21 @@ mod tests {
         let uniques = manager.multi_column_uniques(table_id).unwrap();
         assert_eq!(uniques, vec![multi_unique]);
     }
+}
+
+// TODO: Does this need to track table names or can the resolver handle them instead?
+/// Descriptor describing a foreign key constraint with resolved column names.
+#[derive(Clone, Debug)]
+pub struct ForeignKeyDescriptor {
+    pub constraint_id: ConstraintId,
+    pub referencing_table_id: TableId,
+    pub referencing_table_name: Option<String>,
+    pub referencing_field_ids: Vec<FieldId>,
+    pub referencing_column_names: Vec<String>,
+    pub referenced_table_id: TableId,
+    pub referenced_table_name: Option<String>,
+    pub referenced_field_ids: Vec<FieldId>,
+    pub referenced_column_names: Vec<String>,
+    pub on_delete: ForeignKeyAction,
+    pub on_update: ForeignKeyAction,
 }

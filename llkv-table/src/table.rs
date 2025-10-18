@@ -11,7 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 
 use crate::constants::STREAM_BATCH_ROWS;
-use llkv_column_map::store::{GatherNullPolicy, Projection, ROW_ID_COLUMN_NAME};
+use llkv_column_map::store::{GatherNullPolicy, IndexKind, Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{ColumnStore, types::LogicalFieldId};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -292,6 +292,36 @@ where
             table_id,
             mvcc_cache: RwLock::new(None),
         })
+    }
+
+    /// Register a persisted sort index for the specified user column.
+    pub fn register_sort_index(&self, field_id: FieldId) -> LlkvResult<()> {
+        let logical_field_id = LogicalFieldId::for_user(self.table_id, field_id);
+        self.store
+            .register_index(logical_field_id, IndexKind::Sort)?;
+        Ok(())
+    }
+
+    /// Remove a persisted sort index for the specified user column if it exists.
+    pub fn unregister_sort_index(&self, field_id: FieldId) -> LlkvResult<()> {
+        let logical_field_id = LogicalFieldId::for_user(self.table_id, field_id);
+        match self
+            .store
+            .unregister_index(logical_field_id, IndexKind::Sort)
+        {
+            Ok(()) | Err(Error::NotFound) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// List the persisted index kinds registered for the given user column.
+    pub fn list_registered_indexes(&self, field_id: FieldId) -> LlkvResult<Vec<IndexKind>> {
+        let logical_field_id = LogicalFieldId::for_user(self.table_id, field_id);
+        match self.store.list_persisted_indexes(logical_field_id) {
+            Ok(kinds) => Ok(kinds),
+            Err(Error::NotFound) => Ok(Vec::new()),
+            Err(err) => Err(err),
+        }
     }
 
     /// Get or initialize the MVCC column cache from the provided schema.

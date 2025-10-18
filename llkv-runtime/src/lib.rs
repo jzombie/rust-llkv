@@ -58,13 +58,14 @@ use llkv_table::catalog::{FieldConstraints, FieldDefinition, TableCatalog};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_table::{
-    CATALOG_TABLE_ID, ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta,
+    CATALOG_TABLE_ID, ColMeta, ConstraintColumnInfo, MetadataManager, MultiColumnUniqueEntryMeta,
+    SysCatalog, TableMeta, UniqueKey, build_composite_unique_key,
     constraints::{
         ConstraintKind, ConstraintRecord, ConstraintState,
         ForeignKeyAction as CatalogForeignKeyAction, ForeignKeyConstraint, PrimaryKeyConstraint,
         UniqueConstraint,
     },
-    metadata::MetadataManager,
+    ensure_multi_column_unique, unique_key_component, validate_check_constraints,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -188,14 +189,6 @@ mod mvcc_columns {
 
         RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(Error::Arrow)
     }
-}
-
-#[derive(Hash, Eq, PartialEq, Debug, Clone)]
-enum UniqueKey {
-    Int(i64),
-    Float(u64),
-    Str(String),
-    Composite(Vec<UniqueKey>),
 }
 
 struct PrimaryKeyUpdateContext<'a> {
@@ -1717,13 +1710,7 @@ where
         if plan.columns.len() == 1 {
             let field_id = field_ids[0];
             let column_name = column_names[0].clone();
-            let table_id = table.table.table_id();
-            let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
-            let existing_indexes = match self.store.list_persisted_indexes(logical_field_id) {
-                Ok(kinds) => kinds,
-                Err(Error::NotFound) => Vec::new(),
-                Err(err) => return Err(err),
-            };
+            let existing_indexes = table.table.list_registered_indexes(field_id)?;
 
             if existing_indexes.contains(&IndexKind::Sort) {
                 if plan.if_not_exists {
@@ -1748,8 +1735,7 @@ where
                 }
             }
 
-            self.store
-                .register_index(logical_field_id, IndexKind::Sort)?;
+            table.table.register_sort_index(field_id)?;
 
             if let Some(updated_table) =
                 Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)
@@ -2788,17 +2774,11 @@ where
         table: &ExecutorTable<P>,
         display_name: &str,
     ) -> Result<Vec<ForeignKeyMetadata>> {
-        let constraint_records = self.metadata.constraint_records(table.table.table_id())?;
-        self.build_foreign_key_metadata(table, display_name, &constraint_records)
-    }
+        let descriptors = self
+            .metadata
+            .foreign_key_descriptors(table.table.table_id())?;
 
-    fn build_foreign_key_metadata(
-        &self,
-        table: &ExecutorTable<P>,
-        display_name: &str,
-        constraint_records: &[ConstraintRecord],
-    ) -> Result<Vec<ForeignKeyMetadata>> {
-        if constraint_records.is_empty() {
+        if descriptors.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -2809,20 +2789,12 @@ where
 
         let mut entries = Vec::new();
 
-        for record in constraint_records {
-            if !record.is_active() {
-                continue;
-            }
+        for descriptor in descriptors {
+            let mut referencing_indices =
+                Vec::with_capacity(descriptor.referencing_field_ids.len());
 
-            let ConstraintKind::ForeignKey(fk) = &record.kind else {
-                continue;
-            };
-
-            let mut referencing_indices = Vec::with_capacity(fk.referencing_field_ids.len());
-            let mut referencing_column_names = Vec::with_capacity(fk.referencing_field_ids.len());
-
-            for field_id in &fk.referencing_field_ids {
-                if let Some((idx, col)) = table
+            for field_id in &descriptor.referencing_field_ids {
+                if let Some((idx, _col)) = table
                     .schema
                     .columns
                     .iter()
@@ -2830,7 +2802,6 @@ where
                     .find(|(_, col)| &col.field_id == field_id)
                 {
                     referencing_indices.push(idx);
-                    referencing_column_names.push(col.name.clone());
                 } else {
                     return Err(Error::Internal(format!(
                         "referenced field id {} not found in table '{}'",
@@ -2840,35 +2811,21 @@ where
             }
 
             let (referenced_display, referenced_canonical) =
-                self.resolve_table_name(fk.referenced_table)?;
-
-            let referenced_metas = self
-                .metadata
-                .column_metas(fk.referenced_table, &fk.referenced_field_ids)?;
-
-            let mut referenced_column_names = Vec::with_capacity(fk.referenced_field_ids.len());
-            for (idx, field_id) in fk.referenced_field_ids.iter().enumerate() {
-                let col_name = referenced_metas
-                    .get(idx)
-                    .and_then(|meta| meta.as_ref())
-                    .and_then(|meta| meta.name.clone())
-                    .unwrap_or_else(|| format!("col_{}", field_id));
-                referenced_column_names.push(col_name);
-            }
+                self.resolve_table_name(descriptor.referenced_table_id)?;
 
             entries.push(ForeignKeyMetadata {
                 constraint_name: None,
                 referencing_display: display_name.to_string(),
                 referencing_column_indices: referencing_indices,
-                referencing_field_ids: fk.referencing_field_ids.clone(),
-                referencing_column_names,
+                referencing_field_ids: descriptor.referencing_field_ids.clone(),
+                referencing_column_names: descriptor.referencing_column_names.clone(),
                 referenced_table: referenced_canonical,
                 referenced_display,
-                referenced_field_ids: fk.referenced_field_ids.clone(),
-                referenced_column_names,
-                referenced_table_id: fk.referenced_table,
-                on_delete: convert_action(fk.on_delete),
-                on_update: convert_action(fk.on_update),
+                referenced_field_ids: descriptor.referenced_field_ids.clone(),
+                referenced_column_names: descriptor.referenced_column_names.clone(),
+                referenced_table_id: descriptor.referenced_table_id,
+                on_delete: convert_action(descriptor.on_delete),
+                on_update: convert_action(descriptor.on_update),
             });
         }
 
@@ -3155,105 +3112,29 @@ where
         rows: &[Vec<PlanValue>],
         column_order: &[usize],
     ) -> Result<()> {
-        use sqlparser::dialect::GenericDialect;
-        use sqlparser::parser::Parser;
-
-        // Find columns with CHECK constraints
-        let check_columns: Vec<(usize, &ExecutorColumn, &str)> = table
+        if table
             .schema
             .columns
             .iter()
-            .enumerate()
-            .filter_map(|(idx, col)| {
-                col.check_expr
-                    .as_ref()
-                    .map(|expr| (idx, col, expr.as_str()))
-            })
-            .collect();
-
-        if check_columns.is_empty() {
+            .all(|column| column.check_expr.is_none())
+        {
             return Ok(());
         }
 
-        let dialect = GenericDialect {};
+        let column_info: Vec<ConstraintColumnInfo> = table
+            .schema
+            .columns
+            .iter()
+            .map(|column| ConstraintColumnInfo {
+                name: column.name.clone(),
+                field_id: column.field_id,
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                check_expr: column.check_expr.clone(),
+            })
+            .collect();
 
-        // Check each row against all CHECK constraints
-        for (row_idx, row) in rows.iter().enumerate() {
-            for (col_idx, column, check_expr_str) in &check_columns {
-                // Parse the CHECK expression
-                let sql = format!("SELECT {}", check_expr_str);
-                let ast = Parser::parse_sql(&dialect, &sql).map_err(|e| {
-                    Error::InvalidArgumentError(format!(
-                        "Failed to parse CHECK expression '{}': {}",
-                        check_expr_str, e
-                    ))
-                })?;
-
-                let stmt = ast.into_iter().next().ok_or_else(|| {
-                    Error::InvalidArgumentError(format!(
-                        "CHECK expression '{}' resulted in empty AST",
-                        check_expr_str
-                    ))
-                })?;
-
-                let select = match stmt {
-                    sqlparser::ast::Statement::Query(q) => q,
-                    _ => {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "CHECK expression '{}' did not parse as SELECT",
-                            check_expr_str
-                        )));
-                    }
-                };
-
-                // Extract the expression from SELECT
-                let body = match *select.body {
-                    sqlparser::ast::SetExpr::Select(s) => s,
-                    _ => {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "CHECK expression '{}' is not a simple SELECT",
-                            check_expr_str
-                        )));
-                    }
-                };
-
-                if body.projection.len() != 1 {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "CHECK expression '{}' must have exactly one projection",
-                        check_expr_str
-                    )));
-                }
-
-                let expr = match &body.projection[0] {
-                    sqlparser::ast::SelectItem::UnnamedExpr(e)
-                    | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => e,
-                    _ => {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "CHECK expression '{}' projection is not a simple expression",
-                            check_expr_str
-                        )));
-                    }
-                };
-
-                // Evaluate the expression against this row
-                let result = Self::evaluate_check_expression(
-                    expr,
-                    row,
-                    column_order,
-                    table,
-                    *col_idx,
-                    row_idx,
-                )?;
-
-                if !result {
-                    return Err(Error::ConstraintError(format!(
-                        "CHECK constraint failed for column '{}': {}",
-                        column.name, check_expr_str
-                    )));
-                }
-            }
-        }
-
+        validate_check_constraints(&column_info, rows, column_order)?;
         Ok(())
     }
 
@@ -3298,392 +3179,6 @@ where
 
         Ok(())
     }
-
-    fn evaluate_check_expression(
-        expr: &sqlparser::ast::Expr,
-        row: &[PlanValue],
-        column_order: &[usize],
-        table: &ExecutorTable<P>,
-        _check_column_idx: usize,
-        _row_idx: usize,
-    ) -> Result<bool> {
-        use sqlparser::ast::Expr as SqlExpr;
-
-        match expr {
-            SqlExpr::BinaryOp { left, op, right } => {
-                let left_val = Self::evaluate_check_expr_value(left, row, column_order, table)?;
-                let right_val = Self::evaluate_check_expr_value(right, row, column_order, table)?;
-
-                use sqlparser::ast::BinaryOperator;
-                match op {
-                    BinaryOperator::Eq => {
-                        // NULL = anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null)
-                            || matches!(right_val, PlanValue::Null)
-                        {
-                            return Ok(true); // Unknown = pass CHECK
-                        }
-                        Ok(left_val == right_val)
-                    }
-                    BinaryOperator::NotEq => {
-                        // NULL != anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null)
-                            || matches!(right_val, PlanValue::Null)
-                        {
-                            return Ok(true); // Unknown = pass CHECK
-                        }
-                        Ok(left_val != right_val)
-                    }
-                    BinaryOperator::Lt => {
-                        // NULL < anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null)
-                            || matches!(right_val, PlanValue::Null)
-                        {
-                            return Ok(true); // Unknown = pass CHECK
-                        }
-                        match (left_val, right_val) {
-                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l < r),
-                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l < r),
-                            _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint < operator requires numeric values".into(),
-                            )),
-                        }
-                    }
-                    BinaryOperator::LtEq => {
-                        // NULL <= anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null)
-                            || matches!(right_val, PlanValue::Null)
-                        {
-                            return Ok(true); // Unknown = pass CHECK
-                        }
-                        match (left_val, right_val) {
-                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l <= r),
-                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l <= r),
-                            _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint <= operator requires numeric values".into(),
-                            )),
-                        }
-                    }
-                    BinaryOperator::Gt => {
-                        // NULL > anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null)
-                            || matches!(right_val, PlanValue::Null)
-                        {
-                            return Ok(true); // Unknown = pass CHECK
-                        }
-                        match (left_val, right_val) {
-                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l > r),
-                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l > r),
-                            _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint > operator requires numeric values".into(),
-                            )),
-                        }
-                    }
-                    BinaryOperator::GtEq => {
-                        // NULL >= anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null)
-                            || matches!(right_val, PlanValue::Null)
-                        {
-                            return Ok(true); // Unknown = pass CHECK
-                        }
-                        match (left_val, right_val) {
-                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l >= r),
-                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l >= r),
-                            _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint >= operator requires numeric values".into(),
-                            )),
-                        }
-                    }
-                    _ => Err(Error::InvalidArgumentError(format!(
-                        "Unsupported operator in CHECK constraint: {:?}",
-                        op
-                    ))),
-                }
-            }
-            SqlExpr::IsNull(inner) => {
-                let value = Self::evaluate_check_expr_value(inner, row, column_order, table)?;
-                Ok(matches!(value, PlanValue::Null))
-            }
-            SqlExpr::IsNotNull(inner) => {
-                let value = Self::evaluate_check_expr_value(inner, row, column_order, table)?;
-                Ok(!matches!(value, PlanValue::Null))
-            }
-            _ => Err(Error::InvalidArgumentError(format!(
-                "Unsupported expression in CHECK constraint: {:?}",
-                expr
-            ))),
-        }
-    }
-
-    fn evaluate_check_expr_value(
-        expr: &sqlparser::ast::Expr,
-        row: &[PlanValue],
-        column_order: &[usize],
-        table: &ExecutorTable<P>,
-    ) -> Result<PlanValue> {
-        use sqlparser::ast::Expr as SqlExpr;
-
-        match expr {
-            SqlExpr::BinaryOp { left, op, right } => {
-                // Handle arithmetic operations in CHECK expressions (e.g., i + j)
-                let left_val = Self::evaluate_check_expr_value(left, row, column_order, table)?;
-                let right_val = Self::evaluate_check_expr_value(right, row, column_order, table)?;
-
-                use sqlparser::ast::BinaryOperator;
-                match op {
-                    BinaryOperator::Plus => match (left_val, right_val) {
-                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
-                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
-                            Ok(PlanValue::Integer(l + r))
-                        }
-                        (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l + r)),
-                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
-                            Ok(PlanValue::Float(l as f64 + r))
-                        }
-                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
-                            Ok(PlanValue::Float(l + r as f64))
-                        }
-                        _ => Err(Error::InvalidArgumentError(
-                            "CHECK constraint + operator requires numeric values".into(),
-                        )),
-                    },
-                    BinaryOperator::Minus => match (left_val, right_val) {
-                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
-                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
-                            Ok(PlanValue::Integer(l - r))
-                        }
-                        (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l - r)),
-                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
-                            Ok(PlanValue::Float(l as f64 - r))
-                        }
-                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
-                            Ok(PlanValue::Float(l - r as f64))
-                        }
-                        _ => Err(Error::InvalidArgumentError(
-                            "CHECK constraint - operator requires numeric values".into(),
-                        )),
-                    },
-                    BinaryOperator::Multiply => match (left_val, right_val) {
-                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
-                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
-                            Ok(PlanValue::Integer(l * r))
-                        }
-                        (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l * r)),
-                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
-                            Ok(PlanValue::Float(l as f64 * r))
-                        }
-                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
-                            Ok(PlanValue::Float(l * r as f64))
-                        }
-                        _ => Err(Error::InvalidArgumentError(
-                            "CHECK constraint * operator requires numeric values".into(),
-                        )),
-                    },
-                    BinaryOperator::Divide => match (left_val, right_val) {
-                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
-                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
-                            if r == 0 {
-                                Err(Error::InvalidArgumentError(
-                                    "Division by zero in CHECK constraint".into(),
-                                ))
-                            } else {
-                                Ok(PlanValue::Integer(l / r))
-                            }
-                        }
-                        (PlanValue::Float(l), PlanValue::Float(r)) => {
-                            if r == 0.0 {
-                                Err(Error::InvalidArgumentError(
-                                    "Division by zero in CHECK constraint".into(),
-                                ))
-                            } else {
-                                Ok(PlanValue::Float(l / r))
-                            }
-                        }
-                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
-                            if r == 0.0 {
-                                Err(Error::InvalidArgumentError(
-                                    "Division by zero in CHECK constraint".into(),
-                                ))
-                            } else {
-                                Ok(PlanValue::Float(l as f64 / r))
-                            }
-                        }
-                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
-                            if r == 0 {
-                                Err(Error::InvalidArgumentError(
-                                    "Division by zero in CHECK constraint".into(),
-                                ))
-                            } else {
-                                Ok(PlanValue::Float(l / r as f64))
-                            }
-                        }
-                        _ => Err(Error::InvalidArgumentError(
-                            "CHECK constraint / operator requires numeric values".into(),
-                        )),
-                    },
-                    _ => Err(Error::InvalidArgumentError(format!(
-                        "Unsupported binary operator in CHECK constraint value expression: {:?}",
-                        op
-                    ))),
-                }
-            }
-            SqlExpr::Identifier(ident) => {
-                // Simple column reference
-                let column_name = &ident.value;
-                let col_idx = table
-                    .schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(column_name))
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "Unknown column '{}' in CHECK constraint",
-                            column_name
-                        ))
-                    })?;
-
-                // Find value in row
-                let insert_pos = column_order
-                    .iter()
-                    .position(|&dest_idx| dest_idx == col_idx)
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "Column '{}' not provided in INSERT",
-                            column_name
-                        ))
-                    })?;
-
-                Ok(row[insert_pos].clone())
-            }
-            SqlExpr::CompoundIdentifier(idents) => {
-                // Struct field access like t.t or table.t.t
-                if idents.len() == 2 {
-                    // col.field format
-                    let column_name = &idents[0].value;
-                    let field_name = &idents[1].value;
-
-                    let col_idx = table
-                        .schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(column_name))
-                        .ok_or_else(|| {
-                            Error::InvalidArgumentError(format!(
-                                "Unknown column '{}' in CHECK constraint",
-                                column_name
-                            ))
-                        })?;
-
-                    let insert_pos = column_order
-                        .iter()
-                        .position(|&dest_idx| dest_idx == col_idx)
-                        .ok_or_else(|| {
-                            Error::InvalidArgumentError(format!(
-                                "Column '{}' not provided in INSERT",
-                                column_name
-                            ))
-                        })?;
-
-                    // Extract struct field
-                    match &row[insert_pos] {
-                        PlanValue::Struct(fields) => fields
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case(field_name))
-                            .map(|(_, val)| val.clone())
-                            .ok_or_else(|| {
-                                Error::InvalidArgumentError(format!(
-                                    "Struct field '{}' not found in column '{}'",
-                                    field_name, column_name
-                                ))
-                            }),
-                        _ => Err(Error::InvalidArgumentError(format!(
-                            "Column '{}' is not a struct, cannot access field '{}'",
-                            column_name, field_name
-                        ))),
-                    }
-                } else if idents.len() == 3 {
-                    // table.col.field format - ignore table part
-                    let column_name = &idents[1].value;
-                    let field_name = &idents[2].value;
-
-                    let col_idx = table
-                        .schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(column_name))
-                        .ok_or_else(|| {
-                            Error::InvalidArgumentError(format!(
-                                "Unknown column '{}' in CHECK constraint",
-                                column_name
-                            ))
-                        })?;
-
-                    let insert_pos = column_order
-                        .iter()
-                        .position(|&dest_idx| dest_idx == col_idx)
-                        .ok_or_else(|| {
-                            Error::InvalidArgumentError(format!(
-                                "Column '{}' not provided in INSERT",
-                                column_name
-                            ))
-                        })?;
-
-                    match &row[insert_pos] {
-                        PlanValue::Struct(fields) => fields
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case(field_name))
-                            .map(|(_, val)| val.clone())
-                            .ok_or_else(|| {
-                                Error::InvalidArgumentError(format!(
-                                    "Struct field '{}' not found in column '{}'",
-                                    field_name, column_name
-                                ))
-                            }),
-                        _ => Err(Error::InvalidArgumentError(format!(
-                            "Column '{}' is not a struct, cannot access field '{}'",
-                            column_name, field_name
-                        ))),
-                    }
-                } else {
-                    Err(Error::InvalidArgumentError(format!(
-                        "Unsupported compound identifier in CHECK constraint: {} parts",
-                        idents.len()
-                    )))
-                }
-            }
-            SqlExpr::Value(val_with_span) => {
-                // Numeric literal
-                match &val_with_span.value {
-                    sqlparser::ast::Value::Number(n, _) => {
-                        if let Ok(i) = n.parse::<i64>() {
-                            Ok(PlanValue::Integer(i))
-                        } else if let Ok(f) = n.parse::<f64>() {
-                            Ok(PlanValue::Float(f))
-                        } else {
-                            Err(Error::InvalidArgumentError(format!(
-                                "Invalid number in CHECK constraint: {}",
-                                n
-                            )))
-                        }
-                    }
-                    sqlparser::ast::Value::SingleQuotedString(s)
-                    | sqlparser::ast::Value::DoubleQuotedString(s) => {
-                        Ok(PlanValue::String(s.clone()))
-                    }
-                    sqlparser::ast::Value::Null => Ok(PlanValue::Null),
-                    _ => Err(Error::InvalidArgumentError(format!(
-                        "Unsupported value type in CHECK constraint: {:?}",
-                        val_with_span.value
-                    ))),
-                }
-            }
-            _ => Err(Error::InvalidArgumentError(format!(
-                "Unsupported expression type in CHECK constraint: {:?}",
-                expr
-            ))),
-        }
-    }
-
     fn ensure_existing_rows_unique(
         &self,
         table: &ExecutorTable<P>,
@@ -3697,7 +3192,7 @@ where
         let mut seen: FxHashSet<UniqueKey> = FxHashSet::default();
 
         for value in values {
-            let Some(key) = Self::unique_key_component(&value, column_name)? else {
+            let Some(key) = unique_key_component(&value, column_name)? else {
                 continue;
             };
 
@@ -3766,7 +3261,7 @@ where
                 continue;
             }
 
-            if let Some(key) = Self::build_composite_unique_key(&values, column_names)?
+            if let Some(key) = build_composite_unique_key(&values, column_names)?
                 && !seen.insert(key)
             {
                 return Err(Error::ConstraintError(format!(
@@ -3820,8 +3315,7 @@ where
             }
         }
 
-        let multi_uniques = table.multi_column_uniques();
-        for constraint in multi_uniques {
+        for constraint in table.multi_column_uniques() {
             if constraint.column_indices.is_empty() {
                 continue;
             }
@@ -3840,16 +3334,7 @@ where
             }
 
             let existing_rows = self.scan_multi_column_values(table, &field_ids, snapshot)?;
-            let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
-            for row_values in existing_rows {
-                if let Some(key) =
-                    Self::build_composite_unique_key(&row_values, &constraint_column_names)?
-                {
-                    existing_keys.insert(key);
-                }
-            }
-
-            let mut new_keys: FxHashSet<UniqueKey> = FxHashSet::default();
+            let mut new_rows_for_constraint: Vec<Vec<PlanValue>> = Vec::with_capacity(rows.len());
             for row in rows {
                 let mut values_for_constraint = Vec::with_capacity(constraint.column_indices.len());
                 for &col_idx in &constraint.column_indices {
@@ -3860,17 +3345,14 @@ where
                     }
                 }
 
-                if let Some(key) = Self::build_composite_unique_key(
-                    &values_for_constraint,
-                    &constraint_column_names,
-                )? && (existing_keys.contains(&key) || !new_keys.insert(key))
-                {
-                    return Err(Error::ConstraintError(format!(
-                        "constraint violation on columns '{}'",
-                        constraint_column_names.join(", ")
-                    )));
-                }
+                new_rows_for_constraint.push(values_for_constraint);
             }
+
+            ensure_multi_column_unique(
+                &existing_rows,
+                &new_rows_for_constraint,
+                &constraint_column_names,
+            )?;
         }
 
         Ok(())
@@ -3924,7 +3406,7 @@ where
                 continue;
             }
 
-            let key = Self::build_composite_unique_key(&row_values, &pk_column_names)?;
+            let key = build_composite_unique_key(&row_values, &pk_column_names)?;
             let key = key.ok_or_else(|| {
                 Error::ConstraintError(format!(
                     "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
@@ -3954,7 +3436,7 @@ where
                 values_for_pk.push(value);
             }
 
-            let key = Self::build_composite_unique_key(&values_for_pk, &pk_column_names)?;
+            let key = build_composite_unique_key(&values_for_pk, &pk_column_names)?;
             let key = key.ok_or_else(|| {
                 Error::ConstraintError(format!(
                     "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
@@ -4161,7 +3643,7 @@ where
         let mut existing_rows = self.scan_multi_column_values(table, &pk_field_ids, snapshot)?;
         let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
         for row_values in existing_rows.drain(..) {
-            if let Some(key) = Self::build_composite_unique_key(&row_values, names)? {
+            if let Some(key) = build_composite_unique_key(&row_values, names)? {
                 tracing::trace!(table = %display_name, ?key, "existing primary key");
                 existing_keys.insert(key);
             }
@@ -4199,7 +3681,7 @@ where
                 values.push(row[idx].clone());
             }
 
-            let key = Self::build_composite_unique_key(&values, names)?;
+            let key = build_composite_unique_key(&values, names)?;
             let key = key.ok_or_else(|| {
                 Error::ConstraintError(format!(
                     "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
@@ -4575,39 +4057,6 @@ where
 
         Ok(visible_row_ids.into_iter().zip(rows).collect())
     }
-
-    fn unique_key_component(value: &PlanValue, column_name: &str) -> Result<Option<UniqueKey>> {
-        match value {
-            PlanValue::Null => Ok(None),
-            PlanValue::Integer(v) => Ok(Some(UniqueKey::Int(*v))),
-            PlanValue::Float(v) => Ok(Some(UniqueKey::Float(v.to_bits()))),
-            PlanValue::String(s) => Ok(Some(UniqueKey::Str(s.clone()))),
-            PlanValue::Struct(_) => Err(Error::InvalidArgumentError(format!(
-                "UNIQUE index is not supported on struct column '{}'",
-                column_name
-            ))),
-        }
-    }
-
-    fn build_composite_unique_key(
-        values: &[PlanValue],
-        column_names: &[String],
-    ) -> Result<Option<UniqueKey>> {
-        if values.is_empty() {
-            return Ok(None);
-        }
-
-        let mut components = Vec::with_capacity(values.len());
-        for (value, column_name) in values.iter().zip(column_names) {
-            match Self::unique_key_component(value, column_name)? {
-                Some(component) => components.push(component),
-                None => return Ok(None),
-            }
-        }
-
-        Ok(Some(UniqueKey::Composite(components)))
-    }
-
     fn insert_rows(
         &self,
         table: &ExecutorTable<P>,
@@ -4949,7 +4398,7 @@ where
                 for &idx in &primary_key_indices {
                     values.push(row[idx].clone());
                 }
-                let key = Self::build_composite_unique_key(&values, &primary_key_names)?;
+                let key = build_composite_unique_key(&values, &primary_key_names)?;
                 original_primary_key_keys.push(key);
             }
         }
@@ -5197,7 +4646,7 @@ where
                 for &idx in &primary_key_indices {
                     values.push(row[idx].clone());
                 }
-                let key = Self::build_composite_unique_key(&values, &primary_key_names)?;
+                let key = build_composite_unique_key(&values, &primary_key_names)?;
                 original_primary_key_keys.push(key);
             }
         }
