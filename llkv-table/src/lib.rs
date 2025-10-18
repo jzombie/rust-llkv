@@ -54,8 +54,9 @@ pub mod stream;
 
 pub use constraint_validation::{
     ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo, UniqueKey, ValidatedForeignKey,
-    build_composite_unique_key, ensure_multi_column_unique, unique_key_component,
-    validate_check_constraints, validate_foreign_keys,
+    build_composite_unique_key, ensure_multi_column_unique, ensure_primary_key,
+    ensure_single_column_unique, unique_key_component, validate_check_constraints,
+    validate_foreign_keys,
 };
 pub use constraints::{
     CheckConstraint, ConstraintExpressionRef, ConstraintId, ConstraintKind, ConstraintRecord,
@@ -70,7 +71,7 @@ pub use sys_catalog::{
     ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta, TableMultiColumnUniqueMeta,
 };
 pub use table::Table;
-pub use types::{FieldId, RowId, TableColumn, TableId, ROW_ID_FIELD_ID};
+pub use types::{FieldId, ROW_ID_FIELD_ID, RowId, TableColumn, TableId};
 
 pub use planner::plan_graph::{
     PLAN_GRAPH_VERSION, PlanAnnotations, PlanEdge, PlanEdgeMetadata, PlanExpression, PlanField,

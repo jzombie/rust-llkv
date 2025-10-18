@@ -58,15 +58,12 @@ use llkv_table::catalog::{FieldConstraints, FieldDefinition, TableCatalog};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_table::{
-    CATALOG_TABLE_ID, ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo, MetadataManager,
+    ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo, MetadataManager,
     MultiColumnUniqueEntryMeta, SysCatalog, TableColumn, TableMeta, UniqueKey,
     build_composite_unique_key, canonical_table_name,
-    constraints::{
-        ConstraintKind, ConstraintRecord, ConstraintState,
-        ForeignKeyAction as CatalogForeignKeyAction,
-    },
-    ensure_multi_column_unique, resolve_table_name, unique_key_component,
-    validate_check_constraints, validate_foreign_keys,
+    constraints::{ConstraintKind, ForeignKeyAction as CatalogForeignKeyAction},
+    ensure_multi_column_unique, ensure_primary_key, ensure_single_column_unique,
+    resolve_table_name, validate_check_constraints,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -1729,7 +1726,10 @@ where
             }
 
             if plan.unique {
-                self.ensure_existing_rows_unique(table.as_ref(), field_id, &column_name)?;
+                let snapshot = self.default_snapshot();
+                let existing_values =
+                    self.scan_column_values(table.as_ref(), field_id, snapshot)?;
+                ensure_single_column_unique(&existing_values, &[], &column_name)?;
                 if let Some(table_id) = self.catalog.table_id(&canonical_name)
                     && let Some(resolver) = self.catalog.field_resolver(table_id)
                 {
@@ -1787,7 +1787,9 @@ where
             )));
         }
 
-        self.ensure_existing_rows_unique_multi(table.as_ref(), &field_ids, &column_names)?;
+        let snapshot = self.default_snapshot();
+        let existing_rows = self.scan_multi_column_values(table.as_ref(), &field_ids, snapshot)?;
+        ensure_multi_column_unique(&existing_rows, &[], &column_names)?;
 
         let executor_entry = ExecutorMultiColumnUnique {
             index_name: index_name.clone(),
@@ -2870,34 +2872,6 @@ where
         Ok(())
     }
 
-    fn ensure_existing_rows_unique(
-        &self,
-        table: &ExecutorTable<P>,
-        field_id: FieldId,
-        column_name: &str,
-    ) -> Result<()> {
-        let snapshot = self.default_snapshot();
-        let values = self.scan_column_values(table, field_id, snapshot)?;
-
-        // TODO: This is inefficient for large datasets; consider a more efficient approach
-        let mut seen: FxHashSet<UniqueKey> = FxHashSet::default();
-
-        for value in values {
-            let Some(key) = unique_key_component(&value, column_name)? else {
-                continue;
-            };
-
-            if !seen.insert(key) {
-                return Err(Error::ConstraintError(format!(
-                    "constraint violation on column '{}'",
-                    column_name
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
     fn rebuild_executor_table_with_unique(
         table: &ExecutorTable<P>,
         field_id: FieldId,
@@ -2933,38 +2907,6 @@ where
         }))
     }
 
-    fn ensure_existing_rows_unique_multi(
-        &self,
-        table: &ExecutorTable<P>,
-        field_ids: &[FieldId],
-        column_names: &[String],
-    ) -> Result<()> {
-        if field_ids.is_empty() {
-            return Ok(());
-        }
-
-        let snapshot = self.default_snapshot();
-        let rows = self.scan_multi_column_values(table, field_ids, snapshot)?;
-        let mut seen: FxHashSet<UniqueKey> = FxHashSet::default();
-
-        for values in rows {
-            if values.len() != field_ids.len() {
-                continue;
-            }
-
-            if let Some(key) = build_composite_unique_key(&values, column_names)?
-                && !seen.insert(key)
-            {
-                return Err(Error::ConstraintError(format!(
-                    "constraint violation on columns '{}'",
-                    column_names.join(", ")
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
     fn check_unique_constraints(
         &self,
         table: &ExecutorTable<P>,
@@ -2991,19 +2933,10 @@ where
                 };
                 let value = row[insert_position].clone();
 
-                if matches!(value, PlanValue::Null) {
-                    continue;
-                }
-
-                if existing_values.contains(&value) || new_values.contains(&value) {
-                    return Err(Error::ConstraintError(format!(
-                        "constraint violation on column '{}'",
-                        column.name
-                    )));
-                }
-
                 new_values.push(value);
             }
+
+            ensure_single_column_unique(&existing_values, &new_values, &column.name)?;
         }
 
         for constraint in table.multi_column_uniques() {
@@ -3079,68 +3012,23 @@ where
             .iter()
             .map(|(_, col)| col.name.clone())
             .collect();
-        let pk_label = if pk_column_names.len() == 1 {
-            "column"
-        } else {
-            "columns"
-        };
-        let pk_display = if pk_column_names.len() == 1 {
-            pk_column_names[0].clone()
-        } else {
-            pk_column_names.join(", ")
-        };
-
         let existing_rows = self.scan_multi_column_values(table, &pk_field_ids, snapshot)?;
-        let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
-        for row_values in existing_rows {
-            if row_values.len() != pk_field_ids.len() {
-                continue;
-            }
-
-            let key = build_composite_unique_key(&row_values, &pk_column_names)?;
-            let key = key.ok_or_else(|| {
-                Error::ConstraintError(format!(
-                    "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
-                ))
-            })?;
-            existing_keys.insert(key);
-        }
-
-        let mut new_keys: FxHashSet<UniqueKey> = FxHashSet::default();
+        let mut new_rows_for_pk: Vec<Vec<PlanValue>> = Vec::with_capacity(rows.len());
         for row in rows {
             let mut values_for_pk = Vec::with_capacity(pk_field_ids.len());
-            for &(col_idx, column) in &primary_key_columns {
+            for &(col_idx, _column) in &primary_key_columns {
                 let value = if let Some(pos) = column_order.iter().position(|&dest| dest == col_idx)
                 {
                     row[pos].clone()
                 } else {
                     PlanValue::Null
                 };
-
-                if matches!(value, PlanValue::Null) {
-                    return Err(Error::ConstraintError(format!(
-                        "constraint failed: NOT NULL constraint failed for PRIMARY KEY column '{}'",
-                        column.name
-                    )));
-                }
-
                 values_for_pk.push(value);
             }
-
-            let key = build_composite_unique_key(&values_for_pk, &pk_column_names)?;
-            let key = key.ok_or_else(|| {
-                Error::ConstraintError(format!(
-                    "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
-                ))
-            })?;
-
-            if existing_keys.contains(&key) || !new_keys.insert(key) {
-                return Err(Error::ConstraintError(format!(
-                    "Duplicate key violates primary key constraint on {pk_label} '{}' (PRIMARY KEY or UNIQUE constraint violation)",
-                    pk_display
-                )));
-            }
+            new_rows_for_pk.push(values_for_pk);
         }
+
+        ensure_primary_key(&existing_rows, &new_rows_for_pk, &pk_column_names)?;
 
         Ok(())
     }

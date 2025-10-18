@@ -83,7 +83,12 @@ pub fn ensure_multi_column_unique(
     let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
     for values in existing_rows {
         if let Some(key) = build_composite_unique_key(values, column_names)? {
-            existing_keys.insert(key);
+            if !existing_keys.insert(key.clone()) {
+                return Err(Error::ConstraintError(format!(
+                    "constraint violation on columns '{}'",
+                    column_names.join(", ")
+                )));
+            }
         }
     }
 
@@ -679,4 +684,101 @@ fn map_plan_action(action: PlanForeignKeyAction) -> ForeignKeyAction {
         PlanForeignKeyAction::NoAction => ForeignKeyAction::NoAction,
         PlanForeignKeyAction::Restrict => ForeignKeyAction::Restrict,
     }
+}
+
+// ============================================================================
+// Runtime constraint helpers
+// ============================================================================
+
+/// Ensure existing + incoming values remain unique for a single column.
+pub fn ensure_single_column_unique(
+    existing_values: &[PlanValue],
+    new_values: &[PlanValue],
+    column_name: &str,
+) -> LlkvResult<()> {
+    let mut seen: FxHashSet<UniqueKey> = FxHashSet::default();
+
+    for value in existing_values {
+        if let Some(key) = unique_key_component(value, column_name)? {
+            if !seen.insert(key.clone()) {
+                return Err(Error::ConstraintError(format!(
+                    "constraint violation on column '{}'",
+                    column_name
+                )));
+            }
+        }
+    }
+
+    for value in new_values {
+        if let Some(key) = unique_key_component(value, column_name)? {
+            if !seen.insert(key.clone()) {
+                return Err(Error::ConstraintError(format!(
+                    "constraint violation on column '{}'",
+                    column_name
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Ensure primary key values remain unique and non-null.
+pub fn ensure_primary_key(
+    existing_rows: &[Vec<PlanValue>],
+    new_rows: &[Vec<PlanValue>],
+    column_names: &[String],
+) -> LlkvResult<()> {
+    let pk_label = if column_names.len() == 1 {
+        "column"
+    } else {
+        "columns"
+    };
+    let pk_display = if column_names.len() == 1 {
+        column_names[0].clone()
+    } else {
+        column_names.join(", ")
+    };
+
+    let mut seen: FxHashSet<UniqueKey> = FxHashSet::default();
+
+    for row_values in existing_rows {
+        if row_values.len() != column_names.len() {
+            continue;
+        }
+
+        let key = build_composite_unique_key(row_values, column_names)?;
+        let key = key.ok_or_else(|| {
+            Error::ConstraintError(format!(
+                "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
+            ))
+        })?;
+
+        if !seen.insert(key.clone()) {
+            return Err(Error::ConstraintError(format!(
+                "Duplicate key violates primary key constraint on {pk_label} '{pk_display}' (PRIMARY KEY or UNIQUE constraint violation)"
+            )));
+        }
+    }
+
+    for row_values in new_rows {
+        if row_values.len() != column_names.len() {
+            continue;
+        }
+
+        let key = build_composite_unique_key(row_values, column_names)?;
+        let key = key.ok_or_else(|| {
+            Error::ConstraintError(format!(
+                "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
+            ))
+        })?;
+        
+        if !seen.insert(key.clone()) {
+            return Err(Error::ConstraintError(format!(
+                "Duplicate key violates primary key constraint on {pk_label} '{pk_display}' (PRIMARY KEY or UNIQUE constraint violation)"
+            )));
+        }
+    }
+
+    Ok(())
 }
