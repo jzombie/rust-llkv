@@ -7,19 +7,25 @@
 #![forbid(unsafe_code)]
 
 use crate::catalog::TableCatalog;
-use crate::constraint_validation::ValidatedForeignKey;
+use crate::constraint_validation::{
+    ForeignKeyTableInfo, ValidatedForeignKey, validate_foreign_keys,
+};
 use crate::constraints::{
     ConstraintId, ConstraintKind, ConstraintRecord, ConstraintState, ForeignKeyAction,
-    ForeignKeyConstraint,
+    ForeignKeyConstraint, PrimaryKeyConstraint, UniqueConstraint,
 };
+use crate::reserved;
 use crate::resolvers::resolve_table_name;
 use crate::sys_catalog::SysCatalog;
 use crate::table::Table;
-use crate::types::{FieldId, TableId};
+use crate::types::{FieldId, TableColumn, TableId};
 use crate::{ColMeta, MultiColumnUniqueEntryMeta, TableMeta, TableMultiColumnUniqueMeta};
+use arrow::datatypes::DataType;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::IndexKind;
-use llkv_result::Result as LlkvResult;
+use llkv_column_map::types::LogicalFieldId;
+use llkv_plan::ForeignKeySpec;
+use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -692,6 +698,22 @@ where
         Ok(details)
     }
 
+    /// Validate foreign key specifications and persist them for the referencing table.
+    pub fn validate_and_register_foreign_keys<F>(
+        &self,
+        referencing_table: &ForeignKeyTableInfo,
+        specs: &[ForeignKeySpec],
+        lookup_table: F,
+        timestamp_micros: u64,
+    ) -> LlkvResult<Vec<ValidatedForeignKey>>
+    where
+        F: FnMut(&str) -> LlkvResult<ForeignKeyTableInfo>,
+    {
+        let validated = validate_foreign_keys(referencing_table, specs, lookup_table)?;
+        self.register_foreign_keys(referencing_table.table_id, &validated, timestamp_micros)?;
+        Ok(validated)
+    }
+
     /// Register validated foreign key definitions for a table.
     pub fn register_foreign_keys(
         &self,
@@ -736,6 +758,92 @@ where
         Ok(())
     }
 
+    /// Register column metadata, physical storage columns, and primary/unique constraints.
+    pub fn apply_column_definitions(
+        &self,
+        table_id: TableId,
+        columns: &[TableColumn],
+        timestamp_micros: u64,
+    ) -> LlkvResult<()> {
+        if columns.is_empty() {
+            return Ok(());
+        }
+
+        self.ensure_table_state(table_id)?;
+
+        for column in columns {
+            let column_meta = ColMeta {
+                col_id: column.field_id,
+                name: Some(column.name.clone()),
+                flags: 0,
+                default: None,
+            };
+            self.set_column_meta(table_id, column_meta)?;
+        }
+
+        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
+        let store = table.store();
+
+        for column in columns {
+            let logical_field_id = LogicalFieldId::for_user(table_id, column.field_id);
+            store.ensure_column_registered(logical_field_id, &column.data_type)?;
+            store.data_type(logical_field_id)?;
+        }
+
+        let created_by_lfid = LogicalFieldId::for_mvcc_created_by(table_id);
+        store.ensure_column_registered(created_by_lfid, &DataType::UInt64)?;
+
+        let deleted_by_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
+        store.ensure_column_registered(deleted_by_lfid, &DataType::UInt64)?;
+
+        let existing = self.constraint_record_map(table_id)?;
+        let mut next_constraint_id = existing
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+
+        let mut constraints = Vec::new();
+
+        let primary_key_fields: Vec<FieldId> = columns
+            .iter()
+            .filter(|col| col.primary_key)
+            .map(|col| col.field_id)
+            .collect();
+        if !primary_key_fields.is_empty() {
+            constraints.push(ConstraintRecord {
+                constraint_id: next_constraint_id,
+                kind: ConstraintKind::PrimaryKey(PrimaryKeyConstraint {
+                    field_ids: primary_key_fields,
+                }),
+                state: ConstraintState::Active,
+                revision: 1,
+                last_modified_micros: timestamp_micros,
+            });
+            next_constraint_id = next_constraint_id.saturating_add(1);
+        }
+
+        for column in columns.iter().filter(|col| col.unique && !col.primary_key) {
+            constraints.push(ConstraintRecord {
+                constraint_id: next_constraint_id,
+                kind: ConstraintKind::Unique(UniqueConstraint {
+                    field_ids: vec![column.field_id],
+                }),
+                state: ConstraintState::Active,
+                revision: 1,
+                last_modified_micros: timestamp_micros,
+            });
+            next_constraint_id = next_constraint_id.saturating_add(1);
+        }
+
+        if !constraints.is_empty() {
+            self.put_constraint_records(table_id, &constraints)?;
+        }
+
+        Ok(())
+    }
+
     fn column_names(&self, table_id: TableId, field_ids: &[FieldId]) -> LlkvResult<Vec<String>> {
         if field_ids.is_empty() {
             return Ok(Vec::new());
@@ -752,6 +860,44 @@ where
             names.push(name);
         }
         Ok(names)
+    }
+
+    /// Reserve and return the next available table id.
+    pub fn reserve_table_id(&self) -> LlkvResult<TableId> {
+        let catalog = SysCatalog::new(&self.store);
+
+        let mut next = match catalog.get_next_table_id()? {
+            Some(value) => value,
+            None => {
+                let seed = catalog
+                    .max_table_id()?
+                    .unwrap_or(reserved::CATALOG_TABLE_ID);
+                let initial = seed.checked_add(1).ok_or_else(|| {
+                    Error::InvalidArgumentError("exhausted available table ids".into())
+                })?;
+                catalog.put_next_table_id(initial)?;
+                initial
+            }
+        };
+
+        while reserved::is_reserved_table_id(next) {
+            next = next.checked_add(1).ok_or_else(|| {
+                Error::InvalidArgumentError("exhausted available table ids".into())
+            })?;
+        }
+
+        let mut following = next
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidArgumentError("exhausted available table ids".into()))?;
+
+        while reserved::is_reserved_table_id(following) {
+            following = following.checked_add(1).ok_or_else(|| {
+                Error::InvalidArgumentError("exhausted available table ids".into())
+            })?;
+        }
+
+        catalog.put_next_table_id(following)?;
+        Ok(next)
     }
 
     fn field_has_sort_index(&self, table_id: TableId, field_id: FieldId) -> LlkvResult<bool> {

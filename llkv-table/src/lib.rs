@@ -70,7 +70,7 @@ pub use sys_catalog::{
     ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta, TableMultiColumnUniqueMeta,
 };
 pub use table::Table;
-pub use types::{FieldId, RowId};
+pub use types::{FieldId, RowId, TableColumn, TableId, ROW_ID_FIELD_ID};
 
 pub use planner::plan_graph::{
     PLAN_GRAPH_VERSION, PlanAnnotations, PlanEdge, PlanEdgeMetadata, PlanExpression, PlanField,

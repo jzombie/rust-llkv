@@ -58,13 +58,12 @@ use llkv_table::catalog::{FieldConstraints, FieldDefinition, TableCatalog};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_table::{
-    CATALOG_TABLE_ID, ColMeta, ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo,
-    MetadataManager, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta, UniqueKey,
-    ValidatedForeignKey, build_composite_unique_key, canonical_table_name,
+    CATALOG_TABLE_ID, ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo, MetadataManager,
+    MultiColumnUniqueEntryMeta, SysCatalog, TableColumn, TableMeta, UniqueKey,
+    build_composite_unique_key, canonical_table_name,
     constraints::{
         ConstraintKind, ConstraintRecord, ConstraintState,
-        ForeignKeyAction as CatalogForeignKeyAction, ForeignKeyConstraint, PrimaryKeyConstraint,
-        UniqueConstraint,
+        ForeignKeyAction as CatalogForeignKeyAction,
     },
     ensure_multi_column_unique, resolve_table_name, unique_key_component,
     validate_check_constraints, validate_foreign_keys,
@@ -2332,140 +2331,40 @@ where
             );
         }
 
-        let table_id = self.reserve_table_id()?;
+        let table_id = self.metadata.reserve_table_id()?;
         tracing::trace!(
             "=== TABLE '{}' CREATED WITH table_id={} pager={:p} ===",
             display_name,
             table_id,
             &*self.pager
         );
-        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
+        let now = current_time_micros();
         let table_meta = TableMeta {
             table_id,
             name: Some(display_name.clone()),
-            created_at_micros: current_time_micros(),
+            created_at_micros: now,
             flags: 0,
             epoch: 0,
         };
         self.metadata.set_table_meta(table_id, table_meta)?;
 
-        for column in &column_defs {
-            let column_meta = ColMeta {
-                col_id: column.field_id,
-                name: Some(column.name.clone()),
-                flags: 0,
-                default: None,
-            };
-            self.metadata.set_column_meta(table_id, column_meta)?;
-        }
-
-        {
-            let store = table.store();
-            tracing::trace!(
-                table_id,
-                store_ptr = ?std::ptr::addr_of!(*store),
-                "Registering columns in ColumnStore"
-            );
-            for column in &column_defs {
-                let logical_field_id = LogicalFieldId::for_user(table_id, column.field_id);
-                tracing::trace!(table_id, ?logical_field_id, "Registering user column");
-                store.ensure_column_registered(logical_field_id, &column.data_type)?;
-                // Sanity check: the descriptor should now be readable.
-                store.data_type(logical_field_id)?;
-            }
-
-            // Register MVCC columns (created_by, deleted_by)
-            let created_by_lfid = LogicalFieldId::for_mvcc_created_by(table_id);
-            tracing::trace!(
-                table_id,
-                ?created_by_lfid,
-                "Registering created_by MVCC column"
-            );
-            store.ensure_column_registered(created_by_lfid, &DataType::UInt64)?;
-            tracing::trace!(
-                table_id,
-                ?created_by_lfid,
-                has_field = store.has_field(created_by_lfid),
-                "Verified created_by in catalog"
-            );
-
-            let deleted_by_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
-            tracing::trace!(
-                table_id,
-                ?deleted_by_lfid,
-                "Registering deleted_by MVCC column"
-            );
-            store.ensure_column_registered(deleted_by_lfid, &DataType::UInt64)?;
-            tracing::trace!(
-                table_id,
-                ?deleted_by_lfid,
-                has_field = store.has_field(deleted_by_lfid),
-                "Verified deleted_by in catalog"
-            );
-
-            // Verify that we can actually read the descriptors back
-            for column in &column_defs {
-                let logical_field_id = LogicalFieldId::for_user(table_id, column.field_id);
-                if let Err(e) = store.data_type(logical_field_id) {
-                    tracing::error!(table_id, ?logical_field_id, error = ?e, "VERIFICATION FAILED: Cannot read data_type for registered column!");
-                    return Err(e);
-                }
-            }
-
-            tracing::trace!(table_id, "All columns registered and verified in catalog");
-        }
-
-        let existing_constraints = self.metadata.constraint_record_map(table_id)?;
-        let mut next_constraint_id = existing_constraints
-            .keys()
-            .copied()
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-
-        let mut constraint_records: Vec<ConstraintRecord> = Vec::new();
-        let now = current_time_micros();
-
-        let primary_key_fields: Vec<FieldId> = column_defs
+        let table_columns: Vec<TableColumn> = column_defs
             .iter()
-            .filter(|col| col.primary_key)
-            .map(|col| col.field_id)
+            .map(|column| TableColumn {
+                field_id: column.field_id,
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                primary_key: column.primary_key,
+                unique: column.unique,
+                check_expr: column.check_expr.clone(),
+            })
             .collect();
-        if !primary_key_fields.is_empty() {
-            constraint_records.push(ConstraintRecord {
-                constraint_id: next_constraint_id,
-                kind: ConstraintKind::PrimaryKey(PrimaryKeyConstraint {
-                    field_ids: primary_key_fields,
-                }),
-                state: ConstraintState::Active,
-                revision: 1,
-                last_modified_micros: now,
-            });
-            next_constraint_id = next_constraint_id.saturating_add(1);
-        }
-
-        for column in column_defs
-            .iter()
-            .filter(|col| col.unique && !col.primary_key)
-        {
-            constraint_records.push(ConstraintRecord {
-                constraint_id: next_constraint_id,
-                kind: ConstraintKind::Unique(UniqueConstraint {
-                    field_ids: vec![column.field_id],
-                }),
-                state: ConstraintState::Active,
-                revision: 1,
-                last_modified_micros: now,
-            });
-            next_constraint_id = next_constraint_id.saturating_add(1);
-        }
-
-        if !constraint_records.is_empty() {
-            self.metadata
-                .put_constraint_records(table_id, &constraint_records)?;
-        }
-
+        self.metadata
+            .apply_column_definitions(table_id, &table_columns, now)?;
         self.metadata.flush_table(table_id)?;
+
+        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
 
         let schema = Arc::new(ExecutorSchema {
             columns: column_defs.clone(), // Clone for catalog registration below
@@ -2525,68 +2424,8 @@ where
             );
         }
 
-        if !foreign_keys.is_empty()
-            && let Err(err) = self.register_foreign_keys_for_table(
-                &display_name,
-                &canonical_name,
-                registered_table_id,
-                &column_defs,
-                foreign_keys,
-            )
-        {
-            self.catalog.unregister_table(&canonical_name);
-            self.remove_table_entry(&canonical_name);
-            return Err(err);
-        }
-
-        Ok(RuntimeStatementResult::CreateTable {
-            table_name: display_name,
-        })
-    }
-
-    fn register_foreign_keys_for_table(
-        &self,
-        display_name: &str,
-        canonical_name: &str,
-        table_id: TableId,
-        column_defs: &[ExecutorColumn],
-        foreign_keys: Vec<ForeignKeySpec>,
-    ) -> Result<()> {
-        if foreign_keys.is_empty() {
-            return Ok(());
-        }
-
-        let referencing_columns: Vec<ForeignKeyColumn> = column_defs
-            .iter()
-            .map(|column| ForeignKeyColumn {
-                name: column.name.clone(),
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
-                primary_key: column.primary_key,
-                unique: column.unique,
-                field_id: column.field_id,
-            })
-            .collect();
-
-        let referencing_table = ForeignKeyTableInfo {
-            display_name: display_name.to_string(),
-            canonical_name: canonical_name.to_string(),
-            table_id,
-            columns: referencing_columns,
-        };
-
-        let validated = validate_foreign_keys(&referencing_table, &foreign_keys, |table_name| {
-            let (display, canonical) = canonical_table_name(table_name)?;
-            let referenced_table = self.lookup_table(&canonical).map_err(|_| {
-                Error::InvalidArgumentError(format!(
-                    "referenced table '{}' does not exist",
-                    table_name
-                ))
-            })?;
-
-            let columns = referenced_table
-                .schema
-                .columns
+        if !foreign_keys.is_empty() {
+            let referencing_columns: Vec<ForeignKeyColumn> = column_defs
                 .iter()
                 .map(|column| ForeignKeyColumn {
                     name: column.name.clone(),
@@ -2598,22 +2437,59 @@ where
                 })
                 .collect();
 
-            Ok(ForeignKeyTableInfo {
-                display_name: display,
-                canonical_name: canonical,
-                table_id: referenced_table.table.table_id(),
-                columns,
-            })
-        })?;
+            let referencing_table = ForeignKeyTableInfo {
+                display_name: display_name.clone(),
+                canonical_name: canonical_name.clone(),
+                table_id: registered_table_id,
+                columns: referencing_columns,
+            };
 
-        if validated.is_empty() {
-            return Ok(());
+            let fk_result = self.metadata.validate_and_register_foreign_keys(
+                &referencing_table,
+                &foreign_keys,
+                |table_name| {
+                    let (display, canonical) = canonical_table_name(table_name)?;
+                    let referenced_table = self.lookup_table(&canonical).map_err(|_| {
+                        Error::InvalidArgumentError(format!(
+                            "referenced table '{}' does not exist",
+                            table_name
+                        ))
+                    })?;
+
+                    let columns = referenced_table
+                        .schema
+                        .columns
+                        .iter()
+                        .map(|column| ForeignKeyColumn {
+                            name: column.name.clone(),
+                            data_type: column.data_type.clone(),
+                            nullable: column.nullable,
+                            primary_key: column.primary_key,
+                            unique: column.unique,
+                            field_id: column.field_id,
+                        })
+                        .collect();
+
+                    Ok(ForeignKeyTableInfo {
+                        display_name: display,
+                        canonical_name: canonical,
+                        table_id: referenced_table.table.table_id(),
+                        columns,
+                    })
+                },
+                current_time_micros(),
+            );
+
+            if let Err(err) = fk_result {
+                self.catalog.unregister_table(&canonical_name);
+                self.remove_table_entry(&canonical_name);
+                return Err(err);
+            }
         }
 
-        self.metadata
-            .register_foreign_keys(table_id, &validated, current_time_micros())?;
-
-        Ok(())
+        Ok(RuntimeStatementResult::CreateTable {
+            table_name: display_name,
+        })
     }
 
     fn foreign_keys_for_table(
@@ -2762,44 +2638,34 @@ where
             });
         }
 
-        let table_id = self.reserve_table_id()?;
-        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
+        let table_id = self.metadata.reserve_table_id()?;
+        let now = current_time_micros();
         let table_meta = TableMeta {
             table_id,
             name: Some(display_name.clone()),
-            created_at_micros: current_time_micros(),
+            created_at_micros: now,
             flags: 0,
             epoch: 0,
         };
         self.metadata.set_table_meta(table_id, table_meta)?;
 
-        for column in &column_defs {
-            let column_meta = ColMeta {
-                col_id: column.field_id,
-                name: Some(column.name.clone()),
-                flags: 0,
-                default: None,
-            };
-            self.metadata.set_column_meta(table_id, column_meta)?;
-        }
-
+        let table_columns: Vec<TableColumn> = column_defs
+            .iter()
+            .map(|column| TableColumn {
+                field_id: column.field_id,
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                primary_key: column.primary_key,
+                unique: column.unique,
+                check_expr: column.check_expr.clone(),
+            })
+            .collect();
+        self.metadata
+            .apply_column_definitions(table_id, &table_columns, now)?;
         self.metadata.flush_table(table_id)?;
 
-        // Register all columns in the ColumnStore catalog before appending data
-        {
-            let store = table.store();
-            for column in &column_defs {
-                let logical_field_id = LogicalFieldId::for_user(table_id, column.field_id);
-                store.ensure_column_registered(logical_field_id, &column.data_type)?;
-            }
-
-            // Register MVCC columns
-            let created_by_lfid = LogicalFieldId::for_mvcc_created_by(table_id);
-            store.ensure_column_registered(created_by_lfid, &DataType::UInt64)?;
-
-            let deleted_by_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
-            store.ensure_column_registered(deleted_by_lfid, &DataType::UInt64)?;
-        }
+        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
 
         let schema_arc = Arc::new(ExecutorSchema {
             columns: column_defs.clone(),
@@ -3003,6 +2869,7 @@ where
 
         Ok(())
     }
+
     fn ensure_existing_rows_unique(
         &self,
         table: &ExecutorTable<P>,
@@ -5336,43 +5203,6 @@ where
 
     pub fn is_table_marked_dropped(&self, canonical_name: &str) -> bool {
         self.dropped_tables.read().unwrap().contains(canonical_name)
-    }
-
-    fn reserve_table_id(&self) -> Result<TableId> {
-        let catalog = SysCatalog::new(&self.store);
-
-        let mut next = match catalog.get_next_table_id()? {
-            Some(value) => value,
-            None => {
-                let seed = catalog.max_table_id()?.unwrap_or(CATALOG_TABLE_ID);
-                let initial = seed.checked_add(1).ok_or_else(|| {
-                    Error::InvalidArgumentError("exhausted available table ids".into())
-                })?;
-                catalog.put_next_table_id(initial)?;
-                initial
-            }
-        };
-
-        // Skip any reserved table IDs
-        while llkv_table::reserved::is_reserved_table_id(next) {
-            next = next.checked_add(1).ok_or_else(|| {
-                Error::InvalidArgumentError("exhausted available table ids".into())
-            })?;
-        }
-
-        let mut following = next
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidArgumentError("exhausted available table ids".into()))?;
-
-        // Skip any reserved table IDs for the next allocation
-        while llkv_table::reserved::is_reserved_table_id(following) {
-            following = following.checked_add(1).ok_or_else(|| {
-                Error::InvalidArgumentError("exhausted available table ids".into())
-            })?;
-        }
-
-        catalog.put_next_table_id(following)?;
-        Ok(next)
     }
 }
 
