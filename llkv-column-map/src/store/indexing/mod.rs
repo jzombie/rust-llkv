@@ -115,6 +115,16 @@ pub struct IndexManager<P: Pager> {
     pub(crate) sort_ops: sort::SortIndexOps,
 }
 
+impl<P: Pager> Clone for IndexManager<P> {
+    fn clone(&self) -> Self {
+        Self {
+            pager: Arc::clone(&self.pager),
+            presence_ops: self.presence_ops,
+            sort_ops: self.sort_ops,
+        }
+    }
+}
+
 impl<P: Pager<Blob = EntryHandle>> IndexManager<P> {
     pub(crate) fn new(pager: Arc<P>) -> Self {
         Self {

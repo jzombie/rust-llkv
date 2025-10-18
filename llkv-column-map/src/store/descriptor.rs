@@ -98,6 +98,30 @@ impl ColumnDescriptor {
         {
             Some(GetResult::Raw { bytes, .. }) => {
                 let descriptor = ColumnDescriptor::from_le_bytes(bytes.as_ref());
+
+                // If the descriptor has been cleared (head_page_pk == 0), we need to reinitialize it
+                if descriptor.head_page_pk == 0 {
+                    tracing::debug!(
+                        ?field_id,
+                        descriptor_pk,
+                        "load_or_create: descriptor exists but is empty (head_page_pk == 0), reinitializing"
+                    );
+                    let first_page_pk = pager.alloc_many(1)?[0];
+                    let descriptor = ColumnDescriptor {
+                        field_id,
+                        head_page_pk: first_page_pk,
+                        tail_page_pk: first_page_pk,
+                        ..descriptor // Preserve other fields like registered indices
+                    };
+                    let header = DescriptorPageHeader {
+                        next_page_pk: 0,
+                        entry_count: 0,
+                        _padding: [0; 4],
+                    };
+                    let tail_page_bytes = header.to_le_bytes().to_vec();
+                    return Ok((descriptor, tail_page_bytes));
+                }
+
                 let tail_page_bytes = pager
                     .batch_get(&[BatchGet::Raw {
                         key: descriptor.tail_page_pk,
@@ -107,7 +131,14 @@ impl ColumnDescriptor {
                         GetResult::Raw { bytes, .. } => Some(bytes),
                         _ => None,
                     })
-                    .ok_or(Error::NotFound)?
+                    .ok_or_else(|| {
+                        tracing::error!(
+                            descriptor_pk,
+                            tail_page_pk = descriptor.tail_page_pk,
+                            "load_or_create: missing tail page"
+                        );
+                        Error::NotFound
+                    })?
                     .as_ref()
                     .to_vec();
                 Ok((descriptor, tail_page_bytes))

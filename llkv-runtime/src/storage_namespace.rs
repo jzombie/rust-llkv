@@ -9,7 +9,8 @@ use llkv_transaction::TransactionResult;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::{RuntimeContext, RuntimeStatementResult, canonical_table_name};
+use crate::{RuntimeContext, RuntimeStatementResult};
+use llkv_table::canonical_table_name;
 
 pub type NamespaceId = String;
 

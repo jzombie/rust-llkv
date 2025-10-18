@@ -28,7 +28,7 @@ impl Index for SortIndex {
 }
 
 /// Concrete implementation of sort index operations.
-#[derive(Default)]
+#[derive(Default, Copy, Clone)]
 pub struct SortIndexOps;
 
 impl<P: Pager<Blob = EntryHandle>> IndexOps<P> for SortIndexOps {

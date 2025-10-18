@@ -11,7 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 
 use crate::constants::STREAM_BATCH_ROWS;
-use llkv_column_map::store::{GatherNullPolicy, Projection, ROW_ID_COLUMN_NAME};
+use llkv_column_map::store::{GatherNullPolicy, IndexKind, Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{ColumnStore, types::LogicalFieldId};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -57,7 +57,7 @@ pub struct Table<P = MemPager>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    store: ColumnStore<P>,
+    store: Arc<ColumnStore<P>>,
     table_id: TableId,
     /// Cache of MVCC column presence. Initialized lazily on first schema() call.
     /// None means not yet initialized.
@@ -268,10 +268,60 @@ where
         );
         let store = ColumnStore::open(pager)?;
         Ok(Self {
+            store: Arc::new(store),
+            table_id,
+            mvcc_cache: RwLock::new(None),
+        })
+    }
+
+    /// Create a new `Table` instance using a shared `ColumnStore`.
+    ///
+    /// This is preferred when multiple tables share the same runtime context, as it ensures
+    /// they all use the same ColumnStore catalog instance, avoiding synchronization issues.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table ID is reserved (e.g., table 0).
+    pub fn new_with_store(table_id: TableId, store: Arc<ColumnStore<P>>) -> LlkvResult<Self> {
+        if is_reserved_table_id(table_id) {
+            return Err(Error::ReservedTableId(table_id));
+        }
+
+        Ok(Self {
             store,
             table_id,
             mvcc_cache: RwLock::new(None),
         })
+    }
+
+    /// Register a persisted sort index for the specified user column.
+    pub fn register_sort_index(&self, field_id: FieldId) -> LlkvResult<()> {
+        let logical_field_id = LogicalFieldId::for_user(self.table_id, field_id);
+        self.store
+            .register_index(logical_field_id, IndexKind::Sort)?;
+        Ok(())
+    }
+
+    /// Remove a persisted sort index for the specified user column if it exists.
+    pub fn unregister_sort_index(&self, field_id: FieldId) -> LlkvResult<()> {
+        let logical_field_id = LogicalFieldId::for_user(self.table_id, field_id);
+        match self
+            .store
+            .unregister_index(logical_field_id, IndexKind::Sort)
+        {
+            Ok(()) | Err(Error::NotFound) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// List the persisted index kinds registered for the given user column.
+    pub fn list_registered_indexes(&self, field_id: FieldId) -> LlkvResult<Vec<IndexKind>> {
+        let logical_field_id = LogicalFieldId::for_user(self.table_id, field_id);
+        match self.store.list_persisted_indexes(logical_field_id) {
+            Ok(kinds) => Ok(kinds),
+            Err(Error::NotFound) => Ok(Vec::new()),
+            Err(err) => Err(err),
+        }
     }
 
     /// Get or initialize the MVCC column cache from the provided schema.
@@ -442,7 +492,7 @@ where
                     flags: 0,
                     default: None,
                 };
-                self.put_col_meta(&meta);
+                self.catalog().put_col_meta(self.table_id, &meta);
             }
         }
 
@@ -502,7 +552,41 @@ where
 
         let new_schema = Arc::new(Schema::new(new_fields));
         let namespaced_batch = RecordBatch::try_new(new_schema, new_columns)?;
-        self.store.append(&namespaced_batch)
+
+        tracing::trace!(
+            table_id = self.table_id,
+            num_columns = namespaced_batch.num_columns(),
+            num_rows = namespaced_batch.num_rows(),
+            "Attempting append to table"
+        );
+
+        if let Err(err) = self.store.append(&namespaced_batch) {
+            let batch_field_ids: Vec<LogicalFieldId> = namespaced_batch
+                .schema()
+                .fields()
+                .iter()
+                .filter_map(|f| f.metadata().get(crate::constants::FIELD_ID_META_KEY))
+                .filter_map(|s| s.parse::<u64>().ok())
+                .map(LogicalFieldId::from)
+                .collect();
+
+            // Check which fields are missing from the catalog
+            let missing_fields: Vec<LogicalFieldId> = batch_field_ids
+                .iter()
+                .filter(|&&field_id| !self.store.has_field(field_id))
+                .copied()
+                .collect();
+
+            tracing::error!(
+                table_id = self.table_id,
+                error = ?err,
+                batch_field_ids = ?batch_field_ids,
+                missing_from_catalog = ?missing_fields,
+                "Append failed - some fields missing from catalog"
+            );
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Stream one or more projected columns as a sequence of RecordBatches.
@@ -553,19 +637,8 @@ where
     }
 
     #[inline]
-    pub fn put_table_meta(&self, meta: &TableMeta) {
-        debug_assert_eq!(meta.table_id, self.table_id);
-        self.catalog().put_table_meta(meta);
-    }
-
-    #[inline]
     pub fn get_table_meta(&self) -> Option<TableMeta> {
         self.catalog().get_table_meta(self.table_id)
-    }
-
-    #[inline]
-    pub fn put_col_meta(&self, meta: &ColMeta) {
-        self.catalog().put_col_meta(self.table_id, meta);
     }
 
     #[inline]

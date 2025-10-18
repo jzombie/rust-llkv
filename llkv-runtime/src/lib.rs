@@ -25,6 +25,7 @@
 //! - `deleted_by`: Transaction ID that deleted the row (or `TXN_ID_NONE`)
 //!
 //! The runtime ensures these columns are injected and managed consistently.
+
 #![forbid(unsafe_code)]
 
 pub mod storage_namespace;
@@ -51,13 +52,19 @@ use llkv_column_map::store::{
 };
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
-// Literal is not used at top-level; keep it out to avoid unused import warnings.
 use llkv_result::Error;
 use llkv_storage::pager::{BoxedPager, MemPager, Pager};
 use llkv_table::catalog::{FieldConstraints, FieldDefinition, TableCatalog};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
-use llkv_table::{CATALOG_TABLE_ID, ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta};
+use llkv_table::{
+    ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo, MetadataManager,
+    MultiColumnUniqueEntryMeta, SysCatalog, TableColumn, TableMeta, UniqueKey,
+    build_composite_unique_key, canonical_table_name,
+    constraints::{ConstraintKind, ForeignKeyAction as CatalogForeignKeyAction},
+    ensure_multi_column_unique, ensure_primary_key, ensure_single_column_unique,
+    resolve_table_name, validate_check_constraints,
+};
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName, ObjectNamePart, Select,
@@ -67,6 +74,9 @@ use sqlparser::ast::{
 use time::{Date, Month};
 
 pub type Result<T> = llkv_result::Result<T>;
+
+/// Type alias for child table references: (name, canonical_name, table)
+type ChildTableRefs<P> = Vec<(String, String, Arc<ExecutorTable<P>>)>;
 
 // Re-export plan structures from llkv-plan
 pub use llkv_plan::{
@@ -98,9 +108,6 @@ use llkv_transaction::TransactionSession;
 // Note: RuntimeSession is the high-level wrapper that users should use instead of the lower-level TransactionSession API
 
 /// Helper functions for MVCC column injection.
-///
-/// These functions consolidate the repeated logic for adding MVCC metadata columns
-/// (row_id, created_by, deleted_by) to RecordBatches.
 mod mvcc_columns {
     use super::*;
     use std::collections::HashMap;
@@ -182,20 +189,6 @@ mod mvcc_columns {
     }
 }
 
-#[derive(Hash, Eq, PartialEq, Debug, Clone)]
-enum UniqueKey {
-    Int(i64),
-    Float(u64),
-    Str(String),
-    Composite(Vec<UniqueKey>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct StoredMultiColumnUnique {
-    index_name: Option<String>,
-    field_ids: Vec<FieldId>,
-}
-
 struct PrimaryKeyUpdateContext<'a> {
     indices: &'a [usize],
     names: &'a [String],
@@ -214,42 +207,9 @@ struct ForeignKeyMetadata {
     referenced_display: String,
     referenced_field_ids: Vec<FieldId>,
     referenced_column_names: Vec<String>,
+    referenced_table_id: TableId,
     on_delete: ForeignKeyAction,
-    _on_update: ForeignKeyAction,
-}
-
-#[derive(Default)]
-struct ForeignKeyRegistry {
-    by_child: FxHashMap<String, Vec<ForeignKeyMetadata>>,
-}
-
-impl ForeignKeyRegistry {
-    fn add(&mut self, child: String, metadata: ForeignKeyMetadata) {
-        self.by_child.entry(child).or_default().push(metadata);
-    }
-
-    fn child_constraints(&self, child: &str) -> Vec<ForeignKeyMetadata> {
-        self.by_child.get(child).cloned().unwrap_or_default()
-    }
-
-    fn referencing_constraints(&self, parent: &str) -> Vec<(String, ForeignKeyMetadata)> {
-        let mut out = Vec::new();
-        for (child, metas) in &self.by_child {
-            for meta in metas {
-                if meta.referenced_table == parent {
-                    out.push((child.clone(), meta.clone()));
-                }
-            }
-        }
-        out
-    }
-
-    fn remove_table(&mut self, canonical: &str) {
-        self.by_child.remove(canonical);
-        for metas in self.by_child.values_mut() {
-            metas.retain(|meta| meta.referenced_table != canonical);
-        }
-    }
+    on_update: ForeignKeyAction,
 }
 
 /// Result of running a plan statement.
@@ -1315,10 +1275,12 @@ where
     pager: Arc<P>,
     tables: RwLock<FxHashMap<String, Arc<ExecutorTable<P>>>>,
     dropped_tables: RwLock<FxHashSet<String>>,
-    multi_column_uniques: RwLock<FxHashMap<String, Vec<StoredMultiColumnUnique>>>,
-    foreign_keys: RwLock<ForeignKeyRegistry>,
+    metadata: Arc<MetadataManager<P>>,
     // Centralized catalog for table/field name resolution
     catalog: Arc<TableCatalog>,
+    // Shared column store for all tables in this context
+    // This ensures catalog state is synchronized across all tables
+    store: Arc<ColumnStore<P>>,
     // Transaction manager for session-based transactions
     transaction_manager:
         TransactionManager<RuntimeContextWrapper<P>, RuntimeContextWrapper<MemPager>>,
@@ -1341,99 +1303,60 @@ where
     fn new_with_catalog_inner(pager: Arc<P>, shared_catalog: Option<Arc<TableCatalog>>) -> Self {
         tracing::trace!("RuntimeContext::new called, pager={:p}", &*pager);
 
-        // Load transaction state and table registry from catalog if it exists
-        let (next_txn_id, last_committed, loaded_tables, persisted_unique_metas) =
-            match ColumnStore::open(Arc::clone(&pager)) {
-                Ok(store) => {
-                    let catalog = SysCatalog::new(&store);
-                    let next_txn_id = match catalog.get_next_txn_id() {
-                        Ok(Some(id)) => {
-                            tracing::debug!("[CONTEXT] Loaded next_txn_id={} from catalog", id);
-                            id
-                        }
-                        Ok(None) => {
-                            tracing::debug!(
-                                "[CONTEXT] No persisted next_txn_id found, starting from default"
-                            );
-                            TXN_ID_AUTO_COMMIT + 1
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "[CONTEXT] Failed to load next_txn_id: {}, using default",
-                                e
-                            );
-                            TXN_ID_AUTO_COMMIT + 1
-                        }
-                    };
-                    let last_committed = match catalog.get_last_committed_txn_id() {
-                        Ok(Some(id)) => {
-                            tracing::debug!("[CONTEXT] Loaded last_committed={} from catalog", id);
-                            id
-                        }
-                        Ok(None) => {
-                            tracing::debug!(
-                                "[CONTEXT] No persisted last_committed found, starting from default"
-                            );
-                            TXN_ID_AUTO_COMMIT
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "[CONTEXT] Failed to load last_committed: {}, using default",
-                                e
-                            );
-                            TXN_ID_AUTO_COMMIT
-                        }
-                    };
+        let store = ColumnStore::open(Arc::clone(&pager)).expect("failed to open ColumnStore");
+        let catalog = SysCatalog::new(&store);
 
-                    // Load table registry from catalog
-                    let loaded_tables = match catalog.all_table_metas() {
-                        Ok(metas) => {
-                            tracing::debug!(
-                                "[CONTEXT] Loaded {} table(s) from catalog",
-                                metas.len()
-                            );
-                            metas
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "[CONTEXT] Failed to load table metas: {}, starting with empty registry",
-                                e
-                            );
-                            Vec::new()
-                        }
-                    };
+        let next_txn_id = match catalog.get_next_txn_id() {
+            Ok(Some(id)) => {
+                tracing::debug!("[CONTEXT] Loaded next_txn_id={} from catalog", id);
+                id
+            }
+            Ok(None) => {
+                tracing::debug!("[CONTEXT] No persisted next_txn_id found, starting from default");
+                TXN_ID_AUTO_COMMIT + 1
+            }
+            Err(e) => {
+                tracing::warn!("[CONTEXT] Failed to load next_txn_id: {}, using default", e);
+                TXN_ID_AUTO_COMMIT + 1
+            }
+        };
 
-                    let persisted_unique_metas = match catalog.all_multi_column_unique_metas() {
-                        Ok(entries) => entries,
-                        Err(e) => {
-                            tracing::warn!(
-                                "[CONTEXT] Failed to load multi-column unique metas: {}, starting with empty set",
-                                e
-                            );
-                            Vec::new()
-                        }
-                    };
+        let last_committed = match catalog.get_last_committed_txn_id() {
+            Ok(Some(id)) => {
+                tracing::debug!("[CONTEXT] Loaded last_committed={} from catalog", id);
+                id
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    "[CONTEXT] No persisted last_committed found, starting from default"
+                );
+                TXN_ID_AUTO_COMMIT
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[CONTEXT] Failed to load last_committed: {}, using default",
+                    e
+                );
+                TXN_ID_AUTO_COMMIT
+            }
+        };
 
-                    (
-                        next_txn_id,
-                        last_committed,
-                        loaded_tables,
-                        persisted_unique_metas,
-                    )
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "[CONTEXT] Failed to open ColumnStore: {}, using default state",
-                        e
-                    );
-                    (
-                        TXN_ID_AUTO_COMMIT + 1,
-                        TXN_ID_AUTO_COMMIT,
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                }
-            };
+        let store_arc = Arc::new(store);
+        let metadata = Arc::new(MetadataManager::new(Arc::clone(&store_arc)));
+
+        let loaded_tables = match metadata.all_table_metas() {
+            Ok(metas) => {
+                tracing::debug!("[CONTEXT] Loaded {} table(s) from catalog", metas.len());
+                metas
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[CONTEXT] Failed to load table metas: {}, starting with empty registry",
+                    e
+                );
+                Vec::new()
+            }
+        };
 
         let transaction_manager =
             TransactionManager::new_with_initial_state(next_txn_id, last_committed);
@@ -1464,43 +1387,6 @@ where
             "[CONTEXT] Initialized with lazy loading for {} table(s)",
             loaded_tables.len()
         );
-
-        let mut canonical_by_id: FxHashMap<TableId, String> = FxHashMap::default();
-        for (table_id, table_meta) in &loaded_tables {
-            if let Some(ref table_name) = table_meta.name {
-                canonical_by_id.insert(*table_id, table_name.to_ascii_lowercase());
-            }
-        }
-
-        let mut persisted_multi: FxHashMap<String, Vec<StoredMultiColumnUnique>> =
-            FxHashMap::default();
-        for meta in persisted_unique_metas {
-            if meta.uniques.is_empty() {
-                continue;
-            }
-            let Some(canonical_name) = canonical_by_id.get(&meta.table_id) else {
-                tracing::debug!(
-                    "[CONTEXT] Skipping persisted multi-column UNIQUE metadata for unknown table_id={}",
-                    meta.table_id
-                );
-                continue;
-            };
-
-            let mut stored_entries = Vec::with_capacity(meta.uniques.len());
-            for entry in meta.uniques {
-                if entry.column_ids.is_empty() {
-                    continue;
-                }
-                stored_entries.push(StoredMultiColumnUnique {
-                    index_name: entry.index_name,
-                    field_ids: entry.column_ids,
-                });
-            }
-
-            if !stored_entries.is_empty() {
-                persisted_multi.insert(canonical_name.clone(), stored_entries);
-            }
-        }
 
         // Initialize catalog and populate with existing tables
         let (catalog, is_shared_catalog) = match shared_catalog {
@@ -1539,9 +1425,9 @@ where
             pager,
             tables: RwLock::new(FxHashMap::default()), // Start with empty table cache
             dropped_tables: RwLock::new(FxHashSet::default()),
-            multi_column_uniques: RwLock::new(persisted_multi),
-            foreign_keys: RwLock::new(ForeignKeyRegistry::default()),
+            metadata,
             catalog,
+            store: store_arc,
             transaction_manager,
             txn_manager,
             txn_tables_with_new_rows: RwLock::new(FxHashMap::default()),
@@ -1555,8 +1441,7 @@ where
 
     /// Persist the next_txn_id to the catalog.
     pub fn persist_next_txn_id(&self, next_txn_id: TxnId) -> Result<()> {
-        let store = ColumnStore::open(Arc::clone(&self.pager))?;
-        let catalog = SysCatalog::new(&store);
+        let catalog = SysCatalog::new(&self.store);
         catalog.put_next_txn_id(next_txn_id)?;
         let last_committed = self.txn_manager.last_committed();
         catalog.put_last_committed_txn_id(last_committed)?;
@@ -1568,37 +1453,19 @@ where
         Ok(())
     }
 
-    fn persist_multi_column_uniques(
-        &self,
-        table_id: TableId,
-        entries: &[StoredMultiColumnUnique],
-    ) -> Result<()> {
-        let store = ColumnStore::open(Arc::clone(&self.pager))?;
-        let catalog = SysCatalog::new(&store);
-        let metas: Vec<MultiColumnUniqueEntryMeta> = entries
-            .iter()
-            .map(|entry| MultiColumnUniqueEntryMeta {
-                index_name: entry.index_name.clone(),
-                column_ids: entry.field_ids.clone(),
-            })
-            .collect();
-        catalog.put_multi_column_uniques(table_id, &metas)?;
-        Ok(())
-    }
-
     fn build_executor_multi_column_uniques(
         table: &ExecutorTable<P>,
-        stored: &[StoredMultiColumnUnique],
+        stored: &[MultiColumnUniqueEntryMeta],
     ) -> Vec<ExecutorMultiColumnUnique> {
         let mut results = Vec::with_capacity(stored.len());
 
         'outer: for entry in stored {
-            if entry.field_ids.is_empty() {
+            if entry.column_ids.is_empty() {
                 continue;
             }
 
-            let mut column_indices = Vec::with_capacity(entry.field_ids.len());
-            for field_id in &entry.field_ids {
+            let mut column_indices = Vec::with_capacity(entry.column_ids.len());
+            for field_id in &entry.column_ids {
                 if let Some((idx, _)) = table
                     .schema
                     .columns
@@ -1741,10 +1608,6 @@ where
         if is_dropped {
             self.remove_table_entry(&canonical_name);
             self.dropped_tables.write().unwrap().remove(&canonical_name);
-            self.multi_column_uniques
-                .write()
-                .unwrap()
-                .remove(&canonical_name);
         }
 
         if exists {
@@ -1754,10 +1617,6 @@ where
                     display_name
                 );
                 self.remove_table_entry(&canonical_name);
-                self.multi_column_uniques
-                    .write()
-                    .unwrap()
-                    .remove(&canonical_name);
             } else if if_not_exists {
                 tracing::trace!(
                     "DEBUG create_table_plan: table '{}' exists and if_not_exists=true, returning early WITHOUT creating",
@@ -1850,13 +1709,7 @@ where
             let field_id = field_ids[0];
             let column_name = column_names[0].clone();
             let table_id = table.table.table_id();
-            let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
-            let store = ColumnStore::open(Arc::clone(&self.pager))?;
-            let existing_indexes = match store.list_persisted_indexes(logical_field_id) {
-                Ok(kinds) => kinds,
-                Err(Error::NotFound) => Vec::new(),
-                Err(err) => return Err(err),
-            };
+            let existing_indexes = table.table.list_registered_indexes(field_id)?;
 
             if existing_indexes.contains(&IndexKind::Sort) {
                 if plan.if_not_exists {
@@ -1873,7 +1726,10 @@ where
             }
 
             if plan.unique {
-                self.ensure_existing_rows_unique(table.as_ref(), field_id, &column_name)?;
+                let snapshot = self.default_snapshot();
+                let existing_values =
+                    self.scan_column_values(table.as_ref(), field_id, snapshot)?;
+                ensure_single_column_unique(&existing_values, &[], &column_name)?;
                 if let Some(table_id) = self.catalog.table_id(&canonical_name)
                     && let Some(resolver) = self.catalog.field_resolver(table_id)
                 {
@@ -1881,7 +1737,8 @@ where
                 }
             }
 
-            store.register_index(logical_field_id, IndexKind::Sort)?;
+            self.metadata.register_sort_index(table_id, field_id)?;
+            self.metadata.flush_table(table_id)?;
 
             if let Some(updated_table) =
                 Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)
@@ -1908,23 +1765,19 @@ where
             ));
         }
 
+        let table_id = table.table.table_id();
+
         if let Some(existing) = self
-            .multi_column_uniques
-            .read()
-            .unwrap()
-            .get(&canonical_name)
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|entry| entry.field_ids == field_ids)
-                    .cloned()
-            })
+            .metadata
+            .multi_column_uniques(table_id)?
+            .into_iter()
+            .find(|entry| entry.column_ids == field_ids)
         {
             if plan.if_not_exists {
                 drop(table);
                 return Ok(RuntimeStatementResult::CreateIndex {
                     table_name: display_name,
-                    index_name: existing.index_name.clone(),
+                    index_name: existing.index_name,
                 });
             }
 
@@ -1934,28 +1787,36 @@ where
             )));
         }
 
-        self.ensure_existing_rows_unique_multi(table.as_ref(), &field_ids, &column_names)?;
+        let snapshot = self.default_snapshot();
+        let existing_rows = self.scan_multi_column_values(table.as_ref(), &field_ids, snapshot)?;
+        ensure_multi_column_unique(&existing_rows, &[], &column_names)?;
 
         let executor_entry = ExecutorMultiColumnUnique {
             index_name: index_name.clone(),
             column_indices: column_indices.clone(),
         };
 
-        let mut entries_to_persist = {
-            let guard = self.multi_column_uniques.read().unwrap();
-            guard.get(&canonical_name).cloned().unwrap_or_default()
-        };
+        let mut duplicate_index_name: Option<Option<String>> = None;
+        let mut inserted = false;
+        self.metadata
+            .update_multi_column_uniques(table_id, |entries| {
+                if let Some(existing) = entries.iter().find(|entry| entry.column_ids == field_ids) {
+                    duplicate_index_name = Some(existing.index_name.clone());
+                } else {
+                    entries.push(MultiColumnUniqueEntryMeta {
+                        index_name: index_name.clone(),
+                        column_ids: field_ids.clone(),
+                    });
+                    inserted = true;
+                }
+            })?;
 
-        if entries_to_persist
-            .iter()
-            .any(|existing| existing.field_ids == field_ids)
-        {
-            // Race condition guard: another thread inserted the same index after the initial check.
+        if !inserted {
             if plan.if_not_exists {
                 drop(table);
                 return Ok(RuntimeStatementResult::CreateIndex {
                     table_name: display_name,
-                    index_name: index_name.clone(),
+                    index_name: duplicate_index_name.flatten(),
                 });
             }
             return Err(Error::CatalogError(format!(
@@ -1964,19 +1825,7 @@ where
             )));
         }
 
-        let stored_entry = StoredMultiColumnUnique {
-            index_name: index_name.clone(),
-            field_ids: field_ids.clone(),
-        };
-        entries_to_persist.push(stored_entry.clone());
-
-        self.persist_multi_column_uniques(table.table.table_id(), &entries_to_persist)?;
-
-        {
-            let mut guard = self.multi_column_uniques.write().unwrap();
-            guard.insert(canonical_name.clone(), entries_to_persist);
-        }
-
+        self.metadata.flush_table(table_id)?;
         table.add_multi_column_unique(executor_entry);
 
         Ok(RuntimeStatementResult::CreateIndex {
@@ -2131,6 +1980,10 @@ where
                     .map(|_| "OK")
                     .map_err(|e| format!("{:?}", e))
             );
+        }
+
+        if matches!(result, Err(Error::NotFound)) {
+            panic!("insert yielded Error::NotFound for table {}", display_name);
         }
 
         result
@@ -2442,11 +2295,6 @@ where
             ));
         }
 
-        self.multi_column_uniques
-            .write()
-            .unwrap()
-            .remove(&canonical_name);
-
         let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(columns.len());
         let mut lookup = FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
         for (idx, column) in columns.iter().enumerate() {
@@ -2485,36 +2333,40 @@ where
             );
         }
 
-        let table_id = self.reserve_table_id()?;
+        let table_id = self.metadata.reserve_table_id()?;
         tracing::trace!(
             "=== TABLE '{}' CREATED WITH table_id={} pager={:p} ===",
             display_name,
             table_id,
             &*self.pager
         );
-        let table = Table::new(table_id, Arc::clone(&self.pager))?;
-        table.put_table_meta(&TableMeta {
+        let now = current_time_micros();
+        let table_meta = TableMeta {
             table_id,
             name: Some(display_name.clone()),
-            created_at_micros: current_time_micros(),
+            created_at_micros: now,
             flags: 0,
             epoch: 0,
-        });
+        };
+        self.metadata.set_table_meta(table_id, table_meta)?;
 
-        for column in &column_defs {
-            table.put_col_meta(&ColMeta {
-                col_id: column.field_id,
-                name: Some(column.name.clone()),
-                flags: 0,
-                default: None,
-            });
-        }
+        let table_columns: Vec<TableColumn> = column_defs
+            .iter()
+            .map(|column| TableColumn {
+                field_id: column.field_id,
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                primary_key: column.primary_key,
+                unique: column.unique,
+                check_expr: column.check_expr.clone(),
+            })
+            .collect();
+        self.metadata
+            .apply_column_definitions(table_id, &table_columns, now)?;
+        self.metadata.flush_table(table_id)?;
 
-        let store = ColumnStore::open(Arc::clone(&self.pager))?;
-        for column in &column_defs {
-            let logical_field_id = LogicalFieldId::for_user(table_id, column.field_id);
-            store.ensure_column_registered(logical_field_id, &column.data_type)?;
-        }
+        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
 
         let schema = Arc::new(ExecutorSchema {
             columns: column_defs.clone(), // Clone for catalog registration below
@@ -2574,17 +2426,67 @@ where
             );
         }
 
-        if !foreign_keys.is_empty()
-            && let Err(err) = self.register_foreign_keys_for_table(
-                &display_name,
-                &canonical_name,
-                &column_defs,
-                foreign_keys,
-            )
-        {
-            self.catalog.unregister_table(&canonical_name);
-            self.remove_table_entry(&canonical_name);
-            return Err(err);
+        if !foreign_keys.is_empty() {
+            let referencing_columns: Vec<ForeignKeyColumn> = column_defs
+                .iter()
+                .map(|column| ForeignKeyColumn {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                    primary_key: column.primary_key,
+                    unique: column.unique,
+                    field_id: column.field_id,
+                })
+                .collect();
+
+            let referencing_table = ForeignKeyTableInfo {
+                display_name: display_name.clone(),
+                canonical_name: canonical_name.clone(),
+                table_id: registered_table_id,
+                columns: referencing_columns,
+            };
+
+            let fk_result = self.metadata.validate_and_register_foreign_keys(
+                &referencing_table,
+                &foreign_keys,
+                |table_name| {
+                    let (display, canonical) = canonical_table_name(table_name)?;
+                    let referenced_table = self.lookup_table(&canonical).map_err(|_| {
+                        Error::InvalidArgumentError(format!(
+                            "referenced table '{}' does not exist",
+                            table_name
+                        ))
+                    })?;
+
+                    let columns = referenced_table
+                        .schema
+                        .columns
+                        .iter()
+                        .map(|column| ForeignKeyColumn {
+                            name: column.name.clone(),
+                            data_type: column.data_type.clone(),
+                            nullable: column.nullable,
+                            primary_key: column.primary_key,
+                            unique: column.unique,
+                            field_id: column.field_id,
+                        })
+                        .collect();
+
+                    Ok(ForeignKeyTableInfo {
+                        display_name: display,
+                        canonical_name: canonical,
+                        table_id: referenced_table.table.table_id(),
+                        columns,
+                    })
+                },
+                current_time_micros(),
+            );
+
+            if let Err(err) = fk_result {
+                self.catalog.unregister_table(&canonical_name);
+                self.remove_table_entry(&canonical_name);
+                return Err(err);
+            }
         }
 
         Ok(RuntimeStatementResult::CreateTable {
@@ -2592,206 +2494,103 @@ where
         })
     }
 
-    fn register_foreign_keys_for_table(
+    fn foreign_keys_for_table(
         &self,
+        table: &ExecutorTable<P>,
         display_name: &str,
-        canonical_name: &str,
-        column_defs: &[ExecutorColumn],
-        foreign_keys: Vec<ForeignKeySpec>,
-    ) -> Result<()> {
-        if foreign_keys.is_empty() {
-            return Ok(());
+    ) -> Result<Vec<ForeignKeyMetadata>> {
+        let details = self
+            .metadata
+            .foreign_key_details(&self.catalog, table.table.table_id())?;
+
+        if details.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let mut metadata_entries = Vec::with_capacity(foreign_keys.len());
-        for mut spec in foreign_keys {
-            if spec.columns.is_empty() {
-                return Err(Error::InvalidArgumentError(
-                    "FOREIGN KEY requires at least one referencing column".into(),
-                ));
-            }
+        let convert_action = |action: CatalogForeignKeyAction| match action {
+            CatalogForeignKeyAction::NoAction => ForeignKeyAction::NoAction,
+            CatalogForeignKeyAction::Restrict => ForeignKeyAction::Restrict,
+        };
 
-            // Resolve empty referenced_columns to the primary key of the referenced table
-            if spec.referenced_columns.is_empty() {
-                let referenced_table_canonical = spec.referenced_table.to_ascii_lowercase();
-                let referenced_table =
-                    self.lookup_table(&referenced_table_canonical)
-                        .map_err(|_| {
-                            Error::InvalidArgumentError(format!(
-                                "referenced table '{}' does not exist",
-                                spec.referenced_table
-                            ))
-                        })?;
+        let mut entries = Vec::new();
 
-                let primary_key_columns: Vec<&ExecutorColumn> = referenced_table
+        for detail in details {
+            let mut referencing_indices = Vec::with_capacity(detail.referencing_field_ids.len());
+
+            for field_id in &detail.referencing_field_ids {
+                if let Some((idx, _col)) = table
                     .schema
                     .columns
-                    .iter()
-                    .filter(|col| col.primary_key)
-                    .collect();
-
-                if primary_key_columns.is_empty() {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "there is no primary key for referenced table '{}'",
-                        spec.referenced_table
-                    )));
-                }
-
-                if spec.columns.len() != primary_key_columns.len() {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "number of referencing columns ({}) does not match number of referenced primary key columns ({})",
-                        spec.columns.len(),
-                        primary_key_columns.len()
-                    )));
-                }
-
-                spec.referenced_columns = primary_key_columns
-                    .iter()
-                    .map(|col| col.name.clone())
-                    .collect();
-            }
-
-            if spec.referenced_columns.is_empty() {
-                return Err(Error::InvalidArgumentError(
-                    "FOREIGN KEY requires at least one referenced column".into(),
-                ));
-            }
-
-            if spec.columns.len() != spec.referenced_columns.len() {
-                return Err(Error::InvalidArgumentError(
-                    "FOREIGN KEY must reference the same number of columns".into(),
-                ));
-            }
-
-            let mut seen_referencing = FxHashSet::default();
-            for column_name in &spec.columns {
-                let normalized = column_name.to_ascii_lowercase();
-                if !seen_referencing.insert(normalized.clone()) {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "duplicate column '{}' in FOREIGN KEY constraint",
-                        column_name
-                    )));
-                }
-
-                if !column_defs
-                    .iter()
-                    .any(|col| col.name.eq_ignore_ascii_case(column_name))
-                {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "unknown column '{}' in FOREIGN KEY constraint on table '{}'",
-                        column_name, display_name
-                    )));
-                }
-            }
-
-            let mut seen_referenced = FxHashSet::default();
-            for column_name in &spec.referenced_columns {
-                let normalized = column_name.to_ascii_lowercase();
-                if !seen_referenced.insert(normalized.clone()) {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "duplicate referenced column '{}' in FOREIGN KEY constraint",
-                        column_name
-                    )));
-                }
-            }
-
-            let mut referencing_indices = Vec::with_capacity(spec.columns.len());
-            let mut referencing_field_ids = Vec::with_capacity(spec.columns.len());
-            let mut referencing_column_names = Vec::with_capacity(spec.columns.len());
-            for column_name in &spec.columns {
-                let (idx, column) = column_defs
                     .iter()
                     .enumerate()
-                    .find(|(_, col)| col.name.eq_ignore_ascii_case(column_name))
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "unknown column '{}' in FOREIGN KEY constraint",
-                            column_name
-                        ))
-                    })?;
-                referencing_indices.push(idx);
-                referencing_field_ids.push(column.field_id);
-                referencing_column_names.push(column.name.clone());
-            }
-
-            let (referenced_display, referenced_canonical) =
-                canonical_table_name(&spec.referenced_table)?;
-            let referenced_table = self.lookup_table(&referenced_canonical)?;
-
-            let mut referenced_field_ids = Vec::with_capacity(spec.referenced_columns.len());
-            let mut referenced_column_names = Vec::with_capacity(spec.referenced_columns.len());
-            for column_name in &spec.referenced_columns {
-                let column = referenced_table
-                    .schema
-                    .columns
-                    .iter()
-                    .find(|col| col.name.eq_ignore_ascii_case(column_name))
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "unknown referenced column '{}' in table '{}'",
-                            column_name, referenced_display
-                        ))
-                    })?;
-
-                if !column.primary_key && !column.unique {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "FOREIGN KEY references column '{}' in table '{}' that is not UNIQUE or PRIMARY KEY",
-                        column_name, referenced_display
+                    .find(|(_, col)| &col.field_id == field_id)
+                {
+                    referencing_indices.push(idx);
+                } else {
+                    return Err(Error::Internal(format!(
+                        "referenced field id {} not found in table '{}'",
+                        field_id, display_name
                     )));
                 }
-
-                referenced_field_ids.push(column.field_id);
-                referenced_column_names.push(column.name.clone());
             }
 
-            for (&child_idx, &parent_field_id) in
-                referencing_indices.iter().zip(&referenced_field_ids)
-            {
-                let child_col = &column_defs[child_idx];
-                let parent_col = referenced_table
-                    .schema
-                    .columns
-                    .iter()
-                    .find(|col| col.field_id == parent_field_id)
-                    .expect("referenced column field id must exist");
-
-                if child_col.data_type != parent_col.data_type {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "FOREIGN KEY column '{}' type {:?} does not match referenced column '{}' type {:?}",
-                        child_col.name, child_col.data_type, parent_col.name, parent_col.data_type
-                    )));
-                }
-
-                if child_col.nullable && !parent_col.nullable {
-                    // allowed; child nullable referencing non-null parent is okay
-                }
-            }
-
-            metadata_entries.push(ForeignKeyMetadata {
-                constraint_name: spec.name.clone(),
-                referencing_display: display_name.to_string(),
+            entries.push(ForeignKeyMetadata {
+                constraint_name: None,
+                referencing_display: detail.referencing_table_display.clone(),
                 referencing_column_indices: referencing_indices,
-                referencing_field_ids,
-                referencing_column_names,
-                referenced_table: referenced_canonical,
-                referenced_display,
-                referenced_field_ids,
-                referenced_column_names,
-                on_delete: spec.on_delete.clone(),
-                _on_update: spec.on_update.clone(),
+                referencing_field_ids: detail.referencing_field_ids.clone(),
+                referencing_column_names: detail.referencing_column_names.clone(),
+                referenced_table: detail.referenced_table_canonical.clone(),
+                referenced_display: detail.referenced_table_display.clone(),
+                referenced_field_ids: detail.referenced_field_ids.clone(),
+                referenced_column_names: detail.referenced_column_names.clone(),
+                referenced_table_id: detail.referenced_table_id,
+                on_delete: convert_action(detail.on_delete),
+                on_update: convert_action(detail.on_update),
             });
         }
 
-        if metadata_entries.is_empty() {
-            return Ok(());
+        Ok(entries)
+    }
+
+    fn referencing_child_tables(
+        &self,
+        parent_table_id: TableId,
+        parent_canonical: &str,
+    ) -> Result<ChildTableRefs<P>> {
+        let referencing = self.metadata.foreign_keys_referencing(parent_table_id)?;
+
+        if referencing.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let mut registry = self.foreign_keys.write().unwrap();
-        for entry in metadata_entries {
-            registry.add(canonical_name.to_string(), entry);
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        let mut out = Vec::new();
+
+        for (child_table_id, _) in referencing {
+            let (display_name, canonical_name) =
+                resolve_table_name(&self.catalog, &self.metadata, child_table_id)?;
+
+            if canonical_name == parent_canonical && child_table_id != parent_table_id {
+                // Same canonical but different id (unlikely); still consider.
+            }
+
+            if self.is_table_marked_dropped(&canonical_name) {
+                continue;
+            }
+
+            let table = match self.lookup_table(&canonical_name) {
+                Ok(table) => table,
+                Err(Error::CatalogError(msg)) if msg.contains("does not exist") => continue,
+                Err(err) => return Err(err),
+            };
+
+            if seen.insert(canonical_name.clone()) {
+                out.push((canonical_name, display_name, table));
+            }
         }
 
-        Ok(())
+        Ok(out)
     }
 
     fn create_table_from_batches(
@@ -2807,10 +2606,6 @@ where
                 "CREATE TABLE AS SELECT requires at least one column".into(),
             ));
         }
-        self.multi_column_uniques
-            .write()
-            .unwrap()
-            .remove(&canonical_name);
         let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(schema.fields().len());
         let mut lookup =
             FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
@@ -2845,24 +2640,34 @@ where
             });
         }
 
-        let table_id = self.reserve_table_id()?;
-        let table = Table::new(table_id, Arc::clone(&self.pager))?;
-        table.put_table_meta(&TableMeta {
+        let table_id = self.metadata.reserve_table_id()?;
+        let now = current_time_micros();
+        let table_meta = TableMeta {
             table_id,
             name: Some(display_name.clone()),
-            created_at_micros: current_time_micros(),
+            created_at_micros: now,
             flags: 0,
             epoch: 0,
-        });
+        };
+        self.metadata.set_table_meta(table_id, table_meta)?;
 
-        for column in &column_defs {
-            table.put_col_meta(&ColMeta {
-                col_id: column.field_id,
-                name: Some(column.name.clone()),
-                flags: 0,
-                default: None,
-            });
-        }
+        let table_columns: Vec<TableColumn> = column_defs
+            .iter()
+            .map(|column| TableColumn {
+                field_id: column.field_id,
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                primary_key: column.primary_key,
+                unique: column.unique,
+                check_expr: column.check_expr.clone(),
+            })
+            .collect();
+        self.metadata
+            .apply_column_definitions(table_id, &table_columns, now)?;
+        self.metadata.flush_table(table_id)?;
+
+        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
 
         let schema_arc = Arc::new(ExecutorSchema {
             columns: column_defs.clone(),
@@ -2999,105 +2804,29 @@ where
         rows: &[Vec<PlanValue>],
         column_order: &[usize],
     ) -> Result<()> {
-        use sqlparser::dialect::GenericDialect;
-        use sqlparser::parser::Parser;
-
-        // Find columns with CHECK constraints
-        let check_columns: Vec<(usize, &ExecutorColumn, &str)> = table
+        if table
             .schema
             .columns
             .iter()
-            .enumerate()
-            .filter_map(|(idx, col)| {
-                col.check_expr
-                    .as_ref()
-                    .map(|expr| (idx, col, expr.as_str()))
-            })
-            .collect();
-
-        if check_columns.is_empty() {
+            .all(|column| column.check_expr.is_none())
+        {
             return Ok(());
         }
 
-        let dialect = GenericDialect {};
+        let column_info: Vec<ConstraintColumnInfo> = table
+            .schema
+            .columns
+            .iter()
+            .map(|column| ConstraintColumnInfo {
+                name: column.name.clone(),
+                field_id: column.field_id,
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                check_expr: column.check_expr.clone(),
+            })
+            .collect();
 
-        // Check each row against all CHECK constraints
-        for (row_idx, row) in rows.iter().enumerate() {
-            for (col_idx, column, check_expr_str) in &check_columns {
-                // Parse the CHECK expression
-                let sql = format!("SELECT {}", check_expr_str);
-                let ast = Parser::parse_sql(&dialect, &sql).map_err(|e| {
-                    Error::InvalidArgumentError(format!(
-                        "Failed to parse CHECK expression '{}': {}",
-                        check_expr_str, e
-                    ))
-                })?;
-
-                let stmt = ast.into_iter().next().ok_or_else(|| {
-                    Error::InvalidArgumentError(format!(
-                        "CHECK expression '{}' resulted in empty AST",
-                        check_expr_str
-                    ))
-                })?;
-
-                let select = match stmt {
-                    sqlparser::ast::Statement::Query(q) => q,
-                    _ => {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "CHECK expression '{}' did not parse as SELECT",
-                            check_expr_str
-                        )));
-                    }
-                };
-
-                // Extract the expression from SELECT
-                let body = match *select.body {
-                    sqlparser::ast::SetExpr::Select(s) => s,
-                    _ => {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "CHECK expression '{}' is not a simple SELECT",
-                            check_expr_str
-                        )));
-                    }
-                };
-
-                if body.projection.len() != 1 {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "CHECK expression '{}' must have exactly one projection",
-                        check_expr_str
-                    )));
-                }
-
-                let expr = match &body.projection[0] {
-                    sqlparser::ast::SelectItem::UnnamedExpr(e)
-                    | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => e,
-                    _ => {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "CHECK expression '{}' projection is not a simple expression",
-                            check_expr_str
-                        )));
-                    }
-                };
-
-                // Evaluate the expression against this row
-                let result = Self::evaluate_check_expression(
-                    expr,
-                    row,
-                    column_order,
-                    table,
-                    *col_idx,
-                    row_idx,
-                )?;
-
-                if !result {
-                    return Err(Error::ConstraintError(format!(
-                        "CHECK constraint failed for column '{}': {}",
-                        column.name, check_expr_str
-                    )));
-                }
-            }
-        }
-
+        validate_check_constraints(&column_info, rows, column_order)?;
         Ok(())
     }
 
@@ -3143,419 +2872,6 @@ where
         Ok(())
     }
 
-    fn evaluate_check_expression(
-        expr: &sqlparser::ast::Expr,
-        row: &[PlanValue],
-        column_order: &[usize],
-        table: &ExecutorTable<P>,
-        _check_column_idx: usize,
-        _row_idx: usize,
-    ) -> Result<bool> {
-        use sqlparser::ast::Expr as SqlExpr;
-
-        match expr {
-            SqlExpr::BinaryOp { left, op, right } => {
-                let left_val = Self::evaluate_check_expr_value(left, row, column_order, table)?;
-                let right_val = Self::evaluate_check_expr_value(right, row, column_order, table)?;
-
-                use sqlparser::ast::BinaryOperator;
-                match op {
-                    BinaryOperator::Eq => {
-                        // NULL = anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null)
-                            || matches!(right_val, PlanValue::Null)
-                        {
-                            return Ok(true); // Unknown = pass CHECK
-                        }
-                        Ok(left_val == right_val)
-                    }
-                    BinaryOperator::NotEq => {
-                        // NULL != anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null)
-                            || matches!(right_val, PlanValue::Null)
-                        {
-                            return Ok(true); // Unknown = pass CHECK
-                        }
-                        Ok(left_val != right_val)
-                    }
-                    BinaryOperator::Lt => {
-                        // NULL < anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null)
-                            || matches!(right_val, PlanValue::Null)
-                        {
-                            return Ok(true); // Unknown = pass CHECK
-                        }
-                        match (left_val, right_val) {
-                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l < r),
-                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l < r),
-                            _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint < operator requires numeric values".into(),
-                            )),
-                        }
-                    }
-                    BinaryOperator::LtEq => {
-                        // NULL <= anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null)
-                            || matches!(right_val, PlanValue::Null)
-                        {
-                            return Ok(true); // Unknown = pass CHECK
-                        }
-                        match (left_val, right_val) {
-                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l <= r),
-                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l <= r),
-                            _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint <= operator requires numeric values".into(),
-                            )),
-                        }
-                    }
-                    BinaryOperator::Gt => {
-                        // NULL > anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null)
-                            || matches!(right_val, PlanValue::Null)
-                        {
-                            return Ok(true); // Unknown = pass CHECK
-                        }
-                        match (left_val, right_val) {
-                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l > r),
-                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l > r),
-                            _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint > operator requires numeric values".into(),
-                            )),
-                        }
-                    }
-                    BinaryOperator::GtEq => {
-                        // NULL >= anything is UNKNOWN, which doesn't violate CHECK
-                        if matches!(left_val, PlanValue::Null)
-                            || matches!(right_val, PlanValue::Null)
-                        {
-                            return Ok(true); // Unknown = pass CHECK
-                        }
-                        match (left_val, right_val) {
-                            (PlanValue::Integer(l), PlanValue::Integer(r)) => Ok(l >= r),
-                            (PlanValue::Float(l), PlanValue::Float(r)) => Ok(l >= r),
-                            _ => Err(Error::InvalidArgumentError(
-                                "CHECK constraint >= operator requires numeric values".into(),
-                            )),
-                        }
-                    }
-                    _ => Err(Error::InvalidArgumentError(format!(
-                        "Unsupported operator in CHECK constraint: {:?}",
-                        op
-                    ))),
-                }
-            }
-            SqlExpr::IsNull(inner) => {
-                let value = Self::evaluate_check_expr_value(inner, row, column_order, table)?;
-                Ok(matches!(value, PlanValue::Null))
-            }
-            SqlExpr::IsNotNull(inner) => {
-                let value = Self::evaluate_check_expr_value(inner, row, column_order, table)?;
-                Ok(!matches!(value, PlanValue::Null))
-            }
-            _ => Err(Error::InvalidArgumentError(format!(
-                "Unsupported expression in CHECK constraint: {:?}",
-                expr
-            ))),
-        }
-    }
-
-    fn evaluate_check_expr_value(
-        expr: &sqlparser::ast::Expr,
-        row: &[PlanValue],
-        column_order: &[usize],
-        table: &ExecutorTable<P>,
-    ) -> Result<PlanValue> {
-        use sqlparser::ast::Expr as SqlExpr;
-
-        match expr {
-            SqlExpr::BinaryOp { left, op, right } => {
-                // Handle arithmetic operations in CHECK expressions (e.g., i + j)
-                let left_val = Self::evaluate_check_expr_value(left, row, column_order, table)?;
-                let right_val = Self::evaluate_check_expr_value(right, row, column_order, table)?;
-
-                use sqlparser::ast::BinaryOperator;
-                match op {
-                    BinaryOperator::Plus => match (left_val, right_val) {
-                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
-                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
-                            Ok(PlanValue::Integer(l + r))
-                        }
-                        (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l + r)),
-                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
-                            Ok(PlanValue::Float(l as f64 + r))
-                        }
-                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
-                            Ok(PlanValue::Float(l + r as f64))
-                        }
-                        _ => Err(Error::InvalidArgumentError(
-                            "CHECK constraint + operator requires numeric values".into(),
-                        )),
-                    },
-                    BinaryOperator::Minus => match (left_val, right_val) {
-                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
-                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
-                            Ok(PlanValue::Integer(l - r))
-                        }
-                        (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l - r)),
-                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
-                            Ok(PlanValue::Float(l as f64 - r))
-                        }
-                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
-                            Ok(PlanValue::Float(l - r as f64))
-                        }
-                        _ => Err(Error::InvalidArgumentError(
-                            "CHECK constraint - operator requires numeric values".into(),
-                        )),
-                    },
-                    BinaryOperator::Multiply => match (left_val, right_val) {
-                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
-                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
-                            Ok(PlanValue::Integer(l * r))
-                        }
-                        (PlanValue::Float(l), PlanValue::Float(r)) => Ok(PlanValue::Float(l * r)),
-                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
-                            Ok(PlanValue::Float(l as f64 * r))
-                        }
-                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
-                            Ok(PlanValue::Float(l * r as f64))
-                        }
-                        _ => Err(Error::InvalidArgumentError(
-                            "CHECK constraint * operator requires numeric values".into(),
-                        )),
-                    },
-                    BinaryOperator::Divide => match (left_val, right_val) {
-                        (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(PlanValue::Null),
-                        (PlanValue::Integer(l), PlanValue::Integer(r)) => {
-                            if r == 0 {
-                                Err(Error::InvalidArgumentError(
-                                    "Division by zero in CHECK constraint".into(),
-                                ))
-                            } else {
-                                Ok(PlanValue::Integer(l / r))
-                            }
-                        }
-                        (PlanValue::Float(l), PlanValue::Float(r)) => {
-                            if r == 0.0 {
-                                Err(Error::InvalidArgumentError(
-                                    "Division by zero in CHECK constraint".into(),
-                                ))
-                            } else {
-                                Ok(PlanValue::Float(l / r))
-                            }
-                        }
-                        (PlanValue::Integer(l), PlanValue::Float(r)) => {
-                            if r == 0.0 {
-                                Err(Error::InvalidArgumentError(
-                                    "Division by zero in CHECK constraint".into(),
-                                ))
-                            } else {
-                                Ok(PlanValue::Float(l as f64 / r))
-                            }
-                        }
-                        (PlanValue::Float(l), PlanValue::Integer(r)) => {
-                            if r == 0 {
-                                Err(Error::InvalidArgumentError(
-                                    "Division by zero in CHECK constraint".into(),
-                                ))
-                            } else {
-                                Ok(PlanValue::Float(l / r as f64))
-                            }
-                        }
-                        _ => Err(Error::InvalidArgumentError(
-                            "CHECK constraint / operator requires numeric values".into(),
-                        )),
-                    },
-                    _ => Err(Error::InvalidArgumentError(format!(
-                        "Unsupported binary operator in CHECK constraint value expression: {:?}",
-                        op
-                    ))),
-                }
-            }
-            SqlExpr::Identifier(ident) => {
-                // Simple column reference
-                let column_name = &ident.value;
-                let col_idx = table
-                    .schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(column_name))
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "Unknown column '{}' in CHECK constraint",
-                            column_name
-                        ))
-                    })?;
-
-                // Find value in row
-                let insert_pos = column_order
-                    .iter()
-                    .position(|&dest_idx| dest_idx == col_idx)
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "Column '{}' not provided in INSERT",
-                            column_name
-                        ))
-                    })?;
-
-                Ok(row[insert_pos].clone())
-            }
-            SqlExpr::CompoundIdentifier(idents) => {
-                // Struct field access like t.t or table.t.t
-                if idents.len() == 2 {
-                    // col.field format
-                    let column_name = &idents[0].value;
-                    let field_name = &idents[1].value;
-
-                    let col_idx = table
-                        .schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(column_name))
-                        .ok_or_else(|| {
-                            Error::InvalidArgumentError(format!(
-                                "Unknown column '{}' in CHECK constraint",
-                                column_name
-                            ))
-                        })?;
-
-                    let insert_pos = column_order
-                        .iter()
-                        .position(|&dest_idx| dest_idx == col_idx)
-                        .ok_or_else(|| {
-                            Error::InvalidArgumentError(format!(
-                                "Column '{}' not provided in INSERT",
-                                column_name
-                            ))
-                        })?;
-
-                    // Extract struct field
-                    match &row[insert_pos] {
-                        PlanValue::Struct(fields) => fields
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case(field_name))
-                            .map(|(_, val)| val.clone())
-                            .ok_or_else(|| {
-                                Error::InvalidArgumentError(format!(
-                                    "Struct field '{}' not found in column '{}'",
-                                    field_name, column_name
-                                ))
-                            }),
-                        _ => Err(Error::InvalidArgumentError(format!(
-                            "Column '{}' is not a struct, cannot access field '{}'",
-                            column_name, field_name
-                        ))),
-                    }
-                } else if idents.len() == 3 {
-                    // table.col.field format - ignore table part
-                    let column_name = &idents[1].value;
-                    let field_name = &idents[2].value;
-
-                    let col_idx = table
-                        .schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(column_name))
-                        .ok_or_else(|| {
-                            Error::InvalidArgumentError(format!(
-                                "Unknown column '{}' in CHECK constraint",
-                                column_name
-                            ))
-                        })?;
-
-                    let insert_pos = column_order
-                        .iter()
-                        .position(|&dest_idx| dest_idx == col_idx)
-                        .ok_or_else(|| {
-                            Error::InvalidArgumentError(format!(
-                                "Column '{}' not provided in INSERT",
-                                column_name
-                            ))
-                        })?;
-
-                    match &row[insert_pos] {
-                        PlanValue::Struct(fields) => fields
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case(field_name))
-                            .map(|(_, val)| val.clone())
-                            .ok_or_else(|| {
-                                Error::InvalidArgumentError(format!(
-                                    "Struct field '{}' not found in column '{}'",
-                                    field_name, column_name
-                                ))
-                            }),
-                        _ => Err(Error::InvalidArgumentError(format!(
-                            "Column '{}' is not a struct, cannot access field '{}'",
-                            column_name, field_name
-                        ))),
-                    }
-                } else {
-                    Err(Error::InvalidArgumentError(format!(
-                        "Unsupported compound identifier in CHECK constraint: {} parts",
-                        idents.len()
-                    )))
-                }
-            }
-            SqlExpr::Value(val_with_span) => {
-                // Numeric literal
-                match &val_with_span.value {
-                    sqlparser::ast::Value::Number(n, _) => {
-                        if let Ok(i) = n.parse::<i64>() {
-                            Ok(PlanValue::Integer(i))
-                        } else if let Ok(f) = n.parse::<f64>() {
-                            Ok(PlanValue::Float(f))
-                        } else {
-                            Err(Error::InvalidArgumentError(format!(
-                                "Invalid number in CHECK constraint: {}",
-                                n
-                            )))
-                        }
-                    }
-                    sqlparser::ast::Value::SingleQuotedString(s)
-                    | sqlparser::ast::Value::DoubleQuotedString(s) => {
-                        Ok(PlanValue::String(s.clone()))
-                    }
-                    sqlparser::ast::Value::Null => Ok(PlanValue::Null),
-                    _ => Err(Error::InvalidArgumentError(format!(
-                        "Unsupported value type in CHECK constraint: {:?}",
-                        val_with_span.value
-                    ))),
-                }
-            }
-            _ => Err(Error::InvalidArgumentError(format!(
-                "Unsupported expression type in CHECK constraint: {:?}",
-                expr
-            ))),
-        }
-    }
-
-    fn ensure_existing_rows_unique(
-        &self,
-        table: &ExecutorTable<P>,
-        field_id: FieldId,
-        column_name: &str,
-    ) -> Result<()> {
-        let snapshot = self.default_snapshot();
-        let values = self.scan_column_values(table, field_id, snapshot)?;
-
-        // TODO: This is inefficient for large datasets; consider a more efficient approach
-        let mut seen: FxHashSet<UniqueKey> = FxHashSet::default();
-
-        for value in values {
-            let Some(key) = Self::unique_key_component(&value, column_name)? else {
-                continue;
-            };
-
-            if !seen.insert(key) {
-                return Err(Error::ConstraintError(format!(
-                    "constraint violation on column '{}'",
-                    column_name
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
     fn rebuild_executor_table_with_unique(
         table: &ExecutorTable<P>,
         field_id: FieldId,
@@ -3591,38 +2907,6 @@ where
         }))
     }
 
-    fn ensure_existing_rows_unique_multi(
-        &self,
-        table: &ExecutorTable<P>,
-        field_ids: &[FieldId],
-        column_names: &[String],
-    ) -> Result<()> {
-        if field_ids.is_empty() {
-            return Ok(());
-        }
-
-        let snapshot = self.default_snapshot();
-        let rows = self.scan_multi_column_values(table, field_ids, snapshot)?;
-        let mut seen: FxHashSet<UniqueKey> = FxHashSet::default();
-
-        for values in rows {
-            if values.len() != field_ids.len() {
-                continue;
-            }
-
-            if let Some(key) = Self::build_composite_unique_key(&values, column_names)?
-                && !seen.insert(key)
-            {
-                return Err(Error::ConstraintError(format!(
-                    "constraint violation on columns '{}'",
-                    column_names.join(", ")
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
     fn check_unique_constraints(
         &self,
         table: &ExecutorTable<P>,
@@ -3649,23 +2933,13 @@ where
                 };
                 let value = row[insert_position].clone();
 
-                if matches!(value, PlanValue::Null) {
-                    continue;
-                }
-
-                if existing_values.contains(&value) || new_values.contains(&value) {
-                    return Err(Error::ConstraintError(format!(
-                        "constraint violation on column '{}'",
-                        column.name
-                    )));
-                }
-
                 new_values.push(value);
             }
+
+            ensure_single_column_unique(&existing_values, &new_values, &column.name)?;
         }
 
-        let multi_uniques = table.multi_column_uniques();
-        for constraint in multi_uniques {
+        for constraint in table.multi_column_uniques() {
             if constraint.column_indices.is_empty() {
                 continue;
             }
@@ -3684,16 +2958,7 @@ where
             }
 
             let existing_rows = self.scan_multi_column_values(table, &field_ids, snapshot)?;
-            let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
-            for row_values in existing_rows {
-                if let Some(key) =
-                    Self::build_composite_unique_key(&row_values, &constraint_column_names)?
-                {
-                    existing_keys.insert(key);
-                }
-            }
-
-            let mut new_keys: FxHashSet<UniqueKey> = FxHashSet::default();
+            let mut new_rows_for_constraint: Vec<Vec<PlanValue>> = Vec::with_capacity(rows.len());
             for row in rows {
                 let mut values_for_constraint = Vec::with_capacity(constraint.column_indices.len());
                 for &col_idx in &constraint.column_indices {
@@ -3704,17 +2969,14 @@ where
                     }
                 }
 
-                if let Some(key) = Self::build_composite_unique_key(
-                    &values_for_constraint,
-                    &constraint_column_names,
-                )? && (existing_keys.contains(&key) || !new_keys.insert(key))
-                {
-                    return Err(Error::ConstraintError(format!(
-                        "constraint violation on columns '{}'",
-                        constraint_column_names.join(", ")
-                    )));
-                }
+                new_rows_for_constraint.push(values_for_constraint);
             }
+
+            ensure_multi_column_unique(
+                &existing_rows,
+                &new_rows_for_constraint,
+                &constraint_column_names,
+            )?;
         }
 
         Ok(())
@@ -3750,68 +3012,23 @@ where
             .iter()
             .map(|(_, col)| col.name.clone())
             .collect();
-        let pk_label = if pk_column_names.len() == 1 {
-            "column"
-        } else {
-            "columns"
-        };
-        let pk_display = if pk_column_names.len() == 1 {
-            pk_column_names[0].clone()
-        } else {
-            pk_column_names.join(", ")
-        };
-
         let existing_rows = self.scan_multi_column_values(table, &pk_field_ids, snapshot)?;
-        let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
-        for row_values in existing_rows {
-            if row_values.len() != pk_field_ids.len() {
-                continue;
-            }
-
-            let key = Self::build_composite_unique_key(&row_values, &pk_column_names)?;
-            let key = key.ok_or_else(|| {
-                Error::ConstraintError(format!(
-                    "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
-                ))
-            })?;
-            existing_keys.insert(key);
-        }
-
-        let mut new_keys: FxHashSet<UniqueKey> = FxHashSet::default();
+        let mut new_rows_for_pk: Vec<Vec<PlanValue>> = Vec::with_capacity(rows.len());
         for row in rows {
             let mut values_for_pk = Vec::with_capacity(pk_field_ids.len());
-            for &(col_idx, column) in &primary_key_columns {
+            for &(col_idx, _column) in &primary_key_columns {
                 let value = if let Some(pos) = column_order.iter().position(|&dest| dest == col_idx)
                 {
                     row[pos].clone()
                 } else {
                     PlanValue::Null
                 };
-
-                if matches!(value, PlanValue::Null) {
-                    return Err(Error::ConstraintError(format!(
-                        "constraint failed: NOT NULL constraint failed for PRIMARY KEY column '{}'",
-                        column.name
-                    )));
-                }
-
                 values_for_pk.push(value);
             }
-
-            let key = Self::build_composite_unique_key(&values_for_pk, &pk_column_names)?;
-            let key = key.ok_or_else(|| {
-                Error::ConstraintError(format!(
-                    "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
-                ))
-            })?;
-
-            if existing_keys.contains(&key) || !new_keys.insert(key) {
-                return Err(Error::ConstraintError(format!(
-                    "Duplicate key violates primary key constraint on {pk_label} '{}' (PRIMARY KEY or UNIQUE constraint violation)",
-                    pk_display
-                )));
-            }
+            new_rows_for_pk.push(values_for_pk);
         }
+
+        ensure_primary_key(&existing_rows, &new_rows_for_pk, &pk_column_names)?;
 
         Ok(())
     }
@@ -4005,7 +3222,7 @@ where
         let mut existing_rows = self.scan_multi_column_values(table, &pk_field_ids, snapshot)?;
         let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
         for row_values in existing_rows.drain(..) {
-            if let Some(key) = Self::build_composite_unique_key(&row_values, names)? {
+            if let Some(key) = build_composite_unique_key(&row_values, names)? {
                 tracing::trace!(table = %display_name, ?key, "existing primary key");
                 existing_keys.insert(key);
             }
@@ -4043,7 +3260,7 @@ where
                 values.push(row[idx].clone());
             }
 
-            let key = Self::build_composite_unique_key(&values, names)?;
+            let key = build_composite_unique_key(&values, names)?;
             let key = key.ok_or_else(|| {
                 Error::ConstraintError(format!(
                     "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
@@ -4419,39 +3636,6 @@ where
 
         Ok(visible_row_ids.into_iter().zip(rows).collect())
     }
-
-    fn unique_key_component(value: &PlanValue, column_name: &str) -> Result<Option<UniqueKey>> {
-        match value {
-            PlanValue::Null => Ok(None),
-            PlanValue::Integer(v) => Ok(Some(UniqueKey::Int(*v))),
-            PlanValue::Float(v) => Ok(Some(UniqueKey::Float(v.to_bits()))),
-            PlanValue::String(s) => Ok(Some(UniqueKey::Str(s.clone()))),
-            PlanValue::Struct(_) => Err(Error::InvalidArgumentError(format!(
-                "UNIQUE index is not supported on struct column '{}'",
-                column_name
-            ))),
-        }
-    }
-
-    fn build_composite_unique_key(
-        values: &[PlanValue],
-        column_names: &[String],
-    ) -> Result<Option<UniqueKey>> {
-        if values.is_empty() {
-            return Ok(None);
-        }
-
-        let mut components = Vec::with_capacity(values.len());
-        for (value, column_name) in values.iter().zip(column_names) {
-            match Self::unique_key_component(value, column_name)? {
-                Some(component) => components.push(component),
-                None => return Ok(None),
-            }
-        }
-
-        Ok(Some(UniqueKey::Composite(components)))
-    }
-
     fn insert_rows(
         &self,
         table: &ExecutorTable<P>,
@@ -4529,14 +3713,7 @@ where
 
         constraint_result?;
 
-        self.check_foreign_keys_on_insert(
-            table,
-            &display_name,
-            &canonical_name,
-            &rows,
-            &column_order,
-            snapshot,
-        )?;
+        self.check_foreign_keys_on_insert(table, &display_name, &rows, &column_order, snapshot)?;
 
         let row_count = rows.len();
         let mut column_values: Vec<Vec<PlanValue>> =
@@ -4575,6 +3752,11 @@ where
         }
 
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
+        tracing::trace!(
+            table_name = %display_name,
+            store_ptr = ?std::ptr::addr_of!(*table.table.store()),
+            "About to call table.append"
+        );
         table.table.append(&batch)?;
         table
             .next_row_id
@@ -4795,7 +3977,7 @@ where
                 for &idx in &primary_key_indices {
                     values.push(row[idx].clone());
                 }
-                let key = Self::build_composite_unique_key(&values, &primary_key_names)?;
+                let key = build_composite_unique_key(&values, &primary_key_names)?;
                 original_primary_key_keys.push(key);
             }
         }
@@ -5043,7 +4225,7 @@ where
                 for &idx in &primary_key_indices {
                     values.push(row[idx].clone());
                 }
-                let key = Self::build_composite_unique_key(&values, &primary_key_names)?;
+                let key = build_composite_unique_key(&values, &primary_key_names)?;
                 original_primary_key_keys.push(key);
             }
         }
@@ -5242,71 +4424,80 @@ where
             return Ok(());
         }
 
-        let constraints = {
-            let registry = self.foreign_keys.read().unwrap();
-            registry.referencing_constraints(canonical_name)
-        };
+        let referencing_children =
+            self.referencing_child_tables(table.table.table_id(), canonical_name)?;
 
-        if constraints.is_empty() {
+        if referencing_children.is_empty() {
             return Ok(());
         }
 
         let mut deleting_row_ids: FxHashSet<RowId> = FxHashSet::default();
         deleting_row_ids.extend(row_ids.iter().copied());
 
-        for (child_canonical, metadata) in constraints {
-            let parent_rows =
-                self.collect_row_values_for_ids(table, row_ids, &metadata.referenced_field_ids)?;
+        for (child_canonical, child_display, child_table) in referencing_children {
+            let child_metadata =
+                self.foreign_keys_for_table(child_table.as_ref(), &child_display)?;
 
-            let mut parent_keys: Vec<Vec<PlanValue>> = Vec::new();
-            for values in parent_rows {
-                if values.len() != metadata.referenced_field_ids.len() {
-                    continue;
+            for metadata in child_metadata
+                .into_iter()
+                .filter(|meta| meta.referenced_table == canonical_name)
+            {
+                let parent_rows = self.collect_row_values_for_ids(
+                    table,
+                    row_ids,
+                    &metadata.referenced_field_ids,
+                )?;
+
+                let mut parent_keys: Vec<Vec<PlanValue>> = Vec::new();
+                for values in parent_rows {
+                    if values.len() != metadata.referenced_field_ids.len() {
+                        continue;
+                    }
+                    if values.iter().any(|value| matches!(value, PlanValue::Null)) {
+                        continue;
+                    }
+                    parent_keys.push(values);
                 }
-                if values.iter().any(|value| matches!(value, PlanValue::Null)) {
-                    continue;
-                }
-                parent_keys.push(values);
-            }
 
-            if parent_keys.is_empty() {
-                continue;
-            }
-
-            let child_table = self.lookup_table(&child_canonical)?;
-            let child_rows = self.collect_visible_child_rows(
-                child_table.as_ref(),
-                &metadata.referencing_field_ids,
-                snapshot,
-            )?;
-
-            if child_rows.is_empty() {
-                continue;
-            }
-
-            for (child_row_id, values) in child_rows {
-                if values.len() != metadata.referencing_field_ids.len() {
-                    continue;
-                }
-                if values.iter().any(|value| matches!(value, PlanValue::Null)) {
-                    continue;
-                }
-                if !parent_keys.iter().any(|key| key == &values) {
+                if parent_keys.is_empty() {
                     continue;
                 }
 
-                if child_canonical == canonical_name && deleting_row_ids.contains(&child_row_id) {
+                let child_rows = self.collect_visible_child_rows(
+                    child_table.as_ref(),
+                    &metadata.referencing_field_ids,
+                    snapshot,
+                )?;
+
+                if child_rows.is_empty() {
                     continue;
                 }
 
-                match metadata.on_delete {
-                    ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
-                        let constraint_label =
-                            metadata.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
-                        return Err(Error::ConstraintError(format!(
-                            "Violates foreign key constraint '{}' on table '{}' referencing '{}' - row is still referenced by a foreign key in a different table",
-                            constraint_label, metadata.referencing_display, display_name,
-                        )));
+                for (child_row_id, values) in child_rows {
+                    if values.len() != metadata.referencing_field_ids.len() {
+                        continue;
+                    }
+                    if values.iter().any(|value| matches!(value, PlanValue::Null)) {
+                        continue;
+                    }
+                    if !parent_keys.iter().any(|key| key == &values) {
+                        continue;
+                    }
+
+                    if child_canonical == canonical_name && deleting_row_ids.contains(&child_row_id)
+                    {
+                        continue;
+                    }
+
+                    match metadata.on_delete {
+                        ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
+                            let constraint_label =
+                                metadata.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
+                            return Err(Error::ConstraintError(format!(
+                                "Violates foreign key constraint '{}' on table '{}' referencing '{}' - row is still referenced by a foreign key in a different table",
+                                constraint_label, metadata.referencing_display, display_name,
+                            )));
+                        }
                     }
                 }
             }
@@ -5319,7 +4510,6 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: &str,
-        canonical_name: &str,
         rows: &[Vec<PlanValue>],
         column_order: &[usize],
         snapshot: TransactionSnapshot,
@@ -5328,10 +4518,7 @@ where
             return Ok(());
         }
 
-        let constraints = {
-            let registry = self.foreign_keys.read().unwrap();
-            registry.child_constraints(canonical_name)
-        };
+        let constraints = self.foreign_keys_for_table(table, display_name)?;
 
         if constraints.is_empty() {
             return Ok(());
@@ -5609,58 +4796,100 @@ where
             Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
         })?;
 
-        let store = ColumnStore::open(Arc::clone(&self.pager))?;
-        let catalog = SysCatalog::new(&store);
-
-        // Find the table metadata in the catalog
-        let all_metas = catalog.all_table_metas()?;
-        let (table_id, _meta) = all_metas
-            .iter()
-            .find(|(_, meta)| {
-                meta.name
-                    .as_ref()
-                    .map(|n| n.to_ascii_lowercase() == canonical_name)
-                    .unwrap_or(false)
-            })
+        // Retrieve table metadata from the metadata manager
+        let table_meta = self
+            .metadata
+            .table_meta(_catalog_table_id)?
             .ok_or_else(|| {
                 Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
             })?;
 
-        // Open the table and build ExecutorTable
-        let table = Table::new(*table_id, Arc::clone(&self.pager))?;
-        let schema = table.schema()?;
+        // Fetch persisted constraint records and open the table
+        let constraint_records = self.metadata.constraint_records(table_meta.table_id)?;
+
+        let table = Table::new_with_store(table_meta.table_id, Arc::clone(&self.store))?;
+        let store = table.store();
+        let mut logical_fields = store.user_field_ids_for_table(table_meta.table_id);
+        logical_fields.sort_by_key(|lfid| lfid.field_id());
+        let field_ids: Vec<FieldId> = logical_fields.iter().map(|lfid| lfid.field_id()).collect();
+        let column_metas = self
+            .metadata
+            .column_metas(table_meta.table_id, &field_ids)?;
         let catalog_field_resolver = self.catalog.field_resolver(_catalog_table_id);
+        let mut metadata_primary_keys: FxHashSet<FieldId> = FxHashSet::default();
+        let mut metadata_unique_fields: FxHashSet<FieldId> = FxHashSet::default();
+        let mut has_primary_key_records = false;
+        let mut has_single_unique_records = false;
 
-        // Build ExecutorSchema from Arrow schema (skip row_id field at index 0)
+        for record in constraint_records
+            .iter()
+            .filter(|record| record.is_active())
+        {
+            match &record.kind {
+                ConstraintKind::PrimaryKey(pk) => {
+                    has_primary_key_records = true;
+                    for field_id in &pk.field_ids {
+                        metadata_primary_keys.insert(*field_id);
+                        metadata_unique_fields.insert(*field_id);
+                    }
+                }
+                ConstraintKind::Unique(unique) => {
+                    if unique.field_ids.len() == 1 {
+                        has_single_unique_records = true;
+                        metadata_unique_fields.insert(unique.field_ids[0]);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Build ExecutorSchema from metadata manager snapshots
         let mut executor_columns = Vec::new();
-        let mut lookup =
-            FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
+        let mut lookup = FxHashMap::with_capacity_and_hasher(field_ids.len(), Default::default());
 
-        for (idx, field) in schema.fields().iter().enumerate().skip(1) {
-            // Get field_id from metadata
-            let field_id = field
-                .metadata()
-                .get(llkv_table::constants::FIELD_ID_META_KEY)
-                .and_then(|s| s.parse::<FieldId>().ok())
-                .unwrap_or(idx as FieldId);
+        for (idx, lfid) in logical_fields.iter().enumerate() {
+            let field_id = lfid.field_id();
+            let normalized_index = executor_columns.len();
 
-            let normalized = field.name().to_ascii_lowercase();
-            let col_idx = executor_columns.len();
-            lookup.insert(normalized, col_idx);
+            let column_name = column_metas
+                .get(idx)
+                .and_then(|meta| meta.as_ref())
+                .and_then(|meta| meta.name.clone())
+                .unwrap_or_else(|| format!("col_{}", field_id));
 
-            let constraints: FieldConstraints = catalog_field_resolver
+            let normalized = column_name.to_ascii_lowercase();
+            lookup.insert(normalized, normalized_index);
+
+            let fallback_constraints: FieldConstraints = catalog_field_resolver
                 .as_ref()
-                .and_then(|resolver| resolver.field_constraints_by_name(field.name()))
+                .and_then(|resolver| resolver.field_constraints_by_name(&column_name))
                 .unwrap_or_default();
 
+            let metadata_primary = metadata_primary_keys.contains(&field_id);
+            let primary_key = if has_primary_key_records {
+                metadata_primary
+            } else {
+                fallback_constraints.primary_key
+            };
+
+            let metadata_unique = metadata_primary || metadata_unique_fields.contains(&field_id);
+            let unique = if has_primary_key_records || has_single_unique_records {
+                metadata_unique
+            } else {
+                fallback_constraints.primary_key || fallback_constraints.unique
+            };
+
+            let data_type = store.data_type(*lfid)?;
+            let nullable = !primary_key;
+
             executor_columns.push(ExecutorColumn {
-                name: field.name().to_string(),
-                data_type: field.data_type().clone(),
-                nullable: field.is_nullable(),
-                primary_key: constraints.primary_key,
-                unique: constraints.primary_key || constraints.unique,
+                name: column_name,
+                data_type,
+                nullable,
+                primary_key,
+                unique,
                 field_id,
-                check_expr: constraints.check_expr.clone(),
+                check_expr: fallback_constraints.check_expr.clone(),
             });
         }
 
@@ -5698,7 +4927,7 @@ where
             impl PrimitiveSortedWithRowIdsVisitor for MaxRowIdVisitor {}
 
             // Scan the row_id column for any user field in this table
-            let row_id_field = rowid_fid(LogicalFieldId::for_user(*table_id, 1));
+            let row_id_field = rowid_fid(LogicalFieldId::for_user(table_meta.table_id, 1));
             let mut visitor = MaxRowIdVisitor { max: 0 };
 
             match ScanBuilder::new(table.store(), row_id_field)
@@ -5737,16 +4966,20 @@ where
             multi_column_uniques: RwLock::new(Vec::new()),
         });
 
-        if let Some(stored) = self
-            .multi_column_uniques
-            .read()
-            .unwrap()
-            .get(canonical_name)
-            .cloned()
-        {
-            let executor_uniques =
-                Self::build_executor_multi_column_uniques(&executor_table, &stored);
-            executor_table.set_multi_column_uniques(executor_uniques);
+        match self.metadata.multi_column_uniques(table_meta.table_id) {
+            Ok(stored) if !stored.is_empty() => {
+                let executor_uniques =
+                    Self::build_executor_multi_column_uniques(&executor_table, &stored);
+                executor_table.set_multi_column_uniques(executor_uniques);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    table_id = table_meta.table_id,
+                    error = %err,
+                    "[LAZY_LOAD] Failed to load multi-column UNIQUE metadata during table hydrate"
+                );
+            }
         }
 
         // Cache the loaded table
@@ -5774,8 +5007,8 @@ where
         tracing::debug!(
             "[LAZY_LOAD] Loaded table '{}' (id={}) with {} columns, next_row_id={}",
             canonical_name,
-            table_id,
-            schema.fields().len() - 1,
+            table_meta.table_id,
+            field_ids.len(),
             next_row_id
         );
 
@@ -5783,10 +5016,6 @@ where
     }
 
     fn remove_table_entry(&self, canonical_name: &str) {
-        {
-            let mut registry = self.foreign_keys.write().unwrap();
-            registry.remove_table(canonical_name);
-        }
         let mut tables = self.tables.write().unwrap();
         if tables.remove(canonical_name).is_some() {
             tracing::trace!(
@@ -5798,41 +5027,53 @@ where
 
     pub fn drop_table_immediate(&self, name: &str, if_exists: bool) -> Result<()> {
         let (display_name, canonical_name) = canonical_table_name(name)?;
-        let tables = self.tables.read().unwrap();
-        if !tables.contains_key(&canonical_name) {
-            if if_exists {
-                return Ok(());
-            } else {
-                return Err(Error::CatalogError(format!(
-                    "Catalog Error: Table '{}' does not exist",
-                    display_name
+        let (table_id, column_field_ids) = {
+            let tables = self.tables.read().unwrap();
+            let Some(entry) = tables.get(&canonical_name) else {
+                if if_exists {
+                    return Ok(());
+                } else {
+                    return Err(Error::CatalogError(format!(
+                        "Catalog Error: Table '{}' does not exist",
+                        display_name
+                    )));
+                }
+            };
+
+            let field_ids = entry
+                .schema
+                .columns
+                .iter()
+                .map(|col| col.field_id)
+                .collect::<Vec<_>>();
+            (entry.table.table_id(), field_ids)
+        };
+
+        let referencing_children = self.referencing_child_tables(table_id, &canonical_name)?;
+
+        for (child_canonical, child_display, child_table) in &referencing_children {
+            if child_canonical == &canonical_name {
+                continue;
+            }
+
+            let foreign_keys = self.foreign_keys_for_table(child_table.as_ref(), child_display)?;
+
+            if let Some(metadata) = foreign_keys
+                .into_iter()
+                .find(|meta| meta.referenced_table == canonical_name)
+            {
+                let constraint_label = metadata.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
+                return Err(Error::ConstraintError(format!(
+                    "Cannot drop table '{}' because it is referenced by foreign key constraint '{}' on table '{}'",
+                    display_name, constraint_label, child_display
                 )));
             }
         }
-        drop(tables);
 
-        let referencing = {
-            let registry = self.foreign_keys.read().unwrap();
-            registry.referencing_constraints(&canonical_name)
-        };
-
-        let blocking: Vec<_> = referencing
-            .into_iter()
-            .filter(|(child_canonical, _)| {
-                child_canonical != &canonical_name && !self.is_table_marked_dropped(child_canonical)
-            })
-            .collect();
-
-        if let Some((_, metadata)) = blocking.first() {
-            let constraint_label = metadata.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
-            return Err(Error::ConstraintError(format!(
-                "Cannot drop table '{}' because it is referenced by foreign key constraint '{}' on table '{}'",
-                display_name, constraint_label, metadata.referencing_display
-            )));
-        }
-
-        // Don't remove from tables cache - keep it for transactions with earlier snapshots
-        // self.remove_table_entry(&canonical_name);
+        self.metadata
+            .prepare_table_drop(table_id, &column_field_ids)?;
+        self.metadata.flush_table(table_id)?;
+        self.metadata.remove_table_state(table_id);
 
         // Unregister from catalog
         self.catalog.unregister_table(&canonical_name);
@@ -5845,53 +5086,11 @@ where
             .write()
             .unwrap()
             .insert(canonical_name.clone());
-        self.multi_column_uniques
-            .write()
-            .unwrap()
-            .remove(&canonical_name);
         Ok(())
     }
 
     pub fn is_table_marked_dropped(&self, canonical_name: &str) -> bool {
         self.dropped_tables.read().unwrap().contains(canonical_name)
-    }
-
-    fn reserve_table_id(&self) -> Result<TableId> {
-        let store = ColumnStore::open(Arc::clone(&self.pager))?;
-        let catalog = SysCatalog::new(&store);
-
-        let mut next = match catalog.get_next_table_id()? {
-            Some(value) => value,
-            None => {
-                let seed = catalog.max_table_id()?.unwrap_or(CATALOG_TABLE_ID);
-                let initial = seed.checked_add(1).ok_or_else(|| {
-                    Error::InvalidArgumentError("exhausted available table ids".into())
-                })?;
-                catalog.put_next_table_id(initial)?;
-                initial
-            }
-        };
-
-        // Skip any reserved table IDs
-        while llkv_table::reserved::is_reserved_table_id(next) {
-            next = next.checked_add(1).ok_or_else(|| {
-                Error::InvalidArgumentError("exhausted available table ids".into())
-            })?;
-        }
-
-        let mut following = next
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidArgumentError("exhausted available table ids".into()))?;
-
-        // Skip any reserved table IDs for the next allocation
-        while llkv_table::reserved::is_reserved_table_id(following) {
-            following = following.checked_add(1).ok_or_else(|| {
-                Error::InvalidArgumentError("exhausted available table ids".into())
-            })?;
-        }
-
-        catalog.put_next_table_id(following)?;
-        Ok(next)
     }
 }
 
@@ -6318,17 +5517,6 @@ where
     pub fn collect_rows_vec(self) -> Result<Vec<Vec<PlanValue>>> {
         Ok(self.collect_rows()?.rows)
     }
-}
-
-pub fn canonical_table_name(name: &str) -> Result<(String, String)> {
-    if name.is_empty() {
-        return Err(Error::InvalidArgumentError(
-            "table name must not be empty".into(),
-        ));
-    }
-    let display = name.to_string();
-    let canonical = display.to_ascii_lowercase();
-    Ok((display, canonical))
 }
 
 fn current_time_micros() -> u64 {
