@@ -9,7 +9,7 @@
 use crate::constraints::{ConstraintId, ConstraintKind, ConstraintRecord};
 use crate::sys_catalog::SysCatalog;
 use crate::types::{FieldId, TableId};
-use crate::{ColMeta, TableMeta, TableMultiColumnUniqueMeta};
+use crate::{ColMeta, MultiColumnUniqueEntryMeta, TableMeta, TableMultiColumnUniqueMeta};
 use llkv_column_map::ColumnStore;
 use llkv_result::Result as LlkvResult;
 use llkv_storage::pager::Pager;
@@ -22,6 +22,7 @@ struct TableSnapshot {
     table_meta: Option<TableMeta>,
     column_metas: FxHashMap<FieldId, ColMeta>,
     constraints: FxHashMap<ConstraintId, ConstraintRecord>,
+    multi_uniques: Vec<MultiColumnUniqueEntryMeta>,
 }
 
 impl TableSnapshot {
@@ -29,11 +30,13 @@ impl TableSnapshot {
         table_meta: Option<TableMeta>,
         column_metas: FxHashMap<FieldId, ColMeta>,
         constraints: FxHashMap<ConstraintId, ConstraintRecord>,
+        multi_uniques: Vec<MultiColumnUniqueEntryMeta>,
     ) -> Self {
         Self {
             table_meta,
             column_metas,
             constraints,
+            multi_uniques,
         }
     }
 }
@@ -143,11 +146,13 @@ where
         let catalog = SysCatalog::new(&self.store);
         let table_meta = catalog.get_table_meta(table_id);
         let constraint_records = catalog.constraint_records_for_table(table_id)?;
+        let multi_uniques = catalog.get_multi_column_uniques(table_id)?;
         let mut constraints = FxHashMap::default();
         for record in constraint_records {
             constraints.insert(record.constraint_id, record);
         }
-        let snapshot = TableSnapshot::new(table_meta, FxHashMap::default(), constraints);
+        let snapshot =
+            TableSnapshot::new(table_meta, FxHashMap::default(), constraints, multi_uniques);
         Ok(TableState::from_snapshot(snapshot))
     }
 
@@ -281,6 +286,42 @@ where
         Ok(())
     }
 
+    /// Return the multi-column UNIQUE definitions cached for the table.
+    pub fn multi_column_uniques(
+        &self,
+        table_id: TableId,
+    ) -> LlkvResult<Vec<MultiColumnUniqueEntryMeta>> {
+        self.ensure_table_state(table_id)?;
+        let tables = self.tables.read().unwrap();
+        let state = tables.get(&table_id).unwrap();
+        Ok(state.current.multi_uniques.clone())
+    }
+
+    /// Replace the cached multi-column UNIQUE definitions for the table.
+    pub fn set_multi_column_uniques(
+        &self,
+        table_id: TableId,
+        uniques: Vec<MultiColumnUniqueEntryMeta>,
+    ) -> LlkvResult<()> {
+        self.ensure_table_state(table_id)?;
+        let mut tables = self.tables.write().unwrap();
+        let state = tables.get_mut(&table_id).unwrap();
+        state.current.multi_uniques = uniques;
+        Ok(())
+    }
+
+    /// Mutate the cached multi-column UNIQUE definitions for a table in-place.
+    pub fn update_multi_column_uniques<F, T>(&self, table_id: TableId, f: F) -> LlkvResult<T>
+    where
+        F: FnOnce(&mut Vec<MultiColumnUniqueEntryMeta>) -> T,
+    {
+        self.ensure_table_state(table_id)?;
+        let mut tables = self.tables.write().unwrap();
+        let state = tables.get_mut(&table_id).unwrap();
+        let result = f(&mut state.current.multi_uniques);
+        Ok(result)
+    }
+
     /// Prepare the metadata state for dropping a table by clearing cached entries.
     ///
     /// Column metadata is loaded eagerly for the provided field identifiers so deletions
@@ -297,6 +338,7 @@ where
             state.current.table_meta = None;
             state.current.column_metas.clear();
             state.current.constraints.clear();
+            state.current.multi_uniques.clear();
         }
         drop(tables);
         self.refresh_referencing_index_for_table(table_id);
@@ -310,13 +352,6 @@ where
             .write()
             .unwrap()
             .remove_child(table_id);
-    }
-
-    /// Delete persisted multi-column UNIQUE metadata for a table.
-    pub fn delete_multi_column_uniques(&self, table_id: TableId) -> LlkvResult<()> {
-        let catalog = SysCatalog::new(&self.store);
-        catalog.delete_multi_column_uniques(table_id)?;
-        Ok(())
     }
 
     /// Return all constraint records currently cached for the table.
@@ -457,6 +492,16 @@ where
             }
         }
 
+        if state.current.multi_uniques != state.persisted.multi_uniques {
+            if state.current.multi_uniques.is_empty() {
+                catalog.delete_multi_column_uniques(table_id)?;
+                state.persisted.multi_uniques.clear();
+            } else {
+                catalog.put_multi_column_uniques(table_id, &state.current.multi_uniques)?;
+                state.persisted.multi_uniques = state.current.multi_uniques.clone();
+            }
+        }
+
         Ok(())
     }
 
@@ -488,6 +533,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MultiColumnUniqueEntryMeta;
     use crate::constraints::{ConstraintKind, ConstraintState, PrimaryKeyConstraint};
     use llkv_column_map::ColumnStore;
     use llkv_storage::pager::MemPager;
@@ -540,6 +586,14 @@ mod tests {
             .put_constraint_records(table_id, std::slice::from_ref(&constraint))
             .unwrap();
 
+        let multi_unique = MultiColumnUniqueEntryMeta {
+            index_name: Some("uniq_users_name".into()),
+            column_ids: vec![column_meta.col_id],
+        };
+        manager
+            .set_multi_column_uniques(table_id, vec![multi_unique.clone()])
+            .unwrap();
+
         assert_eq!(
             manager.table_meta(table_id).unwrap(),
             Some(table_meta.clone())
@@ -554,6 +608,8 @@ mod tests {
             .constraint_records_for_table(table_id)
             .unwrap();
         assert_eq!(constraints, vec![constraint.clone()]);
+        let unique_roundtrip = verify_catalog.get_multi_column_uniques(table_id).unwrap();
+        assert_eq!(unique_roundtrip, vec![multi_unique.clone()]);
 
         let meta_from_cache = manager.table_meta(table_id).unwrap();
         assert_eq!(meta_from_cache, Some(table_meta.clone()));
@@ -565,6 +621,9 @@ mod tests {
 
         let constraints_from_cache = manager.constraint_records(table_id).unwrap();
         assert_eq!(constraints_from_cache, vec![constraint.clone()]);
+
+        let uniques_from_cache = manager.multi_column_uniques(table_id).unwrap();
+        assert_eq!(uniques_from_cache, vec![multi_unique]);
 
         // No additional writes should occur on subsequent flushes without modifications.
         manager.flush_table(table_id).unwrap();
@@ -598,6 +657,13 @@ mod tests {
         initial_catalog
             .put_constraint_records(table_id, std::slice::from_ref(&constraint))
             .unwrap();
+        let multi_unique = MultiColumnUniqueEntryMeta {
+            index_name: Some("uniq_value".into()),
+            column_ids: vec![column_meta.col_id],
+        };
+        initial_catalog
+            .put_multi_column_uniques(table_id, std::slice::from_ref(&multi_unique))
+            .unwrap();
 
         let columns = manager
             .column_metas(table_id, &[column_meta.col_id])
@@ -606,5 +672,8 @@ mod tests {
 
         let constraints = manager.constraint_records(table_id).unwrap();
         assert_eq!(constraints, vec![constraint]);
+
+        let uniques = manager.multi_column_uniques(table_id).unwrap();
+        assert_eq!(uniques, vec![multi_unique]);
     }
 }

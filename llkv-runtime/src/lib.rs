@@ -198,12 +198,6 @@ enum UniqueKey {
     Composite(Vec<UniqueKey>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct StoredMultiColumnUnique {
-    index_name: Option<String>,
-    field_ids: Vec<FieldId>,
-}
-
 struct PrimaryKeyUpdateContext<'a> {
     indices: &'a [usize],
     names: &'a [String],
@@ -1290,7 +1284,6 @@ where
     pager: Arc<P>,
     tables: RwLock<FxHashMap<String, Arc<ExecutorTable<P>>>>,
     dropped_tables: RwLock<FxHashSet<String>>,
-    multi_column_uniques: RwLock<FxHashMap<String, Vec<StoredMultiColumnUnique>>>,
     metadata: Arc<MetadataManager<P>>,
     // Centralized catalog for table/field name resolution
     catalog: Arc<TableCatalog>,
@@ -1374,17 +1367,6 @@ where
             }
         };
 
-        let persisted_unique_metas = match metadata.all_multi_column_unique_metas() {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!(
-                    "[CONTEXT] Failed to load multi-column unique metas: {}, starting with empty set",
-                    e
-                );
-                Vec::new()
-            }
-        };
-
         let transaction_manager =
             TransactionManager::new_with_initial_state(next_txn_id, last_committed);
         let txn_manager = transaction_manager.txn_manager();
@@ -1414,43 +1396,6 @@ where
             "[CONTEXT] Initialized with lazy loading for {} table(s)",
             loaded_tables.len()
         );
-
-        let mut canonical_by_id: FxHashMap<TableId, String> = FxHashMap::default();
-        for (table_id, table_meta) in &loaded_tables {
-            if let Some(ref table_name) = table_meta.name {
-                canonical_by_id.insert(*table_id, table_name.to_ascii_lowercase());
-            }
-        }
-
-        let mut persisted_multi: FxHashMap<String, Vec<StoredMultiColumnUnique>> =
-            FxHashMap::default();
-        for meta in persisted_unique_metas {
-            if meta.uniques.is_empty() {
-                continue;
-            }
-            let Some(canonical_name) = canonical_by_id.get(&meta.table_id) else {
-                tracing::debug!(
-                    "[CONTEXT] Skipping persisted multi-column UNIQUE metadata for unknown table_id={}",
-                    meta.table_id
-                );
-                continue;
-            };
-
-            let mut stored_entries = Vec::with_capacity(meta.uniques.len());
-            for entry in meta.uniques {
-                if entry.column_ids.is_empty() {
-                    continue;
-                }
-                stored_entries.push(StoredMultiColumnUnique {
-                    index_name: entry.index_name,
-                    field_ids: entry.column_ids,
-                });
-            }
-
-            if !stored_entries.is_empty() {
-                persisted_multi.insert(canonical_name.clone(), stored_entries);
-            }
-        }
 
         // Initialize catalog and populate with existing tables
         let (catalog, is_shared_catalog) = match shared_catalog {
@@ -1489,7 +1434,6 @@ where
             pager,
             tables: RwLock::new(FxHashMap::default()), // Start with empty table cache
             dropped_tables: RwLock::new(FxHashSet::default()),
-            multi_column_uniques: RwLock::new(persisted_multi),
             metadata,
             catalog,
             store: store_arc,
@@ -1518,36 +1462,19 @@ where
         Ok(())
     }
 
-    fn persist_multi_column_uniques(
-        &self,
-        table_id: TableId,
-        entries: &[StoredMultiColumnUnique],
-    ) -> Result<()> {
-        let catalog = SysCatalog::new(&self.store);
-        let metas: Vec<MultiColumnUniqueEntryMeta> = entries
-            .iter()
-            .map(|entry| MultiColumnUniqueEntryMeta {
-                index_name: entry.index_name.clone(),
-                column_ids: entry.field_ids.clone(),
-            })
-            .collect();
-        catalog.put_multi_column_uniques(table_id, &metas)?;
-        Ok(())
-    }
-
     fn build_executor_multi_column_uniques(
         table: &ExecutorTable<P>,
-        stored: &[StoredMultiColumnUnique],
+        stored: &[MultiColumnUniqueEntryMeta],
     ) -> Vec<ExecutorMultiColumnUnique> {
         let mut results = Vec::with_capacity(stored.len());
 
         'outer: for entry in stored {
-            if entry.field_ids.is_empty() {
+            if entry.column_ids.is_empty() {
                 continue;
             }
 
-            let mut column_indices = Vec::with_capacity(entry.field_ids.len());
-            for field_id in &entry.field_ids {
+            let mut column_indices = Vec::with_capacity(entry.column_ids.len());
+            for field_id in &entry.column_ids {
                 if let Some((idx, _)) = table
                     .schema
                     .columns
@@ -1690,10 +1617,6 @@ where
         if is_dropped {
             self.remove_table_entry(&canonical_name);
             self.dropped_tables.write().unwrap().remove(&canonical_name);
-            self.multi_column_uniques
-                .write()
-                .unwrap()
-                .remove(&canonical_name);
         }
 
         if exists {
@@ -1703,10 +1626,6 @@ where
                     display_name
                 );
                 self.remove_table_entry(&canonical_name);
-                self.multi_column_uniques
-                    .write()
-                    .unwrap()
-                    .remove(&canonical_name);
             } else if if_not_exists {
                 tracing::trace!(
                     "DEBUG create_table_plan: table '{}' exists and if_not_exists=true, returning early WITHOUT creating",
@@ -1857,23 +1776,19 @@ where
             ));
         }
 
+        let table_id = table.table.table_id();
+
         if let Some(existing) = self
-            .multi_column_uniques
-            .read()
-            .unwrap()
-            .get(&canonical_name)
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|entry| entry.field_ids == field_ids)
-                    .cloned()
-            })
+            .metadata
+            .multi_column_uniques(table_id)?
+            .into_iter()
+            .find(|entry| entry.column_ids == field_ids)
         {
             if plan.if_not_exists {
                 drop(table);
                 return Ok(RuntimeStatementResult::CreateIndex {
                     table_name: display_name,
-                    index_name: existing.index_name.clone(),
+                    index_name: existing.index_name,
                 });
             }
 
@@ -1890,21 +1805,27 @@ where
             column_indices: column_indices.clone(),
         };
 
-        let mut entries_to_persist = {
-            let guard = self.multi_column_uniques.read().unwrap();
-            guard.get(&canonical_name).cloned().unwrap_or_default()
-        };
+        let mut duplicate_index_name: Option<Option<String>> = None;
+        let mut inserted = false;
+        self.metadata
+            .update_multi_column_uniques(table_id, |entries| {
+                if let Some(existing) = entries.iter().find(|entry| entry.column_ids == field_ids) {
+                    duplicate_index_name = Some(existing.index_name.clone());
+                } else {
+                    entries.push(MultiColumnUniqueEntryMeta {
+                        index_name: index_name.clone(),
+                        column_ids: field_ids.clone(),
+                    });
+                    inserted = true;
+                }
+            })?;
 
-        if entries_to_persist
-            .iter()
-            .any(|existing| existing.field_ids == field_ids)
-        {
-            // Race condition guard: another thread inserted the same index after the initial check.
+        if !inserted {
             if plan.if_not_exists {
                 drop(table);
                 return Ok(RuntimeStatementResult::CreateIndex {
                     table_name: display_name,
-                    index_name: index_name.clone(),
+                    index_name: duplicate_index_name.flatten(),
                 });
             }
             return Err(Error::CatalogError(format!(
@@ -1913,19 +1834,7 @@ where
             )));
         }
 
-        let stored_entry = StoredMultiColumnUnique {
-            index_name: index_name.clone(),
-            field_ids: field_ids.clone(),
-        };
-        entries_to_persist.push(stored_entry.clone());
-
-        self.persist_multi_column_uniques(table.table.table_id(), &entries_to_persist)?;
-
-        {
-            let mut guard = self.multi_column_uniques.write().unwrap();
-            guard.insert(canonical_name.clone(), entries_to_persist);
-        }
-
+        self.metadata.flush_table(table_id)?;
         table.add_multi_column_unique(executor_entry);
 
         Ok(RuntimeStatementResult::CreateIndex {
@@ -2394,11 +2303,6 @@ where
                 "CREATE TABLE requires at least one column".into(),
             ));
         }
-
-        self.multi_column_uniques
-            .write()
-            .unwrap()
-            .remove(&canonical_name);
 
         let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(columns.len());
         let mut lookup = FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
@@ -3041,10 +2945,6 @@ where
                 "CREATE TABLE AS SELECT requires at least one column".into(),
             ));
         }
-        self.multi_column_uniques
-            .write()
-            .unwrap()
-            .remove(&canonical_name);
         let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(schema.fields().len());
         let mut lookup =
             FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
@@ -6038,16 +5938,20 @@ where
             multi_column_uniques: RwLock::new(Vec::new()),
         });
 
-        if let Some(stored) = self
-            .multi_column_uniques
-            .read()
-            .unwrap()
-            .get(canonical_name)
-            .cloned()
-        {
-            let executor_uniques =
-                Self::build_executor_multi_column_uniques(&executor_table, &stored);
-            executor_table.set_multi_column_uniques(executor_uniques);
+        match self.metadata.multi_column_uniques(table_meta.table_id) {
+            Ok(stored) if !stored.is_empty() => {
+                let executor_uniques =
+                    Self::build_executor_multi_column_uniques(&executor_table, &stored);
+                executor_table.set_multi_column_uniques(executor_uniques);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    table_id = table_meta.table_id,
+                    error = %err,
+                    "[LAZY_LOAD] Failed to load multi-column UNIQUE metadata during table hydrate"
+                );
+            }
         }
 
         // Cache the loaded table
@@ -6154,23 +6058,6 @@ where
             .write()
             .unwrap()
             .insert(canonical_name.clone());
-        let removed_multi = self
-            .multi_column_uniques
-            .write()
-            .unwrap()
-            .remove(&canonical_name);
-        if let Err(err) = self.metadata.delete_multi_column_uniques(table_id) {
-            tracing::debug!(
-                table_id,
-                error = %err,
-                "[CATALOG] Failed to delete multi-column unique metadata during drop"
-            );
-        } else if removed_multi.is_some() {
-            tracing::trace!(
-                table_id,
-                "[CATALOG] Deleted multi-column unique metadata for dropped table"
-            );
-        }
         Ok(())
     }
 
