@@ -58,12 +58,12 @@ use llkv_table::catalog::{FieldConstraints, FieldDefinition, TableCatalog};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_table::{
-    ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo, MetadataManager,
-    MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, SysCatalog, TableColumn, TableMeta,
-    UniqueKey, build_composite_unique_key, canonical_table_name,
+    ConstraintColumnInfo, ConstraintService, ForeignKeyColumn, ForeignKeyTableInfo,
+    MetadataManager, MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, SysCatalog,
+    TableColumn, TableMeta, UniqueKey, build_composite_unique_key, canonical_table_name,
     constraints::{ConstraintKind, ForeignKeyAction as CatalogForeignKeyAction},
     ensure_multi_column_unique, ensure_primary_key, ensure_single_column_unique,
-    resolve_table_name, validate_check_constraints, validate_foreign_key_rows,
+    resolve_table_name, validate_check_constraints,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -200,16 +200,10 @@ struct PrimaryKeyUpdateContext<'a> {
 struct ForeignKeyMetadata {
     constraint_name: Option<String>,
     referencing_display: String,
-    referencing_column_indices: Vec<usize>,
     referencing_field_ids: Vec<FieldId>,
-    referencing_column_names: Vec<String>,
     referenced_table: String,
-    referenced_display: String,
     referenced_field_ids: Vec<FieldId>,
-    referenced_column_names: Vec<String>,
-    referenced_table_id: TableId,
     on_delete: ForeignKeyAction,
-    on_update: ForeignKeyAction,
 }
 
 /// Result of running a plan statement.
@@ -1276,6 +1270,7 @@ where
     tables: RwLock<FxHashMap<String, Arc<ExecutorTable<P>>>>,
     dropped_tables: RwLock<FxHashSet<String>>,
     metadata: Arc<MetadataManager<P>>,
+    constraint_service: ConstraintService<P>,
     // Centralized catalog for table/field name resolution
     catalog: Arc<TableCatalog>,
     // Shared column store for all tables in this context
@@ -1421,11 +1416,15 @@ where
             catalog.table_count()
         );
 
+        let constraint_service =
+            ConstraintService::new(Arc::clone(&metadata), Arc::clone(&catalog));
+
         Self {
             pager,
             tables: RwLock::new(FxHashMap::default()), // Start with empty table cache
             dropped_tables: RwLock::new(FxHashSet::default()),
             metadata,
+            constraint_service,
             catalog,
             store: store_arc,
             transaction_manager,
@@ -2489,18 +2488,13 @@ where
         let mut entries = Vec::new();
 
         for detail in details {
-            let mut referencing_indices = Vec::with_capacity(detail.referencing_field_ids.len());
-
             for field_id in &detail.referencing_field_ids {
-                if let Some((idx, _col)) = table
+                let exists = table
                     .schema
                     .columns
                     .iter()
-                    .enumerate()
-                    .find(|(_, col)| &col.field_id == field_id)
-                {
-                    referencing_indices.push(idx);
-                } else {
+                    .any(|col| &col.field_id == field_id);
+                if !exists {
                     return Err(Error::Internal(format!(
                         "referenced field id {} not found in table '{}'",
                         field_id, display_name
@@ -2511,16 +2505,10 @@ where
             entries.push(ForeignKeyMetadata {
                 constraint_name: None,
                 referencing_display: detail.referencing_table_display.clone(),
-                referencing_column_indices: referencing_indices,
                 referencing_field_ids: detail.referencing_field_ids.clone(),
-                referencing_column_names: detail.referencing_column_names.clone(),
                 referenced_table: detail.referenced_table_canonical.clone(),
-                referenced_display: detail.referenced_table_display.clone(),
                 referenced_field_ids: detail.referenced_field_ids.clone(),
-                referenced_column_names: detail.referenced_column_names.clone(),
-                referenced_table_id: detail.referenced_table_id,
                 on_delete: convert_action(detail.on_delete),
-                on_update: convert_action(detail.on_update),
             });
         }
 
@@ -4483,7 +4471,7 @@ where
     fn check_foreign_keys_on_insert(
         &self,
         table: &ExecutorTable<P>,
-        display_name: &str,
+        _display_name: &str,
         rows: &[Vec<PlanValue>],
         column_order: &[usize],
         snapshot: TransactionSnapshot,
@@ -4492,90 +4480,27 @@ where
             return Ok(());
         }
 
-        let constraints = self.foreign_keys_for_table(table, display_name)?;
+        let schema_field_ids: Vec<FieldId> = table
+            .schema
+            .columns
+            .iter()
+            .map(|column| column.field_id)
+            .collect();
 
-        if constraints.is_empty() {
-            return Ok(());
-        }
-
-        let mut table_to_row_index: Vec<Option<usize>> = vec![None; table.schema.columns.len()];
-        for (row_pos, &schema_idx) in column_order.iter().enumerate() {
-            if let Some(slot) = table_to_row_index.get_mut(schema_idx) {
-                *slot = Some(row_pos);
-            }
-        }
-
-        for metadata in constraints {
-            if metadata.referencing_column_indices.is_empty() {
-                continue;
-            }
-
-            let mut referencing_positions =
-                Vec::with_capacity(metadata.referencing_column_indices.len());
-            for (idx, &schema_idx) in metadata.referencing_column_indices.iter().enumerate() {
-                let Some(position) = table_to_row_index.get(schema_idx).and_then(|entry| *entry)
-                else {
-                    let column_name = metadata
-                        .referencing_column_names
-                        .get(idx)
-                        .cloned()
-                        .unwrap_or_else(|| schema_idx.to_string());
-                    return Err(Error::InvalidArgumentError(format!(
-                        "FOREIGN KEY column '{}' missing from INSERT statement",
-                        column_name
-                    )));
-                };
-                referencing_positions.push(position);
-            }
-
-            let parent_table = self.lookup_table(&metadata.referenced_table)?;
-            let parent_rows = self.scan_multi_column_values(
-                parent_table.as_ref(),
-                &metadata.referenced_field_ids,
-                snapshot,
-            )?;
-
-            let parent_keys: Vec<Vec<PlanValue>> = parent_rows
-                .into_iter()
-                .filter(|values| values.len() == metadata.referenced_field_ids.len())
-                .filter(|values| !values.iter().any(|value| matches!(value, PlanValue::Null)))
-                .collect();
-
-            let mut candidate_keys: Vec<Vec<PlanValue>> = Vec::new();
-            for row in rows {
-                let mut key: Vec<PlanValue> = Vec::with_capacity(referencing_positions.len());
-                let mut contains_null = false;
-                for &row_pos in &referencing_positions {
-                    let value = row.get(row_pos).cloned().ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "INSERT row is missing a required column value".into(),
-                        )
-                    })?;
-                    if matches!(value, PlanValue::Null) {
-                        contains_null = true;
-                        break;
-                    }
-                    key.push(value);
-                }
-
-                if contains_null {
-                    continue;
-                }
-
-                candidate_keys.push(key);
-            }
-
-            validate_foreign_key_rows(
-                metadata.constraint_name.as_deref(),
-                display_name,
-                &metadata.referenced_display,
-                &metadata.referenced_column_names,
-                &parent_keys,
-                &candidate_keys,
-            )?;
-        }
-
-        Ok(())
+        self.constraint_service.validate_insert_foreign_keys(
+            table.table.table_id(),
+            &schema_field_ids,
+            column_order,
+            rows,
+            |request| {
+                let parent_table = self.lookup_table(request.referenced_table_canonical)?;
+                self.scan_multi_column_values(
+                    parent_table.as_ref(),
+                    request.referenced_field_ids,
+                    snapshot,
+                )
+            },
+        )
     }
 
     fn detect_delete_conflicts(

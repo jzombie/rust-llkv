@@ -33,6 +33,7 @@
 
 pub mod catalog;
 pub mod constants;
+pub mod constraint_service;
 pub mod constraint_validation;
 pub mod constraints;
 pub mod gather;
@@ -52,6 +53,7 @@ pub mod types;
 
 pub mod stream;
 
+pub use constraint_service::{ConstraintService, ForeignKeyRowFetch};
 pub use constraint_validation::{
     ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo, UniqueKey, ValidatedForeignKey,
     build_composite_unique_key, ensure_multi_column_unique, ensure_primary_key,
