@@ -217,6 +217,41 @@ where
 
         Ok(())
     }
+
+    /// Return the set of foreign keys referencing the provided table.
+    pub fn referencing_foreign_keys(
+        &self,
+        referenced_table_id: TableId,
+    ) -> LlkvResult<Vec<ForeignKeyDetail>> {
+        let referencing = self
+            .metadata
+            .foreign_keys_referencing(referenced_table_id)?;
+
+        if referencing.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut details_out = Vec::new();
+        for (child_table_id, constraint_id) in referencing {
+            let details = match self
+                .metadata
+                .foreign_key_details(self.catalog.as_ref(), child_table_id)
+            {
+                Ok(details) => details,
+                Err(Error::InvalidArgumentError(_)) | Err(Error::CatalogError(_)) => continue,
+                Err(err) => return Err(err),
+            };
+
+            if let Some(detail) = details
+                .into_iter()
+                .find(|detail| detail.constraint_id == constraint_id)
+            {
+                details_out.push(detail);
+            }
+        }
+
+        Ok(details_out)
+    }
 }
 
 fn build_field_lookup(schema_field_ids: &[FieldId]) -> FxHashMap<FieldId, usize> {

@@ -56,14 +56,13 @@ use llkv_result::Error;
 use llkv_storage::pager::{BoxedPager, MemPager, Pager};
 use llkv_table::catalog::{FieldConstraints, FieldDefinition, TableCatalog};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
-use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
+use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId};
 use llkv_table::{
     ConstraintColumnInfo, ConstraintService, ForeignKeyColumn, ForeignKeyTableInfo,
     MetadataManager, MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, SysCatalog,
     TableColumn, TableMeta, UniqueKey, build_composite_unique_key, canonical_table_name,
-    constraints::ConstraintKind,
-    ensure_multi_column_unique, ensure_primary_key, ensure_single_column_unique,
-    resolve_table_name, validate_check_constraints,
+    constraints::ConstraintKind, ensure_multi_column_unique, ensure_primary_key,
+    ensure_single_column_unique, validate_check_constraints,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -74,9 +73,6 @@ use sqlparser::ast::{
 use time::{Date, Month};
 
 pub type Result<T> = llkv_result::Result<T>;
-
-/// Type alias for child table references: (name, canonical_name, table)
-type ChildTableRefs<P> = Vec<(String, String, Arc<ExecutorTable<P>>)>;
 
 // Re-export plan structures from llkv-plan
 pub use llkv_plan::{
@@ -194,12 +190,6 @@ struct PrimaryKeyUpdateContext<'a> {
     names: &'a [String],
     original_keys: &'a [Option<UniqueKey>],
     new_rows: &'a [Vec<PlanValue>],
-}
-
-#[derive(Clone, Debug)]
-struct ForeignKeyMetadata {
-    constraint_name: Option<String>,
-    referenced_table: String,
 }
 
 /// Result of running a plan statement.
@@ -2461,85 +2451,6 @@ where
         Ok(RuntimeStatementResult::CreateTable {
             table_name: display_name,
         })
-    }
-
-    fn foreign_keys_for_table(
-        &self,
-        table: &ExecutorTable<P>,
-        display_name: &str,
-    ) -> Result<Vec<ForeignKeyMetadata>> {
-        let details = self
-            .metadata
-            .foreign_key_details(&self.catalog, table.table.table_id())?;
-
-        if details.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut entries = Vec::new();
-
-        for detail in details {
-            for field_id in &detail.referencing_field_ids {
-                let exists = table
-                    .schema
-                    .columns
-                    .iter()
-                    .any(|col| &col.field_id == field_id);
-                if !exists {
-                    return Err(Error::Internal(format!(
-                        "referenced field id {} not found in table '{}'",
-                        field_id, display_name
-                    )));
-                }
-            }
-
-            entries.push(ForeignKeyMetadata {
-                constraint_name: None,
-                referenced_table: detail.referenced_table_canonical.clone(),
-            });
-        }
-
-        Ok(entries)
-    }
-
-    fn referencing_child_tables(
-        &self,
-        parent_table_id: TableId,
-        parent_canonical: &str,
-    ) -> Result<ChildTableRefs<P>> {
-        let referencing = self.metadata.foreign_keys_referencing(parent_table_id)?;
-
-        if referencing.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut seen: FxHashSet<String> = FxHashSet::default();
-        let mut out = Vec::new();
-
-        for (child_table_id, _) in referencing {
-            let (display_name, canonical_name) =
-                resolve_table_name(&self.catalog, &self.metadata, child_table_id)?;
-
-            if canonical_name == parent_canonical && child_table_id != parent_table_id {
-                // Same canonical but different id (unlikely); still consider.
-            }
-
-            if self.is_table_marked_dropped(&canonical_name) {
-                continue;
-            }
-
-            let table = match self.lookup_table(&canonical_name) {
-                Ok(table) => table,
-                Err(Error::CatalogError(msg)) if msg.contains("does not exist") => continue,
-                Err(err) => return Err(err),
-            };
-
-            if seen.insert(canonical_name.clone()) {
-                out.push((canonical_name, display_name, table));
-            }
-        }
-
-        Ok(out)
     }
 
     fn create_table_from_batches(
@@ -4870,25 +4781,21 @@ where
             (entry.table.table_id(), field_ids)
         };
 
-        let referencing_children = self.referencing_child_tables(table_id, &canonical_name)?;
+        let referencing = self.constraint_service.referencing_foreign_keys(table_id)?;
 
-        for (child_canonical, child_display, child_table) in &referencing_children {
-            if child_canonical == &canonical_name {
+        for detail in referencing {
+            if detail.referencing_table_canonical == canonical_name {
                 continue;
             }
 
-            let foreign_keys = self.foreign_keys_for_table(child_table.as_ref(), child_display)?;
-
-            if let Some(metadata) = foreign_keys
-                .into_iter()
-                .find(|meta| meta.referenced_table == canonical_name)
-            {
-                let constraint_label = metadata.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
-                return Err(Error::ConstraintError(format!(
-                    "Cannot drop table '{}' because it is referenced by foreign key constraint '{}' on table '{}'",
-                    display_name, constraint_label, child_display
-                )));
+            if self.is_table_marked_dropped(&detail.referencing_table_canonical) {
+                continue;
             }
+
+            return Err(Error::ConstraintError(format!(
+                "Cannot drop table '{}' because it is referenced by foreign key constraint '{}' on table '{}'",
+                display_name, "FOREIGN KEY", detail.referencing_table_display
+            )));
         }
 
         self.metadata
