@@ -492,7 +492,7 @@ where
                     flags: 0,
                     default: None,
                 };
-                self.put_col_meta(&meta);
+                self.catalog().put_col_meta(self.table_id, &meta);
             }
         }
 
@@ -637,19 +637,8 @@ where
     }
 
     #[inline]
-    pub fn put_table_meta(&self, meta: &TableMeta) {
-        debug_assert_eq!(meta.table_id, self.table_id);
-        self.catalog().put_table_meta(meta);
-    }
-
-    #[inline]
     pub fn get_table_meta(&self) -> Option<TableMeta> {
         self.catalog().get_table_meta(self.table_id)
-    }
-
-    #[inline]
-    pub fn put_col_meta(&self, meta: &ColMeta) {
-        self.catalog().put_col_meta(self.table_id, meta);
     }
 
     #[inline]

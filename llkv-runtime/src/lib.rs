@@ -2345,7 +2345,6 @@ where
             flags: 0,
             epoch: 0,
         };
-        table.put_table_meta(&table_meta);
         self.metadata.set_table_meta(table_id, table_meta)?;
 
         for column in &column_defs {
@@ -2355,7 +2354,6 @@ where
                 flags: 0,
                 default: None,
             };
-            table.put_col_meta(&column_meta);
             self.metadata.set_column_meta(table_id, column_meta)?;
         }
 
@@ -2947,7 +2945,6 @@ where
             flags: 0,
             epoch: 0,
         };
-        table.put_table_meta(&table_meta);
         self.metadata.set_table_meta(table_id, table_meta)?;
 
         for column in &column_defs {
@@ -2957,7 +2954,6 @@ where
                 flags: 0,
                 default: None,
             };
-            table.put_col_meta(&column_meta);
             self.metadata.set_column_meta(table_id, column_meta)?;
         }
 

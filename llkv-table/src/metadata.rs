@@ -722,7 +722,8 @@ mod tests {
             .set_column_meta(table_id, column_meta.clone())
             .unwrap();
 
-        let logical_field_id = llkv_column_map::types::LogicalFieldId::for_user(table_id, column_meta.col_id);
+        let logical_field_id =
+            llkv_column_map::types::LogicalFieldId::for_user(table_id, column_meta.col_id);
         store
             .ensure_column_registered(logical_field_id, &arrow::datatypes::DataType::Utf8)
             .unwrap();
