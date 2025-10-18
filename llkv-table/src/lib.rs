@@ -56,13 +56,14 @@ pub use constraint_validation::{
     ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo, UniqueKey, ValidatedForeignKey,
     build_composite_unique_key, ensure_multi_column_unique, ensure_primary_key,
     ensure_single_column_unique, unique_key_component, validate_check_constraints,
-    validate_foreign_keys,
+    validate_foreign_key_rows, validate_foreign_keys,
 };
 pub use constraints::{
     CheckConstraint, ConstraintExpressionRef, ConstraintId, ConstraintKind, ConstraintRecord,
     ConstraintState, ForeignKeyAction, ForeignKeyConstraint, PrimaryKeyConstraint,
     UniqueConstraint, decode_constraint_row_id, encode_constraint_row_id,
 };
+pub use metadata::MultiColumnUniqueRegistration;
 pub use metadata::{ForeignKeyDescriptor, ForeignKeyDetail, MetadataManager};
 pub use reserved::CATALOG_TABLE_ID;
 pub use resolvers::{canonical_table_name, resolve_table_name};

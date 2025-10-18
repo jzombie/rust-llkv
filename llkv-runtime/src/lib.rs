@@ -59,11 +59,11 @@ use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_table::{
     ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo, MetadataManager,
-    MultiColumnUniqueEntryMeta, SysCatalog, TableColumn, TableMeta, UniqueKey,
-    build_composite_unique_key, canonical_table_name,
+    MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, SysCatalog, TableColumn, TableMeta,
+    UniqueKey, build_composite_unique_key, canonical_table_name,
     constraints::{ConstraintKind, ForeignKeyAction as CatalogForeignKeyAction},
     ensure_multi_column_unique, ensure_primary_key, ensure_single_column_unique,
-    resolve_table_name, validate_check_constraints,
+    resolve_table_name, validate_check_constraints, validate_foreign_key_rows,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -1767,26 +1767,6 @@ where
 
         let table_id = table.table.table_id();
 
-        if let Some(existing) = self
-            .metadata
-            .multi_column_uniques(table_id)?
-            .into_iter()
-            .find(|entry| entry.column_ids == field_ids)
-        {
-            if plan.if_not_exists {
-                drop(table);
-                return Ok(RuntimeStatementResult::CreateIndex {
-                    table_name: display_name,
-                    index_name: existing.index_name,
-                });
-            }
-
-            return Err(Error::CatalogError(format!(
-                "Index already exists on columns '{}'",
-                column_names.join(", ")
-            )));
-        }
-
         let snapshot = self.default_snapshot();
         let existing_rows = self.scan_multi_column_values(table.as_ref(), &field_ids, snapshot)?;
         ensure_multi_column_unique(&existing_rows, &[], &column_names)?;
@@ -1796,37 +1776,31 @@ where
             column_indices: column_indices.clone(),
         };
 
-        let mut duplicate_index_name: Option<Option<String>> = None;
-        let mut inserted = false;
-        self.metadata
-            .update_multi_column_uniques(table_id, |entries| {
-                if let Some(existing) = entries.iter().find(|entry| entry.column_ids == field_ids) {
-                    duplicate_index_name = Some(existing.index_name.clone());
-                } else {
-                    entries.push(MultiColumnUniqueEntryMeta {
-                        index_name: index_name.clone(),
-                        column_ids: field_ids.clone(),
-                    });
-                    inserted = true;
-                }
-            })?;
+        let registration =
+            self.metadata
+                .register_multi_column_unique(table_id, &field_ids, index_name.clone())?;
 
-        if !inserted {
-            if plan.if_not_exists {
-                drop(table);
-                return Ok(RuntimeStatementResult::CreateIndex {
-                    table_name: display_name,
-                    index_name: duplicate_index_name.flatten(),
-                });
+        match registration {
+            MultiColumnUniqueRegistration::Created => {
+                self.metadata.flush_table(table_id)?;
+                table.add_multi_column_unique(executor_entry);
             }
-            return Err(Error::CatalogError(format!(
-                "Index already exists on columns '{}'",
-                column_names.join(", ")
-            )));
+            MultiColumnUniqueRegistration::AlreadyExists {
+                index_name: existing,
+            } => {
+                if plan.if_not_exists {
+                    drop(table);
+                    return Ok(RuntimeStatementResult::CreateIndex {
+                        table_name: display_name,
+                        index_name: existing,
+                    });
+                }
+                return Err(Error::CatalogError(format!(
+                    "Index already exists on columns '{}'",
+                    column_names.join(", ")
+                )));
+            }
         }
-
-        self.metadata.flush_table(table_id)?;
-        table.add_multi_column_unique(executor_entry);
 
         Ok(RuntimeStatementResult::CreateIndex {
             table_name: display_name,
@@ -4567,6 +4541,7 @@ where
                 .filter(|values| !values.iter().any(|value| matches!(value, PlanValue::Null)))
                 .collect();
 
+            let mut candidate_keys: Vec<Vec<PlanValue>> = Vec::new();
             for row in rows {
                 let mut key: Vec<PlanValue> = Vec::with_capacity(referencing_positions.len());
                 let mut contains_null = false;
@@ -4587,22 +4562,17 @@ where
                     continue;
                 }
 
-                if parent_keys.iter().any(|existing| existing == &key) {
-                    continue;
-                }
-
-                let constraint_label = metadata.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
-                let referenced_columns = if metadata.referenced_column_names.is_empty() {
-                    String::from("<unknown>")
-                } else {
-                    metadata.referenced_column_names.join(", ")
-                };
-
-                return Err(Error::ConstraintError(format!(
-                    "Violates foreign key constraint '{}' on table '{}' referencing '{}' (columns: {}) - does not exist in the referenced table",
-                    constraint_label, display_name, metadata.referenced_display, referenced_columns,
-                )));
+                candidate_keys.push(key);
             }
+
+            validate_foreign_key_rows(
+                metadata.constraint_name.as_deref(),
+                display_name,
+                &metadata.referenced_display,
+                &metadata.referenced_column_names,
+                &parent_keys,
+                &candidate_keys,
+            )?;
         }
 
         Ok(())

@@ -844,6 +844,38 @@ where
         Ok(())
     }
 
+    /// Register a multi-column UNIQUE definition for a table.
+    pub fn register_multi_column_unique(
+        &self,
+        table_id: TableId,
+        column_ids: &[FieldId],
+        index_name: Option<String>,
+    ) -> LlkvResult<MultiColumnUniqueRegistration> {
+        let mut created = false;
+        let mut existing_name: Option<Option<String>> = None;
+        let column_vec: Vec<FieldId> = column_ids.to_vec();
+
+        self.update_multi_column_uniques(table_id, |entries| {
+            if let Some(existing) = entries.iter().find(|entry| entry.column_ids == column_vec) {
+                existing_name = Some(existing.index_name.clone());
+            } else {
+                entries.push(MultiColumnUniqueEntryMeta {
+                    index_name: index_name.clone(),
+                    column_ids: column_vec.clone(),
+                });
+                created = true;
+            }
+        })?;
+
+        if created {
+            Ok(MultiColumnUniqueRegistration::Created)
+        } else {
+            Ok(MultiColumnUniqueRegistration::AlreadyExists {
+                index_name: existing_name.unwrap_or(None),
+            })
+        }
+    }
+
     fn column_names(&self, table_id: TableId, field_ids: &[FieldId]) -> LlkvResult<Vec<String>> {
         if field_ids.is_empty() {
             return Ok(Vec::new());
@@ -1098,4 +1130,11 @@ pub struct ForeignKeyDetail {
     pub referenced_column_names: Vec<String>,
     pub on_delete: ForeignKeyAction,
     pub on_update: ForeignKeyAction,
+}
+
+/// Result of attempting to register a multi-column unique definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiColumnUniqueRegistration {
+    Created,
+    AlreadyExists { index_name: Option<String> },
 }

@@ -772,12 +772,65 @@ pub fn ensure_primary_key(
                 "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
             ))
         })?;
-        
+
         if !seen.insert(key.clone()) {
             return Err(Error::ConstraintError(format!(
                 "Duplicate key violates primary key constraint on {pk_label} '{pk_display}' (PRIMARY KEY or UNIQUE constraint violation)"
             )));
         }
+    }
+
+    Ok(())
+}
+
+/// Ensure that referencing rows satisfy the foreign key constraint by matching existing parent keys.
+pub fn validate_foreign_key_rows(
+    constraint_name: Option<&str>,
+    referencing_table: &str,
+    referenced_table: &str,
+    referenced_column_names: &[String],
+    parent_keys: &[Vec<PlanValue>],
+    candidate_keys: &[Vec<PlanValue>],
+) -> LlkvResult<()> {
+    if parent_keys.is_empty() {
+        // If there are no parent keys, every non-null candidate will fail.
+        for key in candidate_keys {
+            if key.iter().all(|value| !matches!(value, PlanValue::Null)) {
+                let constraint_label = constraint_name.unwrap_or("FOREIGN KEY");
+                let referenced_columns = if referenced_column_names.is_empty() {
+                    String::from("<unknown>")
+                } else {
+                    referenced_column_names.join(", ")
+                };
+                return Err(Error::ConstraintError(format!(
+                    "Violates foreign key constraint '{}' on table '{}' referencing '{}' (columns: {}) - does not exist in the referenced table",
+                    constraint_label, referencing_table, referenced_table, referenced_columns,
+                )));
+            }
+        }
+        return Ok(());
+    }
+
+    for key in candidate_keys {
+        if key.iter().any(|value| matches!(value, PlanValue::Null)) {
+            continue;
+        }
+
+        if parent_keys.iter().any(|existing| existing == key) {
+            continue;
+        }
+
+        let constraint_label = constraint_name.unwrap_or("FOREIGN KEY");
+        let referenced_columns = if referenced_column_names.is_empty() {
+            String::from("<unknown>")
+        } else {
+            referenced_column_names.join(", ")
+        };
+
+        return Err(Error::ConstraintError(format!(
+            "Violates foreign key constraint '{}' on table '{}' referencing '{}' (columns: {}) - does not exist in the referenced table",
+            constraint_label, referencing_table, referenced_table, referenced_columns,
+        )));
     }
 
     Ok(())
