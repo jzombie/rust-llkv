@@ -61,7 +61,7 @@ pub use constraints::{
     ConstraintState, ForeignKeyAction, ForeignKeyConstraint, PrimaryKeyConstraint,
     UniqueConstraint, decode_constraint_row_id, encode_constraint_row_id,
 };
-pub use metadata::{ForeignKeyDescriptor, MetadataManager};
+pub use metadata::{ForeignKeyDescriptor, ForeignKeyDetail, MetadataManager};
 pub use reserved::CATALOG_TABLE_ID;
 pub use resolvers::{canonical_table_name, resolve_table_name};
 pub use stream::{ColumnStream, ColumnStreamBatch};

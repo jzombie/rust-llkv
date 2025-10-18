@@ -6,7 +6,9 @@
 
 #![forbid(unsafe_code)]
 
+use crate::catalog::TableCatalog;
 use crate::constraints::{ConstraintId, ConstraintKind, ConstraintRecord, ForeignKeyAction};
+use crate::resolvers::resolve_table_name;
 use crate::sys_catalog::SysCatalog;
 use crate::table::Table;
 use crate::types::{FieldId, TableId};
@@ -626,31 +628,64 @@ where
                 continue;
             };
 
-            let referencing_names = self.column_names(table_id, &fk.referencing_field_ids)?;
-            let referenced_names =
-                self.column_names(fk.referenced_table, &fk.referenced_field_ids)?;
-
-            let referencing_table_name = self.table_meta(table_id)?.and_then(|meta| meta.name);
-            let referenced_table_name = self
-                .table_meta(fk.referenced_table)?
-                .and_then(|meta| meta.name);
-
             descriptors.push(ForeignKeyDescriptor {
                 constraint_id: record.constraint_id,
                 referencing_table_id: table_id,
-                referencing_table_name,
                 referencing_field_ids: fk.referencing_field_ids.clone(),
-                referencing_column_names: referencing_names,
                 referenced_table_id: fk.referenced_table,
-                referenced_table_name,
                 referenced_field_ids: fk.referenced_field_ids.clone(),
-                referenced_column_names: referenced_names,
                 on_delete: fk.on_delete,
                 on_update: fk.on_update,
             });
         }
 
         Ok(descriptors)
+    }
+
+    /// Resolve foreign key descriptors into names suitable for runtime consumers.
+    pub fn foreign_key_details(
+        &self,
+        catalog: &TableCatalog,
+        table_id: TableId,
+    ) -> LlkvResult<Vec<ForeignKeyDetail>> {
+        let descriptors = self.foreign_key_descriptors(table_id)?;
+
+        if descriptors.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (referencing_display, referencing_canonical) =
+            resolve_table_name(catalog, self, table_id)?;
+
+        let mut details = Vec::with_capacity(descriptors.len());
+        for descriptor in descriptors {
+            let referenced_table_id = descriptor.referenced_table_id;
+            let (referenced_display, referenced_canonical) =
+                resolve_table_name(catalog, self, referenced_table_id)?;
+
+            let referencing_column_names =
+                self.column_names(table_id, &descriptor.referencing_field_ids)?;
+            let referenced_column_names =
+                self.column_names(referenced_table_id, &descriptor.referenced_field_ids)?;
+
+            details.push(ForeignKeyDetail {
+                constraint_id: descriptor.constraint_id,
+                referencing_table_id: descriptor.referencing_table_id,
+                referencing_table_display: referencing_display.clone(),
+                referencing_table_canonical: referencing_canonical.clone(),
+                referencing_field_ids: descriptor.referencing_field_ids.clone(),
+                referencing_column_names,
+                referenced_table_id,
+                referenced_table_display: referenced_display.clone(),
+                referenced_table_canonical: referenced_canonical.clone(),
+                referenced_field_ids: descriptor.referenced_field_ids.clone(),
+                referenced_column_names,
+                on_delete: descriptor.on_delete,
+                on_update: descriptor.on_update,
+            });
+        }
+
+        Ok(details)
     }
 
     fn column_names(&self, table_id: TableId, field_ids: &[FieldId]) -> LlkvResult<Vec<String>> {
@@ -841,17 +876,30 @@ mod tests {
     }
 }
 
-// TODO: Does this need to track table names or can the resolver handle them instead?
-/// Descriptor describing a foreign key constraint with resolved column names.
+/// Descriptor describing a foreign key constraint scoped to field identifiers.
 #[derive(Clone, Debug)]
 pub struct ForeignKeyDescriptor {
     pub constraint_id: ConstraintId,
     pub referencing_table_id: TableId,
-    pub referencing_table_name: Option<String>,
+    pub referencing_field_ids: Vec<FieldId>,
+    pub referenced_table_id: TableId,
+    pub referenced_field_ids: Vec<FieldId>,
+    pub on_delete: ForeignKeyAction,
+    pub on_update: ForeignKeyAction,
+}
+
+/// Fully resolved foreign key information with column names and display identifiers.
+#[derive(Clone, Debug)]
+pub struct ForeignKeyDetail {
+    pub constraint_id: ConstraintId,
+    pub referencing_table_id: TableId,
+    pub referencing_table_display: String,
+    pub referencing_table_canonical: String,
     pub referencing_field_ids: Vec<FieldId>,
     pub referencing_column_names: Vec<String>,
     pub referenced_table_id: TableId,
-    pub referenced_table_name: Option<String>,
+    pub referenced_table_display: String,
+    pub referenced_table_canonical: String,
     pub referenced_field_ids: Vec<FieldId>,
     pub referenced_column_names: Vec<String>,
     pub on_delete: ForeignKeyAction,

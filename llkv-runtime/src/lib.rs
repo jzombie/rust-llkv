@@ -2775,11 +2775,11 @@ where
         table: &ExecutorTable<P>,
         display_name: &str,
     ) -> Result<Vec<ForeignKeyMetadata>> {
-        let descriptors = self
+        let details = self
             .metadata
-            .foreign_key_descriptors(table.table.table_id())?;
+            .foreign_key_details(&self.catalog, table.table.table_id())?;
 
-        if descriptors.is_empty() {
+        if details.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -2790,11 +2790,10 @@ where
 
         let mut entries = Vec::new();
 
-        for descriptor in descriptors {
-            let mut referencing_indices =
-                Vec::with_capacity(descriptor.referencing_field_ids.len());
+        for detail in details {
+            let mut referencing_indices = Vec::with_capacity(detail.referencing_field_ids.len());
 
-            for field_id in &descriptor.referencing_field_ids {
+            for field_id in &detail.referencing_field_ids {
                 if let Some((idx, _col)) = table
                     .schema
                     .columns
@@ -2811,25 +2810,19 @@ where
                 }
             }
 
-            let (referenced_display, referenced_canonical) = resolve_table_name(
-                &self.catalog,
-                &self.metadata,
-                descriptor.referenced_table_id,
-            )?;
-
             entries.push(ForeignKeyMetadata {
                 constraint_name: None,
-                referencing_display: display_name.to_string(),
+                referencing_display: detail.referencing_table_display.clone(),
                 referencing_column_indices: referencing_indices,
-                referencing_field_ids: descriptor.referencing_field_ids.clone(),
-                referencing_column_names: descriptor.referencing_column_names.clone(),
-                referenced_table: referenced_canonical,
-                referenced_display,
-                referenced_field_ids: descriptor.referenced_field_ids.clone(),
-                referenced_column_names: descriptor.referenced_column_names.clone(),
-                referenced_table_id: descriptor.referenced_table_id,
-                on_delete: convert_action(descriptor.on_delete),
-                on_update: convert_action(descriptor.on_update),
+                referencing_field_ids: detail.referencing_field_ids.clone(),
+                referencing_column_names: detail.referencing_column_names.clone(),
+                referenced_table: detail.referenced_table_canonical.clone(),
+                referenced_display: detail.referenced_table_display.clone(),
+                referenced_field_ids: detail.referenced_field_ids.clone(),
+                referenced_column_names: detail.referenced_column_names.clone(),
+                referenced_table_id: detail.referenced_table_id,
+                on_delete: convert_action(detail.on_delete),
+                on_update: convert_action(detail.on_update),
             });
         }
 
