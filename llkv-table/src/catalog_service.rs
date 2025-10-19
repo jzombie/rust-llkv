@@ -113,7 +113,7 @@ where
     }
 
     /// Create a new table using an Arrow schema (used by CTAS flows).
-    pub(crate) fn create_table_from_schema(
+    pub fn create_table_from_schema(
         &self,
         display_name: &str,
         canonical_name: &str,

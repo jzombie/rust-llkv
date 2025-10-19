@@ -2379,13 +2379,10 @@ where
             table,
             table_columns,
             column_lookup,
-        } = Table::create_from_schema(
+        } = self.catalog_service.create_table_from_schema(
             &display_name,
             &canonical_name,
             &schema,
-            self.metadata.clone(),
-            self.catalog.clone(),
-            self.store.clone(),
         )?;
 
         tracing::trace!(
