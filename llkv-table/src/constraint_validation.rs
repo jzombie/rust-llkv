@@ -396,6 +396,8 @@ where
     F: Fn(f64, f64) -> bool,
 {
     if matches!(left, PlanValue::Null) || matches!(right, PlanValue::Null) {
+        // In SQL, any comparison with NULL yields UNKNOWN.
+        // For CHECK constraints, UNKNOWN is treated as TRUE (constraint passes).
         return Ok(true);
     }
 
