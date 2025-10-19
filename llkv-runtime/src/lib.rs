@@ -61,7 +61,7 @@ use llkv_table::{
     CatalogService, ConstraintColumnInfo, ConstraintService, CreateTableResult, ForeignKeyColumn,
     ForeignKeyTableInfo, InsertColumnConstraint, InsertMultiColumnUnique, InsertUniqueColumn,
     MetadataManager, MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, SysCatalog,
-    TableColumn, TableMeta, TableView, UniqueKey, build_composite_unique_key, canonical_table_name,
+    TableView, UniqueKey, build_composite_unique_key, canonical_table_name,
     constraints::ConstraintKind, ensure_multi_column_unique, ensure_single_column_unique,
 };
 use simd_r_drive_entry_handle::EntryHandle;
@@ -2304,10 +2304,9 @@ where
             table,
             table_columns,
             column_lookup,
-        } = self.catalog_service.create_table_from_columns(
-            &display_name,
-            &columns,
-        )?;
+        } = self
+            .catalog_service
+            .create_table_from_columns(&display_name, &canonical_name, &columns)?;
 
         tracing::trace!(
             "=== TABLE '{}' CREATED WITH table_id={} pager={:p} ===",
@@ -2424,7 +2423,11 @@ where
             );
 
             if let Err(err) = fk_result {
-                self.catalog.unregister_table(table_id);
+                let field_ids: Vec<FieldId> =
+                    column_defs.iter().map(|column| column.field_id).collect();
+                let _ = self
+                    .catalog_service
+                    .drop_table(&canonical_name, table_id, &field_ids);
                 self.remove_table_entry(&canonical_name);
                 return Err(err);
             }
@@ -2443,80 +2446,59 @@ where
         batches: Vec<RecordBatch>,
         if_not_exists: bool,
     ) -> Result<RuntimeStatementResult<P>> {
-        if schema.fields().is_empty() {
-            return Err(Error::InvalidArgumentError(
-                "CREATE TABLE AS SELECT requires at least one column".into(),
-            ));
-        }
-        let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(schema.fields().len());
-        let mut lookup =
-            FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
-        for (idx, field) in schema.fields().iter().enumerate() {
-            let data_type = match field.data_type() {
-                DataType::Int64
-                | DataType::Float64
-                | DataType::Utf8
-                | DataType::Date32
-                | DataType::Struct(_) => field.data_type().clone(),
-                other => {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "unsupported column type in CTAS result: {other:?}"
-                    )));
+        {
+            let tables = self.tables.read().unwrap();
+            if tables.contains_key(&canonical_name) {
+                if if_not_exists {
+                    return Ok(RuntimeStatementResult::CreateTable {
+                        table_name: display_name,
+                    });
                 }
-            };
-            let normalized = field.name().to_ascii_lowercase();
-            if lookup.insert(normalized.clone(), idx).is_some() {
-                return Err(Error::InvalidArgumentError(format!(
-                    "duplicate column name '{}' in CTAS result",
-                    field.name()
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: Table '{}' already exists",
+                    display_name
                 )));
             }
-            column_defs.push(ExecutorColumn {
-                name: field.name().to_string(),
-                data_type,
-                nullable: field.is_nullable(),
-                primary_key: false, // CTAS does not preserve PRIMARY KEY constraints
-                unique: false,      // CTAS does not preserve UNIQUE constraints
-                field_id: (idx + 1) as FieldId,
-                check_expr: None, // CTAS does not preserve CHECK constraints
-            });
         }
 
-        let table_id = self.metadata.reserve_table_id()?;
-        let now = current_time_micros();
-        let table_meta = TableMeta {
+        let CreateTableResult {
             table_id,
-            name: Some(display_name.clone()),
-            created_at_micros: now,
-            flags: 0,
-            epoch: 0,
-        };
-        self.metadata.set_table_meta(table_id, table_meta)?;
+            catalog_table_id: _,
+            table,
+            table_columns,
+            column_lookup,
+        } = self.catalog_service.create_table_from_schema(
+            &display_name,
+            &canonical_name,
+            &schema,
+        )?;
 
-        let table_columns: Vec<TableColumn> = column_defs
-            .iter()
-            .map(|column| TableColumn {
-                field_id: column.field_id,
+        tracing::trace!(
+            "=== CTAS table '{}' created with table_id={} pager={:p} ===",
+            display_name,
+            table_id,
+            &*self.pager
+        );
+
+        let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(table_columns.len());
+        for column in &table_columns {
+            column_defs.push(ExecutorColumn {
                 name: column.name.clone(),
                 data_type: column.data_type.clone(),
                 nullable: column.nullable,
                 primary_key: column.primary_key,
                 unique: column.unique,
+                field_id: column.field_id,
                 check_expr: column.check_expr.clone(),
-            })
-            .collect();
-        self.metadata
-            .apply_column_definitions(table_id, &table_columns, now)?;
-        self.metadata.flush_table(table_id)?;
-
-        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
+            });
+        }
 
         let schema_arc = Arc::new(ExecutorSchema {
             columns: column_defs.clone(),
-            lookup,
+            lookup: column_lookup,
         });
         let table_entry = Arc::new(ExecutorTable {
-            table: Arc::new(table),
+            table: Arc::clone(&table),
             schema: schema_arc,
             next_row_id: AtomicU64::new(0),
             total_rows: AtomicU64::new(0),
@@ -2587,53 +2569,8 @@ where
                 display_name
             )));
         }
-        tracing::trace!(
-            "=== INSERTING TABLE '{}' INTO TABLES MAP (pager={:p}) ===",
-            canonical_name,
-            &*self.pager
-        );
-        for (idx, col) in table_entry.schema.columns.iter().enumerate() {
-            tracing::trace!(
-                "  inserting column[{}]: name='{}' primary_key={} unique={}",
-                idx,
-                col.name,
-                col.primary_key,
-                col.unique
-            );
-        }
-        tables.insert(canonical_name.clone(), table_entry);
+        tables.insert(canonical_name.clone(), Arc::clone(&table_entry));
         drop(tables); // Release write lock before catalog operations
-
-        // Register table in catalog
-        let registered_table_id = self.catalog.register_table(display_name.as_str())?;
-        tracing::debug!(
-            "[CATALOG] Registered table '{}' (CTAS) with catalog_id={}",
-            display_name,
-            registered_table_id
-        );
-
-        // Register fields in catalog
-        if let Some(field_resolver) = self.catalog.field_resolver(registered_table_id) {
-            for column in &column_defs {
-                let definition = FieldDefinition::new(&column.name)
-                    .with_primary_key(column.primary_key)
-                    .with_unique(column.unique)
-                    .with_check_expr(column.check_expr.clone());
-                if let Err(e) = field_resolver.register_field(definition) {
-                    tracing::warn!(
-                        "[CATALOG] Failed to register field '{}' in table '{}': {}",
-                        column.name,
-                        display_name,
-                        e
-                    );
-                }
-            }
-            tracing::debug!(
-                "[CATALOG] Registered {} field(s) for table '{}' (CTAS)",
-                column_defs.len(),
-                display_name
-            );
-        }
 
         Ok(RuntimeStatementResult::CreateTable {
             table_name: display_name,
@@ -4552,7 +4489,7 @@ where
         }
 
         self.catalog_service
-            .drop_table(table_id, &column_field_ids)?;
+            .drop_table(&canonical_name, table_id, &column_field_ids)?;
         tracing::debug!(
             "[CATALOG] Unregistered table '{}' (table_id={}) from catalog",
             canonical_name,

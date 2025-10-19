@@ -4,6 +4,7 @@ use std::convert::TryFrom;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arrow::datatypes::{DataType, Schema};
 use llkv_column_map::ColumnStore;
 use llkv_plan::ColumnSpec;
 use llkv_result::{Error, Result as LlkvResult};
@@ -16,7 +17,8 @@ use crate::metadata::MetadataManager;
 use crate::table::Table;
 use crate::types::{FieldId, TableColumn, TableId};
 
-/// Result of creating a table from column specifications.
+/// Result of creating a table. The caller is responsible for wiring executor
+/// caches and any higher-level state that depends on the table schema.
 pub struct CreateTableResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -28,7 +30,7 @@ where
     pub column_lookup: FxHashMap<String, usize>,
 }
 
-/// High-level catalog service for table lifecycle operations.
+/// High-level catalog service that consolidates table lifecycle metadata flows.
 #[derive(Clone)]
 pub struct CatalogService<P>
 where
@@ -55,14 +57,11 @@ where
         }
     }
 
-    /// Create a new table using the provided column definitions.
-    ///
-    /// The metadata manager and catalog are updated, and an empty physical table is created.
-    /// The caller is responsible for integrating the returned [`Table`] into higher-level
-    /// caches and performing any additional constraint registration (e.g. foreign keys).
+    /// Create a new table using column specifications produced by planning.
     pub fn create_table_from_columns(
         &self,
         display_name: &str,
+        canonical_name: &str,
         columns: &[ColumnSpec],
     ) -> LlkvResult<CreateTableResult<P>> {
         if columns.is_empty() {
@@ -71,13 +70,13 @@ where
             ));
         }
 
-        let mut column_lookup: FxHashMap<String, usize> =
+        let mut lookup: FxHashMap<String, usize> =
             FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
         let mut table_columns: Vec<TableColumn> = Vec::with_capacity(columns.len());
 
         for (idx, column) in columns.iter().enumerate() {
             let normalized = column.name.to_ascii_lowercase();
-            if column_lookup.insert(normalized.clone(), idx).is_some() {
+            if lookup.insert(normalized.clone(), idx).is_some() {
                 return Err(Error::InvalidArgumentError(format!(
                     "duplicate column name '{}' in table '{}'",
                     column.name, display_name
@@ -85,12 +84,7 @@ where
             }
 
             table_columns.push(TableColumn {
-                field_id: FieldId::try_from(idx + 1).map_err(|_| {
-                    Error::Internal(format!(
-                        "column index {} exceeded supported field id range",
-                        idx + 1
-                    ))
-                })?,
+                field_id: field_id_for_index(idx)?,
                 name: column.name.clone(),
                 data_type: column.data_type.clone(),
                 nullable: column.nullable,
@@ -100,6 +94,69 @@ where
             });
         }
 
+        self.create_table_inner(display_name, canonical_name, table_columns, lookup)
+    }
+
+    /// Create a new table using an Arrow schema (used by CTAS flows).
+    pub fn create_table_from_schema(
+        &self,
+        display_name: &str,
+        canonical_name: &str,
+        schema: &Schema,
+    ) -> LlkvResult<CreateTableResult<P>> {
+        if schema.fields().is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TABLE AS SELECT requires at least one column".into(),
+            ));
+        }
+
+        let mut lookup: FxHashMap<String, usize> =
+            FxHashMap::with_capacity_and_hasher(schema.fields().len(), Default::default());
+        let mut table_columns: Vec<TableColumn> = Vec::with_capacity(schema.fields().len());
+
+        for (idx, field) in schema.fields().iter().enumerate() {
+            let data_type = match field.data_type() {
+                DataType::Int64
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::Date32
+                | DataType::Struct(_) => field.data_type().clone(),
+                other => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported column type in CTAS result: {other:?}"
+                    )));
+                }
+            };
+
+            let normalized = field.name().to_ascii_lowercase();
+            if lookup.insert(normalized.clone(), idx).is_some() {
+                return Err(Error::InvalidArgumentError(format!(
+                    "duplicate column name '{}' in CTAS result",
+                    field.name()
+                )));
+            }
+
+            table_columns.push(TableColumn {
+                field_id: field_id_for_index(idx)?,
+                name: field.name().to_string(),
+                data_type,
+                nullable: field.is_nullable(),
+                primary_key: false,
+                unique: false,
+                check_expr: None,
+            });
+        }
+
+        self.create_table_inner(display_name, canonical_name, table_columns, lookup)
+    }
+
+    fn create_table_inner(
+        &self,
+        display_name: &str,
+        _canonical_name: &str,
+        table_columns: Vec<TableColumn>,
+        column_lookup: FxHashMap<String, usize>,
+    ) -> LlkvResult<CreateTableResult<P>> {
         let table_id = self.metadata.reserve_table_id()?;
         let timestamp = current_time_micros();
         let table_meta = crate::sys_catalog::TableMeta {
@@ -148,19 +205,33 @@ where
         })
     }
 
-    /// Prepare metadata and catalog state for dropping a table.
-    ///
-    /// The caller must ensure any constraint validation (e.g. foreign key checks) has already
-    /// been performed. This helper only updates metadata snapshots and unregisters the table
-    /// from the catalog.
-    pub fn drop_table(&self, table_id: TableId, column_field_ids: &[FieldId]) -> LlkvResult<()> {
+    /// Prepare metadata state and unregister catalog entries for a dropped table.
+    pub fn drop_table(
+        &self,
+        canonical_name: &str,
+        table_id: TableId,
+        column_field_ids: &[FieldId],
+    ) -> LlkvResult<()> {
         self.metadata
             .prepare_table_drop(table_id, column_field_ids)?;
         self.metadata.flush_table(table_id)?;
         self.metadata.remove_table_state(table_id);
-        self.catalog.unregister_table(table_id);
+        if let Some(table_id_from_catalog) = self.catalog.table_id(canonical_name) {
+            let _ = self.catalog.unregister_table(table_id_from_catalog);
+        } else {
+            let _ = self.catalog.unregister_table(table_id);
+        }
         Ok(())
     }
+}
+
+fn field_id_for_index(idx: usize) -> LlkvResult<FieldId> {
+    FieldId::try_from(idx + 1).map_err(|_| {
+        Error::Internal(format!(
+            "column index {} exceeded supported field id range",
+            idx + 1
+        ))
+    })
 }
 
 #[allow(clippy::unnecessary_wraps)]
