@@ -1023,6 +1023,31 @@ where
             .as_ref()
             .map(|schema| format!("{}.{}", schema, base_table_name))
             .unwrap_or_else(|| base_table_name.clone());
+        let canonical_table_name = display_table_name.to_ascii_lowercase();
+
+        let context = self.engine.context();
+        let table_view = match context.table_view(&canonical_table_name) {
+            Ok(view) => Some(view),
+            Err(err) => {
+                if Self::is_table_missing_error(&err) {
+                    None
+                } else {
+                    return Err(Self::map_table_error(&display_table_name, err));
+                }
+            }
+        };
+
+        let known_columns: HashSet<String> = table_view
+            .as_ref()
+            .map(|view| {
+                view.column_metas
+                    .iter()
+                    .filter_map(|meta| meta.as_ref())
+                    .filter_map(|meta| meta.name.clone())
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let index_name = match name {
             Some(name_obj) => Some(Self::object_name_to_string(&name_obj)?),
@@ -1078,10 +1103,17 @@ where
             }
 
             let normalized = column_name.to_ascii_lowercase();
-            if !seen_column_names.insert(normalized) {
+            if !seen_column_names.insert(normalized.clone()) {
                 return Err(Error::InvalidArgumentError(format!(
                     "duplicate column '{}' in CREATE INDEX",
                     column_name
+                )));
+            }
+
+            if table_view.is_some() && !known_columns.contains(&normalized) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "column '{}' does not exist in table '{}'",
+                    column_name, display_table_name
                 )));
             }
 
