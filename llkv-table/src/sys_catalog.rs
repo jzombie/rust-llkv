@@ -35,6 +35,7 @@ use bitcode::{Decode, Encode};
 use crate::constraints::{
     ConstraintId, ConstraintRecord, decode_constraint_row_id, encode_constraint_row_id,
 };
+use crate::constants::CONSTRAINT_SCAN_CHUNK_SIZE;
 use crate::types::{FieldId, RowId, TableId};
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
@@ -80,8 +81,6 @@ fn rid_table(table_id: TableId) -> u64 {
 fn rid_col(table_id: TableId, col_id: u32) -> u64 {
     lfid(table_id, col_id).into()
 }
-
-const CONSTRAINT_SCAN_CHUNK: usize = 256;
 
 #[inline]
 fn constraint_meta_lfid() -> LogicalFieldId {
@@ -203,7 +202,7 @@ where
                 continue;
             }
             self.buffer.push(row_id);
-            if self.buffer.len() >= CONSTRAINT_SCAN_CHUNK
+            if self.buffer.len() >= CONSTRAINT_SCAN_CHUNK_SIZE
                 && let Err(err) = self.flush_buffer()
             {
                 self.error = Some(err);
@@ -876,7 +875,7 @@ where
             lfid: constraint_meta_lfid(),
             table_id,
             on_batch: &mut on_batch,
-            buffer: Vec::with_capacity(CONSTRAINT_SCAN_CHUNK),
+            buffer: Vec::with_capacity(CONSTRAINT_SCAN_CHUNK_SIZE),
             error: None,
         };
 
