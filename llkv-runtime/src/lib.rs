@@ -1723,15 +1723,14 @@ where
                 let existing_values =
                     self.scan_column_values(table.as_ref(), field_id, snapshot)?;
                 ensure_single_column_unique(&existing_values, &[], &column_name)?;
-                if let Some(table_id) = self.catalog.table_id(&canonical_name)
-                    && let Some(resolver) = self.catalog.field_resolver(table_id)
-                {
-                    resolver.set_field_unique(&column_name, true)?;
-                }
             }
 
-            self.metadata.register_sort_index(table_id, field_id)?;
-            self.metadata.flush_table(table_id)?;
+            self.catalog_service.register_single_column_index(
+                table_id,
+                field_id,
+                &column_name,
+                plan.unique,
+            )?;
 
             if let Some(updated_table) =
                 Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)
@@ -1769,13 +1768,14 @@ where
             column_indices: column_indices.clone(),
         };
 
-        let registration =
-            self.metadata
-                .register_multi_column_unique(table_id, &field_ids, index_name.clone())?;
+        let registration = self.catalog_service.register_multi_column_unique_index(
+            table_id,
+            &field_ids,
+            index_name.clone(),
+        )?;
 
         match registration {
             MultiColumnUniqueRegistration::Created => {
-                self.metadata.flush_table(table_id)?;
                 table.add_multi_column_unique(executor_entry);
             }
             MultiColumnUniqueRegistration::AlreadyExists {
@@ -2304,9 +2304,11 @@ where
             table,
             table_columns,
             column_lookup,
-        } = self
-            .catalog_service
-            .create_table_from_columns(&display_name, &canonical_name, &columns)?;
+        } = self.catalog_service.create_table_from_columns(
+            &display_name,
+            &canonical_name,
+            &columns,
+        )?;
 
         tracing::trace!(
             "=== TABLE '{}' CREATED WITH table_id={} pager={:p} ===",

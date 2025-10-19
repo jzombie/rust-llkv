@@ -13,7 +13,7 @@ use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::catalog::{FieldDefinition, TableCatalog};
-use crate::metadata::MetadataManager;
+use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration};
 use crate::table::Table;
 use crate::types::{FieldId, TableColumn, TableId};
 
@@ -222,6 +222,44 @@ where
             let _ = self.catalog.unregister_table(table_id);
         }
         Ok(())
+    }
+
+    /// Register a single-column sort (B-tree) index. Optionally marks the field unique.
+    pub fn register_single_column_index(
+        &self,
+        table_id: TableId,
+        field_id: FieldId,
+        column_name: &str,
+        mark_unique: bool,
+    ) -> LlkvResult<()> {
+        self.metadata.register_sort_index(table_id, field_id)?;
+
+        if mark_unique {
+            if let Some(resolver) = self.catalog.field_resolver(table_id) {
+                resolver.set_field_unique(column_name, true)?;
+            }
+        }
+
+        self.metadata.flush_table(table_id)?;
+        Ok(())
+    }
+
+    /// Register a multi-column UNIQUE index.
+    pub fn register_multi_column_unique_index(
+        &self,
+        table_id: TableId,
+        field_ids: &[FieldId],
+        index_name: Option<String>,
+    ) -> LlkvResult<MultiColumnUniqueRegistration> {
+        let registration = self
+            .metadata
+            .register_multi_column_unique(table_id, field_ids, index_name)?;
+
+        if matches!(registration, MultiColumnUniqueRegistration::Created) {
+            self.metadata.flush_table(table_id)?;
+        }
+
+        Ok(registration)
     }
 }
 
