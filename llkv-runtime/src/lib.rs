@@ -2310,7 +2310,6 @@ where
                             table_name
                         ))
                     })?;
-
                     let columns = referenced_table
                         .schema
                         .columns

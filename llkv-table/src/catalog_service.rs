@@ -25,7 +25,7 @@ use crate::catalog::{FieldDefinition, TableCatalog};
 use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration};
 use crate::table::Table;
 use crate::types::{FieldId, RowId, TableColumn, TableId};
-use crate::{ForeignKeyColumn, ForeignKeyTableInfo, ValidatedForeignKey};
+use crate::{ForeignKeyColumn, ForeignKeyTableInfo, ForeignKeyView, ValidatedForeignKey};
 
 /// Result of creating a table. The caller is responsible for wiring executor
 /// caches and any higher-level state that depends on the table schema.
@@ -385,6 +385,59 @@ where
             lookup_table,
             timestamp_micros,
         )
+    }
+
+    /// Resolve referenced tables for the provided foreign key view definitions.
+    pub fn referenced_table_info(
+        &self,
+        views: &[ForeignKeyView],
+    ) -> LlkvResult<Vec<ForeignKeyTableInfo>> {
+        let mut results = Vec::with_capacity(views.len());
+        for view in views {
+            let Some(table_id) = self.catalog.table_id(&view.referenced_table_canonical) else {
+                return Err(Error::InvalidArgumentError(format!(
+                    "referenced table '{}' does not exist",
+                    view.referenced_table_display
+                )));
+            };
+
+            let Some(resolver) = self.catalog.field_resolver(table_id) else {
+                return Err(Error::Internal(format!(
+                    "catalog resolver missing for table '{}'",
+                    view.referenced_table_display
+                )));
+            };
+
+            let mut columns = Vec::with_capacity(view.referenced_field_ids.len());
+            for field_id in &view.referenced_field_ids {
+                let info = resolver.field_info(*field_id).ok_or_else(|| {
+                    Error::Internal(format!(
+                        "field metadata missing for id {} in table '{}'",
+                        field_id, view.referenced_table_display
+                    ))
+                })?;
+
+                let data_type = self.metadata.column_data_type(table_id, *field_id)?;
+
+                columns.push(ForeignKeyColumn {
+                    name: info.display_name.to_string(),
+                    data_type,
+                    nullable: !info.constraints.primary_key,
+                    primary_key: info.constraints.primary_key,
+                    unique: info.constraints.unique,
+                    field_id: *field_id,
+                });
+            }
+
+            results.push(ForeignKeyTableInfo {
+                display_name: view.referenced_table_display.clone(),
+                canonical_name: view.referenced_table_canonical.clone(),
+                table_id,
+                columns,
+            });
+        }
+
+        Ok(results)
     }
 }
 

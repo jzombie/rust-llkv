@@ -971,6 +971,13 @@ where
         Ok(())
     }
 
+    pub fn column_data_type(&self, table_id: TableId, field_id: FieldId) -> LlkvResult<DataType> {
+        let table = Table::from_id_and_store(table_id, Arc::clone(&self.store))?;
+        let store = table.store();
+        let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
+        store.data_type(logical_field_id).map_err(|err| err.into())
+    }
+
     /// Register a multi-column UNIQUE definition for a table.
     pub fn register_multi_column_unique(
         &self,
