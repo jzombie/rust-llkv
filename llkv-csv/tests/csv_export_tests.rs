@@ -29,7 +29,7 @@ fn write_sample_csv() -> NamedTempFile {
 
 fn setup_table_with_sample_data() -> LlkvResult<Table> {
     let pager = Arc::new(MemPager::default());
-    let table = Table::new(200, Arc::clone(&pager))?;
+    let table = Table::from_id(200, Arc::clone(&pager))?;
     let csv_file = write_sample_csv();
     let options = CsvReadOptions::default();
     append_csv_into_table(&table, csv_file.path(), &options)?;

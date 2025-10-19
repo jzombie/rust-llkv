@@ -48,7 +48,7 @@ fn write_additional_csv_rows() -> NamedTempFile {
 #[test]
 fn csv_persists_colmeta_names() {
     let pager = Arc::new(MemPager::default());
-    let table = Table::new(2001, Arc::clone(&pager)).expect("create table");
+    let table = Table::from_id(2001, Arc::clone(&pager)).expect("create table");
 
     let options = CsvReadOptions::default();
     let csv = write_sample_csv();
@@ -98,7 +98,7 @@ fn csv_infer_fuzz_permutations() {
         writeln!(tmp, "{}", ordered2.join(",")).unwrap();
 
         let pager = Arc::new(MemPager::default());
-        let table = Table::new(3000 + seed as u16, Arc::clone(&pager)).expect("create table");
+        let table = Table::from_id(3000 + seed as u16, Arc::clone(&pager)).expect("create table");
         let options = CsvReadOptions::default();
         append_csv_into_table(&table, tmp.path(), &options).expect("append permuted csv");
 
@@ -116,7 +116,7 @@ fn csv_infer_fuzz_permutations() {
 #[test]
 fn csv_append_roundtrip() {
     let pager = Arc::new(MemPager::default());
-    let table = Table::new(42, Arc::clone(&pager)).expect("create table");
+    let table = Table::from_id(42, Arc::clone(&pager)).expect("create table");
 
     let csv_file = write_sample_csv();
     let options = CsvReadOptions::default();
@@ -198,7 +198,7 @@ fn csv_infer_reuse_regression() {
     // Regression test for schema inference reuse: ensure appending a CSV and
     // then appending additional rows reuses field ids instead of erroring.
     let pager = Arc::new(MemPager::default());
-    let table = Table::new(1001, Arc::clone(&pager)).expect("create table");
+    let table = Table::from_id(1001, Arc::clone(&pager)).expect("create table");
 
     let options = CsvReadOptions::default();
     let first = write_sample_csv();
@@ -216,7 +216,7 @@ fn csv_infer_reuse_regression() {
 #[test]
 fn csv_auto_schema_reuses_field_ids() {
     let pager = Arc::new(MemPager::default());
-    let table = Table::new(44, Arc::clone(&pager)).expect("create table");
+    let table = Table::from_id(44, Arc::clone(&pager)).expect("create table");
 
     let options = CsvReadOptions::default();
 
@@ -272,7 +272,7 @@ fn csv_auto_schema_reuses_field_ids() {
 #[test]
 fn csv_append_with_manual_mapping() {
     let pager = Arc::new(MemPager::default());
-    let table = Table::new(45, Arc::clone(&pager)).expect("create table");
+    let table = Table::from_id(45, Arc::clone(&pager)).expect("create table");
 
     let mut field_mapping: HashMap<String, FieldId> = HashMap::new();
     field_mapping.insert("int_col".to_string(), 10);
@@ -360,7 +360,7 @@ fn csv_append_with_manual_mapping() {
 #[test]
 fn csv_append_preserves_nulls() {
     let pager = Arc::new(MemPager::default());
-    let table = Table::new(43, Arc::clone(&pager)).expect("create table");
+    let table = Table::from_id(43, Arc::clone(&pager)).expect("create table");
 
     let csv_file = write_sample_csv_with_nulls();
     let options = CsvReadOptions::default();

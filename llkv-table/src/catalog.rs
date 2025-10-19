@@ -1,39 +1,28 @@
 //! Centralized table catalog for table and field name resolution.
 //!
 //! This module provides thread-safe, performant bidirectional mappings between:
-//! - Table names ↔ TableId
-//! - Field names ↔ FieldId (per table)
+//! - Table names ↔ TableId (case-insensitive)
+//! - Field names ↔ FieldId per table (case-insensitive)
+//!
+//! # Purpose
+//!
+//! The catalog is an in-memory name resolution layer used during query execution.
+//! It does NOT create tables or generate IDs - use `CatalogService` for table creation.
+//!
+//! # Architecture
+//!
+//! - **CatalogService**: Creates tables (coordinates metadata + catalog + storage)
+//! - **TableCatalog** (this module): Name lookups during query execution
+//! - **MetadataManager**: Persistent storage, generates table IDs (source of truth)
+//! - **Table**: Data operations (append, scan, update, delete)
 //!
 //! # Design Goals
 //!
-//! 1. **No logic duplication**: Single source of truth for all name↔ID conversions
+//! 1. **Single source of truth**: MetadataManager generates IDs, catalog registers them
 //! 2. **Thread-safe**: Concurrent reads via `Arc<RwLock<_>>`
-//! 3. **Performance**: Use FxHashMap for fast lookups, numeric ID comparisons in hot paths
+//! 3. **Performance**: Fast lookups with FxHashMap
 //! 4. **Transaction isolation**: Immutable snapshots for MVCC
-//! 5. **Case handling**: Case-insensitive lookups, preserve display names
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use llkv_table::catalog::{TableCatalog, FieldResolver};
-//!
-//! // Create catalog
-//! let catalog = TableCatalog::new();
-//!
-//! // Register table
-//! let table_id = catalog.register_table("Users").unwrap();
-//!
-//! // Get field resolver for table
-//! let field_resolver = catalog.field_resolver(table_id).unwrap();
-//!
-//! // Register fields
-//! let name_fid = field_resolver.register_field("name").unwrap();
-//! let email_fid = field_resolver.register_field("Email").unwrap();
-//!
-//! // Case-insensitive lookups
-//! assert_eq!(field_resolver.field_id("NAME"), Some(name_fid));
-//! assert_eq!(field_resolver.field_id("email"), Some(email_fid));
-//! ```
+//! 5. **Case-insensitive**: SQL standard compliance, preserves display names
 
 use crate::resolvers::TableNameKey;
 use crate::types::TableId;
@@ -52,20 +41,15 @@ pub use crate::resolvers::{
 // TableCatalog - Table-level resolver
 // ============================================================================
 
-/// Centralized table catalog for table name resolution and field resolver management.
+/// In-memory table name resolution for query execution.
 ///
-/// The catalog maintains bidirectional mappings between table names and TableIds,
-/// and provides access to per-table field resolvers.
+/// **To create tables, use `CatalogService`, not this struct directly.**
 ///
-/// # Thread Safety
+/// The catalog maps table names to TableIds for fast lookups during query planning
+/// and execution. It does not create tables, generate IDs, or persist metadata.
 ///
-/// The catalog uses `Arc<RwLock<_>>` for thread-safe access. Multiple readers
-/// can access concurrently, while writers have exclusive access.
-///
-/// # Case Sensitivity
-///
-/// Table lookups are case-insensitive (SQL standard), but display names preserve
-/// original casing for error messages and schema display.
+/// Table IDs are provided by `MetadataManager` (the persistent layer and source of truth).
+/// The catalog simply registers these IDs for in-memory name resolution.
 #[derive(Debug, Clone)]
 pub struct TableCatalog {
     inner: Arc<RwLock<TableCatalogInner>>,
@@ -136,36 +120,16 @@ impl TableCatalog {
 
     /// Register a table in the catalog with the specified table ID.
     ///
-    /// The table ID must come from the metadata layer (`MetadataManager::reserve_table_id()`
-    /// for new tables, or `all_table_metas()` when restoring from disk). The metadata layer
-    /// is the source of truth for table IDs.
+    /// **This does NOT create tables.** It registers an existing table ID from
+    /// `MetadataManager` for name lookups. Use `CatalogService` to create tables.
     ///
-    /// This single method handles both use cases:
-    /// - Creating new tables: Pass the table_id from metadata.reserve_table_id()
-    /// - Restoring from disk: Pass the table_id from metadata.all_table_metas()
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The table name as provided by user (case preserved)
-    /// * `table_id` - The table ID from the metadata layer
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if registration succeeds.
+    /// The table_id must come from metadata (source of truth):
+    /// - New tables: `MetadataManager::reserve_table_id()`
+    /// - Database restart: `MetadataManager::all_table_metas()`
     ///
     /// # Errors
     ///
-    /// Returns `Error::CatalogError` if:
-    /// - A table with this name (case-insensitive) already exists
-    /// - A table with this ID already exists
-    /// - TableId overflow when updating next_table_id (extremely unlikely)
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// // New table creation
-    /// let table_id = metadata.reserve_table_id()?;
-    /// catalog.register_table("Users", table_id)?;
+    /// Returns error if the name or ID is already registered.
     ///
     /// // Database restoration
     /// for (table_id, meta) in metadata.all_table_metas()? {

@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const TABLE_ID: TableId = 1;
     const FIELD_ID: FieldId = 10;
 
-    let table = Table::new(TABLE_ID, pager)?;
+    let table = Table::from_id(TABLE_ID, pager)?;
 
     // Create test data - 10,000 rows for performance testing
     let row_count = 10_000;

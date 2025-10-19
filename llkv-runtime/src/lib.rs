@@ -2306,10 +2306,13 @@ where
             table,
             table_columns,
             column_lookup,
-        } = self.catalog_service.create_table_from_columns(
+        } = Table::create_from_columns(
             &display_name,
             &canonical_name,
             &columns,
+            self.metadata.clone(),
+            self.catalog.clone(),
+            self.store.clone(),
         )?;
 
         tracing::trace!(
@@ -2458,10 +2461,13 @@ where
             table,
             table_columns,
             column_lookup,
-        } = self.catalog_service.create_table_from_schema(
+        } = Table::create_from_schema(
             &display_name,
             &canonical_name,
             &schema,
+            self.metadata.clone(),
+            self.catalog.clone(),
+            self.store.clone(),
         )?;
 
         tracing::trace!(
@@ -4223,7 +4229,7 @@ where
         })?;
 
         let table_id = catalog_table_id;
-        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
+        let table = Table::from_id_and_store(table_id, Arc::clone(&self.store))?;
         let store = table.store();
         let mut logical_fields = store.user_field_ids_for_table(table_id);
         logical_fields.sort_by_key(|lfid| lfid.field_id());

@@ -60,7 +60,7 @@ fn assert_accounts_constraints(pager: &Arc<MemPager>) {
         .into_iter()
         .find(|(_, meta)| meta.name.as_deref() == Some("accounts"))
         .expect("accounts table meta");
-    let table = Table::new_with_store(table_id, Arc::clone(&store)).expect("open table succeeds");
+    let table = Table::from_id_and_store(table_id, Arc::clone(&store)).expect("open table succeeds");
     table.schema().expect("load schema succeeds");
     let records = metadata
         .constraint_records(table_id)

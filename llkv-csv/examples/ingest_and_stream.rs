@@ -87,7 +87,7 @@ fn run(
 ) -> LlkvResult<()> {
     let pager = Arc::new(MemPager::default());
     // Use a simple table identifier for the in-memory table.
-    let table = Table::new(1, Arc::clone(&pager))?;
+    let table = Table::from_id(1, Arc::clone(&pager))?;
 
     let mut options = CsvReadOptions::default();
     if let Some(s) = sample {

@@ -1,3 +1,8 @@
+//! High-level service for creating tables.
+//!
+//! Use `CatalogService` to create tables. It coordinates metadata persistence,
+//! catalog registration, and storage initialization.
+
 #![forbid(unsafe_code)]
 
 use std::convert::TryFrom;
@@ -30,7 +35,10 @@ where
     pub column_lookup: FxHashMap<String, usize>,
 }
 
-/// High-level catalog service that consolidates table lifecycle metadata flows.
+/// Service for creating tables.
+///
+/// Coordinates metadata persistence (`MetadataManager`), catalog registration
+/// (`TableCatalog`), and storage initialization (`ColumnStore`).
 #[derive(Clone)]
 pub struct CatalogService<P>
 where
@@ -57,8 +65,11 @@ where
         }
     }
 
-    /// Create a new table using column specifications produced by planning.
-    pub fn create_table_from_columns(
+    /// Create a new table using column specifications.
+    ///
+    /// Reserves table ID from metadata, validates columns, persists schema,
+    /// registers in catalog, and returns a Table handle for data operations.
+    pub(crate) fn create_table_from_columns(
         &self,
         display_name: &str,
         canonical_name: &str,
@@ -98,7 +109,7 @@ where
     }
 
     /// Create a new table using an Arrow schema (used by CTAS flows).
-    pub fn create_table_from_schema(
+    pub(crate) fn create_table_from_schema(
         &self,
         display_name: &str,
         canonical_name: &str,
@@ -172,7 +183,7 @@ where
             .apply_column_definitions(table_id, &table_columns, timestamp)?;
         self.metadata.flush_table(table_id)?;
 
-        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
+        let table = Table::from_id_and_store(table_id, Arc::clone(&self.store))?;
 
         // Register table in catalog using the table_id from metadata
         if let Err(err) = self.catalog.register_table(display_name, table_id) {

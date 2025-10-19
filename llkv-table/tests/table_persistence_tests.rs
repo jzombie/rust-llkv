@@ -62,7 +62,7 @@ fn table_persistence_many_columns_simd_r_drive() {
     // ---------- Session 1: create pager + table, write a batch ----------
     {
         let pager = Arc::new(SimdRDrivePager::open(&path).expect("open SimdRDrivePager"));
-        let table = Table::new(TID, pager).expect("new table");
+        let table = Table::from_id(TID, pager).expect("new table");
 
         let schema = Arc::new(Schema::new(vec![
             // Row ID must be non-nullable u64
@@ -102,7 +102,7 @@ fn table_persistence_many_columns_simd_r_drive() {
     // ---------- Session 2: reopen from same file and verify ----------
     {
         let pager = Arc::new(SimdRDrivePager::open(&path).expect("reopen SimdRDrivePager"));
-        let table = Table::new(TID, pager).expect("reopen table");
+        let table = Table::from_id(TID, pager).expect("reopen table");
         let store = table.store();
 
         use llkv_column_map::types::{LogicalFieldId, Namespace};
