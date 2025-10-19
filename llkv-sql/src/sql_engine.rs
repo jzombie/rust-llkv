@@ -402,6 +402,49 @@ where
         Ok(tables)
     }
 
+    fn collect_known_columns(
+        &self,
+        display_name: &str,
+        canonical_name: &str,
+    ) -> SqlResult<HashSet<String>> {
+        let context = self.engine.context();
+
+        if context.is_table_marked_dropped(canonical_name) {
+            return Err(Self::table_not_found_error(display_name));
+        }
+
+        match context.table_view(canonical_name) {
+            Ok(view) => Ok(view
+                .column_metas
+                .iter()
+                .filter_map(|meta| meta.as_ref())
+                .filter_map(|meta| meta.name.clone())
+                .map(|name| name.to_ascii_lowercase())
+                .collect()),
+            Err(err) => {
+                if !Self::is_table_missing_error(&err) {
+                    return Err(Self::map_table_error(display_name, err));
+                }
+
+                match context.lookup_table(canonical_name) {
+                    Ok(table) => Ok(table
+                        .schema
+                        .columns
+                        .iter()
+                        .map(|column| column.name.to_ascii_lowercase())
+                        .collect()),
+                    Err(runtime_err) => {
+                        if Self::is_table_missing_error(&runtime_err) {
+                            Ok(HashSet::new())
+                        } else {
+                            Err(Self::map_table_error(display_name, runtime_err))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn is_table_marked_dropped(&self, table_name: &str) -> SqlResult<bool> {
         let canonical = table_name.to_ascii_lowercase();
         Ok(self.engine.context().is_table_marked_dropped(&canonical))
@@ -562,11 +605,35 @@ where
                         ));
                     }
 
-                    let referenced_table = Self::object_name_to_string(foreign_table)?;
-                    // Empty referenced_columns means "use the primary key of the referenced table"
-                    // This will be resolved during table creation in the runtime
+                    let (referenced_display, referenced_canonical) =
+                        canonical_object_name(foreign_table)?;
                     let referenced_columns: Vec<String> =
                         referred_columns.iter().map(|c| c.value.clone()).collect();
+
+                    if referenced_canonical == canonical_name {
+                        for column_name in &referenced_columns {
+                            let normalized = column_name.to_ascii_lowercase();
+                            if !seen_names.contains(&normalized) {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "unknown referenced column '{}' in FOREIGN KEY constraint",
+                                    column_name
+                                )));
+                            }
+                        }
+                    } else {
+                        let known_columns =
+                            self.collect_known_columns(&referenced_display, &referenced_canonical)?;
+                        let enforce_known_columns = !known_columns.is_empty();
+                        for column_name in &referenced_columns {
+                            let normalized = column_name.to_ascii_lowercase();
+                            if enforce_known_columns && !known_columns.contains(&normalized) {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "unknown referenced column '{}' in FOREIGN KEY constraint",
+                                    column_name
+                                )));
+                            }
+                        }
+                    }
 
                     let map_action = |action: &Option<ReferentialAction>,
                                       kind: &str|
@@ -589,7 +656,7 @@ where
                     foreign_keys.push(ForeignKeySpec {
                         name: None,
                         columns: vec![column_def.name.value.clone()],
-                        referenced_table,
+                        referenced_table: referenced_display,
                         referenced_columns,
                         on_delete: on_delete_action,
                         on_update: on_update_action,
@@ -877,7 +944,7 @@ where
                         for ident in referred_columns {
                             let column_name = ident.value;
                             let normalized = column_name.to_ascii_lowercase();
-                            if !seen_referenced.insert(normalized) {
+                            if !seen_referenced.insert(normalized.clone()) {
                                 return Err(Error::InvalidArgumentError(format!(
                                     "duplicate referenced column '{}' in FOREIGN KEY constraint",
                                     column_name
@@ -886,7 +953,35 @@ where
                             referenced_columns_vec.push(column_name);
                         }
 
-                        let referenced_table = Self::object_name_to_string(&foreign_table)?;
+                        let (referenced_display, referenced_canonical) =
+                            canonical_object_name(&foreign_table)?;
+
+                        if referenced_canonical == canonical_name {
+                            for column_name in &referenced_columns_vec {
+                                let normalized = column_name.to_ascii_lowercase();
+                                if !seen_names.contains(&normalized) {
+                                    return Err(Error::InvalidArgumentError(format!(
+                                        "unknown referenced column '{}' in FOREIGN KEY constraint",
+                                        column_name
+                                    )));
+                                }
+                            }
+                        } else {
+                            let known_columns = self.collect_known_columns(
+                                &referenced_display,
+                                &referenced_canonical,
+                            )?;
+                            let enforce_known_columns = !known_columns.is_empty();
+                            for column_name in &referenced_columns_vec {
+                                let normalized = column_name.to_ascii_lowercase();
+                                if enforce_known_columns && !known_columns.contains(&normalized) {
+                                    return Err(Error::InvalidArgumentError(format!(
+                                        "unknown referenced column '{}' in FOREIGN KEY constraint",
+                                        column_name
+                                    )));
+                                }
+                            }
+                        }
 
                         let map_action = |action: Option<ReferentialAction>,
                                           kind: &str|
@@ -911,7 +1006,7 @@ where
                         foreign_keys.push(ForeignKeySpec {
                             name: constraint_name,
                             columns: referencing_columns,
-                            referenced_table,
+                            referenced_table: referenced_display,
                             referenced_columns: referenced_columns_vec,
                             on_delete: on_delete_action,
                             on_update: on_update_action,
@@ -1025,29 +1120,9 @@ where
             .unwrap_or_else(|| base_table_name.clone());
         let canonical_table_name = display_table_name.to_ascii_lowercase();
 
-        let context = self.engine.context();
-        let table_view = match context.table_view(&canonical_table_name) {
-            Ok(view) => Some(view),
-            Err(err) => {
-                if Self::is_table_missing_error(&err) {
-                    None
-                } else {
-                    return Err(Self::map_table_error(&display_table_name, err));
-                }
-            }
-        };
-
-        let known_columns: HashSet<String> = table_view
-            .as_ref()
-            .map(|view| {
-                view.column_metas
-                    .iter()
-                    .filter_map(|meta| meta.as_ref())
-                    .filter_map(|meta| meta.name.clone())
-                    .map(|name| name.to_ascii_lowercase())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let known_columns =
+            self.collect_known_columns(&display_table_name, &canonical_table_name)?;
+        let enforce_known_columns = !known_columns.is_empty();
 
         let index_name = match name {
             Some(name_obj) => Some(Self::object_name_to_string(&name_obj)?),
@@ -1110,7 +1185,7 @@ where
                 )));
             }
 
-            if table_view.is_some() && !known_columns.contains(&normalized) {
+            if enforce_known_columns && !known_columns.contains(&normalized) {
                 return Err(Error::InvalidArgumentError(format!(
                     "column '{}' does not exist in table '{}'",
                     column_name, display_table_name
