@@ -1037,6 +1037,12 @@ where
         Ok(next)
     }
 
+    /// Check if a field has a sort index in the underlying store.
+    ///
+    /// Note: Creates a temporary Table instance to access index metadata.
+    /// This is acceptable since Table::new_with_store is lightweight (just wraps
+    /// table_id + Arc<ColumnStore>) and this method is only called during index
+    /// registration/unregistration, not in query hot paths.
     fn field_has_sort_index(&self, table_id: TableId, field_id: FieldId) -> LlkvResult<bool> {
         let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
         let indexes = table.list_registered_indexes(field_id)?;
