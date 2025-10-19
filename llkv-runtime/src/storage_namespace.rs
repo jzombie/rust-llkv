@@ -221,11 +221,13 @@ where
 
         let catalog = self.context().table_catalog();
         for canonical in canonical_names {
-            if catalog.unregister_table(&canonical) {
-                tracing::debug!(
-                    "[TEMP] Unregistered temporary table '{}' from shared catalog",
-                    canonical
-                );
+            if let Some(table_id) = catalog.table_id(&canonical) {
+                if catalog.unregister_table(table_id) {
+                    tracing::debug!(
+                        "[TEMP] Unregistered temporary table '{}' from shared catalog",
+                        canonical
+                    );
+                }
             }
         }
     }

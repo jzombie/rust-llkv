@@ -63,7 +63,6 @@ where
     pub fn create_table_from_columns(
         &self,
         display_name: &str,
-        canonical_name: &str,
         columns: &[ColumnSpec],
     ) -> LlkvResult<CreateTableResult<P>> {
         if columns.is_empty() {
@@ -133,7 +132,7 @@ where
                     .with_unique(column.unique)
                     .with_check_expr(column.check_expr.clone());
                 if let Err(err) = field_resolver.register_field(definition) {
-                    self.catalog.unregister_table(canonical_name);
+                    self.catalog.unregister_table(registered_table_id);
                     self.metadata.remove_table_state(table_id);
                     return Err(err);
                 }
@@ -147,6 +146,20 @@ where
             table_columns,
             column_lookup,
         })
+    }
+
+    /// Prepare metadata and catalog state for dropping a table.
+    ///
+    /// The caller must ensure any constraint validation (e.g. foreign key checks) has already
+    /// been performed. This helper only updates metadata snapshots and unregisters the table
+    /// from the catalog.
+    pub fn drop_table(&self, table_id: TableId, column_field_ids: &[FieldId]) -> LlkvResult<()> {
+        self.metadata
+            .prepare_table_drop(table_id, column_field_ids)?;
+        self.metadata.flush_table(table_id)?;
+        self.metadata.remove_table_state(table_id);
+        self.catalog.unregister_table(table_id);
+        Ok(())
     }
 }
 

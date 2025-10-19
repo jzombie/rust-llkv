@@ -207,7 +207,7 @@ impl TableCatalog {
     ///
     /// # Arguments
     ///
-    /// * `name` - Table name (any casing)
+    /// * `table_id` - The unique table identifier
     ///
     /// # Returns
     ///
@@ -217,20 +217,20 @@ impl TableCatalog {
     ///
     /// ```rust,ignore
     /// let id = catalog.register_table("Users")?;
-    /// assert!(catalog.unregister_table("users"));
+    /// assert!(catalog.unregister_table(id));
     /// assert_eq!(catalog.table_id("users"), None);
     /// ```
-    pub fn unregister_table(&self, name: &str) -> bool {
-        let key = QualifiedTableNameRef::from(name).canonical_key();
+    pub fn unregister_table(&self, table_id: TableId) -> bool {
         let mut inner = match self.inner.write() {
             Ok(guard) => guard,
             Err(_) => return false,
         };
 
-        // Remove from name → id map and get the table_id
-        if let Some(table_id) = inner.table_name_to_id.remove(&key) {
-            // Remove from id → metadata map
-            inner.table_id_to_meta.remove(&table_id);
+        // Remove from id → metadata map and get the canonical name
+        if let Some(meta) = inner.table_id_to_meta.remove(&table_id) {
+            // Remove from name → id map using the canonical key
+            let canonical_key = meta.display_name.canonical_key();
+            inner.table_name_to_id.remove(&canonical_key);
             true
         } else {
             false

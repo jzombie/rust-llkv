@@ -61,9 +61,8 @@ use llkv_table::{
     CatalogService, ConstraintColumnInfo, ConstraintService, CreateTableResult, ForeignKeyColumn,
     ForeignKeyTableInfo, InsertColumnConstraint, InsertMultiColumnUnique, InsertUniqueColumn,
     MetadataManager, MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, SysCatalog,
-    TableColumn, TableMeta, TableView, UniqueKey, build_composite_unique_key,
-    canonical_table_name, constraints::ConstraintKind, ensure_multi_column_unique,
-    ensure_single_column_unique,
+    TableColumn, TableMeta, TableView, UniqueKey, build_composite_unique_key, canonical_table_name,
+    constraints::ConstraintKind, ensure_multi_column_unique, ensure_single_column_unique,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -2307,7 +2306,6 @@ where
             column_lookup,
         } = self.catalog_service.create_table_from_columns(
             &display_name,
-            &canonical_name,
             &columns,
         )?;
 
@@ -2355,7 +2353,7 @@ where
         let mut tables = self.tables.write().unwrap();
         if tables.contains_key(&canonical_name) {
             drop(tables);
-            self.catalog.unregister_table(&canonical_name);
+            self.catalog.unregister_table(table_id);
             if if_not_exists {
                 return Ok(RuntimeStatementResult::CreateTable {
                     table_name: display_name,
@@ -2426,7 +2424,7 @@ where
             );
 
             if let Err(err) = fk_result {
-                self.catalog.unregister_table(&canonical_name);
+                self.catalog.unregister_table(table_id);
                 self.remove_table_entry(&canonical_name);
                 return Err(err);
             }
@@ -2676,7 +2674,6 @@ where
             multi_column_uniques: RwLock::new(uniques),
         }))
     }
-
 
     fn record_table_with_new_rows(&self, txn_id: TxnId, canonical_name: String) {
         if txn_id == TXN_ID_AUTO_COMMIT {
@@ -4554,16 +4551,12 @@ where
             )));
         }
 
-        self.metadata
-            .prepare_table_drop(table_id, &column_field_ids)?;
-        self.metadata.flush_table(table_id)?;
-        self.metadata.remove_table_state(table_id);
-
-        // Unregister from catalog
-        self.catalog.unregister_table(&canonical_name);
+        self.catalog_service
+            .drop_table(table_id, &column_field_ids)?;
         tracing::debug!(
-            "[CATALOG] Unregistered table '{}' from catalog",
-            canonical_name
+            "[CATALOG] Unregistered table '{}' (table_id={}) from catalog",
+            canonical_name,
+            table_id
         );
 
         self.dropped_tables
