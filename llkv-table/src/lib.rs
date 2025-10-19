@@ -32,6 +32,7 @@
 #![forbid(unsafe_code)]
 
 pub mod catalog;
+mod catalog_service;
 pub mod constants;
 pub mod constraint_service;
 pub mod constraint_validation;
@@ -54,6 +55,7 @@ pub mod types;
 
 pub mod stream;
 
+pub use catalog_service::{CatalogService, CreateTableResult};
 pub use constraint_service::{
     ConstraintService, ForeignKeyChildRowsFetch, ForeignKeyParentRowsFetch, ForeignKeyRowFetch,
     InsertColumnConstraint, InsertMultiColumnUnique, InsertUniqueColumn,

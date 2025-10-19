@@ -58,11 +58,12 @@ use llkv_table::catalog::{FieldConstraints, FieldDefinition, TableCatalog};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId};
 use llkv_table::{
-    ConstraintColumnInfo, ConstraintService, ForeignKeyColumn, ForeignKeyTableInfo,
-    InsertColumnConstraint, InsertMultiColumnUnique, InsertUniqueColumn, MetadataManager,
-    MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, SysCatalog, TableColumn, TableMeta,
-    TableView, UniqueKey, build_composite_unique_key, canonical_table_name,
-    constraints::ConstraintKind, ensure_multi_column_unique, ensure_single_column_unique,
+    CatalogService, ConstraintColumnInfo, ConstraintService, CreateTableResult, ForeignKeyColumn,
+    ForeignKeyTableInfo, InsertColumnConstraint, InsertMultiColumnUnique, InsertUniqueColumn,
+    MetadataManager, MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, SysCatalog,
+    TableColumn, TableMeta, TableView, UniqueKey, build_composite_unique_key,
+    canonical_table_name, constraints::ConstraintKind, ensure_multi_column_unique,
+    ensure_single_column_unique,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -1258,6 +1259,7 @@ where
     dropped_tables: RwLock<FxHashSet<String>>,
     metadata: Arc<MetadataManager<P>>,
     constraint_service: ConstraintService<P>,
+    catalog_service: CatalogService<P>,
     // Centralized catalog for table/field name resolution
     catalog: Arc<TableCatalog>,
     // Shared column store for all tables in this context
@@ -1405,6 +1407,11 @@ where
 
         let constraint_service =
             ConstraintService::new(Arc::clone(&metadata), Arc::clone(&catalog));
+        let catalog_service = CatalogService::new(
+            Arc::clone(&metadata),
+            Arc::clone(&catalog),
+            Arc::clone(&store_arc),
+        );
 
         Self {
             pager,
@@ -1412,6 +1419,7 @@ where
             dropped_tables: RwLock::new(FxHashSet::default()),
             metadata,
             constraint_service,
+            catalog_service,
             catalog,
             store: store_arc,
             transaction_manager,
@@ -2274,16 +2282,44 @@ where
             ));
         }
 
-        let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(columns.len());
-        let mut lookup = FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
-        for (idx, column) in columns.iter().enumerate() {
-            let normalized = column.name.to_ascii_lowercase();
-            if lookup.insert(normalized.clone(), idx).is_some() {
-                return Err(Error::InvalidArgumentError(format!(
-                    "duplicate column name '{}' in table '{}'",
-                    column.name, display_name
+        // Avoid repeating catalog work if the table already exists.
+        {
+            let tables = self.tables.read().unwrap();
+            if tables.contains_key(&canonical_name) {
+                if if_not_exists {
+                    return Ok(RuntimeStatementResult::CreateTable {
+                        table_name: display_name,
+                    });
+                }
+
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: Table '{}' already exists",
+                    display_name
                 )));
             }
+        }
+
+        let CreateTableResult {
+            table_id,
+            catalog_table_id,
+            table,
+            table_columns,
+            column_lookup,
+        } = self.catalog_service.create_table_from_columns(
+            &display_name,
+            &canonical_name,
+            &columns,
+        )?;
+
+        tracing::trace!(
+            "=== TABLE '{}' CREATED WITH table_id={} pager={:p} ===",
+            display_name,
+            table_id,
+            &*self.pager
+        );
+
+        let mut column_defs: Vec<ExecutorColumn> = Vec::with_capacity(table_columns.len());
+        for (idx, column) in table_columns.iter().enumerate() {
             tracing::trace!(
                 "DEBUG create_table_from_columns[{}]: name='{}' data_type={:?} nullable={} primary_key={} unique={}",
                 idx,
@@ -2299,60 +2335,17 @@ where
                 nullable: column.nullable,
                 primary_key: column.primary_key,
                 unique: column.unique,
-                field_id: (idx + 1) as FieldId,
+                field_id: column.field_id,
                 check_expr: column.check_expr.clone(),
             });
-            let pushed = column_defs.last().unwrap();
-            tracing::trace!(
-                "DEBUG create_table_from_columns[{}]: pushed ExecutorColumn name='{}' primary_key={} unique={}",
-                idx,
-                pushed.name,
-                pushed.primary_key,
-                pushed.unique
-            );
         }
 
-        let table_id = self.metadata.reserve_table_id()?;
-        tracing::trace!(
-            "=== TABLE '{}' CREATED WITH table_id={} pager={:p} ===",
-            display_name,
-            table_id,
-            &*self.pager
-        );
-        let now = current_time_micros();
-        let table_meta = TableMeta {
-            table_id,
-            name: Some(display_name.clone()),
-            created_at_micros: now,
-            flags: 0,
-            epoch: 0,
-        };
-        self.metadata.set_table_meta(table_id, table_meta)?;
-
-        let table_columns: Vec<TableColumn> = column_defs
-            .iter()
-            .map(|column| TableColumn {
-                field_id: column.field_id,
-                name: column.name.clone(),
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
-                primary_key: column.primary_key,
-                unique: column.unique,
-                check_expr: column.check_expr.clone(),
-            })
-            .collect();
-        self.metadata
-            .apply_column_definitions(table_id, &table_columns, now)?;
-        self.metadata.flush_table(table_id)?;
-
-        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
-
         let schema = Arc::new(ExecutorSchema {
-            columns: column_defs.clone(), // Clone for catalog registration below
-            lookup,
+            columns: column_defs.clone(),
+            lookup: column_lookup,
         });
         let table_entry = Arc::new(ExecutorTable {
-            table: Arc::new(table),
+            table: Arc::clone(&table),
             schema,
             next_row_id: AtomicU64::new(0),
             total_rows: AtomicU64::new(0),
@@ -2361,6 +2354,8 @@ where
 
         let mut tables = self.tables.write().unwrap();
         if tables.contains_key(&canonical_name) {
+            drop(tables);
+            self.catalog.unregister_table(&canonical_name);
             if if_not_exists {
                 return Ok(RuntimeStatementResult::CreateTable {
                     table_name: display_name,
@@ -2371,39 +2366,8 @@ where
                 display_name
             )));
         }
-        tables.insert(canonical_name.clone(), table_entry);
-        drop(tables); // Release write lock before catalog operations
-
-        // Register table in catalog
-        let registered_table_id = self.catalog.register_table(display_name.as_str())?;
-        tracing::debug!(
-            "[CATALOG] Registered table '{}' with catalog_id={}",
-            display_name,
-            registered_table_id
-        );
-
-        // Register fields in catalog
-        if let Some(field_resolver) = self.catalog.field_resolver(registered_table_id) {
-            for column in &column_defs {
-                let definition = FieldDefinition::new(&column.name)
-                    .with_primary_key(column.primary_key)
-                    .with_unique(column.unique)
-                    .with_check_expr(column.check_expr.clone());
-                if let Err(e) = field_resolver.register_field(definition) {
-                    tracing::warn!(
-                        "[CATALOG] Failed to register field '{}' in table '{}': {}",
-                        column.name,
-                        display_name,
-                        e
-                    );
-                }
-            }
-            tracing::debug!(
-                "[CATALOG] Registered {} field(s) for table '{}'",
-                column_defs.len(),
-                display_name
-            );
-        }
+        tables.insert(canonical_name.clone(), Arc::clone(&table_entry));
+        drop(tables);
 
         if !foreign_keys.is_empty() {
             let referencing_columns: Vec<ForeignKeyColumn> = column_defs
@@ -2421,7 +2385,7 @@ where
             let referencing_table = ForeignKeyTableInfo {
                 display_name: display_name.clone(),
                 canonical_name: canonical_name.clone(),
-                table_id: registered_table_id,
+                table_id: catalog_table_id,
                 columns: referencing_columns,
             };
 
@@ -2713,80 +2677,6 @@ where
         }))
     }
 
-    fn check_unique_constraints(
-        &self,
-        table: &ExecutorTable<P>,
-        rows: &[Vec<PlanValue>],
-        column_order: &[usize],
-        snapshot: TransactionSnapshot,
-    ) -> Result<()> {
-        let unique_columns: Vec<(usize, &ExecutorColumn)> = table
-            .schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, col)| col.unique && !col.primary_key)
-            .collect();
-
-        for (col_idx, column) in unique_columns {
-            let existing_values = self.scan_column_values(table, column.field_id, snapshot)?;
-            let mut new_values: Vec<PlanValue> = Vec::new();
-
-            for row in rows {
-                let Some(insert_position) = column_order.iter().position(|&dest| dest == col_idx)
-                else {
-                    continue;
-                };
-                let value = row[insert_position].clone();
-
-                new_values.push(value);
-            }
-
-            ensure_single_column_unique(&existing_values, &new_values, &column.name)?;
-        }
-
-        for constraint in table.multi_column_uniques() {
-            if constraint.column_indices.is_empty() {
-                continue;
-            }
-
-            let mut constraint_column_names = Vec::with_capacity(constraint.column_indices.len());
-            let mut field_ids = Vec::with_capacity(constraint.column_indices.len());
-            for &col_idx in &constraint.column_indices {
-                let Some(column) = table.schema.columns.get(col_idx) else {
-                    return Err(Error::Internal(format!(
-                        "multi-column UNIQUE constraint references invalid column index {}",
-                        col_idx
-                    )));
-                };
-                constraint_column_names.push(column.name.clone());
-                field_ids.push(column.field_id);
-            }
-
-            let existing_rows = self.scan_multi_column_values(table, &field_ids, snapshot)?;
-            let mut new_rows_for_constraint: Vec<Vec<PlanValue>> = Vec::with_capacity(rows.len());
-            for row in rows {
-                let mut values_for_constraint = Vec::with_capacity(constraint.column_indices.len());
-                for &col_idx in &constraint.column_indices {
-                    if let Some(pos) = column_order.iter().position(|&dest| dest == col_idx) {
-                        values_for_constraint.push(row[pos].clone());
-                    } else {
-                        values_for_constraint.push(PlanValue::Null);
-                    }
-                }
-
-                new_rows_for_constraint.push(values_for_constraint);
-            }
-
-            ensure_multi_column_unique(
-                &existing_rows,
-                &new_rows_for_constraint,
-                &constraint_column_names,
-            )?;
-        }
-
-        Ok(())
-    }
 
     fn record_table_with_new_rows(&self, txn_id: TxnId, canonical_name: String) {
         if txn_id == TXN_ID_AUTO_COMMIT {
