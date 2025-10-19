@@ -56,6 +56,7 @@ pub mod stream;
 
 pub use constraint_service::{
     ConstraintService, ForeignKeyChildRowsFetch, ForeignKeyParentRowsFetch, ForeignKeyRowFetch,
+    InsertColumnConstraint, InsertMultiColumnUnique, InsertUniqueColumn,
 };
 pub use constraint_validation::{
     ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo, UniqueKey, ValidatedForeignKey,

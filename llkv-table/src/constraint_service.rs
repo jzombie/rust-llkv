@@ -6,6 +6,10 @@
 
 use crate::catalog::TableCatalog;
 use crate::constraint_validation::validate_foreign_key_rows;
+use crate::constraint_validation::{
+    ConstraintColumnInfo, UniqueKey, build_composite_unique_key, ensure_multi_column_unique,
+    ensure_primary_key, ensure_single_column_unique, validate_check_constraints,
+};
 use crate::constraints::ForeignKeyAction;
 use crate::metadata::MetadataManager;
 use crate::types::{FieldId, RowId, TableId};
@@ -16,6 +20,29 @@ use llkv_storage::pager::Pager;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
+
+/// Column metadata required to validate NOT NULL and CHECK constraints during inserts.
+#[derive(Clone, Debug)]
+pub struct InsertColumnConstraint {
+    pub schema_index: usize,
+    pub column: ConstraintColumnInfo,
+}
+
+/// Descriptor for a single-column UNIQUE constraint.
+#[derive(Clone, Debug)]
+pub struct InsertUniqueColumn {
+    pub schema_index: usize,
+    pub field_id: FieldId,
+    pub name: String,
+}
+
+/// Descriptor for composite UNIQUE or PRIMARY KEY constraints.
+#[derive(Clone, Debug)]
+pub struct InsertMultiColumnUnique {
+    pub schema_indices: Vec<usize>,
+    pub field_ids: Vec<FieldId>,
+    pub column_names: Vec<String>,
+}
 
 /// Callback payload describing what parent rows need to be fetched for validation.
 pub struct ForeignKeyRowFetch<'a> {
@@ -117,6 +144,184 @@ where
                 &parent_keys,
                 &candidate_keys,
             )?;
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_insert_constraints<FSingle, FMulti>(
+        &self,
+        schema_field_ids: &[FieldId],
+        column_constraints: &[InsertColumnConstraint],
+        unique_columns: &[InsertUniqueColumn],
+        multi_column_uniques: &[InsertMultiColumnUnique],
+        primary_key: Option<&InsertMultiColumnUnique>,
+        column_order: &[usize],
+        rows: &[Vec<PlanValue>],
+        mut fetch_column_values: FSingle,
+        mut fetch_multi_column_rows: FMulti,
+    ) -> LlkvResult<()>
+    where
+        FSingle: FnMut(FieldId) -> LlkvResult<Vec<PlanValue>>,
+        FMulti: FnMut(&[FieldId]) -> LlkvResult<Vec<Vec<PlanValue>>>,
+    {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let schema_to_row_index = build_schema_to_row_index(schema_field_ids.len(), column_order)?;
+        validate_row_constraints_with_mapping(
+            column_constraints,
+            rows,
+            &schema_to_row_index,
+            column_order,
+        )?;
+
+        for unique in unique_columns {
+            let Some(row_pos) = schema_to_row_index
+                .get(unique.schema_index)
+                .and_then(|opt| *opt)
+            else {
+                continue;
+            };
+
+            let existing_values = fetch_column_values(unique.field_id)?;
+            let mut new_values: Vec<PlanValue> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = row.get(row_pos).cloned().unwrap_or(PlanValue::Null);
+                new_values.push(value);
+            }
+
+            ensure_single_column_unique(&existing_values, &new_values, &unique.name)?;
+        }
+
+        for constraint in multi_column_uniques {
+            if constraint.schema_indices.is_empty() {
+                continue;
+            }
+
+            let existing_rows = fetch_multi_column_rows(&constraint.field_ids)?;
+            let new_rows = collect_row_sets(rows, &schema_to_row_index, &constraint.schema_indices);
+            ensure_multi_column_unique(&existing_rows, &new_rows, &constraint.column_names)?;
+        }
+
+        if let Some(pk) = primary_key {
+            if !pk.schema_indices.is_empty() {
+                let existing_rows = fetch_multi_column_rows(&pk.field_ids)?;
+                let new_rows = collect_row_sets(rows, &schema_to_row_index, &pk.schema_indices);
+                ensure_primary_key(&existing_rows, &new_rows, &pk.column_names)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_row_level_constraints(
+        &self,
+        schema_field_ids: &[FieldId],
+        column_constraints: &[InsertColumnConstraint],
+        column_order: &[usize],
+        rows: &[Vec<PlanValue>],
+    ) -> LlkvResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let schema_to_row_index = build_schema_to_row_index(schema_field_ids.len(), column_order)?;
+        validate_row_constraints_with_mapping(
+            column_constraints,
+            rows,
+            &schema_to_row_index,
+            column_order,
+        )
+    }
+
+    pub fn validate_primary_key_rows<F>(
+        &self,
+        schema_field_ids: &[FieldId],
+        primary_key: &InsertMultiColumnUnique,
+        column_order: &[usize],
+        rows: &[Vec<PlanValue>],
+        mut fetch_multi_column_rows: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(&[FieldId]) -> LlkvResult<Vec<Vec<PlanValue>>>,
+    {
+        if rows.is_empty() || primary_key.schema_indices.is_empty() {
+            return Ok(());
+        }
+
+        let schema_to_row_index = build_schema_to_row_index(schema_field_ids.len(), column_order)?;
+        let existing_rows = fetch_multi_column_rows(&primary_key.field_ids)?;
+        let new_rows = collect_row_sets(rows, &schema_to_row_index, &primary_key.schema_indices);
+        ensure_primary_key(&existing_rows, &new_rows, &primary_key.column_names)
+    }
+
+    pub fn validate_update_primary_keys<F>(
+        &self,
+        schema_field_ids: &[FieldId],
+        primary_key: &InsertMultiColumnUnique,
+        column_order: &[usize],
+        rows: &[Vec<PlanValue>],
+        original_keys: &[Option<UniqueKey>],
+        mut fetch_multi_column_rows: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(&[FieldId]) -> LlkvResult<Vec<Vec<PlanValue>>>,
+    {
+        if rows.is_empty() || primary_key.schema_indices.is_empty() {
+            return Ok(());
+        }
+
+        if original_keys.len() != rows.len() {
+            return Err(Error::Internal(
+                "primary key original value count does not match row count".into(),
+            ));
+        }
+
+        let schema_to_row_index = build_schema_to_row_index(schema_field_ids.len(), column_order)?;
+
+        let mut existing_rows = fetch_multi_column_rows(&primary_key.field_ids)?;
+        let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
+        for row_values in existing_rows.drain(..) {
+            if let Some(key) = build_composite_unique_key(&row_values, &primary_key.column_names)? {
+                existing_keys.insert(key);
+            }
+        }
+
+        for key in original_keys.iter().flatten() {
+            existing_keys.remove(key);
+        }
+
+        let (pk_label, pk_display) = primary_key_context(&primary_key.column_names);
+        let mut new_seen: FxHashSet<UniqueKey> = FxHashSet::default();
+        let new_row_sets =
+            collect_row_sets(rows, &schema_to_row_index, &primary_key.schema_indices);
+
+        for values in new_row_sets {
+            let key = build_composite_unique_key(&values, &primary_key.column_names)?;
+            let key = key.ok_or_else(|| {
+                Error::ConstraintError(format!(
+                    "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
+                ))
+            })?;
+
+            if existing_keys.contains(&key) {
+                return Err(Error::ConstraintError(format!(
+                    "Duplicate key violates primary key constraint on {pk_label} '{}' (PRIMARY KEY or UNIQUE constraint violation)",
+                    pk_display
+                )));
+            }
+
+            if !new_seen.insert(key.clone()) {
+                return Err(Error::ConstraintError(format!(
+                    "Duplicate key violates primary key constraint on {pk_label} '{}' (PRIMARY KEY or UNIQUE constraint violation)",
+                    pk_display
+                )));
+            }
+
+            existing_keys.insert(key);
         }
 
         Ok(())
@@ -262,6 +467,92 @@ fn build_field_lookup(schema_field_ids: &[FieldId]) -> FxHashMap<FieldId, usize>
         lookup.insert(field_id, idx);
     }
     lookup
+}
+
+fn validate_row_constraints_with_mapping(
+    column_constraints: &[InsertColumnConstraint],
+    rows: &[Vec<PlanValue>],
+    schema_to_row_index: &[Option<usize>],
+    column_order: &[usize],
+) -> LlkvResult<()> {
+    for constraint in column_constraints {
+        if constraint.column.nullable {
+            continue;
+        }
+
+        let Some(row_pos) = schema_to_row_index
+            .get(constraint.schema_index)
+            .and_then(|opt| *opt)
+        else {
+            return Err(Error::ConstraintError(format!(
+                "NOT NULL column '{}' missing from INSERT/UPDATE",
+                constraint.column.name
+            )));
+        };
+
+        for row in rows {
+            if matches!(row.get(row_pos), Some(PlanValue::Null)) {
+                return Err(Error::ConstraintError(format!(
+                    "NOT NULL constraint failed for column '{}'",
+                    constraint.column.name
+                )));
+            }
+        }
+    }
+
+    let check_columns: Vec<ConstraintColumnInfo> = column_constraints
+        .iter()
+        .map(|constraint| constraint.column.clone())
+        .collect();
+    validate_check_constraints(check_columns.as_slice(), rows, column_order)?;
+    Ok(())
+}
+
+fn build_schema_to_row_index(
+    schema_len: usize,
+    column_order: &[usize],
+) -> LlkvResult<Vec<Option<usize>>> {
+    let mut schema_to_row_index: Vec<Option<usize>> = vec![None; schema_len];
+    for (row_pos, &schema_idx) in column_order.iter().enumerate() {
+        if schema_idx >= schema_len {
+            return Err(Error::Internal(format!(
+                "column index {} out of bounds for schema (len={})",
+                schema_idx, schema_len
+            )));
+        }
+        schema_to_row_index[schema_idx] = Some(row_pos);
+    }
+    Ok(schema_to_row_index)
+}
+
+fn primary_key_context(column_names: &[String]) -> (&'static str, String) {
+    if column_names.len() == 1 {
+        ("column", column_names[0].clone())
+    } else {
+        ("columns", column_names.join(", "))
+    }
+}
+
+fn collect_row_sets(
+    rows: &[Vec<PlanValue>],
+    schema_to_row_index: &[Option<usize>],
+    schema_indices: &[usize],
+) -> Vec<Vec<PlanValue>> {
+    rows.iter()
+        .map(|row| {
+            schema_indices
+                .iter()
+                .map(|&schema_idx| {
+                    schema_to_row_index
+                        .get(schema_idx)
+                        .and_then(|opt| {
+                            opt.map(|row_pos| row.get(row_pos).cloned().unwrap_or(PlanValue::Null))
+                        })
+                        .unwrap_or(PlanValue::Null)
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn referencing_row_positions(

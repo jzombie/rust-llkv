@@ -59,10 +59,10 @@ use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId};
 use llkv_table::{
     ConstraintColumnInfo, ConstraintService, ForeignKeyColumn, ForeignKeyTableInfo,
-    MetadataManager, MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, SysCatalog,
-    TableColumn, TableMeta, TableView, UniqueKey, build_composite_unique_key, canonical_table_name,
-    constraints::ConstraintKind, ensure_multi_column_unique, ensure_primary_key,
-    ensure_single_column_unique, validate_check_constraints,
+    InsertColumnConstraint, InsertMultiColumnUnique, InsertUniqueColumn, MetadataManager,
+    MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, SysCatalog, TableColumn, TableMeta,
+    TableView, UniqueKey, build_composite_unique_key, canonical_table_name,
+    constraints::ConstraintKind, ensure_multi_column_unique, ensure_single_column_unique,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -185,11 +185,12 @@ mod mvcc_columns {
     }
 }
 
-struct PrimaryKeyUpdateContext<'a> {
-    indices: &'a [usize],
-    names: &'a [String],
-    original_keys: &'a [Option<UniqueKey>],
-    new_rows: &'a [Vec<PlanValue>],
+struct TableConstraintContext {
+    schema_field_ids: Vec<FieldId>,
+    column_constraints: Vec<InsertColumnConstraint>,
+    unique_columns: Vec<InsertUniqueColumn>,
+    multi_column_uniques: Vec<InsertMultiColumnUnique>,
+    primary_key: Option<InsertMultiColumnUnique>,
 }
 
 /// Result of running a plan statement.
@@ -2677,80 +2678,6 @@ where
         })
     }
 
-    fn check_check_constraints(
-        &self,
-        table: &ExecutorTable<P>,
-        rows: &[Vec<PlanValue>],
-        column_order: &[usize],
-    ) -> Result<()> {
-        if table
-            .schema
-            .columns
-            .iter()
-            .all(|column| column.check_expr.is_none())
-        {
-            return Ok(());
-        }
-
-        let column_info: Vec<ConstraintColumnInfo> = table
-            .schema
-            .columns
-            .iter()
-            .map(|column| ConstraintColumnInfo {
-                name: column.name.clone(),
-                field_id: column.field_id,
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
-                check_expr: column.check_expr.clone(),
-            })
-            .collect();
-
-        validate_check_constraints(&column_info, rows, column_order)?;
-        Ok(())
-    }
-
-    fn check_not_null_constraints(
-        &self,
-        table: &ExecutorTable<P>,
-        rows: &[Vec<PlanValue>],
-        column_order: &[usize],
-    ) -> Result<()> {
-        let not_null_columns: Vec<(usize, &ExecutorColumn)> = table
-            .schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| !column.nullable)
-            .collect();
-
-        if not_null_columns.is_empty() {
-            return Ok(());
-        }
-
-        for (col_idx, column) in not_null_columns {
-            let insert_pos = column_order
-                .iter()
-                .position(|&dest_idx| dest_idx == col_idx)
-                .ok_or_else(|| {
-                    Error::ConstraintError(format!(
-                        "NOT NULL column '{}' missing from INSERT/UPDATE",
-                        column.name
-                    ))
-                })?;
-
-            for row in rows {
-                if matches!(row.get(insert_pos), Some(PlanValue::Null)) {
-                    return Err(Error::ConstraintError(format!(
-                        "NOT NULL constraint failed for column '{}'",
-                        column.name
-                    )));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     fn rebuild_executor_table_with_unique(
         table: &ExecutorTable<P>,
         field_id: FieldId,
@@ -2857,57 +2784,6 @@ where
                 &constraint_column_names,
             )?;
         }
-
-        Ok(())
-    }
-
-    fn check_primary_key_constraints(
-        &self,
-        table: &ExecutorTable<P>,
-        _canonical_name: &str,
-        rows: &[Vec<PlanValue>],
-        column_order: &[usize],
-        snapshot: TransactionSnapshot,
-    ) -> Result<()> {
-        let _table_id = table.table.table_id();
-        // Find columns with PRIMARY KEY constraint
-        let primary_key_columns: Vec<(usize, &ExecutorColumn)> = table
-            .schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, col)| col.primary_key)
-            .collect();
-
-        if primary_key_columns.is_empty() {
-            return Ok(());
-        }
-
-        let pk_field_ids: Vec<FieldId> = primary_key_columns
-            .iter()
-            .map(|(_, col)| col.field_id)
-            .collect();
-        let pk_column_names: Vec<String> = primary_key_columns
-            .iter()
-            .map(|(_, col)| col.name.clone())
-            .collect();
-        let existing_rows = self.scan_multi_column_values(table, &pk_field_ids, snapshot)?;
-        let mut new_rows_for_pk: Vec<Vec<PlanValue>> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut values_for_pk = Vec::with_capacity(pk_field_ids.len());
-            for &(col_idx, _column) in &primary_key_columns {
-                let value = if let Some(pos) = column_order.iter().position(|&dest| dest == col_idx)
-                {
-                    row[pos].clone()
-                } else {
-                    PlanValue::Null
-                };
-                values_for_pk.push(value);
-            }
-            new_rows_for_pk.push(values_for_pk);
-        }
-
-        ensure_primary_key(&existing_rows, &new_rows_for_pk, &pk_column_names)?;
 
         Ok(())
     }
@@ -3035,9 +2911,10 @@ where
 
         for table_name in tables {
             let table = self.lookup_table(&table_name)?;
-            if !table.schema.columns.iter().any(|column| column.primary_key) {
+            let constraint_ctx = self.build_table_constraint_context(table.as_ref())?;
+            let Some(primary_key) = constraint_ctx.primary_key.as_ref() else {
                 continue;
-            }
+            };
 
             let new_rows = self.collect_rows_created_by_txn(table.as_ref(), txn_id)?;
             if new_rows.is_empty() {
@@ -3045,12 +2922,12 @@ where
             }
 
             let column_order: Vec<usize> = (0..table.schema.columns.len()).collect();
-            self.check_primary_key_constraints(
-                table.as_ref(),
-                table_name.as_str(),
-                &new_rows,
+            self.constraint_service.validate_primary_key_rows(
+                &constraint_ctx.schema_field_ids,
+                primary_key,
                 &column_order,
-                snapshot,
+                &new_rows,
+                |field_ids| self.scan_multi_column_values(table.as_ref(), field_ids, snapshot),
             )?;
         }
 
@@ -3064,108 +2941,6 @@ where
 
         let mut guard = self.txn_tables_with_new_rows.write().unwrap();
         guard.remove(&txn_id);
-    }
-
-    fn validate_primary_keys_for_update(
-        &self,
-        table: &ExecutorTable<P>,
-        display_name: &str,
-        pk_context: PrimaryKeyUpdateContext<'_>,
-        snapshot: TransactionSnapshot,
-    ) -> Result<()> {
-        let PrimaryKeyUpdateContext {
-            indices,
-            names,
-            original_keys,
-            new_rows,
-        } = pk_context;
-
-        if indices.is_empty() {
-            return Ok(());
-        }
-
-        debug_assert_eq!(original_keys.len(), new_rows.len());
-
-        let pk_field_ids: Vec<FieldId> = indices
-            .iter()
-            .map(|&idx| {
-                table
-                    .schema
-                    .columns
-                    .get(idx)
-                    .expect("primary key column index out of bounds")
-                    .field_id
-            })
-            .collect();
-
-        let mut existing_rows = self.scan_multi_column_values(table, &pk_field_ids, snapshot)?;
-        let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
-        for row_values in existing_rows.drain(..) {
-            if let Some(key) = build_composite_unique_key(&row_values, names)? {
-                tracing::trace!(table = %display_name, ?key, "existing primary key");
-                existing_keys.insert(key);
-            }
-        }
-
-        for key in original_keys.iter().flatten() {
-            tracing::trace!(table = %display_name, ?key, "removing original key");
-            existing_keys.remove(key);
-        }
-
-        tracing::trace!(
-            table = %display_name,
-            pk_columns = ?names,
-            existing_keys = existing_keys.len(),
-            pending_rows = new_rows.len(),
-            "validating primary key uniqueness for update"
-        );
-
-        let pk_label = if names.len() == 1 {
-            "column"
-        } else {
-            "columns"
-        };
-        let pk_display = if names.len() == 1 {
-            names[0].clone()
-        } else {
-            names.join(", ")
-        };
-
-        let mut new_seen: FxHashSet<UniqueKey> = FxHashSet::default();
-
-        for row in new_rows {
-            let mut values = Vec::with_capacity(indices.len());
-            for &idx in indices {
-                values.push(row[idx].clone());
-            }
-
-            let key = build_composite_unique_key(&values, names)?;
-            let key = key.ok_or_else(|| {
-                Error::ConstraintError(format!(
-                    "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
-                ))
-            })?;
-
-            tracing::trace!(table = %display_name, ?key, "validating new primary key");
-
-            if existing_keys.contains(&key) {
-                return Err(Error::ConstraintError(format!(
-                    "Duplicate key violates primary key constraint on {pk_label} '{}' (PRIMARY KEY or UNIQUE constraint violation)",
-                    pk_display
-                )));
-            }
-
-            if !new_seen.insert(key.clone()) {
-                return Err(Error::ConstraintError(format!(
-                    "Duplicate key violates primary key constraint on {pk_label} '{}' (PRIMARY KEY or UNIQUE constraint violation)",
-                    pk_display
-                )));
-            }
-
-            existing_keys.insert(key);
-        }
-
-        Ok(())
     }
 
     fn coerce_plan_value_for_column(
@@ -3515,6 +3290,117 @@ where
 
         Ok(visible_row_ids.into_iter().zip(rows).collect())
     }
+
+    fn build_table_constraint_context(
+        &self,
+        table: &ExecutorTable<P>,
+    ) -> Result<TableConstraintContext> {
+        let schema_field_ids: Vec<FieldId> = table
+            .schema
+            .columns
+            .iter()
+            .map(|column| column.field_id)
+            .collect();
+
+        let column_constraints: Vec<InsertColumnConstraint> = table
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| InsertColumnConstraint {
+                schema_index: idx,
+                column: ConstraintColumnInfo {
+                    name: column.name.clone(),
+                    field_id: column.field_id,
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                    check_expr: column.check_expr.clone(),
+                },
+            })
+            .collect();
+
+        let unique_columns: Vec<InsertUniqueColumn> = table
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.unique && !column.primary_key)
+            .map(|(idx, column)| InsertUniqueColumn {
+                schema_index: idx,
+                field_id: column.field_id,
+                name: column.name.clone(),
+            })
+            .collect();
+
+        let mut multi_column_uniques: Vec<InsertMultiColumnUnique> = Vec::new();
+        for constraint in table.multi_column_uniques() {
+            if constraint.column_indices.is_empty() {
+                continue;
+            }
+
+            let mut schema_indices = Vec::with_capacity(constraint.column_indices.len());
+            let mut field_ids = Vec::with_capacity(constraint.column_indices.len());
+            let mut column_names = Vec::with_capacity(constraint.column_indices.len());
+            for &col_idx in &constraint.column_indices {
+                let column = table.schema.columns.get(col_idx).ok_or_else(|| {
+                    Error::Internal(format!(
+                        "multi-column UNIQUE constraint references invalid column index {}",
+                        col_idx
+                    ))
+                })?;
+                schema_indices.push(col_idx);
+                field_ids.push(column.field_id);
+                column_names.push(column.name.clone());
+            }
+
+            multi_column_uniques.push(InsertMultiColumnUnique {
+                schema_indices,
+                field_ids,
+                column_names,
+            });
+        }
+
+        let primary_indices: Vec<usize> = table
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.primary_key)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        let primary_key = if primary_indices.is_empty() {
+            None
+        } else {
+            let mut field_ids = Vec::with_capacity(primary_indices.len());
+            let mut column_names = Vec::with_capacity(primary_indices.len());
+            for &idx in &primary_indices {
+                let column = table.schema.columns.get(idx).ok_or_else(|| {
+                    Error::Internal(format!(
+                        "primary key references invalid column index {}",
+                        idx
+                    ))
+                })?;
+                field_ids.push(column.field_id);
+                column_names.push(column.name.clone());
+            }
+
+            Some(InsertMultiColumnUnique {
+                schema_indices: primary_indices.clone(),
+                field_ids,
+                column_names,
+            })
+        };
+
+        Ok(TableConstraintContext {
+            schema_field_ids,
+            column_constraints,
+            unique_columns,
+            multi_column_uniques,
+            primary_key,
+        })
+    }
+
     fn insert_rows(
         &self,
         table: &ExecutorTable<P>,
@@ -3559,15 +3445,12 @@ where
             }
         }
 
-        self.check_not_null_constraints(table, &rows, &column_order)?;
-        // Check CHECK constraints
-        self.check_check_constraints(table, &rows, &column_order)?;
-        // Check UNIQUE constraints
-        self.check_unique_constraints(table, &rows, &column_order, snapshot)?;
+        let constraint_ctx = self.build_table_constraint_context(table)?;
+        let primary_key_spec = constraint_ctx.primary_key.as_ref();
 
         if display_name == "keys" {
             tracing::trace!(
-                "[KEYS] Checking PRIMARY KEY constraints - {} rows to insert",
+                "[KEYS] Validating constraints for {} row(s) before insert",
                 rows.len()
             );
             for (i, row) in rows.iter().enumerate() {
@@ -3575,22 +3458,17 @@ where
             }
         }
 
-        let constraint_result = self.check_primary_key_constraints(
-            table,
-            canonical_name.as_str(),
-            &rows,
+        self.constraint_service.validate_insert_constraints(
+            &constraint_ctx.schema_field_ids,
+            &constraint_ctx.column_constraints,
+            &constraint_ctx.unique_columns,
+            &constraint_ctx.multi_column_uniques,
+            primary_key_spec,
             &column_order,
-            snapshot,
-        );
-
-        if display_name == "keys" {
-            match &constraint_result {
-                Ok(_) => tracing::trace!("[KEYS] PRIMARY KEY check PASSED"),
-                Err(e) => tracing::trace!("[KEYS] PRIMARY KEY check FAILED: {:?}", e),
-            }
-        }
-
-        constraint_result?;
+            &rows,
+            |field_id| self.scan_column_values(table, field_id, snapshot),
+            |field_ids| self.scan_multi_column_values(table, field_ids, snapshot),
+        )?;
 
         self.check_foreign_keys_on_insert(table, &display_name, &rows, &column_order, snapshot)?;
 
@@ -3835,28 +3713,18 @@ where
             "update_filtered_rows captured source rows"
         );
 
-        let primary_key_columns: Vec<(usize, &ExecutorColumn)> = table
-            .schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.primary_key)
-            .collect();
-        let primary_key_indices: Vec<usize> =
-            primary_key_columns.iter().map(|(idx, _)| *idx).collect();
-        let primary_key_names: Vec<String> = primary_key_columns
-            .iter()
-            .map(|(_, column)| column.name.clone())
-            .collect();
+        let constraint_ctx = self.build_table_constraint_context(table)?;
+        let primary_key_spec = constraint_ctx.primary_key.as_ref();
         let mut original_primary_key_keys: Vec<Option<UniqueKey>> = Vec::new();
-        if !primary_key_indices.is_empty() {
+        if let Some(pk) = primary_key_spec {
             original_primary_key_keys.reserve(row_count);
             for row in &new_rows {
-                let mut values = Vec::with_capacity(primary_key_indices.len());
-                for &idx in &primary_key_indices {
-                    values.push(row[idx].clone());
+                let mut values = Vec::with_capacity(pk.schema_indices.len());
+                for &idx in &pk.schema_indices {
+                    let value = row.get(idx).cloned().unwrap_or(PlanValue::Null);
+                    values.push(value);
                 }
-                let key = build_composite_unique_key(&values, &primary_key_names)?;
+                let key = build_composite_unique_key(&values, &pk.column_names)?;
                 original_primary_key_keys.push(key);
             }
         }
@@ -3907,20 +3775,6 @@ where
             }
         }
 
-        if !primary_key_indices.is_empty() {
-            self.validate_primary_keys_for_update(
-                table,
-                &display_name,
-                PrimaryKeyUpdateContext {
-                    indices: &primary_key_indices,
-                    names: &primary_key_names,
-                    original_keys: &original_primary_key_keys,
-                    new_rows: &new_rows,
-                },
-                snapshot,
-            )?;
-        }
-
         let column_names: Vec<String> = table
             .schema
             .columns
@@ -3928,8 +3782,23 @@ where
             .map(|column| column.name.clone())
             .collect();
         let column_order = resolve_insert_columns(&column_names, table.schema.as_ref())?;
-        self.check_not_null_constraints(table, &new_rows, &column_order)?;
-        self.check_check_constraints(table, &new_rows, &column_order)?;
+        self.constraint_service.validate_row_level_constraints(
+            &constraint_ctx.schema_field_ids,
+            &constraint_ctx.column_constraints,
+            &column_order,
+            &new_rows,
+        )?;
+
+        if let Some(pk) = primary_key_spec {
+            self.constraint_service.validate_update_primary_keys(
+                &constraint_ctx.schema_field_ids,
+                pk,
+                &column_order,
+                &new_rows,
+                &original_primary_key_keys,
+                |field_ids| self.scan_multi_column_values(table, field_ids, snapshot),
+            )?;
+        }
 
         let _ = self.apply_delete(
             table,
@@ -4083,28 +3952,18 @@ where
                 .all(|row| row.len() == table.schema.columns.len())
         );
 
-        let primary_key_columns: Vec<(usize, &ExecutorColumn)> = table
-            .schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.primary_key)
-            .collect();
-        let primary_key_indices: Vec<usize> =
-            primary_key_columns.iter().map(|(idx, _)| *idx).collect();
-        let primary_key_names: Vec<String> = primary_key_columns
-            .iter()
-            .map(|(_, column)| column.name.clone())
-            .collect();
+        let constraint_ctx = self.build_table_constraint_context(table)?;
+        let primary_key_spec = constraint_ctx.primary_key.as_ref();
         let mut original_primary_key_keys: Vec<Option<UniqueKey>> = Vec::new();
-        if !primary_key_indices.is_empty() {
+        if let Some(pk) = primary_key_spec {
             original_primary_key_keys.reserve(row_count);
             for row in &new_rows {
-                let mut values = Vec::with_capacity(primary_key_indices.len());
-                for &idx in &primary_key_indices {
-                    values.push(row[idx].clone());
+                let mut values = Vec::with_capacity(pk.schema_indices.len());
+                for &idx in &pk.schema_indices {
+                    let value = row.get(idx).cloned().unwrap_or(PlanValue::Null);
+                    values.push(value);
                 }
-                let key = build_composite_unique_key(&values, &primary_key_names)?;
+                let key = build_composite_unique_key(&values, &pk.column_names)?;
                 original_primary_key_keys.push(key);
             }
         }
@@ -4155,20 +4014,6 @@ where
             }
         }
 
-        if !primary_key_indices.is_empty() {
-            self.validate_primary_keys_for_update(
-                table,
-                &display_name,
-                PrimaryKeyUpdateContext {
-                    indices: &primary_key_indices,
-                    names: &primary_key_names,
-                    original_keys: &original_primary_key_keys,
-                    new_rows: &new_rows,
-                },
-                snapshot,
-            )?;
-        }
-
         let column_names: Vec<String> = table
             .schema
             .columns
@@ -4176,8 +4021,23 @@ where
             .map(|column| column.name.clone())
             .collect();
         let column_order = resolve_insert_columns(&column_names, table.schema.as_ref())?;
-        self.check_not_null_constraints(table, &new_rows, &column_order)?;
-        self.check_check_constraints(table, &new_rows, &column_order)?;
+        self.constraint_service.validate_row_level_constraints(
+            &constraint_ctx.schema_field_ids,
+            &constraint_ctx.column_constraints,
+            &column_order,
+            &new_rows,
+        )?;
+
+        if let Some(pk) = primary_key_spec {
+            self.constraint_service.validate_update_primary_keys(
+                &constraint_ctx.schema_field_ids,
+                pk,
+                &column_order,
+                &new_rows,
+                &original_primary_key_keys,
+                |field_ids| self.scan_multi_column_values(table, field_ids, snapshot),
+            )?;
+        }
 
         let _ = self.apply_delete(
             table,
