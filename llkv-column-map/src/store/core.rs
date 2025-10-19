@@ -1554,7 +1554,7 @@ where
         // If empty: free everything and clear counters.
         if need_pages == 0 {
             frees.extend(old_pages.iter().copied());
-            
+
             // Setting both page pointers to 0 indicates an empty descriptor state.
             // This signals that the descriptor needs reinitialization on next access,
             // as this pattern (head_page_pk == 0 && tail_page_pk == 0) is checked

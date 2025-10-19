@@ -32,10 +32,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bitcode::{Decode, Encode};
 
+use crate::constants::CONSTRAINT_SCAN_CHUNK_SIZE;
 use crate::constraints::{
     ConstraintId, ConstraintRecord, decode_constraint_row_id, encode_constraint_row_id,
 };
-use crate::constants::CONSTRAINT_SCAN_CHUNK_SIZE;
 use crate::types::{FieldId, RowId, TableId};
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,

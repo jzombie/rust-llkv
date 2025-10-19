@@ -19,7 +19,7 @@ use crate::resolvers::resolve_table_name;
 use crate::sys_catalog::{ConstraintNameRecord, SysCatalog};
 use crate::table::Table;
 use crate::types::{FieldId, TableColumn, TableId};
-use crate::view::ForeignKeyView;
+use crate::view::{ForeignKeyView, TableView};
 use crate::{ColMeta, MultiColumnUniqueEntryMeta, TableMeta, TableMultiColumnUniqueMeta};
 use arrow::datatypes::DataType;
 use llkv_column_map::ColumnStore;
@@ -796,6 +796,28 @@ where
         }
 
         Ok(details)
+    }
+
+    /// Assemble a consolidated read-only view of table metadata.
+    pub fn table_view(
+        &self,
+        catalog: &TableCatalog,
+        table_id: TableId,
+        field_ids: &[FieldId],
+    ) -> LlkvResult<TableView> {
+        let table_meta = self.table_meta(table_id)?;
+        let column_metas = self.column_metas(table_id, field_ids)?;
+        let constraint_records = self.constraint_records(table_id)?;
+        let multi_column_uniques = self.multi_column_uniques(table_id)?;
+        let foreign_keys = self.foreign_key_views(catalog, table_id)?;
+
+        Ok(TableView {
+            table_meta,
+            column_metas,
+            constraint_records,
+            multi_column_uniques,
+            foreign_keys,
+        })
     }
 
     /// Validate foreign key specifications and persist them for the referencing table.

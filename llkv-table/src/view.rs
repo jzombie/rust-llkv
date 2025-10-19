@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
-use crate::constraints::ConstraintId;
-use crate::constraints::ForeignKeyAction;
+use crate::MultiColumnUniqueEntryMeta;
+use crate::constraints::{ConstraintId, ConstraintRecord, ForeignKeyAction};
+use crate::sys_catalog::{ColMeta, TableMeta};
 use crate::types::{FieldId, TableId};
 
 /// Read-only view describing a resolved foreign key constraint.
@@ -21,4 +22,14 @@ pub struct ForeignKeyView {
     pub referenced_column_names: Vec<String>,
     pub on_delete: ForeignKeyAction,
     pub on_update: ForeignKeyAction,
+}
+
+/// Read-only snapshot aggregating table metadata used by runtime consumers.
+#[derive(Clone, Debug)]
+pub struct TableView {
+    pub table_meta: Option<TableMeta>,
+    pub column_metas: Vec<Option<ColMeta>>,
+    pub constraint_records: Vec<ConstraintRecord>,
+    pub multi_column_uniques: Vec<MultiColumnUniqueEntryMeta>,
+    pub foreign_keys: Vec<ForeignKeyView>,
 }

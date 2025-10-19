@@ -4541,17 +4541,17 @@ where
                 Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
             })?;
 
-        // Fetch persisted constraint records and open the table
-        let constraint_records = self.metadata.constraint_records(table_meta.table_id)?;
-
         let table = Table::new_with_store(table_meta.table_id, Arc::clone(&self.store))?;
         let store = table.store();
         let mut logical_fields = store.user_field_ids_for_table(table_meta.table_id);
         logical_fields.sort_by_key(|lfid| lfid.field_id());
         let field_ids: Vec<FieldId> = logical_fields.iter().map(|lfid| lfid.field_id()).collect();
-        let column_metas = self
-            .metadata
-            .column_metas(table_meta.table_id, &field_ids)?;
+        let table_view =
+            self.metadata
+                .table_view(&self.catalog, table_meta.table_id, &field_ids)?;
+        let column_metas = table_view.column_metas;
+        let constraint_records = table_view.constraint_records;
+        let multi_column_uniques = table_view.multi_column_uniques;
         let catalog_field_resolver = self.catalog.field_resolver(_catalog_table_id);
         let mut metadata_primary_keys: FxHashSet<FieldId> = FxHashSet::default();
         let mut metadata_unique_fields: FxHashSet<FieldId> = FxHashSet::default();
@@ -4703,20 +4703,10 @@ where
             multi_column_uniques: RwLock::new(Vec::new()),
         });
 
-        match self.metadata.multi_column_uniques(table_meta.table_id) {
-            Ok(stored) if !stored.is_empty() => {
-                let executor_uniques =
-                    Self::build_executor_multi_column_uniques(&executor_table, &stored);
-                executor_table.set_multi_column_uniques(executor_uniques);
-            }
-            Ok(_) => {}
-            Err(err) => {
-                tracing::warn!(
-                    table_id = table_meta.table_id,
-                    error = %err,
-                    "[LAZY_LOAD] Failed to load multi-column UNIQUE metadata during table hydrate"
-                );
-            }
+        if !multi_column_uniques.is_empty() {
+            let executor_uniques =
+                Self::build_executor_multi_column_uniques(&executor_table, &multi_column_uniques);
+            executor_table.set_multi_column_uniques(executor_uniques);
         }
 
         // Cache the loaded table
