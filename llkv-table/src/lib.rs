@@ -44,6 +44,7 @@ pub mod resolvers;
 mod scalar_eval;
 pub mod schema_ext;
 mod sys_catalog;
+pub mod view;
 pub mod expr {
     pub use llkv_expr::expr::*;
 }
@@ -68,7 +69,7 @@ pub use constraints::{
     UniqueConstraint, decode_constraint_row_id, encode_constraint_row_id,
 };
 pub use metadata::MultiColumnUniqueRegistration;
-pub use metadata::{ForeignKeyDescriptor, ForeignKeyDetail, MetadataManager};
+pub use metadata::{ForeignKeyDescriptor, MetadataManager};
 pub use reserved::CATALOG_TABLE_ID;
 pub use resolvers::{canonical_table_name, resolve_table_name};
 pub use stream::{ColumnStream, ColumnStreamBatch};
@@ -77,6 +78,7 @@ pub use sys_catalog::{
 };
 pub use table::Table;
 pub use types::{FieldId, ROW_ID_FIELD_ID, RowId, TableColumn, TableId};
+pub use view::ForeignKeyView;
 
 pub use planner::plan_graph::{
     PLAN_GRAPH_VERSION, PlanAnnotations, PlanEdge, PlanEdgeMetadata, PlanExpression, PlanField,

@@ -7,8 +7,9 @@
 use crate::catalog::TableCatalog;
 use crate::constraint_validation::validate_foreign_key_rows;
 use crate::constraints::ForeignKeyAction;
-use crate::metadata::{ForeignKeyDetail, MetadataManager};
+use crate::metadata::MetadataManager;
 use crate::types::{FieldId, RowId, TableId};
+use crate::view::ForeignKeyView;
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
@@ -73,7 +74,7 @@ where
 
         let details = self
             .metadata
-            .foreign_key_details(self.catalog.as_ref(), referencing_table_id)?;
+            .foreign_key_views(self.catalog.as_ref(), referencing_table_id)?;
 
         if details.is_empty() {
             return Ok(());
@@ -149,7 +150,7 @@ where
         for (child_table_id, constraint_id) in referencing {
             let details = self
                 .metadata
-                .foreign_key_details(self.catalog.as_ref(), child_table_id)?;
+                .foreign_key_views(self.catalog.as_ref(), child_table_id)?;
 
             let Some(detail) = details
                 .into_iter()
@@ -223,7 +224,7 @@ where
     pub fn referencing_foreign_keys(
         &self,
         referenced_table_id: TableId,
-    ) -> LlkvResult<Vec<ForeignKeyDetail>> {
+    ) -> LlkvResult<Vec<ForeignKeyView>> {
         let referencing = self
             .metadata
             .foreign_keys_referencing(referenced_table_id)?;
@@ -236,7 +237,7 @@ where
         for (child_table_id, constraint_id) in referencing {
             let details = match self
                 .metadata
-                .foreign_key_details(self.catalog.as_ref(), child_table_id)
+                .foreign_key_views(self.catalog.as_ref(), child_table_id)
             {
                 Ok(details) => details,
                 Err(Error::InvalidArgumentError(_)) | Err(Error::CatalogError(_)) => continue,
@@ -264,7 +265,7 @@ fn build_field_lookup(schema_field_ids: &[FieldId]) -> FxHashMap<FieldId, usize>
 }
 
 fn referencing_row_positions(
-    detail: &ForeignKeyDetail,
+    detail: &ForeignKeyView,
     lookup: &FxHashMap<FieldId, usize>,
     table_to_row_index: &[Option<usize>],
     table_id: TableId,
@@ -301,7 +302,7 @@ fn referencing_row_positions(
 }
 
 fn canonical_parent_keys(
-    detail: &ForeignKeyDetail,
+    detail: &ForeignKeyView,
     parent_rows: Vec<Vec<PlanValue>>,
 ) -> Vec<Vec<PlanValue>> {
     parent_rows

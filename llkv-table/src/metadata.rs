@@ -19,6 +19,7 @@ use crate::resolvers::resolve_table_name;
 use crate::sys_catalog::{ConstraintNameRecord, SysCatalog};
 use crate::table::Table;
 use crate::types::{FieldId, TableColumn, TableId};
+use crate::view::ForeignKeyView;
 use crate::{ColMeta, MultiColumnUniqueEntryMeta, TableMeta, TableMultiColumnUniqueMeta};
 use arrow::datatypes::DataType;
 use llkv_column_map::ColumnStore;
@@ -750,11 +751,11 @@ where
     }
 
     /// Resolve foreign key descriptors into names suitable for runtime consumers.
-    pub fn foreign_key_details(
+    pub fn foreign_key_views(
         &self,
         catalog: &TableCatalog,
         table_id: TableId,
-    ) -> LlkvResult<Vec<ForeignKeyDetail>> {
+    ) -> LlkvResult<Vec<ForeignKeyView>> {
         let descriptors = self.foreign_key_descriptors(table_id)?;
 
         if descriptors.is_empty() {
@@ -776,7 +777,7 @@ where
                 self.column_names(referenced_table_id, &descriptor.referenced_field_ids)?;
             let constraint_name = self.constraint_name_for(table_id, descriptor.constraint_id)?;
 
-            details.push(ForeignKeyDetail {
+            details.push(ForeignKeyView {
                 constraint_id: descriptor.constraint_id,
                 constraint_name,
                 referencing_table_id: descriptor.referencing_table_id,
@@ -1214,25 +1215,6 @@ pub struct ForeignKeyDescriptor {
     pub referencing_field_ids: Vec<FieldId>,
     pub referenced_table_id: TableId,
     pub referenced_field_ids: Vec<FieldId>,
-    pub on_delete: ForeignKeyAction,
-    pub on_update: ForeignKeyAction,
-}
-
-/// Fully resolved foreign key information with column names and display identifiers.
-#[derive(Clone, Debug)]
-pub struct ForeignKeyDetail {
-    pub constraint_id: ConstraintId,
-    pub constraint_name: Option<String>,
-    pub referencing_table_id: TableId,
-    pub referencing_table_display: String,
-    pub referencing_table_canonical: String,
-    pub referencing_field_ids: Vec<FieldId>,
-    pub referencing_column_names: Vec<String>,
-    pub referenced_table_id: TableId,
-    pub referenced_table_display: String,
-    pub referenced_table_canonical: String,
-    pub referenced_field_ids: Vec<FieldId>,
-    pub referenced_column_names: Vec<String>,
     pub on_delete: ForeignKeyAction,
     pub on_update: ForeignKeyAction,
 }
