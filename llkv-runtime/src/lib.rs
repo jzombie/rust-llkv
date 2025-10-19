@@ -1942,7 +1942,12 @@ where
         }
 
         if matches!(result, Err(Error::NotFound)) {
-            panic!("insert yielded Error::NotFound for table {}", display_name);
+            panic!(
+                "BUG: insert yielded Error::NotFound for table '{}'. \
+                 This should never happen: insert should never return NotFound after successful table lookup. \
+                 This indicates a logic error in the runtime.",
+                display_name
+            );
         }
 
         result
