@@ -89,8 +89,19 @@ fn constraint_meta_lfid() -> LogicalFieldId {
 }
 
 #[inline]
+fn constraint_name_lfid() -> LogicalFieldId {
+    lfid(CATALOG_TABLE_ID, CATALOG_FIELD_CONSTRAINT_NAME_ID)
+}
+
+#[inline]
 fn constraint_row_lfid() -> LogicalFieldId {
     rowid_fid(constraint_meta_lfid())
+}
+
+#[derive(Clone, Debug, Encode, Decode)]
+pub struct ConstraintNameRecord {
+    pub constraint_id: ConstraintId,
+    pub name: Option<String>,
 }
 
 fn decode_constraint_record(bytes: &[u8]) -> LlkvResult<ConstraintRecord> {
@@ -488,6 +499,24 @@ where
         self.write_null_entries(meta_field, &row_ids)
     }
 
+    /// Delete persisted constraint names for the provided identifiers.
+    pub fn delete_constraint_names(
+        &self,
+        table_id: TableId,
+        constraint_ids: &[ConstraintId],
+    ) -> LlkvResult<()> {
+        if constraint_ids.is_empty() {
+            return Ok(());
+        }
+
+        let lfid = constraint_name_lfid();
+        let row_ids: Vec<RowId> = constraint_ids
+            .iter()
+            .map(|&constraint_id| encode_constraint_row_id(table_id, constraint_id))
+            .collect();
+        self.write_null_entries(lfid, &row_ids)
+    }
+
     /// Delete the multi-column UNIQUE metadata record for a table, if any.
     pub fn delete_multi_column_uniques(&self, table_id: TableId) -> LlkvResult<()> {
         let meta_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID);
@@ -679,6 +708,41 @@ where
         Ok(())
     }
 
+    /// Persist or update constraint names for the specified identifiers.
+    pub fn put_constraint_names(
+        &self,
+        table_id: TableId,
+        names: &[ConstraintNameRecord],
+    ) -> LlkvResult<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+
+        let lfid_val: u64 = constraint_name_lfid().into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("constraint_name", DataType::Binary, false).with_metadata(HashMap::from([
+                (
+                    crate::constants::FIELD_ID_META_KEY.to_string(),
+                    lfid_val.to_string(),
+                ),
+            ])),
+        ]));
+
+        let row_ids: Vec<RowId> = names
+            .iter()
+            .map(|record| encode_constraint_row_id(table_id, record.constraint_id))
+            .collect();
+        let row_ids_array = Arc::new(UInt64Array::from(row_ids));
+        let payload_array = Arc::new(BinaryArray::from_iter_values(
+            names.iter().map(bitcode::encode),
+        ));
+
+        let batch = RecordBatch::try_new(schema, vec![row_ids_array, payload_array])?;
+        self.store.append(&batch)?;
+        Ok(())
+    }
+
     /// Fetch multiple constraint records for a table in a single batch.
     pub fn get_constraint_records(
         &self,
@@ -733,6 +797,65 @@ where
                 ));
             }
             results.push(Some(record));
+        }
+
+        Ok(results)
+    }
+
+    /// Fetch constraint names for a table in a single batch.
+    pub fn get_constraint_names(
+        &self,
+        table_id: TableId,
+        constraint_ids: &[ConstraintId],
+    ) -> LlkvResult<Vec<Option<String>>> {
+        if constraint_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let lfid = constraint_name_lfid();
+        let row_ids: Vec<RowId> = constraint_ids
+            .iter()
+            .map(|&constraint_id| encode_constraint_row_id(table_id, constraint_id))
+            .collect();
+
+        let batch = match self
+            .store
+            .gather_rows(&[lfid], &row_ids, GatherNullPolicy::IncludeNulls)
+        {
+            Ok(batch) => batch,
+            Err(llkv_result::Error::NotFound) => {
+                return Ok(vec![None; constraint_ids.len()]);
+            }
+            Err(err) => return Err(err),
+        };
+
+        if batch.num_columns() == 0 {
+            return Ok(vec![None; constraint_ids.len()]);
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal(
+                    "constraint name metadata column stored unexpected type".into(),
+                )
+            })?;
+
+        let mut results = Vec::with_capacity(row_ids.len());
+        for idx in 0..row_ids.len() {
+            if array.is_null(idx) {
+                results.push(None);
+            } else {
+                let record: ConstraintNameRecord =
+                    bitcode::decode(array.value(idx)).map_err(|err| {
+                        llkv_result::Error::Internal(format!(
+                            "failed to decode constraint name metadata: {err}"
+                        ))
+                    })?;
+                results.push(record.name);
+            }
         }
 
         Ok(results)

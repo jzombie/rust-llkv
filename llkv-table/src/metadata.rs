@@ -16,7 +16,7 @@ use crate::constraints::{
 };
 use crate::reserved;
 use crate::resolvers::resolve_table_name;
-use crate::sys_catalog::SysCatalog;
+use crate::sys_catalog::{ConstraintNameRecord, SysCatalog};
 use crate::table::Table;
 use crate::types::{FieldId, TableColumn, TableId};
 use crate::{ColMeta, MultiColumnUniqueEntryMeta, TableMeta, TableMultiColumnUniqueMeta};
@@ -37,6 +37,7 @@ struct TableSnapshot {
     column_metas: FxHashMap<FieldId, ColMeta>,
     constraints: FxHashMap<ConstraintId, ConstraintRecord>,
     multi_uniques: Vec<MultiColumnUniqueEntryMeta>,
+    constraint_names: FxHashMap<ConstraintId, String>,
     sort_indexes: FxHashSet<FieldId>,
 }
 
@@ -46,12 +47,14 @@ impl TableSnapshot {
         column_metas: FxHashMap<FieldId, ColMeta>,
         constraints: FxHashMap<ConstraintId, ConstraintRecord>,
         multi_uniques: Vec<MultiColumnUniqueEntryMeta>,
+        constraint_names: FxHashMap<ConstraintId, String>,
     ) -> Self {
         Self {
             table_meta,
             column_metas,
             constraints,
             multi_uniques,
+            constraint_names,
             sort_indexes: FxHashSet::default(),
         }
     }
@@ -162,13 +165,34 @@ where
         let catalog = SysCatalog::new(&self.store);
         let table_meta = catalog.get_table_meta(table_id);
         let constraint_records = catalog.constraint_records_for_table(table_id)?;
+        let constraint_ids: Vec<ConstraintId> = constraint_records
+            .iter()
+            .map(|record| record.constraint_id)
+            .collect();
+        let constraint_name_entries = if constraint_ids.is_empty() {
+            Vec::new()
+        } else {
+            catalog.get_constraint_names(table_id, &constraint_ids)?
+        };
         let multi_uniques = catalog.get_multi_column_uniques(table_id)?;
         let mut constraints = FxHashMap::default();
-        for record in constraint_records {
+        let mut constraint_names = FxHashMap::default();
+        for (record, name) in constraint_records
+            .into_iter()
+            .zip(constraint_name_entries.into_iter())
+        {
+            if let Some(name) = name {
+                constraint_names.insert(record.constraint_id, name);
+            }
             constraints.insert(record.constraint_id, record);
         }
-        let snapshot =
-            TableSnapshot::new(table_meta, FxHashMap::default(), constraints, multi_uniques);
+        let snapshot = TableSnapshot::new(
+            table_meta,
+            FxHashMap::default(),
+            constraints,
+            multi_uniques,
+            constraint_names,
+        );
         Ok(TableState::from_snapshot(snapshot))
     }
 
@@ -198,6 +222,17 @@ where
         for (parent_table, constraint_id) in foreign_keys {
             index.insert(parent_table, table_id, constraint_id);
         }
+    }
+
+    fn constraint_name_for(
+        &self,
+        table_id: TableId,
+        constraint_id: ConstraintId,
+    ) -> LlkvResult<Option<String>> {
+        self.ensure_table_state(table_id)?;
+        let tables = self.tables.read().unwrap();
+        let state = tables.get(&table_id).unwrap();
+        Ok(state.current.constraint_names.get(&constraint_id).cloned())
     }
 
     fn ensure_referencing_index_initialized(&self) -> LlkvResult<()> {
@@ -404,6 +439,7 @@ where
             state.current.column_metas.clear();
             state.current.constraints.clear();
             state.current.multi_uniques.clear();
+            state.current.constraint_names.clear();
             state.current.sort_indexes.clear();
         }
         drop(tables);
@@ -460,6 +496,32 @@ where
         }
         drop(tables);
         self.refresh_referencing_index_for_table(table_id);
+        Ok(())
+    }
+
+    /// Upsert constraint names in the in-memory snapshot.
+    pub fn put_constraint_names(
+        &self,
+        table_id: TableId,
+        names: &[(ConstraintId, Option<String>)],
+    ) -> LlkvResult<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        self.ensure_table_state(table_id)?;
+        let mut tables = self.tables.write().unwrap();
+        if let Some(state) = tables.get_mut(&table_id) {
+            for (constraint_id, name) in names {
+                if let Some(name) = name {
+                    state
+                        .current
+                        .constraint_names
+                        .insert(*constraint_id, name.clone());
+                } else {
+                    state.current.constraint_names.remove(constraint_id);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -555,6 +617,41 @@ where
             catalog.delete_constraint_records(table_id, &removed_constraints)?;
             for constraint_id in removed_constraints {
                 state.persisted.constraints.remove(&constraint_id);
+            }
+        }
+
+        let mut dirty_constraint_names: Vec<(ConstraintId, String)> = Vec::new();
+        for (constraint_id, name) in &state.current.constraint_names {
+            match state.persisted.constraint_names.get(constraint_id) {
+                Some(existing) if existing == name => {}
+                _ => dirty_constraint_names.push((*constraint_id, name.clone())),
+            }
+        }
+        if !dirty_constraint_names.is_empty() {
+            let records: Vec<ConstraintNameRecord> = dirty_constraint_names
+                .iter()
+                .map(|(constraint_id, name)| ConstraintNameRecord {
+                    constraint_id: *constraint_id,
+                    name: Some(name.clone()),
+                })
+                .collect();
+            catalog.put_constraint_names(table_id, &records)?;
+            for (constraint_id, name) in dirty_constraint_names {
+                state.persisted.constraint_names.insert(constraint_id, name);
+            }
+        }
+
+        let removed_constraint_names: Vec<ConstraintId> = state
+            .persisted
+            .constraint_names
+            .keys()
+            .copied()
+            .filter(|constraint_id| !state.current.constraint_names.contains_key(constraint_id))
+            .collect();
+        if !removed_constraint_names.is_empty() {
+            catalog.delete_constraint_names(table_id, &removed_constraint_names)?;
+            for constraint_id in removed_constraint_names {
+                state.persisted.constraint_names.remove(&constraint_id);
             }
         }
 
@@ -677,9 +774,11 @@ where
                 self.column_names(table_id, &descriptor.referencing_field_ids)?;
             let referenced_column_names =
                 self.column_names(referenced_table_id, &descriptor.referenced_field_ids)?;
+            let constraint_name = self.constraint_name_for(table_id, descriptor.constraint_id)?;
 
             details.push(ForeignKeyDetail {
                 constraint_id: descriptor.constraint_id,
+                constraint_name,
                 referencing_table_id: descriptor.referencing_table_id,
                 referencing_table_display: referencing_display.clone(),
                 referencing_table_canonical: referencing_canonical.clone(),
@@ -734,10 +833,13 @@ where
             .saturating_add(1);
 
         let mut constraint_records = Vec::with_capacity(foreign_keys.len());
+        let mut constraint_names: Vec<(ConstraintId, Option<String>)> =
+            Vec::with_capacity(foreign_keys.len());
 
         for fk in foreign_keys {
+            let constraint_id = next_constraint_id;
             constraint_records.push(ConstraintRecord {
-                constraint_id: next_constraint_id,
+                constraint_id,
                 kind: ConstraintKind::ForeignKey(ForeignKeyConstraint {
                     referencing_field_ids: fk.referencing_field_ids.clone(),
                     referenced_table: fk.referenced_table_id,
@@ -749,10 +851,12 @@ where
                 revision: 1,
                 last_modified_micros: timestamp_micros,
             });
+            constraint_names.push((constraint_id, fk.name.clone()));
             next_constraint_id = next_constraint_id.saturating_add(1);
         }
 
         self.put_constraint_records(table_id, &constraint_records)?;
+        self.put_constraint_names(table_id, &constraint_names)?;
         self.flush_table(table_id)?;
 
         Ok(())
@@ -1118,6 +1222,7 @@ pub struct ForeignKeyDescriptor {
 #[derive(Clone, Debug)]
 pub struct ForeignKeyDetail {
     pub constraint_id: ConstraintId,
+    pub constraint_name: Option<String>,
     pub referencing_table_id: TableId,
     pub referencing_table_display: String,
     pub referencing_table_canonical: String,

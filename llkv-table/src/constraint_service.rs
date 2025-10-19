@@ -109,7 +109,7 @@ where
             let candidate_keys = candidate_child_keys(&referencing_positions, rows)?;
 
             validate_foreign_key_rows(
-                None,
+                detail.constraint_name.as_deref(),
                 &detail.referencing_table_display,
                 &detail.referenced_table_display,
                 &detail.referenced_column_names,
@@ -202,11 +202,12 @@ where
                     continue;
                 }
 
+                let constraint_label = detail.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
                 match detail.on_delete {
                     ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
                         return Err(Error::ConstraintError(format!(
                             "Violates foreign key constraint '{}' on table '{}' referencing '{}' - row is still referenced by a foreign key in a different table",
-                            "FOREIGN KEY",
+                            constraint_label,
                             detail.referencing_table_display,
                             detail.referenced_table_display,
                         )));

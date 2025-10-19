@@ -4792,9 +4792,10 @@ where
                 continue;
             }
 
+            let constraint_label = detail.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
             return Err(Error::ConstraintError(format!(
                 "Cannot drop table '{}' because it is referenced by foreign key constraint '{}' on table '{}'",
-                display_name, "FOREIGN KEY", detail.referencing_table_display
+                display_name, constraint_label, detail.referencing_table_display
             )));
         }
 
