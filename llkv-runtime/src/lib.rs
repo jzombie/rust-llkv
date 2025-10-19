@@ -4529,30 +4529,26 @@ where
         );
 
         // Check catalog first for table existence
-        let _catalog_table_id = self.catalog.table_id(canonical_name).ok_or_else(|| {
+        let catalog_table_id = self.catalog.table_id(canonical_name).ok_or_else(|| {
             Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
         })?;
 
-        // Retrieve table metadata from the metadata manager
-        let table_meta = self
-            .metadata
-            .table_meta(_catalog_table_id)?
-            .ok_or_else(|| {
-                Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
-            })?;
-
-        let table = Table::new_with_store(table_meta.table_id, Arc::clone(&self.store))?;
+        let table_id = catalog_table_id;
+        let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
         let store = table.store();
-        let mut logical_fields = store.user_field_ids_for_table(table_meta.table_id);
+        let mut logical_fields = store.user_field_ids_for_table(table_id);
         logical_fields.sort_by_key(|lfid| lfid.field_id());
         let field_ids: Vec<FieldId> = logical_fields.iter().map(|lfid| lfid.field_id()).collect();
-        let table_view =
-            self.metadata
-                .table_view(&self.catalog, table_meta.table_id, &field_ids)?;
+        let table_view = self
+            .metadata
+            .table_view(&self.catalog, table_id, &field_ids)?;
+        let table_meta = table_view.table_meta.clone().ok_or_else(|| {
+            Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
+        })?;
         let column_metas = table_view.column_metas;
         let constraint_records = table_view.constraint_records;
         let multi_column_uniques = table_view.multi_column_uniques;
-        let catalog_field_resolver = self.catalog.field_resolver(_catalog_table_id);
+        let catalog_field_resolver = self.catalog.field_resolver(catalog_table_id);
         let mut metadata_primary_keys: FxHashSet<FieldId> = FxHashSet::default();
         let mut metadata_unique_fields: FxHashSet<FieldId> = FxHashSet::default();
         let mut has_primary_key_records = false;
@@ -4716,7 +4712,7 @@ where
         }
 
         // Register fields in catalog (may already be registered from RuntimeContext::new())
-        if let Some(field_resolver) = self.catalog.field_resolver(_catalog_table_id) {
+        if let Some(field_resolver) = self.catalog.field_resolver(catalog_table_id) {
             for col in &executor_table.schema.columns {
                 let definition = FieldDefinition::new(&col.name)
                     .with_primary_key(col.primary_key)
