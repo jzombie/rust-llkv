@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::{DataType, Schema};
 use llkv_column_map::ColumnStore;
-use llkv_plan::ColumnSpec;
+use llkv_plan::{ColumnSpec, ForeignKeySpec};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use rustc_hash::FxHashMap;
@@ -16,6 +16,7 @@ use crate::catalog::{FieldDefinition, TableCatalog};
 use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration};
 use crate::table::Table;
 use crate::types::{FieldId, TableColumn, TableId};
+use crate::{ForeignKeyColumn, ForeignKeyTableInfo, ValidatedForeignKey};
 
 /// Result of creating a table. The caller is responsible for wiring executor
 /// caches and any higher-level state that depends on the table schema.
@@ -24,7 +25,6 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub table_id: TableId,
-    pub catalog_table_id: TableId,
     pub table: Arc<Table<P>>,
     pub table_columns: Vec<TableColumn>,
     pub column_lookup: FxHashMap<String, usize>,
@@ -174,22 +174,20 @@ where
 
         let table = Table::new_with_store(table_id, Arc::clone(&self.store))?;
 
-        let registered_table_id = match self.catalog.register_table(display_name) {
-            Ok(id) => id,
-            Err(err) => {
-                self.metadata.remove_table_state(table_id);
-                return Err(err);
-            }
-        };
+        // Register table in catalog using the table_id from metadata
+        if let Err(err) = self.catalog.register_table(display_name, table_id) {
+            self.metadata.remove_table_state(table_id);
+            return Err(err);
+        }
 
-        if let Some(field_resolver) = self.catalog.field_resolver(registered_table_id) {
+        if let Some(field_resolver) = self.catalog.field_resolver(table_id) {
             for column in &table_columns {
                 let definition = FieldDefinition::new(&column.name)
                     .with_primary_key(column.primary_key)
                     .with_unique(column.unique)
                     .with_check_expr(column.check_expr.clone());
                 if let Err(err) = field_resolver.register_field(definition) {
-                    self.catalog.unregister_table(registered_table_id);
+                    self.catalog.unregister_table(table_id);
                     self.metadata.remove_table_state(table_id);
                     return Err(err);
                 }
@@ -198,7 +196,6 @@ where
 
         Ok(CreateTableResult {
             table_id,
-            catalog_table_id: registered_table_id,
             table: Arc::new(table),
             table_columns,
             column_lookup,
@@ -227,6 +224,7 @@ where
     /// Register a single-column sort (B-tree) index. Optionally marks the field unique.
     pub fn register_single_column_index(
         &self,
+        canonical_name: &str,
         table_id: TableId,
         field_id: FieldId,
         column_name: &str,
@@ -235,7 +233,8 @@ where
         self.metadata.register_sort_index(table_id, field_id)?;
 
         if mark_unique {
-            if let Some(resolver) = self.catalog.field_resolver(table_id) {
+            let catalog_table_id = self.catalog.table_id(canonical_name).unwrap_or(table_id);
+            if let Some(resolver) = self.catalog.field_resolver(catalog_table_id) {
                 resolver.set_field_unique(column_name, true)?;
             }
         }
@@ -260,6 +259,51 @@ where
         }
 
         Ok(registration)
+    }
+
+    /// Validate and register foreign keys for a newly created table.
+    pub fn register_foreign_keys_for_new_table<F>(
+        &self,
+        table_id: TableId,
+        display_name: &str,
+        canonical_name: &str,
+        table_columns: &[TableColumn],
+        specs: &[ForeignKeySpec],
+        lookup_table: F,
+        timestamp_micros: u64,
+    ) -> LlkvResult<Vec<ValidatedForeignKey>>
+    where
+        F: FnMut(&str) -> LlkvResult<ForeignKeyTableInfo>,
+    {
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let referencing_columns: Vec<ForeignKeyColumn> = table_columns
+            .iter()
+            .map(|column| ForeignKeyColumn {
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                primary_key: column.primary_key,
+                unique: column.unique,
+                field_id: column.field_id,
+            })
+            .collect();
+
+        let referencing_table = ForeignKeyTableInfo {
+            display_name: display_name.to_string(),
+            canonical_name: canonical_name.to_string(),
+            table_id,
+            columns: referencing_columns,
+        };
+
+        self.metadata.validate_and_register_foreign_keys(
+            &referencing_table,
+            specs,
+            lookup_table,
+            timestamp_micros,
+        )
     }
 }
 

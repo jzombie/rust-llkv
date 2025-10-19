@@ -134,33 +134,49 @@ impl TableCatalog {
         }
     }
 
-    /// Register a new table in the catalog.
+    /// Register a table in the catalog with the specified table ID.
+    ///
+    /// The table ID must come from the metadata layer (`MetadataManager::reserve_table_id()`
+    /// for new tables, or `all_table_metas()` when restoring from disk). The metadata layer
+    /// is the source of truth for table IDs.
+    ///
+    /// This single method handles both use cases:
+    /// - Creating new tables: Pass the table_id from metadata.reserve_table_id()
+    /// - Restoring from disk: Pass the table_id from metadata.all_table_metas()
     ///
     /// # Arguments
     ///
-    /// * `display_name` - The table name as provided by user (case preserved)
+    /// * `name` - The table name as provided by user (case preserved)
+    /// * `table_id` - The table ID from the metadata layer
     ///
     /// # Returns
     ///
-    /// The assigned `TableId` for the newly registered table.
+    /// `Ok(())` if registration succeeds.
     ///
     /// # Errors
     ///
     /// Returns `Error::CatalogError` if:
     /// - A table with this name (case-insensitive) already exists
-    /// - TableId overflow (extremely unlikely)
+    /// - A table with this ID already exists
+    /// - TableId overflow when updating next_table_id (extremely unlikely)
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// let catalog = TableCatalog::new();
-    /// let users_id = catalog.register_table("Users")?;
-    /// let orders_id = catalog.register_table("Orders")?;
+    /// // New table creation
+    /// let table_id = metadata.reserve_table_id()?;
+    /// catalog.register_table("Users", table_id)?;
     ///
-    /// // Case-insensitive duplicate detection
-    /// assert!(catalog.register_table("users").is_err());
+    /// // Database restoration
+    /// for (table_id, meta) in metadata.all_table_metas()? {
+    ///     catalog.register_table(&meta.name, table_id)?;
+    /// }
     /// ```
-    pub fn register_table(&self, name: impl Into<QualifiedTableName>) -> Result<TableId> {
+    pub fn register_table(
+        &self,
+        name: impl Into<QualifiedTableName>,
+        table_id: TableId,
+    ) -> Result<()> {
         let display_name: QualifiedTableName = name.into();
         let canonical_name = display_name.canonical_key();
 
@@ -169,7 +185,7 @@ impl TableCatalog {
             .write()
             .map_err(|_| Error::Internal("Failed to acquire catalog write lock".to_string()))?;
 
-        // Check for duplicate (case-insensitive)
+        // Check for duplicate name (case-insensitive)
         if inner.table_name_to_id.contains_key(&canonical_name) {
             return Err(Error::CatalogError(format!(
                 "Table '{}' already exists in catalog",
@@ -177,12 +193,20 @@ impl TableCatalog {
             )));
         }
 
-        // Assign new TableId
-        let table_id = inner.next_table_id;
-        inner.next_table_id = inner
-            .next_table_id
-            .checked_add(1)
-            .ok_or_else(|| Error::Internal("TableId overflow".to_string()))?;
+        // Check for duplicate ID
+        if inner.table_id_to_meta.contains_key(&table_id) {
+            return Err(Error::CatalogError(format!(
+                "Table ID {} already exists in catalog",
+                table_id
+            )));
+        }
+
+        // Update next_table_id if necessary to avoid conflicts with future allocations
+        if table_id >= inner.next_table_id {
+            inner.next_table_id = table_id
+                .checked_add(1)
+                .ok_or_else(|| Error::Internal("TableId overflow".to_string()))?;
+        }
 
         // Create field resolver for this table
         let field_resolver = FieldResolver::new();
@@ -197,7 +221,7 @@ impl TableCatalog {
         inner.table_name_to_id.insert(canonical_name, table_id);
         inner.table_id_to_meta.insert(table_id, metadata);
 
-        Ok(table_id)
+        Ok(())
     }
 
     /// Unregister a table from the catalog.
@@ -677,9 +701,11 @@ mod tests {
     fn test_catalog_basic_operations() {
         let catalog = TableCatalog::new();
 
-        // Register tables
-        let users_id = catalog.register_table("Users").unwrap();
-        let orders_id = catalog.register_table("Orders").unwrap();
+        // Register tables with explicit IDs (simulating metadata layer)
+        let users_id = 1;
+        let orders_id = 2;
+        catalog.register_table("Users", users_id).unwrap();
+        catalog.register_table("Orders", orders_id).unwrap();
 
         assert_ne!(users_id, orders_id);
 
@@ -707,21 +733,21 @@ mod tests {
     fn test_catalog_duplicate_detection() {
         let catalog = TableCatalog::new();
 
-        catalog.register_table("Users").unwrap();
+        catalog.register_table("Users", 1).unwrap();
 
         // Case-insensitive duplicate detection
-        assert!(catalog.register_table("users").is_err());
-        assert!(catalog.register_table("USERS").is_err());
-        assert!(catalog.register_table("UsErS").is_err());
+        assert!(catalog.register_table("users", 2).is_err());
+        assert!(catalog.register_table("USERS", 3).is_err());
+        assert!(catalog.register_table("UsErS", 4).is_err());
     }
 
     #[test]
     fn test_catalog_table_names() {
         let catalog = TableCatalog::new();
 
-        catalog.register_table("Users").unwrap();
-        catalog.register_table("Orders").unwrap();
-        catalog.register_table("Products").unwrap();
+        catalog.register_table("Users", 1).unwrap();
+        catalog.register_table("Orders", 2).unwrap();
+        catalog.register_table("Products", 3).unwrap();
 
         let names = catalog.table_names();
         assert_eq!(names.len(), 3);
@@ -734,14 +760,15 @@ mod tests {
     fn test_catalog_snapshot() {
         let catalog = TableCatalog::new();
 
-        let users_id = catalog.register_table("Users").unwrap();
+        let users_id = 1;
+        catalog.register_table("Users", users_id).unwrap();
         let snapshot = catalog.snapshot();
 
         // Snapshot sees existing table
         assert_eq!(snapshot.table_id("users"), Some(users_id));
 
         // Add new table after snapshot
-        catalog.register_table("Orders").unwrap();
+        catalog.register_table("Orders", 2).unwrap();
 
         // Snapshot doesn't see new table (isolation)
         assert_eq!(snapshot.table_id("orders"), None);
@@ -821,7 +848,8 @@ mod tests {
         let catalog = TableCatalog::new();
 
         // Register table
-        let table_id = catalog.register_table("Users").unwrap();
+        let table_id = 1;
+        catalog.register_table("Users", table_id).unwrap();
 
         // Get field resolver
         let resolver = catalog.field_resolver(table_id).unwrap();
@@ -843,7 +871,7 @@ mod tests {
     #[test]
     fn test_catalog_exists_helpers() {
         let catalog = TableCatalog::new();
-        catalog.register_table("Users").unwrap();
+        catalog.register_table("Users", 1).unwrap();
 
         assert!(catalog.table_exists("users"));
         assert!(catalog.table_exists("USERS"));
@@ -869,8 +897,10 @@ mod tests {
         let catalog = TableCatalog::new();
 
         // Register tables with fields
-        let users_id = catalog.register_table("Users").unwrap();
-        let orders_id = catalog.register_table("Orders").unwrap();
+        let users_id = 1;
+        let orders_id = 2;
+        catalog.register_table("Users", users_id).unwrap();
+        catalog.register_table("Orders", orders_id).unwrap();
 
         let users_resolver = catalog.field_resolver(users_id).unwrap();
         let name_fid = users_resolver.register_field("name").unwrap();
@@ -926,8 +956,10 @@ mod tests {
         let catalog = TableCatalog::new();
 
         // Register tables
-        let table1_id = catalog.register_table("Table1").unwrap();
-        let table2_id = catalog.register_table("Table2").unwrap();
+        let table1_id = 1;
+        let table2_id = 2;
+        catalog.register_table("Table1", table1_id).unwrap();
+        catalog.register_table("Table2", table2_id).unwrap();
 
         // Export and restore
         let state = catalog.export_state();
@@ -938,7 +970,8 @@ mod tests {
         assert_eq!(restored.table_id("table2"), Some(table2_id));
 
         // New registrations should continue from saved counter
-        let table3_id = restored.register_table("Table3").unwrap();
+        let table3_id = 3;
+        restored.register_table("Table3", table3_id).unwrap();
         assert!(table3_id > table2_id);
     }
 

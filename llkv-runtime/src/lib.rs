@@ -1376,23 +1376,25 @@ where
             Some(existing) => (existing, true),
             None => (Arc::new(TableCatalog::new()), false),
         };
-        for (_table_id, table_meta) in &loaded_tables {
+        for (table_id, table_meta) in &loaded_tables {
             if let Some(ref table_name) = table_meta.name
-                && let Err(e) = catalog.register_table(table_name.as_str())
+                && let Err(e) = catalog.register_table(table_name.as_str(), *table_id)
             {
                 match e {
                     Error::CatalogError(ref msg)
                         if is_shared_catalog && msg.contains("already exists") =>
                     {
                         tracing::debug!(
-                            "[CONTEXT] Shared catalog already contains table '{}'",
-                            table_name
+                            "[CONTEXT] Shared catalog already contains table '{}' with id={}",
+                            table_name,
+                            table_id
                         );
                     }
                     other => {
                         tracing::warn!(
-                            "[CONTEXT] Failed to register table '{}' in catalog: {}",
+                            "[CONTEXT] Failed to register table '{}' (id={}) in catalog: {}",
                             table_name,
+                            table_id,
                             other
                         );
                     }
@@ -1726,6 +1728,7 @@ where
             }
 
             self.catalog_service.register_single_column_index(
+                &canonical_name,
                 table_id,
                 field_id,
                 &column_name,
@@ -2300,7 +2303,6 @@ where
 
         let CreateTableResult {
             table_id,
-            catalog_table_id,
             table,
             table_columns,
             column_lookup,
@@ -2354,7 +2356,11 @@ where
         let mut tables = self.tables.write().unwrap();
         if tables.contains_key(&canonical_name) {
             drop(tables);
-            self.catalog.unregister_table(table_id);
+            let field_ids: Vec<FieldId> =
+                table_columns.iter().map(|column| column.field_id).collect();
+            let _ = self
+                .catalog_service
+                .drop_table(&canonical_name, table_id, &field_ids);
             if if_not_exists {
                 return Ok(RuntimeStatementResult::CreateTable {
                     table_name: display_name,
@@ -2369,27 +2375,11 @@ where
         drop(tables);
 
         if !foreign_keys.is_empty() {
-            let referencing_columns: Vec<ForeignKeyColumn> = column_defs
-                .iter()
-                .map(|column| ForeignKeyColumn {
-                    name: column.name.clone(),
-                    data_type: column.data_type.clone(),
-                    nullable: column.nullable,
-                    primary_key: column.primary_key,
-                    unique: column.unique,
-                    field_id: column.field_id,
-                })
-                .collect();
-
-            let referencing_table = ForeignKeyTableInfo {
-                display_name: display_name.clone(),
-                canonical_name: canonical_name.clone(),
-                table_id: catalog_table_id,
-                columns: referencing_columns,
-            };
-
-            let fk_result = self.metadata.validate_and_register_foreign_keys(
-                &referencing_table,
+            let fk_result = self.catalog_service.register_foreign_keys_for_new_table(
+                table_id,
+                &display_name,
+                &canonical_name,
+                &table_columns,
                 &foreign_keys,
                 |table_name| {
                     let (display, canonical) = canonical_table_name(table_name)?;
@@ -2426,7 +2416,7 @@ where
 
             if let Err(err) = fk_result {
                 let field_ids: Vec<FieldId> =
-                    column_defs.iter().map(|column| column.field_id).collect();
+                    table_columns.iter().map(|column| column.field_id).collect();
                 let _ = self
                     .catalog_service
                     .drop_table(&canonical_name, table_id, &field_ids);
@@ -2465,7 +2455,6 @@ where
 
         let CreateTableResult {
             table_id,
-            catalog_table_id: _,
             table,
             table_columns,
             column_lookup,
