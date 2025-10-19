@@ -9,7 +9,9 @@ use std::convert::TryFrom;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Schema};
+use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_plan::{ColumnSpec, ForeignKeySpec};
 use llkv_result::{Error, Result as LlkvResult};
@@ -17,10 +19,12 @@ use llkv_storage::pager::Pager;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 
+use crate::mvcc;
+
 use crate::catalog::{FieldDefinition, TableCatalog};
 use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration};
 use crate::table::Table;
-use crate::types::{FieldId, TableColumn, TableId};
+use crate::types::{FieldId, RowId, TableColumn, TableId};
 use crate::{ForeignKeyColumn, ForeignKeyTableInfo, ValidatedForeignKey};
 
 /// Result of creating a table. The caller is responsible for wiring executor
@@ -270,6 +274,72 @@ where
         }
 
         Ok(registration)
+    }
+
+    /// Append RecordBatches to a freshly created table, injecting MVCC columns.
+    pub fn append_batches_with_mvcc(
+        &self,
+        table: &Table<P>,
+        table_columns: &[TableColumn],
+        batches: &[RecordBatch],
+        creator_txn_id: u64,
+        deleted_marker: u64,
+        starting_row_id: RowId,
+    ) -> LlkvResult<(RowId, u64)> {
+        let mut next_row_id = starting_row_id;
+        let mut total_rows: u64 = 0;
+
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            if batch.num_columns() != table_columns.len() {
+                return Err(Error::InvalidArgumentError(format!(
+                    "CTAS query returned unexpected column count (expected {}, found {})",
+                    table_columns.len(),
+                    batch.num_columns()
+                )));
+            }
+
+            let row_count = batch.num_rows();
+
+            let (row_id_array, created_by_array, deleted_by_array) =
+                mvcc::build_insert_mvcc_columns(
+                    row_count,
+                    next_row_id,
+                    creator_txn_id,
+                    deleted_marker,
+                );
+
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(table_columns.len() + 3);
+            arrays.push(row_id_array);
+            arrays.push(created_by_array);
+            arrays.push(deleted_by_array);
+
+            let mut fields = mvcc::build_mvcc_fields();
+
+            for (idx, column) in table_columns.iter().enumerate() {
+                let array = batch.column(idx).clone();
+                let field = mvcc::build_field_with_metadata(
+                    &column.name,
+                    column.data_type.clone(),
+                    column.nullable,
+                    column.field_id,
+                );
+                arrays.push(array);
+                fields.push(field);
+            }
+
+            let append_schema = Arc::new(Schema::new(fields));
+            let append_batch = RecordBatch::try_new(append_schema, arrays).map_err(Error::Arrow)?;
+            table.append(&append_batch)?;
+
+            next_row_id = next_row_id.saturating_add(row_count as u64);
+            total_rows = total_rows.saturating_add(row_count as u64);
+        }
+
+        Ok((next_row_id, total_rows))
     }
 
     /// Validate and register foreign keys for a newly created table.

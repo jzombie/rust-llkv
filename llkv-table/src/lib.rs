@@ -39,6 +39,7 @@ pub mod constraint_validation;
 pub mod constraints;
 pub mod gather;
 pub mod metadata;
+pub mod mvcc;
 mod planner;
 pub mod reserved;
 pub mod resolvers;

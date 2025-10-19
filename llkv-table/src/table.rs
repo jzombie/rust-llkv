@@ -224,7 +224,7 @@ impl<P> Table<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-/// Create a new table from column specifications.
+    /// Create a new table from column specifications.
     ///
     /// Coordinates metadata persistence, catalog registration, and storage initialization.
     pub fn create_from_columns(
@@ -277,7 +277,7 @@ where
 
     /// Internal constructor: wrap a table ID with a shared column store.
     ///
-    /// **This is for internal crate use only.** Preferred over `from_id()` when 
+    /// **This is for internal crate use only.** Preferred over `from_id()` when
     /// multiple tables share the same store. For tests, use `Table::from_id_with_store()`.
     #[doc(hidden)]
     pub fn from_id_and_store(table_id: TableId, store: Arc<ColumnStore<P>>) -> LlkvResult<Self> {
