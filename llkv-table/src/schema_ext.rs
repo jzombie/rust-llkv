@@ -6,46 +6,30 @@
 //!
 //! # Performance Impact
 //!
-//! **Before (repeated metadata lookups)**:
-//! ```rust,ignore
-//! for field in schema.fields() {
-//!     if let Some(fid_str) = field.metadata().get(FIELD_ID_META_KEY) {
-//!         let fid: u32 = fid_str.parse().unwrap(); // HashMap lookup + parse per field
-//!         // ... use fid
-//!     }
-//! }
-//! ```
+//! **Before (repeated metadata lookups)**: iterate Arrow fields, pull the
+//! `FIELD_ID_META_KEY` value from metadata, and parse it for every column.
 //!
-//! **After (cached lookups)**:
-//! ```rust,ignore
-//! for idx in 0..schema.field_count() {
-//!     if let Some(fid) = cached_schema.field_id(idx) { // Array index, no parse
-//!         // ... use fid
-//!     }
-//! }
-//! ```
+//! **After (cached lookups)**: use `CachedSchema::field_id` to retrieve the
+//! pre-parsed value with a simple array access.
 //!
 //! **Speedup**: 20-100x for field ID extraction (measured in benchmarks)
 //!
 //! # Usage
 //!
-//! ```rust,ignore
-//! use arrow::datatypes::Schema;
+//! ```
+//! use arrow::datatypes::{DataType, Field, Schema};
+//! use llkv_table::constants::FIELD_ID_META_KEY;
 //! use llkv_table::schema_ext::CachedSchema;
 //! use std::sync::Arc;
 //!
-//! let schema = Arc::new(Schema::new(fields));
-//! let cached = CachedSchema::new(schema);
+//! let field = Field::new("id", DataType::UInt32, false)
+//!     .with_metadata([(FIELD_ID_META_KEY.to_string(), "7".to_string())].into());
+//! let schema = Arc::new(Schema::new(vec![field]));
+//! let cached = CachedSchema::new(schema.clone());
 //!
-//! // Fast field ID lookup (array index)
-//! if let Some(fid) = cached.field_id(0) {
-//!     println!("Field 0 has ID: {}", fid);
-//! }
-//!
-//! // Check system column presence (cached, no string comparisons)
-//! if cached.system_columns().has_created_by {
-//!     println!("Schema includes MVCC created_by column");
-//! }
+//! assert_eq!(cached.field_id(0), Some(7));
+//! assert_eq!(cached.field_count(), 1);
+//! assert!(!cached.system_columns().has_row_id);
 //! ```
 
 use crate::constants::FIELD_ID_META_KEY;
@@ -103,16 +87,19 @@ impl CachedSchema {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
     /// use arrow::datatypes::{DataType, Field, Schema};
+    /// use llkv_table::constants::FIELD_ID_META_KEY;
+    /// use llkv_table::schema_ext::CachedSchema;
     /// use std::sync::Arc;
     ///
     /// let field = Field::new("name", DataType::Utf8, false)
-    ///     .with_metadata([("field_id".to_string(), "3".to_string())].into());
+    ///     .with_metadata([(FIELD_ID_META_KEY.to_string(), "3".to_string())].into());
     /// let schema = Arc::new(Schema::new(vec![field]));
     ///
-    /// let cached = CachedSchema::new(schema);
+    /// let cached = CachedSchema::new(schema.clone());
     /// assert_eq!(cached.field_id(0), Some(3));
+    /// assert_eq!(cached.index_of_field_id(3), Some(0));
     /// ```
     pub fn new(schema: Arc<Schema>) -> Self {
         let field_count = schema.fields().len();
@@ -195,11 +182,26 @@ impl CachedSchema {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let presence = cached_schema.system_columns();
-    /// if presence.has_created_by && presence.has_deleted_by {
-    ///     println!("Schema has full MVCC support");
+    /// ```
+    /// use arrow::datatypes::{DataType, Field, Schema};
+    /// use llkv_table::constants::FIELD_ID_META_KEY;
+    /// use llkv_table::reserved::{MVCC_CREATED_BY_FIELD_ID, MVCC_DELETED_BY_FIELD_ID};
+    /// use llkv_table::schema_ext::CachedSchema;
+    /// use llkv_table::types::FieldId;
+    /// use std::sync::Arc;
+    ///
+    /// fn system_field(name: &str, fid: FieldId) -> Field {
+    ///     Field::new(name, DataType::Int64, false)
+    ///         .with_metadata([(FIELD_ID_META_KEY.to_string(), fid.to_string())].into())
     /// }
+    ///
+    /// let schema = Arc::new(Schema::new(vec![
+    ///     system_field("created_by", MVCC_CREATED_BY_FIELD_ID),
+    ///     system_field("deleted_by", MVCC_DELETED_BY_FIELD_ID),
+    /// ]));
+    ///
+    /// let presence = CachedSchema::new(schema).system_columns();
+    /// assert!(presence.has_full_mvcc());
     /// ```
     #[inline]
     pub fn system_columns(&self) -> SystemColumnPresence {
@@ -230,16 +232,11 @@ impl CachedSchema {
 ///
 /// # Performance
 ///
-/// **Before (string comparisons)**:
-/// ```rust,ignore
-/// let has_created_by = schema.fields().iter()
-///     .any(|f| f.name() == CREATED_BY_COLUMN_NAME); // String comparison per field
-/// ```
+/// **Before (string comparisons)**: iterate Arrow fields and compare every
+/// column name against the MVCC constants.
 ///
-/// **After (cached flag)**:
-/// ```rust,ignore
-/// let has_created_by = cached_schema.system_columns().has_created_by; // Direct boolean
-/// ```
+/// **After (cached flag)**: read the boolean flags computed during
+/// `CachedSchema::new`, avoiding repeated string comparisons.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemColumnPresence {
     /// True if schema contains row_id column (FieldId 0)

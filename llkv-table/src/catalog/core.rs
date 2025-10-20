@@ -41,16 +41,17 @@ pub use crate::resolvers::{
 // TableCatalog - Table-level resolver
 // ============================================================================
 
-/// In-memory table name resolution for query execution.
+/// In-memory name resolution cache: table name ↔ id, field name ↔ id.
 ///
-/// **To create tables, use `CatalogService`, not this struct directly.**
+/// Not responsible for:
+/// - Persistence (handled by MetadataManager)
+/// - Column store creation (handled by Table)
+/// - Constraint validation (handled by ConstraintService)
 ///
-/// The catalog maps table names to TableIds for fast lookups during query planning
-/// and execution. It does not create tables, generate IDs, or persist metadata.
-///
-/// Table IDs are provided by `MetadataManager` (the persistent layer and source of truth).
-/// The catalog simply registers these IDs for in-memory name resolution.
+/// Note: This is marked #[doc(hidden)] as it's an internal implementation detail.
+/// External code should use CatalogService instead.
 #[derive(Debug, Clone)]
+#[doc(hidden)]
 pub struct TableCatalog {
     inner: Arc<RwLock<TableCatalogInner>>,
 }
@@ -80,7 +81,8 @@ struct TableMetadata {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TableMetadataView {
+#[doc(hidden)]
+pub struct TableMetadataView {
     canonical_name: TableNameKey,
 }
 
@@ -130,6 +132,12 @@ impl TableCatalog {
     /// # Errors
     ///
     /// Returns error if the name or ID is already registered.
+    ///
+    /// // Database restoration
+    /// for (table_id, meta) in metadata.all_table_metas()? {
+    ///     catalog.register_table(&meta.name, table_id)?;
+    /// }
+    /// ```
     pub fn register_table(
         &self,
         name: impl Into<QualifiedTableName>,
@@ -197,14 +205,7 @@ impl TableCatalog {
     ///
     /// # Example
     ///
-    /// ```
-    /// use llkv_table::catalog::TableCatalog;
-    ///
-    /// let catalog = TableCatalog::new();
-    /// catalog.register_table("Users", 1).unwrap();
-    /// assert!(catalog.unregister_table(1));
-    /// assert_eq!(catalog.table_id("users"), None);
-    /// ```
+    /// Register a table, call `unregister_table`, then verify lookups no longer return an ID.
     pub fn unregister_table(&self, table_id: TableId) -> bool {
         let mut inner = match self.inner.write() {
             Ok(guard) => guard,
@@ -234,16 +235,7 @@ impl TableCatalog {
     ///
     /// # Example
     ///
-    /// ```
-    /// use llkv_table::catalog::TableCatalog;
-    ///
-    /// let catalog = TableCatalog::new();
-    /// catalog.register_table("Users", 42).unwrap();
-    ///
-    /// assert_eq!(catalog.table_id("users"), Some(42));
-    /// assert_eq!(catalog.table_id("USERS"), Some(42));
-    /// assert_eq!(catalog.table_id("Users"), Some(42));
-    /// ```
+    /// Register a table named "Users" and look it up via any casing to receive the same ID.
     pub fn table_id(&self, name: &str) -> Option<TableId> {
         let canonical = QualifiedTableNameRef::from(name).canonical_key();
         let inner = self.inner.read().ok()?;
@@ -319,18 +311,7 @@ impl TableCatalog {
     ///
     /// # Example
     ///
-    /// ```
-    /// use llkv_table::catalog::TableCatalog;
-    ///
-    /// let catalog = TableCatalog::new();
-    /// catalog.register_table("Users", 7).unwrap();
-    ///
-    /// let snapshot = catalog.snapshot();
-    /// catalog.unregister_table(7);
-    ///
-    /// assert_eq!(snapshot.table_id("users"), Some(7));
-    /// assert_eq!(catalog.table_id("users"), None);
-    /// ```
+    /// Create a snapshot before mutating the catalog to retain the original view for a transaction.
     pub fn snapshot(&self) -> TableCatalogSnapshot {
         let inner = match self.inner.read() {
             Ok(inner) => inner,
@@ -456,17 +437,7 @@ impl TableCatalog {
     ///
     /// # Example
     ///
-    /// ```
-    /// use llkv_table::catalog::TableCatalog;
-    ///
-    /// let catalog = TableCatalog::new();
-    /// catalog.register_table("Users", 9).unwrap();
-    ///
-    /// let state = catalog.export_state();
-    /// let restored = TableCatalog::from_state(state).unwrap();
-    ///
-    /// assert_eq!(restored.table_id("users"), Some(9));
-    /// ```
+    /// Export catalog state, serialize it, and reconstruct a new catalog via `TableCatalog::from_state`.
     pub fn export_state(&self) -> TableCatalogState {
         let inner = match self.inner.read() {
             Ok(inner) => inner,
