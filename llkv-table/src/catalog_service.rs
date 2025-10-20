@@ -26,7 +26,7 @@ use crate::constraints::ConstraintKind;
 use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration};
 use crate::table::Table;
 use crate::types::{FieldId, RowId, TableColumn, TableId};
-use crate::{ForeignKeyColumn, ForeignKeyTableInfo, ForeignKeyView, ValidatedForeignKey};
+use crate::{ForeignKeyColumn, ForeignKeyTableInfo, ForeignKeyView, TableView, ValidatedForeignKey};
 
 /// Result of creating a table. The caller is responsible for wiring executor
 /// caches and any higher-level state that depends on the table schema.
@@ -441,6 +441,16 @@ where
         Ok(results)
     }
 
+    /// Return the current metadata snapshot for a table, including column metadata and constraints.
+    pub fn table_view(&self, canonical_name: &str) -> LlkvResult<TableView> {
+        let table_id = self.catalog.table_id(canonical_name).ok_or_else(|| {
+            Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
+        })?;
+
+        let (_, field_ids) = self.sorted_user_fields(table_id);
+        self.table_view_with_field_ids(table_id, &field_ids)
+    }
+
     /// Produce a read-only view of a table's catalog, including column metadata and constraints.
     pub fn table_column_specs(&self, canonical_name: &str) -> LlkvResult<Vec<ColumnSpec>> {
         let table_id = self.catalog.table_id(canonical_name).ok_or_else(|| {
@@ -452,13 +462,9 @@ where
             .field_resolver(table_id)
             .ok_or_else(|| Error::Internal("missing field resolver for table".into()))?;
 
-        let mut logical_fields = self.store.user_field_ids_for_table(table_id);
-        logical_fields.sort_by_key(|lfid| lfid.field_id());
-        let field_ids: Vec<FieldId> = logical_fields.iter().map(|lfid| lfid.field_id()).collect();
+        let (logical_fields, field_ids) = self.sorted_user_fields(table_id);
 
-        let table_view = self
-            .metadata
-            .table_view(&self.catalog, table_id, &field_ids)?;
+        let table_view = self.table_view_with_field_ids(table_id, &field_ids)?;
         let column_metas = table_view.column_metas;
         let constraint_records = table_view.constraint_records;
 
@@ -535,6 +541,33 @@ where
         }
 
         Ok(specs)
+    }
+
+    fn sorted_user_fields(
+        &self,
+        table_id: TableId,
+    ) -> (
+        Vec<llkv_column_map::types::LogicalFieldId>,
+        Vec<FieldId>,
+    ) {
+        let mut logical_fields = self.store.user_field_ids_for_table(table_id);
+        logical_fields.sort_by_key(|lfid| lfid.field_id());
+        let field_ids = logical_fields
+            .iter()
+            .map(|lfid| lfid.field_id())
+            .collect::<Vec<_>>();
+
+        (logical_fields, field_ids)
+    }
+
+    fn table_view_with_field_ids(
+        &self,
+        table_id: TableId,
+        field_ids: &[FieldId],
+    ) -> LlkvResult<TableView> {
+        self.metadata
+            .table_view(&self.catalog, table_id, field_ids)
+            .map_err(Into::into)
     }
 }
 

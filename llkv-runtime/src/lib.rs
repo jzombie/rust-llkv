@@ -1728,16 +1728,8 @@ where
     }
 
     pub fn table_view(&self, canonical_name: &str) -> Result<TableView> {
-        let table_id = self.catalog.table_id(canonical_name).ok_or_else(|| {
-            Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
-        })?;
-
-        let mut logical_fields = self.store.user_field_ids_for_table(table_id);
-        logical_fields.sort_by_key(|lfid| lfid.field_id());
-        let field_ids: Vec<FieldId> = logical_fields.iter().map(|lfid| lfid.field_id()).collect();
-
-        self.metadata
-            .table_view(&self.catalog, table_id, &field_ids)
+        self.catalog_service
+            .table_view(canonical_name)
             .map_err(Into::into)
     }
 
