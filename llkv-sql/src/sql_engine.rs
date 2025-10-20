@@ -19,6 +19,9 @@ use llkv_runtime::{
     RuntimeContext, RuntimeEngine, RuntimeSession, RuntimeStatementResult, SelectPlan,
     SelectProjection, UpdatePlan, extract_rows_from_range,
 };
+use llkv_plan::validation::{
+    ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
+};
 use llkv_storage::pager::Pager;
 use llkv_table::catalog::{IdentifierContext, IdentifierResolver};
 use regex::Regex;
@@ -515,24 +518,20 @@ where
         let column_defs_ast = std::mem::take(&mut stmt.columns);
         let constraints = std::mem::take(&mut stmt.constraints);
 
+        let column_names: Vec<String> = column_defs_ast
+            .iter()
+            .map(|column_def| column_def.name.value.clone())
+            .collect();
+        ensure_unique_case_insensitive(
+            column_names.iter().map(|name| name.as_str()),
+            |dup| format!("duplicate column name '{}' in table '{}'", dup, display_name),
+        )?;
+        let column_names_lower: HashSet<String> =
+            column_names.iter().map(|name| name.to_ascii_lowercase()).collect();
+
         let mut columns: Vec<ColumnSpec> = Vec::with_capacity(column_defs_ast.len());
         let mut primary_key_columns: HashSet<String> = HashSet::new();
         let mut foreign_keys: Vec<ForeignKeySpec> = Vec::new();
-
-        // First pass: collect all column names and check for duplicates
-        let mut seen_names: HashSet<String> = HashSet::with_capacity(column_defs_ast.len());
-        let mut all_column_names: Vec<String> = Vec::with_capacity(column_defs_ast.len());
-        for column_def in &column_defs_ast {
-            let column_name = column_def.name.value.clone();
-            let normalized = column_name.to_ascii_lowercase();
-            if !seen_names.insert(normalized) {
-                return Err(Error::InvalidArgumentError(format!(
-                    "duplicate column name '{}' in table '{}'",
-                    column_name, display_name
-                )));
-            }
-            all_column_names.push(column_name);
-        }
 
         // Second pass: process columns including CHECK validation and column-level FKs
         for column_def in column_defs_ast {
@@ -567,7 +566,7 @@ where
 
             // Validate CHECK constraint if present (now we have all column names)
             if let Some(check_expr) = check_expr {
-                let all_col_refs: Vec<&str> = all_column_names.iter().map(|s| s.as_str()).collect();
+                let all_col_refs: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
                 validate_check_constraint(check_expr, &display_name, &all_col_refs)?;
             }
 
@@ -592,7 +591,7 @@ where
                         on_delete.clone(),
                         on_update.clone(),
                         characteristics,
-                        &seen_names,
+                        &column_names_lower,
                         None,
                     )?;
                     foreign_keys.push(spec);
@@ -836,7 +835,7 @@ where
                             on_delete,
                             on_update,
                             &characteristics,
-                            &seen_names,
+                            &column_names_lower,
                             name.map(|ident| ident.value),
                         )?;
 
@@ -1075,81 +1074,61 @@ where
             ));
         }
 
-        if referencing_columns.is_empty() {
-            return Err(Error::InvalidArgumentError(
-                "FOREIGN KEY constraint requires at least one referencing column".into(),
-            ));
-        }
+        ensure_non_empty(&referencing_columns, || {
+            "FOREIGN KEY constraint requires at least one referencing column".into()
+        })?;
+        ensure_unique_case_insensitive(
+            referencing_columns.iter().map(|name| name.as_str()),
+            |dup| format!("duplicate column '{}' in FOREIGN KEY constraint", dup),
+        )?;
+        ensure_known_columns_case_insensitive(
+            referencing_columns.iter().map(|name| name.as_str()),
+            known_columns_lower,
+            |unknown| format!("unknown column '{}' in FOREIGN KEY constraint", unknown),
+        )?;
 
-        let mut normalized_referencing: HashSet<String> =
-            HashSet::with_capacity(referencing_columns.len());
-        for column_name in &referencing_columns {
-            let normalized = column_name.to_ascii_lowercase();
-            if !normalized_referencing.insert(normalized.clone()) {
-                return Err(Error::InvalidArgumentError(format!(
-                    "duplicate column '{}' in FOREIGN KEY constraint",
-                    column_name
-                )));
-            }
+        let referenced_columns_vec: Vec<String> =
+            referenced_columns.iter().map(|ident| ident.value.clone()).collect();
+        ensure_unique_case_insensitive(
+            referenced_columns_vec.iter().map(|name| name.as_str()),
+            |dup| format!(
+                "duplicate referenced column '{}' in FOREIGN KEY constraint",
+                dup
+            ),
+        )?;
 
-            if !known_columns_lower.contains(&normalized) {
-                return Err(Error::InvalidArgumentError(format!(
-                    "unknown column '{}' in FOREIGN KEY constraint",
-                    column_name
-                )));
-            }
-        }
-
-        if !referenced_columns.is_empty()
-            && referenced_columns.len() != referencing_columns.len()
+        if !referenced_columns_vec.is_empty()
+            && referenced_columns_vec.len() != referencing_columns.len()
         {
             return Err(Error::InvalidArgumentError(
                 "FOREIGN KEY referencing and referenced column counts must match".into(),
             ));
         }
 
-        let mut referenced_columns_vec: Vec<String> =
-            Vec::with_capacity(referenced_columns.len());
-        let mut seen_referenced: HashSet<String> =
-            HashSet::with_capacity(referenced_columns.len());
-        for ident in referenced_columns {
-            let column_name = ident.value.clone();
-            let normalized = column_name.to_ascii_lowercase();
-            if !seen_referenced.insert(normalized.clone()) {
-                return Err(Error::InvalidArgumentError(format!(
-                    "duplicate referenced column '{}' in FOREIGN KEY constraint",
-                    column_name
-                )));
-            }
-            referenced_columns_vec.push(column_name);
-        }
-
         let (referenced_display, referenced_canonical) =
             canonical_object_name(foreign_table)?;
 
         if referenced_canonical == referencing_canonical {
-            for column_name in &referenced_columns_vec {
-                let normalized = column_name.to_ascii_lowercase();
-                if !known_columns_lower.contains(&normalized) {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "unknown referenced column '{}' in FOREIGN KEY constraint",
-                        column_name
-                    )));
-                }
-            }
+            ensure_known_columns_case_insensitive(
+                referenced_columns_vec.iter().map(|name| name.as_str()),
+                known_columns_lower,
+                |unknown| format!(
+                    "unknown referenced column '{}' in FOREIGN KEY constraint",
+                    unknown
+                ),
+            )?;
         } else {
             let known_columns =
                 self.collect_known_columns(&referenced_display, &referenced_canonical)?;
             if !known_columns.is_empty() {
-                for column_name in &referenced_columns_vec {
-                    let normalized = column_name.to_ascii_lowercase();
-                    if !known_columns.contains(&normalized) {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "unknown referenced column '{}' in FOREIGN KEY constraint",
-                            column_name
-                        )));
-                    }
-                }
+                ensure_known_columns_case_insensitive(
+                    referenced_columns_vec.iter().map(|name| name.as_str()),
+                    &known_columns,
+                    |unknown| format!(
+                        "unknown referenced column '{}' in FOREIGN KEY constraint",
+                        unknown
+                    ),
+                )?;
             }
         }
 

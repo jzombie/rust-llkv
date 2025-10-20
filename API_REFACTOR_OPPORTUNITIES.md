@@ -50,6 +50,7 @@ would help.
 - 🚧 Remaining runtime helpers (catalog-derived read views, executor cache rebuilds) still live in `llkv-runtime`.
 - ⚙️ SQL planner/CREATE flows now reuse shared FK validation helpers, but further consolidation (e.g., UNIQUE checks) remains.
 - ✅ Catalog read APIs (column specs, table view, foreign-key views, constraint summaries) now route through the catalog service instead of touching metadata snapshots directly.
+- ✅ Shared validation utilities (`llkv_plan::validation`) centralise column/FK shape checks so frontends can reuse them without SQL-specific logic.
 - ✅ SQL planner column-resolution (`collect_known_columns`) now sources metadata via `RuntimeContext::table_column_specs`, avoiding ad-hoc `table_view` + `lookup_table` fallbacks.
 
 ### In-flight
