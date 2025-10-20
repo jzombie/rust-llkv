@@ -615,7 +615,7 @@ where
     ///
     /// Callers that already parsed expressions into [`ScanProjection`] values can
     /// use this entry point to skip the iterator conversion performed by
-    /// [`scan_stream`]. The execution semantics and callbacks are identical.
+    /// [`Self::scan_stream`]. The execution semantics and callbacks are identical.
     pub fn scan_stream_with_exprs<'a, F>(
         &self,
         projections: &[ScanProjection],

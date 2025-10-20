@@ -145,7 +145,7 @@ type HashTable = FxHashMap<HashKey, Vec<RowRef>>;
 /// Execute a hash join between two tables and stream joined batches to `on_batch`.
 ///
 /// Supports `Inner`, `Left`, `Semi`, and `Anti` joins today. Right and Full outer
-/// joins return an [`Error::Internal`](llkv_result::Error::Internal) since their
+/// joins return an [`llkv_result::Error::Internal`] since their
 /// probe phases are not wired up yet.
 pub fn hash_join_stream<P, F>(
     left: &Table<P>,

@@ -1,7 +1,7 @@
 //! Build and evaluate fully typed predicates derived from logical expressions.
 //!
-//! The conversion utilities bridge the logical [`Operator`](crate::expr::Operator) values that
-//! operate on untyped [`Literal`](crate::literal::Literal) instances and the concrete predicate
+//! The conversion utilities bridge the logical [`crate::expr::Operator`] values that
+//! operate on untyped [`crate::literal::Literal`] instances and the concrete predicate
 //! evaluators needed by execution code.
 
 use std::cmp::Ordering;

@@ -2803,7 +2803,7 @@ where
     // TODO: Make streamable; don't buffer all values in memory at once
     /// Scan a set of columns and materialize rows into memory.
     ///
-    /// NOTE: Similar to [`scan_column_values`], this buffers eagerly pending
+    /// NOTE: Similar to [`Self::scan_column_values`], this buffers eagerly pending
     /// enhancements to the executor pipeline.
     fn scan_multi_column_values(
         &self,

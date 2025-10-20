@@ -8,8 +8,8 @@
 //! # Layout
 //! - [`core`]: ColumnStore implementation, ingestion, and metadata handling
 //! - [`catalog`], [`descriptor`], [`layout`]: Persistent metadata structures
-//! - [`scan`], [`projection`], [`indexing`]: Execution helpers for readers and indexes
-//! - [`rowid`], [`dtype_cache`]: Supporting utilities for ID management and type lookup
+//! - [`scan`], projection helpers, [`indexing`]: Execution helpers for readers and indexes
+//! - [`rowid`], dtype cache utilities: Supporting utilities for ID management and type lookup
 //!
 //! Consumers should import from this module rather than the individual files so
 //! rustdoc presents a coherent surface.

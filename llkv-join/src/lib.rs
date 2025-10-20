@@ -2,7 +2,7 @@
 //!
 //! This crate exposes shared types (`JoinKey`, `JoinType`, `JoinOptions`) used by the
 //! planner and runtime to negotiate join configuration. Execution currently routes
-//! through the hash join implementation in [`hash_join`], with a placeholder for
+//! through the hash join implementation in [`hash_join_stream`], with a placeholder for
 //! alternate algorithms when they land.
 #![forbid(unsafe_code)]
 
