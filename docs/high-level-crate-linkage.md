@@ -1,6 +1,6 @@
-# High Level Crate Overview
+# High-Level Crate Overview
 
-This draft diagram provides a simplistic, high-level picture of how the primary crates relate; we will layer in the remaining crates as the documentation matures.
+This diagram provides a simplistic, high-level picture of how the primary crates relate; we will layer in the remaining crates as the documentation matures.
 
 ```mermaid
 graph TB
