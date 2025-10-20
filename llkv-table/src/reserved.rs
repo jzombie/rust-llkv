@@ -168,8 +168,11 @@ pub const CATALOG_FIELD_CATALOG_STATE: u32 = 103;
 /// Stores schema names and metadata for SQL schema support.
 pub const CATALOG_FIELD_SCHEMA_META_ID: u32 = 104;
 
-// TODO: Does this need a catalog field ID devoted to it?  The other indexes don't seem to need this. Are they persisted differently?
 /// Catalog field for multi-column unique index metadata (Binary-encoded TableMultiColumnUniqueMeta).
+///
+/// Multi-column unique state is persisted separately from single-column indexes so it can
+/// capture composite key components and null-handling rules. Keeping a dedicated field ID
+/// avoids collisions with legacy constraint encodings.
 pub const CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID: u32 = 105;
 
 /// Catalog field for constraint metadata (Binary-encoded ConstraintRecord).

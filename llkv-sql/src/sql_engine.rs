@@ -1346,6 +1346,7 @@ where
     }
 
     // TODO: Refactor into runtime or executor layer?
+    // NOTE: PRAGMA handling lives in the SQL layer until a shared runtime hook exists.
     /// Try to handle pragma_table_info('table_name') table function
     fn try_handle_pragma_table_info(
         &self,
@@ -1870,7 +1871,7 @@ where
         self.execute_plan_statement(PlanStatement::Delete(plan))
     }
 
-    #[allow(clippy::too_many_arguments)] // TODO: Consider refactor
+    #[allow(clippy::too_many_arguments)] // NOTE: Signature mirrors SQL grammar; keep grouped until command builder is introduced.
     fn handle_drop(
         &self,
         object_type: ObjectType,
@@ -2557,7 +2558,7 @@ where
         Ok(projections)
     }
 
-    #[allow(clippy::too_many_arguments)] // TODO: Refactor using struct for arg
+    #[allow(clippy::too_many_arguments)] // NOTE: Keeps parity with SQL START TRANSACTION grammar; revisit when options expand.
     fn handle_start_transaction(
         &self,
         modes: Vec<TransactionMode>,

@@ -54,7 +54,7 @@ impl TryFrom<u8> for IndexKind {
 /// Uniform ops each concrete index must implement.
 pub(crate) trait IndexOps<P: Pager>: Send + Sync {
     /// Stages the full build of an index for a column with existing data.
-    #[allow(clippy::too_many_arguments)] // TODO: Use struct for args
+    #[allow(clippy::too_many_arguments)] // NOTE: Arguments intentionally expanded to avoid per-call heap allocations.
     fn stage_registration(
         &self,
         index_manager: &IndexManager<P>,
@@ -68,7 +68,7 @@ pub(crate) trait IndexOps<P: Pager>: Send + Sync {
     ) -> Result<()>;
 
     /// Stages the full removal of an index from a column.
-    #[allow(clippy::too_many_arguments)] // TODO: Use struct for args
+    #[allow(clippy::too_many_arguments)] // NOTE: Arguments intentionally expanded to avoid per-call heap allocations.
     fn stage_unregistration(
         &self,
         index_manager: &IndexManager<P>,
@@ -252,7 +252,7 @@ impl<P: Pager<Blob = EntryHandle>> IndexManager<P> {
     }
 
     /// Dispatches updates for a new data chunk to all registered indexes for that column.
-    #[allow(clippy::too_many_arguments)] // TODO: Refactor
+    #[allow(clippy::too_many_arguments)] // NOTE: Inline argument list keeps call sites allocation-free while the API stabilizes.
     pub(crate) fn stage_updates_for_new_chunk(
         &self,
         _field_id: LogicalFieldId,

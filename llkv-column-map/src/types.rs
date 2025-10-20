@@ -13,9 +13,7 @@
 
 use modular_bitfield::prelude::*;
 
-// TODO: Clarify how many namespaces can actually be used.
 /// Category of data a column contains.
-///
 ///
 /// The `Namespace` enum prevents ID collisions by segregating different types of
 /// columns into distinct namespaces. Each namespace can contain up to 2^16 tables,

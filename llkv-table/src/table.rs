@@ -611,7 +611,11 @@ where
         self.scan_stream_with_exprs(&stream_projections, filter_expr, options, on_batch)
     }
 
-    // TODO: Document difference between this and `scan_stream`
+    /// Stream projections using fully resolved expression inputs.
+    ///
+    /// Callers that already parsed expressions into [`ScanProjection`] values can
+    /// use this entry point to skip the iterator conversion performed by
+    /// [`scan_stream`]. The execution semantics and callbacks are identical.
     pub fn scan_stream_with_exprs<'a, F>(
         &self,
         projections: &[ScanProjection],

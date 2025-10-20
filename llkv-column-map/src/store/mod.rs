@@ -1,4 +1,18 @@
-//! The main ColumnStore API.
+//! ColumnStore facade and supporting modules.
+//!
+//! This module groups the high-level storage concepts exposed by the column map
+//! crate: configuration, catalog management, scans, projections, and indexing.
+//! Each submodule provides a focused capability while re-exporting the primary
+//! entry points (`ColumnStore`, `ScanBuilder`, projection helpers, etc.).
+//!
+//! # Layout
+//! - [`core`]: ColumnStore implementation, ingestion, and metadata handling
+//! - [`catalog`], [`descriptor`], [`layout`]: Persistent metadata structures
+//! - [`scan`], [`projection`], [`indexing`]: Execution helpers for readers and indexes
+//! - [`rowid`], [`dtype_cache`]: Supporting utilities for ID management and type lookup
+//!
+//! Consumers should import from this module rather than the individual files so
+//! rustdoc presents a coherent surface.
 
 mod config;
 use config::*;

@@ -85,6 +85,8 @@ impl ColumnDescriptor {
     pub(crate) const FIXED_DISK_SIZE: usize = Self::FIXED_DISK_SIZE_WITHOUT_INDEX_META + 4; // + index_meta_len
 
     // TODO: Separate between `data` and `rid` states?
+    // NOTE: Descriptor metadata covers both value and row-id columns; callers
+    // differentiate behavior via the `LogicalFieldId` namespace.
     /// (Internal) Loads the full state for a descriptor, creating it if it
     /// doesn't exist.
     pub(crate) fn load_or_create<P: Pager>(
@@ -421,19 +423,3 @@ impl<'a, P: Pager> Iterator for DescriptorIterator<'a, P> {
         }
     }
 }
-
-// TODO: Keep?
-// Build a descriptor page payload (header + packed entries) with a single
-// allocation. Useful when rewriting a page after metadata updates.
-// pub(crate) fn build_descriptor_page_bytes(
-//     header: &DescriptorPageHeader,
-//     entries: &[ChunkMetadata],
-// ) -> Vec<u8> {
-//     let cap = DescriptorPageHeader::DISK_SIZE + entries.len() * ChunkMetadata::DISK_SIZE;
-//     let mut page = Vec::with_capacity(cap);
-//     page.extend_from_slice(&header.to_le_bytes());
-//     for m in entries {
-//         page.extend_from_slice(&m.to_le_bytes());
-//     }
-//     page
-// }

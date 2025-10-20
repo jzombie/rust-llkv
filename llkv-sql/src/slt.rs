@@ -246,7 +246,7 @@ pub fn expand_loops_with_mapping(
 /// into explicit `connection` records so the upstream parser can understand them.
 /// Also ensures proper termination of statement error blocks by adding a blank line
 /// after ---- when there's no expected error pattern.
-#[allow(clippy::type_complexity)] // TODO: Refactor type complexity
+#[allow(clippy::type_complexity)] // NOTE: Helper returns structured parsing results; refactor once sqllogictest parser is extracted.
 fn normalize_inline_connections(
     lines: Vec<String>,
     mapping: Vec<usize>,

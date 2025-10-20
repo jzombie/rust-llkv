@@ -1,3 +1,8 @@
+//! Numeric scalar expression evaluation utilities for table scans.
+//!
+//! Planner and executor components leverage these helpers to cast input columns
+//! to floating-point and apply lightweight kernels without duplicating logic.
+
 use std::{iter, sync::Arc};
 
 use arrow::array::{Array, ArrayRef, Float64Array};
@@ -13,7 +18,7 @@ use crate::types::FieldId;
 /// Mapping from field identifiers to the numeric Arrow array used for evaluation.
 pub type NumericArrayMap = FxHashMap<FieldId, Arc<Float64Array>>;
 
-// TODO: Document
+/// Represents an affine transformation `scale * field + offset`.
 #[derive(Clone, Copy, Debug)]
 pub struct AffineExpr {
     pub field: FieldId,
@@ -21,7 +26,7 @@ pub struct AffineExpr {
     pub offset: f64,
 }
 
-// TODO: Document
+/// Internal accumulator representing a partially merged affine expression.
 #[derive(Clone, Copy, Debug)]
 struct AffineState {
     field: Option<FieldId>,
@@ -30,6 +35,7 @@ struct AffineState {
 }
 
 // TODO: Place in impl?
+/// Combine field identifiers while tracking whether multiple fields were encountered.
 fn merge_field(lhs: Option<FieldId>, rhs: Option<FieldId>) -> Option<Option<FieldId>> {
     match (lhs, rhs) {
         (Some(a), Some(b)) => {
@@ -45,7 +51,7 @@ fn merge_field(lhs: Option<FieldId>, rhs: Option<FieldId>) -> Option<Option<Fiel
     }
 }
 
-// TODO: Document
+/// Intermediate representation for vectorized evaluators.
 enum VectorizedExpr {
     Array(Arc<Float64Array>),
     Scalar(Option<f64>),

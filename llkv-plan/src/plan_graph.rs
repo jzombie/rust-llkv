@@ -428,7 +428,8 @@ impl PlanGraph {
         }
 
         // Validate inputs and outputs line up with edges.
-        #[allow(clippy::type_complexity)] // TODO: Refactor
+        #[allow(clippy::type_complexity)]
+        // NOTE: Map values capture edge metadata tuples; restructure when plan graph API stabilizes.
         let mut expected_inputs: BTreeMap<
             PlanNodeId,
             Vec<(PlanNodeId, Option<String>, Vec<(String, String)>)>,
@@ -449,7 +450,8 @@ impl PlanGraph {
         }
 
         for node in &self.nodes {
-            #[allow(clippy::type_complexity)] // TODO: Refactor
+            #[allow(clippy::type_complexity)]
+            // NOTE: Preserves rich edge metadata while validating topologies.
             let mut actual_inputs: Vec<(
                 PlanNodeId,
                 Option<String>,

@@ -1249,6 +1249,8 @@ where
 }
 
 // TODO: Can this be replaced by `run_filter_for_with_result`?
+// NOTE: Boolean filters have specialized visitors; this helper mirrors the
+// non-boolean path while preserving legacy result structures.
 fn run_filter_for_bool_with_result<P, F>(
     store: &ColumnStore<P>,
     field_id: LogicalFieldId,
@@ -1266,6 +1268,7 @@ where
 }
 
 // TODO: Can this be replaced by `run_filter_for`?
+// NOTE: Separate helper retains compatibility with callers returning raw row IDs.
 fn run_filter_for_bool<P, F>(
     store: &ColumnStore<P>,
     field_id: LogicalFieldId,

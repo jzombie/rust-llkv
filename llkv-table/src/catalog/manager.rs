@@ -62,6 +62,7 @@ impl<P> CatalogManager<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    /// Creates a new CatalogManager coordinating metadata, catalog, and storage layers.
     pub fn new(
         metadata: Arc<MetadataManager<P>>,
         catalog: Arc<TableCatalog>,

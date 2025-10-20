@@ -74,9 +74,9 @@ impl<P> ColumnStore<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    /// Open or create a `ColumnStore` using the provided pager.
+    /// Opens or creates a `ColumnStore` using the provided pager.
     ///
-    /// This loads the column catalog from the pager's root catalog key, or initializes
+    /// Loads the column catalog from the pager's root catalog key, or initializes
     /// an empty catalog if none exists. The catalog maps [`LogicalFieldId`] to the
     /// physical keys of column descriptors.
     ///
@@ -107,9 +107,9 @@ where
         })
     }
 
-    /// Create and persist an index for a column.
+    /// Creates and persists an index for a column.
     ///
-    /// This builds the specified index type for all existing data in the column and
+    /// Builds the specified index type for all existing data in the column and
     /// persists it atomically. The index will be maintained automatically on subsequent
     /// appends and updates.
     ///
@@ -120,15 +120,15 @@ where
         self.index_manager.register_index(self, field_id, kind)
     }
 
-    /// Check if a logical field is registered in the catalog.
+    /// Checks if a logical field is registered in the catalog.
     pub fn has_field(&self, field_id: LogicalFieldId) -> bool {
         let catalog = self.catalog.read().unwrap();
         catalog.map.contains_key(&field_id)
     }
 
-    /// Remove a persisted index from a column.
+    /// Removes a persisted index from a column.
     ///
-    /// This atomically removes the index and frees associated storage. The column data
+    /// Atomically removes the index and frees associated storage. The column data
     /// itself is not affected.
     ///
     /// # Errors
@@ -138,9 +138,9 @@ where
         self.index_manager.unregister_index(self, field_id, kind)
     }
 
-    /// Get the Arrow data type of a column.
+    /// Returns the Arrow data type of a column.
     ///
-    /// This returns the data type from cache if available, otherwise loads it from
+    /// Returns the data type from cache if available, otherwise loads it from
     /// the column descriptor and caches it for future queries.
     ///
     /// # Errors
@@ -153,9 +153,9 @@ where
         self.dtype_cache.dtype_for_field(field_id)
     }
 
-    /// Ensure that catalog entries and descriptors exist for a logical column.
+    /// Ensures that catalog entries and descriptors exist for a logical column.
     ///
-    /// This is primarily used when creating empty tables so that subsequent
+    /// Primarily used when creating empty tables so that subsequent
     /// operations (like `CREATE INDEX`) can resolve column metadata before any
     /// data has been appended.
     pub fn ensure_column_registered(
@@ -298,7 +298,20 @@ where
         res
     }
 
-    // TODO: Document
+    /// Evaluate a predicate against a column and return match metadata.
+    ///
+    /// This variant drives a primitive predicate over the column and returns a
+    /// [`FilterResult`] describing contiguous match regions. Callers can use the
+    /// result to build paginated scans or gather row identifiers.
+    ///
+    /// # Arguments
+    /// - `field_id`: Logical column to filter.
+    /// - `predicate`: Callable invoked on each value; should be cheap and free of
+    ///   side effects.
+    ///
+    /// # Errors
+    /// Returns an error if the column metadata cannot be loaded or if decoding a
+    /// chunk fails.
     pub fn filter_matches<T, F>(
         &self,
         field_id: LogicalFieldId,
@@ -520,7 +533,8 @@ where
         Ok(false)
     }
 
-    // TODO: Set up a way to optionally auto-increment a row ID column if not provided.
+    // NOTE: Row IDs must be provided explicitly today. Consider introducing an
+    // opt-in auto-increment mode once table-level schema metadata can enforce it.
     /// Append a [`RecordBatch`] to the store.
     ///
     /// The batch must include a `rowid` column (type `UInt64`) that uniquely identifies
@@ -549,7 +563,7 @@ where
     /// - The batch is missing the `rowid` column
     /// - Column metadata is missing or invalid
     /// - Storage operations fail
-    #[allow(unused_variables, unused_assignments)] // TODO: Keep `presence_index_created`?
+    #[allow(unused_variables, unused_assignments)] // NOTE: Preserve variable hooks used during feature gating of presence indexes.
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         tracing::trace!(
             num_columns = batch.num_columns(),
@@ -1514,6 +1528,8 @@ where
     }
 
     // TODO: Move to descriptor module?
+    // NOTE: This helper mutates descriptor metadata in place because it needs
+    // access to the pager and catalog locks owned by `ColumnStore`.
     /// Write a descriptor chain from a meta slice. Reuses first page when
     /// possible. Frees surplus pages via `frees`.
     pub(crate) fn write_descriptor_chain(

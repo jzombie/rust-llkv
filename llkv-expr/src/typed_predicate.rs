@@ -1,3 +1,9 @@
+//! Build and evaluate fully typed predicates derived from logical expressions.
+//!
+//! The conversion utilities bridge the logical [`Operator`](crate::expr::Operator) values that
+//! operate on untyped [`Literal`](crate::literal::Literal) instances and the concrete predicate
+//! evaluators needed by execution code.
+
 use std::cmp::Ordering;
 use std::fmt;
 use std::ops::Bound;
@@ -9,6 +15,7 @@ use crate::literal::{
     FromLiteral, Literal, LiteralCastError, bound_to_native, literal_to_native, literal_to_string,
 };
 
+/// Value that can participate in typed predicate evaluation.
 pub trait PredicateValue: Clone {
     type Borrowed<'a>: ?Sized
     where
@@ -31,6 +38,7 @@ pub trait PredicateValue: Clone {
     }
 }
 
+/// Fully typed predicate ready to be matched against borrowed values.
 #[derive(Debug, Clone)]
 pub enum Predicate<V>
 where
@@ -65,6 +73,7 @@ impl<V> Predicate<V>
 where
     V: PredicateValue,
 {
+    /// Return `true` when `value` satisfies the predicate variant.
     pub fn matches(&self, value: &V::Borrowed<'_>) -> bool {
         match self {
             Predicate::All => true,
@@ -202,6 +211,7 @@ impl PredicateValue for String {
     }
 }
 
+/// Error building a typed predicate from a logical operator.
 #[derive(Debug, Clone)]
 pub enum PredicateBuildError {
     LiteralCast(LiteralCastError),
@@ -234,6 +244,13 @@ impl From<LiteralCastError> for PredicateBuildError {
     }
 }
 
+/// Convert a logical operator into a predicate for fixed-width Arrow types.
+///
+/// # Errors
+///
+/// Returns [`PredicateBuildError::LiteralCast`] when the provided literal cannot be coerced into
+/// the target native type or [`PredicateBuildError::UnsupportedOperator`] when the operator is not
+/// supported for fixed-width values.
 pub fn build_fixed_width_predicate<T>(
     op: &Operator<'_>,
 ) -> Result<Predicate<T::Native>, PredicateBuildError>
@@ -302,6 +319,13 @@ fn parse_bool_bound(bound: &Bound<Literal>) -> Result<Option<Bound<bool>>, Predi
     })
 }
 
+/// Convert a logical operator into a predicate over boolean values.
+///
+/// # Errors
+///
+/// Returns [`PredicateBuildError::LiteralCast`] when the literal cannot be interpreted as a
+/// boolean or [`PredicateBuildError::UnsupportedOperator`] when string-specific predicates are
+/// attempted.
 pub fn build_bool_predicate(op: &Operator<'_>) -> Result<Predicate<bool>, PredicateBuildError> {
     match op {
         Operator::Equals(lit) => Ok(Predicate::Equals(
@@ -358,6 +382,13 @@ fn parse_string_bound(
     }
 }
 
+/// Convert a logical operator into a predicate over UTF-8 string values.
+///
+/// # Errors
+///
+/// Returns [`PredicateBuildError::LiteralCast`] when literals cannot be converted into strings or
+/// [`PredicateBuildError::UnsupportedOperator`] when the operator is not yet implemented for
+/// strings.
 pub fn build_var_width_predicate(
     op: &Operator<'_>,
 ) -> Result<Predicate<String>, PredicateBuildError> {

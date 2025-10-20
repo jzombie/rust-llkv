@@ -36,7 +36,7 @@ use crate::constants::CONSTRAINT_SCAN_CHUNK_SIZE;
 use crate::constraints::{
     ConstraintId, ConstraintRecord, decode_constraint_row_id, encode_constraint_row_id,
 };
-use crate::types::{FieldId, RowId, TableId};
+use crate::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
@@ -46,7 +46,6 @@ use llkv_column_map::types::LogicalFieldId;
 use llkv_column_map::{
     ColumnStore,
     store::{GatherNullPolicy, ROW_ID_COLUMN_NAME, rowid_fid},
-    types::Namespace,
 };
 use llkv_result::{self, Result as LlkvResult};
 use llkv_storage::pager::{MemPager, Pager};
@@ -60,26 +59,19 @@ use crate::reserved::*;
 // TODO: Dedupe with llkv_column_map::types::lfid()
 #[inline]
 fn lfid(table_id: TableId, col_id: u32) -> LogicalFieldId {
-    LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(table_id)
-        .with_field_id(col_id)
+    LogicalFieldId::for_user(table_id, col_id)
 }
 
 // TODO: Migrate to llkv_column_map::types::rid_table()
 #[inline]
 fn rid_table(table_id: TableId) -> u64 {
-    let fid = LogicalFieldId::new()
-        .with_namespace(Namespace::UserData)
-        .with_table_id(table_id)
-        .with_field_id(0);
-    fid.into()
+    LogicalFieldId::for_user(table_id, ROW_ID_FIELD_ID).into()
 }
 
 // TODO: Migrate to llkv_column_map::types::rid_col()
 #[inline]
 fn rid_col(table_id: TableId, col_id: u32) -> u64 {
-    lfid(table_id, col_id).into()
+    rowid_fid(lfid(table_id, col_id)).into()
 }
 
 #[inline]

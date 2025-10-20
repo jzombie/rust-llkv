@@ -1,3 +1,8 @@
+//! Untyped literal values plus helpers for converting them into native types.
+//!
+//! Literals capture query parameters before a table knows the concrete Arrow
+//! type of each column. Conversion helpers here defer type checking until the
+//! caller can perform schema-aware coercion.
 use arrow::datatypes::ArrowPrimitiveType;
 use std::ops::Bound;
 

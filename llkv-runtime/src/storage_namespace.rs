@@ -1,3 +1,8 @@
+//! Runtime storage namespace abstraction.
+//!
+//! Namespaces wrap pager-backed contexts so sessions can route operations based
+//! on table ownership (persistent vs. temporary).
+
 use std::any::Any;
 use std::sync::{Arc, RwLock};
 
@@ -15,10 +20,12 @@ use llkv_table::canonical_table_name;
 pub type NamespaceId = String;
 
 // TODO: Extract to constants module
+// NOTE: Keep string identifiers here until the runtime constants module is formalized.
 pub const PERSISTENT_NAMESPACE_ID: &str = "main";
 pub const TEMPORARY_NAMESPACE_ID: &str = "temp";
 
 // TODO: Rename to `RuntimeStorageNamespace`?
+// NOTE: Trait name mirrors the broader storage namespace concept used across crates.
 /// Trait implemented by all runtime storage namespaces.
 ///
 /// Each namespace encapsulates a single storage backend (pager + catalog + table cache).

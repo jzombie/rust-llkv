@@ -79,6 +79,7 @@ impl<P> ConstraintService<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    /// Create a new constraint validation service.
     pub fn new(metadata: Arc<MetadataManager<P>>, catalog: Arc<TableCatalog>) -> Self {
         Self { metadata, catalog }
     }
@@ -149,6 +150,9 @@ where
         Ok(())
     }
 
+    /// Validate INSERT rows against all table constraints including primary keys, unique constraints,
+    /// and CHECK expressions. This is a comprehensive validation that combines uniqueness checks
+    /// (both single-column and multi-column) with row-level CHECK constraint evaluation.
     #[allow(clippy::too_many_arguments)]
     pub fn validate_insert_constraints<FSingle, FMulti>(
         &self,
@@ -217,6 +221,8 @@ where
         Ok(())
     }
 
+    /// Validate rows against CHECK constraints. This method evaluates CHECK expressions
+    /// for each row, ensuring they satisfy the table's row-level constraint rules.
     pub fn validate_row_level_constraints(
         &self,
         schema_field_ids: &[FieldId],
@@ -237,6 +243,8 @@ where
         )
     }
 
+    /// Validate that INSERT rows satisfy the primary key constraint by checking for duplicates
+    /// against both existing rows in the table and within the new batch.
     pub fn validate_primary_key_rows<F>(
         &self,
         schema_field_ids: &[FieldId],
@@ -258,6 +266,8 @@ where
         ensure_primary_key(&existing_rows, &new_rows, &primary_key.column_names)
     }
 
+    /// Validate UPDATE operations that modify primary key columns. Ensures that updated
+    /// primary key values don't conflict with existing rows (excluding the original row being updated).
     pub fn validate_update_primary_keys<F>(
         &self,
         schema_field_ids: &[FieldId],

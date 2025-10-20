@@ -206,6 +206,12 @@ where
     }
 }
 
+/// Represents how a column assignment should be materialized during UPDATE/INSERT.
+enum PreparedAssignmentValue {
+    Literal(PlanValue),
+    Expression { expr_index: usize },
+}
+
 impl<P> RuntimeStatementResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -301,10 +307,10 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
 // This separation allows plans to be used independently of execution logic.
 // ============================================================================
 
-// Transaction management is now handled by llkv-transaction crate
-// The SessionTransaction and TableDeltaState types are re-exported from there
+// Transaction management is now handled by llkv-transaction crate.
+// The SessionTransaction and TableDeltaState types are re-exported from there.
 
-/// Wrapper for Context that implements TransactionContext
+/// Wrapper for Context that implements TransactionContext.
 pub struct RuntimeContextWrapper<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -420,6 +426,8 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     // TODO: Allow generic pager type
+    // NOTE: Sessions always embed a `MemPager` for temporary namespaces; extend the
+    // wrapper when pluggable temp storage is supported.
     inner: TransactionSession<RuntimeContextWrapper<P>, RuntimeContextWrapper<MemPager>>,
     namespaces: Arc<SessionNamespaces<P>>,
 }
@@ -1717,11 +1725,13 @@ where
         })
     }
 
+    /// Returns all table names currently registered in the catalog.
     pub fn table_names(self: &Arc<Self>) -> Vec<String> {
         // Use catalog for table names (single source of truth)
         self.catalog.table_names()
     }
 
+    /// Returns metadata snapshot for a table including columns, types, and constraints.
     pub fn table_view(&self, canonical_name: &str) -> Result<TableView> {
         self.catalog_service.table_view(canonical_name)
     }
@@ -1735,6 +1745,7 @@ where
         filter_row_ids_for_snapshot(table.table.as_ref(), row_ids, &self.txn_manager, snapshot)
     }
 
+    /// Creates a fluent builder for defining and creating a new table with columns and constraints.
     pub fn create_table_builder(&self, name: &str) -> RuntimeCreateTableBuilder<'_, P> {
         RuntimeCreateTableBuilder {
             ctx: self,
@@ -1742,16 +1753,19 @@ where
         }
     }
 
+    /// Returns column specifications for a table including names, types, and constraint flags.
     pub fn table_column_specs(self: &Arc<Self>, name: &str) -> Result<Vec<ColumnSpec>> {
         let (_, canonical_name) = canonical_table_name(name)?;
         self.catalog_service.table_column_specs(&canonical_name)
     }
 
+    /// Returns foreign key relationships for a table, both referencing and referenced constraints.
     pub fn foreign_key_views(self: &Arc<Self>, name: &str) -> Result<Vec<ForeignKeyView>> {
         let (_, canonical_name) = canonical_table_name(name)?;
         self.catalog_service.foreign_key_views(&canonical_name)
     }
 
+    /// Exports all rows from a table as a `RowBatch`, useful for data migration or inspection.
     pub fn export_table_rows(self: &Arc<Self>, name: &str) -> Result<RowBatch> {
         let handle = RuntimeTableHandle::new(Arc::clone(self), name)?;
         handle.lazy()?.collect_rows()
@@ -2143,7 +2157,8 @@ where
                 snapshot,
             )))
         } else {
-            // For multi-table queries, we don't apply MVCC filtering yet (TODO)
+            // TODO: Extend MVCC filtering once joins propagate per-table snapshots.
+            // Multi-table plans rely on executor-level visibility checks
             None
         };
 
@@ -2709,7 +2724,10 @@ where
         }
     }
 
-    // TODO: Make streamable; don't buffer all values in memory at once
+    /// Scan a single column and materialize values into memory.
+    ///
+    /// NOTE: Current implementation buffers the entire result set; convert to a
+    /// streaming iterator once executor-side consumers support incremental consumption.
     fn scan_column_values(
         &self,
         table: &ExecutorTable<P>,
@@ -2763,6 +2781,8 @@ where
         };
 
         // TODO: Don't buffer all values; make this streamable
+        // NOTE: Values are accumulated eagerly; revisit when `llkv-plan` supports
+        // incremental parameter binding.
         let mut values = Vec::with_capacity(row_count);
         while let Some(chunk) = stream.next_batch()? {
             let batch = chunk.batch();
@@ -2781,6 +2801,10 @@ where
     }
 
     // TODO: Make streamable; don't buffer all values in memory at once
+    /// Scan a set of columns and materialize rows into memory.
+    ///
+    /// NOTE: Similar to [`scan_column_values`], this buffers eagerly pending
+    /// enhancements to the executor pipeline.
     fn scan_multi_column_values(
         &self,
         table: &ExecutorTable<P>,
@@ -3301,15 +3325,9 @@ where
         let schema = table.schema.as_ref();
         let filter_expr = translate_predicate(filter, schema)?;
 
-        // TODO: Dedupe
-        enum PreparedValue {
-            Literal(PlanValue),
-            Expression { expr_index: usize },
-        }
-
         let mut seen_columns: FxHashSet<String> =
             FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
-        let mut prepared: Vec<(ExecutorColumn, PreparedValue)> =
+        let mut prepared: Vec<(ExecutorColumn, PreparedAssignmentValue)> =
             Vec::with_capacity(assignments.len());
         let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
 
@@ -3330,13 +3348,16 @@ where
 
             match assignment.value {
                 AssignmentValue::Literal(value) => {
-                    prepared.push((column.clone(), PreparedValue::Literal(value)));
+                    prepared.push((column.clone(), PreparedAssignmentValue::Literal(value)));
                 }
                 AssignmentValue::Expression(expr) => {
                     let translated = translate_scalar(&expr, schema)?;
                     let expr_index = scalar_exprs.len();
                     scalar_exprs.push(translated);
-                    prepared.push((column.clone(), PreparedValue::Expression { expr_index }));
+                    prepared.push((
+                        column.clone(),
+                        PreparedAssignmentValue::Expression { expr_index },
+                    ));
                 }
             }
         }
@@ -3438,8 +3459,8 @@ where
                     })?;
 
             let values = match value {
-                PreparedValue::Literal(lit) => vec![lit; row_count],
-                PreparedValue::Expression { expr_index } => {
+                PreparedAssignmentValue::Literal(lit) => vec![lit; row_count],
+                PreparedAssignmentValue::Expression { expr_index } => {
                     let column_values = expr_values.get_mut(expr_index).ok_or_else(|| {
                         Error::InvalidArgumentError(
                             "expression assignment value missing during UPDATE".into(),
@@ -3538,15 +3559,9 @@ where
 
         let schema = table.schema.as_ref();
 
-        // TODO: Dedupe
-        enum PreparedValue {
-            Literal(PlanValue),
-            Expression { expr_index: usize },
-        }
-
         let mut seen_columns: FxHashSet<String> =
             FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
-        let mut prepared: Vec<(ExecutorColumn, PreparedValue)> =
+        let mut prepared: Vec<(ExecutorColumn, PreparedAssignmentValue)> =
             Vec::with_capacity(assignments.len());
         let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
         let mut first_field_id: Option<FieldId> = None;
@@ -3571,13 +3586,16 @@ where
 
             match assignment.value {
                 AssignmentValue::Literal(value) => {
-                    prepared.push((column.clone(), PreparedValue::Literal(value)));
+                    prepared.push((column.clone(), PreparedAssignmentValue::Literal(value)));
                 }
                 AssignmentValue::Expression(expr) => {
                     let translated = translate_scalar(&expr, schema)?;
                     let expr_index = scalar_exprs.len();
                     scalar_exprs.push(translated);
-                    prepared.push((column.clone(), PreparedValue::Expression { expr_index }));
+                    prepared.push((
+                        column.clone(),
+                        PreparedAssignmentValue::Expression { expr_index },
+                    ));
                 }
             }
         }
@@ -3677,8 +3695,8 @@ where
                     })?;
 
             let values = match value {
-                PreparedValue::Literal(lit) => vec![lit; row_count],
-                PreparedValue::Expression { expr_index } => {
+                PreparedAssignmentValue::Literal(lit) => vec![lit; row_count],
+                PreparedAssignmentValue::Expression { expr_index } => {
                     let column_values = expr_values.get_mut(expr_index).ok_or_else(|| {
                         Error::InvalidArgumentError(
                             "expression assignment value missing during UPDATE".into(),
@@ -4062,6 +4080,8 @@ where
         Ok(())
     }
 
+    /// Looks up a table in the executor cache, lazily loading it from metadata if not already cached.
+    /// This is the primary method for obtaining table references for query execution.
     pub fn lookup_table(&self, canonical_name: &str) -> Result<Arc<ExecutorTable<P>>> {
         // Fast path: check if table is already loaded
         {

@@ -1,3 +1,9 @@
+//! Row gathering helpers for assembling Arrow arrays across chunks.
+//!
+//! These utilities provide shared implementations used by projections, joins,
+//! and multi-column scans. They focus on minimizing temporary allocations while
+//! preserving row order guarantees.
+
 use std::mem;
 use std::sync::Arc;
 

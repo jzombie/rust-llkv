@@ -10,6 +10,7 @@ Large modules and crates must start with a module-level doc comment (`//!`) that
 - When documenting one parameter, document them all; otherwise omit the parameter section entirely.
 - Favor short sentences and bulleted lists for clarity.
 - Large modules must open with a clear summary paragraph that orients readers before diving into details.
+- Use backticks for identifiers, code keywords, and literal values that benefit from monospaced formatting.
 
 ## Structuring API Docs
 1. **Summary line:** One sentence that states what the item does.
