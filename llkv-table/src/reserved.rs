@@ -168,9 +168,18 @@ pub const CATALOG_FIELD_CATALOG_STATE: u32 = 103;
 /// Stores schema names and metadata for SQL schema support.
 pub const CATALOG_FIELD_SCHEMA_META_ID: u32 = 104;
 
-// TODO: Does this need a catalog field ID devoted to it?  The other indexes don't seem to need this. Are they persisted differently?
 /// Catalog field for multi-column unique index metadata (Binary-encoded TableMultiColumnUniqueMeta).
+///
+/// Multi-column unique state is persisted separately from single-column indexes so it can
+/// capture composite key components and null-handling rules. Keeping a dedicated field ID
+/// avoids collisions with legacy constraint encodings.
 pub const CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID: u32 = 105;
+
+/// Catalog field for constraint metadata (Binary-encoded ConstraintRecord).
+pub const CATALOG_FIELD_CONSTRAINT_META_ID: u32 = 106;
+
+/// Catalog field for constraint names (Binary-encoded ConstraintNameRecord).
+pub const CATALOG_FIELD_CONSTRAINT_NAME_ID: u32 = 107;
 
 /// Check if a field ID is used by the catalog's internal structure.
 #[inline]
@@ -185,6 +194,8 @@ pub fn is_catalog_internal_field(id: u32) -> bool {
             | CATALOG_FIELD_CATALOG_STATE
             | CATALOG_FIELD_SCHEMA_META_ID
             | CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID
+            | CATALOG_FIELD_CONSTRAINT_META_ID
+            | CATALOG_FIELD_CONSTRAINT_NAME_ID
     )
 }
 
@@ -303,6 +314,10 @@ mod tests {
         ));
         assert!(is_catalog_internal_field(CATALOG_FIELD_CATALOG_STATE));
         assert!(is_catalog_internal_field(CATALOG_FIELD_SCHEMA_META_ID));
+        assert!(is_catalog_internal_field(
+            CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID
+        ));
+        assert!(is_catalog_internal_field(CATALOG_FIELD_CONSTRAINT_META_ID));
         assert!(!is_catalog_internal_field(2));
         assert!(!is_catalog_internal_field(200));
     }

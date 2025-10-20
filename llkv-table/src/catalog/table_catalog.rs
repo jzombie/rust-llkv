@@ -1,256 +1,55 @@
 //! Centralized table catalog for table and field name resolution.
 //!
 //! This module provides thread-safe, performant bidirectional mappings between:
-//! - Table names ↔ TableId
-//! - Field names ↔ FieldId (per table)
+//! - Table names ↔ TableId (case-insensitive)
+//! - Field names ↔ FieldId per table (case-insensitive)
+//!
+//! # Purpose
+//!
+//! The catalog is an in-memory name resolution layer used during query execution.
+//! It does NOT create tables or generate IDs - use `CatalogService` for table creation.
+//!
+//! # Architecture
+//!
+//! - **CatalogService**: Creates tables (coordinates metadata + catalog + storage)
+//! - **TableCatalog** (this module): Name lookups during query execution
+//! - **MetadataManager**: Persistent storage, generates table IDs (source of truth)
+//! - **Table**: Data operations (append, scan, update, delete)
 //!
 //! # Design Goals
 //!
-//! 1. **No logic duplication**: Single source of truth for all name↔ID conversions
+//! 1. **Single source of truth**: MetadataManager generates IDs, catalog registers them
 //! 2. **Thread-safe**: Concurrent reads via `Arc<RwLock<_>>`
-//! 3. **Performance**: Use FxHashMap for fast lookups, numeric ID comparisons in hot paths
+//! 3. **Performance**: Fast lookups with FxHashMap
 //! 4. **Transaction isolation**: Immutable snapshots for MVCC
-//! 5. **Case handling**: Case-insensitive lookups, preserve display names
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use llkv_table::catalog::{TableCatalog, FieldResolver};
-//!
-//! // Create catalog
-//! let catalog = TableCatalog::new();
-//!
-//! // Register table
-//! let table_id = catalog.register_table("Users").unwrap();
-//!
-//! // Get field resolver for table
-//! let field_resolver = catalog.field_resolver(table_id).unwrap();
-//!
-//! // Register fields
-//! let name_fid = field_resolver.register_field("name").unwrap();
-//! let email_fid = field_resolver.register_field("Email").unwrap();
-//!
-//! // Case-insensitive lookups
-//! assert_eq!(field_resolver.field_id("NAME"), Some(name_fid));
-//! assert_eq!(field_resolver.field_id("email"), Some(email_fid));
-//! ```
+//! 5. **Case-insensitive**: SQL standard compliance, preserves display names
 
+use crate::resolvers::TableNameKey;
 use crate::types::TableId;
 use llkv_column_map::types::FieldId;
-use llkv_expr::expr::ScalarExpr;
 use llkv_result::{Error, Result};
 use rustc_hash::FxHashMap;
-use std::fmt;
 use std::sync::{Arc, RwLock};
 
-// ============================================================================
-// Qualified table name helpers
-// ============================================================================
-
-/// Owned representation of a schema-qualified table name (preserves original casing).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct QualifiedTableName {
-    schema: Option<String>,
-    table: String,
-}
-
-impl QualifiedTableName {
-    /// Create a new qualified table name from optional schema and table components.
-    pub fn new<S, T>(schema: Option<S>, table: T) -> Self
-    where
-        S: Into<String>,
-        T: Into<String>,
-    {
-        Self {
-            schema: schema.map(Into::into),
-            table: table.into(),
-        }
-    }
-
-    /// Create a qualified table name from a pre-formatted string.
-    ///
-    /// Strings in the form `schema.table` will be split into schema and table components.
-    /// Strings without a dot are treated as bare table names.
-    pub fn from_qualified(name: impl Into<String>) -> Self {
-        let raw = name.into();
-        let (schema, table) = split_schema_table(&raw);
-        Self {
-            schema: schema.map(|s| s.to_string()),
-            table: table.to_string(),
-        }
-    }
-
-    /// Return the schema component, if present.
-    pub fn schema(&self) -> Option<&str> {
-        self.schema.as_deref()
-    }
-
-    /// Return the table component.
-    pub fn table(&self) -> &str {
-        &self.table
-    }
-
-    /// Format as `schema.table` (or just `table` if schema is absent).
-    pub fn to_display_string(&self) -> String {
-        match &self.schema {
-            Some(schema) => format!("{schema}.{}", self.table),
-            None => self.table.clone(),
-        }
-    }
-
-    /// Convert into the canonical (lowercase) key representation.
-    fn canonical_key(&self) -> TableNameKey {
-        TableNameKey::from(self)
-    }
-}
-
-impl fmt::Display for QualifiedTableName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_display_string())
-    }
-}
-
-impl From<&str> for QualifiedTableName {
-    fn from(value: &str) -> Self {
-        Self::from_qualified(value)
-    }
-}
-
-impl From<String> for QualifiedTableName {
-    fn from(value: String) -> Self {
-        Self::from_qualified(value)
-    }
-}
-
-impl<S, T> From<(S, T)> for QualifiedTableName
-where
-    S: Into<String>,
-    T: Into<String>,
-{
-    fn from(value: (S, T)) -> Self {
-        Self::new(Some(value.0.into()), value.1.into())
-    }
-}
-
-/// Borrowed representation of a schema-qualified table name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct QualifiedTableNameRef<'a> {
-    schema: Option<&'a str>,
-    table: &'a str,
-}
-
-impl<'a> QualifiedTableNameRef<'a> {
-    /// Create a borrowed qualified name.
-    pub fn new(schema: Option<&'a str>, table: &'a str) -> Self {
-        Self { schema, table }
-    }
-
-    /// Parse a raw string into a borrowed qualified name.
-    pub fn parse(raw: &'a str) -> Self {
-        let (schema, table) = split_schema_table(raw);
-        Self { schema, table }
-    }
-
-    fn canonical_key(self) -> TableNameKey {
-        TableNameKey::from(self)
-    }
-}
-
-impl<'a> From<&'a str> for QualifiedTableNameRef<'a> {
-    fn from(value: &'a str) -> Self {
-        Self::parse(value)
-    }
-}
-
-impl<'a> From<(&'a str, &'a str)> for QualifiedTableNameRef<'a> {
-    fn from(value: (&'a str, &'a str)) -> Self {
-        Self::new(Some(value.0), value.1)
-    }
-}
-
-impl<'a> From<QualifiedTableNameRef<'a>> for QualifiedTableName {
-    fn from(value: QualifiedTableNameRef<'a>) -> Self {
-        Self::new(value.schema.map(str::to_string), value.table.to_string())
-    }
-}
-
-/// Canonical (lowercase) key for table name lookups.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TableNameKey {
-    schema: Option<String>,
-    table: String,
-}
-
-impl TableNameKey {
-    fn new(schema: Option<&str>, table: &str) -> Self {
-        Self {
-            schema: schema.map(|s| s.to_ascii_lowercase()),
-            table: table.to_ascii_lowercase(),
-        }
-    }
-
-    fn schema(&self) -> Option<&str> {
-        self.schema.as_deref()
-    }
-
-    fn table(&self) -> &str {
-        &self.table
-    }
-}
-
-impl fmt::Display for TableNameKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.schema {
-            Some(schema) => write!(f, "{schema}.{}", self.table),
-            None => write!(f, "{}", self.table),
-        }
-    }
-}
-
-impl From<&QualifiedTableName> for TableNameKey {
-    fn from(value: &QualifiedTableName) -> Self {
-        Self::new(value.schema(), value.table())
-    }
-}
-
-impl<'a> From<QualifiedTableNameRef<'a>> for TableNameKey {
-    fn from(value: QualifiedTableNameRef<'a>) -> Self {
-        Self::new(value.schema, value.table)
-    }
-}
-
-fn split_schema_table(name: &str) -> (Option<&str>, &str) {
-    if let Some(idx) = name.find('.') {
-        let (schema, rest) = name.split_at(idx);
-        let table = &rest[1..];
-        if table.is_empty() {
-            (Some(schema), "")
-        } else {
-            (Some(schema), table)
-        }
-    } else {
-        (None, name)
-    }
-}
+pub use crate::resolvers::{
+    ColumnResolution, FieldConstraints, FieldDefinition, FieldInfo, FieldResolver,
+    FieldResolverState, FieldState, IdentifierContext, IdentifierResolver, QualifiedTableName,
+    QualifiedTableNameRef,
+};
 
 // ============================================================================
 // TableCatalog - Table-level resolver
 // ============================================================================
 
-/// Centralized table catalog for table name resolution and field resolver management.
+/// In-memory table name resolution for query execution.
 ///
-/// The catalog maintains bidirectional mappings between table names and TableIds,
-/// and provides access to per-table field resolvers.
+/// **To create tables, use `CatalogService`, not this struct directly.**
 ///
-/// # Thread Safety
+/// The catalog maps table names to TableIds for fast lookups during query planning
+/// and execution. It does not create tables, generate IDs, or persist metadata.
 ///
-/// The catalog uses `Arc<RwLock<_>>` for thread-safe access. Multiple readers
-/// can access concurrently, while writers have exclusive access.
-///
-/// # Case Sensitivity
-///
-/// Table lookups are case-insensitive (SQL standard), but display names preserve
-/// original casing for error messages and schema display.
+/// Table IDs are provided by `MetadataManager` (the persistent layer and source of truth).
+/// The catalog simply registers these IDs for in-memory name resolution.
 #[derive(Debug, Clone)]
 pub struct TableCatalog {
     inner: Arc<RwLock<TableCatalogInner>>,
@@ -293,6 +92,16 @@ impl TableMetadata {
     }
 }
 
+impl TableMetadataView {
+    pub(crate) fn canonical_table(&self) -> &str {
+        self.canonical_name.table()
+    }
+
+    pub(crate) fn canonical_schema(&self) -> Option<&str> {
+        self.canonical_name.schema()
+    }
+}
+
 impl TableCatalog {
     /// Create a new empty catalog.
     ///
@@ -309,33 +118,34 @@ impl TableCatalog {
         }
     }
 
-    /// Register a new table in the catalog.
+    /// Register a table in the catalog with the specified table ID.
     ///
-    /// # Arguments
+    /// **This does NOT create tables.** It registers an existing table ID from
+    /// `MetadataManager` for name lookups. Use `CatalogService` to create tables.
     ///
-    /// * `display_name` - The table name as provided by user (case preserved)
-    ///
-    /// # Returns
-    ///
-    /// The assigned `TableId` for the newly registered table.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::CatalogError` if:
-    /// - A table with this name (case-insensitive) already exists
-    /// - TableId overflow (extremely unlikely)
+    /// The table_id must come from metadata (source of truth):
+    /// - New tables: `MetadataManager::reserve_table_id()`
+    /// - Database restart: `MetadataManager::all_table_metas()`
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let catalog = TableCatalog::new();
-    /// let users_id = catalog.register_table("Users")?;
-    /// let orders_id = catalog.register_table("Orders")?;
-    ///
-    /// // Case-insensitive duplicate detection
-    /// assert!(catalog.register_table("users").is_err());
     /// ```
-    pub fn register_table(&self, name: impl Into<QualifiedTableName>) -> Result<TableId> {
+    /// use llkv_table::catalog::TableCatalog;
+    ///
+    /// let catalog = TableCatalog::new();
+    /// catalog.register_table("Users", 42).unwrap();
+    ///
+    /// assert_eq!(catalog.table_id("users"), Some(42));
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the name or ID is already registered.
+    pub fn register_table(
+        &self,
+        name: impl Into<QualifiedTableName>,
+        table_id: TableId,
+    ) -> Result<()> {
         let display_name: QualifiedTableName = name.into();
         let canonical_name = display_name.canonical_key();
 
@@ -344,7 +154,7 @@ impl TableCatalog {
             .write()
             .map_err(|_| Error::Internal("Failed to acquire catalog write lock".to_string()))?;
 
-        // Check for duplicate (case-insensitive)
+        // Check for duplicate name (case-insensitive)
         if inner.table_name_to_id.contains_key(&canonical_name) {
             return Err(Error::CatalogError(format!(
                 "Table '{}' already exists in catalog",
@@ -352,12 +162,20 @@ impl TableCatalog {
             )));
         }
 
-        // Assign new TableId
-        let table_id = inner.next_table_id;
-        inner.next_table_id = inner
-            .next_table_id
-            .checked_add(1)
-            .ok_or_else(|| Error::Internal("TableId overflow".to_string()))?;
+        // Check for duplicate ID
+        if inner.table_id_to_meta.contains_key(&table_id) {
+            return Err(Error::CatalogError(format!(
+                "Table ID {} already exists in catalog",
+                table_id
+            )));
+        }
+
+        // Update next_table_id if necessary to avoid conflicts with future allocations
+        if table_id >= inner.next_table_id {
+            inner.next_table_id = table_id
+                .checked_add(1)
+                .ok_or_else(|| Error::Internal("TableId overflow".to_string()))?;
+        }
 
         // Create field resolver for this table
         let field_resolver = FieldResolver::new();
@@ -372,7 +190,7 @@ impl TableCatalog {
         inner.table_name_to_id.insert(canonical_name, table_id);
         inner.table_id_to_meta.insert(table_id, metadata);
 
-        Ok(table_id)
+        Ok(())
     }
 
     /// Unregister a table from the catalog.
@@ -382,7 +200,7 @@ impl TableCatalog {
     ///
     /// # Arguments
     ///
-    /// * `name` - Table name (any casing)
+    /// * `table_id` - The unique table identifier
     ///
     /// # Returns
     ///
@@ -390,22 +208,25 @@ impl TableCatalog {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let id = catalog.register_table("Users")?;
-    /// assert!(catalog.unregister_table("users"));
+    /// ```
+    /// use llkv_table::catalog::TableCatalog;
+    ///
+    /// let catalog = TableCatalog::new();
+    /// catalog.register_table("Users", 1).unwrap();
+    /// assert!(catalog.unregister_table(1));
     /// assert_eq!(catalog.table_id("users"), None);
     /// ```
-    pub fn unregister_table(&self, name: &str) -> bool {
-        let key = QualifiedTableNameRef::from(name).canonical_key();
+    pub fn unregister_table(&self, table_id: TableId) -> bool {
         let mut inner = match self.inner.write() {
             Ok(guard) => guard,
             Err(_) => return false,
         };
 
-        // Remove from name → id map and get the table_id
-        if let Some(table_id) = inner.table_name_to_id.remove(&key) {
-            // Remove from id → metadata map
-            inner.table_id_to_meta.remove(&table_id);
+        // Remove from id → metadata map and get the canonical name
+        if let Some(meta) = inner.table_id_to_meta.remove(&table_id) {
+            // Remove from name → id map using the canonical key
+            let canonical_key = meta.display_name.canonical_key();
+            inner.table_name_to_id.remove(&canonical_key);
             true
         } else {
             false
@@ -424,11 +245,15 @@ impl TableCatalog {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let id = catalog.register_table("Users")?;
-    /// assert_eq!(catalog.table_id("users"), Some(id));
-    /// assert_eq!(catalog.table_id("USERS"), Some(id));
-    /// assert_eq!(catalog.table_id("Users"), Some(id));
+    /// ```
+    /// use llkv_table::catalog::TableCatalog;
+    ///
+    /// let catalog = TableCatalog::new();
+    /// catalog.register_table("Users", 42).unwrap();
+    ///
+    /// assert_eq!(catalog.table_id("users"), Some(42));
+    /// assert_eq!(catalog.table_id("USERS"), Some(42));
+    /// assert_eq!(catalog.table_id("Users"), Some(42));
     /// ```
     pub fn table_id(&self, name: &str) -> Option<TableId> {
         let canonical = QualifiedTableNameRef::from(name).canonical_key();
@@ -505,10 +330,17 @@ impl TableCatalog {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// use llkv_table::catalog::TableCatalog;
+    ///
+    /// let catalog = TableCatalog::new();
+    /// catalog.register_table("Users", 7).unwrap();
+    ///
     /// let snapshot = catalog.snapshot();
-    /// // Transaction sees this snapshot even if catalog changes
-    /// let table_id = snapshot.table_id("users");
+    /// catalog.unregister_table(7);
+    ///
+    /// assert_eq!(snapshot.table_id("users"), Some(7));
+    /// assert_eq!(catalog.table_id("users"), None);
     /// ```
     pub fn snapshot(&self) -> TableCatalogSnapshot {
         let inner = match self.inner.read() {
@@ -545,11 +377,6 @@ impl TableCatalog {
             Ok(inner) => inner.table_id_to_meta.len(),
             Err(_) => 0,
         }
-    }
-
-    /// Create an identifier resolver bound to this catalog.
-    pub fn identifier_resolver(&self) -> IdentifierResolver<'_> {
-        IdentifierResolver { catalog: self }
     }
 
     /// Register a new schema in the catalog.
@@ -640,10 +467,16 @@ impl TableCatalog {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```
+    /// use llkv_table::catalog::TableCatalog;
+    ///
+    /// let catalog = TableCatalog::new();
+    /// catalog.register_table("Users", 9).unwrap();
+    ///
     /// let state = catalog.export_state();
-    /// // ... serialize state to disk ...
-    /// let restored_catalog = TableCatalog::from_state(state)?;
+    /// let restored = TableCatalog::from_state(state).unwrap();
+    ///
+    /// assert_eq!(restored.table_id("users"), Some(9));
     /// ```
     pub fn export_state(&self) -> TableCatalogState {
         let inner = match self.inner.read() {
@@ -813,560 +646,6 @@ impl TableCatalogSnapshot {
 }
 
 // ============================================================================
-// Identifier resolution
-// ============================================================================
-
-/// Context for resolving identifiers (e.g., default table from FROM clause).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct IdentifierContext {
-    default_table_id: Option<TableId>,
-}
-
-impl IdentifierContext {
-    /// Create a new identifier context.
-    pub fn new(default_table_id: Option<TableId>) -> Self {
-        Self { default_table_id }
-    }
-
-    /// Get the default table id (if any).
-    pub fn default_table_id(&self) -> Option<TableId> {
-        self.default_table_id
-    }
-}
-
-/// Resolution result for a column identifier.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ColumnResolution {
-    column: String,
-    field_path: Vec<String>,
-}
-
-impl ColumnResolution {
-    /// Resolved column name (with original casing as provided in identifier).
-    pub fn column(&self) -> &str {
-        &self.column
-    }
-
-    /// Structured field path for nested field access following the base column.
-    pub fn field_path(&self) -> &[String] {
-        &self.field_path
-    }
-
-    /// Whether the identifier referred to a simple column (no struct field access).
-    pub fn is_simple(&self) -> bool {
-        self.field_path.is_empty()
-    }
-
-    /// Convert the resolution into a scalar expression (column + optional get_field chain).
-    pub fn into_scalar_expr(self) -> ScalarExpr<String> {
-        let mut expr = ScalarExpr::column(self.column);
-        for field in self.field_path {
-            expr = ScalarExpr::get_field(expr, field);
-        }
-        expr
-    }
-}
-
-/// Catalog-backed identifier resolver.
-pub struct IdentifierResolver<'a> {
-    catalog: &'a TableCatalog,
-}
-
-impl<'a> IdentifierResolver<'a> {
-    /// Resolve an identifier represented as parts into a column resolution.
-    pub fn resolve(
-        &self,
-        parts: &[String],
-        context: IdentifierContext,
-    ) -> Result<ColumnResolution> {
-        if parts.is_empty() {
-            return Err(Error::InvalidArgumentError(
-                "invalid compound identifier".into(),
-            ));
-        }
-
-        // Without default table context, treat the full identifier as a logical column name.
-        if context.default_table_id().is_none() {
-            return Ok(ColumnResolution {
-                column: parts.join("."),
-                field_path: Vec::new(),
-            });
-        }
-
-        let table_id = context.default_table_id().unwrap();
-        let table_meta = self.catalog.table_metadata_view(table_id).ok_or_else(|| {
-            Error::CatalogError(format!(
-                "Catalog Error: table id {} is not registered",
-                table_id
-            ))
-        })?;
-
-        let canonical_table = table_meta.canonical_name.table().to_string();
-        let canonical_schema = table_meta.canonical_name.schema().map(str::to_string);
-        let canonical_parts: Vec<String> =
-            parts.iter().map(|part| part.to_ascii_lowercase()).collect();
-
-        let mut column_start_idx = 0usize;
-
-        if let Some(schema) = canonical_schema.as_deref() {
-            let schema_then_table = canonical_parts.len() == 2
-                && canonical_parts[0] == schema
-                && canonical_parts[1] == canonical_table;
-            let starts_with_table =
-                canonical_parts.len() >= 2 && canonical_parts[0] == canonical_table;
-
-            if canonical_parts.len() >= 3
-                && canonical_parts[0] == schema
-                && canonical_parts[1] == canonical_table
-            {
-                column_start_idx = 2;
-            } else if schema_then_table || starts_with_table {
-                column_start_idx = 1;
-            } else if canonical_parts.len() >= 3 && canonical_parts[1] == canonical_table {
-                return Err(Error::InvalidArgumentError(format!(
-                    "Binder Error: table '{}' not found",
-                    parts[0]
-                )));
-            } else if canonical_parts.len() >= 3 && canonical_parts[0] == schema {
-                return Err(Error::InvalidArgumentError(format!(
-                    "Binder Error: table '{}' not found",
-                    parts[1]
-                )));
-            }
-        } else if canonical_parts.len() >= 2 && canonical_parts[0] == canonical_table {
-            column_start_idx = 1;
-        }
-
-        if column_start_idx >= parts.len() {
-            return Err(Error::InvalidArgumentError(format!(
-                "invalid column reference in identifier: {}",
-                parts.join(".")
-            )));
-        }
-
-        let column = parts[column_start_idx].clone();
-        let mut field_path = Vec::new();
-        if column_start_idx + 1 < parts.len() {
-            field_path.extend(parts[(column_start_idx + 1)..].iter().cloned());
-        }
-
-        Ok(ColumnResolution { column, field_path })
-    }
-}
-
-// ============================================================================
-// FieldResolver - Per-table field name resolution
-// ============================================================================
-
-/// Constraint metadata recorded for each field.
-#[derive(Debug, Clone, PartialEq, Eq, Default, bitcode::Encode, bitcode::Decode)]
-pub struct FieldConstraints {
-    pub primary_key: bool,
-    pub unique: bool,
-    pub check_expr: Option<String>,
-}
-
-/// Definition for registering a field with the catalog.
-#[derive(Debug, Clone)]
-pub struct FieldDefinition {
-    display_name: String,
-    constraints: FieldConstraints,
-}
-
-impl FieldDefinition {
-    pub fn new(display_name: impl Into<String>) -> Self {
-        Self {
-            display_name: display_name.into(),
-            constraints: FieldConstraints::default(),
-        }
-    }
-
-    pub fn with_primary_key(mut self, primary_key: bool) -> Self {
-        self.constraints.primary_key = primary_key;
-        if primary_key {
-            self.constraints.unique = true;
-        }
-        self
-    }
-
-    pub fn with_unique(mut self, unique: bool) -> Self {
-        if unique {
-            self.constraints.unique = true;
-        }
-        self
-    }
-
-    pub fn with_check_expr(mut self, check_expr: Option<String>) -> Self {
-        self.constraints.check_expr = check_expr;
-        self
-    }
-
-    pub fn constraints(&self) -> &FieldConstraints {
-        &self.constraints
-    }
-}
-
-impl From<&str> for FieldDefinition {
-    fn from(value: &str) -> Self {
-        FieldDefinition::new(value)
-    }
-}
-
-impl From<String> for FieldDefinition {
-    fn from(value: String) -> Self {
-        FieldDefinition::new(value)
-    }
-}
-
-/// Rich field metadata exposed by the catalog.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FieldInfo {
-    pub field_id: FieldId,
-    pub display_name: String,
-    pub canonical_name: String,
-    pub constraints: FieldConstraints,
-}
-
-#[derive(Debug, Clone)]
-struct FieldMetadata {
-    display_name: String,
-    canonical_name: String,
-    constraints: FieldConstraints,
-}
-
-/// Per-table field name resolver.
-///
-/// Each table has its own field resolver that maintains bidirectional mappings
-/// between field names and FieldIds. Field IDs start at 3 to reserve space for
-/// system columns (row_id=0, created_by=1, deleted_by=2).
-///
-/// # Thread Safety
-///
-/// Like `Catalog`, the resolver uses `Arc<RwLock<_>>` for safe concurrent access.
-///
-/// # Case Sensitivity
-///
-/// Field lookups are case-insensitive (SQL standard), but display names preserve
-/// original casing.
-#[derive(Debug, Clone)]
-pub struct FieldResolver {
-    inner: Arc<RwLock<FieldResolverInner>>,
-}
-
-#[derive(Debug)]
-struct FieldResolverInner {
-    /// Canonical field name (lowercase) -> FieldId
-    field_name_to_id: FxHashMap<String, FieldId>,
-    /// FieldId -> field metadata
-    field_id_to_meta: FxHashMap<FieldId, FieldMetadata>,
-    /// Next field ID to assign (starts at 3, reserves 0-2 for system columns)
-    next_field_id: FieldId,
-}
-
-impl FieldResolver {
-    /// Create a new empty field resolver.
-    ///
-    /// The first assigned FieldId will be 3 (reserves 0-2 for system columns).
-    pub fn new() -> Self {
-        use crate::reserved::FIRST_USER_FIELD_ID;
-
-        Self {
-            inner: Arc::new(RwLock::new(FieldResolverInner {
-                field_name_to_id: FxHashMap::default(),
-                field_id_to_meta: FxHashMap::default(),
-                next_field_id: FIRST_USER_FIELD_ID,
-            })),
-        }
-    }
-
-    /// Register a new field in this table.
-    ///
-    /// # Arguments
-    ///
-    /// * `display_name` - The field name as provided by user (case preserved)
-    ///
-    /// # Returns
-    ///
-    /// The assigned `FieldId` for the newly registered field.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::CatalogError` if:
-    /// - A field with this name (case-insensitive) already exists
-    /// - FieldId overflow (unlikely)
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let resolver = FieldResolver::new();
-    /// let name_fid = resolver.register_field("Name")?;
-    /// let email_fid = resolver.register_field("email")?;
-    ///
-    /// // Case-insensitive duplicate detection
-    /// assert!(resolver.register_field("NAME").is_err());
-    /// ```
-    pub fn register_field(&self, definition: impl Into<FieldDefinition>) -> Result<FieldId> {
-        let FieldDefinition {
-            display_name,
-            constraints,
-        } = definition.into();
-        let canonical_name = display_name.to_ascii_lowercase();
-
-        let mut inner = self.inner.write().map_err(|_| {
-            Error::Internal("Failed to acquire field resolver write lock".to_string())
-        })?;
-
-        // Check for duplicate (case-insensitive)
-        if inner.field_name_to_id.contains_key(&canonical_name) {
-            return Err(Error::CatalogError(format!(
-                "Field '{}' already exists in table",
-                display_name
-            )));
-        }
-
-        // Assign new FieldId
-        let field_id = inner.next_field_id;
-        inner.next_field_id = inner
-            .next_field_id
-            .checked_add(1)
-            .ok_or_else(|| Error::Internal("FieldId overflow".to_string()))?;
-
-        inner
-            .field_name_to_id
-            .insert(canonical_name.clone(), field_id);
-        inner.field_id_to_meta.insert(
-            field_id,
-            FieldMetadata {
-                display_name,
-                canonical_name,
-                constraints,
-            },
-        );
-
-        Ok(field_id)
-    }
-
-    /// Get FieldId by field name (case-insensitive lookup).
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - Field name (any casing)
-    ///
-    /// # Returns
-    ///
-    /// `Some(FieldId)` if field exists, `None` otherwise.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let fid = resolver.register_field("UserName")?;
-    /// assert_eq!(resolver.field_id("username"), Some(fid));
-    /// assert_eq!(resolver.field_id("USERNAME"), Some(fid));
-    /// assert_eq!(resolver.field_id("UserName"), Some(fid));
-    /// ```
-    pub fn field_id(&self, name: &str) -> Option<FieldId> {
-        let canonical = name.to_ascii_lowercase();
-        let inner = self.inner.read().ok()?;
-        inner.field_name_to_id.get(&canonical).copied()
-    }
-
-    /// Get display name for a FieldId.
-    ///
-    /// Returns the original field name with preserved casing.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The FieldId to look up
-    ///
-    /// # Returns
-    ///
-    /// `Some(String)` with the display name if field exists, `None` otherwise.
-    pub fn field_name(&self, id: FieldId) -> Option<String> {
-        let inner = self.inner.read().ok()?;
-        inner
-            .field_id_to_meta
-            .get(&id)
-            .map(|meta| meta.display_name.clone())
-    }
-
-    /// Check if a field exists (case-insensitive).
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - Field name to check
-    ///
-    /// # Returns
-    ///
-    /// `true` if field exists, `false` otherwise.
-    pub fn field_exists(&self, name: &str) -> bool {
-        self.field_id(name).is_some()
-    }
-
-    /// Get the number of registered fields.
-    pub fn field_count(&self) -> usize {
-        match self.inner.read() {
-            Ok(inner) => inner.field_id_to_meta.len(),
-            Err(_) => 0,
-        }
-    }
-
-    /// Get all field names in display format.
-    pub fn field_names(&self) -> Vec<String> {
-        match self.inner.read() {
-            Ok(inner) => inner
-                .field_id_to_meta
-                .values()
-                .map(|meta| meta.display_name.clone())
-                .collect(),
-            Err(_) => Vec::new(),
-        }
-    }
-
-    /// Retrieve constraint metadata for a field id.
-    pub fn field_constraints(&self, id: FieldId) -> Option<FieldConstraints> {
-        let inner = self.inner.read().ok()?;
-        inner
-            .field_id_to_meta
-            .get(&id)
-            .map(|meta| meta.constraints.clone())
-    }
-
-    /// Retrieve constraint metadata for a field name.
-    pub fn field_constraints_by_name(&self, name: &str) -> Option<FieldConstraints> {
-        let id = self.field_id(name)?;
-        self.field_constraints(id)
-    }
-
-    /// Update the UNIQUE constraint flag for a field.
-    pub fn set_field_unique(&self, name: &str, unique: bool) -> Result<()> {
-        let canonical = name.to_ascii_lowercase();
-        let mut inner = self.inner.write().map_err(|_| {
-            Error::Internal("Failed to acquire field resolver write lock".to_string())
-        })?;
-
-        let field_id = *inner.field_name_to_id.get(&canonical).ok_or_else(|| {
-            Error::CatalogError(format!("Field '{}' does not exist in table", name))
-        })?;
-
-        let metadata = inner.field_id_to_meta.get_mut(&field_id).ok_or_else(|| {
-            Error::CatalogError(format!("Field '{}' metadata is missing from catalog", name))
-        })?;
-
-        if unique {
-            metadata.constraints.unique = true;
-        } else if !metadata.constraints.primary_key {
-            metadata.constraints.unique = false;
-        }
-
-        Ok(())
-    }
-
-    /// Retrieve complete field information by field id.
-    pub fn field_info(&self, id: FieldId) -> Option<FieldInfo> {
-        let inner = self.inner.read().ok()?;
-        inner.field_id_to_meta.get(&id).map(|meta| FieldInfo {
-            field_id: id,
-            display_name: meta.display_name.clone(),
-            canonical_name: meta.canonical_name.clone(),
-            constraints: meta.constraints.clone(),
-        })
-    }
-
-    /// Retrieve complete field information by field name.
-    pub fn field_info_by_name(&self, name: &str) -> Option<FieldInfo> {
-        let id = self.field_id(name)?;
-        self.field_info(id)
-    }
-
-    /// Export field resolver state for persistence.
-    ///
-    /// Returns a serializable representation of all field mappings.
-    pub fn export_state(&self) -> FieldResolverState {
-        let inner = match self.inner.read() {
-            Ok(inner) => inner,
-            Err(_) => {
-                return FieldResolverState {
-                    fields: Vec::new(),
-                    next_field_id: crate::reserved::FIRST_USER_FIELD_ID,
-                };
-            }
-        };
-
-        let mut fields = Vec::new();
-        for (&field_id, meta) in &inner.field_id_to_meta {
-            fields.push(FieldState {
-                field_id,
-                display_name: meta.display_name.clone(),
-                canonical_name: meta.canonical_name.clone(),
-                constraints: meta.constraints.clone(),
-            });
-        }
-
-        FieldResolverState {
-            fields,
-            next_field_id: inner.next_field_id,
-        }
-    }
-
-    /// Restore field resolver from persisted state.
-    ///
-    /// Creates a new field resolver instance with all field mappings
-    /// restored from the provided state.
-    pub fn from_state(state: FieldResolverState) -> Result<Self> {
-        let mut field_name_to_id = FxHashMap::default();
-        let mut field_id_to_meta = FxHashMap::default();
-
-        for field_state in state.fields {
-            let FieldState {
-                field_id,
-                display_name,
-                canonical_name,
-                constraints,
-            } = field_state;
-            // Check for duplicate field IDs
-            if field_id_to_meta.contains_key(&field_id) {
-                return Err(Error::CatalogError(format!(
-                    "Duplicate field_id {} in field resolver state",
-                    field_id
-                )));
-            }
-
-            // Check for duplicate field names
-            if field_name_to_id.contains_key(&canonical_name) {
-                return Err(Error::CatalogError(format!(
-                    "Duplicate field name '{}' in field resolver state",
-                    display_name
-                )));
-            }
-
-            field_name_to_id.insert(canonical_name.clone(), field_id);
-            field_id_to_meta.insert(
-                field_id,
-                FieldMetadata {
-                    display_name,
-                    canonical_name,
-                    constraints,
-                },
-            );
-        }
-
-        Ok(Self {
-            inner: Arc::new(RwLock::new(FieldResolverInner {
-                field_name_to_id,
-                field_id_to_meta,
-                next_field_id: state.next_field_id,
-            })),
-        })
-    }
-}
-
-impl Default for FieldResolver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ============================================================================
 // Persistence Types
 // ============================================================================
 
@@ -1403,28 +682,6 @@ pub struct TableState {
     pub next_field_id: FieldId,
 }
 
-/// Serializable field resolver state.
-#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
-pub struct FieldResolverState {
-    /// All fields in this resolver
-    pub fields: Vec<FieldState>,
-    /// Next field ID to assign
-    pub next_field_id: FieldId,
-}
-
-/// Serializable field state.
-#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
-pub struct FieldState {
-    /// The field's unique ID
-    pub field_id: FieldId,
-    /// Display name (preserves original case)
-    pub display_name: String,
-    /// Canonical name (lowercase)
-    pub canonical_name: String,
-    /// Persisted constraint metadata for this field
-    pub constraints: FieldConstraints,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1433,9 +690,11 @@ mod tests {
     fn test_catalog_basic_operations() {
         let catalog = TableCatalog::new();
 
-        // Register tables
-        let users_id = catalog.register_table("Users").unwrap();
-        let orders_id = catalog.register_table("Orders").unwrap();
+        // Register tables with explicit IDs (simulating metadata layer)
+        let users_id = 1;
+        let orders_id = 2;
+        catalog.register_table("Users", users_id).unwrap();
+        catalog.register_table("Orders", orders_id).unwrap();
 
         assert_ne!(users_id, orders_id);
 
@@ -1463,21 +722,21 @@ mod tests {
     fn test_catalog_duplicate_detection() {
         let catalog = TableCatalog::new();
 
-        catalog.register_table("Users").unwrap();
+        catalog.register_table("Users", 1).unwrap();
 
         // Case-insensitive duplicate detection
-        assert!(catalog.register_table("users").is_err());
-        assert!(catalog.register_table("USERS").is_err());
-        assert!(catalog.register_table("UsErS").is_err());
+        assert!(catalog.register_table("users", 2).is_err());
+        assert!(catalog.register_table("USERS", 3).is_err());
+        assert!(catalog.register_table("UsErS", 4).is_err());
     }
 
     #[test]
     fn test_catalog_table_names() {
         let catalog = TableCatalog::new();
 
-        catalog.register_table("Users").unwrap();
-        catalog.register_table("Orders").unwrap();
-        catalog.register_table("Products").unwrap();
+        catalog.register_table("Users", 1).unwrap();
+        catalog.register_table("Orders", 2).unwrap();
+        catalog.register_table("Products", 3).unwrap();
 
         let names = catalog.table_names();
         assert_eq!(names.len(), 3);
@@ -1490,14 +749,15 @@ mod tests {
     fn test_catalog_snapshot() {
         let catalog = TableCatalog::new();
 
-        let users_id = catalog.register_table("Users").unwrap();
+        let users_id = 1;
+        catalog.register_table("Users", users_id).unwrap();
         let snapshot = catalog.snapshot();
 
         // Snapshot sees existing table
         assert_eq!(snapshot.table_id("users"), Some(users_id));
 
         // Add new table after snapshot
-        catalog.register_table("Orders").unwrap();
+        catalog.register_table("Orders", 2).unwrap();
 
         // Snapshot doesn't see new table (isolation)
         assert_eq!(snapshot.table_id("orders"), None);
@@ -1577,7 +837,8 @@ mod tests {
         let catalog = TableCatalog::new();
 
         // Register table
-        let table_id = catalog.register_table("Users").unwrap();
+        let table_id = 1;
+        catalog.register_table("Users", table_id).unwrap();
 
         // Get field resolver
         let resolver = catalog.field_resolver(table_id).unwrap();
@@ -1599,7 +860,7 @@ mod tests {
     #[test]
     fn test_catalog_exists_helpers() {
         let catalog = TableCatalog::new();
-        catalog.register_table("Users").unwrap();
+        catalog.register_table("Users", 1).unwrap();
 
         assert!(catalog.table_exists("users"));
         assert!(catalog.table_exists("USERS"));
@@ -1625,8 +886,10 @@ mod tests {
         let catalog = TableCatalog::new();
 
         // Register tables with fields
-        let users_id = catalog.register_table("Users").unwrap();
-        let orders_id = catalog.register_table("Orders").unwrap();
+        let users_id = 1;
+        let orders_id = 2;
+        catalog.register_table("Users", users_id).unwrap();
+        catalog.register_table("Orders", orders_id).unwrap();
 
         let users_resolver = catalog.field_resolver(users_id).unwrap();
         let name_fid = users_resolver.register_field("name").unwrap();
@@ -1682,8 +945,10 @@ mod tests {
         let catalog = TableCatalog::new();
 
         // Register tables
-        let table1_id = catalog.register_table("Table1").unwrap();
-        let table2_id = catalog.register_table("Table2").unwrap();
+        let table1_id = 1;
+        let table2_id = 2;
+        catalog.register_table("Table1", table1_id).unwrap();
+        catalog.register_table("Table2", table2_id).unwrap();
 
         // Export and restore
         let state = catalog.export_state();
@@ -1694,7 +959,8 @@ mod tests {
         assert_eq!(restored.table_id("table2"), Some(table2_id));
 
         // New registrations should continue from saved counter
-        let table3_id = restored.register_table("Table3").unwrap();
+        let table3_id = 3;
+        restored.register_table("Table3", table3_id).unwrap();
         assert!(table3_id > table2_id);
     }
 

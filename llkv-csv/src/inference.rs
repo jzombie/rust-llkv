@@ -1,3 +1,9 @@
+//! CSV schema inference helpers shared by the reader and ingestion pipeline.
+//!
+//! The inference pass samples the input file, coerces numeric-looking strings, and returns both
+//! the normalized schema and per-column type overrides so the reader can request the desired Arrow
+//! types.
+
 use std::fs::File;
 use std::io::{BufRead, Cursor};
 use std::path::Path;

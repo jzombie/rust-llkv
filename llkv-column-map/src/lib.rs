@@ -72,10 +72,10 @@
 //   re-indent, open an issue with rustfmt (include rustfmt version and the
 //   minimal example) and link it here.
 //
-// TODO: When/if a reproducer is found, link the rustfmt issue and remove the
-// `#[rustfmt::skip]` attributes so the file can be formatted normally. If you
-// have a reproducer or additional context, please refer to this existing
-// discussion: https://github.com/rust-lang/rustfmt/issues/6629#issuecomment-3395446770
+// NOTE: Once a minimal reproducer for the rustfmt regression exists, link the
+// upstream issue here and remove the `#[rustfmt::skip]` attributes so the file
+// can return to standard formatting. Progress is tracked at
+// https://github.com/rust-lang/rustfmt/issues/6629#issuecomment-3395446770.
 
 /// Dispatches to type-specific code based on an Arrow `DataType`.
 ///

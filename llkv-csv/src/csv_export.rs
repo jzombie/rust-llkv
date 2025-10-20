@@ -1,3 +1,9 @@
+//! Export table data to CSV files or writers.
+//!
+//! The functions here wrap [`CsvWriter`] for common export scenarios so callers can pipe table
+//! rows directly into a file or any `Write` implementor, optionally applying filters or
+//! projections.
+
 use std::io::Write;
 use std::path::Path;
 
@@ -11,6 +17,7 @@ use llkv_table::{Table, types::FieldId};
 
 pub use crate::writer::{CsvExportColumn, CsvWriteOptions, CsvWriter};
 
+/// Materialize a table scan into a CSV file using column projections.
 pub fn export_csv_from_table<P, C>(
     table: &Table<P>,
     csv_path: C,
@@ -32,6 +39,7 @@ where
     result
 }
 
+/// Export a filtered table scan to a CSV file.
 pub fn export_csv_from_table_with_filter<P, C>(
     table: &Table<P>,
     csv_path: C,
@@ -47,6 +55,7 @@ where
     writer.write_columns_to_path_with_filter(csv_path, columns, filter_expr)
 }
 
+/// Stream a filtered table scan into an arbitrary writer.
 pub fn export_csv_to_writer_with_filter<P, W>(
     table: &Table<P>,
     writer: W,
@@ -62,6 +71,7 @@ where
     writer_state.write_columns_to_writer(writer, columns, filter_expr)
 }
 
+/// Export a table scan driven by explicit projections (expressions or columns) into a file.
 pub fn export_csv_from_table_with_projections<P, C, I, SP>(
     table: &Table<P>,
     csv_path: C,
@@ -79,6 +89,7 @@ where
     writer.write_projections_to_path(csv_path, projections, filter_expr)
 }
 
+/// Export a projected table scan into an arbitrary writer.
 pub fn export_csv_to_writer_with_projections<P, W, I, SP>(
     table: &Table<P>,
     writer: W,

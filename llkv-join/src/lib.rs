@@ -1,3 +1,9 @@
+//! High-level join planning API that wraps hash join execution.
+//!
+//! This crate exposes shared types (`JoinKey`, `JoinType`, `JoinOptions`) used by the
+//! planner and runtime to negotiate join configuration. Execution currently routes
+//! through the hash join implementation in [`hash_join_stream`], with a placeholder for
+//! alternate algorithms when they land.
 #![forbid(unsafe_code)]
 
 mod hash_join;
@@ -202,8 +208,12 @@ impl JoinOptions {
 }
 
 // TODO: Build out more fully or remove
+// NOTE: Validation presently only asserts that zero keys implies a Cartesian
+// join. Extend this once the planner provides richer metadata about key
+// compatibility (equality types, null semantics, etc.).
 /// Validate join keys before execution.
-/// Note: Empty keys = cross product (Cartesian product)
+///
+/// Note: Empty keys = cross product (Cartesian product).
 pub fn validate_join_keys(_keys: &[JoinKey]) -> LlkvResult<()> {
     // Empty keys is valid for cross product
     Ok(())

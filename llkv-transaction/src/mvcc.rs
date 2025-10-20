@@ -112,6 +112,8 @@ impl TxnIdManager {
     }
 
     // TODO: Is this method a good idea?  A transaction has to begin in order to determine the next ID?
+    // NOTE: This helper preserves existing call sites that only need identifiers; revisit after
+    // transaction lifecycle changes land.
     /// Convenience helper that returns only the allocated transaction ID.
     /// Prefer [`TxnIdManager::begin_transaction`] when a snapshot is required.
     pub fn next_txn_id(&self) -> TxnId {

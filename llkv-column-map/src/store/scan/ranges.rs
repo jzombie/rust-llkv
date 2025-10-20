@@ -1,6 +1,14 @@
+//! Range helpers used by scanner predicates.
+//!
+//! The `IntRanges` structure captures inclusive/exclusive bounds for all
+//! primitive Arrow types so filter dispatchers can reason about range pruning
+//! without monomorphizing the storage layout.
+
 use super::*;
 
 // TODO: Rename to ScalarRanges?
+// NOTE: Struct name reflects historical usage across integer scans; retain
+// until floating-point range pruning is fully generalized.
 #[derive(Default, Clone, Copy)]
 pub struct IntRanges {
     pub u64_r: Option<(Bound<u64>, Bound<u64>)>,

@@ -1,3 +1,8 @@
+//! Runtime storage namespace abstraction.
+//!
+//! Namespaces wrap pager-backed contexts so sessions can route operations based
+//! on table ownership (persistent vs. temporary).
+
 use std::any::Any;
 use std::sync::{Arc, RwLock};
 
@@ -9,15 +14,18 @@ use llkv_transaction::TransactionResult;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::{RuntimeContext, RuntimeStatementResult, canonical_table_name};
+use crate::{RuntimeContext, RuntimeStatementResult};
+use llkv_table::canonical_table_name;
 
 pub type NamespaceId = String;
 
 // TODO: Extract to constants module
+// NOTE: Keep string identifiers here until the runtime constants module is formalized.
 pub const PERSISTENT_NAMESPACE_ID: &str = "main";
 pub const TEMPORARY_NAMESPACE_ID: &str = "temp";
 
 // TODO: Rename to `RuntimeStorageNamespace`?
+// NOTE: Trait name mirrors the broader storage namespace concept used across crates.
 /// Trait implemented by all runtime storage namespaces.
 ///
 /// Each namespace encapsulates a single storage backend (pager + catalog + table cache).
@@ -220,7 +228,9 @@ where
 
         let catalog = self.context().table_catalog();
         for canonical in canonical_names {
-            if catalog.unregister_table(&canonical) {
+            if let Some(table_id) = catalog.table_id(&canonical)
+                && catalog.unregister_table(table_id)
+            {
                 tracing::debug!(
                     "[TEMP] Unregistered temporary table '{}' from shared catalog",
                     canonical

@@ -57,7 +57,8 @@ use self::plan_graph::{
 };
 use crate::stream::{RowStream, RowStreamBuilder};
 
-// TODO: Refactor into executor and potentially migrate any remnants to `llkv-plan`
+// NOTE: Planning and execution currently live together; once the dedicated
+// executor crate stabilizes we can migrate these components into `llkv-plan`.
 
 macro_rules! impl_single_column_emit_chunk {
     (
@@ -576,7 +577,8 @@ where
     }
 
     // TODO: Make streamable. Don't pre-buffer all row ids in memory at once.
-    // TODO: Return `LlkvResult<Vec<RowId>>`
+    // NOTE: Planner currently buffers row IDs eagerly; revisit once executor
+    // supports incremental pagination to reduce peak memory usage.
     fn plan_scan<'expr>(
         &self,
         projections: &[ScanProjection],
@@ -1120,8 +1122,10 @@ where
                                 })?
                             }
                             ScalarExpr::Aggregate(_) => {
-                                // Aggregates in computed columns return Int64
+                                // Aggregates in computed columns return Int64.
                                 // TODO: Fix: This is a simplification - ideally we'd determine type from the aggregate
+                                // NOTE: This assumes SUM-like semantics; extend once planner
+                                // carries precise aggregate signatures.
                                 DataType::Int64
                             }
                             ScalarExpr::GetField { base, field_name } => {

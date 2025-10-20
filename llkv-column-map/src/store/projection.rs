@@ -1,3 +1,9 @@
+//! Projection planners for building Arrow batches from column chunks.
+//!
+//! The projection subsystem wires descriptor metadata, chunk loading helpers,
+//! and gather routines to materialize user-facing result sets. It centralizes
+//! null-handling policies and keeps the hot paths monomorphized per Arrow type.
+
 use super::*;
 use crate::gather::{
     RowLocator, filter_rows_with_non_null as shared_filter_rows_with_non_null,
@@ -802,7 +808,7 @@ where
         )
     }
 
-    #[allow(clippy::too_many_arguments)] // TODO: Refactor
+    #[allow(clippy::too_many_arguments)] // NOTE: Signature mirrors shared helper and avoids intermediate structs.
     fn gather_rows_from_chunks_string<O>(
         row_ids: &[u64],
         row_locator: RowLocator,
@@ -850,7 +856,7 @@ where
         )
     }
 
-    #[allow(clippy::too_many_arguments)] // TODO: Refactor
+    #[allow(clippy::too_many_arguments)] // NOTE: Signature mirrors shared helper and avoids intermediate structs.
     fn gather_rows_from_chunks_binary<O>(
         row_ids: &[u64],
         row_locator: RowLocator,
@@ -877,7 +883,7 @@ where
         )
     }
 
-    #[allow(clippy::too_many_arguments)] // TODO: Refactor
+    #[allow(clippy::too_many_arguments)] // NOTE: Signature mirrors shared helper and avoids intermediate structs.
     fn gather_rows_from_chunks_bool(
         row_ids: &[u64],
         row_locator: RowLocator,
@@ -901,7 +907,7 @@ where
         )
     }
 
-    #[allow(clippy::too_many_arguments)] // TODO: Refactor
+    #[allow(clippy::too_many_arguments)] // NOTE: Signature mirrors shared helper and avoids intermediate structs.
     fn gather_rows_from_chunks_struct(
         row_locator: RowLocator,
         len: usize,
@@ -925,7 +931,7 @@ where
         )
     }
 
-    #[allow(clippy::too_many_arguments)] // TODO: Refactor
+    #[allow(clippy::too_many_arguments)] // NOTE: Signature mirrors shared helper and keeps type monomorphization straightforward.
     fn gather_rows_from_chunks<T>(
         row_ids: &[u64],
         row_locator: RowLocator,

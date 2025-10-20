@@ -33,12 +33,17 @@
 
 pub mod catalog;
 pub mod constants;
+pub mod constraints;
 pub mod gather;
+pub mod metadata;
+pub mod mvcc;
 mod planner;
 pub mod reserved;
+pub mod resolvers;
 mod scalar_eval;
 pub mod schema_ext;
 mod sys_catalog;
+pub mod view;
 pub mod expr {
     pub use llkv_expr::expr::*;
 }
@@ -48,13 +53,29 @@ pub mod types;
 
 pub mod stream;
 
+pub use catalog::{CatalogManager, CreateTableResult, FieldResolver, TableCatalogSnapshot};
+pub use constraints::{
+    CheckConstraint, ConstraintColumnInfo, ConstraintExpressionRef, ConstraintId, ConstraintKind,
+    ConstraintRecord, ConstraintService, ConstraintState, ForeignKeyAction,
+    ForeignKeyChildRowsFetch, ForeignKeyColumn, ForeignKeyConstraint, ForeignKeyParentRowsFetch,
+    ForeignKeyRowFetch, ForeignKeyTableInfo, InsertColumnConstraint, InsertMultiColumnUnique,
+    InsertUniqueColumn, PrimaryKeyConstraint, UniqueConstraint, UniqueKey, ValidatedForeignKey,
+    build_composite_unique_key, decode_constraint_row_id, encode_constraint_row_id,
+    ensure_multi_column_unique, ensure_primary_key, ensure_single_column_unique,
+    unique_key_component, validate_check_constraints, validate_foreign_key_rows,
+    validate_foreign_keys,
+};
+pub use metadata::MultiColumnUniqueRegistration;
+pub use metadata::{ForeignKeyDescriptor, MetadataManager};
 pub use reserved::CATALOG_TABLE_ID;
+pub use resolvers::{canonical_table_name, resolve_table_name};
 pub use stream::{ColumnStream, ColumnStreamBatch};
 pub use sys_catalog::{
     ColMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta, TableMultiColumnUniqueMeta,
 };
 pub use table::Table;
-pub use types::{FieldId, RowId};
+pub use types::{FieldId, ROW_ID_FIELD_ID, RowId, TableColumn, TableId};
+pub use view::{ForeignKeyView, TableConstraintSummaryView, TableView};
 
 pub use planner::plan_graph::{
     PLAN_GRAPH_VERSION, PlanAnnotations, PlanEdge, PlanEdgeMetadata, PlanExpression, PlanField,

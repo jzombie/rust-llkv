@@ -1,3 +1,9 @@
+//! Cached Arrow type metadata for logical fields.
+//!
+//! The descriptor cache accelerates repeated dtype lookups by memoizing results in
+//! memory and persisting lightweight fingerprints alongside column descriptors.
+//! This keeps hot scan and planning paths from re-reading descriptor chains.
+
 use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{ColumnDescriptor, DescriptorIterator};
 use crate::types::{LogicalFieldId, ROW_ID_FIELD_ID};
@@ -17,6 +23,19 @@ pub struct DTypeCache<P: Pager> {
     pager: Arc<P>,
     catalog: Arc<RwLock<ColumnCatalog>>,
     cache: RwLock<FxHashMap<LogicalFieldId, DataType>>,
+}
+
+impl<P> Clone for DTypeCache<P>
+where
+    P: Pager,
+{
+    fn clone(&self) -> Self {
+        Self {
+            pager: Arc::clone(&self.pager),
+            catalog: Arc::clone(&self.catalog),
+            cache: RwLock::new(FxHashMap::default()),
+        }
+    }
 }
 
 impl<P> DTypeCache<P>
@@ -40,9 +59,9 @@ where
         self.cache.read().unwrap().get(&field_id).cloned()
     }
 
-    /// Stable FNV-1a 64-bit over the Debug representation of DataType.
+    /// Stable FNV-1a 64-bit over the `Debug` representation of [`DataType`].
     #[inline]
-    #[allow(dead_code)] // TODO: Keep?
+    #[allow(dead_code)] // NOTE: Only used when persisting fresh fingerprints on descriptors.
     pub(crate) fn dtype_fingerprint(dt: &DataType) -> u64 {
         const FNV_OFFSET: u64 = 0xcbf29ce484222325;
         const FNV_PRIME: u64 = 0x100000001b3;
@@ -56,20 +75,20 @@ where
     }
 
     #[inline]
-    #[allow(dead_code)] // TODO: Keep?
+    #[allow(dead_code)] // NOTE: Exercised when existing descriptors carry cached fingerprints.
     pub(crate) fn desc_dtype_fingerprint(desc: &ColumnDescriptor) -> u64 {
         ((desc._padding as u64) << 32) | (desc.data_type_code as u64)
     }
 
     #[inline]
-    #[allow(dead_code)] // TODO: Keep?
+    #[allow(dead_code)] // NOTE: Used during descriptor bootstrap to persist new fingerprints.
     pub(crate) fn set_desc_dtype_fingerprint(desc: &mut ColumnDescriptor, fp: u64) {
         desc.data_type_code = (fp & 0xFFFF_FFFF) as u32;
         desc._padding = ((fp >> 32) & 0xFFFF_FFFF) as u32;
     }
 
     /// Returns and caches the Arrow DataType for a given field id.
-    #[allow(dead_code)] // TODO: Keep
+    #[allow(dead_code)] // NOTE: Public within crate for tests; not all call sites are compiled in every feature set.
     pub fn dtype_for_field(&self, field_id: LogicalFieldId) -> Result<DataType> {
         // Fast path: cached
         if let Some(dt) = self.cache.read().unwrap().get(&field_id).cloned() {
@@ -121,6 +140,26 @@ where
             }
             if fp == Self::dtype_fingerprint(&DataType::Int32) {
                 let dt = DataType::Int32;
+                self.cache.write().unwrap().insert(field_id, dt.clone());
+                return Ok(dt);
+            }
+            if fp == Self::dtype_fingerprint(&DataType::Int64) {
+                let dt = DataType::Int64;
+                self.cache.write().unwrap().insert(field_id, dt.clone());
+                return Ok(dt);
+            }
+            if fp == Self::dtype_fingerprint(&DataType::Float64) {
+                let dt = DataType::Float64;
+                self.cache.write().unwrap().insert(field_id, dt.clone());
+                return Ok(dt);
+            }
+            if fp == Self::dtype_fingerprint(&DataType::Utf8) {
+                let dt = DataType::Utf8;
+                self.cache.write().unwrap().insert(field_id, dt.clone());
+                return Ok(dt);
+            }
+            if fp == Self::dtype_fingerprint(&DataType::Date32) {
+                let dt = DataType::Date32;
                 self.cache.write().unwrap().insert(field_id, dt.clone());
                 return Ok(dt);
             }

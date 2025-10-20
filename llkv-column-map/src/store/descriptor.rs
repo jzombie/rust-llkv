@@ -85,6 +85,8 @@ impl ColumnDescriptor {
     pub(crate) const FIXED_DISK_SIZE: usize = Self::FIXED_DISK_SIZE_WITHOUT_INDEX_META + 4; // + index_meta_len
 
     // TODO: Separate between `data` and `rid` states?
+    // NOTE: Descriptor metadata covers both value and row-id columns; callers
+    // differentiate behavior via the `LogicalFieldId` namespace.
     /// (Internal) Loads the full state for a descriptor, creating it if it
     /// doesn't exist.
     pub(crate) fn load_or_create<P: Pager>(
@@ -98,6 +100,30 @@ impl ColumnDescriptor {
         {
             Some(GetResult::Raw { bytes, .. }) => {
                 let descriptor = ColumnDescriptor::from_le_bytes(bytes.as_ref());
+
+                // If the descriptor has been cleared (head_page_pk == 0), we need to reinitialize it
+                if descriptor.head_page_pk == 0 {
+                    tracing::debug!(
+                        ?field_id,
+                        descriptor_pk,
+                        "load_or_create: descriptor exists but is empty (head_page_pk == 0), reinitializing"
+                    );
+                    let first_page_pk = pager.alloc_many(1)?[0];
+                    let descriptor = ColumnDescriptor {
+                        field_id,
+                        head_page_pk: first_page_pk,
+                        tail_page_pk: first_page_pk,
+                        ..descriptor // Preserve other fields like registered indices
+                    };
+                    let header = DescriptorPageHeader {
+                        next_page_pk: 0,
+                        entry_count: 0,
+                        _padding: [0; 4],
+                    };
+                    let tail_page_bytes = header.to_le_bytes().to_vec();
+                    return Ok((descriptor, tail_page_bytes));
+                }
+
                 let tail_page_bytes = pager
                     .batch_get(&[BatchGet::Raw {
                         key: descriptor.tail_page_pk,
@@ -107,7 +133,14 @@ impl ColumnDescriptor {
                         GetResult::Raw { bytes, .. } => Some(bytes),
                         _ => None,
                     })
-                    .ok_or(Error::NotFound)?
+                    .ok_or_else(|| {
+                        tracing::error!(
+                            descriptor_pk,
+                            tail_page_pk = descriptor.tail_page_pk,
+                            "load_or_create: missing tail page"
+                        );
+                        Error::NotFound
+                    })?
                     .as_ref()
                     .to_vec();
                 Ok((descriptor, tail_page_bytes))
@@ -390,19 +423,3 @@ impl<'a, P: Pager> Iterator for DescriptorIterator<'a, P> {
         }
     }
 }
-
-// TODO: Keep?
-// Build a descriptor page payload (header + packed entries) with a single
-// allocation. Useful when rewriting a page after metadata updates.
-// pub(crate) fn build_descriptor_page_bytes(
-//     header: &DescriptorPageHeader,
-//     entries: &[ChunkMetadata],
-// ) -> Vec<u8> {
-//     let cap = DescriptorPageHeader::DISK_SIZE + entries.len() * ChunkMetadata::DISK_SIZE;
-//     let mut page = Vec::with_capacity(cap);
-//     page.extend_from_slice(&header.to_le_bytes());
-//     for m in entries {
-//         page.extend_from_slice(&m.to_le_bytes());
-//     }
-//     page
-// }

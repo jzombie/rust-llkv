@@ -15,10 +15,10 @@
 //   re-indent, open an issue with rustfmt (include rustfmt version and the
 //   minimal example) and link it here.
 //
-// TODO: When/if a reproducer is found, link the rustfmt issue and remove the
-// `#[rustfmt::skip]` attributes so the file can be formatted normally. If you
-// have a reproducer or additional context, please refer to this existing
-// discussion: https://github.com/rust-lang/rustfmt/issues/6629#issuecomment-3395446770
+// TODO: Track progress on the rustfmt issue and remove the `#[rustfmt::skip]`
+// attributes once stable releases keep the macro layout unchanged. See
+// https://github.com/rust-lang/rustfmt/issues/6629#issuecomment-3395446770 for
+// discussion and potential reproducers.
 
 use super::*;
 use rustc_hash::FxHashMap;

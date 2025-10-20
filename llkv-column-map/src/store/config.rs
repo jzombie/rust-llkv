@@ -1,3 +1,9 @@
+//! Runtime configuration knobs for `ColumnStore`.
+//!
+//! Values are intentionally few; prefer deriving settings from column metadata
+//! whenever possible. The defaults here act as last-resort fallbacks for
+//! variable-width arrays that lack layout hints.
+
 /// Run-time configuration (no hidden constants).
 #[derive(Debug, Clone)]
 pub(crate) struct ColumnStoreConfig {

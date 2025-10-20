@@ -69,7 +69,7 @@ pub struct RowBatch {
     pub rows: Vec<Vec<PlanValue>>,
 }
 
-/// Transaction kind enum
+/// Transaction kind enum.
 #[derive(Clone, Debug)]
 pub enum TransactionKind {
     Begin,
@@ -77,7 +77,7 @@ pub enum TransactionKind {
     Rollback,
 }
 
-/// Helper to extract table name from SelectPlan (only for single-table queries)
+/// Extracts table name from SelectPlan for single-table queries.
 fn select_plan_table_name(plan: &SelectPlan) -> Option<String> {
     if plan.tables.len() == 1 {
         Some(plan.tables[0].qualified_name())
@@ -86,8 +86,10 @@ fn select_plan_table_name(plan: &SelectPlan) -> Option<String> {
     }
 }
 
-/// Transaction result enum (simplified version for transaction module)
-#[allow(clippy::large_enum_variant)] // TODO: Consider refactoring large variants
+/// Transaction result enum (simplified version for transaction module).
+#[allow(clippy::large_enum_variant)]
+// TODO: Consider refactoring large variants
+// NOTE: The SELECT arm holds stateful execution handles; splitting it requires planner/runtime API changes.
 #[derive(Clone, Debug)]
 pub enum TransactionResult<P>
 where
@@ -1037,7 +1039,7 @@ where
     }
 }
 
-/// Transaction manager for coordinating sessions
+/// Transaction manager for coordinating sessions.
 pub struct TransactionManager<BaseCtx, StagingCtx>
 where
     BaseCtx: TransactionContext + 'static,

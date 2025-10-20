@@ -1,3 +1,8 @@
+//! Runtime aggregation utilities used by the planner and executor.
+//!
+//! The crate evaluates logical aggregates described by [`llkv_plan::AggregateExpr`] against Arrow
+//! batches. It supports streaming accumulation with overflow checks and COUNT DISTINCT tracking for
+//! a subset of scalar types.
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, Int64Builder,
     RecordBatch, StringArray,
@@ -10,15 +15,17 @@ use std::sync::Arc;
 
 pub use llkv_plan::{AggregateExpr, AggregateFunction};
 
+/// Result type alias for aggregation routines.
 pub type AggregateResult<T> = Result<T, Error>;
-/// Specification for an aggregate operation
+
+/// Specification for an aggregate operation.
 #[derive(Clone)]
 pub struct AggregateSpec {
     pub alias: String,
     pub kind: AggregateKind,
 }
 
-/// Type of aggregate operation
+/// Type of aggregate operation.
 #[derive(Clone)]
 pub enum AggregateKind {
     CountStar,
@@ -31,7 +38,7 @@ pub enum AggregateKind {
 }
 
 impl AggregateKind {
-    /// Get the field_id associated with this aggregate, if any
+    /// Returns the field ID referenced by this aggregate, if any.
     pub fn field_id(&self) -> Option<FieldId> {
         match self {
             AggregateKind::CountStar => None,
@@ -45,14 +52,14 @@ impl AggregateKind {
     }
 }
 
-/// Runtime state for an aggregate computation
+/// Runtime state for an aggregate computation.
 pub struct AggregateState {
     pub alias: String,
     pub accumulator: AggregateAccumulator,
     pub override_value: Option<i64>,
 }
 
-/// Accumulator for incremental aggregate computation
+/// Accumulator for incremental aggregate computation.
 pub enum AggregateAccumulator {
     CountStar {
         value: i64,
@@ -157,8 +164,17 @@ impl DistinctKey {
 }
 
 impl AggregateAccumulator {
-    /// Create accumulator using projection index (position in the batch columns)
-    /// instead of table schema position. projection_idx is None for CountStar.
+    /// Creates an accumulator using the projection index from a batch.
+    ///
+    /// # Arguments
+    ///
+    /// - `spec`: Aggregate specification defining the operation type
+    /// - `projection_idx`: Column position in the batch; `None` for `CountStar`
+    /// - `_total_rows_hint`: Unused optimization hint for row count
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the aggregate kind requires a projection index but none is provided.
     pub fn new_with_projection_index(
         spec: &AggregateSpec,
         projection_idx: Option<usize>,
@@ -226,7 +242,15 @@ impl AggregateAccumulator {
         }
     }
 
-    /// Update the accumulator with a new batch of data
+    /// Updates the accumulator with values from a new batch.
+    ///
+    /// # Arguments
+    ///
+    /// - `batch`: RecordBatch containing the column data to aggregate
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if column types mismatch, overflow occurs, or downcast fails.
     pub fn update(&mut self, batch: &RecordBatch) -> AggregateResult<()> {
         match self {
             AggregateAccumulator::CountStar { value } => {
@@ -347,7 +371,15 @@ impl AggregateAccumulator {
         Ok(())
     }
 
-    /// Finalize the accumulator and produce the result
+    /// Finalizes the accumulator and produces the resulting field and array.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing the output field schema and the computed aggregate value array.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if result conversion to i64 fails or arithmetic underflow occurs.
     pub fn finalize(self) -> AggregateResult<(Field, ArrayRef)> {
         match self {
             AggregateAccumulator::CountStar { value } => {
@@ -423,7 +455,13 @@ impl AggregateAccumulator {
 }
 
 impl AggregateState {
-    /// Create a new aggregate state
+    /// Creates a new aggregate state with the given components.
+    ///
+    /// # Arguments
+    ///
+    /// - `alias`: Output column name for the aggregate result
+    /// - `accumulator`: The aggregator instance performing the computation
+    /// - `override_value`: Optional fixed value to replace the computed result
     pub fn new(
         alias: String,
         accumulator: AggregateAccumulator,
@@ -436,12 +474,30 @@ impl AggregateState {
         }
     }
 
-    /// Update the state with a new batch of data
+    /// Updates the state with values from a new batch.
+    ///
+    /// # Arguments
+    ///
+    /// - `batch`: RecordBatch containing the column data to aggregate
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying accumulator update fails.
     pub fn update(&mut self, batch: &RecordBatch) -> AggregateResult<()> {
         self.accumulator.update(batch)
     }
 
-    /// Finalize the state and produce the result
+    /// Finalizes the state and produces the resulting field and array.
+    ///
+    /// Applies the alias and override value if present.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing the output field schema and the computed aggregate value array.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying accumulator finalization fails.
     pub fn finalize(self) -> AggregateResult<(Field, ArrayRef)> {
         let (mut field, array) = self.accumulator.finalize()?;
         field = field.with_name(self.alias);

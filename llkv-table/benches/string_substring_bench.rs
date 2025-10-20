@@ -30,7 +30,7 @@ fn schema_with_row_id(field: Field) -> Arc<Schema> {
 
 fn setup_table() -> Table {
     let pager = Arc::new(MemPager::default());
-    let table = Table::new(TABLE_ID, Arc::clone(&pager)).expect("table creation");
+    let table = Table::from_id(TABLE_ID, Arc::clone(&pager)).expect("table creation");
 
     let mut metadata = std::collections::HashMap::new();
     metadata.insert(

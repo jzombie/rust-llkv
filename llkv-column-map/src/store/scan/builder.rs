@@ -454,6 +454,8 @@ where
         }
 
         // TODO: Implement unsorted range filtering efficiently.
+        // NOTE: Unsorted scans currently defer range pruning until more efficient
+        // adapters are available. The adapter below simply forwards all chunks.
         // Range-filtering adapter for unsorted runs. (Pass-through today.)
         struct RangeAdapter<'v, V> {
             inner: &'v mut V,

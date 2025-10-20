@@ -55,13 +55,28 @@ pub struct ColumnStore<P: Pager> {
     index_manager: IndexManager<P>,
 }
 
+impl<P> Clone for ColumnStore<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            pager: Arc::clone(&self.pager),
+            catalog: Arc::clone(&self.catalog),
+            cfg: self.cfg.clone(),
+            dtype_cache: self.dtype_cache.clone(),
+            index_manager: self.index_manager.clone(),
+        }
+    }
+}
+
 impl<P> ColumnStore<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    /// Open or create a `ColumnStore` using the provided pager.
+    /// Opens or creates a `ColumnStore` using the provided pager.
     ///
-    /// This loads the column catalog from the pager's root catalog key, or initializes
+    /// Loads the column catalog from the pager's root catalog key, or initializes
     /// an empty catalog if none exists. The catalog maps [`LogicalFieldId`] to the
     /// physical keys of column descriptors.
     ///
@@ -92,9 +107,9 @@ where
         })
     }
 
-    /// Create and persist an index for a column.
+    /// Creates and persists an index for a column.
     ///
-    /// This builds the specified index type for all existing data in the column and
+    /// Builds the specified index type for all existing data in the column and
     /// persists it atomically. The index will be maintained automatically on subsequent
     /// appends and updates.
     ///
@@ -105,9 +120,15 @@ where
         self.index_manager.register_index(self, field_id, kind)
     }
 
-    /// Remove a persisted index from a column.
+    /// Checks if a logical field is registered in the catalog.
+    pub fn has_field(&self, field_id: LogicalFieldId) -> bool {
+        let catalog = self.catalog.read().unwrap();
+        catalog.map.contains_key(&field_id)
+    }
+
+    /// Removes a persisted index from a column.
     ///
-    /// This atomically removes the index and frees associated storage. The column data
+    /// Atomically removes the index and frees associated storage. The column data
     /// itself is not affected.
     ///
     /// # Errors
@@ -117,9 +138,9 @@ where
         self.index_manager.unregister_index(self, field_id, kind)
     }
 
-    /// Get the Arrow data type of a column.
+    /// Returns the Arrow data type of a column.
     ///
-    /// This returns the data type from cache if available, otherwise loads it from
+    /// Returns the data type from cache if available, otherwise loads it from
     /// the column descriptor and caches it for future queries.
     ///
     /// # Errors
@@ -132,9 +153,9 @@ where
         self.dtype_cache.dtype_for_field(field_id)
     }
 
-    /// Ensure that catalog entries and descriptors exist for a logical column.
+    /// Ensures that catalog entries and descriptors exist for a logical column.
     ///
-    /// This is primarily used when creating empty tables so that subsequent
+    /// Primarily used when creating empty tables so that subsequent
     /// operations (like `CREATE INDEX`) can resolve column metadata before any
     /// data has been appended.
     pub fn ensure_column_registered(
@@ -277,7 +298,20 @@ where
         res
     }
 
-    // TODO: Document
+    /// Evaluate a predicate against a column and return match metadata.
+    ///
+    /// This variant drives a primitive predicate over the column and returns a
+    /// [`FilterResult`] describing contiguous match regions. Callers can use the
+    /// result to build paginated scans or gather row identifiers.
+    ///
+    /// # Arguments
+    /// - `field_id`: Logical column to filter.
+    /// - `predicate`: Callable invoked on each value; should be cheap and free of
+    ///   side effects.
+    ///
+    /// # Errors
+    /// Returns an error if the column metadata cannot be loaded or if decoding a
+    /// chunk fails.
     pub fn filter_matches<T, F>(
         &self,
         field_id: LogicalFieldId,
@@ -499,25 +533,26 @@ where
         Ok(false)
     }
 
-    // TODO: Set up a way to optionally auto-increment a row ID column if not provided.
+    // NOTE: Row IDs must be provided explicitly today. Consider introducing an
+    // opt-in auto-increment mode once table-level schema metadata can enforce it.
     /// Append a [`RecordBatch`] to the store.
     ///
     /// The batch must include a `rowid` column (type `UInt64`) that uniquely identifies
     /// each row. Each other column must have `field_id` metadata mapping it to a
     /// [`LogicalFieldId`].
     ///
-    /// ## Last-Write-Wins Updates
+    /// # Last-Write-Wins Updates
     ///
     /// If any row IDs in the batch already exist, they are updated in-place (overwritten)
     /// rather than creating duplicates. This happens in a separate transaction before
     /// appending new rows.
     ///
-    /// ## Row ID Ordering
+    /// # Row ID Ordering
     ///
     /// The batch is automatically sorted by `rowid` if not already sorted. This ensures
     /// efficient metadata updates and naturally sorted shadow columns.
     ///
-    /// ## Table Separation
+    /// # Table Separation
     ///
     /// Each batch should contain columns from only one table. To append to multiple
     /// tables, call `append` separately for each table's batch (may be concurrent).
@@ -528,8 +563,13 @@ where
     /// - The batch is missing the `rowid` column
     /// - Column metadata is missing or invalid
     /// - Storage operations fail
-    #[allow(unused_variables, unused_assignments)] // TODO: Keep `presence_index_created`?
+    #[allow(unused_variables, unused_assignments)] // NOTE: Preserve variable hooks used during feature gating of presence indexes.
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
+        tracing::trace!(
+            num_columns = batch.num_columns(),
+            num_rows = batch.num_rows(),
+            "ColumnStore::append BEGIN"
+        );
         // --- PHASE 1: PRE-PROCESSING THE INCOMING BATCH ---
         // The `append` logic relies on row IDs being processed in ascending order to handle
         // metadata updates efficiently and to ensure the shadow row_id chunks are naturally sorted.
@@ -584,6 +624,8 @@ where
                 &working_batch
             }
         };
+
+        tracing::trace!("ColumnStore::append PHASE 1 complete - batch preprocessed");
 
         // --- PHASE 2: LAST-WRITER-WINS (LWW) REWRITE ---
         // This phase handles updates. It identifies any rows in the incoming batch that
@@ -644,6 +686,8 @@ where
             self.pager.batch_put(&puts_rewrites)?;
         }
 
+        tracing::trace!("ColumnStore::append PHASE 2 complete - LWW rewrites done");
+
         // --- PHASE 3: FILTERING FOR NEW ROWS ---
         // After handling updates, we filter the incoming batch to remove the rows that were
         // just rewritten. The remaining rows are guaranteed to be new additions to the store.
@@ -659,8 +703,11 @@ where
 
         // If no new rows are left, we are done.
         if batch_to_append.num_rows() == 0 {
+            tracing::trace!("ColumnStore::append early exit - no new rows to append");
             return Ok(());
         }
+
+        tracing::trace!("ColumnStore::append PHASE 3 complete - filtered for new rows");
 
         // --- PHASE 4: APPENDING NEW DATA ---
         // This is the main append transaction. All writes generated in this phase will be
@@ -725,12 +772,30 @@ where
             // Load the descriptors and their tail metadata pages into memory.
             // If they don't exist, `load_or_create` will initialize new ones.
             let (mut data_descriptor, mut data_tail_page) =
-                ColumnDescriptor::load_or_create(Arc::clone(&self.pager), descriptor_pk, field_id)?;
+                ColumnDescriptor::load_or_create(Arc::clone(&self.pager), descriptor_pk, field_id)
+                    .map_err(|e| {
+                        tracing::error!(
+                            ?field_id,
+                            descriptor_pk,
+                            error = ?e,
+                            "append: load_or_create failed for data descriptor"
+                        );
+                        e
+                    })?;
             let (mut rid_descriptor, mut rid_tail_page) = ColumnDescriptor::load_or_create(
                 Arc::clone(&self.pager),
                 rid_descriptor_pk,
                 rid_fid,
-            )?;
+            )
+            .map_err(|e| {
+                tracing::error!(
+                    ?rid_fid,
+                    rid_descriptor_pk,
+                    error = ?e,
+                    "append: load_or_create failed for rid descriptor"
+                );
+                e
+            })?;
 
             // Logically register the Presence index on the main data descriptor. This ensures
             // that even if no physical index chunks are created (because data arrived sorted),
@@ -872,6 +937,7 @@ where
         if !puts_appends.is_empty() {
             self.pager.batch_put(&puts_appends)?;
         }
+        tracing::trace!("ColumnStore::append END - success");
         Ok(())
     }
 
@@ -917,21 +983,50 @@ where
             }
         }
 
-        let desc_blob_data = blobs_by_pk.remove(&desc_pk_data).ok_or(Error::NotFound)?;
+        let desc_blob_data = blobs_by_pk.remove(&desc_pk_data).ok_or_else(|| {
+            tracing::error!(
+                ?field_id,
+                desc_pk_data,
+                "lww_rewrite: data descriptor blob not found in pager"
+            );
+            Error::NotFound
+        })?;
         let mut descriptor_data = ColumnDescriptor::from_le_bytes(desc_blob_data.as_ref());
 
-        let desc_blob_rid = blobs_by_pk.remove(&desc_pk_rid).ok_or(Error::NotFound)?;
+        let desc_blob_rid = blobs_by_pk.remove(&desc_pk_rid).ok_or_else(|| {
+            tracing::error!(
+                ?rid_fid,
+                desc_pk_rid,
+                "lww_rewrite: rid descriptor blob not found in pager"
+            );
+            Error::NotFound
+        })?;
         let mut descriptor_rid = ColumnDescriptor::from_le_bytes(desc_blob_rid.as_ref());
+
+        tracing::trace!(?field_id, "lww_rewrite: descriptors loaded successfully");
 
         // Collect chunk metadata.
         let mut metas_data: Vec<ChunkMetadata> = Vec::new();
         let mut metas_rid: Vec<ChunkMetadata> = Vec::new();
         for m in DescriptorIterator::new(self.pager.as_ref(), descriptor_data.head_page_pk) {
-            metas_data.push(m?);
+            metas_data.push(m.map_err(|e| {
+                tracing::error!(?field_id, error = ?e, "lww_rewrite: failed to iterate data descriptor");
+                e
+            })?);
         }
         for m in DescriptorIterator::new(self.pager.as_ref(), descriptor_rid.head_page_pk) {
-            metas_rid.push(m?);
+            metas_rid.push(m.map_err(|e| {
+                tracing::error!(?rid_fid, error = ?e, "lww_rewrite: failed to iterate rid descriptor");
+                e
+            })?);
         }
+
+        tracing::trace!(
+            ?field_id,
+            data_chunks = metas_data.len(),
+            rid_chunks = metas_rid.len(),
+            "lww_rewrite: chunk metadata collected"
+        );
 
         // Classify incoming rows: delete vs upsert.
         let rid_in = incoming_row_ids
@@ -1433,6 +1528,8 @@ where
     }
 
     // TODO: Move to descriptor module?
+    // NOTE: This helper mutates descriptor metadata in place because it needs
+    // access to the pager and catalog locks owned by `ColumnStore`.
     /// Write a descriptor chain from a meta slice. Reuses first page when
     /// possible. Frees surplus pages via `frees`.
     pub(crate) fn write_descriptor_chain(
@@ -1473,6 +1570,13 @@ where
         // If empty: free everything and clear counters.
         if need_pages == 0 {
             frees.extend(old_pages.iter().copied());
+
+            // Setting both page pointers to 0 indicates an empty descriptor state.
+            // This signals that the descriptor needs reinitialization on next access,
+            // as this pattern (head_page_pk == 0 && tail_page_pk == 0) is checked
+            // in the `load_or_create` method to determine if allocation is needed.
+            descriptor.head_page_pk = 0;
+            descriptor.tail_page_pk = 0;
             descriptor.total_row_count = 0;
             descriptor.total_chunk_count = 0;
             puts.push(BatchPut::Raw {

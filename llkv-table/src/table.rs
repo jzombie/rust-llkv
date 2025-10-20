@@ -11,7 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 
 use crate::constants::STREAM_BATCH_ROWS;
-use llkv_column_map::store::{GatherNullPolicy, Projection, ROW_ID_COLUMN_NAME};
+use llkv_column_map::store::{GatherNullPolicy, IndexKind, Projection, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{ColumnStore, types::LogicalFieldId};
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -30,34 +30,13 @@ struct MvccColumnCache {
     has_deleted_by: bool,
 }
 
-/// A schema-aware table built on top of columnar storage.
+/// Handle for data operations on a table.
 ///
-/// `Table` provides a higher-level interface than [`ColumnStore`], adding:
-///
-/// - **Schema management**: Validates field IDs and data types on append
-/// - **MVCC integration**: Automatically manages `created_by` and `deleted_by` columns
-/// - **Scan operations**: Supports projection, filtering, ordering, and computed columns
-/// - **Row ID filtering**: Allows transaction visibility enforcement via [`RowIdFilter`]
-///
-/// # Table IDs
-///
-/// Each table is identified by a [`TableId`]. Table 0 is reserved for the system catalog.
-/// User tables start at ID 1.
-///
-/// # Field IDs
-///
-/// Each column is assigned a [`FieldId`] stored in the Arrow field metadata. This maps
-/// to a [`LogicalFieldId`] in the underlying storage layer, combining the table ID,
-/// namespace, and field ID.
-///
-/// # Thread Safety
-///
-/// `Table` is `Send + Sync` and can be safely shared via `Arc`.
 pub struct Table<P = MemPager>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    store: ColumnStore<P>,
+    store: Arc<ColumnStore<P>>,
     table_id: TableId,
     /// Cache of MVCC column presence. Initialized lazily on first schema() call.
     /// None means not yet initialized.
@@ -245,33 +224,102 @@ impl<P> Table<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    /// Create a new `Table` instance for the given table ID.
+    /// Create a new table from column specifications.
     ///
-    /// This opens the underlying [`ColumnStore`] and initializes table-specific state.
-    /// The table does not need to already exist; this method works for both new and
-    /// existing tables.
+    /// Coordinates metadata persistence, catalog registration, and storage initialization.
+    pub fn create_from_columns(
+        display_name: &str,
+        canonical_name: &str,
+        columns: &[llkv_plan::ColumnSpec],
+        metadata: Arc<crate::metadata::MetadataManager<P>>,
+        catalog: Arc<crate::catalog::TableCatalog>,
+        store: Arc<ColumnStore<P>>,
+    ) -> LlkvResult<crate::catalog::CreateTableResult<P>> {
+        let service = crate::catalog::CatalogManager::new(metadata, catalog, store);
+        service.create_table_from_columns(display_name, canonical_name, columns)
+    }
+
+    /// Create a new table from an Arrow schema (for CREATE TABLE AS SELECT).
+    pub fn create_from_schema(
+        display_name: &str,
+        canonical_name: &str,
+        schema: &arrow::datatypes::Schema,
+        metadata: Arc<crate::metadata::MetadataManager<P>>,
+        catalog: Arc<crate::catalog::TableCatalog>,
+        store: Arc<ColumnStore<P>>,
+    ) -> LlkvResult<crate::catalog::CreateTableResult<P>> {
+        let service = crate::catalog::CatalogManager::new(metadata, catalog, store);
+        service.create_table_from_schema(display_name, canonical_name, schema)
+    }
+
+    /// Internal constructor: wrap a table ID with column store access.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The table ID is reserved (e.g., table 0)
-    /// - The column store cannot be opened
-    pub fn new(table_id: TableId, pager: Arc<P>) -> LlkvResult<Self> {
+    /// **This is for internal crate use only.** User code should create tables via
+    /// `CatalogService::create_table_*()`. For tests, use `Table::from_id()`.
+    #[doc(hidden)]
+    pub fn from_id(table_id: TableId, pager: Arc<P>) -> LlkvResult<Self> {
         if is_reserved_table_id(table_id) {
             return Err(Error::ReservedTableId(table_id));
         }
 
         tracing::trace!(
-            "!!! Table::new: Creating table table_id={} with pager at {:p}",
+            "Table::from_id: Opening table_id={} with pager at {:p}",
             table_id,
             &*pager
         );
         let store = ColumnStore::open(pager)?;
         Ok(Self {
+            store: Arc::new(store),
+            table_id,
+            mvcc_cache: RwLock::new(None),
+        })
+    }
+
+    /// Internal constructor: wrap a table ID with a shared column store.
+    ///
+    /// **This is for internal crate use only.** Preferred over `from_id()` when
+    /// multiple tables share the same store. For tests, use `Table::from_id_with_store()`.
+    #[doc(hidden)]
+    pub fn from_id_and_store(table_id: TableId, store: Arc<ColumnStore<P>>) -> LlkvResult<Self> {
+        if is_reserved_table_id(table_id) {
+            return Err(Error::ReservedTableId(table_id));
+        }
+
+        Ok(Self {
             store,
             table_id,
             mvcc_cache: RwLock::new(None),
         })
+    }
+
+    /// Register a persisted sort index for the specified user column.
+    pub fn register_sort_index(&self, field_id: FieldId) -> LlkvResult<()> {
+        let logical_field_id = LogicalFieldId::for_user(self.table_id, field_id);
+        self.store
+            .register_index(logical_field_id, IndexKind::Sort)?;
+        Ok(())
+    }
+
+    /// Remove a persisted sort index for the specified user column if it exists.
+    pub fn unregister_sort_index(&self, field_id: FieldId) -> LlkvResult<()> {
+        let logical_field_id = LogicalFieldId::for_user(self.table_id, field_id);
+        match self
+            .store
+            .unregister_index(logical_field_id, IndexKind::Sort)
+        {
+            Ok(()) | Err(Error::NotFound) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// List the persisted index kinds registered for the given user column.
+    pub fn list_registered_indexes(&self, field_id: FieldId) -> LlkvResult<Vec<IndexKind>> {
+        let logical_field_id = LogicalFieldId::for_user(self.table_id, field_id);
+        match self.store.list_persisted_indexes(logical_field_id) {
+            Ok(kinds) => Ok(kinds),
+            Err(Error::NotFound) => Ok(Vec::new()),
+            Err(err) => Err(err),
+        }
     }
 
     /// Get or initialize the MVCC column cache from the provided schema.
@@ -312,12 +360,12 @@ where
     /// - A `row_id` column (type `UInt64`) with unique row identifiers
     /// - `field_id` metadata for each user column, mapping to this table's field IDs
     ///
-    /// ## MVCC Columns
+    /// # MVCC Columns
     ///
     /// If the batch includes `created_by` or `deleted_by` columns, they are automatically
     /// assigned the correct [`LogicalFieldId`] for this table's MVCC metadata.
     ///
-    /// ## Field ID Mapping
+    /// # Field ID Mapping
     ///
     /// Each column's `field_id` metadata is converted to a [`LogicalFieldId`] by combining
     /// it with this table's ID. This ensures columns from different tables don't collide
@@ -442,7 +490,7 @@ where
                     flags: 0,
                     default: None,
                 };
-                self.put_col_meta(&meta);
+                self.catalog().put_col_meta(self.table_id, &meta);
             }
         }
 
@@ -502,7 +550,41 @@ where
 
         let new_schema = Arc::new(Schema::new(new_fields));
         let namespaced_batch = RecordBatch::try_new(new_schema, new_columns)?;
-        self.store.append(&namespaced_batch)
+
+        tracing::trace!(
+            table_id = self.table_id,
+            num_columns = namespaced_batch.num_columns(),
+            num_rows = namespaced_batch.num_rows(),
+            "Attempting append to table"
+        );
+
+        if let Err(err) = self.store.append(&namespaced_batch) {
+            let batch_field_ids: Vec<LogicalFieldId> = namespaced_batch
+                .schema()
+                .fields()
+                .iter()
+                .filter_map(|f| f.metadata().get(crate::constants::FIELD_ID_META_KEY))
+                .filter_map(|s| s.parse::<u64>().ok())
+                .map(LogicalFieldId::from)
+                .collect();
+
+            // Check which fields are missing from the catalog
+            let missing_fields: Vec<LogicalFieldId> = batch_field_ids
+                .iter()
+                .filter(|&&field_id| !self.store.has_field(field_id))
+                .copied()
+                .collect();
+
+            tracing::error!(
+                table_id = self.table_id,
+                error = ?err,
+                batch_field_ids = ?batch_field_ids,
+                missing_from_catalog = ?missing_fields,
+                "Append failed - some fields missing from catalog"
+            );
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Stream one or more projected columns as a sequence of RecordBatches.
@@ -529,7 +611,11 @@ where
         self.scan_stream_with_exprs(&stream_projections, filter_expr, options, on_batch)
     }
 
-    // TODO: Document difference between this and `scan_stream`
+    /// Stream projections using fully resolved expression inputs.
+    ///
+    /// Callers that already parsed expressions into [`ScanProjection`] values can
+    /// use this entry point to skip the iterator conversion performed by
+    /// [`Self::scan_stream`]. The execution semantics and callbacks are identical.
     pub fn scan_stream_with_exprs<'a, F>(
         &self,
         projections: &[ScanProjection],
@@ -553,19 +639,8 @@ where
     }
 
     #[inline]
-    pub fn put_table_meta(&self, meta: &TableMeta) {
-        debug_assert_eq!(meta.table_id, self.table_id);
-        self.catalog().put_table_meta(meta);
-    }
-
-    #[inline]
     pub fn get_table_meta(&self) -> Option<TableMeta> {
         self.catalog().get_table_meta(self.table_id)
-    }
-
-    #[inline]
-    pub fn put_col_meta(&self, meta: &ColMeta) {
-        self.catalog().put_col_meta(self.table_id, meta);
     }
 
     #[inline]
@@ -728,7 +803,7 @@ mod tests {
     }
 
     fn setup_test_table_with_pager(pager: &Arc<MemPager>) -> Table {
-        let table = Table::new(1, Arc::clone(pager)).unwrap();
+        let table = Table::from_id(1, Arc::clone(pager)).unwrap();
         const COL_A_U64: FieldId = 10;
         const COL_B_BIN: FieldId = 11;
         const COL_C_I32: FieldId = 12;
@@ -807,7 +882,7 @@ mod tests {
 
     #[test]
     fn table_new_rejects_reserved_table_id() {
-        let result = Table::new(CATALOG_TABLE_ID, Arc::new(MemPager::default()));
+        let result = Table::from_id(CATALOG_TABLE_ID, Arc::new(MemPager::default()));
         assert!(matches!(
             result,
             Err(Error::ReservedTableId(id)) if id == CATALOG_TABLE_ID
@@ -819,7 +894,7 @@ mod tests {
         // Create a table and build a schema where the column's metadata
         // contains a fully-qualified LogicalFieldId (u64). Append should
         // reject this and require a plain user FieldId instead.
-        let table = Table::new(7, Arc::new(MemPager::default())).unwrap();
+        let table = Table::from_id(7, Arc::new(MemPager::default())).unwrap();
 
         const USER_FID: FieldId = 42;
         // Build a logical id (namespaced) and put its numeric value into metadata
@@ -878,7 +953,7 @@ mod tests {
     #[test]
     fn test_scan_with_string_filter() {
         let pager = Arc::new(MemPager::default());
-        let table = Table::new(500, Arc::clone(&pager)).unwrap();
+        let table = Table::from_id(500, Arc::clone(&pager)).unwrap();
 
         const COL_STR: FieldId = 42;
         let schema = Arc::new(Schema::new(vec![
@@ -953,7 +1028,7 @@ mod tests {
 
         // First session: create tables and write data.
         {
-            let table = Table::new(TABLE_ALPHA, Arc::clone(&pager)).unwrap();
+            let table = Table::from_id(TABLE_ALPHA, Arc::clone(&pager)).unwrap();
             let schema = Arc::new(Schema::new(vec![
                 Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
                 Field::new("alpha_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
@@ -988,7 +1063,7 @@ mod tests {
         }
 
         {
-            let table = Table::new(TABLE_BETA, Arc::clone(&pager)).unwrap();
+            let table = Table::from_id(TABLE_BETA, Arc::clone(&pager)).unwrap();
             let schema = Arc::new(Schema::new(vec![
                 Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
                 Field::new("beta_u64", DataType::UInt64, false).with_metadata(HashMap::from([(
@@ -1013,7 +1088,7 @@ mod tests {
         }
 
         {
-            let table = Table::new(TABLE_GAMMA, Arc::clone(&pager)).unwrap();
+            let table = Table::from_id(TABLE_GAMMA, Arc::clone(&pager)).unwrap();
             let schema = Arc::new(Schema::new(vec![
                 Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
                 Field::new("gamma_i16", DataType::Int16, false).with_metadata(HashMap::from([(
@@ -1034,7 +1109,7 @@ mod tests {
 
         // Second session: reopen each table and ensure schema and values are intact.
         {
-            let table = Table::new(TABLE_ALPHA, Arc::clone(&pager)).unwrap();
+            let table = Table::from_id(TABLE_ALPHA, Arc::clone(&pager)).unwrap();
             let store = table.store();
 
             let expectations: &[(FieldId, DataType)] = &[
@@ -1071,7 +1146,7 @@ mod tests {
         }
 
         {
-            let table = Table::new(TABLE_BETA, Arc::clone(&pager)).unwrap();
+            let table = Table::from_id(TABLE_BETA, Arc::clone(&pager)).unwrap();
             let store = table.store();
 
             let lfid_u64 = LogicalFieldId::for_user(TABLE_BETA, COL_BETA_U64);
@@ -1088,7 +1163,7 @@ mod tests {
         }
 
         {
-            let table = Table::new(TABLE_GAMMA, Arc::clone(&pager)).unwrap();
+            let table = Table::from_id(TABLE_GAMMA, Arc::clone(&pager)).unwrap();
             let store = table.store();
             let lfid = LogicalFieldId::for_user(TABLE_GAMMA, COL_GAMMA_I16);
             assert_eq!(store.data_type(lfid).unwrap(), DataType::Int16);
@@ -1690,7 +1765,7 @@ mod tests {
         //   streaming. No concat or whole-column materialization.
         use arrow::array::{Int16Array, UInt8Array, UInt32Array};
 
-        let table = Table::new(2, Arc::new(MemPager::default())).unwrap();
+        let table = Table::from_id(2, Arc::new(MemPager::default())).unwrap();
 
         const COL_A_U64: FieldId = 20;
         const COL_D_U32: FieldId = 21;

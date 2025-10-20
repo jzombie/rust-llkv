@@ -1,3 +1,9 @@
+//! Row gathering helpers for assembling Arrow arrays across chunks.
+//!
+//! These utilities provide shared implementations used by projections, joins,
+//! and multi-column scans. They focus on minimizing temporary allocations while
+//! preserving row order guarantees.
+
 use std::mem;
 use std::sync::Arc;
 
@@ -24,6 +30,28 @@ use simd_r_drive_entry_handle::EntryHandle;
 /// array, avoiding the per-row allocations that arise from repeatedly slicing
 /// the input column. The order of `indices` is preserved in the returned
 /// columns. An empty `indices` slice yields an empty vector.
+///
+/// # Examples
+///
+/// ```
+/// use arrow::array::Int32Array;
+/// use arrow::datatypes::{DataType, Field, Schema};
+/// use arrow::record_batch::RecordBatch;
+/// use llkv_column_map::gather::gather_indices;
+/// use std::sync::Arc;
+///
+/// let schema = Schema::new(vec![Field::new("values", DataType::Int32, false)]);
+/// let batch = RecordBatch::try_new(
+///     Arc::new(schema),
+///     vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+/// )
+/// .unwrap();
+///
+/// let columns = gather_indices(&batch, &[2, 0]).unwrap();
+/// let values = columns[0].as_any().downcast_ref::<Int32Array>().unwrap();
+/// let collected: Vec<_> = values.values().iter().copied().collect();
+/// assert_eq!(collected, vec![30, 10]);
+/// ```
 pub fn gather_indices(batch: &RecordBatch, indices: &[usize]) -> LlkvResult<Vec<ArrayRef>> {
     if indices.is_empty() {
         return Ok(Vec::new());
@@ -49,6 +77,34 @@ pub fn gather_indices(batch: &RecordBatch, indices: &[usize]) -> LlkvResult<Vec<
 /// same batch so each underlying column is scanned once per run, minimizing
 /// Arrow allocations. The returned column slices are concatenated in the input
 /// order. Supplying an empty `indices` slice returns an empty vector.
+///
+/// # Examples
+///
+/// ```
+/// use arrow::array::Int32Array;
+/// use arrow::datatypes::{DataType, Field, Schema};
+/// use arrow::record_batch::RecordBatch;
+/// use llkv_column_map::gather::gather_indices_from_batches;
+/// use std::sync::Arc;
+///
+/// let schema = Arc::new(Schema::new(vec![Field::new("values", DataType::Int32, false)]));
+/// let batch_a = RecordBatch::try_new(
+///     schema.clone(),
+///     vec![Arc::new(Int32Array::from(vec![1, 2]))],
+/// )
+/// .unwrap();
+/// let batch_b = RecordBatch::try_new(
+///     schema,
+///     vec![Arc::new(Int32Array::from(vec![3, 4]))],
+/// )
+/// .unwrap();
+///
+/// let batches = vec![batch_a.clone(), batch_b.clone()];
+/// let columns = gather_indices_from_batches(&batches, &[(0, 1), (1, 0)]).unwrap();
+/// let values = columns[0].as_any().downcast_ref::<Int32Array>().unwrap();
+/// let collected: Vec<_> = values.values().iter().copied().collect();
+/// assert_eq!(collected, vec![2, 3]);
+/// ```
 pub fn gather_indices_from_batches(
     batches: &[RecordBatch],
     indices: &[(usize, usize)],

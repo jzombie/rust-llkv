@@ -17,7 +17,7 @@ fn create_table_with_rows(
     pager: &Arc<MemPager>,
     num_rows: usize,
 ) -> Table<MemPager> {
-    let table = Table::new(table_id, Arc::clone(pager)).unwrap();
+    let table = Table::from_id(table_id, Arc::clone(pager)).unwrap();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),

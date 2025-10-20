@@ -292,7 +292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lfid = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
 
     // Create table and append data once (ensures catalog metadata matches Table expectations)
-    let table = Table::new(TABLE_ID, Arc::clone(&pager))?;
+    let table = Table::from_id(TABLE_ID, Arc::clone(&pager))?;
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         field_with_fid("test_col", DataType::Int64, FIELD_ID, false),
