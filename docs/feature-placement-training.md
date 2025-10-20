@@ -22,6 +22,7 @@ This guide keeps feature work aligned with our architecture so we avoid wasteful
 - [ ] Reviewed existing modules to avoid re-implementing the same capability.
 - [ ] Ran benchmarks or targeted tests when performance-sensitive paths are touched.
 - [ ] Confirmed Cargo manifests stay acyclic.
+- [ ] New dependencies should be treated as workspace dependencies. You never know if another crate might eventually reuse a dependency.
 - [ ] Updated the crate linkage diagram if the dependency graph changes.
 
 Keep this checklist close; following it is cheaper than repeating large-scale refactors later.
