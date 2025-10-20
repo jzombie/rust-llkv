@@ -243,6 +243,7 @@ where
 
     /// Register a single-column sort (B-tree) index. Optionally marks the field unique.
     /// Returns `true` if the index was newly created, `false` if it already existed and `if_not_exists` was true.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_single_column_index(
         &self,
         display_name: &str,
@@ -363,6 +364,7 @@ where
     }
 
     /// Validate and register foreign keys for a newly created table.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_foreign_keys_for_new_table<F>(
         &self,
         table_id: TableId,
@@ -568,9 +570,7 @@ where
             Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
         })?;
 
-        self.metadata
-            .foreign_key_views(&self.catalog, table_id)
-            .map_err(Into::into)
+        self.metadata.foreign_key_views(&self.catalog, table_id)
     }
 
     /// Return constraint-related catalog metadata for the specified table.
@@ -599,10 +599,7 @@ where
     fn sorted_user_fields(
         &self,
         table_id: TableId,
-    ) -> (
-        Vec<llkv_column_map::types::LogicalFieldId>,
-        Vec<FieldId>,
-    ) {
+    ) -> (Vec<llkv_column_map::types::LogicalFieldId>, Vec<FieldId>) {
         let mut logical_fields = self.store.user_field_ids_for_table(table_id);
         logical_fields.sort_by_key(|lfid| lfid.field_id());
         let field_ids = logical_fields
@@ -618,9 +615,7 @@ where
         table_id: TableId,
         field_ids: &[FieldId],
     ) -> LlkvResult<TableView> {
-        self.metadata
-            .table_view(&self.catalog, table_id, field_ids)
-            .map_err(Into::into)
+        self.metadata.table_view(&self.catalog, table_id, field_ids)
     }
 
     // -------------------------------------------------------------------------

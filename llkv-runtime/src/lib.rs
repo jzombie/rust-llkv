@@ -1723,9 +1723,7 @@ where
     }
 
     pub fn table_view(&self, canonical_name: &str) -> Result<TableView> {
-        self.catalog_service
-            .table_view(canonical_name)
-            .map_err(Into::into)
+        self.catalog_service.table_view(canonical_name)
     }
 
     fn filter_visible_row_ids(
@@ -1746,16 +1744,12 @@ where
 
     pub fn table_column_specs(self: &Arc<Self>, name: &str) -> Result<Vec<ColumnSpec>> {
         let (_, canonical_name) = canonical_table_name(name)?;
-        self.catalog_service
-            .table_column_specs(&canonical_name)
-            .map_err(Into::into)
+        self.catalog_service.table_column_specs(&canonical_name)
     }
 
     pub fn foreign_key_views(self: &Arc<Self>, name: &str) -> Result<Vec<ForeignKeyView>> {
         let (_, canonical_name) = canonical_table_name(name)?;
-        self.catalog_service
-            .foreign_key_views(&canonical_name)
-            .map_err(Into::into)
+        self.catalog_service.foreign_key_views(&canonical_name)
     }
 
     pub fn export_table_rows(self: &Arc<Self>, name: &str) -> Result<RowBatch> {
@@ -4108,7 +4102,7 @@ where
         let field_ids: Vec<FieldId> = logical_fields.iter().map(|lfid| lfid.field_id()).collect();
         let summary = self
             .catalog_service
-            .table_constraint_summary(&canonical_name)?;
+            .table_constraint_summary(canonical_name)?;
         let TableConstraintSummaryView {
             table_meta,
             column_metas,

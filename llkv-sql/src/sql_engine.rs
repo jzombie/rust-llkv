@@ -10,6 +10,9 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_executor::SelectExecution;
 use llkv_expr::literal::Literal;
+use llkv_plan::validation::{
+    ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
+};
 use llkv_result::Error;
 use llkv_runtime::storage_namespace::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
@@ -19,22 +22,19 @@ use llkv_runtime::{
     RuntimeContext, RuntimeEngine, RuntimeSession, RuntimeStatementResult, SelectPlan,
     SelectProjection, UpdatePlan, extract_rows_from_range,
 };
-use llkv_plan::validation::{
-    ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
-};
 use llkv_storage::pager::Pager;
 use llkv_table::catalog::{IdentifierContext, IdentifierResolver};
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
-    ColumnOptionDef, DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable,
-    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause,
-    NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType, OrderBy, OrderByKind, Query,
-    ConstraintCharacteristics,
-    ReferentialAction, SchemaName, Select, SelectItem, SelectItemQualifiedWildcardKind, Set,
-    SetExpr, SqlOption, Statement, TableConstraint, TableFactor, TableObject, TableWithJoins,
-    TransactionMode, TransactionModifier, UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
+    ColumnOptionDef, ConstraintCharacteristics, DataType as SqlDataType, Delete, ExceptionWhen,
+    Expr as SqlExpr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    Ident, LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType, OrderBy,
+    OrderByKind, Query, ReferentialAction, SchemaName, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableConstraint,
+    TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
+    UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -522,12 +522,16 @@ where
             .iter()
             .map(|column_def| column_def.name.value.clone())
             .collect();
-        ensure_unique_case_insensitive(
-            column_names.iter().map(|name| name.as_str()),
-            |dup| format!("duplicate column name '{}' in table '{}'", dup, display_name),
-        )?;
-        let column_names_lower: HashSet<String> =
-            column_names.iter().map(|name| name.to_ascii_lowercase()).collect();
+        ensure_unique_case_insensitive(column_names.iter().map(|name| name.as_str()), |dup| {
+            format!(
+                "duplicate column name '{}' in table '{}'",
+                dup, display_name
+            )
+        })?;
+        let column_names_lower: HashSet<String> = column_names
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
 
         let mut columns: Vec<ColumnSpec> = Vec::with_capacity(column_defs_ast.len());
         let mut primary_key_columns: HashSet<String> = HashSet::new();
@@ -588,8 +592,8 @@ where
                         vec![column_def.name.value.clone()],
                         foreign_table,
                         referred_columns,
-                        on_delete.clone(),
-                        on_update.clone(),
+                        *on_delete,
+                        *on_update,
                         characteristics,
                         &column_names_lower,
                         None,
@@ -661,7 +665,8 @@ where
                             "PRIMARY KEY requires at least one column".into()
                         })?;
 
-                        let mut pk_column_names: Vec<String> = Vec::with_capacity(constraint_columns.len());
+                        let mut pk_column_names: Vec<String> =
+                            Vec::with_capacity(constraint_columns.len());
 
                         for index_col in &constraint_columns {
                             let column_ident = extract_index_column_name(
@@ -675,19 +680,15 @@ where
 
                         ensure_unique_case_insensitive(
                             pk_column_names.iter().map(|name| name.as_str()),
-                            |dup| format!(
-                                "duplicate column '{}' in PRIMARY KEY constraint",
-                                dup
-                            ),
+                            |dup| format!("duplicate column '{}' in PRIMARY KEY constraint", dup),
                         )?;
 
                         ensure_known_columns_case_insensitive(
                             pk_column_names.iter().map(|name| name.as_str()),
                             &column_names_lower,
-                            |unknown| format!(
-                                "unknown column '{}' in PRIMARY KEY constraint",
-                                unknown
-                            ),
+                            |unknown| {
+                                format!("unknown column '{}' in PRIMARY KEY constraint", unknown)
+                            },
                         )?;
 
                         for column_ident in pk_column_names {
@@ -765,19 +766,13 @@ where
 
                         ensure_unique_case_insensitive(
                             unique_column_names.iter().map(|name| name.as_str()),
-                            |dup| format!(
-                                "duplicate column '{}' in UNIQUE constraint",
-                                dup
-                            ),
+                            |dup| format!("duplicate column '{}' in UNIQUE constraint", dup),
                         )?;
 
                         ensure_known_columns_case_insensitive(
                             unique_column_names.iter().map(|name| name.as_str()),
                             &column_names_lower,
-                            |unknown| format!(
-                                "unknown column '{}' in UNIQUE constraint",
-                                unknown
-                            ),
+                            |unknown| format!("unknown column '{}' in UNIQUE constraint", unknown),
                         )?;
 
                         let column_ident = unique_column_names
@@ -959,8 +954,8 @@ where
             let column_name = extract_index_column_name(
                 &item,
                 "CREATE INDEX",
-                true,  // allow and validate sort options
-                true,  // allow compound identifiers
+                true, // allow and validate sort options
+                true, // allow compound identifiers
             )?;
 
             // Get sort options (already validated by helper)
@@ -1049,14 +1044,18 @@ where
             |unknown| format!("unknown column '{}' in FOREIGN KEY constraint", unknown),
         )?;
 
-        let referenced_columns_vec: Vec<String> =
-            referenced_columns.iter().map(|ident| ident.value.clone()).collect();
+        let referenced_columns_vec: Vec<String> = referenced_columns
+            .iter()
+            .map(|ident| ident.value.clone())
+            .collect();
         ensure_unique_case_insensitive(
             referenced_columns_vec.iter().map(|name| name.as_str()),
-            |dup| format!(
-                "duplicate referenced column '{}' in FOREIGN KEY constraint",
-                dup
-            ),
+            |dup| {
+                format!(
+                    "duplicate referenced column '{}' in FOREIGN KEY constraint",
+                    dup
+                )
+            },
         )?;
 
         if !referenced_columns_vec.is_empty()
@@ -1067,17 +1066,18 @@ where
             ));
         }
 
-        let (referenced_display, referenced_canonical) =
-            canonical_object_name(foreign_table)?;
+        let (referenced_display, referenced_canonical) = canonical_object_name(foreign_table)?;
 
         if referenced_canonical == referencing_canonical {
             ensure_known_columns_case_insensitive(
                 referenced_columns_vec.iter().map(|name| name.as_str()),
                 known_columns_lower,
-                |unknown| format!(
-                    "unknown referenced column '{}' in FOREIGN KEY constraint",
-                    unknown
-                ),
+                |unknown| {
+                    format!(
+                        "unknown referenced column '{}' in FOREIGN KEY constraint",
+                        unknown
+                    )
+                },
             )?;
         } else {
             let known_columns =
@@ -1086,10 +1086,12 @@ where
                 ensure_known_columns_case_insensitive(
                     referenced_columns_vec.iter().map(|name| name.as_str()),
                     &known_columns,
-                    |unknown| format!(
-                        "unknown referenced column '{}' in FOREIGN KEY constraint",
-                        unknown
-                    ),
+                    |unknown| {
+                        format!(
+                            "unknown referenced column '{}' in FOREIGN KEY constraint",
+                            unknown
+                        )
+                    },
                 )?;
             }
         }

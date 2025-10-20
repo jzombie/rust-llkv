@@ -55,15 +55,15 @@ pub mod stream;
 
 pub use catalog::{CatalogManager, CreateTableResult, FieldResolver, TableCatalogSnapshot};
 pub use constraints::{
-    ConstraintService, ForeignKeyChildRowsFetch, ForeignKeyParentRowsFetch, ForeignKeyRowFetch,
-    InsertColumnConstraint, InsertMultiColumnUnique, InsertUniqueColumn,
-    ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo, UniqueKey, ValidatedForeignKey,
-    build_composite_unique_key, ensure_multi_column_unique, ensure_primary_key,
-    ensure_single_column_unique, unique_key_component, validate_check_constraints,
-    validate_foreign_key_rows, validate_foreign_keys,
-    CheckConstraint, ConstraintExpressionRef, ConstraintId, ConstraintKind, ConstraintRecord,
-    ConstraintState, ForeignKeyAction, ForeignKeyConstraint, PrimaryKeyConstraint,
-    UniqueConstraint, decode_constraint_row_id, encode_constraint_row_id,
+    CheckConstraint, ConstraintColumnInfo, ConstraintExpressionRef, ConstraintId, ConstraintKind,
+    ConstraintRecord, ConstraintService, ConstraintState, ForeignKeyAction,
+    ForeignKeyChildRowsFetch, ForeignKeyColumn, ForeignKeyConstraint, ForeignKeyParentRowsFetch,
+    ForeignKeyRowFetch, ForeignKeyTableInfo, InsertColumnConstraint, InsertMultiColumnUnique,
+    InsertUniqueColumn, PrimaryKeyConstraint, UniqueConstraint, UniqueKey, ValidatedForeignKey,
+    build_composite_unique_key, decode_constraint_row_id, encode_constraint_row_id,
+    ensure_multi_column_unique, ensure_primary_key, ensure_single_column_unique,
+    unique_key_component, validate_check_constraints, validate_foreign_key_rows,
+    validate_foreign_keys,
 };
 pub use metadata::MultiColumnUniqueRegistration;
 pub use metadata::{ForeignKeyDescriptor, MetadataManager};

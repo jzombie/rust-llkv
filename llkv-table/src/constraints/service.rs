@@ -4,13 +4,13 @@
 
 #![forbid(unsafe_code)]
 
-use crate::catalog::TableCatalog;
+use super::types::ForeignKeyAction;
 use super::validation::validate_foreign_key_rows;
 use super::validation::{
     ConstraintColumnInfo, UniqueKey, build_composite_unique_key, ensure_multi_column_unique,
     ensure_primary_key, ensure_single_column_unique, validate_check_constraints,
 };
-use super::types::ForeignKeyAction;
+use crate::catalog::TableCatalog;
 use crate::metadata::MetadataManager;
 use crate::types::{FieldId, RowId, TableId};
 use crate::view::ForeignKeyView;
@@ -206,12 +206,12 @@ where
             ensure_multi_column_unique(&existing_rows, &new_rows, &constraint.column_names)?;
         }
 
-        if let Some(pk) = primary_key {
-            if !pk.schema_indices.is_empty() {
-                let existing_rows = fetch_multi_column_rows(&pk.field_ids)?;
-                let new_rows = collect_row_sets(rows, &schema_to_row_index, &pk.schema_indices);
-                ensure_primary_key(&existing_rows, &new_rows, &pk.column_names)?;
-            }
+        if let Some(pk) = primary_key
+            && !pk.schema_indices.is_empty()
+        {
+            let existing_rows = fetch_multi_column_rows(&pk.field_ids)?;
+            let new_rows = collect_row_sets(rows, &schema_to_row_index, &pk.schema_indices);
+            ensure_primary_key(&existing_rows, &new_rows, &pk.column_names)?;
         }
 
         Ok(())

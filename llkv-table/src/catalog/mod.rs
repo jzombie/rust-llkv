@@ -6,15 +6,14 @@
 //!
 //! External code should use this `catalog` module instead of accessing individual components.
 
-mod table_catalog;
 mod manager;
+mod table_catalog;
 
 // Re-export TableCatalog and related types
 pub use table_catalog::{
-    TableCatalog, TableCatalogSnapshot, TableCatalogState, TableState,
-    FieldResolver, FieldDefinition, FieldConstraints, FieldInfo,
-    ColumnResolution, IdentifierResolver, IdentifierContext,
-    QualifiedTableName, QualifiedTableNameRef, FieldResolverState, FieldState,
+    ColumnResolution, FieldConstraints, FieldDefinition, FieldInfo, FieldResolver,
+    FieldResolverState, FieldState, IdentifierContext, IdentifierResolver, QualifiedTableName,
+    QualifiedTableNameRef, TableCatalog, TableCatalogSnapshot, TableCatalogState, TableState,
 };
 
 // Re-export internal types needed by other modules

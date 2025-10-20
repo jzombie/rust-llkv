@@ -69,9 +69,8 @@ fn foreign_key_views_reload_from_metadata() {
             .expect("create parents table");
 
         let mut plan = CreateTablePlan::new("children");
-        plan.columns.push(
-            ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true),
-        );
+        plan.columns
+            .push(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true));
         plan.columns
             .push(ColumnSpec::new("parent_id", DataType::Int64, true));
         plan.foreign_keys.push(ForeignKeySpec {

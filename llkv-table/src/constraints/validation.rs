@@ -82,25 +82,25 @@ pub fn ensure_multi_column_unique(
 ) -> LlkvResult<()> {
     let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
     for values in existing_rows {
-        if let Some(key) = build_composite_unique_key(values, column_names)? {
-            if !existing_keys.insert(key.clone()) {
-                return Err(Error::ConstraintError(format!(
-                    "constraint violation on columns '{}'",
-                    column_names.join(", ")
-                )));
-            }
+        if let Some(key) = build_composite_unique_key(values, column_names)?
+            && !existing_keys.insert(key.clone())
+        {
+            return Err(Error::ConstraintError(format!(
+                "constraint violation on columns '{}'",
+                column_names.join(", ")
+            )));
         }
     }
 
     let mut new_keys: FxHashSet<UniqueKey> = FxHashSet::default();
     for values in new_rows {
-        if let Some(key) = build_composite_unique_key(values, column_names)? {
-            if existing_keys.contains(&key) || !new_keys.insert(key) {
-                return Err(Error::ConstraintError(format!(
-                    "constraint violation on columns '{}'",
-                    column_names.join(", ")
-                )));
-            }
+        if let Some(key) = build_composite_unique_key(values, column_names)?
+            && (existing_keys.contains(&key) || !new_keys.insert(key))
+        {
+            return Err(Error::ConstraintError(format!(
+                "constraint violation on columns '{}'",
+                column_names.join(", ")
+            )));
         }
     }
 
@@ -254,6 +254,7 @@ fn evaluate_check_expression(
     }
 }
 
+#[allow(clippy::only_used_in_recursion)]
 fn evaluate_check_expr_value(
     expr: &SqlExpr,
     row: &[PlanValue],
@@ -621,7 +622,7 @@ where
         let mut referenced_column_defs = Vec::with_capacity(referenced_columns.len());
         let mut referenced_column_names = Vec::with_capacity(referenced_columns.len());
 
-        for column_name in referenced_columns.iter().cloned() {
+        for column_name in referenced_columns.iter() {
             let normalized = column_name.to_ascii_lowercase();
             if !seen_referenced.insert(normalized.clone()) {
                 return Err(Error::InvalidArgumentError(format!(
@@ -701,24 +702,24 @@ pub fn ensure_single_column_unique(
     let mut seen: FxHashSet<UniqueKey> = FxHashSet::default();
 
     for value in existing_values {
-        if let Some(key) = unique_key_component(value, column_name)? {
-            if !seen.insert(key.clone()) {
-                return Err(Error::ConstraintError(format!(
-                    "constraint violation on column '{}'",
-                    column_name
-                )));
-            }
+        if let Some(key) = unique_key_component(value, column_name)?
+            && !seen.insert(key.clone())
+        {
+            return Err(Error::ConstraintError(format!(
+                "constraint violation on column '{}'",
+                column_name
+            )));
         }
     }
 
     for value in new_values {
-        if let Some(key) = unique_key_component(value, column_name)? {
-            if !seen.insert(key.clone()) {
-                return Err(Error::ConstraintError(format!(
-                    "constraint violation on column '{}'",
-                    column_name
-                )));
-            }
+        if let Some(key) = unique_key_component(value, column_name)?
+            && !seen.insert(key.clone())
+        {
+            return Err(Error::ConstraintError(format!(
+                "constraint violation on column '{}'",
+                column_name
+            )));
         }
     }
 

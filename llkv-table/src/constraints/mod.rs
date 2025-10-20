@@ -7,8 +7,8 @@
 //!
 //! External code should use this `constraint` module instead of accessing individual components.
 
-mod types;
 mod service;
+mod types;
 mod validation;
 
 // Re-export constraint types
