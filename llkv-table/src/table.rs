@@ -234,8 +234,8 @@ where
         metadata: Arc<crate::metadata::MetadataManager<P>>,
         catalog: Arc<crate::catalog::TableCatalog>,
         store: Arc<ColumnStore<P>>,
-    ) -> LlkvResult<crate::catalog_service::CreateTableResult<P>> {
-        let service = crate::catalog_service::CatalogService::new(metadata, catalog, store);
+    ) -> LlkvResult<crate::catalog::CreateTableResult<P>> {
+        let service = crate::catalog::CatalogManager::new(metadata, catalog, store);
         service.create_table_from_columns(display_name, canonical_name, columns)
     }
 
@@ -247,8 +247,8 @@ where
         metadata: Arc<crate::metadata::MetadataManager<P>>,
         catalog: Arc<crate::catalog::TableCatalog>,
         store: Arc<ColumnStore<P>>,
-    ) -> LlkvResult<crate::catalog_service::CreateTableResult<P>> {
-        let service = crate::catalog_service::CatalogService::new(metadata, catalog, store);
+    ) -> LlkvResult<crate::catalog::CreateTableResult<P>> {
+        let service = crate::catalog::CatalogManager::new(metadata, catalog, store);
         service.create_table_from_schema(display_name, canonical_name, schema)
     }
 

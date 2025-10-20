@@ -56,7 +56,7 @@ use llkv_table::catalog::{FieldConstraints, FieldDefinition, TableCatalog};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId};
 use llkv_table::{
-    CatalogService, ConstraintColumnInfo, ConstraintService, CreateTableResult, ForeignKeyColumn,
+    CatalogManager, ConstraintColumnInfo, ConstraintService, CreateTableResult, ForeignKeyColumn,
     ForeignKeyTableInfo, ForeignKeyView, InsertColumnConstraint, InsertMultiColumnUnique,
     InsertUniqueColumn, MetadataManager, MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration,
     SysCatalog, TableConstraintSummaryView, TableView, UniqueKey, build_composite_unique_key,
@@ -1177,7 +1177,7 @@ where
     dropped_tables: RwLock<FxHashSet<String>>,
     metadata: Arc<MetadataManager<P>>,
     constraint_service: ConstraintService<P>,
-    catalog_service: CatalogService<P>,
+    catalog_service: CatalogManager<P>,
     // Centralized catalog for table/field name resolution
     catalog: Arc<TableCatalog>,
     // Shared column store for all tables in this context
@@ -1327,7 +1327,7 @@ where
 
         let constraint_service =
             ConstraintService::new(Arc::clone(&metadata), Arc::clone(&catalog));
-        let catalog_service = CatalogService::new(
+        let catalog_service = CatalogManager::new(
             Arc::clone(&metadata),
             Arc::clone(&catalog),
             Arc::clone(&store_arc),

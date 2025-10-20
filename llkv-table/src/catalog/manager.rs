@@ -1,6 +1,6 @@
 //! High-level service for creating tables.
 //!
-//! Use `CatalogService` to create tables. It coordinates metadata persistence,
+//! Use `CatalogManager` to create tables. It coordinates metadata persistence,
 //! catalog registration, and storage initialization.
 
 #![forbid(unsafe_code)]
@@ -22,7 +22,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::mvcc;
 
-use crate::catalog::{FieldDefinition, TableCatalog};
+use super::table_catalog::{FieldDefinition, TableCatalog};
 use crate::constraints::ConstraintKind;
 use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration};
 use crate::table::Table;
@@ -49,7 +49,7 @@ where
 /// Coordinates metadata persistence (`MetadataManager`), catalog registration
 /// (`TableCatalog`), and storage initialization (`ColumnStore`).
 #[derive(Clone)]
-pub struct CatalogService<P>
+pub struct CatalogManager<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -58,7 +58,7 @@ where
     store: Arc<ColumnStore<P>>,
 }
 
-impl<P> CatalogService<P>
+impl<P> CatalogManager<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -621,6 +621,36 @@ where
         self.metadata
             .table_view(&self.catalog, table_id, field_ids)
             .map_err(Into::into)
+    }
+
+    // -------------------------------------------------------------------------
+    // Catalog read-only views
+    // -------------------------------------------------------------------------
+
+    /// Returns all table names in the catalog.
+    pub fn table_names(&self) -> Vec<String> {
+        self.catalog.table_names()
+    }
+
+    /// Returns the TableId for a canonical table name.
+    pub fn table_id(&self, canonical_name: &str) -> Option<TableId> {
+        self.catalog.table_id(canonical_name)
+    }
+
+    /// Returns a field resolver for the given table.
+    pub fn field_resolver(&self, table_id: TableId) -> Option<crate::catalog::FieldResolver> {
+        self.catalog.field_resolver(table_id)
+    }
+
+    /// Returns a snapshot of the catalog for read-only access.
+    pub fn catalog_snapshot(&self) -> crate::catalog::TableCatalogSnapshot {
+        self.catalog.snapshot()
+    }
+
+    /// Returns a reference to the internal catalog for services that need it.
+    /// Note: This is primarily for internal use by services like ConstraintService.
+    pub fn catalog(&self) -> &Arc<TableCatalog> {
+        &self.catalog
     }
 }
 
