@@ -163,7 +163,7 @@ where
                 flags: 0,
                 default: None,
             };
-            table.put_col_meta(&meta);
+            table.catalog().put_col_meta(table.table_id(), &meta);
             existing.insert(field.name().to_string(), fid);
         }
         if fid == 0 {
@@ -437,7 +437,7 @@ where
                 flags: 0,
                 default: None,
             };
-            table.put_col_meta(&meta);
+            table.catalog().put_col_meta(table.table_id(), &meta);
         }
     }
 

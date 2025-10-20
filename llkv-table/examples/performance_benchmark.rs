@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const FIELD_A: FieldId = 10;
     const FIELD_B: FieldId = 11;
 
-    let table = Table::new(TABLE_ID, pager)?;
+    let table = Table::from_id(TABLE_ID, pager)?;
 
     // Create test data - 1,000,000 rows to match column-map benchmarks
     let row_count = 1_000_000;

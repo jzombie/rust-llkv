@@ -30,7 +30,7 @@ impl Index for PresenceIndex {
 }
 
 /// Concrete implementation of presence index operations.
-#[derive(Default)]
+#[derive(Default, Copy, Clone)]
 pub struct PresenceIndexOps;
 
 impl<P: Pager<Blob = EntryHandle>> IndexOps<P> for PresenceIndexOps {

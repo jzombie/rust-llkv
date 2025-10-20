@@ -13,7 +13,7 @@ use llkv_table::Table;
 fn test_total_rows_before_after_append_and_delete() {
     // Create table with a single user column and append rows with explicit row_ids
     let pager = Arc::new(MemPager::new());
-    let table = Table::new(1000, Arc::clone(&pager)).expect("create table");
+    let table = Table::from_id(1000, Arc::clone(&pager)).expect("create table");
 
     // Build schema: row_id + name (field_id 1) + age (field_id 2)
     let mut md1 = std::collections::HashMap::new();

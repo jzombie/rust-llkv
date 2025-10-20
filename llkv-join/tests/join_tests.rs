@@ -20,7 +20,7 @@ fn create_test_table(
     pager: &Arc<MemPager>,
     data: Vec<(u64, i32, &str)>,
 ) -> Table<MemPager> {
-    let table = Table::new(table_id, Arc::clone(pager)).unwrap();
+    let table = Table::from_id(table_id, Arc::clone(pager)).unwrap();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
@@ -313,7 +313,7 @@ fn test_join_with_expression_filters() {
 
     let pager = Arc::new(MemPager::default());
 
-    let customer_table = Table::new(LEFT_TABLE_ID, Arc::clone(&pager)).unwrap();
+    let customer_table = Table::from_id(LEFT_TABLE_ID, Arc::clone(&pager)).unwrap();
     let customer_schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("customer_id", DataType::Int32, false).with_metadata(HashMap::from([(
@@ -360,7 +360,7 @@ fn test_join_with_expression_filters() {
     .unwrap();
     customer_table.append(&customer_batch).unwrap();
 
-    let orders_table = Table::new(RIGHT_TABLE_ID, Arc::clone(&pager)).unwrap();
+    let orders_table = Table::from_id(RIGHT_TABLE_ID, Arc::clone(&pager)).unwrap();
     let orders_schema = Arc::new(Schema::new(vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new("order_id", DataType::Int32, false).with_metadata(HashMap::from([(

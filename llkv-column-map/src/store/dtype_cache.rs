@@ -19,6 +19,19 @@ pub struct DTypeCache<P: Pager> {
     cache: RwLock<FxHashMap<LogicalFieldId, DataType>>,
 }
 
+impl<P> Clone for DTypeCache<P>
+where
+    P: Pager,
+{
+    fn clone(&self) -> Self {
+        Self {
+            pager: Arc::clone(&self.pager),
+            catalog: Arc::clone(&self.catalog),
+            cache: RwLock::new(FxHashMap::default()),
+        }
+    }
+}
+
 impl<P> DTypeCache<P>
 where
     P: Pager<Blob = EntryHandle>,
@@ -121,6 +134,26 @@ where
             }
             if fp == Self::dtype_fingerprint(&DataType::Int32) {
                 let dt = DataType::Int32;
+                self.cache.write().unwrap().insert(field_id, dt.clone());
+                return Ok(dt);
+            }
+            if fp == Self::dtype_fingerprint(&DataType::Int64) {
+                let dt = DataType::Int64;
+                self.cache.write().unwrap().insert(field_id, dt.clone());
+                return Ok(dt);
+            }
+            if fp == Self::dtype_fingerprint(&DataType::Float64) {
+                let dt = DataType::Float64;
+                self.cache.write().unwrap().insert(field_id, dt.clone());
+                return Ok(dt);
+            }
+            if fp == Self::dtype_fingerprint(&DataType::Utf8) {
+                let dt = DataType::Utf8;
+                self.cache.write().unwrap().insert(field_id, dt.clone());
+                return Ok(dt);
+            }
+            if fp == Self::dtype_fingerprint(&DataType::Date32) {
+                let dt = DataType::Date32;
                 self.cache.write().unwrap().insert(field_id, dt.clone());
                 return Ok(dt);
             }

@@ -21,7 +21,7 @@ fn col_names_persist_across_reopen() {
     // Create a table instance, append data, then drop that instance so the
     // reopened `Table::new` simulates a fresh process reading the same pager.
     {
-        let table = Table::new(TID, Arc::clone(&pager)).expect("create table");
+        let table = Table::from_id(TID, Arc::clone(&pager)).expect("create table");
 
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
@@ -52,7 +52,7 @@ fn col_names_persist_across_reopen() {
 
     {
         // Act: reopen the table using the same pager to simulate a new process.
-        let reopened = Table::new(TID, Arc::clone(&pager)).expect("reopen table");
+        let reopened = Table::from_id(TID, Arc::clone(&pager)).expect("reopen table");
 
         let schema_after = reopened.schema().expect("schema after reopen");
 

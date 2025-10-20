@@ -68,7 +68,7 @@ fn open_pager(path: &Path) -> Result<Arc<SimdRDrivePager>> {
 
 /// Helper to open or create a Table with the given pager.
 fn open_table(table_id: TableId, pager: Arc<SimdRDrivePager>) -> Result<Table<SimdRDrivePager>> {
-    Table::new(table_id, pager)
+    Table::from_id(table_id, pager)
 }
 
 /// Helper to insert a batch with MVCC columns into a table.
