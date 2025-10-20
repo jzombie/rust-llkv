@@ -5,12 +5,12 @@
 #![forbid(unsafe_code)]
 
 use crate::catalog::TableCatalog;
-use crate::constraint_validation::validate_foreign_key_rows;
-use crate::constraint_validation::{
+use super::validation::validate_foreign_key_rows;
+use super::validation::{
     ConstraintColumnInfo, UniqueKey, build_composite_unique_key, ensure_multi_column_unique,
     ensure_primary_key, ensure_single_column_unique, validate_check_constraints,
 };
-use crate::constraints::ForeignKeyAction;
+use super::types::ForeignKeyAction;
 use crate::metadata::MetadataManager;
 use crate::types::{FieldId, RowId, TableId};
 use crate::view::ForeignKeyView;

@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 
 use crate::catalog::TableCatalog;
-use crate::constraint_validation::{
+use crate::constraints::{
     ForeignKeyTableInfo, ValidatedForeignKey, validate_foreign_keys,
 };
 use crate::constraints::{

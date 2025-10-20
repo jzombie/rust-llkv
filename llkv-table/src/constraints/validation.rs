@@ -6,7 +6,7 @@ use sqlparser::ast::{self, Expr as SqlExpr};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::constraints::ForeignKeyAction;
+use super::types::ForeignKeyAction;
 use crate::types::{FieldId, TableId};
 
 /// Lightweight column descriptor used for constraint validation.
