@@ -127,6 +127,17 @@ impl TableCatalog {
     /// - New tables: `MetadataManager::reserve_table_id()`
     /// - Database restart: `MetadataManager::all_table_metas()`
     ///
+    /// # Example
+    ///
+    /// ```
+    /// use llkv_table::catalog::TableCatalog;
+    ///
+    /// let catalog = TableCatalog::new();
+    /// catalog.register_table("Users", 42).unwrap();
+    ///
+    /// assert_eq!(catalog.table_id("users"), Some(42));
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns error if the name or ID is already registered.
