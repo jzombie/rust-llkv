@@ -1068,7 +1068,7 @@ where
     ///
     /// Note: Creates a temporary Table instance to access index metadata.
     /// This is acceptable since Table::from_id_and_store is lightweight (just wraps
-    /// table_id + Arc<ColumnStore>) and this method is only called during index
+    /// table_id + `Arc<ColumnStore>`) and this method is only called during index
     /// registration/unregistration, not in query hot paths.
     fn field_has_sort_index(&self, table_id: TableId, field_id: FieldId) -> LlkvResult<bool> {
         let table = Table::from_id_and_store(table_id, Arc::clone(&self.store))?;

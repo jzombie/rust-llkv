@@ -130,12 +130,6 @@ impl TableCatalog {
     /// # Errors
     ///
     /// Returns error if the name or ID is already registered.
-    ///
-    /// // Database restoration
-    /// for (table_id, meta) in metadata.all_table_metas()? {
-    ///     catalog.register_table(&meta.name, table_id)?;
-    /// }
-    /// ```
     pub fn register_table(
         &self,
         name: impl Into<QualifiedTableName>,
