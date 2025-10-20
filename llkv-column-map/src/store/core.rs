@@ -541,18 +541,18 @@ where
     /// each row. Each other column must have `field_id` metadata mapping it to a
     /// [`LogicalFieldId`].
     ///
-    /// ## Last-Write-Wins Updates
+    /// # Last-Write-Wins Updates
     ///
     /// If any row IDs in the batch already exist, they are updated in-place (overwritten)
     /// rather than creating duplicates. This happens in a separate transaction before
     /// appending new rows.
     ///
-    /// ## Row ID Ordering
+    /// # Row ID Ordering
     ///
     /// The batch is automatically sorted by `rowid` if not already sorted. This ensures
     /// efficient metadata updates and naturally sorted shadow columns.
     ///
-    /// ## Table Separation
+    /// # Table Separation
     ///
     /// Each batch should contain columns from only one table. To append to multiple
     /// tables, call `append` separately for each table's batch (may be concurrent).

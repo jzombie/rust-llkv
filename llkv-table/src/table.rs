@@ -360,12 +360,12 @@ where
     /// - A `row_id` column (type `UInt64`) with unique row identifiers
     /// - `field_id` metadata for each user column, mapping to this table's field IDs
     ///
-    /// ## MVCC Columns
+    /// # MVCC Columns
     ///
     /// If the batch includes `created_by` or `deleted_by` columns, they are automatically
     /// assigned the correct [`LogicalFieldId`] for this table's MVCC metadata.
     ///
-    /// ## Field ID Mapping
+    /// # Field ID Mapping
     ///
     /// Each column's `field_id` metadata is converted to a [`LogicalFieldId`] by combining
     /// it with this table's ID. This ensures columns from different tables don't collide
