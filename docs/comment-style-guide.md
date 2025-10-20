@@ -31,6 +31,7 @@ Large modules and crates must start with a module-level doc comment (`//!`) that
 - When touching a file, skim nearby comments and align them with this guide. Treat outdated comments as lint violations to fix on sight.
 - Keep terminology synchronized with the high-level crate overview in `docs/crate-linkage.md`.
 - Use consistent headings and casing (`# Arguments`, `# Returns`, `# Errors`, `# Safety`).
+- Leave existing TODO/FIXME-style notes in place unless you can resolve them immediately, and never promote those markers into `///` doc comments.
 
 ## Process Checklist
 - [ ] Verified that summary line is accurate after your change.
