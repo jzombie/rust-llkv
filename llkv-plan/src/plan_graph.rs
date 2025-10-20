@@ -374,6 +374,7 @@ pub struct PlanGraph {
 }
 
 impl PlanGraph {
+    /// Construct a new [`PlanGraphBuilder`].
     pub fn builder() -> PlanGraphBuilder {
         PlanGraphBuilder::default()
     }

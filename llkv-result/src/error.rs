@@ -181,6 +181,19 @@ impl Error {
     ///
     /// This is a convenience method for converting other error types into
     /// [`Error::ExprCast`] while preserving the original error message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use llkv_result::Error;
+    ///
+    /// fn parse_number(input: &str) -> Result<u32, Error> {
+    ///     input.parse::<u32>().map_err(Error::expr_cast)
+    /// }
+    ///
+    /// assert_eq!(parse_number("42").unwrap(), 42);
+    /// assert!(matches!(parse_number("abc"), Err(Error::ExprCast(_))));
+    /// ```
     #[inline]
     pub fn expr_cast<E: fmt::Display>(err: E) -> Self {
         Error::ExprCast(err.to_string())
@@ -190,6 +203,20 @@ impl Error {
     ///
     /// This is a convenience method for converting other error types into
     /// [`Error::PredicateBuild`] while preserving the original error message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use llkv_result::Error;
+    ///
+    /// fn unsupported_predicate() -> Result<(), Error> {
+    ///     let io_err = std::io::Error::new(std::io::ErrorKind::Other, "not supported");
+    ///     Err(Error::predicate_build(io_err))
+    /// }
+    ///
+    /// let err = unsupported_predicate().unwrap_err();
+    /// assert!(matches!(err, Error::PredicateBuild(msg) if msg.contains("not supported")));
+    /// ```
     #[inline]
     pub fn predicate_build<E: fmt::Display>(err: E) -> Self {
         Error::PredicateBuild(err.to_string())

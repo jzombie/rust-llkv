@@ -39,6 +39,51 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+/// SQL execution engine built on top of the LLKV runtime.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use arrow::array::StringArray;
+/// use llkv_sql::{RuntimeStatementResult, SqlEngine};
+/// use llkv_storage::pager::MemPager;
+///
+/// let engine = SqlEngine::new(Arc::new(MemPager::default()));
+///
+/// let setup = r#"
+///     CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
+///     INSERT INTO users (id, name) VALUES (1, 'Ada');
+/// "#;
+///
+/// let results = engine.execute(setup).unwrap();
+/// assert_eq!(results.len(), 2);
+///
+/// assert!(matches!(
+///     results[0],
+///     RuntimeStatementResult::CreateTable { ref table_name } if table_name == "users"
+/// ));
+/// assert!(matches!(
+///     results[1],
+///     RuntimeStatementResult::Insert { rows_inserted, .. } if rows_inserted == 1
+/// ));
+///
+/// let batches = engine.sql("SELECT id, name FROM users ORDER BY id;").unwrap();
+/// assert_eq!(batches.len(), 1);
+///
+/// let batch = &batches[0];
+/// assert_eq!(batch.num_rows(), 1);
+/// assert_eq!(batch.schema().field(1).name(), "name");
+///
+/// let names = batch
+///     .column(1)
+///     .as_any()
+///     .downcast_ref::<StringArray>()
+///     .unwrap();
+///
+/// assert_eq!(names.value(0), "Ada");
+/// ```
 pub struct SqlEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -169,6 +214,18 @@ where
         self.engine.session()
     }
 
+    /// Execute one or more SQL statements and return their raw [`RuntimeStatementResult`]s.
+    ///
+    /// This method is the general-purpose entry point for running SQL against the engine when
+    /// you need to mix statement types (e.g. `CREATE TABLE`, `INSERT`, `UPDATE`, `SELECT`) or
+    /// when you care about per-statement status information. Statements are executed in the order
+    /// they appear in the input string, and the results vector mirrors that ordering.
+    ///
+    /// For ad-hoc read queries where you only care about the resulting Arrow [`RecordBatch`]es,
+    /// prefer [`SqlEngine::sql`], which enforces a single `SELECT` statement and collects its
+    /// output for you. `execute` remains the right tool for schema migrations, transactional
+    /// scripts, or workflows that need to inspect the specific runtime response for each
+    /// statement.
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<RuntimeStatementResult<P>>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
 
@@ -189,6 +246,58 @@ where
         }
         tracing::trace!("DEBUG SQL execute completed successfully");
         Ok(results)
+    }
+
+    /// Execute a single SELECT statement and return its results as Arrow [`RecordBatch`]es.
+    ///
+    /// The SQL passed to this method must contain exactly one statement, and that statement must
+    /// be a `SELECT`. Statements that modify data (e.g. `INSERT`) should be executed up front
+    /// using [`SqlEngine::execute`] before calling this helper.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use arrow::array::StringArray;
+    /// use llkv_sql::SqlEngine;
+    /// use llkv_storage::pager::MemPager;
+    ///
+    /// let engine = SqlEngine::new(Arc::new(MemPager::default()));
+    /// let _ = engine
+    ///     .execute(
+    ///         "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);\n         \
+    ///          INSERT INTO users (id, name) VALUES (1, 'Ada');",
+    ///     )
+    ///     .unwrap();
+    ///
+    /// let batches = engine.sql("SELECT id, name FROM users ORDER BY id;").unwrap();
+    /// assert_eq!(batches.len(), 1);
+    ///
+    /// let batch = &batches[0];
+    /// assert_eq!(batch.num_rows(), 1);
+    ///
+    /// let names = batch
+    ///     .column(1)
+    ///     .as_any()
+    ///     .downcast_ref::<StringArray>()
+    ///     .unwrap();
+    /// assert_eq!(names.value(0), "Ada");
+    /// ```
+    pub fn sql(&self, sql: &str) -> SqlResult<Vec<RecordBatch>> {
+        let mut results = self.execute(sql)?;
+        if results.len() != 1 {
+            return Err(Error::InvalidArgumentError(
+                "SqlEngine::sql expects exactly one SQL statement".into(),
+            ));
+        }
+
+        match results.pop().expect("checked length above") {
+            RuntimeStatementResult::Select { execution, .. } => execution.collect(),
+            other => Err(Error::InvalidArgumentError(format!(
+                "SqlEngine::sql requires a SELECT statement, got {other:?}",
+            ))),
+        }
     }
 
     fn execute_statement(&self, statement: Statement) -> SqlResult<RuntimeStatementResult<P>> {

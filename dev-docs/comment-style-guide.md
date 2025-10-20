@@ -24,6 +24,11 @@ Large modules and crates must start with a module-level doc comment (`//!`) that
 - Prefer mentioning related crates or modules directly in the summary or architecture sections so readers can see inter-crate responsibilities at a glance.
 - Keep structural docs (such as `docs/crate-linkage.md`) updated when dependencies change, and sync comment links with those updates.
 
+## Heading Levels
+- Use Markdown heading levels consistently: top-level sections in doc comments start with `#` (for example `# Arguments`).
+- Nested sections should increment the number of `#` symbols (`##`, `###`, etc.) to reflect depth.
+- Avoid skipping heading levels; keep the hierarchy shallow unless a section truly needs sub-subsections.
+
 ## Unsafe Code
 - Document `unsafe` sections with inline comments of the form `// SAFETY: ...`, explaining the invariants that make the block sound.
 - Keep the safety rationale specific and actionable (e.g., memory aliasing requirements, threading guarantees).
