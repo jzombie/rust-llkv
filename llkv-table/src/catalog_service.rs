@@ -16,12 +16,13 @@ use llkv_column_map::ColumnStore;
 use llkv_plan::{ColumnSpec, ForeignKeySpec};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::mvcc;
 
 use crate::catalog::{FieldDefinition, TableCatalog};
+use crate::constraints::ConstraintKind;
 use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration};
 use crate::table::Table;
 use crate::types::{FieldId, RowId, TableColumn, TableId};
@@ -438,6 +439,102 @@ where
         }
 
         Ok(results)
+    }
+
+    /// Produce a read-only view of a table's catalog, including column metadata and constraints.
+    pub fn table_column_specs(&self, canonical_name: &str) -> LlkvResult<Vec<ColumnSpec>> {
+        let table_id = self.catalog.table_id(canonical_name).ok_or_else(|| {
+            Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
+        })?;
+
+        let resolver = self
+            .catalog
+            .field_resolver(table_id)
+            .ok_or_else(|| Error::Internal("missing field resolver for table".into()))?;
+
+        let mut logical_fields = self.store.user_field_ids_for_table(table_id);
+        logical_fields.sort_by_key(|lfid| lfid.field_id());
+        let field_ids: Vec<FieldId> = logical_fields.iter().map(|lfid| lfid.field_id()).collect();
+
+        let table_view = self
+            .metadata
+            .table_view(&self.catalog, table_id, &field_ids)?;
+        let column_metas = table_view.column_metas;
+        let constraint_records = table_view.constraint_records;
+
+        let mut metadata_primary_keys: FxHashSet<FieldId> = FxHashSet::default();
+        let mut metadata_unique_fields: FxHashSet<FieldId> = FxHashSet::default();
+        let mut has_primary_key_records = false;
+        let mut has_single_unique_records = false;
+
+        for record in constraint_records
+            .iter()
+            .filter(|record| record.is_active())
+        {
+            match &record.kind {
+                ConstraintKind::PrimaryKey(pk) => {
+                    has_primary_key_records = true;
+                    for field_id in &pk.field_ids {
+                        metadata_primary_keys.insert(*field_id);
+                        metadata_unique_fields.insert(*field_id);
+                    }
+                }
+                ConstraintKind::Unique(unique) => {
+                    if unique.field_ids.len() == 1 {
+                        has_single_unique_records = true;
+                        if let Some(field_id) = unique.field_ids.first() {
+                            metadata_unique_fields.insert(*field_id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut specs = Vec::with_capacity(field_ids.len());
+
+        for (idx, lfid) in logical_fields.iter().enumerate() {
+            let field_id = lfid.field_id();
+
+            let column_name = column_metas
+                .get(idx)
+                .and_then(|meta| meta.as_ref())
+                .and_then(|meta| meta.name.clone())
+                .unwrap_or_else(|| format!("col_{}", field_id));
+
+            let fallback_constraints = resolver
+                .field_constraints_by_name(&column_name)
+                .unwrap_or_default();
+
+            let metadata_primary = metadata_primary_keys.contains(&field_id);
+            let primary_key = if has_primary_key_records {
+                metadata_primary
+            } else {
+                fallback_constraints.primary_key
+            };
+
+            let metadata_unique = metadata_primary || metadata_unique_fields.contains(&field_id);
+            let unique = if has_primary_key_records || has_single_unique_records {
+                metadata_unique
+            } else {
+                fallback_constraints.primary_key || fallback_constraints.unique
+            };
+
+            let data_type = self.store.data_type(*lfid)?;
+            let nullable = !primary_key;
+
+            let mut spec = ColumnSpec::new(column_name.clone(), data_type, nullable)
+                .with_primary_key(primary_key)
+                .with_unique(unique);
+
+            if let Some(check_expr) = fallback_constraints.check_expr.clone() {
+                spec = spec.with_check(Some(check_expr));
+            }
+
+            specs.push(spec);
+        }
+
+        Ok(specs)
     }
 }
 

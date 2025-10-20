@@ -1759,22 +1759,9 @@ where
 
     pub fn table_column_specs(self: &Arc<Self>, name: &str) -> Result<Vec<ColumnSpec>> {
         let (_, canonical_name) = canonical_table_name(name)?;
-        let table = self.lookup_table(&canonical_name)?;
-        Ok(table
-            .schema
-            .columns
-            .iter()
-            .map(|column| {
-                ColumnSpec::new(
-                    column.name.clone(),
-                    column.data_type.clone(),
-                    column.nullable,
-                )
-                .with_primary_key(column.primary_key)
-                .with_unique(column.unique)
-                .with_check(column.check_expr.clone())
-            })
-            .collect())
+        self.catalog_service
+            .table_column_specs(&canonical_name)
+            .map_err(Into::into)
     }
 
     pub fn export_table_rows(self: &Arc<Self>, name: &str) -> Result<RowBatch> {
@@ -2310,6 +2297,7 @@ where
                             table_name
                         ))
                     })?;
+
                     let columns = referenced_table
                         .schema
                         .columns
