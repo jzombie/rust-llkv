@@ -52,9 +52,17 @@ would help.
 - ✅ Catalog read APIs (column specs, table view, foreign-key views, constraint summaries) now route through the catalog service instead of touching metadata snapshots directly.
 
 ### In-flight
-- Build additional read-only views for SQL planner / CLI tooling. Remaining item:
-  - Update SQL-specific callers to consume the new helpers and drop any remaining bespoke wrappers now that catalog service surfaces the structured snapshots.
+- Update SQL planner/DDL code paths to consume catalog-service helpers:
+  - Emit IDs + constraint descriptors from `llkv-sql` planning instead of string-heavy structures.
+  - Remove bespoke validation in `handle_create_table` / `handle_create_index` once shared helpers are in place.
 - Fold runtime CREATE/DROP/index helpers into a table-layer `CatalogService`.
+- Persistence + change detection polish:
+  - Add diff-aware metadata writes so `flush_table` skips no-op updates.
+  - Expose snapshot invalidation semantics for constraint updates across threads.
+  - Complete migration of multi-column unique, PK, CHECK, and FK metadata into the unified constraint store and remove the legacy catalog blobs once reads are redirected.
+- Validation coverage:
+  - Expand restart/persistence tests that exercise constraint snapshots.
+  - Keep SLT suites under `llkv-sql/tests/slt/duckdb/constraints` and related transaction tests in the loop during refactors.
 
 ### Catalog service lift – runtime responsibilities inventory
 
@@ -164,3 +172,8 @@ While refactoring, align the structure across crates:
 
 This re-architecture will finally give us a single authoritative API in `llkv-table`, with
 `llkv-runtime` focusing solely on orchestration and execution.
+
+## Open Questions
+
+- How do we safely retire `CATALOG_FIELD_CATALOG_STATE` while keeping mixed-version upgrades smooth?
+- Are the current locking primitives (`RwLock` snapshots, etc.) sufficient once constraint diffing lands, or do we need a more explicit cache invalidation layer?
