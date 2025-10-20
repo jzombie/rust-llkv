@@ -42,7 +42,8 @@ would help.
 - ✅ `CatalogService::create_table_from_columns` handles metadata + catalog staging for regular CREATE TABLE; runtime only materialises executor caches and optional FK wiring.
 - ✅ `CatalogService::create_table_from_schema` backs CTAS flows; runtime simply wires executor caches after the service returns metadata.
 - ✅ `CatalogService::append_batches_with_mvcc` handles CTAS data staging (injecting MVCC columns and appending batches) with transactional rollback if the runtime sees an error.
-- ✅ `CatalogService::register_single_column_index` / `register_multi_column_unique_index` perform the metadata/catalog work for CREATE INDEX; runtime now limits itself to column resolution, uniqueness scans, and executor cache updates.
+- ✅ `CatalogService::create_single_column_index` performs index-existence checks, metadata registration, and catalog updates for single-column CREATE INDEX; runtime validates data uniqueness (when needed) and updates executor caches.
+- ✅ `CatalogService::register_multi_column_unique_index` performs the metadata/catalog work for multi-column UNIQUE indexes; runtime validates existing data and updates executor caches.
 - ✅ `CatalogService::register_foreign_keys_for_new_table` wraps FK registration during CREATE TABLE so the runtime only supplies closures that resolve referenced tables.
 - ✅ `CatalogService::drop_table` centralises metadata teardown and catalog unregister so runtime drop only enforces FK safety and cache updates.
 - ⚙️ Runtime now only stages executor caches for CREATE TABLE/CTAS; metadata, catalog writes, and MVCC batch seeding are handled by `CatalogService`.
@@ -50,14 +51,13 @@ would help.
 - 🚧 Remaining runtime helpers (catalog-derived read views, executor cache rebuilds) still live in `llkv-runtime`.
 - ⚙️ SQL planner/CREATE flows now reuse shared FK validation helpers, but further consolidation (e.g., UNIQUE checks) remains.
 - ✅ Catalog read APIs (column specs, table view, foreign-key views, constraint summaries) now route through the catalog service instead of touching metadata snapshots directly.
-- ✅ Shared validation utilities (`llkv_plan::validation`) centralise column/FK shape checks so frontends can reuse them without SQL-specific logic.
+- ✅ Shared validation utilities (`llkv_plan::validation`) centralise column/FK/PK/UNIQUE shape checks so frontends can reuse them without SQL-specific logic.
 - ✅ SQL planner column-resolution (`collect_known_columns`) now sources metadata via `RuntimeContext::table_column_specs`, avoiding ad-hoc `table_view` + `lookup_table` fallbacks.
 
 ### In-flight
 - Update SQL planner/DDL code paths to consume catalog-service helpers:
   - Emit IDs + constraint descriptors from `llkv-sql` planning instead of string-heavy structures.
-  - Finish collapsing bespoke validation in `handle_create_table` / `handle_create_index` (CHECK/UNIQUE dedupe still pending).
-- Fold runtime CREATE/DROP/index helpers into a table-layer `CatalogService`.
+  - Finish collapsing remaining CHECK-expression validation in `handle_create_table` (currently still SQL-specific AST traversal).
 - Persistence + change detection polish:
   - Add diff-aware metadata writes so `flush_table` skips no-op updates.
   - Expose snapshot invalidation semantics for constraint updates across threads.
@@ -68,23 +68,22 @@ would help.
 
 ### Catalog service lift – runtime responsibilities inventory
 
-While planning the catalog service move, the runtime currently owns the following work that needs to be rehomed:
+The `CatalogService` now handles most CREATE/DROP/index metadata and catalog operations. The runtime's remaining responsibilities for these operations are:
 
-- `RuntimeContext::create_table_from_columns` (`llkv-runtime/src/lib.rs:2250`): now delegates metadata + catalog registration to `CatalogService`, but still constructs executor caches; FK wiring is a thin call into the service with runtime closures.
-- `RuntimeContext::create_table_from_batches` (`llkv-runtime/src/lib.rs:2415`): metadata + CTAS batch appends now happen via `CatalogService`; runtime just updates executor caches and tracks transactions.
-- `RuntimeContext::create_table_from_columns` (`llkv-runtime/src/lib.rs:2250`): still constructs executor caches and provides a closure for referenced table lookups during FK registration.
-- `RuntimeContext::create_index` (`llkv-runtime/src/lib.rs:1688`): now delegates metadata registration to `CatalogService`, but still resolves columns, enforces uniqueness against live data, and refreshes executor caches.
-- `RuntimeContext::drop_table_immediate` (`llkv-runtime/src/lib.rs:4625`): now delegates metadata removal + catalog unregister to `CatalogService`, but still enforces FK safety and tracks dropped-table cache locally.
-- Supporting helpers such as `remove_table_entry`, `rebuild_executor_table_with_unique`, and catalog-facing registration calls (`TableCatalog::register_table`, `field_resolver.register_field`) are still orchestrated directly inside the runtime.
+- `RuntimeContext::create_table_from_columns`: delegates metadata + catalog registration to `CatalogService::create_table_from_columns`, then constructs executor caches; FK wiring is a thin call into `CatalogService::register_foreign_keys_for_new_table` with runtime closures.
+- `RuntimeContext::create_table_from_batches`: delegates metadata + CTAS batch appends to `CatalogService::create_table_from_schema` and `CatalogService::append_batches_with_mvcc`; runtime just updates executor caches and tracks transactions.
+- `RuntimeContext::create_index`: delegates index-existence checks and metadata registration to `CatalogService::create_single_column_index` or `CatalogService::register_multi_column_unique_index`; runtime resolves columns, enforces uniqueness against live data, and refreshes executor caches.
+- `RuntimeContext::drop_table_immediate`: delegates metadata removal + catalog unregister to `CatalogService::drop_table`; runtime enforces FK safety and tracks dropped-table cache locally.
+- Supporting helpers such as `remove_table_entry`, `rebuild_executor_table_with_unique` remain in the runtime for executor cache management.
 
-Each of these flows should ultimately be exposed from `llkv-table` (likely through a dedicated `CatalogService`) so the runtime can delegate and focus solely on transaction orchestration plus executor caching.
+The catalog service successfully centralizes metadata/catalog orchestration while the runtime focuses on transaction orchestration and executor caching.
 
 ### Up Next
 
-> **Current checkpoint:** ConstraintService now covers foreign keys plus PK/UNIQUE/CHECK for inserts and updates. Next up is catalog orchestration.
+> **Current checkpoint:** CREATE/DROP/index responsibilities now delegated to CatalogService. Runtime focuses on transaction orchestration, data validation with live snapshots, and executor cache management.
 
-1. **Catalog service** – add high-level create/drop/index helpers in `llkv-table`; runtime delegates and just updates in-memory caches.
-2. **Plan-level validators** – add shared validation routines in `llkv-plan` and switch SQL engine to those to eliminate duplicate option checks.
+1. **SQL planning refinement** – continue reducing duplicate validation logic in `llkv-sql` by consuming shared validators from `llkv-plan`.
+2. **Persistence polish** – add diff-aware metadata writes and snapshot invalidation semantics for constraint updates.
 3. **Module cleanup** – align naming (`types.rs`, service modules) once the API surface settles.
 
 ---
@@ -104,11 +103,11 @@ Everything else should move down. The main offenders are listed below.
 
 ### 1. Table creation / deletion pipeline
 
-| Runtime Method | What it currently does | Desired destination |
-| --- | --- | --- |
-| `create_table_from_columns` (implicit inside `create_table_plan`) | Allocates table id, writes table/column metadata, registers catalog entries, sets up MVCC columns | `MetadataManager::create_table_with_columns` (new helper) plus a `TableBuilder` that returns `ExecutorTable` metadata |
-| `drop_table_immediate` | Looks up referencing tables, checks FK constraints, calls `prepare_table_drop`, unregisters catalog entry | `MetadataManager::drop_table` should own referencing lookups + FK enforcement (with runtime just passing canonical name) |
-| `reserve_table_id` (now removed but historically here) | Reserved ids out of SysCatalog | Already moved to `MetadataManager::reserve_table_id`, but more context needed (doc + dedicated API) |
+| Runtime Method                                                    | What it currently does                                                                                    | Desired destination                                                                                                      |
+| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `create_table_from_columns` (implicit inside `create_table_plan`) | Allocates table id, writes table/column metadata, registers catalog entries, sets up MVCC columns         | `MetadataManager::create_table_with_columns` (new helper) plus a `TableBuilder` that returns `ExecutorTable` metadata    |
+| `drop_table_immediate`                                            | Looks up referencing tables, checks FK constraints, calls `prepare_table_drop`, unregisters catalog entry | `MetadataManager::drop_table` should own referencing lookups + FK enforcement (with runtime just passing canonical name) |
+| `reserve_table_id` (now removed but historically here)            | Reserved ids out of SysCatalog                                                                            | Already moved to `MetadataManager::reserve_table_id`, but more context needed (doc + dedicated API)                      |
 
 ### 2. Foreign key lifecycle
 

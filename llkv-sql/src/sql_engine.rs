@@ -657,14 +657,11 @@ where
                             ));
                         }
 
-                        if constraint_columns.is_empty() {
-                            return Err(Error::InvalidArgumentError(
-                                "PRIMARY KEY requires at least one column".into(),
-                            ));
-                        }
+                        ensure_non_empty(&constraint_columns, || {
+                            "PRIMARY KEY requires at least one column".into()
+                        })?;
 
-                        let mut seen_constraint_cols: HashSet<String> =
-                            HashSet::with_capacity(constraint_columns.len());
+                        let mut pk_column_names: Vec<String> = Vec::with_capacity(constraint_columns.len());
 
                         for index_col in &constraint_columns {
                             if index_col.operator_class.is_some() {
@@ -695,14 +692,28 @@ where
                                 }
                             };
 
-                            let normalized = column_ident.to_ascii_lowercase();
-                            if !seen_constraint_cols.insert(normalized.clone()) {
-                                return Err(Error::InvalidArgumentError(format!(
-                                    "duplicate column '{}' in PRIMARY KEY constraint",
-                                    column_ident
-                                )));
-                            }
+                            pk_column_names.push(column_ident);
+                        }
 
+                        ensure_unique_case_insensitive(
+                            pk_column_names.iter().map(|name| name.as_str()),
+                            |dup| format!(
+                                "duplicate column '{}' in PRIMARY KEY constraint",
+                                dup
+                            ),
+                        )?;
+
+                        ensure_known_columns_case_insensitive(
+                            pk_column_names.iter().map(|name| name.as_str()),
+                            &column_names_lower,
+                            |unknown| format!(
+                                "unknown column '{}' in PRIMARY KEY constraint",
+                                unknown
+                            ),
+                        )?;
+
+                        for column_ident in pk_column_names {
+                            let normalized = column_ident.to_ascii_lowercase();
                             let idx = column_lookup.get(&normalized).copied().ok_or_else(|| {
                                 Error::InvalidArgumentError(format!(
                                     "unknown column '{}' in PRIMARY KEY constraint",
@@ -751,49 +762,73 @@ where
                             ));
                         }
 
-                        if constraint_columns.is_empty() {
-                            return Err(Error::InvalidArgumentError(
-                                "UNIQUE constraint requires at least one column".into(),
-                            ));
+                        ensure_non_empty(&constraint_columns, || {
+                            "UNIQUE constraint requires at least one column".into()
+                        })?;
+
+                        let mut unique_column_names: Vec<String> =
+                            Vec::with_capacity(constraint_columns.len());
+
+                        for index_column in &constraint_columns {
+                            if index_column.operator_class.is_some() {
+                                return Err(Error::InvalidArgumentError(
+                                    "UNIQUE constraints with operator classes are not supported yet"
+                                        .into(),
+                                ));
+                            }
+
+                            let order_expr = &index_column.column;
+                            if order_expr.options.asc.is_some()
+                                || order_expr.options.nulls_first.is_some()
+                                || order_expr.with_fill.is_some()
+                            {
+                                return Err(Error::InvalidArgumentError(
+                                    "UNIQUE constraint columns must be simple identifiers".into(),
+                                ));
+                            }
+
+                            let column_ident = match &order_expr.expr {
+                                SqlExpr::Identifier(ident) => ident.value.clone(),
+                                SqlExpr::CompoundIdentifier(parts) if parts.len() == 1 => {
+                                    parts[0].value.clone()
+                                }
+                                _ => {
+                                    return Err(Error::InvalidArgumentError(
+                                        "UNIQUE constraint columns must be column identifiers".into(),
+                                    ));
+                                }
+                            };
+
+                            unique_column_names.push(column_ident);
                         }
 
-                        if constraint_columns.len() > 1 {
+                        if unique_column_names.len() > 1 {
                             return Err(Error::InvalidArgumentError(
                                 "multi-column UNIQUE constraints are not supported yet".into(),
                             ));
                         }
 
-                        let index_column = &constraint_columns[0];
+                        ensure_unique_case_insensitive(
+                            unique_column_names.iter().map(|name| name.as_str()),
+                            |dup| format!(
+                                "duplicate column '{}' in UNIQUE constraint",
+                                dup
+                            ),
+                        )?;
 
-                        if index_column.operator_class.is_some() {
-                            return Err(Error::InvalidArgumentError(
-                                "UNIQUE constraints with operator classes are not supported yet"
-                                    .into(),
-                            ));
-                        }
+                        ensure_known_columns_case_insensitive(
+                            unique_column_names.iter().map(|name| name.as_str()),
+                            &column_names_lower,
+                            |unknown| format!(
+                                "unknown column '{}' in UNIQUE constraint",
+                                unknown
+                            ),
+                        )?;
 
-                        let order_expr = &index_column.column;
-                        if order_expr.options.asc.is_some()
-                            || order_expr.options.nulls_first.is_some()
-                            || order_expr.with_fill.is_some()
-                        {
-                            return Err(Error::InvalidArgumentError(
-                                "UNIQUE constraint columns must be simple identifiers".into(),
-                            ));
-                        }
-
-                        let column_ident = match &order_expr.expr {
-                            SqlExpr::Identifier(ident) => ident.value.clone(),
-                            SqlExpr::CompoundIdentifier(parts) if parts.len() == 1 => {
-                                parts[0].value.clone()
-                            }
-                            _ => {
-                                return Err(Error::InvalidArgumentError(
-                                    "UNIQUE constraint columns must be column identifiers".into(),
-                                ));
-                            }
-                        };
-
+                        let column_ident = unique_column_names
+                            .into_iter()
+                            .next()
+                            .expect("unique constraint checked for emptiness");
                         let normalized = column_ident.to_ascii_lowercase();
                         let idx = column_lookup.get(&normalized).copied().ok_or_else(|| {
                             Error::InvalidArgumentError(format!(
@@ -2891,144 +2926,106 @@ fn validate_check_constraint(
 ) -> SqlResult<()> {
     use sqlparser::ast::Expr as SqlExpr;
 
-    match check_expr {
-        // Subqueries are not allowed
-        SqlExpr::Subquery(_) => {
-            return Err(Error::InvalidArgumentError(
-                "Subqueries are not allowed in CHECK constraints".into(),
-            ));
-        }
-        // Aggregate functions are not allowed
-        SqlExpr::Function(func) => {
-            // Check if it's an aggregate function
-            let func_name = func.name.to_string().to_uppercase();
-            if matches!(func_name.as_str(), "SUM" | "AVG" | "COUNT" | "MIN" | "MAX") {
+    let column_names_lower: HashSet<String> = column_names
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+
+    let mut stack: Vec<&SqlExpr> = vec![check_expr];
+
+    while let Some(expr) = stack.pop() {
+        match expr {
+            SqlExpr::Subquery(_) => {
                 return Err(Error::InvalidArgumentError(
-                    "Aggregate functions are not allowed in CHECK constraints".into(),
+                    "Subqueries are not allowed in CHECK constraints".into(),
                 ));
             }
-            // Recursively validate function arguments
-            let args_slice: &[sqlparser::ast::FunctionArg] = match &func.args {
-                sqlparser::ast::FunctionArguments::List(list) => &list.args,
-                _ => &[],
-            };
-            for arg in args_slice {
-                if let sqlparser::ast::FunctionArg::Unnamed(
-                    sqlparser::ast::FunctionArgExpr::Expr(expr),
-                ) = arg
-                {
-                    validate_check_constraint(expr, table_name, column_names)?;
+            SqlExpr::Function(func) => {
+                let func_name = func.name.to_string().to_uppercase();
+                if matches!(func_name.as_str(), "SUM" | "AVG" | "COUNT" | "MIN" | "MAX") {
+                    return Err(Error::InvalidArgumentError(
+                        "Aggregate functions are not allowed in CHECK constraints".into(),
+                    ));
+                }
+
+                if let sqlparser::ast::FunctionArguments::List(list) = &func.args {
+                    for arg in &list.args {
+                        if let sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(expr),
+                        ) = arg
+                        {
+                            stack.push(expr);
+                        }
+                    }
                 }
             }
-        }
-        // Check column references
-        SqlExpr::Identifier(ident) => {
-            let col_name = &ident.value;
-            if !column_names
-                .iter()
-                .any(|&name| name.eq_ignore_ascii_case(col_name))
-            {
-                return Err(Error::InvalidArgumentError(format!(
-                    "Column '{}' referenced in CHECK constraint does not exist",
-                    col_name
-                )));
-            }
-        }
-        SqlExpr::CompoundIdentifier(idents) => {
-            // Handle table.column, col.field, or schema.table.column references
-            if idents.len() == 2 {
-                // Could be table.column OR col.field (struct field access)
-                let first_part = &idents[0].value;
-                let second_part = &idents[1].value;
-
-                // Check if first part is a column name (struct field access case)
-                if column_names
-                    .iter()
-                    .any(|&name| name.eq_ignore_ascii_case(first_part))
-                {
-                    // This is col.field - struct field access, which is valid
-                    // Runtime will validate the struct field exists during INSERT
-                    return Ok(());
-                }
-
-                // Otherwise, treat as table.column
-                // Check if table reference matches the current table being created
-                if !first_part.eq_ignore_ascii_case(table_name) {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "CHECK constraint references column from different table '{}'",
-                        first_part
-                    )));
-                }
-
-                // Check if column exists
-                if !column_names
-                    .iter()
-                    .any(|&name| name.eq_ignore_ascii_case(second_part))
-                {
+            SqlExpr::Identifier(ident) => {
+                if !column_names_lower.contains(&ident.value.to_ascii_lowercase()) {
                     return Err(Error::InvalidArgumentError(format!(
                         "Column '{}' referenced in CHECK constraint does not exist",
-                        second_part
+                        ident.value
                     )));
                 }
-            } else if idents.len() == 3 {
-                // Could be schema.table.column OR table.column.field
-                let first_part = &idents[0].value;
-                let second_part = &idents[1].value;
-                let third_part = &idents[2].value;
-
-                // Check if first part matches table name (table.column.field case)
-                if first_part.eq_ignore_ascii_case(table_name) {
-                    // This is table.column.field - validate column exists
-                    if !column_names
-                        .iter()
-                        .any(|&name| name.eq_ignore_ascii_case(second_part))
-                    {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "Column '{}' referenced in CHECK constraint does not exist",
-                            second_part
-                        )));
-                    }
-                    // Field access will be validated at runtime
-                } else if second_part.eq_ignore_ascii_case(table_name) {
-                    // This is schema.table.column - validate column exists
-                    if !column_names
-                        .iter()
-                        .any(|&name| name.eq_ignore_ascii_case(third_part))
-                    {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "Column '{}' referenced in CHECK constraint does not exist",
-                            third_part
-                        )));
-                    }
-                } else {
-                    // References different table - reject
-                    return Err(Error::InvalidArgumentError(format!(
-                        "CHECK constraint references column from different table '{}'",
-                        second_part
-                    )));
-                }
-            } else {
-                // For longer paths (col.field.subfield), allow it
-                // Runtime will validate during INSERT
             }
+            SqlExpr::CompoundIdentifier(idents) => {
+                if idents.len() == 2 {
+                    let first = idents[0].value.as_str();
+                    let second = &idents[1].value;
+
+                    if column_names_lower.contains(&first.to_ascii_lowercase()) {
+                        continue;
+                    }
+
+                    if !first.eq_ignore_ascii_case(table_name) {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "CHECK constraint references column from different table '{}'",
+                            first
+                        )));
+                    }
+
+                    if !column_names_lower.contains(&second.to_ascii_lowercase()) {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Column '{}' referenced in CHECK constraint does not exist",
+                            second
+                        )));
+                    }
+                } else if idents.len() == 3 {
+                    let first = &idents[0].value;
+                    let second = &idents[1].value;
+                    let third = &idents[2].value;
+
+                    if first.eq_ignore_ascii_case(table_name) {
+                        if !column_names_lower.contains(&second.to_ascii_lowercase()) {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "Column '{}' referenced in CHECK constraint does not exist",
+                                second
+                            )));
+                        }
+                    } else if second.eq_ignore_ascii_case(table_name) {
+                        if !column_names_lower.contains(&third.to_ascii_lowercase()) {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "Column '{}' referenced in CHECK constraint does not exist",
+                                third
+                            )));
+                        }
+                    } else {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "CHECK constraint references column from different table '{}'",
+                            second
+                        )));
+                    }
+                }
+            }
+            SqlExpr::BinaryOp { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) => {
+                stack.push(expr);
+            }
+            SqlExpr::Value(_) | SqlExpr::TypedString { .. } => {}
+            _ => {}
         }
-        // Binary operations - recursively validate both sides
-        SqlExpr::BinaryOp { left, right, .. } => {
-            validate_check_constraint(left, table_name, column_names)?;
-            validate_check_constraint(right, table_name, column_names)?;
-        }
-        // Unary operations - validate the operand
-        SqlExpr::UnaryOp { expr, .. } => {
-            validate_check_constraint(expr, table_name, column_names)?;
-        }
-        // Nested expressions
-        SqlExpr::Nested(expr) => {
-            validate_check_constraint(expr, table_name, column_names)?;
-        }
-        // Literals and other safe expressions are allowed
-        SqlExpr::Value(_) | SqlExpr::TypedString { .. } => {}
-        // Allow other expression types for now
-        _ => {}
     }
 
     Ok(())

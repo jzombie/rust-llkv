@@ -47,7 +47,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
-use llkv_column_map::store::{GatherNullPolicy, IndexKind, ROW_ID_COLUMN_NAME};
+use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_result::Error;
@@ -1622,22 +1622,6 @@ where
         if plan.columns.len() == 1 {
             let field_id = field_ids[0];
             let column_name = column_names[0].clone();
-            let table_id = table.table.table_id();
-            let existing_indexes = table.table.list_registered_indexes(field_id)?;
-
-            if existing_indexes.contains(&IndexKind::Sort) {
-                if plan.if_not_exists {
-                    return Ok(RuntimeStatementResult::CreateIndex {
-                        table_name: display_name,
-                        index_name,
-                    });
-                }
-
-                return Err(Error::CatalogError(format!(
-                    "Index already exists on column '{}'",
-                    column_name
-                )));
-            }
 
             if plan.unique {
                 let snapshot = self.default_snapshot();
@@ -1646,13 +1630,23 @@ where
                 ensure_single_column_unique(&existing_values, &[], &column_name)?;
             }
 
-            self.catalog_service.register_single_column_index(
+            let created = self.catalog_service.register_single_column_index(
+                &display_name,
                 &canonical_name,
-                table_id,
+                &table.table,
                 field_id,
                 &column_name,
                 plan.unique,
+                plan.if_not_exists,
             )?;
+
+            if !created {
+                // Index already existed and if_not_exists was true
+                return Ok(RuntimeStatementResult::CreateIndex {
+                    table_name: display_name,
+                    index_name,
+                });
+            }
 
             if let Some(updated_table) =
                 Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)

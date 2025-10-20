@@ -13,6 +13,7 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
+use llkv_column_map::store::IndexKind;
 use llkv_plan::{ColumnSpec, ForeignKeySpec};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
@@ -241,14 +242,29 @@ where
     }
 
     /// Register a single-column sort (B-tree) index. Optionally marks the field unique.
+    /// Returns `true` if the index was newly created, `false` if it already existed and `if_not_exists` was true.
     pub fn register_single_column_index(
         &self,
+        display_name: &str,
         canonical_name: &str,
-        table_id: TableId,
+        table: &Table<P>,
         field_id: FieldId,
         column_name: &str,
         mark_unique: bool,
-    ) -> LlkvResult<()> {
+        if_not_exists: bool,
+    ) -> LlkvResult<bool> {
+        let existing_indexes = table.list_registered_indexes(field_id)?;
+        if existing_indexes.contains(&IndexKind::Sort) {
+            if if_not_exists {
+                return Ok(false);
+            }
+            return Err(Error::CatalogError(format!(
+                "Index already exists on column '{}' in table '{}'",
+                column_name, display_name
+            )));
+        }
+
+        let table_id = table.table_id();
         self.metadata.register_sort_index(table_id, field_id)?;
 
         if mark_unique {
@@ -259,7 +275,7 @@ where
         }
 
         self.metadata.flush_table(table_id)?;
-        Ok(())
+        Ok(true)
     }
 
     /// Register a multi-column UNIQUE index.
