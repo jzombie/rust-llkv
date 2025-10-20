@@ -87,7 +87,9 @@ fn select_plan_table_name(plan: &SelectPlan) -> Option<String> {
 }
 
 /// Transaction result enum (simplified version for transaction module).
-#[allow(clippy::large_enum_variant)] // TODO: Consider refactoring large variants
+#[allow(clippy::large_enum_variant)]
+// TODO: Consider refactoring large variants
+// NOTE: The SELECT arm holds stateful execution handles; splitting it requires planner/runtime API changes.
 #[derive(Clone, Debug)]
 pub enum TransactionResult<P>
 where

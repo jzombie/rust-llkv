@@ -142,7 +142,11 @@ type RowRef = (usize, usize);
 /// Hash table mapping join keys to lists of matching rows.
 type HashTable = FxHashMap<HashKey, Vec<RowRef>>;
 
-/// Entry point for hash join algorithm.
+/// Execute a hash join between two tables and stream joined batches to `on_batch`.
+///
+/// Supports `Inner`, `Left`, `Semi`, and `Anti` joins today. Right and Full outer
+/// joins return an [`Error::Internal`](llkv_result::Error::Internal) since their
+/// probe phases are not wired up yet.
 pub fn hash_join_stream<P, F>(
     left: &Table<P>,
     right: &Table<P>,

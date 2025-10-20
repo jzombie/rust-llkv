@@ -1,3 +1,8 @@
+//! CSV reader utilities with schema inference integration.
+//!
+//! A [`CsvReader`] lazily samples the file to infer Arrow schemas, tracks per-column type
+//! overrides, and then streams batches on demand for ingestion.
+
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -9,6 +14,7 @@ use arrow::record_batch::RecordBatch;
 use crate::CsvResult;
 use crate::inference;
 
+/// Configuration flags controlling CSV parsing behavior.
 #[derive(Debug, Clone)]
 pub struct CsvReadOptions {
     pub has_header: bool,
@@ -40,6 +46,7 @@ impl CsvReadOptions {
     }
 }
 
+/// Builder for CSV reader sessions that reuses schema inference results.
 #[derive(Debug, Clone, Default)]
 pub struct CsvReader {
     options: CsvReadOptions,
@@ -66,11 +73,13 @@ impl CsvReader {
         self.options
     }
 
+    /// Infer a schema from the file without fully streaming its contents.
     pub fn infer_schema(&self, path: &Path) -> CsvResult<SchemaRef> {
         let outcome = inference::infer(path, &self.options)?;
         Ok(outcome.target_schema)
     }
 
+    /// Create a streaming read session that yields Arrow record batches.
     pub fn open(&self, path: &Path) -> CsvResult<CsvReadSession> {
         let outcome = inference::infer(path, &self.options)?;
         let file = File::open(path)?;
@@ -90,6 +99,7 @@ impl CsvReader {
     }
 }
 
+/// Streaming iterator over CSV record batches plus associated type overrides.
 pub struct CsvReadSession {
     schema: SchemaRef,
     type_overrides: Vec<Option<DataType>>,
@@ -97,18 +107,22 @@ pub struct CsvReadSession {
 }
 
 impl CsvReadSession {
+    /// Return the normalized schema inferred for the CSV source.
     pub fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
+    /// Optionally overridden data types for each column, matching the schema ordering.
     pub fn type_overrides(&self) -> &[Option<DataType>] {
         &self.type_overrides
     }
 
+    /// Consume the session, yielding ownership of the schema, reader, and type overrides.
     pub fn into_parts(self) -> (SchemaRef, Reader<File>, Vec<Option<DataType>>) {
         (self.schema, self.reader, self.type_overrides)
     }
 
+    /// Mutably access the underlying Arrow CSV reader.
     pub fn reader(&mut self) -> &mut Reader<File> {
         &mut self.reader
     }

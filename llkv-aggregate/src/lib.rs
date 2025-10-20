@@ -1,3 +1,8 @@
+//! Runtime aggregation utilities used by the planner and executor.
+//!
+//! The crate evaluates logical aggregates described by [`llkv_plan::AggregateExpr`] against Arrow
+//! batches. It supports streaming accumulation with overflow checks and COUNT DISTINCT tracking for
+//! a subset of scalar types.
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, Int64Builder,
     RecordBatch, StringArray,
@@ -10,6 +15,7 @@ use std::sync::Arc;
 
 pub use llkv_plan::{AggregateExpr, AggregateFunction};
 
+/// Result type alias for aggregation routines.
 pub type AggregateResult<T> = Result<T, Error>;
 
 /// Specification for an aggregate operation.

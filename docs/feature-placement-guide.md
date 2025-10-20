@@ -16,6 +16,7 @@ This guide keeps feature work aligned with our architecture so we avoid wasteful
 - **Performance first:** moving logic downward must not introduce cross-crate chatter that slows hot paths.
 - **No duplicates:** extend existing modules instead of cloning functionality elsewhere.
 - **No loops:** ensure dependency arrows still point downward; adding a reference that forces a circular dependency is a blocker.
+- **Comment hygiene:** follow [comment-style-guide.md](comment-style-guide.md) and tidy nearby comments while you are in the module so style drifts do not accumulate.
 
 ## Before You Open a PR
 - [ ] Verified that the chosen crate is the lowest layer that satisfies the feature.
@@ -24,5 +25,6 @@ This guide keeps feature work aligned with our architecture so we avoid wasteful
 - [ ] Confirmed Cargo manifests stay acyclic.
 - [ ] New dependencies should be treated as workspace dependencies. You never know if another crate might eventually reuse a dependency.
 - [ ] Updated the crate linkage diagram if the dependency graph changes.
+- [ ] Double-checked all comments in the touched modules against `docs/comment-style-guide.md`, fixing inconsistencies even if they predate the feature.
 
 Keep this checklist close; following it is cheaper than repeating large-scale refactors later.

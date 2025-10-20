@@ -1,3 +1,8 @@
+//! CSV export writer built on top of table scan projections.
+//!
+//! [`CsvWriter`] adapts table scans into Arrow CSV writers, handling alias resolution and
+//! optional filtering while streaming batches directly to disk or an arbitrary `Write` sink.
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};

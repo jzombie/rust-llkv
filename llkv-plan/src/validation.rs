@@ -1,3 +1,9 @@
+//! Shared validation utilities for plan construction.
+//!
+//! The helpers here return [`llkv_result::Error::InvalidArgumentError`] with caller-provided
+//! messages so the planner can surface precise diagnostics while keeping the validation logic
+//! reusable across plan builders.
+
 #![forbid(unsafe_code)]
 
 use llkv_result::{Error, Result};

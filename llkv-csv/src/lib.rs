@@ -1,5 +1,12 @@
+//! CSV ingestion and export helpers for LLKV tables.
+//!
+//! The crate wraps Arrow's CSV reader/writer to stream data into LLKV tables and export query
+//! results. High-level entry points live in [`csv_ingest`] and [`csv_export`], while internal
+//! modules provide schema inference and streaming utilities.
+
 use std::error::Error;
 
+/// Result type alias used by CSV ingestion components.
 pub type CsvResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 pub mod csv_export;

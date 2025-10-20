@@ -1,3 +1,8 @@
+//! Append CSV files into LLKV tables with schema inference and column mapping.
+//!
+//! The ingestion pipeline streams Arrow batches from CSV files, normalizes types, and registers
+//! any newly inferred columns with the table catalog so downstream scans see consistent metadata.
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -20,6 +25,8 @@ use crate::inference::normalize_numeric_like;
 use crate::{CsvReadOptions, CsvReader};
 
 // TODO: Migrate to common type utils
+// NOTE: Duplicating the conversion avoids pulling in table-layer dependencies until the shared
+// utility module exists.
 fn convert_row_id(array: &ArrayRef) -> LlkvResult<ArrayRef> {
     match array.data_type() {
         DataType::UInt64 => Ok(Arc::clone(array)),
@@ -444,6 +451,7 @@ where
     Ok(())
 }
 
+/// Append all CSV rows into the target table using inferred column mappings.
 pub fn append_csv_into_table<P, C>(
     table: &Table<P>,
     csv_path: C,
@@ -456,6 +464,7 @@ where
     append_csv_into_table_internal(table, csv_path, csv_options, None)
 }
 
+/// Append rows while honoring an explicit column-to-field mapping supplied by the caller.
 pub fn append_csv_into_table_with_mapping<P, C>(
     table: &Table<P>,
     csv_path: C,

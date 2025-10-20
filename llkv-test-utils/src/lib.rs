@@ -1,3 +1,5 @@
+//! Shared helpers for test binaries, including tracing initialization.
+
 use std::sync::Once;
 
 static INIT: Once = Once::new();
