@@ -1,18 +1,26 @@
 # Comment Style Guide
 
-Our goal is to keep documentation blocks brief, accurate, and consistent across crates. Reference this guide whenever you add or update API comments.
+Our goal is to keep documentation blocks brief, accurate, and consistent across crates. Reference this guide whenever you add or update API comments. Treat it as an overlay on top of idiomatic Rust documentation practices.
+
+Large modules and crates must start with a module-level doc comment (`//!`) that summarizes what the component does, why it exists, and how it is used. Mirror the consistent structure shown in the transaction crate header: summary, key concepts, reserved values or constants, visibility rules, and architecture roles. Tailor sections to the module’s needs while keeping the narrative concise.
 
 ## Core Principles
 - Write comments only when they add value—prefer expressive names over redundant narration.
 - Keep tone direct and technical; avoid marketing phrasing or speculative language.
 - When documenting one parameter, document them all; otherwise omit the parameter section entirely.
 - Favor short sentences and bulleted lists for clarity.
+- Large modules must open with a clear summary paragraph that orients readers before diving into details.
 
 ## Structuring API Docs
 1. **Summary line:** One sentence that states what the item does.
 2. **Details:** Optional paragraphs describing invariants, concurrency expectations, or performance characteristics.
-3. **Inputs/Outputs:** Use `# Arguments`, `# Returns`, and `# Errors` headings only when you need to explain behavior not obvious from the signature. When used, cover every parameter or variant under that heading.
+3. **Inputs/Outputs:** Use `# Arguments`, `# Returns`, `# Errors`, and `# Safety` headings only when needed. When you introduce one heading, document every item underneath it. Avoid partially documented argument lists; either cover them all or omit the section.
 4. **Examples:** Include only runnable snippets. Avoid `ignore` or non-Rust code fences.
+
+## Unsafe Code
+- Document `unsafe` sections with inline comments of the form `// SAFETY: ...`, explaining the invariants that make the block sound.
+- Keep the safety rationale specific and actionable (e.g., memory aliasing requirements, threading guarantees).
+- For public `unsafe` APIs, still include a `# Safety` rustdoc section that mirrors the inline comment and informs callers of their obligations.
 
 ## Examples Policy
 - Examples must compile and pass `cargo test --doc`.
