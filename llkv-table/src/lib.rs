@@ -82,7 +82,7 @@ pub use sys_catalog::{
 };
 pub use table::Table;
 pub use types::{FieldId, ROW_ID_FIELD_ID, RowId, TableColumn, TableId};
-pub use view::{ForeignKeyView, TableView};
+pub use view::{ForeignKeyView, TableConstraintSummaryView, TableView};
 
 pub use planner::plan_graph::{
     PLAN_GRAPH_VERSION, PlanAnnotations, PlanEdge, PlanEdgeMetadata, PlanExpression, PlanField,

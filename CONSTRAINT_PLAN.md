@@ -33,6 +33,7 @@
    - ✅ `RuntimeContext::table_column_specs` now delegates to `CatalogService::table_column_specs`, synthesizes specs from persisted column metadata and constraint records while falling back to resolver state only when no catalog records exist.
    - ✅ `RuntimeContext::table_view` now calls into `CatalogService::table_view`, keeping read paths aligned with the catalog service and avoiding direct metadata access from the runtime layer.
    - ✅ `CatalogService::foreign_key_views` (with `RuntimeContext::foreign_key_views`) surfaces persisted FK metadata without touching metadata internals, keeping read access aligned with the table-layer helpers.
+   - ✅ `CatalogService::table_constraint_summary` now feeds runtime table loading, so constraint and multi-unique metadata no longer come directly from `MetadataManager::table_view`.
 3. **SQL Frontend Cleanup**
    - Update `llkv-sql` planning/execution to emit constraint descriptors that reference IDs instead of strings.
    - Ensure column and table constraint syntax follow the same plumbing path, eliminating one-off handlers.

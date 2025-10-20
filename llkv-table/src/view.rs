@@ -34,3 +34,12 @@ pub struct TableView {
     pub multi_column_uniques: Vec<MultiColumnUniqueEntryMeta>,
     pub foreign_keys: Vec<ForeignKeyView>,
 }
+
+/// Constraint-oriented snapshot without foreign key data.
+#[derive(Clone, Debug)]
+pub struct TableConstraintSummaryView {
+    pub table_meta: Option<TableMeta>,
+    pub column_metas: Vec<Option<ColMeta>>,
+    pub constraint_records: Vec<ConstraintRecord>,
+    pub multi_column_uniques: Vec<MultiColumnUniqueEntryMeta>,
+}

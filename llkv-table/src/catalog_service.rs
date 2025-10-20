@@ -26,7 +26,10 @@ use crate::constraints::ConstraintKind;
 use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration};
 use crate::table::Table;
 use crate::types::{FieldId, RowId, TableColumn, TableId};
-use crate::{ForeignKeyColumn, ForeignKeyTableInfo, ForeignKeyView, TableView, ValidatedForeignKey};
+use crate::{
+    ForeignKeyColumn, ForeignKeyTableInfo, ForeignKeyView, TableConstraintSummaryView, TableView,
+    ValidatedForeignKey,
+};
 
 /// Result of creating a table. The caller is responsible for wiring executor
 /// caches and any higher-level state that depends on the table schema.
@@ -552,6 +555,29 @@ where
         self.metadata
             .foreign_key_views(&self.catalog, table_id)
             .map_err(Into::into)
+    }
+
+    /// Return constraint-related catalog metadata for the specified table.
+    pub fn table_constraint_summary(
+        &self,
+        canonical_name: &str,
+    ) -> LlkvResult<TableConstraintSummaryView> {
+        let table_id = self.catalog.table_id(canonical_name).ok_or_else(|| {
+            Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
+        })?;
+
+        let (_, field_ids) = self.sorted_user_fields(table_id);
+        let table_meta = self.metadata.table_meta(table_id)?;
+        let column_metas = self.metadata.column_metas(table_id, &field_ids)?;
+        let constraint_records = self.metadata.constraint_records(table_id)?;
+        let multi_column_uniques = self.metadata.multi_column_uniques(table_id)?;
+
+        Ok(TableConstraintSummaryView {
+            table_meta,
+            column_metas,
+            constraint_records,
+            multi_column_uniques,
+        })
     }
 
     fn sorted_user_fields(

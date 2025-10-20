@@ -49,13 +49,11 @@ would help.
 - ✅ `CatalogService::table_column_specs` rebuilds column specs from persisted metadata and constraint records, giving runtime callers restart-stable constraint flags without touching executor caches.
 - 🚧 Remaining runtime helpers (catalog-derived read views, executor cache rebuilds) still live in `llkv-runtime`.
 - 🚧 SQL planner/CREATE flows still perform their own validation instead of using shared helpers.
-- ⚙️ Catalog read APIs are mid-migration; column specs, table view, and foreign-key views now call into the service, while constraint summaries remain runtime-only.
+- ✅ Catalog read APIs (column specs, table view, foreign-key views, constraint summaries) now route through the catalog service instead of touching metadata snapshots directly.
 
 ### In-flight
-- Build additional read-only views (constraint/FK snapshots) for consumption by SQL planner and CLI tooling. Remaining steps:
-  - ✅ Expose `CatalogService::foreign_key_views` and route runtime access through `RuntimeContext::foreign_key_views`.
-  - Provide a table-layer helper for constraint summaries (`CatalogService::table_constraints`?) so runtime consumers no longer hydrate `TableView` directly.
-  - Update runtime/SQL callers to consume the new helpers and drop the bespoke wrappers once the service surfaces structured snapshots.
+- Build additional read-only views for SQL planner / CLI tooling. Remaining item:
+  - Update SQL-specific callers to consume the new helpers and drop any remaining bespoke wrappers now that catalog service surfaces the structured snapshots.
 - Fold runtime CREATE/DROP/index helpers into a table-layer `CatalogService`.
 
 ### Catalog service lift – runtime responsibilities inventory

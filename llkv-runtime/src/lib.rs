@@ -59,8 +59,9 @@ use llkv_table::{
     CatalogService, ConstraintColumnInfo, ConstraintService, CreateTableResult, ForeignKeyColumn,
     ForeignKeyTableInfo, ForeignKeyView, InsertColumnConstraint, InsertMultiColumnUnique,
     InsertUniqueColumn, MetadataManager, MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration,
-    SysCatalog, TableView, UniqueKey, build_composite_unique_key, canonical_table_name,
-    constraints::ConstraintKind, ensure_multi_column_unique, ensure_single_column_unique,
+    SysCatalog, TableConstraintSummaryView, TableView, UniqueKey, build_composite_unique_key,
+    canonical_table_name, constraints::ConstraintKind, ensure_multi_column_unique,
+    ensure_single_column_unique,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -4111,15 +4112,18 @@ where
         let mut logical_fields = store.user_field_ids_for_table(table_id);
         logical_fields.sort_by_key(|lfid| lfid.field_id());
         let field_ids: Vec<FieldId> = logical_fields.iter().map(|lfid| lfid.field_id()).collect();
-        let table_view = self
-            .metadata
-            .table_view(&self.catalog, table_id, &field_ids)?;
-        let table_meta = table_view.table_meta.clone().ok_or_else(|| {
+        let summary = self
+            .catalog_service
+            .table_constraint_summary(&canonical_name)?;
+        let TableConstraintSummaryView {
+            table_meta,
+            column_metas,
+            constraint_records,
+            multi_column_uniques,
+        } = summary;
+        let _table_meta = table_meta.ok_or_else(|| {
             Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
         })?;
-        let column_metas = table_view.column_metas;
-        let constraint_records = table_view.constraint_records;
-        let multi_column_uniques = table_view.multi_column_uniques;
         let catalog_field_resolver = self.catalog.field_resolver(catalog_table_id);
         let mut metadata_primary_keys: FxHashSet<FieldId> = FxHashSet::default();
         let mut metadata_unique_fields: FxHashSet<FieldId> = FxHashSet::default();
@@ -4232,7 +4236,7 @@ where
             impl PrimitiveSortedWithRowIdsVisitor for MaxRowIdVisitor {}
 
             // Scan the row_id column for any user field in this table
-            let row_id_field = rowid_fid(LogicalFieldId::for_user(table_meta.table_id, 1));
+            let row_id_field = rowid_fid(LogicalFieldId::for_user(table_id, 1));
             let mut visitor = MaxRowIdVisitor { max: 0 };
 
             match ScanBuilder::new(table.store(), row_id_field)
@@ -4302,7 +4306,7 @@ where
         tracing::debug!(
             "[LAZY_LOAD] Loaded table '{}' (id={}) with {} columns, next_row_id={}",
             canonical_name,
-            table_meta.table_id,
+            table_id,
             field_ids.len(),
             next_row_id
         );
