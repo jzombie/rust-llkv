@@ -672,7 +672,6 @@ where
         Ok(metas)
     }
 
-    // TODO: Use batch APIs for better performance.
     /// Persist or update multiple constraint records for a table in a single batch.
     pub fn put_constraint_records(
         &self,

@@ -24,7 +24,6 @@ pub struct ForeignKeyView {
     pub on_update: ForeignKeyAction,
 }
 
-// TODO: Rename!
 /// Read-only snapshot aggregating table metadata used by runtime consumers.
 #[derive(Clone, Debug)]
 pub struct TableView {
