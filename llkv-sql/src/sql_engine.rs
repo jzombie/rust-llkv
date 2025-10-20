@@ -664,34 +664,12 @@ where
                         let mut pk_column_names: Vec<String> = Vec::with_capacity(constraint_columns.len());
 
                         for index_col in &constraint_columns {
-                            if index_col.operator_class.is_some() {
-                                return Err(Error::InvalidArgumentError(
-                                    "PRIMARY KEY operator classes are not supported".into(),
-                                ));
-                            }
-
-                            let order_expr = &index_col.column;
-                            if order_expr.options.asc.is_some()
-                                || order_expr.options.nulls_first.is_some()
-                                || order_expr.with_fill.is_some()
-                            {
-                                return Err(Error::InvalidArgumentError(
-                                    "PRIMARY KEY columns must be simple identifiers".into(),
-                                ));
-                            }
-
-                            let column_ident = match &order_expr.expr {
-                                SqlExpr::Identifier(ident) => ident.value.clone(),
-                                SqlExpr::CompoundIdentifier(parts) if parts.len() == 1 => {
-                                    parts[0].value.clone()
-                                }
-                                _ => {
-                                    return Err(Error::InvalidArgumentError(
-                                        "PRIMARY KEY columns must be column identifiers".into(),
-                                    ));
-                                }
-                            };
-
+                            let column_ident = extract_index_column_name(
+                                index_col,
+                                "PRIMARY KEY",
+                                false, // no sort options allowed
+                                false, // only simple identifiers
+                            )?;
                             pk_column_names.push(column_ident);
                         }
 
@@ -770,35 +748,12 @@ where
                             Vec::with_capacity(constraint_columns.len());
 
                         for index_column in &constraint_columns {
-                            if index_column.operator_class.is_some() {
-                                return Err(Error::InvalidArgumentError(
-                                    "UNIQUE constraints with operator classes are not supported yet"
-                                        .into(),
-                                ));
-                            }
-
-                            let order_expr = &index_column.column;
-                            if order_expr.options.asc.is_some()
-                                || order_expr.options.nulls_first.is_some()
-                                || order_expr.with_fill.is_some()
-                            {
-                                return Err(Error::InvalidArgumentError(
-                                    "UNIQUE constraint columns must be simple identifiers".into(),
-                                ));
-                            }
-
-                            let column_ident = match &order_expr.expr {
-                                SqlExpr::Identifier(ident) => ident.value.clone(),
-                                SqlExpr::CompoundIdentifier(parts) if parts.len() == 1 => {
-                                    parts[0].value.clone()
-                                }
-                                _ => {
-                                    return Err(Error::InvalidArgumentError(
-                                        "UNIQUE constraint columns must be column identifiers".into(),
-                                    ));
-                                }
-                            };
-
+                            let column_ident = extract_index_column_name(
+                                index_column,
+                                "UNIQUE constraint",
+                                false, // no sort options allowed
+                                false, // only simple identifiers
+                            )?;
                             unique_column_names.push(column_ident);
                         }
 
@@ -902,8 +857,6 @@ where
         &self,
         stmt: sqlparser::ast::CreateIndex,
     ) -> SqlResult<RuntimeStatementResult<P>> {
-        use sqlparser::ast::Expr as SqlExpr;
-
         let sqlparser::ast::CreateIndex {
             name,
             table_name,
@@ -996,50 +949,24 @@ where
         let mut index_columns: Vec<IndexColumnPlan> = Vec::with_capacity(columns.len());
         let mut seen_column_names: HashSet<String> = HashSet::new();
         for item in columns {
-            if item.operator_class.is_some() {
-                return Err(Error::InvalidArgumentError(
-                    "CREATE INDEX operator classes are not supported".into(),
-                ));
-            }
-
-            let order_expr = item.column;
-
-            if order_expr.with_fill.is_some() {
+            // Check WITH FILL before calling helper (not part of standard validation)
+            if item.column.with_fill.is_some() {
                 return Err(Error::InvalidArgumentError(
                     "CREATE INDEX column WITH FILL is not supported".into(),
                 ));
             }
 
-            let column_name = match order_expr.expr {
-                SqlExpr::Identifier(ident) => ident.value,
-                SqlExpr::CompoundIdentifier(idents) => idents
-                    .last()
-                    .map(|ident| ident.value.clone())
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "invalid column reference in CREATE INDEX".into(),
-                        )
-                    })?,
-                other => {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "CREATE INDEX only supports column references, found {other:?}",
-                    )));
-                }
-            };
+            let column_name = extract_index_column_name(
+                &item,
+                "CREATE INDEX",
+                true,  // allow and validate sort options
+                true,  // allow compound identifiers
+            )?;
 
+            // Get sort options (already validated by helper)
+            let order_expr = &item.column;
             let ascending = order_expr.options.asc.unwrap_or(true);
             let nulls_first = order_expr.options.nulls_first.unwrap_or(false);
-
-            if !ascending {
-                return Err(Error::InvalidArgumentError(
-                    "CREATE INDEX DESC ordering is not supported".into(),
-                ));
-            }
-            if nulls_first {
-                return Err(Error::InvalidArgumentError(
-                    "CREATE INDEX NULLS FIRST ordering is not supported".into(),
-                ));
-            }
 
             let normalized = column_name.to_ascii_lowercase();
             if !seen_column_names.insert(normalized.clone()) {
@@ -2876,6 +2803,104 @@ fn parse_schema_qualified_name(name: &ObjectName) -> SqlResult<(Option<String>, 
             name
         ))),
     }
+}
+
+/// Extract column name from an index column specification (OrderBy expression).
+///
+/// This handles the common pattern of validating and extracting column names from
+/// SQL index column definitions (PRIMARY KEY, UNIQUE, CREATE INDEX).
+///
+/// # Parameters
+/// - `index_col`: The index column from sqlparser AST
+/// - `context`: Description of where this column appears (e.g., "PRIMARY KEY", "UNIQUE constraint")
+/// - `allow_sort_options`: If false, errors if any sort options are present; if true, validates them
+/// - `allow_compound`: If true, allows compound identifiers and takes the last part; if false, only allows simple identifiers
+///
+/// # Returns
+/// Column name as a String
+fn extract_index_column_name(
+    index_col: &sqlparser::ast::IndexColumn,
+    context: &str,
+    allow_sort_options: bool,
+    allow_compound: bool,
+) -> SqlResult<String> {
+    use sqlparser::ast::Expr as SqlExpr;
+
+    // Check operator class
+    if index_col.operator_class.is_some() {
+        return Err(Error::InvalidArgumentError(format!(
+            "{} operator classes are not supported",
+            context
+        )));
+    }
+
+    let order_expr = &index_col.column;
+
+    // Validate sort options
+    if allow_sort_options {
+        // For CREATE INDEX: validate specific values are supported
+        let ascending = order_expr.options.asc.unwrap_or(true);
+        let nulls_first = order_expr.options.nulls_first.unwrap_or(false);
+
+        if !ascending {
+            return Err(Error::InvalidArgumentError(format!(
+                "{} DESC ordering is not supported",
+                context
+            )));
+        }
+        if nulls_first {
+            return Err(Error::InvalidArgumentError(format!(
+                "{} NULLS FIRST ordering is not supported",
+                context
+            )));
+        }
+    } else {
+        // For constraints: no sort options allowed
+        if order_expr.options.asc.is_some()
+            || order_expr.options.nulls_first.is_some()
+            || order_expr.with_fill.is_some()
+        {
+            return Err(Error::InvalidArgumentError(format!(
+                "{} columns must be simple identifiers",
+                context
+            )));
+        }
+    }
+
+    // Extract column name from expression
+    let column_name = match &order_expr.expr {
+        SqlExpr::Identifier(ident) => ident.value.clone(),
+        SqlExpr::CompoundIdentifier(parts) => {
+            if allow_compound {
+                // For CREATE INDEX: allow qualified names, take last part
+                parts
+                    .last()
+                    .map(|ident| ident.value.clone())
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!(
+                            "invalid column reference in {}",
+                            context
+                        ))
+                    })?
+            } else if parts.len() == 1 {
+                // For constraints: only allow single-part compound identifiers
+                parts[0].value.clone()
+            } else {
+                return Err(Error::InvalidArgumentError(format!(
+                    "{} columns must be column identifiers",
+                    context
+                )));
+            }
+        }
+        other => {
+            return Err(Error::InvalidArgumentError(format!(
+                "{} only supports column references, found {:?}",
+                context, other
+            )));
+        }
+    };
+
+    Ok(column_name)
 }
 
 fn validate_create_table_common(stmt: &sqlparser::ast::CreateTable) -> SqlResult<()> {

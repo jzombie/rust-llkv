@@ -28,10 +28,13 @@ would help.
 
 ## SQL planning duplication
 
-- `handle_create_table` and `handle_create_index` in `llkv-sql/src/sql_engine.rs` perform
-  column de-duplication and option validation that could live in `llkv-plan`. A lightweight
-  validator shared by CLI/SQL clients would cut duplicate checks and make the code easier to
-  unit test outside the runtime.
+The SQL engine in `llkv-sql/src/sql_engine.rs` has internal duplication that should be addressed:
+
+- **Column extraction from SQL AST**: The pattern of extracting column names from `OrderBy` expressions and validating them (checking for operator classes, sort options, compound identifiers) appears 3+ times in `handle_create_table` (for PRIMARY KEY and UNIQUE constraints) and `handle_create_index`. This could be consolidated into a helper function within the SQL engine module.
+
+- **Column validation already shared**: The `llkv-plan::validation` module successfully provides `ensure_non_empty`, `ensure_unique_case_insensitive`, and `ensure_known_columns_case_insensitive` utilities that are already used by the SQL engine to eliminate duplicate validation logic.
+
+- **SQL-specific validations**: Most of the remaining validation logic in `handle_create_table` and `handle_create_index` is inherently SQL AST-specific (checking unsupported SQL features like `CONCURRENTLY`, `USING`, `NULLS DISTINCT`, etc.) and cannot easily move to `llkv-plan` since that crate doesn't depend on `sqlparser`. These validations serve as a translation layer from SQL syntax to plan structures and appropriately belong in the SQL engine.
 
 ## Status Snapshot
 
@@ -53,11 +56,9 @@ would help.
 - ✅ Catalog read APIs (column specs, table view, foreign-key views, constraint summaries) now route through the catalog service instead of touching metadata snapshots directly.
 - ✅ Shared validation utilities (`llkv_plan::validation`) centralise column/FK/PK/UNIQUE shape checks so frontends can reuse them without SQL-specific logic.
 - ✅ SQL planner column-resolution (`collect_known_columns`) now sources metadata via `RuntimeContext::table_column_specs`, avoiding ad-hoc `table_view` + `lookup_table` fallbacks.
+- ✅ SQL engine internal cleanup: consolidated the repeated "extract column name from OrderBy expression" pattern into `extract_index_column_name` helper within `sql_engine.rs`, eliminating duplicate AST validation code across PRIMARY KEY, UNIQUE, and CREATE INDEX handlers.
 
 ### In-flight
-- Update SQL planner/DDL code paths to consume catalog-service helpers:
-  - Emit IDs + constraint descriptors from `llkv-sql` planning instead of string-heavy structures.
-  - Finish collapsing remaining CHECK-expression validation in `handle_create_table` (currently still SQL-specific AST traversal).
 - Persistence + change detection polish:
   - Add diff-aware metadata writes so `flush_table` skips no-op updates.
   - Expose snapshot invalidation semantics for constraint updates across threads.
@@ -80,11 +81,10 @@ The catalog service successfully centralizes metadata/catalog orchestration whil
 
 ### Up Next
 
-> **Current checkpoint:** CREATE/DROP/index responsibilities now delegated to CatalogService. Runtime focuses on transaction orchestration, data validation with live snapshots, and executor cache management.
+> **Current checkpoint:** CREATE/DROP/index responsibilities now delegated to CatalogService. Runtime focuses on transaction orchestration, data validation with live snapshots, and executor cache management. SQL engine internal cleanup completed—column extraction from SQL AST consolidated into reusable helper.
 
-1. **SQL planning refinement** – continue reducing duplicate validation logic in `llkv-sql` by consuming shared validators from `llkv-plan`.
-2. **Persistence polish** – add diff-aware metadata writes and snapshot invalidation semantics for constraint updates.
-3. **Module cleanup** – align naming (`types.rs`, service modules) once the API surface settles.
+1. **Persistence polish** – add diff-aware metadata writes and snapshot invalidation semantics for constraint updates.
+2. **Module cleanup** – align naming (`types.rs`, service modules) once the API surface settles.
 
 ---
 
