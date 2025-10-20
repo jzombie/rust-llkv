@@ -1,4 +1,4 @@
-# Feature Placement Training
+# Feature Placement Guide
 
 This guide keeps feature work aligned with our architecture so we avoid wasteful refactors and protect runtime performance.
 
