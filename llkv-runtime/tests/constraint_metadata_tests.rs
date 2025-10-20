@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use llkv_column_map::store::ColumnStore;
-use llkv_runtime::{ColumnSpec, RuntimeContext, RuntimeStatementResult};
+use llkv_runtime::{
+    ColumnSpec, CreateTablePlan, ForeignKeyAction, ForeignKeySpec, RuntimeContext,
+    RuntimeStatementResult,
+};
 use llkv_storage::pager::MemPager;
 use llkv_table::{ConstraintKind, MetadataManager, PrimaryKeyConstraint, Table, UniqueConstraint};
 
@@ -50,6 +53,56 @@ fn primary_key_and_unique_constraints_reload_from_metadata() {
     let email_spec = specs.iter().find(|spec| spec.name == "email").unwrap();
     assert!(!email_spec.primary_key);
     assert!(email_spec.unique);
+}
+
+#[test]
+fn foreign_key_views_reload_from_metadata() {
+    let pager = Arc::new(MemPager::default());
+
+    {
+        let context = Arc::new(RuntimeContext::new(Arc::clone(&pager)));
+
+        context
+            .create_table_builder("parents")
+            .with_column_spec(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
+            .finish()
+            .expect("create parents table");
+
+        let mut plan = CreateTablePlan::new("children");
+        plan.columns.push(
+            ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true),
+        );
+        plan.columns
+            .push(ColumnSpec::new("parent_id", DataType::Int64, true));
+        plan.foreign_keys.push(ForeignKeySpec {
+            name: Some("fk_children_parent".into()),
+            columns: vec!["parent_id".into()],
+            referenced_table: "parents".into(),
+            referenced_columns: vec!["id".into()],
+            on_delete: ForeignKeyAction::Restrict,
+            on_update: ForeignKeyAction::Restrict,
+        });
+
+        match context
+            .create_table_plan(plan)
+            .expect("create children table with foreign key")
+        {
+            RuntimeStatementResult::CreateTable { .. } => {}
+            other => panic!("expected CreateTable result, got {:?}", other),
+        }
+    }
+
+    let context = Arc::new(RuntimeContext::new(Arc::clone(&pager)));
+    let views = context
+        .foreign_key_views("children")
+        .expect("load foreign key views");
+
+    assert_eq!(views.len(), 1);
+    let view = &views[0];
+    assert_eq!(view.referencing_table_display, "children");
+    assert_eq!(view.referenced_table_display, "parents");
+    assert_eq!(view.referencing_column_names, vec!["parent_id"]);
+    assert_eq!(view.referenced_column_names, vec!["id"]);
 }
 
 fn assert_accounts_constraints(pager: &Arc<MemPager>) {

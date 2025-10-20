@@ -57,9 +57,9 @@ use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId};
 use llkv_table::{
     CatalogService, ConstraintColumnInfo, ConstraintService, CreateTableResult, ForeignKeyColumn,
-    ForeignKeyTableInfo, InsertColumnConstraint, InsertMultiColumnUnique, InsertUniqueColumn,
-    MetadataManager, MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, SysCatalog,
-    TableView, UniqueKey, build_composite_unique_key, canonical_table_name,
+    ForeignKeyTableInfo, ForeignKeyView, InsertColumnConstraint, InsertMultiColumnUnique,
+    InsertUniqueColumn, MetadataManager, MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration,
+    SysCatalog, TableView, UniqueKey, build_composite_unique_key, canonical_table_name,
     constraints::ConstraintKind, ensure_multi_column_unique, ensure_single_column_unique,
 };
 use simd_r_drive_entry_handle::EntryHandle;
@@ -1753,6 +1753,13 @@ where
         let (_, canonical_name) = canonical_table_name(name)?;
         self.catalog_service
             .table_column_specs(&canonical_name)
+            .map_err(Into::into)
+    }
+
+    pub fn foreign_key_views(self: &Arc<Self>, name: &str) -> Result<Vec<ForeignKeyView>> {
+        let (_, canonical_name) = canonical_table_name(name)?;
+        self.catalog_service
+            .foreign_key_views(&canonical_name)
             .map_err(Into::into)
     }
 

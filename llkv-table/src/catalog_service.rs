@@ -543,6 +543,17 @@ where
         Ok(specs)
     }
 
+    /// Return the foreign key metadata for the specified table.
+    pub fn foreign_key_views(&self, canonical_name: &str) -> LlkvResult<Vec<ForeignKeyView>> {
+        let table_id = self.catalog.table_id(canonical_name).ok_or_else(|| {
+            Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
+        })?;
+
+        self.metadata
+            .foreign_key_views(&self.catalog, table_id)
+            .map_err(Into::into)
+    }
+
     fn sorted_user_fields(
         &self,
         table_id: TableId,
