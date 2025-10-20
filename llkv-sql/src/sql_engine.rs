@@ -28,6 +28,7 @@ use sqlparser::ast::{
     ColumnOptionDef, DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause,
     NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType, OrderBy, OrderByKind, Query,
+    ConstraintCharacteristics,
     ReferentialAction, SchemaName, Select, SelectItem, SelectItemQualifiedWildcardKind, Set,
     SetExpr, SqlOption, Statement, TableConstraint, TableFactor, TableObject, TableWithJoins,
     TransactionMode, TransactionModifier, UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
@@ -413,34 +414,17 @@ where
             return Err(Self::table_not_found_error(display_name));
         }
 
-        match context.table_view(canonical_name) {
-            Ok(view) => Ok(view
-                .column_metas
-                .iter()
-                .filter_map(|meta| meta.as_ref())
-                .filter_map(|meta| meta.name.clone())
-                .map(|name| name.to_ascii_lowercase())
+        match context.table_column_specs(display_name) {
+            Ok(specs) => Ok(specs
+                .into_iter()
+                .map(|spec| spec.name.to_ascii_lowercase())
                 .collect()),
             Err(err) => {
                 if !Self::is_table_missing_error(&err) {
                     return Err(Self::map_table_error(display_name, err));
                 }
 
-                match context.lookup_table(canonical_name) {
-                    Ok(table) => Ok(table
-                        .schema
-                        .columns
-                        .iter()
-                        .map(|column| column.name.to_ascii_lowercase())
-                        .collect()),
-                    Err(runtime_err) => {
-                        if Self::is_table_missing_error(&runtime_err) {
-                            Ok(HashSet::new())
-                        } else {
-                            Err(Self::map_table_error(display_name, runtime_err))
-                        }
-                    }
-                }
+                Ok(HashSet::new())
             }
         }
     }
@@ -599,68 +583,19 @@ where
                     characteristics,
                 } = &opt.option
                 {
-                    if characteristics.is_some() {
-                        return Err(Error::InvalidArgumentError(
-                            "FOREIGN KEY constraint characteristics are not supported yet".into(),
-                        ));
-                    }
-
-                    let (referenced_display, referenced_canonical) =
-                        canonical_object_name(foreign_table)?;
-                    let referenced_columns: Vec<String> =
-                        referred_columns.iter().map(|c| c.value.clone()).collect();
-
-                    if referenced_canonical == canonical_name {
-                        for column_name in &referenced_columns {
-                            let normalized = column_name.to_ascii_lowercase();
-                            if !seen_names.contains(&normalized) {
-                                return Err(Error::InvalidArgumentError(format!(
-                                    "unknown referenced column '{}' in FOREIGN KEY constraint",
-                                    column_name
-                                )));
-                            }
-                        }
-                    } else {
-                        let known_columns =
-                            self.collect_known_columns(&referenced_display, &referenced_canonical)?;
-                        let enforce_known_columns = !known_columns.is_empty();
-                        for column_name in &referenced_columns {
-                            let normalized = column_name.to_ascii_lowercase();
-                            if enforce_known_columns && !known_columns.contains(&normalized) {
-                                return Err(Error::InvalidArgumentError(format!(
-                                    "unknown referenced column '{}' in FOREIGN KEY constraint",
-                                    column_name
-                                )));
-                            }
-                        }
-                    }
-
-                    let map_action = |action: &Option<ReferentialAction>,
-                                      kind: &str|
-                     -> SqlResult<ForeignKeyAction> {
-                        match action {
-                            None | Some(ReferentialAction::NoAction) => {
-                                Ok(ForeignKeyAction::NoAction)
-                            }
-                            Some(ReferentialAction::Restrict) => Ok(ForeignKeyAction::Restrict),
-                            Some(other) => Err(Error::InvalidArgumentError(format!(
-                                "FOREIGN KEY ON {kind} {:?} is not supported yet",
-                                other
-                            ))),
-                        }
-                    };
-
-                    let on_delete_action = map_action(on_delete, "DELETE")?;
-                    let on_update_action = map_action(on_update, "UPDATE")?;
-
-                    foreign_keys.push(ForeignKeySpec {
-                        name: None,
-                        columns: vec![column_def.name.value.clone()],
-                        referenced_table: referenced_display,
-                        referenced_columns,
-                        on_delete: on_delete_action,
-                        on_update: on_update_action,
-                    });
+                    let spec = self.build_foreign_key_spec(
+                        &display_name,
+                        &canonical_name,
+                        vec![column_def.name.value.clone()],
+                        foreign_table,
+                        referred_columns,
+                        on_delete.clone(),
+                        on_update.clone(),
+                        characteristics,
+                        &seen_names,
+                        None,
+                    )?;
+                    foreign_keys.push(spec);
                 }
             }
 
@@ -890,127 +825,22 @@ where
                             ));
                         }
 
-                        if characteristics.is_some() {
-                            return Err(Error::InvalidArgumentError(
-                                "FOREIGN KEY constraint characteristics are not supported yet"
-                                    .into(),
-                            ));
-                        }
+                        let referencing_columns: Vec<String> =
+                            fk_columns.into_iter().map(|ident| ident.value).collect();
+                        let spec = self.build_foreign_key_spec(
+                            &display_name,
+                            &canonical_name,
+                            referencing_columns,
+                            &foreign_table,
+                            &referred_columns,
+                            on_delete,
+                            on_update,
+                            &characteristics,
+                            &seen_names,
+                            name.map(|ident| ident.value),
+                        )?;
 
-                        if fk_columns.is_empty() {
-                            return Err(Error::InvalidArgumentError(
-                                "FOREIGN KEY constraint requires at least one referencing column"
-                                    .into(),
-                            ));
-                        }
-
-                        // If referred_columns is empty, it means "use the primary key"
-                        // This will be resolved during table creation
-                        if !referred_columns.is_empty()
-                            && fk_columns.len() != referred_columns.len()
-                        {
-                            return Err(Error::InvalidArgumentError(
-                                "FOREIGN KEY referencing and referenced column counts must match"
-                                    .into(),
-                            ));
-                        }
-
-                        let mut referencing_columns = Vec::with_capacity(fk_columns.len());
-                        let mut seen_referencing: HashSet<String> =
-                            HashSet::with_capacity(fk_columns.len());
-                        for ident in fk_columns {
-                            let column_name = ident.value;
-                            let normalized = column_name.to_ascii_lowercase();
-                            if !seen_referencing.insert(normalized.clone()) {
-                                return Err(Error::InvalidArgumentError(format!(
-                                    "duplicate column '{}' in FOREIGN KEY constraint",
-                                    column_name
-                                )));
-                            }
-
-                            if !column_lookup.contains_key(&normalized) {
-                                return Err(Error::InvalidArgumentError(format!(
-                                    "unknown column '{}' in FOREIGN KEY constraint",
-                                    column_name
-                                )));
-                            }
-
-                            referencing_columns.push(column_name);
-                        }
-
-                        let mut referenced_columns_vec = Vec::with_capacity(referred_columns.len());
-                        let mut seen_referenced: HashSet<String> =
-                            HashSet::with_capacity(referred_columns.len());
-                        for ident in referred_columns {
-                            let column_name = ident.value;
-                            let normalized = column_name.to_ascii_lowercase();
-                            if !seen_referenced.insert(normalized.clone()) {
-                                return Err(Error::InvalidArgumentError(format!(
-                                    "duplicate referenced column '{}' in FOREIGN KEY constraint",
-                                    column_name
-                                )));
-                            }
-                            referenced_columns_vec.push(column_name);
-                        }
-
-                        let (referenced_display, referenced_canonical) =
-                            canonical_object_name(&foreign_table)?;
-
-                        if referenced_canonical == canonical_name {
-                            for column_name in &referenced_columns_vec {
-                                let normalized = column_name.to_ascii_lowercase();
-                                if !seen_names.contains(&normalized) {
-                                    return Err(Error::InvalidArgumentError(format!(
-                                        "unknown referenced column '{}' in FOREIGN KEY constraint",
-                                        column_name
-                                    )));
-                                }
-                            }
-                        } else {
-                            let known_columns = self.collect_known_columns(
-                                &referenced_display,
-                                &referenced_canonical,
-                            )?;
-                            let enforce_known_columns = !known_columns.is_empty();
-                            for column_name in &referenced_columns_vec {
-                                let normalized = column_name.to_ascii_lowercase();
-                                if enforce_known_columns && !known_columns.contains(&normalized) {
-                                    return Err(Error::InvalidArgumentError(format!(
-                                        "unknown referenced column '{}' in FOREIGN KEY constraint",
-                                        column_name
-                                    )));
-                                }
-                            }
-                        }
-
-                        let map_action = |action: Option<ReferentialAction>,
-                                          kind: &str|
-                         -> SqlResult<ForeignKeyAction> {
-                            match action {
-                                None | Some(ReferentialAction::NoAction) => {
-                                    Ok(ForeignKeyAction::NoAction)
-                                }
-                                Some(ReferentialAction::Restrict) => Ok(ForeignKeyAction::Restrict),
-                                Some(other) => Err(Error::InvalidArgumentError(format!(
-                                    "FOREIGN KEY ON {kind} {:?} is not supported yet",
-                                    other
-                                ))),
-                            }
-                        };
-
-                        let on_delete_action = map_action(on_delete, "DELETE")?;
-                        let on_update_action = map_action(on_update, "UPDATE")?;
-
-                        let constraint_name = name.map(|ident| ident.value);
-
-                        foreign_keys.push(ForeignKeySpec {
-                            name: constraint_name,
-                            columns: referencing_columns,
-                            referenced_table: referenced_display,
-                            referenced_columns: referenced_columns_vec,
-                            on_delete: on_delete_action,
-                            on_update: on_update_action,
-                        });
+                        foreign_keys.push(spec);
                     }
                     unsupported => {
                         return Err(Error::InvalidArgumentError(format!(
@@ -1209,6 +1039,131 @@ where
             .with_columns(index_columns);
 
         self.execute_plan_statement(PlanStatement::CreateIndex(plan))
+    }
+
+    fn map_referential_action(
+        action: Option<ReferentialAction>,
+        kind: &str,
+    ) -> SqlResult<ForeignKeyAction> {
+        match action {
+            None | Some(ReferentialAction::NoAction) => Ok(ForeignKeyAction::NoAction),
+            Some(ReferentialAction::Restrict) => Ok(ForeignKeyAction::Restrict),
+            Some(other) => Err(Error::InvalidArgumentError(format!(
+                "FOREIGN KEY ON {kind} {:?} is not supported yet",
+                other
+            ))),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_foreign_key_spec(
+        &self,
+        _referencing_display: &str,
+        referencing_canonical: &str,
+        referencing_columns: Vec<String>,
+        foreign_table: &ObjectName,
+        referenced_columns: &[Ident],
+        on_delete: Option<ReferentialAction>,
+        on_update: Option<ReferentialAction>,
+        characteristics: &Option<ConstraintCharacteristics>,
+        known_columns_lower: &HashSet<String>,
+        name: Option<String>,
+    ) -> SqlResult<ForeignKeySpec> {
+        if characteristics.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "FOREIGN KEY constraint characteristics are not supported yet".into(),
+            ));
+        }
+
+        if referencing_columns.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "FOREIGN KEY constraint requires at least one referencing column".into(),
+            ));
+        }
+
+        let mut normalized_referencing: HashSet<String> =
+            HashSet::with_capacity(referencing_columns.len());
+        for column_name in &referencing_columns {
+            let normalized = column_name.to_ascii_lowercase();
+            if !normalized_referencing.insert(normalized.clone()) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "duplicate column '{}' in FOREIGN KEY constraint",
+                    column_name
+                )));
+            }
+
+            if !known_columns_lower.contains(&normalized) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "unknown column '{}' in FOREIGN KEY constraint",
+                    column_name
+                )));
+            }
+        }
+
+        if !referenced_columns.is_empty()
+            && referenced_columns.len() != referencing_columns.len()
+        {
+            return Err(Error::InvalidArgumentError(
+                "FOREIGN KEY referencing and referenced column counts must match".into(),
+            ));
+        }
+
+        let mut referenced_columns_vec: Vec<String> =
+            Vec::with_capacity(referenced_columns.len());
+        let mut seen_referenced: HashSet<String> =
+            HashSet::with_capacity(referenced_columns.len());
+        for ident in referenced_columns {
+            let column_name = ident.value.clone();
+            let normalized = column_name.to_ascii_lowercase();
+            if !seen_referenced.insert(normalized.clone()) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "duplicate referenced column '{}' in FOREIGN KEY constraint",
+                    column_name
+                )));
+            }
+            referenced_columns_vec.push(column_name);
+        }
+
+        let (referenced_display, referenced_canonical) =
+            canonical_object_name(foreign_table)?;
+
+        if referenced_canonical == referencing_canonical {
+            for column_name in &referenced_columns_vec {
+                let normalized = column_name.to_ascii_lowercase();
+                if !known_columns_lower.contains(&normalized) {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unknown referenced column '{}' in FOREIGN KEY constraint",
+                        column_name
+                    )));
+                }
+            }
+        } else {
+            let known_columns =
+                self.collect_known_columns(&referenced_display, &referenced_canonical)?;
+            if !known_columns.is_empty() {
+                for column_name in &referenced_columns_vec {
+                    let normalized = column_name.to_ascii_lowercase();
+                    if !known_columns.contains(&normalized) {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "unknown referenced column '{}' in FOREIGN KEY constraint",
+                            column_name
+                        )));
+                    }
+                }
+            }
+        }
+
+        let on_delete_action = Self::map_referential_action(on_delete, "DELETE")?;
+        let on_update_action = Self::map_referential_action(on_update, "UPDATE")?;
+
+        Ok(ForeignKeySpec {
+            name,
+            columns: referencing_columns,
+            referenced_table: referenced_display,
+            referenced_columns: referenced_columns_vec,
+            on_delete: on_delete_action,
+            on_update: on_update_action,
+        })
     }
 
     fn handle_create_schema(

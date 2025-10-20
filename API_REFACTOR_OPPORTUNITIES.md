@@ -48,13 +48,14 @@ would help.
 - ⚙️ Runtime now only stages executor caches for CREATE TABLE/CTAS; metadata, catalog writes, and MVCC batch seeding are handled by `CatalogService`.
 - ✅ `CatalogService::table_column_specs` rebuilds column specs from persisted metadata and constraint records, giving runtime callers restart-stable constraint flags without touching executor caches.
 - 🚧 Remaining runtime helpers (catalog-derived read views, executor cache rebuilds) still live in `llkv-runtime`.
-- 🚧 SQL planner/CREATE flows still perform their own validation instead of using shared helpers.
+- ⚙️ SQL planner/CREATE flows now reuse shared FK validation helpers, but further consolidation (e.g., UNIQUE checks) remains.
 - ✅ Catalog read APIs (column specs, table view, foreign-key views, constraint summaries) now route through the catalog service instead of touching metadata snapshots directly.
+- ✅ SQL planner column-resolution (`collect_known_columns`) now sources metadata via `RuntimeContext::table_column_specs`, avoiding ad-hoc `table_view` + `lookup_table` fallbacks.
 
 ### In-flight
 - Update SQL planner/DDL code paths to consume catalog-service helpers:
   - Emit IDs + constraint descriptors from `llkv-sql` planning instead of string-heavy structures.
-  - Remove bespoke validation in `handle_create_table` / `handle_create_index` once shared helpers are in place.
+  - Finish collapsing bespoke validation in `handle_create_table` / `handle_create_index` (CHECK/UNIQUE dedupe still pending).
 - Fold runtime CREATE/DROP/index helpers into a table-layer `CatalogService`.
 - Persistence + change detection polish:
   - Add diff-aware metadata writes so `flush_table` skips no-op updates.
