@@ -30,6 +30,9 @@
    - Retire `ForeignKeyRegistry` and similar ad-hoc maps in favor of manager snapshots built on precomputed `Arc` views that refresh under write locks.
    - ✅ Lazy table loads now rebuild executor schemas from `MetadataManager` snapshots, eliminating the remaining direct `SysCatalog` reads and ensuring column/constraint metadata comes from a single source. Empty-table type resolution was hardened by extending the column store dtype cache so descriptors expose their Arrow types immediately after registration.
    - ✅ Drop flows now route through the manager: `RuntimeContext::drop_table_immediate` collects the registered columns, clears table/column/constraint snapshots via `MetadataManager::prepare_table_drop`, flushes the diffs, and nulls out persisted multi-column unique rows. Catalog state and foreign key caches are pruned in the same pass so restarts see the table as fully removed.
+   - ✅ `RuntimeContext::table_column_specs` now delegates to `CatalogService::table_column_specs`, synthesizes specs from persisted column metadata and constraint records while falling back to resolver state only when no catalog records exist.
+   - ✅ `RuntimeContext::table_view` now calls into `CatalogService::table_view`, keeping read paths aligned with the catalog service and avoiding direct metadata access from the runtime layer.
+   - ✅ `CatalogService::foreign_key_views` (with `RuntimeContext::foreign_key_views`) surfaces persisted FK metadata without touching metadata internals, keeping read access aligned with the table-layer helpers.
 3. **SQL Frontend Cleanup**
    - Update `llkv-sql` planning/execution to emit constraint descriptors that reference IDs instead of strings.
    - Ensure column and table constraint syntax follow the same plumbing path, eliminating one-off handlers.
