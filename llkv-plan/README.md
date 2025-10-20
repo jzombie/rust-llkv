@@ -1,4 +1,4 @@
-# llkv-plan
+# LLKV Plan
 
 **Work in Progress**
 
@@ -7,7 +7,7 @@
 ## Purpose
 
 - Define execution plan structures for SQL operations (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE).
-- Convert SQL AST from [`sqlparser`] into typed execution plans.
+- Convert SQL AST from [sqlparser](https://crates.io/crates/sqlparser) into typed execution plans.
 - Provide plan data structures used by [`llkv-runtime`](../llkv-runtime/) and [`llkv-executor`](../llkv-executor/).
 
 ## Design Notes

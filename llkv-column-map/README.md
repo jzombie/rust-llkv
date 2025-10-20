@@ -2,9 +2,9 @@
 
 **Work in Progress**
 
-Prototype B+Tree replacement with batch-only pager I/O for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
+This crate provides low-level columnar mapping for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
 
-This crate provides low-level columnar storage using Arrow format. It is used by [`llkv-table`](../llkv-table/) for table storage and accessed by [`llkv-runtime`](../llkv-runtime/) for data operations.
+It's used by [`llkv-table`](../llkv-table/) as an interface into the lower-level [`llkv-storage`](../llkv-storage/) pagers.
 
 ## Features
 

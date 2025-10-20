@@ -1,6 +1,8 @@
-# llkv-test-utils
+# LLKV Test Utils
 
-Utilities for running tests across the [LLKV](../) toolkit.
+**Work in Progress**
+
+Utilities for running tests across the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
 
 The crate currently provides a tiny, test-focused tracing initializer and a convenient `auto-init` feature for automatically installing a tracing subscriber at test-binary startup.
 
