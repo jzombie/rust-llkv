@@ -1,21 +1,53 @@
 /// Multi-Version Concurrency Control (MVCC) utilities.
 ///
 /// This module centralizes the transaction ID allocator, row-version metadata,
-/// and visibility checks used across the engine. The overarching goal is to
-/// allow transactions to operate directly on the base storage without copying
-/// tables into a staging area.
+/// Arrow helpers for MVCC column construction, and visibility checks used across
+/// the engine. The overarching goal is to allow transactions to operate directly
+/// on the base storage without copying tables into a staging area.
+use arrow::array::{ArrayRef, UInt64Array, UInt64Builder};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use llkv_column_map::store::{
+    CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME, FIELD_ID_META_KEY, ROW_ID_COLUMN_NAME,
+};
+use llkv_column_map::types::{FieldId, RowId};
+use llkv_result::Error;
 use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Transaction ID type.
 pub type TxnId = u64;
 
-// Re-export reserved constants from llkv-table
-pub use llkv_table::reserved::{
-    TXN_ID_AUTO_COMMIT, TXN_ID_MIN_MULTI_STATEMENT, TXN_ID_NONE, is_reserved_txn_id,
-    reserved_txn_id_message,
-};
+/// Transaction ID representing "no transaction" or "not deleted".
+pub const TXN_ID_NONE: TxnId = TxnId::MAX;
+
+/// Transaction ID for auto-commit (single-statement) transactions.
+pub const TXN_ID_AUTO_COMMIT: TxnId = 1;
+
+/// Minimum valid transaction ID for multi-statement transactions.
+pub const TXN_ID_MIN_MULTI_STATEMENT: TxnId = TXN_ID_AUTO_COMMIT + 1;
+
+/// Check if a transaction ID is reserved (cannot be allocated).
+#[inline]
+pub fn is_reserved_txn_id(id: TxnId) -> bool {
+    id == TXN_ID_NONE || id <= TXN_ID_AUTO_COMMIT
+}
+
+/// Return the error message for attempting to use a reserved transaction ID.
+#[inline]
+pub fn reserved_txn_id_message(id: TxnId) -> String {
+    match id {
+        TXN_ID_NONE => format!(
+            "Transaction ID {} (u64::MAX) is reserved for TXN_ID_NONE",
+            id
+        ),
+        0 => "Transaction ID 0 is invalid".to_string(),
+        TXN_ID_AUTO_COMMIT => "Transaction ID 1 is reserved for TXN_ID_AUTO_COMMIT".to_string(),
+        _ => format!("Transaction ID {} is reserved", id),
+    }
+}
 
 /// Internal state shared across transaction ID managers.
 #[derive(Debug)]
@@ -327,6 +359,74 @@ impl TxnStatus {
     pub fn is_aborted(self) -> bool {
         matches!(self, TxnStatus::Aborted)
     }
+}
+
+// ============================================================================
+// Arrow helpers for MVCC column construction
+// ============================================================================
+
+/// Build MVCC columns (row_id, created_by, deleted_by) for INSERT/CTAS operations.
+pub fn build_insert_mvcc_columns(
+    row_count: usize,
+    start_row_id: RowId,
+    creator_txn_id: TxnId,
+    deleted_marker: TxnId,
+) -> (ArrayRef, ArrayRef, ArrayRef) {
+    let mut row_builder = UInt64Builder::with_capacity(row_count);
+    for offset in 0..row_count {
+        row_builder.append_value(start_row_id + offset as u64);
+    }
+
+    let mut created_builder = UInt64Builder::with_capacity(row_count);
+    let mut deleted_builder = UInt64Builder::with_capacity(row_count);
+    for _ in 0..row_count {
+        created_builder.append_value(creator_txn_id);
+        deleted_builder.append_value(deleted_marker);
+    }
+
+    (
+        Arc::new(row_builder.finish()) as ArrayRef,
+        Arc::new(created_builder.finish()) as ArrayRef,
+        Arc::new(deleted_builder.finish()) as ArrayRef,
+    )
+}
+
+/// Build MVCC field definitions (row_id, created_by, deleted_by).
+pub fn build_mvcc_fields() -> Vec<Field> {
+    vec![
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+        Field::new(CREATED_BY_COLUMN_NAME, DataType::UInt64, false),
+        Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false),
+    ]
+}
+
+/// Build field with field_id metadata for a user column.
+pub fn build_field_with_metadata(
+    name: &str,
+    data_type: DataType,
+    nullable: bool,
+    field_id: FieldId,
+) -> Field {
+    let mut metadata = HashMap::with_capacity(1);
+    metadata.insert(FIELD_ID_META_KEY.to_string(), field_id.to_string());
+    Field::new(name, data_type, nullable).with_metadata(metadata)
+}
+
+/// Build DELETE batch with row_id and deleted_by columns.
+pub fn build_delete_batch(row_ids: Vec<RowId>, deleted_by_txn_id: TxnId) -> llkv_result::Result<RecordBatch> {
+    let row_count = row_ids.len();
+
+    let fields = vec![
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+        Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false),
+    ];
+
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(UInt64Array::from(row_ids)),
+        Arc::new(UInt64Array::from(vec![deleted_by_txn_id; row_count])),
+    ];
+
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(Error::Arrow)
 }
 
 #[cfg(test)]

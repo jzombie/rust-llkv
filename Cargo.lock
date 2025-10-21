@@ -1139,9 +1139,9 @@ name = "llkv-aggregate"
 version = "0.4.0-alpha"
 dependencies = [
  "arrow",
+ "llkv-column-map",
  "llkv-plan",
  "llkv-result",
- "llkv-table",
  "rustc-hash",
 ]
 

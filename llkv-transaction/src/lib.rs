@@ -48,6 +48,7 @@ pub use mvcc::{
 /// They are distinct from transaction IDs and managed separately.
 pub type SessionId = u64;
 
+pub use llkv_column_map::types::TableId;
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
     ColumnSpec, CreateIndexPlan, CreateTablePlan, DeletePlan, InsertPlan, PlanOperation, PlanValue,
@@ -122,6 +123,38 @@ where
     },
 }
 
+/// Catalog snapshot interface used by the transaction layer.
+///
+/// Implementers provide immutable access to table name→ID mappings captured at
+/// the start of a transaction. The trait is lightweight so callers can wrap or
+/// translate existing catalog views without copying large data structures.
+pub trait CatalogSnapshot: Clone + Send + Sync + 'static {
+    /// Look up a table ID by name (case-insensitive).
+    fn table_id(&self, name: &str) -> Option<TableId>;
+
+    /// Check whether a table exists in this snapshot.
+    fn table_exists(&self, name: &str) -> bool {
+        self.table_id(name).is_some()
+    }
+
+    /// Return all table names captured in this snapshot.
+    fn table_names(&self) -> Vec<String>;
+}
+
+impl CatalogSnapshot for llkv_table::catalog::TableCatalogSnapshot {
+    fn table_id(&self, name: &str) -> Option<TableId> {
+        llkv_table::catalog::TableCatalogSnapshot::table_id(self, name)
+    }
+
+    fn table_exists(&self, name: &str) -> bool {
+        llkv_table::catalog::TableCatalogSnapshot::table_exists(self, name)
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        llkv_table::catalog::TableCatalogSnapshot::table_names(self)
+    }
+}
+
 impl<P> TransactionResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
@@ -173,6 +206,8 @@ where
 pub trait TransactionContext: Send + Sync {
     /// The pager type used by this context
     type Pager: Pager<Blob = EntryHandle> + Send + Sync + 'static;
+    /// Snapshot representation returned by this context.
+    type Snapshot: CatalogSnapshot;
 
     /// Update the snapshot used for MVCC visibility decisions.
     fn set_snapshot(&self, snapshot: mvcc::TransactionSnapshot);
@@ -225,10 +260,10 @@ pub trait TransactionContext: Send + Sync {
     fn table_names(&self) -> Vec<String>;
 
     /// Get table ID for a given table name (for conflict detection)
-    fn table_id(&self, table_name: &str) -> LlkvResult<llkv_table::types::TableId>;
+    fn table_id(&self, table_name: &str) -> LlkvResult<TableId>;
 
     /// Get an immutable catalog snapshot for transaction isolation
-    fn catalog_snapshot(&self) -> llkv_table::catalog::TableCatalogSnapshot;
+    fn catalog_snapshot(&self) -> Self::Snapshot;
 
     /// Validate any pending commit-time constraints for this transaction.
     fn validate_commit_constraints(&self, _txn_id: TxnId) -> LlkvResult<()> {
@@ -259,7 +294,7 @@ where
     missing_tables: HashSet<String>,
     /// Immutable catalog snapshot at transaction start (for isolation).
     /// Contains table name→ID mappings. Replaces separate HashSet and HashMap.
-    catalog_snapshot: llkv_table::catalog::TableCatalogSnapshot,
+    catalog_snapshot: BaseCtx::Snapshot,
     /// Base context for reading existing tables with MVCC visibility.
     base_context: Arc<BaseCtx>,
     /// Whether this transaction has been aborted due to an error.
