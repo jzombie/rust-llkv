@@ -56,11 +56,11 @@ use llkv_table::catalog::{FieldConstraints, FieldDefinition, MvccColumnBuilder, 
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId};
 use llkv_table::{
-    CatalogManager, ConstraintColumnInfo, ConstraintService, CreateTableResult, ForeignKeyColumn,
-    ForeignKeyTableInfo, ForeignKeyView, InsertColumnConstraint, InsertMultiColumnUnique,
-    InsertUniqueColumn, MetadataManager, MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration,
-    SingleColumnIndexDescriptor, SingleColumnIndexRegistration, SysCatalog,
-    TableConstraintSummaryView, TableView, UniqueKey, build_composite_unique_key,
+    CatalogDdl, CatalogManager, ConstraintColumnInfo, ConstraintService, CreateTableResult,
+    ForeignKeyColumn, ForeignKeyTableInfo, ForeignKeyView, InsertColumnConstraint,
+    InsertMultiColumnUnique, InsertUniqueColumn, MetadataManager, MultiColumnUniqueEntryMeta,
+    MultiColumnUniqueRegistration, SingleColumnIndexDescriptor, SingleColumnIndexRegistration,
+    SysCatalog, TableConstraintSummaryView, TableView, UniqueKey, build_composite_unique_key,
     canonical_table_name, constraints::ConstraintKind, ensure_multi_column_unique,
     ensure_single_column_unique,
 };
@@ -348,6 +348,7 @@ fn is_index_not_found_error(err: &Error) -> bool {
 // Transaction management is now handled by llkv-transaction crate.
 // The SessionTransaction and TableDeltaState types are re-exported from there.
 
+// TODO: Rename to `RuntimeTransactionContext`?
 /// Wrapper for Context that implements TransactionContext.
 pub struct RuntimeContextWrapper<P>
 where
@@ -384,6 +385,45 @@ where
 
     fn ctx(&self) -> &RuntimeContext<P> {
         &self.ctx
+    }
+}
+
+impl<P> CatalogDdl for RuntimeContextWrapper<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    type CreateTableOutput = TransactionResult<P>;
+    type DropTableOutput = ();
+    type RenameTableOutput = ();
+    type CreateIndexOutput = TransactionResult<P>;
+    type DropIndexOutput = Option<SingleColumnIndexDescriptor>;
+
+    fn create_table(&self, plan: CreateTablePlan) -> llkv_result::Result<Self::CreateTableOutput> {
+        let ctx = self.context();
+        let result = CatalogDdl::create_table(ctx.as_ref(), plan)?;
+        Ok(convert_statement_result(result))
+    }
+
+    fn drop_table(&self, plan: DropTablePlan) -> llkv_result::Result<Self::DropTableOutput> {
+        CatalogDdl::drop_table(self.ctx.as_ref(), plan)
+    }
+
+    fn rename_table(
+        &self,
+        current_name: &str,
+        new_name: &str,
+    ) -> llkv_result::Result<Self::RenameTableOutput> {
+        CatalogDdl::rename_table(self.ctx.as_ref(), current_name, new_name)
+    }
+
+    fn create_index(&self, plan: CreateIndexPlan) -> llkv_result::Result<Self::CreateIndexOutput> {
+        let ctx = self.context();
+        let result = CatalogDdl::create_index(ctx.as_ref(), plan)?;
+        Ok(convert_statement_result(result))
+    }
+
+    fn drop_index(&self, plan: DropIndexPlan) -> llkv_result::Result<Self::DropIndexOutput> {
+        CatalogDdl::drop_index(self.ctx.as_ref(), plan)
     }
 }
 
@@ -753,7 +793,7 @@ where
     /// Create a table (outside or inside transaction) - RuntimeSession layer.
     ///
     /// This is the **session-level** entry point for CREATE TABLE operations. It provides:
-    /// 1. **CTAS Materialization**: Calls `materialize_create_table_plan` to execute any
+    /// 1. **CTAS Materialization**: Calls [`materialize_ctas_plan`] to execute any
     ///    SELECT queries in CREATE TABLE AS SELECT statements.
     /// 2. **Namespace Resolution**: Determines whether to use temporary or persistent storage.
     /// 3. **Transaction Support**: Routes creation through the transaction system if a
@@ -763,13 +803,12 @@ where
     /// ```text
     /// RuntimeEngine::execute_statement()
     ///   └─> RuntimeSession::execute_create_table_plan()  ← YOU ARE HERE
-    ///         ├─> materialize_create_table_plan() (if source is SELECT)
-    ///         └─> RuntimeContext::apply_create_table_plan() (for actual table creation)
+    ///         ├─> materialize_ctas_plan() (if source is SELECT)
+    ///         └─> [`CatalogDdl::create_table`] (for actual table creation)
     /// ```
     ///
     /// # See Also
-    /// - [`RuntimeContext::apply_create_table_plan`] - Lower-level implementation that does the
-    ///   actual table creation work.
+    /// - [`CatalogDdl::create_table`] - Trait entry point that performs the actual table creation.
     /// - [`materialize_ctas_plan`] - Helper that executes SELECT queries in CTAS.
     pub fn execute_create_table_plan(
         &self,
@@ -2199,7 +2238,7 @@ where
     /// column definitions. Use this when you're writing Rust code that needs to create tables
     /// directly, rather than executing SQL.
     ///
-    /// # When to use `create_table` vs `apply_create_table_plan`
+    /// # When to use `create_table` vs [`CatalogDdl::create_table`]
     ///
     /// **Use `create_table`:**
     /// - You're writing Rust code (not parsing SQL)
@@ -2208,7 +2247,7 @@ where
     /// - You want a `RuntimeTableHandle` to work with immediately
     /// - **Does NOT support**: CREATE TABLE AS SELECT, foreign keys, namespaces
     ///
-    /// **Use `apply_create_table_plan`:**
+    /// **Use [`CatalogDdl::create_table`]:**
     /// - You're implementing SQL execution (already have a parsed `CreateTablePlan`)
     /// - You need CREATE TABLE AS SELECT support
     /// - You need foreign key constraints
@@ -2223,8 +2262,9 @@ where
     /// - Returns `RuntimeTableHandle` for immediate use
     /// - Simple, ergonomic, no plan construction needed
     ///
-    /// **SQL execution API** ([`apply_create_table_plan`]):
+    /// **SQL execution API** ([`CatalogDdl::create_table`]):
     /// - Construct a `CreateTablePlan` with all SQL features
+    /// - Delegates to the [`CatalogDdl`] trait for catalog-aware creation
     /// - Support for CTAS, foreign keys, namespaces, transactions
     /// - Returns `RuntimeStatementResult` for consistency with other SQL operations
     ///
@@ -2253,323 +2293,6 @@ where
         I: IntoIterator<Item = C>,
     {
         self.create_table_with_options(name, columns, true)
-    }
-
-    /// Create a table from a plan - RuntimeContext layer (low-level implementation).
-    ///
-    /// This is the **context-level** implementation that performs the actual table creation.
-    /// It is called by [`RuntimeSession::execute_create_table_plan`] after that layer has handled
-    /// transaction and namespace concerns.
-    ///
-    /// # When to use `create_table` vs `apply_create_table_plan`
-    ///
-    /// **Use [`create_table`]** (the simple programmatic API):
-    /// - Writing Rust code that needs to create tables
-    /// - Have explicit column definitions
-    /// - Want immediate `RuntimeTableHandle` access
-    /// - Don't need advanced SQL features
-    ///
-    /// **Use `apply_create_table_plan`** (this method):
-    /// - Implementing SQL execution (you have a `CreateTablePlan` from parsing)
-    /// - Need CREATE TABLE AS SELECT support
-    /// - Need foreign key constraints
-    /// - Need namespace support
-    /// - Working within transaction system
-    ///
-    /// # Responsibilities
-    /// - Validates that the plan has either explicit columns OR a source (batches/select).
-    /// - Handles `IF NOT EXISTS` and `OR REPLACE` semantics.
-    /// - Routes to appropriate creation method based on source type:
-    ///   - `CreateTableSource::Batches` → `create_table_from_batches()`
-    ///   - `CreateTableSource::Select` → Returns error (should be materialized by session layer)
-    ///   - `None` → `create_table_with_explicit_columns()`
-    /// - Registers foreign key constraints.
-    ///
-    /// # Call Chain
-    /// ```text
-    /// RuntimeEngine::execute_statement()
-    ///   └─> RuntimeSession::execute_create_table_plan()
-    ///         ├─> materialize_create_table_plan() (if source is SELECT)
-    ///         └─> RuntimeContext::apply_create_table_plan() ← YOU ARE HERE
-    ///               └─> create_table_from_batches() / create_table_with_explicit_columns()
-    /// ```
-    ///
-    /// # See Also
-    /// - [`RuntimeSession::execute_create_table_plan`] - Higher-level session wrapper that handles
-    ///   CTAS materialization and transaction routing.
-    ///
-    /// # Panics
-    /// This method expects that `CreateTableSource::Select` has already been materialized
-    /// into `CreateTableSource::Batches` by the session layer. If a `Select` source is
-    /// received here, it returns an error.
-    pub fn apply_create_table_plan(
-        &self,
-        plan: CreateTablePlan,
-    ) -> Result<RuntimeStatementResult<P>> {
-        if plan.columns.is_empty() && plan.source.is_none() {
-            return Err(Error::InvalidArgumentError(
-                "CREATE TABLE requires explicit columns or a source".into(),
-            ));
-        }
-
-        let (display_name, canonical_name) = canonical_table_name(&plan.name)?;
-        let CreateTablePlan {
-            name: _,
-            if_not_exists,
-            or_replace,
-            columns,
-            source,
-            namespace: _,
-            foreign_keys,
-            multi_column_uniques,
-        } = plan;
-
-        tracing::trace!(
-            "DEBUG apply_create_table_plan: table='{}' if_not_exists={} columns={}",
-            display_name,
-            if_not_exists,
-            columns.len()
-        );
-        for (idx, col) in columns.iter().enumerate() {
-            tracing::trace!(
-                "  plan column[{}]: name='{}' primary_key={}",
-                idx,
-                col.name,
-                col.primary_key
-            );
-        }
-        let (exists, is_dropped) = {
-            let tables = self.tables.read().unwrap();
-            let in_cache = tables.contains_key(&canonical_name);
-            let is_dropped = self
-                .dropped_tables
-                .read()
-                .unwrap()
-                .contains(&canonical_name);
-            // Table exists if it's in cache and NOT marked as dropped
-            (in_cache && !is_dropped, is_dropped)
-        };
-        tracing::trace!(
-            "DEBUG apply_create_table_plan: exists={}, is_dropped={}",
-            exists,
-            is_dropped
-        );
-
-        // If table was dropped, remove it from cache before creating new one
-        if is_dropped {
-            self.remove_table_entry(&canonical_name);
-            self.dropped_tables.write().unwrap().remove(&canonical_name);
-        }
-
-        if exists {
-            if or_replace {
-                tracing::trace!(
-                    "DEBUG create_table_plan: table '{}' exists and or_replace=true, removing existing table before recreation",
-                    display_name
-                );
-                self.remove_table_entry(&canonical_name);
-            } else if if_not_exists {
-                tracing::trace!(
-                    "DEBUG create_table_plan: table '{}' exists and if_not_exists=true, returning early WITHOUT creating",
-                    display_name
-                );
-                return Ok(RuntimeStatementResult::CreateTable {
-                    table_name: display_name,
-                });
-            } else {
-                return Err(Error::CatalogError(format!(
-                    "Catalog Error: Table '{}' already exists",
-                    display_name
-                )));
-            }
-        }
-
-        match source {
-            Some(CreateTableSource::Batches { schema, batches }) => self.create_table_from_batches(
-                display_name,
-                canonical_name,
-                schema,
-                batches,
-                if_not_exists,
-            ),
-            Some(CreateTableSource::Select { .. }) => Err(Error::Internal(
-                "CreateTableSource::Select should be materialized before reaching RuntimeContext::apply_create_table_plan"
-                    .into(),
-            )),
-            None => self.create_table_from_columns(
-                display_name,
-                canonical_name,
-                columns,
-                foreign_keys,
-                multi_column_uniques,
-                if_not_exists,
-            ),
-        }
-    }
-
-    pub fn create_index(&self, plan: CreateIndexPlan) -> Result<RuntimeStatementResult<P>> {
-        if plan.columns.is_empty() {
-            return Err(Error::InvalidArgumentError(
-                "CREATE INDEX requires at least one column".into(),
-            ));
-        }
-
-        for column_plan in &plan.columns {
-            if !column_plan.ascending || column_plan.nulls_first {
-                return Err(Error::InvalidArgumentError(
-                    "only ASC indexes with NULLS LAST are supported".into(),
-                ));
-            }
-        }
-
-        let mut index_name = plan.name.clone();
-        let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
-        let table = self.lookup_table(&canonical_name)?;
-
-        let mut column_indices = Vec::with_capacity(plan.columns.len());
-        let mut field_ids = Vec::with_capacity(plan.columns.len());
-        let mut column_names = Vec::with_capacity(plan.columns.len());
-        let mut seen_column_indices = FxHashSet::default();
-
-        for column_plan in &plan.columns {
-            let normalized = column_plan.name.to_ascii_lowercase();
-            let col_idx = table
-                .schema
-                .lookup
-                .get(&normalized)
-                .copied()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError(format!(
-                        "column '{}' does not exist in table '{}'",
-                        column_plan.name, display_name
-                    ))
-                })?;
-            if !seen_column_indices.insert(col_idx) {
-                return Err(Error::InvalidArgumentError(format!(
-                    "duplicate column '{}' in CREATE INDEX",
-                    column_plan.name
-                )));
-            }
-
-            let column = &table.schema.columns[col_idx];
-            column_indices.push(col_idx);
-            field_ids.push(column.field_id);
-            column_names.push(column.name.clone());
-        }
-
-        if plan.columns.len() == 1 {
-            let field_id = field_ids[0];
-            let column_name = column_names[0].clone();
-
-            if plan.unique {
-                let snapshot = self.default_snapshot();
-                let existing_values =
-                    self.scan_column_values(table.as_ref(), field_id, snapshot)?;
-                ensure_single_column_unique(&existing_values, &[], &column_name)?;
-            }
-
-            let registration = self.catalog_service.register_single_column_index(
-                &display_name,
-                &canonical_name,
-                &table.table,
-                field_id,
-                &column_name,
-                plan.name.clone(),
-                plan.unique,
-                plan.if_not_exists,
-            )?;
-
-            let created_name = match registration {
-                SingleColumnIndexRegistration::Created { index_name } => index_name,
-                SingleColumnIndexRegistration::AlreadyExists { index_name } => {
-                    drop(table);
-                    return Ok(RuntimeStatementResult::CreateIndex {
-                        table_name: display_name,
-                        index_name: Some(index_name),
-                    });
-                }
-            };
-
-            index_name = Some(created_name.clone());
-
-            if let Some(updated_table) =
-                Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)
-            {
-                self.tables
-                    .write()
-                    .unwrap()
-                    .insert(canonical_name.clone(), Arc::clone(&updated_table));
-            } else {
-                self.remove_table_entry(&canonical_name);
-            }
-
-            drop(table);
-
-            return Ok(RuntimeStatementResult::CreateIndex {
-                table_name: display_name,
-                index_name,
-            });
-        }
-
-        if !plan.unique {
-            return Err(Error::InvalidArgumentError(
-                "multi-column CREATE INDEX currently supports UNIQUE indexes only".into(),
-            ));
-        }
-
-        let table_id = table.table.table_id();
-
-        let snapshot = self.default_snapshot();
-        let existing_rows = self.scan_multi_column_values(table.as_ref(), &field_ids, snapshot)?;
-        ensure_multi_column_unique(&existing_rows, &[], &column_names)?;
-
-        let executor_entry = ExecutorMultiColumnUnique {
-            index_name: index_name.clone(),
-            column_indices: column_indices.clone(),
-        };
-
-        let registration = self.catalog_service.register_multi_column_unique_index(
-            table_id,
-            &field_ids,
-            index_name.clone(),
-        )?;
-
-        match registration {
-            MultiColumnUniqueRegistration::Created => {
-                table.add_multi_column_unique(executor_entry);
-            }
-            MultiColumnUniqueRegistration::AlreadyExists {
-                index_name: existing,
-            } => {
-                if plan.if_not_exists {
-                    drop(table);
-                    return Ok(RuntimeStatementResult::CreateIndex {
-                        table_name: display_name,
-                        index_name: existing,
-                    });
-                }
-                return Err(Error::CatalogError(format!(
-                    "Index already exists on columns '{}'",
-                    column_names.join(", ")
-                )));
-            }
-        }
-
-        Ok(RuntimeStatementResult::CreateIndex {
-            table_name: display_name,
-            index_name,
-        })
-    }
-
-    /// Drop a single-column index and clear any cached executor state.
-    pub fn drop_index(&self, plan: DropIndexPlan) -> Result<Option<SingleColumnIndexDescriptor>> {
-        let descriptor = self.catalog_service.drop_single_column_index(plan)?;
-
-        if let Some(descriptor) = &descriptor {
-            self.remove_table_entry(&descriptor.canonical_table_name);
-        }
-
-        Ok(descriptor)
     }
 
     /// Returns all table names currently registered in the catalog.
@@ -2687,7 +2410,7 @@ where
     }
 
     fn execute_create_table(&self, plan: CreateTablePlan) -> Result<RuntimeStatementResult<P>> {
-        self.apply_create_table_plan(plan)
+        CatalogDdl::create_table(self, plan)
     }
 
     fn create_table_with_options<C, I>(
@@ -2706,7 +2429,7 @@ where
             .into_iter()
             .map(|column| column.into_column_spec())
             .collect();
-        let result = self.apply_create_table_plan(plan)?;
+        let result = CatalogDdl::create_table(self.as_ref(), plan)?;
         match result {
             RuntimeStatementResult::CreateTable { .. } => {
                 RuntimeTableHandle::new(Arc::clone(self), name)
@@ -5364,32 +5087,132 @@ where
         }
     }
 
-    /// Drops a table directly against the catalog and executor caches.
-    ///
-    /// Accepts a planned `DROP TABLE` statement, resolves the canonical table name,
-    /// reloads metadata when the table is not cached, validates foreign-key dependencies,
-    /// and unregisters the table from the catalog before marking it as dropped. Callers
-    /// must ensure that higher-level transactional guarantees have already been satisfied.
-    ///
-    /// # Arguments
-    /// * `plan` – Logical `DROP TABLE` request produced by the planner.
-    ///
-    /// # Errors
-    /// Returns [`Error::CatalogError`] when the table has referencing foreign keys or
-    /// when the table does not exist and `if_exists` is `false`. Returns other catalog or
-    /// storage errors bubbled up from metadata reload and catalog service interactions.
-    pub fn drop_table_catalog(&self, plan: DropTablePlan) -> Result<()> {
+    pub fn is_table_marked_dropped(&self, canonical_name: &str) -> bool {
+        self.dropped_tables.read().unwrap().contains(canonical_name)
+    }
+}
+
+impl<P> CatalogDdl for RuntimeContext<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    type CreateTableOutput = RuntimeStatementResult<P>;
+    type DropTableOutput = ();
+    type RenameTableOutput = ();
+    type CreateIndexOutput = RuntimeStatementResult<P>;
+    type DropIndexOutput = Option<SingleColumnIndexDescriptor>;
+
+    fn create_table(&self, plan: CreateTablePlan) -> Result<Self::CreateTableOutput> {
+        if plan.columns.is_empty() && plan.source.is_none() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TABLE requires explicit columns or a source".into(),
+            ));
+        }
+
+        let (display_name, canonical_name) = canonical_table_name(&plan.name)?;
+        let CreateTablePlan {
+            name: _,
+            if_not_exists,
+            or_replace,
+            columns,
+            source,
+            namespace: _,
+            foreign_keys,
+            multi_column_uniques,
+        } = plan;
+
+        tracing::trace!(
+            "DEBUG create_table (plan): table='{}' if_not_exists={} columns={}",
+            display_name,
+            if_not_exists,
+            columns.len()
+        );
+        for (idx, col) in columns.iter().enumerate() {
+            tracing::trace!(
+                "  plan column[{}]: name='{}' primary_key={}",
+                idx,
+                col.name,
+                col.primary_key
+            );
+        }
+        let (exists, is_dropped) = {
+            let tables = self.tables.read().unwrap();
+            let in_cache = tables.contains_key(&canonical_name);
+            let is_dropped = self
+                .dropped_tables
+                .read()
+                .unwrap()
+                .contains(&canonical_name);
+            // Table exists if it's in cache and NOT marked as dropped
+            (in_cache && !is_dropped, is_dropped)
+        };
+        tracing::trace!(
+            "DEBUG create_table (plan): exists={}, is_dropped={}",
+            exists,
+            is_dropped
+        );
+
+        // If table was dropped, remove it from cache before creating new one
+        if is_dropped {
+            self.remove_table_entry(&canonical_name);
+            self.dropped_tables.write().unwrap().remove(&canonical_name);
+        }
+
+        if exists {
+            if or_replace {
+                tracing::trace!(
+                    "DEBUG create_table (plan): table '{}' exists and or_replace=true, removing existing table before recreation",
+                    display_name
+                );
+                self.remove_table_entry(&canonical_name);
+            } else if if_not_exists {
+                tracing::trace!(
+                    "DEBUG create_table (plan): table '{}' exists and if_not_exists=true, returning early WITHOUT creating",
+                    display_name
+                );
+                return Ok(RuntimeStatementResult::CreateTable {
+                    table_name: display_name,
+                });
+            } else {
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: Table '{}' already exists",
+                    display_name
+                )));
+            }
+        }
+
+        match source {
+            Some(CreateTableSource::Batches { schema, batches }) => self.create_table_from_batches(
+                display_name,
+                canonical_name,
+                schema,
+                batches,
+                if_not_exists,
+            ),
+            Some(CreateTableSource::Select { .. }) => Err(Error::Internal(
+                "CreateTableSource::Select should be materialized before reaching RuntimeContext::create_table"
+                    .into(),
+            )),
+            None => self.create_table_from_columns(
+                display_name,
+                canonical_name,
+                columns,
+                foreign_keys,
+                multi_column_uniques,
+                if_not_exists,
+            ),
+        }
+    }
+
+    fn drop_table(&self, plan: DropTablePlan) -> Result<Self::DropTableOutput> {
         let DropTablePlan { name, if_exists } = plan;
         let (display_name, canonical_name) = canonical_table_name(&name)?;
 
-        tracing::debug!(
-            "drop_table_catalog: attempting to drop table '{}'",
-            canonical_name
-        );
+        tracing::debug!("drop_table: attempting to drop table '{}'", canonical_name);
 
         let cached_entry = {
             let tables = self.tables.read().unwrap();
-            tracing::debug!("drop_table_catalog: cache contains {} tables", tables.len());
+            tracing::debug!("drop_table: cache contains {} tables", tables.len());
             tables.get(&canonical_name).cloned()
         };
 
@@ -5397,13 +5220,13 @@ where
             Some(entry) => entry,
             None => {
                 tracing::debug!(
-                    "drop_table_catalog: table '{}' not cached; attempting reload",
+                    "drop_table: table '{}' not cached; attempting reload",
                     canonical_name
                 );
 
                 if self.catalog.table_id(&canonical_name).is_none() {
                     tracing::debug!(
-                        "drop_table_catalog: no catalog entry for '{}'; if_exists={}",
+                        "drop_table: no catalog entry for '{}'; if_exists={}",
                         canonical_name,
                         if_exists
                     );
@@ -5420,7 +5243,7 @@ where
                     Ok(entry) => entry,
                     Err(err) => {
                         tracing::warn!(
-                            "drop_table_catalog: failed to reload table '{}': {:?}",
+                            "drop_table: failed to reload table '{}': {:?}",
                             canonical_name,
                             err
                         );
@@ -5473,18 +5296,7 @@ where
         Ok(())
     }
 
-    /// Apply a table rename directly against the persistent catalog.
-    ///
-    /// This helper performs catalog lookups, foreign-key dependency checks, and cache
-    /// maintenance in a single step. Callers must already ensure that any higher-level
-    /// transactional state has been resolved, because this method updates metadata and
-    /// catalog records immediately.
-    ///
-    /// # Errors
-    /// Returns a catalog error when the source table does not exist, when the new
-    /// name conflicts with an existing table, or when foreign-key constraints prevent
-    /// the rename.
-    pub fn apply_rename_table(&self, current_name: &str, new_name: &str) -> Result<()> {
+    fn rename_table(&self, current_name: &str, new_name: &str) -> Result<Self::RenameTableOutput> {
         let (current_display, current_canonical) = canonical_table_name(current_name)?;
         let (new_display, new_canonical) = canonical_table_name(new_name)?;
 
@@ -5544,8 +5356,168 @@ where
         Ok(())
     }
 
-    pub fn is_table_marked_dropped(&self, canonical_name: &str) -> bool {
-        self.dropped_tables.read().unwrap().contains(canonical_name)
+    fn create_index(&self, plan: CreateIndexPlan) -> Result<Self::CreateIndexOutput> {
+        if plan.columns.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX requires at least one column".into(),
+            ));
+        }
+
+        for column_plan in &plan.columns {
+            if !column_plan.ascending || column_plan.nulls_first {
+                return Err(Error::InvalidArgumentError(
+                    "only ASC indexes with NULLS LAST are supported".into(),
+                ));
+            }
+        }
+
+        let mut index_name = plan.name.clone();
+        let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
+        let table = self.lookup_table(&canonical_name)?;
+
+        let mut column_indices = Vec::with_capacity(plan.columns.len());
+        let mut field_ids = Vec::with_capacity(plan.columns.len());
+        let mut column_names = Vec::with_capacity(plan.columns.len());
+        let mut seen_column_indices = FxHashSet::default();
+
+        for column_plan in &plan.columns {
+            let normalized = column_plan.name.to_ascii_lowercase();
+            let col_idx = table
+                .schema
+                .lookup
+                .get(&normalized)
+                .copied()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "column '{}' does not exist in table '{}'",
+                        column_plan.name, display_name
+                    ))
+                })?;
+            if !seen_column_indices.insert(col_idx) {
+                return Err(Error::InvalidArgumentError(format!(
+                    "duplicate column '{}' in CREATE INDEX",
+                    column_plan.name
+                )));
+            }
+
+            let column = &table.schema.columns[col_idx];
+            column_indices.push(col_idx);
+            field_ids.push(column.field_id);
+            column_names.push(column.name.clone());
+        }
+
+        if plan.columns.len() == 1 {
+            let field_id = field_ids[0];
+            let column_name = column_names[0].clone();
+
+            if plan.unique {
+                let snapshot = self.default_snapshot();
+                let existing_values =
+                    self.scan_column_values(table.as_ref(), field_id, snapshot)?;
+                ensure_single_column_unique(&existing_values, &[], &column_name)?;
+            }
+
+            let registration = self.catalog_service.register_single_column_index(
+                &display_name,
+                &canonical_name,
+                &table.table,
+                field_id,
+                &column_name,
+                plan.name.clone(),
+                plan.unique,
+                plan.if_not_exists,
+            )?;
+
+            let created_name = match registration {
+                SingleColumnIndexRegistration::Created { index_name } => index_name,
+                SingleColumnIndexRegistration::AlreadyExists { index_name } => {
+                    drop(table);
+                    return Ok(RuntimeStatementResult::CreateIndex {
+                        table_name: display_name,
+                        index_name: Some(index_name),
+                    });
+                }
+            };
+
+            index_name = Some(created_name.clone());
+
+            if let Some(updated_table) =
+                Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)
+            {
+                self.tables
+                    .write()
+                    .unwrap()
+                    .insert(canonical_name.clone(), Arc::clone(&updated_table));
+            } else {
+                self.remove_table_entry(&canonical_name);
+            }
+
+            drop(table);
+
+            return Ok(RuntimeStatementResult::CreateIndex {
+                table_name: display_name,
+                index_name,
+            });
+        }
+
+        if !plan.unique {
+            return Err(Error::InvalidArgumentError(
+                "multi-column CREATE INDEX currently supports UNIQUE indexes only".into(),
+            ));
+        }
+
+        let table_id = table.table.table_id();
+
+        let snapshot = self.default_snapshot();
+        let existing_rows = self.scan_multi_column_values(table.as_ref(), &field_ids, snapshot)?;
+        ensure_multi_column_unique(&existing_rows, &[], &column_names)?;
+
+        let executor_entry = ExecutorMultiColumnUnique {
+            index_name: index_name.clone(),
+            column_indices: column_indices.clone(),
+        };
+
+        let registration = self.catalog_service.register_multi_column_unique_index(
+            table_id,
+            &field_ids,
+            index_name.clone(),
+        )?;
+
+        match registration {
+            MultiColumnUniqueRegistration::Created => {
+                table.add_multi_column_unique(executor_entry);
+            }
+            MultiColumnUniqueRegistration::AlreadyExists {
+                index_name: existing,
+            } => {
+                if plan.if_not_exists {
+                    drop(table);
+                    return Ok(RuntimeStatementResult::CreateIndex {
+                        table_name: display_name,
+                        index_name: existing,
+                    });
+                }
+                return Err(Error::CatalogError(format!(
+                    "Index already exists on columns '{}'",
+                    column_names.join(", ")
+                )));
+            }
+        }
+
+        Ok(RuntimeStatementResult::CreateIndex {
+            table_name: display_name,
+            index_name,
+        })
+    }
+
+    fn drop_index(&self, plan: DropIndexPlan) -> Result<Self::DropIndexOutput> {
+        let descriptor = self.catalog_service.drop_single_column_index(plan)?;
+
+        if let Some(descriptor) = &descriptor {
+            self.remove_table_entry(&descriptor.canonical_table_name);
+        }
+
+        Ok(descriptor)
     }
 }
 
@@ -5605,12 +5577,13 @@ where
         &self,
         plan: CreateTablePlan,
     ) -> llkv_result::Result<TransactionResult<P>> {
-        let result = RuntimeContext::apply_create_table_plan(self.context(), plan)?;
+        let ctx = self.context();
+        let result = CatalogDdl::create_table(ctx.as_ref(), plan)?;
         Ok(convert_statement_result(result))
     }
 
     fn drop_table(&self, plan: DropTablePlan) -> llkv_result::Result<()> {
-        self.ctx.drop_table_catalog(plan)
+        CatalogDdl::drop_table(self.ctx.as_ref(), plan)
     }
 
     fn insert(&self, plan: InsertPlan) -> llkv_result::Result<TransactionResult<P>> {
@@ -5649,7 +5622,8 @@ where
     }
 
     fn create_index(&self, plan: CreateIndexPlan) -> llkv_result::Result<TransactionResult<P>> {
-        let result = RuntimeContext::create_index(self.context(), plan)?;
+        let ctx = self.context();
+        let result = CatalogDdl::create_index(ctx.as_ref(), plan)?;
         Ok(convert_statement_result(result))
     }
 
@@ -5892,6 +5866,7 @@ where
     }
 }
 
+// TODO: Rename to `[what-kind-of]ContextProvider`
 // Wrapper to implement TableProvider for Context
 struct ContextProvider<P>
 where

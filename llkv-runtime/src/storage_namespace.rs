@@ -15,9 +15,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{RuntimeContext, RuntimeStatementResult};
-use llkv_table::SingleColumnIndexDescriptor;
 use llkv_table::canonical_table_name;
+use llkv_table::{CatalogDdl, SingleColumnIndexDescriptor};
 
+// TODO: Rename to `RuntimeStorageNamespaceId`?
 pub type NamespaceId = String;
 
 // TODO: Extract to constants module
@@ -25,6 +26,7 @@ pub type NamespaceId = String;
 pub const PERSISTENT_NAMESPACE_ID: &str = "main";
 pub const TEMPORARY_NAMESPACE_ID: &str = "temp";
 
+// TODO: Extend `CatalogDdl`
 // TODO: Rename to `RuntimeStorageNamespace`?
 // NOTE: Trait name mirrors the broader storage namespace concept used across crates.
 /// Trait implemented by all runtime storage namespaces.
@@ -52,6 +54,8 @@ pub trait StorageNamespace: Send + Sync + 'static {
 
     /// Rename a table within this namespace.
     fn rename_table(&self, current_name: &str, new_name: &str) -> crate::Result<()>;
+
+    /// Create an index within this namespace.
     fn create_index(
         &self,
         plan: CreateIndexPlan,
@@ -62,7 +66,7 @@ pub trait StorageNamespace: Send + Sync + 'static {
     -> crate::Result<Option<SingleColumnIndexDescriptor>>;
 
     /// Execute a generic plan operation. Namespaces that do not yet support this entry point
-    /// should rely on the default error implementation.
+    /// should override this method and provide an implementation.
     fn execute_operation(
         &self,
         operation: PlanOperation,
@@ -152,29 +156,29 @@ where
         &self,
         plan: CreateTablePlan,
     ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
-        self.context.apply_create_table_plan(plan)
+        CatalogDdl::create_table(self.context.as_ref(), plan)
     }
 
     fn drop_table(&self, plan: DropTablePlan) -> crate::Result<()> {
-        self.context.drop_table_catalog(plan)
+        CatalogDdl::drop_table(self.context.as_ref(), plan)
     }
 
     fn rename_table(&self, current_name: &str, new_name: &str) -> crate::Result<()> {
-        self.context.apply_rename_table(current_name, new_name)
+        CatalogDdl::rename_table(self.context.as_ref(), current_name, new_name)
     }
 
     fn create_index(
         &self,
         plan: CreateIndexPlan,
     ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
-        self.context.create_index(plan)
+        CatalogDdl::create_index(self.context.as_ref(), plan)
     }
 
     fn drop_index(
         &self,
         plan: DropIndexPlan,
     ) -> crate::Result<Option<SingleColumnIndexDescriptor>> {
-        self.context.drop_index(plan)
+        CatalogDdl::drop_index(self.context.as_ref(), plan)
     }
 
     fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<Self::Pager>>> {
@@ -293,7 +297,7 @@ where
     ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
         let (_, canonical) = canonical_table_name(&plan.name)?;
         let context = self.context();
-        let result = context.apply_create_table_plan(plan)?;
+        let result = CatalogDdl::create_table(context.as_ref(), plan)?;
         if !self.has_table(&canonical) {
             self.register_table(canonical);
         }
@@ -303,7 +307,7 @@ where
     fn drop_table(&self, plan: DropTablePlan) -> crate::Result<()> {
         let (_, canonical) = canonical_table_name(&plan.name)?;
         let context = self.context();
-        context.drop_table_catalog(plan)?;
+        CatalogDdl::drop_table(context.as_ref(), plan)?;
         self.unregister_table(&canonical);
         Ok(())
     }
@@ -312,7 +316,7 @@ where
         let (_, current_canonical) = canonical_table_name(current_name)?;
         let (_, new_canonical) = canonical_table_name(new_name)?;
         let context = self.context();
-        context.apply_rename_table(current_name, new_name)?;
+        CatalogDdl::rename_table(context.as_ref(), current_name, new_name)?;
         self.unregister_table(&current_canonical);
         self.register_table(new_canonical);
         Ok(())
@@ -322,14 +326,16 @@ where
         &self,
         plan: CreateIndexPlan,
     ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
-        self.context().create_index(plan)
+        let context = self.context();
+        CatalogDdl::create_index(context.as_ref(), plan)
     }
 
     fn drop_index(
         &self,
         plan: DropIndexPlan,
     ) -> crate::Result<Option<SingleColumnIndexDescriptor>> {
-        self.context().drop_index(plan)
+        let context = self.context();
+        CatalogDdl::drop_index(context.as_ref(), plan)
     }
 
     fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<Self::Pager>>> {

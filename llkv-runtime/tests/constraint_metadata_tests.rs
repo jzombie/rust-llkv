@@ -7,7 +7,9 @@ use llkv_runtime::{
     RuntimeStatementResult,
 };
 use llkv_storage::pager::MemPager;
-use llkv_table::{ConstraintKind, MetadataManager, PrimaryKeyConstraint, Table, UniqueConstraint};
+use llkv_table::{
+    CatalogDdl, ConstraintKind, MetadataManager, PrimaryKeyConstraint, Table, UniqueConstraint,
+};
 
 #[test]
 fn primary_key_and_unique_constraints_reload_from_metadata() {
@@ -82,8 +84,7 @@ fn foreign_key_views_reload_from_metadata() {
             on_update: ForeignKeyAction::Restrict,
         });
 
-        match context
-            .apply_create_table_plan(plan)
+        match CatalogDdl::create_table(context.as_ref(), plan)
             .expect("create children table with foreign key")
         {
             RuntimeStatementResult::CreateTable { .. } => {}

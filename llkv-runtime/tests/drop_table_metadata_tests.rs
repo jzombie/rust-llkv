@@ -6,10 +6,10 @@ use llkv_plan::DropTablePlan;
 use llkv_result::Error;
 use llkv_runtime::{ColumnSpec, RuntimeContext};
 use llkv_storage::pager::MemPager;
-use llkv_table::MetadataManager;
 use llkv_table::constraints::{
     ConstraintKind, ConstraintRecord, ConstraintState, ForeignKeyAction, ForeignKeyConstraint,
 };
+use llkv_table::{CatalogDdl, MetadataManager};
 
 #[test]
 fn drop_table_removes_persisted_metadata() {
@@ -43,8 +43,7 @@ fn drop_table_removes_persisted_metadata() {
             .is_empty()
     );
 
-    context
-        .drop_table_catalog(DropTablePlan::new("drop_test"))
+    CatalogDdl::drop_table(context.as_ref(), DropTablePlan::new("drop_test"))
         .expect("drop table succeeds");
 
     let metadata_after = MetadataManager::new(Arc::clone(&store));
@@ -121,8 +120,7 @@ fn drop_table_respects_foreign_keys_after_restart() {
     context
         .lookup_table("parents")
         .expect("load parent table before drop");
-    let err = context
-        .drop_table_catalog(DropTablePlan::new("parents"))
+    let err = CatalogDdl::drop_table(&context, DropTablePlan::new("parents"))
         .expect_err("dropping referenced parent should fail");
 
     match err {
