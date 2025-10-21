@@ -435,6 +435,110 @@ where
         Ok(())
     }
 
+    /// Validate that updating the given rows will not violate foreign key constraints.
+    ///
+    /// This checks if any columns being updated are referenced by foreign keys, and whether
+    /// the OLD values are still being referenced by child tables.
+    pub fn validate_update_foreign_keys<FParents, FChildren>(
+        &self,
+        referenced_table_id: TableId,
+        referenced_row_ids: &[RowId],
+        updated_field_ids: &[FieldId],
+        mut fetch_parent_rows: FParents,
+        mut fetch_child_rows: FChildren,
+    ) -> LlkvResult<()>
+    where
+        FParents: FnMut(ForeignKeyParentRowsFetch<'_>) -> LlkvResult<Vec<Vec<PlanValue>>>,
+        FChildren: FnMut(ForeignKeyChildRowsFetch<'_>) -> LlkvResult<Vec<(RowId, Vec<PlanValue>)>>,
+    {
+        if referenced_row_ids.is_empty() || updated_field_ids.is_empty() {
+            return Ok(());
+        }
+
+        let referencing = self
+            .metadata
+            .foreign_keys_referencing(referenced_table_id)?;
+        if referencing.is_empty() {
+            return Ok(());
+        }
+
+        for (child_table_id, constraint_id) in referencing {
+            let details = self
+                .metadata
+                .foreign_key_views(self.catalog.as_ref(), child_table_id)?;
+
+            let Some(detail) = details
+                .into_iter()
+                .find(|detail| detail.constraint_id == constraint_id)
+            else {
+                continue;
+            };
+
+            if detail.referenced_field_ids.is_empty() || detail.referencing_field_ids.is_empty() {
+                continue;
+            }
+
+            // Check if any of the columns being updated are part of this foreign key
+            let is_referenced_column_updated = detail
+                .referenced_field_ids
+                .iter()
+                .any(|fid| updated_field_ids.contains(fid));
+
+            if !is_referenced_column_updated {
+                // This FK doesn't reference any columns being updated, skip
+                continue;
+            }
+
+            // Fetch the OLD values from the parent table (before update)
+            let parent_rows = fetch_parent_rows(ForeignKeyParentRowsFetch {
+                referenced_table_id,
+                referenced_row_ids,
+                referenced_field_ids: &detail.referenced_field_ids,
+            })?;
+
+            let parent_keys = canonical_parent_keys(&detail, parent_rows);
+            if parent_keys.is_empty() {
+                continue;
+            }
+
+            // Fetch all rows from child table that reference this parent
+            let child_rows = fetch_child_rows(ForeignKeyChildRowsFetch {
+                referencing_table_id: detail.referencing_table_id,
+                referencing_table_canonical: &detail.referencing_table_canonical,
+                referencing_field_ids: &detail.referencing_field_ids,
+            })?;
+
+            if child_rows.is_empty() {
+                continue;
+            }
+
+            // Check if any child rows reference the OLD values
+            for (_child_row_id, values) in child_rows {
+                if values.len() != detail.referencing_field_ids.len() {
+                    continue;
+                }
+
+                if values.iter().any(|value| matches!(value, PlanValue::Null)) {
+                    continue;
+                }
+
+                // If a child row references one of the parent keys being updated, fail
+                if parent_keys.iter().any(|key| key == &values) {
+                    let constraint_label =
+                        detail.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
+                    return Err(Error::ConstraintError(format!(
+                        "Violates foreign key constraint '{}' on table '{}' referencing '{}' - cannot update referenced column while foreign key exists",
+                        constraint_label,
+                        detail.referencing_table_display,
+                        detail.referenced_table_display,
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Return the set of foreign keys referencing the provided table.
     pub fn referencing_foreign_keys(
         &self,

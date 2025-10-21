@@ -3688,6 +3688,12 @@ where
                 .map(|(idx, column)| (column.field_id, idx)),
         );
 
+        // Extract field IDs being updated for FK validation later
+        let updated_field_ids: Vec<FieldId> = prepared
+            .iter()
+            .map(|(column, _)| column.field_id)
+            .collect();
+
         for (column, value) in prepared {
             let column_index =
                 column_positions
@@ -3749,6 +3755,16 @@ where
                 |field_ids| self.scan_multi_column_values(table, field_ids, snapshot),
             )?;
         }
+
+        // Check foreign key constraints before updating (update_filtered_rows)
+        self.check_foreign_keys_on_update(
+            table,
+            &display_name,
+            &canonical_name,
+            &row_ids,
+            &updated_field_ids,
+            snapshot,
+        )?;
 
         let _ = self.apply_delete(
             table,
@@ -3924,6 +3940,12 @@ where
                 .map(|(idx, column)| (column.field_id, idx)),
         );
 
+        // Extract field IDs being updated for FK validation later (update_all_rows)
+        let updated_field_ids: Vec<FieldId> = prepared
+            .iter()
+            .map(|(column, _)| column.field_id)
+            .collect();
+
         for (column, value) in prepared {
             let column_index =
                 column_positions
@@ -3985,6 +4007,16 @@ where
                 |field_ids| self.scan_multi_column_values(table, field_ids, snapshot),
             )?;
         }
+
+        // Check foreign key constraints before updating (update_all_rows)
+        self.check_foreign_keys_on_update(
+            table,
+            &display_name,
+            &canonical_name,
+            &row_ids,
+            &updated_field_ids,
+            snapshot,
+        )?;
 
         let _ = self.apply_delete(
             table,
@@ -4113,6 +4145,41 @@ where
         self.constraint_service.validate_delete_foreign_keys(
             table.table.table_id(),
             row_ids,
+            |request| {
+                self.collect_row_values_for_ids(
+                    table,
+                    request.referenced_row_ids,
+                    request.referenced_field_ids,
+                )
+            },
+            |request| {
+                let child_table = self.lookup_table(request.referencing_table_canonical)?;
+                self.collect_visible_child_rows(
+                    child_table.as_ref(),
+                    request.referencing_field_ids,
+                    snapshot,
+                )
+            },
+        )
+    }
+
+    fn check_foreign_keys_on_update(
+        &self,
+        table: &ExecutorTable<P>,
+        _display_name: &str,
+        _canonical_name: &str,
+        row_ids: &[RowId],
+        updated_field_ids: &[FieldId],
+        snapshot: TransactionSnapshot,
+    ) -> Result<()> {
+        if row_ids.is_empty() || updated_field_ids.is_empty() {
+            return Ok(());
+        }
+
+        self.constraint_service.validate_update_foreign_keys(
+            table.table.table_id(),
+            row_ids,
+            updated_field_ids,
             |request| {
                 self.collect_row_values_for_ids(
                     table,
