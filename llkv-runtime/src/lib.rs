@@ -52,7 +52,7 @@ use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_result::Error;
 use llkv_storage::pager::{BoxedPager, MemPager, Pager};
-use llkv_table::catalog::{FieldConstraints, FieldDefinition, TableCatalog};
+use llkv_table::catalog::{FieldConstraints, FieldDefinition, MvccColumnBuilder, TableCatalog};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId};
 use llkv_table::{
@@ -93,7 +93,7 @@ use crate::storage_namespace::{
 // Import transaction structures from llkv-transaction for internal use.
 pub use llkv_transaction::TransactionKind;
 use llkv_transaction::{
-    RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TransactionContext, TransactionManager,
+    RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TableId, TransactionContext, TransactionManager,
     TransactionResult, TxnId, TxnIdManager, mvcc::TransactionSnapshot,
 };
 
@@ -102,7 +102,7 @@ use llkv_transaction::TransactionSession;
 
 // Note: RuntimeSession is the high-level wrapper that users should use instead of the lower-level TransactionSession API
 
-use llkv_table::mvcc;
+use llkv_transaction::mvcc;
 
 struct TableConstraintContext {
     schema_field_ids: Vec<FieldId>,
@@ -110,6 +110,34 @@ struct TableConstraintContext {
     unique_columns: Vec<InsertUniqueColumn>,
     multi_column_uniques: Vec<InsertMultiColumnUnique>,
     primary_key: Option<InsertMultiColumnUnique>,
+}
+
+struct TransactionMvccBuilder;
+
+impl MvccColumnBuilder for TransactionMvccBuilder {
+    fn build_insert_columns(
+        &self,
+        row_count: usize,
+        start_row_id: RowId,
+        creator_txn_id: u64,
+        deleted_marker: u64,
+    ) -> (ArrayRef, ArrayRef, ArrayRef) {
+        mvcc::build_insert_mvcc_columns(row_count, start_row_id, creator_txn_id, deleted_marker)
+    }
+
+    fn mvcc_fields(&self) -> Vec<Field> {
+        mvcc::build_mvcc_fields()
+    }
+
+    fn field_with_metadata(
+        &self,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        field_id: FieldId,
+    ) -> Field {
+        mvcc::build_field_with_metadata(name, data_type, nullable, field_id)
+    }
 }
 
 /// Result of running a plan statement.
@@ -2448,6 +2476,7 @@ where
 
         let creator_snapshot = self.txn_manager.begin_transaction();
         let creator_txn_id = creator_snapshot.txn_id;
+        let mvcc_builder = TransactionMvccBuilder;
         let (next_row_id, total_rows) = match self.catalog_service.append_batches_with_mvcc(
             table.as_ref(),
             &table_columns,
@@ -2455,6 +2484,7 @@ where
             creator_txn_id,
             TXN_ID_NONE,
             0,
+            &mvcc_builder,
         ) {
             Ok(result) => {
                 self.txn_manager.mark_committed(creator_txn_id);
@@ -4509,6 +4539,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     type Pager = P;
+    type Snapshot = llkv_table::catalog::TableCatalogSnapshot;
 
     fn set_snapshot(&self, snapshot: TransactionSnapshot) {
         self.update_snapshot(snapshot);
@@ -4614,7 +4645,7 @@ where
         RuntimeContext::table_names(self.context())
     }
 
-    fn table_id(&self, table_name: &str) -> llkv_result::Result<llkv_table::types::TableId> {
+    fn table_id(&self, table_name: &str) -> llkv_result::Result<TableId> {
         // Check CURRENT state: if table is marked as dropped, return error
         // This is used by conflict detection to detect if a table was dropped
         let ctx = self.context();
@@ -4629,7 +4660,7 @@ where
         Ok(table.table.table_id())
     }
 
-    fn catalog_snapshot(&self) -> llkv_table::catalog::TableCatalogSnapshot {
+    fn catalog_snapshot(&self) -> Self::Snapshot {
         let ctx = self.context();
         ctx.catalog.snapshot()
     }
