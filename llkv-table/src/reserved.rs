@@ -181,6 +181,10 @@ pub const CATALOG_FIELD_CONSTRAINT_META_ID: u32 = 106;
 /// Catalog field for constraint names (Binary-encoded ConstraintNameRecord).
 pub const CATALOG_FIELD_CONSTRAINT_NAME_ID: u32 = 107;
 
+/// Catalog field for custom type definitions (Binary-encoded CustomTypeMeta).
+/// Stores CREATE TYPE/DOMAIN aliases: type_name -> base_data_type.
+pub const CATALOG_FIELD_CUSTOM_TYPE_META_ID: u32 = 108;
+
 /// Check if a field ID is used by the catalog's internal structure.
 #[inline]
 pub fn is_catalog_internal_field(id: u32) -> bool {
@@ -196,6 +200,7 @@ pub fn is_catalog_internal_field(id: u32) -> bool {
             | CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID
             | CATALOG_FIELD_CONSTRAINT_META_ID
             | CATALOG_FIELD_CONSTRAINT_NAME_ID
+            | CATALOG_FIELD_CUSTOM_TYPE_META_ID
     )
 }
 
@@ -318,6 +323,8 @@ mod tests {
             CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID
         ));
         assert!(is_catalog_internal_field(CATALOG_FIELD_CONSTRAINT_META_ID));
+        assert!(is_catalog_internal_field(CATALOG_FIELD_CONSTRAINT_NAME_ID));
+        assert!(is_catalog_internal_field(CATALOG_FIELD_CUSTOM_TYPE_META_ID));
         assert!(!is_catalog_internal_field(2));
         assert!(!is_catalog_internal_field(200));
     }

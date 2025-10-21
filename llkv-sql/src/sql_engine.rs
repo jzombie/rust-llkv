@@ -170,6 +170,34 @@ where
 
     /// Preprocess SQL to handle qualified names in EXCLUDE clauses
     /// Converts EXCLUDE (schema.table.col) to EXCLUDE ("schema.table.col")
+    /// Preprocess CREATE TYPE to CREATE DOMAIN for sqlparser compatibility.
+    ///
+    /// DuckDB uses `CREATE TYPE name AS basetype` for type aliases, but sqlparser
+    /// only supports the SQL standard `CREATE DOMAIN name AS basetype` syntax.
+    /// This method converts the DuckDB syntax to the standard syntax.
+    fn preprocess_create_type_syntax(sql: &str) -> String {
+        static CREATE_TYPE_REGEX: OnceLock<Regex> = OnceLock::new();
+        static DROP_TYPE_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        // Match: CREATE TYPE name AS datatype
+        let create_re = CREATE_TYPE_REGEX.get_or_init(|| {
+            Regex::new(r"(?i)\bCREATE\s+TYPE\s+")
+                .expect("valid CREATE TYPE regex")
+        });
+
+        // Match: DROP TYPE [IF EXISTS] name
+        let drop_re = DROP_TYPE_REGEX.get_or_init(|| {
+            Regex::new(r"(?i)\bDROP\s+TYPE\s+")
+                .expect("valid DROP TYPE regex")
+        });
+
+        // First replace CREATE TYPE with CREATE DOMAIN
+        let sql = create_re.replace_all(sql, "CREATE DOMAIN ").to_string();
+        
+        // Then replace DROP TYPE with DROP DOMAIN
+        drop_re.replace_all(&sql, "DROP DOMAIN ").to_string()
+    }
+
     fn preprocess_exclude_syntax(sql: &str) -> String {
         static EXCLUDE_REGEX: OnceLock<Regex> = OnceLock::new();
 
@@ -229,9 +257,12 @@ where
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<RuntimeStatementResult<P>>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
 
+        // Preprocess SQL to handle CREATE TYPE / DROP TYPE (DuckDB syntax)
+        let processed_sql = Self::preprocess_create_type_syntax(sql);
+
         // Preprocess SQL to handle qualified names in EXCLUDE
         // Replace EXCLUDE (schema.table.col) with EXCLUDE ("schema.table.col")
-        let processed_sql = Self::preprocess_exclude_syntax(sql);
+        let processed_sql = Self::preprocess_exclude_syntax(&processed_sql);
 
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, &processed_sql)
@@ -375,6 +406,14 @@ where
                     default_collate_spec,
                     clone,
                 )
+            }
+            Statement::CreateDomain(create_domain) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateDomain");
+                self.handle_create_domain(create_domain)
+            }
+            Statement::DropDomain(drop_domain) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: DropDomain");
+                self.handle_drop_domain(drop_domain)
             }
             Statement::Insert(stmt) => {
                 let table_name =
@@ -742,9 +781,12 @@ where
                 check_expr_str
             );
 
+            // Resolve custom type aliases to their base types
+            let resolved_data_type = self.engine.context().resolve_type(&column_def.data_type);
+
             let mut column = ColumnSpec::new(
                 column_def.name.value.clone(),
-                arrow_type_from_sql(&column_def.data_type)?,
+                arrow_type_from_sql(&resolved_data_type)?,
                 is_nullable,
             );
             tracing::trace!(
@@ -1300,6 +1342,72 @@ where
                 display_name, err
             ))
         })?;
+
+        Ok(RuntimeStatementResult::NoOp)
+    }
+
+    fn handle_create_domain(
+        &self,
+        create_domain: sqlparser::ast::CreateDomain,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        use llkv_table::CustomTypeMeta;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Extract the type alias name
+        let type_name = create_domain.name.to_string();
+        
+        // Convert the data type to SQL string for persistence
+        let base_type_sql = create_domain.data_type.to_string();
+        
+        // Register the type alias in the runtime context (in-memory)
+        self.engine
+            .context()
+            .register_type(type_name.clone(), create_domain.data_type.clone());
+
+        // Persist to catalog
+        let context = self.engine.context();
+        let catalog = llkv_table::SysCatalog::new(context.store());
+        
+        let created_at_micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        
+        let meta = CustomTypeMeta {
+            name: type_name.clone(),
+            base_type_sql,
+            created_at_micros,
+        };
+        
+        catalog.put_custom_type_meta(&meta)?;
+
+        tracing::debug!("Created and persisted type alias: {}", type_name);
+        Ok(RuntimeStatementResult::NoOp)
+    }
+
+    fn handle_drop_domain(
+        &self,
+        drop_domain: sqlparser::ast::DropDomain,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let if_exists = drop_domain.if_exists;
+        let type_name = drop_domain.name.to_string();
+        
+        // Drop the type from the registry (in-memory)
+        let result = self.engine.context().drop_type(&type_name);
+        
+        if let Err(err) = result {
+            if !if_exists {
+                return Err(err);
+            }
+            // if_exists = true, so ignore the error
+        } else {
+            // Persist deletion to catalog
+            let context = self.engine.context();
+            let catalog = llkv_table::SysCatalog::new(context.store());
+            catalog.delete_custom_type_meta(&type_name)?;
+            
+            tracing::debug!("Dropped and removed from catalog type alias: {}", type_name);
+        }
 
         Ok(RuntimeStatementResult::NoOp)
     }

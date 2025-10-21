@@ -1330,6 +1330,8 @@ where
         TransactionManager<RuntimeContextWrapper<P>, RuntimeContextWrapper<MemPager>>,
     txn_manager: Arc<TxnIdManager>,
     txn_tables_with_new_rows: RwLock<FxHashMap<TxnId, FxHashSet<String>>>,
+    // Type registry for custom type aliases (CREATE TYPE/DOMAIN)
+    type_registry: RwLock<FxHashMap<String, sqlparser::ast::DataType>>,
 }
 
 impl<P> RuntimeContext<P>
@@ -1475,6 +1477,38 @@ where
             Arc::clone(&store_arc),
         );
 
+        // Load custom types from catalog
+        let sys_catalog = SysCatalog::new(&store_arc);
+        let mut type_registry_map = FxHashMap::default();
+        
+        match sys_catalog.all_custom_type_metas() {
+            Ok(type_metas) => {
+                tracing::debug!("[CONTEXT] Loaded {} custom type(s) from catalog", type_metas.len());
+                for type_meta in type_metas {
+                    // Parse the base_type_sql back to a DataType
+                    if let Ok(parsed_type) = Self::parse_data_type_from_sql(&type_meta.base_type_sql) {
+                        type_registry_map.insert(type_meta.name.to_lowercase(), parsed_type);
+                    } else {
+                        tracing::warn!(
+                            "[CONTEXT] Failed to parse base type SQL for type '{}': {}",
+                            type_meta.name,
+                            type_meta.base_type_sql
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[CONTEXT] Failed to load custom types: {}, starting with empty type registry",
+                    e
+                );
+            }
+        }
+        tracing::debug!(
+            "[CONTEXT] Type registry initialized with {} type(s)",
+            type_registry_map.len()
+        );
+
         Self {
             pager,
             tables: RwLock::new(FxHashMap::default()), // Start with empty table cache
@@ -1487,12 +1521,84 @@ where
             transaction_manager,
             txn_manager,
             txn_tables_with_new_rows: RwLock::new(FxHashMap::default()),
+            type_registry: RwLock::new(type_registry_map),
         }
     }
 
     /// Return the transaction ID manager shared with sessions.
     pub fn txn_manager(&self) -> Arc<TxnIdManager> {
         Arc::clone(&self.txn_manager)
+    }
+
+    /// Return the column store for catalog operations.
+    pub fn store(&self) -> &Arc<ColumnStore<P>> {
+        &self.store
+    }
+
+    /// Register a custom type alias (CREATE TYPE/DOMAIN).
+    pub fn register_type(&self, name: String, data_type: sqlparser::ast::DataType) {
+        let mut registry = self.type_registry.write().unwrap();
+        registry.insert(name.to_lowercase(), data_type);
+    }
+
+    /// Drop a custom type alias (DROP TYPE/DOMAIN).
+    pub fn drop_type(&self, name: &str) -> Result<()> {
+        let mut registry = self.type_registry.write().unwrap();
+        if registry.remove(&name.to_lowercase()).is_none() {
+            return Err(Error::InvalidArgumentError(format!(
+                "Type '{}' does not exist",
+                name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolve a type name to its base DataType, recursively following aliases.
+    pub fn resolve_type(&self, data_type: &sqlparser::ast::DataType) -> sqlparser::ast::DataType {
+        use sqlparser::ast::DataType;
+        
+        match data_type {
+            DataType::Custom(obj_name, _) => {
+                let name = obj_name.to_string().to_lowercase();
+                let registry = self.type_registry.read().unwrap();
+                if let Some(base_type) = registry.get(&name) {
+                    // Recursively resolve in case the base type is also an alias
+                    self.resolve_type(base_type)
+                } else {
+                    // Not a custom type, return as-is
+                    data_type.clone()
+                }
+            }
+            // For non-custom types, return as-is
+            _ => data_type.clone(),
+        }
+    }
+
+    /// Parse a SQL type string (e.g., "INTEGER") back into a DataType.
+    fn parse_data_type_from_sql(sql: &str) -> Result<sqlparser::ast::DataType> {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        // Try to parse as a simple CREATE DOMAIN statement
+        let create_sql = format!("CREATE DOMAIN dummy AS {}", sql);
+        let dialect = GenericDialect {};
+        
+        match Parser::parse_sql(&dialect, &create_sql) {
+            Ok(stmts) if !stmts.is_empty() => {
+                if let sqlparser::ast::Statement::CreateDomain(create_domain) = &stmts[0] {
+                    Ok(create_domain.data_type.clone())
+                } else {
+                    Err(Error::InvalidArgumentError(format!(
+                        "Failed to parse type from SQL: {}",
+                        sql
+                    )))
+                }
+            }
+            _ => Err(Error::InvalidArgumentError(format!(
+                "Failed to parse type from SQL: {}",
+                sql
+            ))),
+        }
     }
 
     /// Persist the next_txn_id to the catalog.
