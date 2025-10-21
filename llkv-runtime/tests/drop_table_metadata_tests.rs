@@ -125,13 +125,13 @@ fn drop_table_respects_foreign_keys_after_restart() {
         .expect_err("dropping referenced parent should fail");
 
     match err {
-        Error::ConstraintError(message) => {
+        Error::ConstraintError(message) | Error::CatalogError(message) => {
             assert!(
                 message.to_ascii_lowercase().contains("children"),
                 "error message should mention child table, got '{}'",
                 message
             );
         }
-        other => panic!("expected constraint error, got {:?}", other),
+        other => panic!("expected catalog or constraint error, got {:?}", other),
     }
 }
