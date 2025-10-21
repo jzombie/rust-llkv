@@ -212,6 +212,7 @@ where
             created_at_micros: timestamp,
             flags: 0,
             epoch: 0,
+            view_definition: None, // Regular table, not a view
         };
 
         self.metadata.set_table_meta(table_id, table_meta)?;

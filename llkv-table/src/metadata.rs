@@ -1100,6 +1100,7 @@ mod tests {
             created_at_micros: 123,
             flags: 0,
             epoch: 1,
+            view_definition: None,
         };
         manager
             .set_table_meta(table_id, table_meta.clone())

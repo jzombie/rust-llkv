@@ -217,6 +217,21 @@ where
         .to_string()
     }
 
+    /// Preprocess SQL to remove trailing commas in VALUES clauses.
+    /// DuckDB allows trailing commas like VALUES ('v2',) but sqlparser does not.
+    fn preprocess_trailing_commas_in_values(sql: &str) -> String {
+        static TRAILING_COMMA_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        // Pattern to match trailing comma before closing paren in VALUES
+        // Matches: , followed by optional whitespace and )
+        let re = TRAILING_COMMA_REGEX.get_or_init(|| {
+            Regex::new(r",(\s*)\)")
+                .expect("valid trailing comma regex")
+        });
+
+        re.replace_all(sql, "$1)").to_string()
+    }
+
     pub(crate) fn context_arc(&self) -> Arc<RuntimeContext<P>> {
         self.engine.context()
     }
@@ -263,6 +278,10 @@ where
         // Preprocess SQL to handle qualified names in EXCLUDE
         // Replace EXCLUDE (schema.table.col) with EXCLUDE ("schema.table.col")
         let processed_sql = Self::preprocess_exclude_syntax(&processed_sql);
+
+        // Preprocess SQL to remove trailing commas in VALUES clauses
+        // DuckDB allows VALUES ('v2',) but sqlparser does not
+        let processed_sql = Self::preprocess_trailing_commas_in_values(&processed_sql);
 
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, &processed_sql)
@@ -405,6 +424,44 @@ where
                     options,
                     default_collate_spec,
                     clone,
+                )
+            }
+            Statement::CreateView {
+                name,
+                columns,
+                query,
+                materialized,
+                or_replace,
+                or_alter,
+                options,
+                cluster_by,
+                comment,
+                with_no_schema_binding,
+                if_not_exists,
+                temporary,
+                to,
+                params,
+                secure,
+                name_before_not_exists,
+            } => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateView");
+                self.handle_create_view(
+                    name,
+                    columns,
+                    query,
+                    materialized,
+                    or_replace,
+                    or_alter,
+                    options,
+                    cluster_by,
+                    comment,
+                    with_no_schema_binding,
+                    if_not_exists,
+                    temporary,
+                    to,
+                    params,
+                    secure,
+                    name_before_not_exists,
                 )
             }
             Statement::CreateDomain(create_domain) => {
@@ -1242,6 +1299,18 @@ where
 
         let (referenced_display, referenced_canonical) = canonical_object_name(foreign_table)?;
 
+        // Check if the referenced table is a VIEW - VIEWs cannot be referenced by foreign keys
+        let catalog = self.engine.context().table_catalog();
+        if let Some(table_id) = catalog.table_id(&referenced_canonical) {
+            let context = self.engine.context();
+            if context.is_view(table_id)? {
+                return Err(Error::CatalogError(format!(
+                    "Binder Error: cannot reference a VIEW with a FOREIGN KEY: {}",
+                    referenced_display
+                )));
+            }
+        }
+
         if referenced_canonical == referencing_canonical {
             ensure_known_columns_case_insensitive(
                 referenced_columns_vec.iter().map(|name| name.as_str()),
@@ -1343,6 +1412,91 @@ where
             ))
         })?;
 
+        Ok(RuntimeStatementResult::NoOp)
+    }
+
+    fn handle_create_view(
+        &self,
+        name: ObjectName,
+        _columns: Vec<sqlparser::ast::ViewColumnDef>,
+        query: Box<sqlparser::ast::Query>,
+        materialized: bool,
+        or_replace: bool,
+        or_alter: bool,
+        _options: sqlparser::ast::CreateTableOptions,
+        _cluster_by: Vec<sqlparser::ast::Ident>,
+        _comment: Option<String>,
+        _with_no_schema_binding: bool,
+        if_not_exists: bool,
+        temporary: bool,
+        _to: Option<ObjectName>,
+        _params: Option<sqlparser::ast::CreateViewParams>,
+        _secure: bool,
+        _name_before_not_exists: bool,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        // Validate unsupported features
+        if materialized {
+            return Err(Error::InvalidArgumentError(
+                "MATERIALIZED VIEWS are not supported".into(),
+            ));
+        }
+        if or_replace {
+            return Err(Error::InvalidArgumentError(
+                "CREATE OR REPLACE VIEW is not supported".into(),
+            ));
+        }
+        if or_alter {
+            return Err(Error::InvalidArgumentError(
+                "CREATE OR ALTER VIEW is not supported".into(),
+            ));
+        }
+        if temporary {
+            return Err(Error::InvalidArgumentError(
+                "TEMPORARY VIEWS are not supported".into(),
+            ));
+        }
+
+        // Parse view name (same as table parsing)
+        let (schema_name, view_name) = parse_schema_qualified_name(&name)?;
+        
+        // Validate schema exists if specified
+        if let Some(ref schema) = schema_name {
+            let catalog = self.engine.context().table_catalog();
+            if !catalog.schema_exists(schema) {
+                return Err(Error::CatalogError(format!(
+                    "Schema '{}' does not exist",
+                    schema
+                )));
+            }
+        }
+
+        // Use full qualified name (schema.view or just view)
+        let display_name = match &schema_name {
+            Some(schema) => format!("{}.{}", schema, view_name),
+            None => view_name.clone(),
+        };
+        let canonical_name = display_name.to_ascii_lowercase();
+        
+        // Check if view already exists
+        let catalog = self.engine.context().table_catalog();
+        if catalog.table_exists(&canonical_name) {
+            if if_not_exists {
+                return Ok(RuntimeStatementResult::NoOp);
+            }
+            return Err(Error::CatalogError(format!(
+                "Table or view '{}' already exists",
+                display_name
+            )));
+        }
+
+        // Convert query to SQL string for storage
+        let view_definition = query.to_string();
+
+        // Create the view using the runtime context helper
+        let context = self.engine.context();
+        context.create_view(&display_name, view_definition)?;
+
+        tracing::debug!("Created view: {}", display_name);
         Ok(RuntimeStatementResult::NoOp)
     }
 
@@ -1810,6 +1964,23 @@ where
         or_replace: bool,
         namespace: Option<String>,
     ) -> SqlResult<RuntimeStatementResult<P>> {
+        // Check if this is a SELECT from VALUES in a derived table
+        // Pattern: SELECT * FROM (VALUES ...) alias(col1, col2, ...)
+        if let SetExpr::Select(select) = query.body.as_ref() {
+            if let Some((rows, column_names)) = extract_values_from_derived_table(&select.from)? {
+                // Convert VALUES rows to Arrow RecordBatches
+                return self.handle_create_table_from_values(
+                    display_name,
+                    rows,
+                    column_names,
+                    if_not_exists,
+                    or_replace,
+                    namespace,
+                );
+            }
+        }
+
+        // Regular CTAS with SELECT from existing tables
         let select_plan = self.build_select_plan(query)?;
 
         if select_plan.projections.is_empty() && select_plan.aggregates.is_empty() {
@@ -1829,6 +2000,142 @@ where
             namespace,
             foreign_keys: Vec::new(),
         };
+        self.execute_plan_statement(PlanStatement::CreateTable(plan))
+    }
+
+    fn handle_create_table_from_values(
+        &self,
+        display_name: String,
+        rows: Vec<Vec<PlanValue>>,
+        column_names: Vec<String>,
+        if_not_exists: bool,
+        or_replace: bool,
+        namespace: Option<String>,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        use arrow::array::{ArrayRef, StringBuilder, Int64Builder, Float64Builder};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        if rows.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "VALUES must have at least one row".into(),
+            ));
+        }
+
+        let num_cols = column_names.len();
+        
+        // Infer schema from first row
+        let first_row = &rows[0];
+        if first_row.len() != num_cols {
+            return Err(Error::InvalidArgumentError(
+                "VALUES row column count mismatch".into(),
+            ));
+        }
+
+        let mut fields = Vec::with_capacity(num_cols);
+        let mut column_types = Vec::with_capacity(num_cols);
+
+        for (idx, value) in first_row.iter().enumerate() {
+            let (data_type, nullable) = match value {
+                PlanValue::Integer(_) => (DataType::Int64, false),
+                PlanValue::Float(_) => (DataType::Float64, false),
+                PlanValue::String(_) => (DataType::Utf8, false),
+                PlanValue::Null => (DataType::Utf8, true), // Default NULL to string type
+                _ => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported value type in VALUES for column '{}'",
+                        column_names.get(idx).unwrap_or(&format!("column{}", idx))
+                    )));
+                }
+            };
+            
+            column_types.push(data_type.clone());
+            fields.push(Field::new(&column_names[idx], data_type, nullable));
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+
+        // Build Arrow arrays for each column
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(num_cols);
+        
+        for col_idx in 0..num_cols {
+            let col_type = &column_types[col_idx];
+            
+            match col_type {
+                DataType::Int64 => {
+                    let mut builder = Int64Builder::with_capacity(rows.len());
+                    for row in &rows {
+                        match &row[col_idx] {
+                            PlanValue::Integer(v) => builder.append_value(*v),
+                            PlanValue::Null => builder.append_null(),
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "type mismatch in VALUES: expected Integer, got {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()) as ArrayRef);
+                }
+                DataType::Float64 => {
+                    let mut builder = Float64Builder::with_capacity(rows.len());
+                    for row in &rows {
+                        match &row[col_idx] {
+                            PlanValue::Float(v) => builder.append_value(*v),
+                            PlanValue::Null => builder.append_null(),
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "type mismatch in VALUES: expected Float, got {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()) as ArrayRef);
+                }
+                DataType::Utf8 => {
+                    let mut builder = StringBuilder::with_capacity(rows.len(), 1024);
+                    for row in &rows {
+                        match &row[col_idx] {
+                            PlanValue::String(v) => builder.append_value(v),
+                            PlanValue::Null => builder.append_null(),
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "type mismatch in VALUES: expected String, got {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()) as ArrayRef);
+                }
+                other => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported column type in VALUES: {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
+            .map_err(|e| Error::Internal(format!("failed to create RecordBatch from VALUES: {}", e)))?;
+
+        let plan = CreateTablePlan {
+            name: display_name.clone(),
+            if_not_exists,
+            or_replace,
+            columns: Vec::new(),
+            source: Some(CreateTableSource::Batches {
+                schema: Arc::clone(&schema),
+                batches: vec![batch],
+            }),
+            namespace,
+            foreign_keys: Vec::new(),
+        };
+        
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
     }
 
@@ -4290,6 +4597,81 @@ fn parse_sql_data_type(type_str: &str, dialect: &GenericDialect) -> SqlResult<Sq
     }
 }
 
+/// Extract VALUES data from a derived table in FROM clause.
+/// Returns (rows, column_names) if the pattern matches: SELECT ... FROM (VALUES ...) alias(col1, col2, ...)
+fn extract_values_from_derived_table(
+    from: &[TableWithJoins],
+) -> SqlResult<Option<(Vec<Vec<PlanValue>>, Vec<String>)>> {
+    if from.len() != 1 {
+        return Ok(None);
+    }
+
+    let table_with_joins = &from[0];
+    if !table_with_joins.joins.is_empty() {
+        return Ok(None);
+    }
+
+    match &table_with_joins.relation {
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            // Check if the subquery is a VALUES expression
+            let values = match subquery.body.as_ref() {
+                SetExpr::Values(v) => v,
+                _ => return Ok(None),
+            };
+
+            // Extract column names from alias
+            let column_names = if let Some(alias) = alias {
+                alias
+                    .columns
+                    .iter()
+                    .map(|col_def| col_def.name.value.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                // Generate default column names if no alias provided
+                if values.rows.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "VALUES expression must have at least one row".into(),
+                    ));
+                }
+                let first_row = &values.rows[0];
+                (0..first_row.len())
+                    .map(|i| format!("column{}", i))
+                    .collect()
+            };
+
+            // Extract rows
+            if values.rows.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "VALUES expression must have at least one row".into(),
+                ));
+            }
+
+            let mut rows = Vec::with_capacity(values.rows.len());
+            for row in &values.rows {
+                if row.len() != column_names.len() {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "VALUES row has {} columns but table alias specifies {} columns",
+                        row.len(),
+                        column_names.len()
+                    )));
+                }
+
+                let mut converted_row = Vec::with_capacity(row.len());
+                for expr in row {
+                    let value = SqlValue::try_from_expr(expr)?;
+                    converted_row.push(PlanValue::from(value));
+                }
+                rows.push(converted_row);
+            }
+
+            Ok(Some((rows, column_names)))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn extract_constant_select_rows(select: &Select) -> SqlResult<Option<Vec<Vec<PlanValue>>>> {
     if !select.from.is_empty() {
         return Ok(None);
@@ -4351,8 +4733,18 @@ fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> 
     }
     match &item.relation {
         TableFactor::Table { name, .. } => canonical_object_name(name),
+        TableFactor::Derived { alias, .. } => {
+            // Derived table (subquery) - use the alias as the table name if provided
+            // For CTAS, this allows: CREATE TABLE t AS SELECT * FROM (VALUES ...) v(id)
+            let table_name = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| "derived".to_string());
+            let canonical = table_name.to_ascii_lowercase();
+            Ok((table_name, canonical))
+        }
         _ => Err(Error::InvalidArgumentError(
-            "queries require a plain table name".into(),
+            "queries require a plain table name or derived table".into(),
         )),
     }
 }

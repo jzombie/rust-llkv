@@ -699,30 +699,67 @@ where
         })
     }
 
-    fn materialize_create_table_plan(&self, mut plan: CreateTablePlan) -> Result<CreateTablePlan> {
-        if let Some(CreateTableSource::Select { plan: select_plan }) = plan.source.take() {
-            let select_result = self.select(*select_plan)?;
-            let (schema, batches) = match select_result {
-                RuntimeStatementResult::Select {
-                    schema, execution, ..
-                } => {
-                    let batches = execution.collect()?;
-                    (schema, batches)
-                }
-                _ => {
-                    return Err(Error::Internal(
-                        "expected SELECT result while executing CREATE TABLE AS SELECT".into(),
-                    ));
-                }
-            };
-            plan.source = Some(CreateTableSource::Batches { schema, batches });
+    /// Materialize CREATE TABLE AS SELECT by executing the SELECT and converting to batches.
+    ///
+    /// This method handles the preprocessing step for CREATE TABLE AS SELECT statements:
+    /// - If `plan.source` is `CreateTableSource::Select`, executes the SELECT query and
+    ///   converts the result into `CreateTableSource::Batches` for insertion.
+    /// - If `plan.source` is already `CreateTableSource::Batches`, leaves it unchanged
+    ///   (the SQL layer has already converted VALUES or other sources to batches).
+    /// - If `plan.source` is `None`, leaves it unchanged (explicit column definitions).
+    ///
+    /// # Important
+    /// This method uses `.take()` on the source, so it **must** restore the source in all
+    /// code paths. If you modify this, ensure `plan.source` is not left as `None` when it
+    /// should contain data.
+    fn materialize_ctas_plan(&self, mut plan: CreateTablePlan) -> Result<CreateTablePlan> {
+        // Only materialize if source is a SELECT query
+        // If source is already Batches, leave it alone
+        if matches!(plan.source, Some(CreateTableSource::Select { .. })) {
+            if let Some(CreateTableSource::Select { plan: select_plan }) = plan.source.take() {
+                let select_result = self.select(*select_plan)?;
+                let (schema, batches) = match select_result {
+                    RuntimeStatementResult::Select {
+                        schema, execution, ..
+                    } => {
+                        let batches = execution.collect()?;
+                        (schema, batches)
+                    }
+                    _ => {
+                        return Err(Error::Internal(
+                            "expected SELECT result while executing CREATE TABLE AS SELECT".into(),
+                        ));
+                    }
+                };
+                plan.source = Some(CreateTableSource::Batches { schema, batches });
+            }
         }
         Ok(plan)
     }
 
-    /// Create a table (outside or inside transaction).
+    /// Create a table (outside or inside transaction) - RuntimeSession layer.
+    ///
+    /// This is the **session-level** entry point for CREATE TABLE operations. It provides:
+    /// 1. **CTAS Materialization**: Calls `materialize_create_table_plan` to execute any
+    ///    SELECT queries in CREATE TABLE AS SELECT statements.
+    /// 2. **Namespace Resolution**: Determines whether to use temporary or persistent storage.
+    /// 3. **Transaction Support**: Routes creation through the transaction system if a
+    ///    transaction is active.
+    ///
+    /// # Call Chain
+    /// ```text
+    /// RuntimeEngine::execute_statement()
+    ///   └─> RuntimeSession::create_table_plan()  ← YOU ARE HERE
+    ///         ├─> materialize_create_table_plan() (if source is SELECT)
+    ///         └─> RuntimeContext::create_table_plan() (for actual table creation)
+    /// ```
+    ///
+    /// # See Also
+    /// - [`RuntimeContext::create_table_plan`] - Lower-level implementation that does the
+    ///   actual table creation work.
+    /// - [`materialize_ctas_plan`] - Helper that executes SELECT queries in CTAS.
     pub fn create_table_plan(&self, plan: CreateTablePlan) -> Result<RuntimeStatementResult<P>> {
-        let mut plan = self.materialize_create_table_plan(plan)?;
+        let mut plan = self.materialize_ctas_plan(plan)?;
         let namespace_id = plan
             .namespace
             .clone()
@@ -1553,6 +1590,50 @@ where
         Ok(())
     }
 
+    /// Create a view by storing its SQL definition in the catalog.
+    /// The view will be registered as a table with a view_definition.
+    pub fn create_view(&self, display_name: &str, view_definition: String) -> Result<TableId> {
+        use llkv_table::TableMeta;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Reserve a new table ID for the view
+        let table_id = self.metadata.reserve_table_id()?;
+        
+        let created_at_micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+
+        // Create the table metadata with view_definition set
+        let table_meta = TableMeta {
+            table_id,
+            name: Some(display_name.to_string()),
+            created_at_micros,
+            flags: 0,
+            epoch: 0,
+            view_definition: Some(view_definition),
+        };
+
+        // Store the metadata and flush to disk
+        self.metadata.set_table_meta(table_id, table_meta)?;
+        self.metadata.flush_table(table_id)?;
+
+        // Register the view in the catalog so it can be looked up by name
+        self.catalog.register_table(display_name, table_id)?;
+
+        tracing::debug!("Created view '{}' with table_id={}", display_name, table_id);
+        Ok(table_id)
+    }
+
+    /// Check if a table is actually a view by looking at its metadata.
+    /// Returns true if the table exists and has a view_definition.
+    pub fn is_view(&self, table_id: TableId) -> Result<bool> {
+        match self.metadata.table_meta(table_id)? {
+            Some(meta) => Ok(meta.view_definition.is_some()),
+            None => Ok(false),
+        }
+    }
+
     /// Resolve a type name to its base DataType, recursively following aliases.
     pub fn resolve_type(&self, data_type: &sqlparser::ast::DataType) -> sqlparser::ast::DataType {
         use sqlparser::ast::DataType;
@@ -1693,6 +1774,44 @@ where
         self.transaction_manager.has_active_transaction()
     }
 
+    /// Create a table with explicit column definitions - Programmatic API.
+    ///
+    /// This is a **convenience method** for programmatically creating tables with explicit
+    /// column definitions. Use this when you're writing Rust code that needs to create tables
+    /// directly, rather than executing SQL.
+    ///
+    /// # When to use `create_table` vs `create_table_plan`
+    ///
+    /// **Use `create_table`:**
+    /// - You're writing Rust code (not parsing SQL)
+    /// - You have explicit column definitions
+    /// - You want a simple, ergonomic API: `ctx.create_table("users", vec![...])`
+    /// - You want a `RuntimeTableHandle` to work with immediately
+    /// - **Does NOT support**: CREATE TABLE AS SELECT, foreign keys, namespaces
+    ///
+    /// **Use `create_table_plan`:**
+    /// - You're implementing SQL execution (already have a parsed `CreateTablePlan`)
+    /// - You need CREATE TABLE AS SELECT support
+    /// - You need foreign key constraints
+    /// - You need namespace support (temporary tables)
+    /// - You need IF NOT EXISTS / OR REPLACE semantics
+    /// - You're working within the transaction system
+    ///
+    /// # Usage Comparison
+    ///
+    /// **Programmatic API** (this method):
+    /// - `ctx.create_table("users", vec![("id", DataType::Int64, false), ...])?`
+    /// - Returns `RuntimeTableHandle` for immediate use
+    /// - Simple, ergonomic, no plan construction needed
+    ///
+    /// **SQL execution API** ([`create_table_plan`]):
+    /// - Construct a `CreateTablePlan` with all SQL features
+    /// - Support for CTAS, foreign keys, namespaces, transactions
+    /// - Returns `RuntimeStatementResult` for consistency with other SQL operations
+    ///
+    /// # Returns
+    /// Returns a [`RuntimeTableHandle`] that provides immediate access to the table.
+    /// Use this for further programmatic operations on the table.
     pub fn create_table<C, I>(
         self: &Arc<Self>,
         name: &str,
@@ -1717,6 +1836,53 @@ where
         self.create_table_with_options(name, columns, true)
     }
 
+    /// Create a table from a plan - RuntimeContext layer (low-level implementation).
+    ///
+    /// This is the **context-level** implementation that performs the actual table creation.
+    /// It is called by [`RuntimeSession::create_table_plan`] after that layer has handled
+    /// transaction and namespace concerns.
+    ///
+    /// # When to use `create_table` vs `create_table_plan`
+    ///
+    /// **Use [`create_table`]** (the simple programmatic API):
+    /// - Writing Rust code that needs to create tables
+    /// - Have explicit column definitions
+    /// - Want immediate `RuntimeTableHandle` access
+    /// - Don't need advanced SQL features
+    ///
+    /// **Use `create_table_plan`** (this method):
+    /// - Implementing SQL execution (you have a `CreateTablePlan` from parsing)
+    /// - Need CREATE TABLE AS SELECT support
+    /// - Need foreign key constraints
+    /// - Need namespace support
+    /// - Working within transaction system
+    ///
+    /// # Responsibilities
+    /// - Validates that the plan has either explicit columns OR a source (batches/select).
+    /// - Handles `IF NOT EXISTS` and `OR REPLACE` semantics.
+    /// - Routes to appropriate creation method based on source type:
+    ///   - `CreateTableSource::Batches` → `create_table_from_batches()`
+    ///   - `CreateTableSource::Select` → Returns error (should be materialized by session layer)
+    ///   - `None` → `create_table_with_explicit_columns()`
+    /// - Registers foreign key constraints.
+    ///
+    /// # Call Chain
+    /// ```text
+    /// RuntimeEngine::execute_statement()
+    ///   └─> RuntimeSession::create_table_plan()
+    ///         ├─> materialize_create_table_plan() (if source is SELECT)
+    ///         └─> RuntimeContext::create_table_plan() ← YOU ARE HERE
+    ///               └─> create_table_from_batches() / create_table_with_explicit_columns()
+    /// ```
+    ///
+    /// # See Also
+    /// - [`RuntimeSession::create_table_plan`] - Higher-level session wrapper that handles
+    ///   CTAS materialization and transaction routing.
+    ///
+    /// # Panics
+    /// This method expects that `CreateTableSource::Select` has already been materialized
+    /// into `CreateTableSource::Batches` by the session layer. If a `Select` source is
+    /// received here, it returns an error.
     pub fn create_table_plan(&self, plan: CreateTablePlan) -> Result<RuntimeStatementResult<P>> {
         if plan.columns.is_empty() && plan.source.is_none() {
             return Err(Error::InvalidArgumentError(

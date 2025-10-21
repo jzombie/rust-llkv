@@ -242,6 +242,9 @@ pub struct TableMeta {
     pub flags: u32,
     /// Schema version or modification counter.
     pub epoch: u64,
+    /// If this is a view, contains the SQL definition (SELECT statement).
+    /// If None, this is a regular table.
+    pub view_definition: Option<String>,
 }
 
 /// Metadata about a column.
