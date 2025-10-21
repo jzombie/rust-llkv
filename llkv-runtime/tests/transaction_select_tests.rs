@@ -4,6 +4,7 @@ use llkv_runtime::{
     RuntimeStatementResult, SelectPlan,
 };
 use llkv_storage::pager::MemPager;
+use llkv_table::CatalogDdl;
 use std::sync::Arc;
 
 #[test]
@@ -26,7 +27,7 @@ fn test_transaction_select() {
         foreign_keys: Vec::new(),
         multi_column_uniques: Vec::new(),
     };
-    session.execute_create_table_plan(create_plan).unwrap();
+    CatalogDdl::create_table(&session, create_plan).unwrap();
 
     // Insert data
     let insert_plan = InsertPlan {
@@ -101,7 +102,7 @@ fn test_transaction_select_with_aggregates() {
         foreign_keys: Vec::new(),
         multi_column_uniques: Vec::new(),
     };
-    session.execute_create_table_plan(create_plan).unwrap();
+    CatalogDdl::create_table(&session, create_plan).unwrap();
 
     // Insert data
     let insert_plan = InsertPlan {

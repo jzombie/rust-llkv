@@ -23,6 +23,7 @@ use llkv_runtime::{
     SelectProjection, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
+use llkv_table::CatalogDdl;
 use llkv_table::catalog::{IdentifierContext, IdentifierResolver};
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -2724,11 +2725,7 @@ where
             new_table_display.clone()
         };
 
-        match self
-            .engine
-            .session()
-            .rename_table(&current_display, &new_display)
-        {
+        match CatalogDdl::rename_table(self.engine.session(), &current_display, &new_display) {
             Ok(()) => Ok(RuntimeStatementResult::NoOp),
             Err(err) => {
                 if if_exists && Self::is_table_missing_error(&err) {

@@ -790,150 +790,6 @@ where
         Ok(plan)
     }
 
-    /// Create a table (outside or inside transaction) - RuntimeSession layer.
-    ///
-    /// This is the **session-level** entry point for CREATE TABLE operations. It provides:
-    /// 1. **CTAS Materialization**: Calls [`materialize_ctas_plan`] to execute any
-    ///    SELECT queries in CREATE TABLE AS SELECT statements.
-    /// 2. **Namespace Resolution**: Determines whether to use temporary or persistent storage.
-    /// 3. **Transaction Support**: Routes creation through the transaction system if a
-    ///    transaction is active.
-    ///
-    /// # Call Chain
-    /// ```text
-    /// RuntimeEngine::execute_statement()
-    ///   └─> RuntimeSession::execute_create_table_plan()  ← YOU ARE HERE
-    ///         ├─> materialize_ctas_plan() (if source is SELECT)
-    ///         └─> [`CatalogDdl::create_table`] (for actual table creation)
-    /// ```
-    ///
-    /// # See Also
-    /// - [`CatalogDdl::create_table`] - Trait entry point that performs the actual table creation.
-    /// - [`materialize_ctas_plan`] - Helper that executes SELECT queries in CTAS.
-    pub fn execute_create_table_plan(
-        &self,
-        plan: CreateTablePlan,
-    ) -> Result<RuntimeStatementResult<P>> {
-        let mut plan = self.materialize_ctas_plan(plan)?;
-        let namespace_id = plan
-            .namespace
-            .clone()
-            .unwrap_or_else(|| storage_namespace::PERSISTENT_NAMESPACE_ID.to_string());
-        plan.namespace = Some(namespace_id.clone());
-
-        match namespace_id.as_str() {
-            storage_namespace::TEMPORARY_NAMESPACE_ID => {
-                let temp_namespace = self
-                    .temporary_namespace()
-                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                temp_namespace.create_table(plan)?.convert_pager_type::<P>()
-            }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => {
-                if self.has_active_transaction() {
-                    let table_name = plan.name.clone();
-                    match self
-                        .inner
-                        .execute_operation(PlanOperation::CreateTable(plan))
-                    {
-                        Ok(_) => Ok(RuntimeStatementResult::CreateTable { table_name }),
-                        Err(e) => {
-                            // If an error occurs during a transaction, abort it
-                            self.abort_transaction();
-                            Err(e)
-                        }
-                    }
-                } else {
-                    // Even without an active transaction, check if another session has this table locked
-                    if self.inner.has_table_locked_by_other_session(&plan.name) {
-                        return Err(Error::TransactionContextError(format!(
-                            "table '{}' is locked by another active transaction",
-                            plan.name
-                        )));
-                    }
-                    self.persistent_namespace().create_table(plan)
-                }
-            }
-            other => Err(Error::InvalidArgumentError(format!(
-                "Unknown storage namespace '{}'",
-                other
-            ))),
-        }
-    }
-
-    /// Executes a planned `DROP TABLE` statement in the session layer.
-    ///
-    /// Resolves the owning namespace, enforces transactional guard rails, and then
-    /// routes the drop to either the temporary or persistent namespace. Auto-commit
-    /// calls execute immediately, while transactional callers enqueue the plan for
-    /// replay during commit.
-    ///
-    /// # Arguments
-    /// * `plan` – Logical `DROP TABLE` request produced by the SQL planner.
-    ///
-    /// # Errors
-    /// Returns [`Error::CatalogError`] when foreign-key dependencies block the drop.
-    /// Returns [`Error::TransactionContextError`] when another session holds the
-    /// table lock. Returns [`Error::InvalidArgumentError`] if the table lives in an
-    /// unknown namespace.
-    pub fn execute_drop_table_plan(
-        &self,
-        plan: DropTablePlan,
-    ) -> Result<RuntimeStatementResult<P>> {
-        let (_, canonical_table) = canonical_table_name(&plan.name)?;
-        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
-
-        match namespace_id.as_str() {
-            storage_namespace::TEMPORARY_NAMESPACE_ID => {
-                let temp_namespace = self
-                    .temporary_namespace()
-                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                temp_namespace.drop_table(plan.clone())?;
-                Ok(RuntimeStatementResult::NoOp)
-            }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => {
-                if self.has_active_transaction() {
-                    // Check for transactional FK constraints before attempting drop
-                    let referencing_tables = self.tables_referencing_in_transaction(&plan.name);
-                    if !referencing_tables.is_empty() {
-                        // Find the first referencing table for the error message
-                        let referencing_table = &referencing_tables[0];
-                        self.abort_transaction();
-                        return Err(Error::CatalogError(format!(
-                            "Catalog Error: Could not drop the table because this table is main key table of the table \"{}\".",
-                            referencing_table
-                        )));
-                    }
-
-                    match self
-                        .inner
-                        .execute_operation(PlanOperation::DropTable(plan.clone()))
-                    {
-                        Ok(_) => Ok(RuntimeStatementResult::NoOp),
-                        Err(e) => {
-                            // If an error occurs during a transaction, abort it
-                            self.abort_transaction();
-                            Err(e)
-                        }
-                    }
-                } else {
-                    // Even without an active transaction, check if another session has this table locked
-                    if self.inner.has_table_locked_by_other_session(&plan.name) {
-                        return Err(Error::TransactionContextError(format!(
-                            "table '{}' is locked by another active transaction",
-                            plan.name
-                        )));
-                    }
-                    self.persistent_namespace().drop_table(plan)?;
-                    Ok(RuntimeStatementResult::NoOp)
-                }
-            }
-            other => Err(Error::InvalidArgumentError(format!(
-                "Unknown storage namespace '{}'",
-                other
-            ))),
-        }
-    }
-
     pub fn execute_alter_table_plan(
         &self,
         plan: AlterTablePlan,
@@ -1253,134 +1109,6 @@ where
                 }
                 Ok(())
             }
-        }
-    }
-
-    /// Rename a table through the owning storage namespace.
-    ///
-    /// The session looks up the namespace that currently owns `current_name`, then
-    /// delegates the rename request to that namespace. Renames are limited to
-    /// auto-commit mode so catalog consistency and namespace routing stay simple.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidArgumentError`] when the session has an active
-    /// transaction or when the target namespace rejects the rename (for example
-    /// because the destination already exists).
-    pub fn rename_table(&self, current_name: &str, new_name: &str) -> Result<()> {
-        if self.has_active_transaction() {
-            return Err(Error::InvalidArgumentError(
-                "ALTER TABLE RENAME is not supported inside an active transaction".into(),
-            ));
-        }
-
-        let (_, canonical_table) = canonical_table_name(current_name)?;
-        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
-
-        match namespace_id.as_str() {
-            storage_namespace::TEMPORARY_NAMESPACE_ID => {
-                let temp_namespace = self
-                    .temporary_namespace()
-                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                temp_namespace.rename_table(current_name, new_name)
-            }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => self
-                .persistent_namespace()
-                .rename_table(current_name, new_name),
-            other => Err(Error::InvalidArgumentError(format!(
-                "Unknown storage namespace '{}'",
-                other
-            ))),
-        }
-    }
-
-    /// Create an index (auto-commit only for now).
-    pub fn execute_create_index_plan(
-        &self,
-        plan: CreateIndexPlan,
-    ) -> Result<RuntimeStatementResult<P>> {
-        let (_, canonical_table) = canonical_table_name(&plan.table)?;
-        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
-
-        match namespace_id.as_str() {
-            storage_namespace::TEMPORARY_NAMESPACE_ID => {
-                let temp_namespace = self
-                    .temporary_namespace()
-                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                temp_namespace.create_index(plan)?.convert_pager_type::<P>()
-            }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => {
-                if self.has_active_transaction() {
-                    return Err(Error::InvalidArgumentError(
-                        "CREATE INDEX is not supported inside an active transaction".into(),
-                    ));
-                }
-
-                self.persistent_namespace().create_index(plan)
-            }
-            other => Err(Error::InvalidArgumentError(format!(
-                "Unknown storage namespace '{}'",
-                other
-            ))),
-        }
-    }
-
-    /// Drop an index by name through plan execution.
-    pub fn drop_index(&self, index_name: &str, if_exists: bool) -> Result<()> {
-        let plan = DropIndexPlan::new(index_name).if_exists(if_exists);
-        self.execute_drop_index_plan(plan)?;
-        Ok(())
-    }
-
-    pub fn execute_drop_index_plan(
-        &self,
-        plan: DropIndexPlan,
-    ) -> Result<RuntimeStatementResult<P>> {
-        if self.has_active_transaction() {
-            return Err(Error::InvalidArgumentError(
-                "DROP INDEX is not supported inside an active transaction".into(),
-            ));
-        }
-
-        let mut dropped = false;
-
-        match self.persistent_namespace().drop_index(plan.clone()) {
-            Ok(Some(_)) => {
-                dropped = true;
-            }
-            Ok(None) => {
-                // Index not found in persistent namespace (allowed when IF EXISTS)
-            }
-            Err(err) => {
-                if !is_index_not_found_error(&err) {
-                    return Err(err);
-                }
-            }
-        }
-
-        if !dropped {
-            if let Some(temp_namespace) = self.temporary_namespace() {
-                match temp_namespace.drop_index(plan.clone()) {
-                    Ok(Some(_)) => {
-                        dropped = true;
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        if !is_index_not_found_error(&err) {
-                            return Err(err);
-                        }
-                    }
-                }
-            }
-        }
-
-        if dropped || plan.if_exists {
-            Ok(RuntimeStatementResult::NoOp)
-        } else {
-            Err(Error::CatalogError(format!(
-                "Index '{}' does not exist",
-                plan.name
-            )))
         }
     }
 
@@ -1711,6 +1439,218 @@ where
     }
 }
 
+/// Implement [`CatalogDdl`] directly on the session so callers must import the trait
+/// to perform schema mutations. This keeps all runtime DDL entry points aligned with
+/// the shared contract used by contexts and storage namespaces.
+impl<P> CatalogDdl for RuntimeSession<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    type CreateTableOutput = RuntimeStatementResult<P>;
+    type DropTableOutput = RuntimeStatementResult<P>;
+    type RenameTableOutput = ();
+    type CreateIndexOutput = RuntimeStatementResult<P>;
+    type DropIndexOutput = RuntimeStatementResult<P>;
+
+    fn create_table(&self, plan: CreateTablePlan) -> Result<Self::CreateTableOutput> {
+        let mut plan = self.materialize_ctas_plan(plan)?;
+        let namespace_id = plan
+            .namespace
+            .clone()
+            .unwrap_or_else(|| storage_namespace::PERSISTENT_NAMESPACE_ID.to_string());
+        plan.namespace = Some(namespace_id.clone());
+
+        match namespace_id.as_str() {
+            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                temp_namespace.create_table(plan)?.convert_pager_type::<P>()
+            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+                if self.has_active_transaction() {
+                    let table_name = plan.name.clone();
+                    match self
+                        .inner
+                        .execute_operation(PlanOperation::CreateTable(plan))
+                    {
+                        Ok(_) => Ok(RuntimeStatementResult::CreateTable { table_name }),
+                        Err(e) => {
+                            self.abort_transaction();
+                            Err(e)
+                        }
+                    }
+                } else {
+                    if self.inner.has_table_locked_by_other_session(&plan.name) {
+                        return Err(Error::TransactionContextError(format!(
+                            "table '{}' is locked by another active transaction",
+                            plan.name
+                        )));
+                    }
+                    self.persistent_namespace().create_table(plan)
+                }
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
+        }
+    }
+
+    fn drop_table(&self, plan: DropTablePlan) -> Result<Self::DropTableOutput> {
+        let (_, canonical_table) = canonical_table_name(&plan.name)?;
+        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
+
+        match namespace_id.as_str() {
+            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                temp_namespace.drop_table(plan.clone())?;
+                Ok(RuntimeStatementResult::NoOp)
+            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+                if self.has_active_transaction() {
+                    let referencing_tables = self.tables_referencing_in_transaction(&plan.name);
+                    if !referencing_tables.is_empty() {
+                        let referencing_table = &referencing_tables[0];
+                        self.abort_transaction();
+                        return Err(Error::CatalogError(format!(
+                            "Catalog Error: Could not drop the table because this table is main key table of the table \"{}\".",
+                            referencing_table
+                        )));
+                    }
+
+                    match self
+                        .inner
+                        .execute_operation(PlanOperation::DropTable(plan.clone()))
+                    {
+                        Ok(_) => Ok(RuntimeStatementResult::NoOp),
+                        Err(e) => {
+                            self.abort_transaction();
+                            Err(e)
+                        }
+                    }
+                } else {
+                    if self.inner.has_table_locked_by_other_session(&plan.name) {
+                        return Err(Error::TransactionContextError(format!(
+                            "table '{}' is locked by another active transaction",
+                            plan.name
+                        )));
+                    }
+                    self.persistent_namespace().drop_table(plan)?;
+                    Ok(RuntimeStatementResult::NoOp)
+                }
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
+        }
+    }
+
+    fn rename_table(&self, current_name: &str, new_name: &str) -> Result<Self::RenameTableOutput> {
+        if self.has_active_transaction() {
+            return Err(Error::InvalidArgumentError(
+                "ALTER TABLE RENAME is not supported inside an active transaction".into(),
+            ));
+        }
+
+        let (_, canonical_table) = canonical_table_name(current_name)?;
+        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
+
+        match namespace_id.as_str() {
+            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                temp_namespace.rename_table(current_name, new_name)
+            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => self
+                .persistent_namespace()
+                .rename_table(current_name, new_name),
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
+        }
+    }
+
+    fn create_index(&self, plan: CreateIndexPlan) -> Result<Self::CreateIndexOutput> {
+        let (_, canonical_table) = canonical_table_name(&plan.table)?;
+        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
+
+        match namespace_id.as_str() {
+            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                temp_namespace.create_index(plan)?.convert_pager_type::<P>()
+            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+                if self.has_active_transaction() {
+                    return Err(Error::InvalidArgumentError(
+                        "CREATE INDEX is not supported inside an active transaction".into(),
+                    ));
+                }
+
+                self.persistent_namespace().create_index(plan)
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
+        }
+    }
+
+    fn drop_index(&self, plan: DropIndexPlan) -> Result<Self::DropIndexOutput> {
+        if self.has_active_transaction() {
+            return Err(Error::InvalidArgumentError(
+                "DROP INDEX is not supported inside an active transaction".into(),
+            ));
+        }
+
+        let mut dropped = false;
+
+        match self.persistent_namespace().drop_index(plan.clone()) {
+            Ok(Some(_)) => {
+                dropped = true;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                if !is_index_not_found_error(&err) {
+                    return Err(err);
+                }
+            }
+        }
+
+        if !dropped {
+            if let Some(temp_namespace) = self.temporary_namespace() {
+                match temp_namespace.drop_index(plan.clone()) {
+                    Ok(Some(_)) => {
+                        dropped = true;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        if !is_index_not_found_error(&err) {
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+        }
+
+        if dropped || plan.if_exists {
+            Ok(RuntimeStatementResult::NoOp)
+        } else {
+            Err(Error::CatalogError(format!(
+                "Index '{}' does not exist",
+                plan.name
+            )))
+        }
+    }
+}
+
 pub struct RuntimeEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
@@ -1763,11 +1703,11 @@ where
             PlanStatement::BeginTransaction => self.session.begin_transaction(),
             PlanStatement::CommitTransaction => self.session.commit_transaction(),
             PlanStatement::RollbackTransaction => self.session.rollback_transaction(),
-            PlanStatement::CreateTable(plan) => self.session.execute_create_table_plan(plan),
-            PlanStatement::DropTable(plan) => self.session.execute_drop_table_plan(plan),
-            PlanStatement::DropIndex(plan) => self.session.execute_drop_index_plan(plan),
+            PlanStatement::CreateTable(plan) => CatalogDdl::create_table(&self.session, plan),
+            PlanStatement::DropTable(plan) => CatalogDdl::drop_table(&self.session, plan),
+            PlanStatement::DropIndex(plan) => CatalogDdl::drop_index(&self.session, plan),
             PlanStatement::AlterTable(plan) => self.session.execute_alter_table_plan(plan),
-            PlanStatement::CreateIndex(plan) => self.session.execute_create_index_plan(plan),
+            PlanStatement::CreateIndex(plan) => CatalogDdl::create_index(&self.session, plan),
             PlanStatement::Insert(plan) => self.session.execute_insert_plan(plan),
             PlanStatement::Update(plan) => self.session.execute_update_plan(plan),
             PlanStatement::Delete(plan) => self.session.execute_delete_plan(plan),
