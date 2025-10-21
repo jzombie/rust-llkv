@@ -596,6 +596,12 @@ where
         self.inner.table_column_specs_from_transaction(table_name)
     }
 
+    /// Get tables that reference the given table via foreign keys created in the current transaction.
+    /// Returns an empty vector if there's no active transaction or no transactional FKs reference this table.
+    pub fn tables_referencing_in_transaction(&self, referenced_table: &str) -> Vec<String> {
+        self.inner.tables_referencing_in_transaction(referenced_table)
+    }
+
     /// Commit the current transaction and apply changes to the base context.
     /// If the transaction was aborted, this acts as a ROLLBACK instead.
     pub fn commit_transaction(&self) -> Result<RuntimeStatementResult<P>> {
@@ -819,6 +825,18 @@ where
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
+                    // Check for transactional FK constraints before attempting drop
+                    let referencing_tables = self.tables_referencing_in_transaction(&plan.name);
+                    if !referencing_tables.is_empty() {
+                        // Find the first referencing table for the error message
+                        let referencing_table = &referencing_tables[0];
+                        self.abort_transaction();
+                        return Err(Error::CatalogError(format!(
+                            "Catalog Error: Could not drop the table because this table is main key table of the table \"{}\".",
+                            referencing_table
+                        )));
+                    }
+                    
                     match self.inner.execute_operation(PlanOperation::DropTable(plan)) {
                         Ok(_) => Ok(RuntimeStatementResult::NoOp),
                         Err(e) => {

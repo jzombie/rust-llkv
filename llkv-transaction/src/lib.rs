@@ -311,6 +311,10 @@ where
     txn_manager: Arc<TxnIdManager>,
     /// Tables accessed (names only) by this transaction
     accessed_tables: HashSet<String>,
+    /// Foreign key constraints created in this transaction.
+    /// Maps referenced_table_name -> Vec<referencing_table_name>
+    /// Used to check FK dependencies when dropping tables within a transaction.
+    transactional_foreign_keys: HashMap<String, Vec<String>>,
 }
 
 impl<BaseCtx, StagingCtx> SessionTransaction<BaseCtx, StagingCtx>
@@ -349,6 +353,7 @@ where
             accessed_tables: HashSet::new(),
             snapshot,
             txn_manager,
+            transactional_foreign_keys: HashMap::new(),
         }
     }
 
@@ -521,6 +526,16 @@ where
                         self.staged_tables.insert(plan.name.clone());
                         // Lock this table name for the duration of the transaction
                         self.locked_table_names.insert(plan.name.to_ascii_lowercase());
+                        
+                        // Track foreign key dependencies for DROP TABLE validation
+                        for fk in &plan.foreign_keys {
+                            let referenced_table = fk.referenced_table.to_ascii_lowercase();
+                            self.transactional_foreign_keys
+                                .entry(referenced_table)
+                                .or_insert_with(Vec::new)
+                                .push(plan.name.to_ascii_lowercase());
+                        }
+                        
                         // Track for commit replay WITH original foreign keys
                         self.operations
                             .push(PlanOperation::CreateTable(plan.clone()));
@@ -545,6 +560,14 @@ where
                     self.staging.drop_table(&plan.name, plan.if_exists)?;
                     self.new_tables.remove(&canonical_name);
                     self.staged_tables.remove(&canonical_name);
+                    
+                    // Remove FK constraints where this table was the referencing table
+                    self.transactional_foreign_keys.iter_mut().for_each(|(_, referencing_tables)| {
+                        referencing_tables.retain(|t| t != &canonical_name);
+                    });
+                    // Clean up empty entries
+                    self.transactional_foreign_keys.retain(|_, referencing_tables| !referencing_tables.is_empty());
+                    
                     // Remove the CREATE TABLE operation from the operation list
                     self.operations.retain(|op| {
                         !matches!(op, PlanOperation::CreateTable(p) if p.name.to_ascii_lowercase() == canonical_name)
@@ -892,6 +915,27 @@ where
         // Get column specs from the staging context
         tx.staging.table_column_specs(table_name).ok()
     }
+
+    /// Get tables that reference the given table via foreign keys created in the current transaction.
+    /// Returns an empty vector if there's no active transaction or no transactional FKs reference this table.
+    pub fn tables_referencing_in_transaction(&self, referenced_table: &str) -> Vec<String> {
+        let canonical = referenced_table.to_ascii_lowercase();
+        let guard = self
+            .transactions
+            .lock()
+            .expect("transactions lock poisoned");
+        
+        let tx = match guard.get(&self.session_id) {
+            Some(tx) => tx,
+            None => return Vec::new(),
+        };
+        
+        tx.transactional_foreign_keys
+            .get(&canonical)
+            .cloned()
+            .unwrap_or_else(Vec::new)
+    }
+    
     /// Check if a table is locked by another active session's transaction.
     /// Returns true if ANY other session has this table in their locked_table_names.
     pub fn has_table_locked_by_other_session(&self, table_name: &str) -> bool {
