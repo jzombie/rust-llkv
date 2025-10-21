@@ -8,8 +8,8 @@ use arrow::array::{
     RecordBatch, StringArray,
 };
 use arrow::datatypes::{DataType, Field};
+use llkv_column_map::types::FieldId;
 use llkv_result::Error;
-use llkv_table::types::FieldId;
 use rustc_hash::FxHashSet;
 use std::sync::Arc;
 

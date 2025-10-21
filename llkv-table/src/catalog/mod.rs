@@ -20,4 +20,4 @@ pub use table_catalog::{
 pub(crate) use table_catalog::TableMetadataView;
 
 // Re-export CatalogManager (formerly CatalogService)
-pub use manager::{CatalogManager, CreateTableResult};
+pub use manager::{CatalogManager, CreateTableResult, MvccColumnBuilder};

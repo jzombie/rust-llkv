@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::ArrayRef;
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::IndexKind;
@@ -19,8 +19,6 @@ use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
-
-use crate::mvcc;
 
 use super::table_catalog::{FieldDefinition, TableCatalog};
 use crate::constraints::ConstraintKind;
@@ -42,6 +40,34 @@ where
     pub table: Arc<Table<P>>,
     pub table_columns: Vec<TableColumn>,
     pub column_lookup: FxHashMap<String, usize>,
+}
+
+/// Trait for constructing MVCC columns and Arrow metadata during batch ingestion.
+///
+/// Implementations can delegate to `llkv_transaction::mvcc` or provide custom logic
+/// for synthetic data sources. This indirection avoids coupling the table crate to the
+/// transaction crate while still centralizing MVCC helpers.
+pub trait MvccColumnBuilder: Send + Sync {
+    /// Build MVCC columns (row_id, created_by, deleted_by) for INSERT/CTAS operations.
+    fn build_insert_columns(
+        &self,
+        row_count: usize,
+        start_row_id: RowId,
+        creator_txn_id: u64,
+        deleted_marker: u64,
+    ) -> (ArrayRef, ArrayRef, ArrayRef);
+
+    /// Return the Arrow field definitions for MVCC columns.
+    fn mvcc_fields(&self) -> Vec<Field>;
+
+    /// Construct a user column field with the required metadata assigned.
+    fn field_with_metadata(
+        &self,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        field_id: FieldId,
+    ) -> Field;
 }
 
 /// Service for creating tables.
@@ -341,6 +367,7 @@ where
     }
 
     /// Append RecordBatches to a freshly created table, injecting MVCC columns.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_batches_with_mvcc(
         &self,
         table: &Table<P>,
@@ -349,6 +376,7 @@ where
         creator_txn_id: u64,
         deleted_marker: u64,
         starting_row_id: RowId,
+        mvcc_builder: &dyn MvccColumnBuilder,
     ) -> LlkvResult<(RowId, u64)> {
         let mut next_row_id = starting_row_id;
         let mut total_rows: u64 = 0;
@@ -368,24 +396,19 @@ where
 
             let row_count = batch.num_rows();
 
-            let (row_id_array, created_by_array, deleted_by_array) =
-                mvcc::build_insert_mvcc_columns(
-                    row_count,
-                    next_row_id,
-                    creator_txn_id,
-                    deleted_marker,
-                );
+            let (row_id_array, created_by_array, deleted_by_array) = mvcc_builder
+                .build_insert_columns(row_count, next_row_id, creator_txn_id, deleted_marker);
 
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(table_columns.len() + 3);
             arrays.push(row_id_array);
             arrays.push(created_by_array);
             arrays.push(deleted_by_array);
 
-            let mut fields = mvcc::build_mvcc_fields();
+            let mut fields = mvcc_builder.mvcc_fields();
 
             for (idx, column) in table_columns.iter().enumerate() {
                 let array = batch.column(idx).clone();
-                let field = mvcc::build_field_with_metadata(
+                let field = mvcc_builder.field_with_metadata(
                     &column.name,
                     column.data_type.clone(),
                     column.nullable,
