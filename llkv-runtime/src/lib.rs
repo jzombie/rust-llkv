@@ -836,6 +836,21 @@ where
         }
     }
 
+    /// Executes a planned `DROP TABLE` statement in the session layer.
+    ///
+    /// Resolves the owning namespace, enforces transactional guard rails, and then
+    /// routes the drop to either the temporary or persistent namespace. Auto-commit
+    /// calls execute immediately, while transactional callers enqueue the plan for
+    /// replay during commit.
+    ///
+    /// # Arguments
+    /// * `plan` – Logical `DROP TABLE` request produced by the SQL planner.
+    ///
+    /// # Errors
+    /// Returns [`Error::CatalogError`] when foreign-key dependencies block the drop.
+    /// Returns [`Error::TransactionContextError`] when another session holds the
+    /// table lock. Returns [`Error::InvalidArgumentError`] if the table lives in an
+    /// unknown namespace.
     pub fn drop_table_plan(&self, plan: DropTablePlan) -> Result<RuntimeStatementResult<P>> {
         let (_, canonical_table) = canonical_table_name(&plan.name)?;
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
@@ -1131,6 +1146,21 @@ where
         }
     }
 
+    /// Drops a table by delegating to the namespace that owns it.
+    ///
+    /// This helper bypasses planning and transaction bookkeeping; it is intended for
+    /// auto-commit flows, direct namespace manipulation, and test utilities. The
+    /// underlying namespace forwards the request to
+    /// [`RuntimeContext::drop_table_immediate`], which performs catalog updates and
+    /// cache eviction.
+    ///
+    /// # Arguments
+    /// * `name` – Table name provided by the caller, which may include schema prefixes.
+    /// * `if_exists` – Skips the drop when the table is missing if set to `true`.
+    ///
+    /// # Errors
+    /// Mirrors the errors raised by [`RuntimeContext::drop_table_immediate`],
+    /// including catalog, foreign-key, and namespace resolution failures.
     pub fn drop_table(&self, name: &str, if_exists: bool) -> Result<()> {
         let (_, canonical_table) = canonical_table_name(name)?;
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
@@ -5295,6 +5325,21 @@ where
         }
     }
 
+    /// Removes a table from the catalog and executor caches without transactional routing.
+    ///
+    /// The method resolves the canonical table name, reloads metadata when the table is
+    /// not cached, validates foreign-key dependencies, and finally unregisters the table
+    /// from the catalog before marking it as dropped. Callers must ensure that higher-level
+    /// transactional guarantees have already been satisfied.
+    ///
+    /// # Arguments
+    /// * `name` – Name of the table to drop; canonical casing is derived internally.
+    /// * `if_exists` – When `true`, missing tables are ignored instead of raising an error.
+    ///
+    /// # Errors
+    /// Returns [`Error::CatalogError`] when the table has referencing foreign keys or
+    /// when the table does not exist and `if_exists` is `false`. Returns other catalog or
+    /// storage errors bubbled up from metadata reload and catalog service interactions.
     pub fn drop_table_immediate(&self, name: &str, if_exists: bool) -> Result<()> {
         let (display_name, canonical_name) = canonical_table_name(name)?;
         
