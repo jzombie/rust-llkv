@@ -49,6 +49,9 @@ pub trait StorageNamespace: Send + Sync + 'static {
     /// Drop a table from this namespace.
     fn drop_table(&self, name: &str, if_exists: bool) -> crate::Result<()>;
 
+    /// Rename a table within this namespace.
+    fn rename_table(&self, current_name: &str, new_name: &str) -> crate::Result<()>;
+
     /// Create an index inside this namespace.
     fn create_index(
         &self,
@@ -151,6 +154,10 @@ where
 
     fn drop_table(&self, name: &str, if_exists: bool) -> crate::Result<()> {
         self.context.drop_table_immediate(name, if_exists)
+    }
+
+    fn rename_table(&self, current_name: &str, new_name: &str) -> crate::Result<()> {
+        self.context.rename_table_immediate(current_name, new_name)
     }
 
     fn create_index(
@@ -288,6 +295,16 @@ where
         let context = self.context();
         context.drop_table_immediate(name, if_exists)?;
         self.unregister_table(&canonical);
+        Ok(())
+    }
+
+    fn rename_table(&self, current_name: &str, new_name: &str) -> crate::Result<()> {
+        let (_, current_canonical) = canonical_table_name(current_name)?;
+        let (_, new_canonical) = canonical_table_name(new_name)?;
+        let context = self.context();
+        context.rename_table_immediate(current_name, new_name)?;
+        self.unregister_table(&current_canonical);
+        self.register_table(new_canonical);
         Ok(())
     }
 

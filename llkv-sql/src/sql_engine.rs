@@ -27,14 +27,14 @@ use llkv_table::catalog::{IdentifierContext, IdentifierResolver};
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
-    ColumnOptionDef, ConstraintCharacteristics, DataType as SqlDataType, Delete, ExceptionWhen,
-    Expr as SqlExpr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    Ident, LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType, OrderBy,
-    OrderByKind, Query, ReferentialAction, SchemaName, Select, SelectItem,
+    AlterTableOperation, Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator,
+    ColumnOption, ColumnOptionDef, ConstraintCharacteristics, DataType as SqlDataType, Delete,
+    ExceptionWhen, Expr as SqlExpr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, Ident, LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType,
+    OrderBy, OrderByKind, Query, ReferentialAction, SchemaName, Select, SelectItem,
     SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableConstraint,
-    TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
-    UpdateTableFromKind, Value, ValueWithSpan,
+    TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier,
+    UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -424,6 +424,16 @@ where
                     purge,
                     temporary,
                 )
+            }
+            Statement::AlterTable {
+                name,
+                if_exists,
+                only,
+                operations,
+                ..
+            } => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: AlterTable");
+                self.handle_alter_table(name, if_exists, only, operations)
             }
             Statement::Set(set_stmt) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: Set");
@@ -2079,6 +2089,130 @@ where
                 "DROP {} is not supported",
                 object_type
             ))),
+        }
+    }
+
+    fn handle_alter_table(
+        &self,
+        name: ObjectName,
+        if_exists: bool,
+        only: bool,
+        operations: Vec<AlterTableOperation>,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        if only {
+            return Err(Error::InvalidArgumentError(
+                "ALTER TABLE ONLY is not supported yet".into(),
+            ));
+        }
+
+        if operations.is_empty() {
+            return Ok(RuntimeStatementResult::NoOp);
+        }
+
+        if operations.len() != 1 {
+            return Err(Error::InvalidArgumentError(
+                "ALTER TABLE currently supports exactly one operation".into(),
+            ));
+        }
+
+        let operation = operations.into_iter().next().expect("checked length");
+        match operation {
+            AlterTableOperation::RenameTable { table_name } => {
+                let new_name = table_name.to_string();
+                self.handle_alter_table_rename(name, new_name, if_exists)
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "unsupported ALTER TABLE operation: {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn handle_alter_table_rename(
+        &self,
+        original_name: ObjectName,
+        new_table_name: String,
+        if_exists: bool,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let (schema_opt, table_name) = parse_schema_qualified_name(&original_name)?;
+
+        let new_table_name_clean = new_table_name.trim();
+
+        if new_table_name_clean.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "ALTER TABLE RENAME requires a non-empty table name".into(),
+            ));
+        }
+
+        let (raw_new_schema_opt, raw_new_table) = if let Some((schema_part, table_part)) =
+            new_table_name_clean.split_once('.')
+        {
+            (Some(schema_part.trim().to_string()), table_part.trim().to_string())
+        } else {
+            (None, new_table_name_clean.to_string())
+        };
+
+        if schema_opt.is_none() && raw_new_schema_opt.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "ALTER TABLE RENAME cannot add a schema qualifier".into(),
+            ));
+        }
+
+        let new_table_trimmed = raw_new_table.trim_matches('"');
+        if new_table_trimmed.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "ALTER TABLE RENAME requires a non-empty table name".into(),
+            ));
+        }
+
+        if let (Some(existing_schema), Some(new_schema_raw)) =
+            (schema_opt.as_ref(), raw_new_schema_opt.as_ref())
+        {
+            let new_schema_trimmed = new_schema_raw.trim_matches('"');
+            if !existing_schema.eq_ignore_ascii_case(new_schema_trimmed) {
+                return Err(Error::InvalidArgumentError(
+                    "ALTER TABLE RENAME cannot change table schema".into(),
+                ));
+            }
+        }
+
+        let new_table_display = raw_new_table;
+        let new_schema_opt = raw_new_schema_opt;
+
+        fn join_schema_table(schema: &str, table: &str) -> String {
+            let mut qualified = String::with_capacity(schema.len() + table.len() + 1);
+            qualified.push_str(schema);
+            qualified.push('.');
+            qualified.push_str(table);
+            qualified
+        }
+
+        let current_display = schema_opt
+            .as_ref()
+            .map(|schema| join_schema_table(schema, &table_name))
+            .unwrap_or_else(|| table_name.clone());
+
+        let new_display = if let Some(new_schema_raw) = new_schema_opt.clone() {
+            join_schema_table(&new_schema_raw, &new_table_display)
+        } else if let Some(schema) = schema_opt.as_ref() {
+            join_schema_table(schema, &new_table_display)
+        } else {
+            new_table_display.clone()
+        };
+
+        match self
+            .engine
+            .session()
+            .rename_table(&current_display, &new_display)
+        {
+            Ok(()) => Ok(RuntimeStatementResult::NoOp),
+            Err(err) => {
+                if if_exists && Self::is_table_missing_error(&err) {
+                    Ok(RuntimeStatementResult::NoOp)
+                } else {
+                    Err(Self::map_table_error(&current_display, err))
+                }
+            }
         }
     }
 

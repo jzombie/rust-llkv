@@ -242,6 +242,56 @@ where
         Ok(())
     }
 
+    /// Rename a table across metadata and catalog layers.
+    pub fn rename_table(
+        &self,
+        table_id: TableId,
+        current_name: &str,
+        new_name: &str,
+    ) -> LlkvResult<()> {
+        if !current_name.eq_ignore_ascii_case(new_name)
+            && self.catalog.table_id(new_name).is_some()
+        {
+            return Err(Error::CatalogError(format!(
+                "Table '{}' already exists",
+                new_name
+            )));
+        }
+
+        let previous_meta = self.metadata.table_meta(table_id)?;
+        let mut prior_snapshot = None;
+        if let Some(mut meta) = previous_meta.clone() {
+            prior_snapshot = Some(meta.clone());
+            meta.name = Some(new_name.to_string());
+            self.metadata.set_table_meta(table_id, meta)?;
+        }
+
+        if let Err(err) = self
+            .catalog
+            .rename_registered_table(current_name, new_name)
+        {
+            if let Some(prior) = prior_snapshot {
+                let _ = self.metadata.set_table_meta(table_id, prior);
+            }
+            return Err(err);
+        }
+
+        if prior_snapshot.is_some() {
+            if let Err(err) = self.metadata.flush_table(table_id) {
+                if let Some(prior) = prior_snapshot {
+                    let _ = self.metadata.set_table_meta(table_id, prior);
+                    let _ = self
+                        .catalog
+                        .rename_registered_table(new_name, current_name);
+                    let _ = self.metadata.flush_table(table_id);
+                }
+                return Err(err);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Register a single-column sort (B-tree) index. Optionally marks the field unique.
     /// Returns `true` if the index was newly created, `false` if it already existed and `if_not_exists` was true.
     #[allow(clippy::too_many_arguments)]

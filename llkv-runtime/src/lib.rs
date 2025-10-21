@@ -735,6 +735,34 @@ where
             ))),
         }
     }
+
+    pub fn rename_table(&self, current_name: &str, new_name: &str) -> Result<()> {
+        if self.has_active_transaction() {
+            return Err(Error::InvalidArgumentError(
+                "ALTER TABLE RENAME is not supported inside an active transaction".into(),
+            ));
+        }
+
+        let (_, canonical_table) = canonical_table_name(current_name)?;
+        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
+
+        match namespace_id.as_str() {
+            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                temp_namespace.rename_table(current_name, new_name)
+            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+                self.persistent_namespace().rename_table(current_name, new_name)
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
+        }
+    }
+    
     /// Create an index (auto-commit only for now).
     pub fn create_index(&self, plan: CreateIndexPlan) -> Result<RuntimeStatementResult<P>> {
         let (_, canonical_table) = canonical_table_name(&plan.table)?;
@@ -4367,10 +4395,9 @@ where
                 continue;
             }
 
-            let constraint_label = detail.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
-            return Err(Error::ConstraintError(format!(
-                "Cannot drop table '{}' because it is referenced by foreign key constraint '{}' on table '{}'",
-                display_name, constraint_label, detail.referencing_table_display
+            return Err(Error::CatalogError(format!(
+                "Catalog Error: Could not drop the table because this table is main key table of the table \"{}\".",
+                detail.referencing_table_display
             )));
         }
 
@@ -4386,6 +4413,68 @@ where
             .write()
             .unwrap()
             .insert(canonical_name.clone());
+        Ok(())
+    }
+
+    pub fn rename_table_immediate(&self, current_name: &str, new_name: &str) -> Result<()> {
+        let (current_display, current_canonical) = canonical_table_name(current_name)?;
+        let (new_display, new_canonical) = canonical_table_name(new_name)?;
+
+        if current_canonical == new_canonical {
+            if current_display == new_display {
+                return Ok(());
+            }
+        }
+
+        if self.is_table_marked_dropped(&current_canonical) {
+            return Err(Error::CatalogError(format!(
+                "Catalog Error: Table '{}' does not exist",
+                current_display
+            )));
+        }
+
+        // Ensure the source table exists
+        let table_id = self
+            .catalog
+            .table_id(&current_canonical)
+            .or_else(|| self.catalog.table_id(&current_display))
+            .ok_or_else(|| {
+                Error::CatalogError(format!(
+                    "Catalog Error: Table '{}' does not exist",
+                    current_display
+                ))
+            })?;
+
+        if !current_display.eq_ignore_ascii_case(&new_display)
+            && (self.catalog.table_id(&new_canonical).is_some()
+                || self.catalog.table_id(&new_display).is_some())
+        {
+            return Err(Error::CatalogError(format!(
+                "Catalog Error: Table '{}' already exists",
+                new_display
+            )));
+        }
+
+        let referencing = self.constraint_service.referencing_foreign_keys(table_id)?;
+        if !referencing.is_empty() {
+            return Err(Error::CatalogError(format!(
+                "Dependency Error: Cannot alter entry \"{}\" because there are entries that depend on it.",
+                current_display
+            )));
+        }
+
+        self.catalog_service
+            .rename_table(table_id, &current_display, &new_display)?;
+
+        let mut tables = self.tables.write().unwrap();
+        if let Some(table) = tables.remove(&current_canonical) {
+            tables.insert(new_canonical.clone(), table);
+        }
+
+        let mut dropped = self.dropped_tables.write().unwrap();
+        dropped.remove(&current_canonical);
+        dropped.remove(&new_canonical);
+
         Ok(())
     }
 
