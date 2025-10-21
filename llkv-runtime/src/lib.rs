@@ -2535,8 +2535,8 @@ where
                 |table_name| {
                     let (display, canonical) = canonical_table_name(table_name)?;
                     let referenced_table = self.lookup_table(&canonical).map_err(|_| {
-                        Error::InvalidArgumentError(format!(
-                            "referenced table '{}' does not exist",
+                        Error::CatalogError(format!(
+                            "Catalog Error: referenced table '{}' does not exist",
                             table_name
                         ))
                     })?;

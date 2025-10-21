@@ -483,8 +483,8 @@ where
         let mut results = Vec::with_capacity(views.len());
         for view in views {
             let Some(table_id) = self.catalog.table_id(&view.referenced_table_canonical) else {
-                return Err(Error::InvalidArgumentError(format!(
-                    "referenced table '{}' does not exist",
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: referenced table '{}' does not exist",
                     view.referenced_table_display
                 )));
             };

@@ -500,8 +500,8 @@ where
                         && !self.catalog_snapshot.table_exists(&canonical_ref_table)
                     {
                         self.is_aborted = true;
-                        return Err(Error::InvalidArgumentError(format!(
-                            "referenced table '{}' does not exist",
+                        return Err(Error::CatalogError(format!(
+                            "Catalog Error: referenced table '{}' does not exist",
                             fk.referenced_table
                         )));
                     }
