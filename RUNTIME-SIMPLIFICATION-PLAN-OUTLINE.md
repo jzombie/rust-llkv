@@ -35,8 +35,8 @@
 
 ### 3. Context-Level Consolidation
 - Rename and scope catalog/storage helpers:
-	- `drop_table_immediate` → `drop_table_catalog_side` (or similar) with `pub(crate)` visibility.
-	- Inspect other helpers (`create_table_plan`, `rename_table_immediate`, index methods) and align naming/visibility.
+	- `drop_table_catalog` (formerly `apply_drop_table` / `drop_table_immediate`) – revisit visibility once integration tests stop depending on it.
+	- Inspect other helpers (`apply_create_table_plan`, `apply_rename_table`, index methods) and align naming/visibility.
 - Centralize shared validation (FK checks, cache eviction, lazy reload) into reusable utilities where appropriate.
 - Update `TransactionContext` replay logic to depend on the renamed helpers.
 

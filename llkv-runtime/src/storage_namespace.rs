@@ -7,7 +7,7 @@ use std::any::Any;
 use std::sync::{Arc, RwLock};
 
 use llkv_executor::ExecutorTable;
-use llkv_plan::{CreateIndexPlan, CreateTablePlan, PlanOperation};
+use llkv_plan::{CreateIndexPlan, CreateTablePlan, DropIndexPlan, DropTablePlan, PlanOperation};
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
 use llkv_transaction::TransactionResult;
@@ -47,24 +47,19 @@ pub trait StorageNamespace: Send + Sync + 'static {
         plan: CreateTablePlan,
     ) -> crate::Result<RuntimeStatementResult<Self::Pager>>;
 
-    /// Drop a table from this namespace.
-    fn drop_table(&self, name: &str, if_exists: bool) -> crate::Result<()>;
+    /// Drop a table from this namespace by forwarding the planned request to the context.
+    fn drop_table(&self, plan: DropTablePlan) -> crate::Result<()>;
 
     /// Rename a table within this namespace.
     fn rename_table(&self, current_name: &str, new_name: &str) -> crate::Result<()>;
-
-    /// Create an index inside this namespace.
     fn create_index(
         &self,
         plan: CreateIndexPlan,
     ) -> crate::Result<RuntimeStatementResult<Self::Pager>>;
 
-    /// Drop an index from this namespace.
-    fn drop_index(
-        &self,
-        canonical_index_name: &str,
-        if_exists: bool,
-    ) -> crate::Result<Option<SingleColumnIndexDescriptor>>;
+    /// Drop an index from this namespace by forwarding the planned request to the context.
+    fn drop_index(&self, plan: DropIndexPlan)
+    -> crate::Result<Option<SingleColumnIndexDescriptor>>;
 
     /// Execute a generic plan operation. Namespaces that do not yet support this entry point
     /// should rely on the default error implementation.
@@ -160,12 +155,12 @@ where
         self.context.apply_create_table_plan(plan)
     }
 
-    fn drop_table(&self, name: &str, if_exists: bool) -> crate::Result<()> {
-        self.context.drop_table_immediate(name, if_exists)
+    fn drop_table(&self, plan: DropTablePlan) -> crate::Result<()> {
+        self.context.drop_table_catalog(plan)
     }
 
     fn rename_table(&self, current_name: &str, new_name: &str) -> crate::Result<()> {
-        self.context.rename_table_immediate(current_name, new_name)
+        self.context.apply_rename_table(current_name, new_name)
     }
 
     fn create_index(
@@ -177,10 +172,9 @@ where
 
     fn drop_index(
         &self,
-        canonical_index_name: &str,
-        if_exists: bool,
+        plan: DropIndexPlan,
     ) -> crate::Result<Option<SingleColumnIndexDescriptor>> {
-        self.context.drop_index(canonical_index_name, if_exists)
+        self.context.drop_index(plan)
     }
 
     fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<Self::Pager>>> {
@@ -306,10 +300,10 @@ where
         Ok(result)
     }
 
-    fn drop_table(&self, name: &str, if_exists: bool) -> crate::Result<()> {
-        let (_, canonical) = canonical_table_name(name)?;
+    fn drop_table(&self, plan: DropTablePlan) -> crate::Result<()> {
+        let (_, canonical) = canonical_table_name(&plan.name)?;
         let context = self.context();
-        context.drop_table_immediate(name, if_exists)?;
+        context.drop_table_catalog(plan)?;
         self.unregister_table(&canonical);
         Ok(())
     }
@@ -318,7 +312,7 @@ where
         let (_, current_canonical) = canonical_table_name(current_name)?;
         let (_, new_canonical) = canonical_table_name(new_name)?;
         let context = self.context();
-        context.rename_table_immediate(current_name, new_name)?;
+        context.apply_rename_table(current_name, new_name)?;
         self.unregister_table(&current_canonical);
         self.register_table(new_canonical);
         Ok(())
@@ -333,10 +327,9 @@ where
 
     fn drop_index(
         &self,
-        canonical_index_name: &str,
-        if_exists: bool,
+        plan: DropIndexPlan,
     ) -> crate::Result<Option<SingleColumnIndexDescriptor>> {
-        self.context().drop_index(canonical_index_name, if_exists)
+        self.context().drop_index(plan)
     }
 
     fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<Self::Pager>>> {

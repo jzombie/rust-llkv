@@ -667,11 +667,7 @@ where
                     TransactionContext::apply_create_table_plan(&**self.inner.context(), plan)?;
                 }
                 PlanOperation::DropTable(plan) => {
-                    TransactionContext::drop_table(
-                        &**self.inner.context(),
-                        &plan.name,
-                        plan.if_exists,
-                    )?;
+                    TransactionContext::drop_table(&**self.inner.context(), plan)?;
                 }
                 PlanOperation::Insert(plan) => {
                     TransactionContext::insert(&**self.inner.context(), plan)?;
@@ -852,7 +848,7 @@ where
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                temp_namespace.drop_table(&plan.name, plan.if_exists)?;
+                temp_namespace.drop_table(plan.clone())?;
                 Ok(RuntimeStatementResult::NoOp)
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {
@@ -869,7 +865,10 @@ where
                         )));
                     }
 
-                    match self.inner.execute_operation(PlanOperation::DropTable(plan)) {
+                    match self
+                        .inner
+                        .execute_operation(PlanOperation::DropTable(plan.clone()))
+                    {
                         Ok(_) => Ok(RuntimeStatementResult::NoOp),
                         Err(e) => {
                             // If an error occurs during a transaction, abort it
@@ -885,8 +884,7 @@ where
                             plan.name
                         )));
                     }
-                    self.persistent_namespace()
-                        .drop_table(&plan.name, plan.if_exists)?;
+                    self.persistent_namespace().drop_table(plan)?;
                     Ok(RuntimeStatementResult::NoOp)
                 }
             }
@@ -1305,13 +1303,9 @@ where
             ));
         }
 
-        let canonical_index = plan.canonical_name.clone();
         let mut dropped = false;
 
-        match self
-            .persistent_namespace()
-            .drop_index(&canonical_index, plan.if_exists)
-        {
+        match self.persistent_namespace().drop_index(plan.clone()) {
             Ok(Some(_)) => {
                 dropped = true;
             }
@@ -1327,7 +1321,7 @@ where
 
         if !dropped {
             if let Some(temp_namespace) = self.temporary_namespace() {
-                match temp_namespace.drop_index(&canonical_index, plan.if_exists) {
+                match temp_namespace.drop_index(plan.clone()) {
                     Ok(Some(_)) => {
                         dropped = true;
                     }
@@ -2568,14 +2562,8 @@ where
     }
 
     /// Drop a single-column index and clear any cached executor state.
-    pub fn drop_index(
-        &self,
-        canonical_index_name: &str,
-        if_exists: bool,
-    ) -> Result<Option<SingleColumnIndexDescriptor>> {
-        let descriptor = self
-            .catalog_service
-            .drop_single_column_index(canonical_index_name, if_exists)?;
+    pub fn drop_index(&self, plan: DropIndexPlan) -> Result<Option<SingleColumnIndexDescriptor>> {
+        let descriptor = self.catalog_service.drop_single_column_index(plan)?;
 
         if let Some(descriptor) = &descriptor {
             self.remove_table_entry(&descriptor.canonical_table_name);
@@ -5376,35 +5364,32 @@ where
         }
     }
 
-    /// Removes a table from the catalog and executor caches without transactional routing.
+    /// Drops a table directly against the catalog and executor caches.
     ///
-    /// The method resolves the canonical table name, reloads metadata when the table is
-    /// not cached, validates foreign-key dependencies, and finally unregisters the table
-    /// from the catalog before marking it as dropped. Callers must ensure that higher-level
-    /// transactional guarantees have already been satisfied.
+    /// Accepts a planned `DROP TABLE` statement, resolves the canonical table name,
+    /// reloads metadata when the table is not cached, validates foreign-key dependencies,
+    /// and unregisters the table from the catalog before marking it as dropped. Callers
+    /// must ensure that higher-level transactional guarantees have already been satisfied.
     ///
     /// # Arguments
-    /// * `name` – Name of the table to drop; canonical casing is derived internally.
-    /// * `if_exists` – When `true`, missing tables are ignored instead of raising an error.
+    /// * `plan` – Logical `DROP TABLE` request produced by the planner.
     ///
     /// # Errors
     /// Returns [`Error::CatalogError`] when the table has referencing foreign keys or
     /// when the table does not exist and `if_exists` is `false`. Returns other catalog or
     /// storage errors bubbled up from metadata reload and catalog service interactions.
-    pub fn drop_table_immediate(&self, name: &str, if_exists: bool) -> Result<()> {
-        let (display_name, canonical_name) = canonical_table_name(name)?;
+    pub fn drop_table_catalog(&self, plan: DropTablePlan) -> Result<()> {
+        let DropTablePlan { name, if_exists } = plan;
+        let (display_name, canonical_name) = canonical_table_name(&name)?;
 
         tracing::debug!(
-            "drop_table_immediate: attempting to drop table '{}'",
+            "drop_table_catalog: attempting to drop table '{}'",
             canonical_name
         );
 
         let cached_entry = {
             let tables = self.tables.read().unwrap();
-            tracing::debug!(
-                "drop_table_immediate: cache contains {} tables",
-                tables.len()
-            );
+            tracing::debug!("drop_table_catalog: cache contains {} tables", tables.len());
             tables.get(&canonical_name).cloned()
         };
 
@@ -5412,13 +5397,13 @@ where
             Some(entry) => entry,
             None => {
                 tracing::debug!(
-                    "drop_table_immediate: table '{}' not cached; attempting reload",
+                    "drop_table_catalog: table '{}' not cached; attempting reload",
                     canonical_name
                 );
 
                 if self.catalog.table_id(&canonical_name).is_none() {
                     tracing::debug!(
-                        "drop_table_immediate: no catalog entry for '{}'; if_exists={}",
+                        "drop_table_catalog: no catalog entry for '{}'; if_exists={}",
                         canonical_name,
                         if_exists
                     );
@@ -5435,7 +5420,7 @@ where
                     Ok(entry) => entry,
                     Err(err) => {
                         tracing::warn!(
-                            "drop_table_immediate: failed to reload table '{}': {:?}",
+                            "drop_table_catalog: failed to reload table '{}': {:?}",
                             canonical_name,
                             err
                         );
@@ -5499,7 +5484,7 @@ where
     /// Returns a catalog error when the source table does not exist, when the new
     /// name conflicts with an existing table, or when foreign-key constraints prevent
     /// the rename.
-    pub fn rename_table_immediate(&self, current_name: &str, new_name: &str) -> Result<()> {
+    pub fn apply_rename_table(&self, current_name: &str, new_name: &str) -> Result<()> {
         let (current_display, current_canonical) = canonical_table_name(current_name)?;
         let (new_display, new_canonical) = canonical_table_name(new_name)?;
 
@@ -5624,9 +5609,8 @@ where
         Ok(convert_statement_result(result))
     }
 
-    fn drop_table(&self, name: &str, if_exists: bool) -> llkv_result::Result<()> {
-        // For transaction contexts, use drop_table_immediate which bypasses transaction handling
-        self.ctx.drop_table_immediate(name, if_exists)
+    fn drop_table(&self, plan: DropTablePlan) -> llkv_result::Result<()> {
+        self.ctx.drop_table_catalog(plan)
     }
 
     fn insert(&self, plan: InsertPlan) -> llkv_result::Result<TransactionResult<P>> {

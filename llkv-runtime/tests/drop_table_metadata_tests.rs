@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use llkv_column_map::store::ColumnStore;
+use llkv_plan::DropTablePlan;
 use llkv_result::Error;
 use llkv_runtime::{ColumnSpec, RuntimeContext};
 use llkv_storage::pager::MemPager;
@@ -43,7 +44,7 @@ fn drop_table_removes_persisted_metadata() {
     );
 
     context
-        .drop_table_immediate("drop_test", false)
+        .drop_table_catalog(DropTablePlan::new("drop_test"))
         .expect("drop table succeeds");
 
     let metadata_after = MetadataManager::new(Arc::clone(&store));
@@ -121,7 +122,7 @@ fn drop_table_respects_foreign_keys_after_restart() {
         .lookup_table("parents")
         .expect("load parent table before drop");
     let err = context
-        .drop_table_immediate("parents", false)
+        .drop_table_catalog(DropTablePlan::new("parents"))
         .expect_err("dropping referenced parent should fail");
 
     match err {

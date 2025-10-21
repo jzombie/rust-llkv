@@ -14,7 +14,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::IndexKind;
-use llkv_plan::{ColumnSpec, ForeignKeySpec};
+use llkv_plan::{ColumnSpec, DropIndexPlan, ForeignKeySpec};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -546,10 +546,9 @@ where
 
     pub fn drop_single_column_index(
         &self,
-        canonical_index_name: &str,
-        if_exists: bool,
+        plan: DropIndexPlan,
     ) -> LlkvResult<Option<SingleColumnIndexDescriptor>> {
-        let canonical_index = canonical_index_name.to_ascii_lowercase();
+        let canonical_index = plan.canonical_name.to_ascii_lowercase();
         let snapshot = self.catalog.snapshot();
 
         for canonical_table_name in snapshot.table_names() {
@@ -590,12 +589,12 @@ where
             }
         }
 
-        if if_exists {
+        if plan.if_exists {
             Ok(None)
         } else {
             Err(Error::CatalogError(format!(
                 "Index '{}' does not exist",
-                canonical_index_name
+                plan.name
             )))
         }
     }

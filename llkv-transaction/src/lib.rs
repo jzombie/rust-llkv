@@ -51,8 +51,8 @@ pub type SessionId = u64;
 pub use llkv_column_map::types::TableId;
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
-    ColumnSpec, CreateIndexPlan, CreateTablePlan, DeletePlan, InsertPlan, PlanOperation, PlanValue,
-    SelectPlan, UpdatePlan,
+    ColumnSpec, CreateIndexPlan, CreateTablePlan, DeletePlan, DropTablePlan, InsertPlan,
+    PlanOperation, PlanValue, SelectPlan, UpdatePlan,
 };
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
@@ -240,7 +240,7 @@ pub trait TransactionContext: Send + Sync {
     ) -> LlkvResult<TransactionResult<Self::Pager>>;
 
     /// Drop a table
-    fn drop_table(&self, name: &str, if_exists: bool) -> LlkvResult<()>;
+    fn drop_table(&self, plan: DropTablePlan) -> LlkvResult<()>;
 
     /// Insert rows
     fn insert(&self, plan: InsertPlan) -> LlkvResult<TransactionResult<Self::Pager>>;
@@ -558,7 +558,7 @@ where
                 let result = if self.new_tables.contains(&canonical_name) {
                     // Table was created in this transaction, so drop it from staging
                     // and remove from tracking
-                    self.staging.drop_table(&plan.name, plan.if_exists)?;
+                    self.staging.drop_table(plan.clone())?;
                     self.new_tables.remove(&canonical_name);
                     self.staged_tables.remove(&canonical_name);
 
