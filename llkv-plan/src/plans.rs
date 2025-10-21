@@ -135,6 +135,35 @@ impl DropTablePlan {
     }
 }
 
+/// Plan for dropping an index.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropIndexPlan {
+    pub name: String,
+    pub canonical_name: String,
+    pub if_exists: bool,
+}
+
+impl DropIndexPlan {
+    pub fn new(name: impl Into<String>) -> Self {
+        let display = name.into();
+        Self {
+            canonical_name: display.to_ascii_lowercase(),
+            name: display,
+            if_exists: false,
+        }
+    }
+
+    pub fn with_canonical(mut self, canonical: impl Into<String>) -> Self {
+        self.canonical_name = canonical.into();
+        self
+    }
+
+    pub fn if_exists(mut self, if_exists: bool) -> Self {
+        self.if_exists = if_exists;
+        self
+    }
+}
+
 // ============================================================================
 // ALTER TABLE Plan Structures
 // ============================================================================
@@ -764,6 +793,7 @@ pub enum PlanStatement {
     RollbackTransaction,
     CreateTable(CreateTablePlan),
     DropTable(DropTablePlan),
+    DropIndex(DropIndexPlan),
     AlterTable(AlterTablePlan),
     CreateIndex(CreateIndexPlan),
     Insert(InsertPlan),

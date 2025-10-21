@@ -299,6 +299,30 @@ pub struct MultiColumnUniqueEntryMeta {
     pub column_ids: Vec<u32>,
 }
 
+/// Metadata describing a single named single-column index.
+#[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
+pub struct SingleColumnIndexEntryMeta {
+    /// Human-readable index name (case preserved).
+    pub index_name: String,
+    /// Lower-cased canonical index name for case-insensitive lookups.
+    pub canonical_name: String,
+    /// Identifier of the column the index covers.
+    pub column_id: FieldId,
+    /// Human-readable column name (case preserved).
+    pub column_name: String,
+    /// Whether this index enforces uniqueness for the column.
+    pub unique: bool,
+}
+
+/// Metadata describing all single-column indexes registered for a table.
+#[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
+pub struct TableSingleColumnIndexMeta {
+    /// Owning table identifier.
+    pub table_id: TableId,
+    /// Definitions for each named single-column index on the table.
+    pub indexes: Vec<SingleColumnIndexEntryMeta>,
+}
+
 /// Metadata describing all multi-column UNIQUE indexes for a table.
 #[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
 pub struct TableMultiColumnUniqueMeta {
@@ -533,6 +557,13 @@ where
         self.write_null_entries(meta_field, &[row_id])
     }
 
+    /// Delete the single-column index metadata record for a table, if any exists.
+    pub fn delete_single_column_indexes(&self, table_id: TableId) -> LlkvResult<()> {
+        let meta_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_SINGLE_COLUMN_INDEX_META_ID);
+        let row_id = rid_table(table_id);
+        self.write_null_entries(meta_field, &[row_id])
+    }
+
     /// Persist the complete set of multi-column UNIQUE definitions for a table.
     pub fn put_multi_column_uniques(
         &self,
@@ -553,6 +584,37 @@ where
         let meta = TableMultiColumnUniqueMeta {
             table_id,
             uniques: uniques.to_vec(),
+        };
+        let encoded = bitcode::encode(&meta);
+        let meta_bytes = Arc::new(BinaryArray::from(vec![encoded.as_slice()]));
+
+        let batch = RecordBatch::try_new(schema, vec![row_id, meta_bytes])?;
+        self.store.append(&batch)?;
+        Ok(())
+    }
+
+    /// Persist the complete set of single-column index definitions for a table.
+    pub fn put_single_column_indexes(
+        &self,
+        table_id: TableId,
+        indexes: &[SingleColumnIndexEntryMeta],
+    ) -> LlkvResult<()> {
+        let lfid_val: u64 =
+            lfid(CATALOG_TABLE_ID, CATALOG_FIELD_SINGLE_COLUMN_INDEX_META_ID).into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("meta", DataType::Binary, false).with_metadata(HashMap::from([
+                (
+                    crate::constants::FIELD_ID_META_KEY.to_string(),
+                    lfid_val.to_string(),
+                ),
+            ])),
+        ]));
+
+        let row_id = Arc::new(UInt64Array::from(vec![rid_table(table_id)]));
+        let meta = TableSingleColumnIndexMeta {
+            table_id,
+            indexes: indexes.to_vec(),
         };
         let encoded = bitcode::encode(&meta);
         let meta_bytes = Arc::new(BinaryArray::from(vec![encoded.as_slice()]));
@@ -603,6 +665,49 @@ where
         })?;
 
         Ok(meta.uniques)
+    }
+
+    /// Retrieve all persisted single-column index definitions for a table.
+    pub fn get_single_column_indexes(
+        &self,
+        table_id: TableId,
+    ) -> LlkvResult<Vec<SingleColumnIndexEntryMeta>> {
+        let lfid = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_SINGLE_COLUMN_INDEX_META_ID);
+        let row_id = rid_table(table_id);
+        let batch = match self
+            .store
+            .gather_rows(&[lfid], &[row_id], GatherNullPolicy::IncludeNulls)
+        {
+            Ok(batch) => batch,
+            Err(llkv_result::Error::NotFound) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+
+        if batch.num_columns() == 0 || batch.num_rows() == 0 {
+            return Ok(Vec::new());
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal(
+                    "catalog single-column index column stored unexpected type".into(),
+                )
+            })?;
+
+        if array.is_null(0) {
+            return Ok(Vec::new());
+        }
+
+        let meta: TableSingleColumnIndexMeta = bitcode::decode(array.value(0)).map_err(|err| {
+            llkv_result::Error::Internal(format!(
+                "failed to decode single-column index metadata: {err}"
+            ))
+        })?;
+
+        Ok(meta.indexes)
     }
 
     /// Retrieve all persisted multi-column UNIQUE definitions across tables.

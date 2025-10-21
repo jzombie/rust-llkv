@@ -65,12 +65,14 @@ pub use constraints::{
     validate_foreign_keys,
 };
 pub use metadata::MultiColumnUniqueRegistration;
+pub use catalog::{SingleColumnIndexDescriptor, SingleColumnIndexRegistration};
 pub use metadata::{ForeignKeyDescriptor, MetadataManager};
 pub use reserved::CATALOG_TABLE_ID;
 pub use resolvers::{canonical_table_name, resolve_table_name};
 pub use stream::{ColumnStream, ColumnStreamBatch};
 pub use sys_catalog::{
-    ColMeta, CustomTypeMeta, MultiColumnUniqueEntryMeta, SysCatalog, TableMeta, TableMultiColumnUniqueMeta,
+    ColMeta, CustomTypeMeta, MultiColumnUniqueEntryMeta, SingleColumnIndexEntryMeta, SysCatalog,
+    TableMeta, TableMultiColumnUniqueMeta, TableSingleColumnIndexMeta,
 };
 pub use table::Table;
 pub use types::{FieldId, ROW_ID_FIELD_ID, RowId, TableColumn, TableId};

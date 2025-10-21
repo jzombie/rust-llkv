@@ -16,6 +16,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{RuntimeContext, RuntimeStatementResult};
 use llkv_table::canonical_table_name;
+use llkv_table::SingleColumnIndexDescriptor;
 
 pub type NamespaceId = String;
 
@@ -57,6 +58,13 @@ pub trait StorageNamespace: Send + Sync + 'static {
         &self,
         plan: CreateIndexPlan,
     ) -> crate::Result<RuntimeStatementResult<Self::Pager>>;
+
+    /// Drop an index from this namespace.
+    fn drop_index(
+        &self,
+        canonical_index_name: &str,
+        if_exists: bool,
+    ) -> crate::Result<Option<SingleColumnIndexDescriptor>>;
 
     /// Execute a generic plan operation. Namespaces that do not yet support this entry point
     /// should rely on the default error implementation.
@@ -165,6 +173,15 @@ where
         plan: CreateIndexPlan,
     ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
         self.context.create_index(plan)
+    }
+
+    fn drop_index(
+        &self,
+        canonical_index_name: &str,
+        if_exists: bool,
+    ) -> crate::Result<Option<SingleColumnIndexDescriptor>> {
+        self.context
+            .drop_index(canonical_index_name, if_exists)
     }
 
     fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<Self::Pager>>> {
@@ -313,6 +330,15 @@ where
         plan: CreateIndexPlan,
     ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
         self.context().create_index(plan)
+    }
+
+    fn drop_index(
+        &self,
+        canonical_index_name: &str,
+        if_exists: bool,
+    ) -> crate::Result<Option<SingleColumnIndexDescriptor>> {
+        self.context()
+            .drop_index(canonical_index_name, if_exists)
     }
 
     fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<Self::Pager>>> {

@@ -22,7 +22,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 use super::table_catalog::{FieldDefinition, TableCatalog};
 use crate::constraints::{ConstraintId, ConstraintKind};
-use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration};
+use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration, SingleColumnIndexEntry};
 use crate::sys_catalog::{ColMeta, SysCatalog};
 use crate::table::Table;
 use crate::types::{FieldId, RowId, TableColumn, TableId};
@@ -41,6 +41,25 @@ where
     pub table: Arc<Table<P>>,
     pub table_columns: Vec<TableColumn>,
     pub column_lookup: FxHashMap<String, usize>,
+}
+
+/// Result of attempting to register a single-column index definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SingleColumnIndexRegistration {
+    Created { index_name: String },
+    AlreadyExists { index_name: String },
+}
+
+/// Descriptor for a single-column index resolved from catalog metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingleColumnIndexDescriptor {
+    pub index_name: String,
+    pub table_id: TableId,
+    pub canonical_table_name: String,
+    pub display_table_name: String,
+    pub field_id: FieldId,
+    pub column_name: String,
+    pub was_unique: bool,
 }
 
 /// Trait for constructing MVCC columns and Arrow metadata during batch ingestion.
@@ -457,21 +476,69 @@ where
         table: &Table<P>,
         field_id: FieldId,
         column_name: &str,
+        index_name: Option<String>,
         mark_unique: bool,
         if_not_exists: bool,
-    ) -> LlkvResult<bool> {
+    ) -> LlkvResult<SingleColumnIndexRegistration> {
+        let table_id = table.table_id();
         let existing_indexes = table.list_registered_indexes(field_id)?;
         if existing_indexes.contains(&IndexKind::Sort) {
+            let existing_name = self
+                .metadata
+                .single_column_indexes(table_id)?
+                .into_iter()
+                .find(|entry| entry.column_id == field_id)
+                .map(|entry| entry.index_name)
+                .unwrap_or_else(|| column_name.to_string());
+
             if if_not_exists {
-                return Ok(false);
+                return Ok(SingleColumnIndexRegistration::AlreadyExists {
+                    index_name: existing_name,
+                });
             }
+
             return Err(Error::CatalogError(format!(
                 "Index already exists on column '{}' in table '{}'",
                 column_name, display_name
             )));
         }
 
-        let table_id = table.table_id();
+    let index_display_name = match index_name {
+            Some(name) => name,
+            None => self.generate_single_column_index_name(table_id, canonical_name, column_name)?,
+        };
+        if index_display_name.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "Index name must not be empty".into(),
+            ));
+        }
+        let canonical_index_name = index_display_name.to_ascii_lowercase();
+
+        if let Some(existing) = self
+            .metadata
+            .single_column_index(table_id, &canonical_index_name)?
+        {
+            if if_not_exists {
+                return Ok(SingleColumnIndexRegistration::AlreadyExists {
+                    index_name: existing.index_name,
+                });
+            }
+
+            return Err(Error::CatalogError(format!(
+                "Index '{}' already exists on table '{}'",
+                existing.index_name, display_name
+            )));
+        }
+
+        let entry = SingleColumnIndexEntry {
+            index_name: index_display_name.clone(),
+            canonical_name: canonical_index_name,
+            column_id: field_id,
+            column_name: column_name.to_string(),
+            unique: mark_unique,
+        };
+
+        self.metadata.put_single_column_index(table_id, entry)?;
         self.metadata.register_sort_index(table_id, field_id)?;
 
         if mark_unique {
@@ -482,7 +549,66 @@ where
         }
 
         self.metadata.flush_table(table_id)?;
-        Ok(true)
+
+        Ok(SingleColumnIndexRegistration::Created {
+            index_name: index_display_name,
+        })
+    }
+
+    pub fn drop_single_column_index(
+        &self,
+        canonical_index_name: &str,
+        if_exists: bool,
+    ) -> LlkvResult<Option<SingleColumnIndexDescriptor>> {
+        let canonical_index = canonical_index_name.to_ascii_lowercase();
+        let snapshot = self.catalog.snapshot();
+
+        for canonical_table_name in snapshot.table_names() {
+            let Some(table_id) = snapshot.table_id(&canonical_table_name) else {
+                continue;
+            };
+
+            if let Some(entry) = self
+                .metadata
+                .single_column_index(table_id, &canonical_index)?
+            {
+                self.metadata
+                    .remove_single_column_index(table_id, &canonical_index)?;
+
+                if entry.unique {
+                    if let Some(resolver) = self.catalog.field_resolver(table_id) {
+                        resolver.set_field_unique(&entry.column_name, false)?;
+                    }
+                }
+
+                self.metadata.flush_table(table_id)?;
+
+                let display_table_name = self
+                    .metadata
+                    .table_meta(table_id)?
+                    .and_then(|meta| meta.name)
+                    .unwrap_or_else(|| canonical_table_name.clone());
+
+                return Ok(Some(SingleColumnIndexDescriptor {
+                    index_name: entry.index_name,
+                    table_id,
+                    canonical_table_name,
+                    display_table_name,
+                    field_id: entry.column_id,
+                    column_name: entry.column_name,
+                    was_unique: entry.unique,
+                }));
+            }
+        }
+
+        if if_exists {
+            Ok(None)
+        } else {
+            Err(Error::CatalogError(format!(
+                "Index '{}' does not exist",
+                canonical_index_name
+            )))
+        }
     }
 
     /// Register a multi-column UNIQUE index.
@@ -501,6 +627,42 @@ where
         }
 
         Ok(registration)
+    }
+
+    fn generate_single_column_index_name(
+        &self,
+        table_id: TableId,
+        canonical_table_name: &str,
+        column_name: &str,
+    ) -> LlkvResult<String> {
+        let table_token = if canonical_table_name.is_empty() {
+            "table".to_string()
+        } else {
+            canonical_table_name.replace('.', "_")
+        };
+        let column_token = column_name.to_ascii_lowercase();
+
+        let mut candidate = format!("{}_{}_idx", table_token, column_token);
+        let mut suffix: u32 = 1;
+        loop {
+            let canonical = candidate.to_ascii_lowercase();
+            if self
+                .metadata
+                .single_column_index(table_id, &canonical)?
+                .is_none()
+            {
+                return Ok(candidate);
+            }
+
+            candidate = format!("{}_{}_idx{}", table_token, column_token, suffix);
+            suffix = suffix
+                .checked_add(1)
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "exhausted unique index name generation space".into(),
+                    )
+                })?;
+        }
     }
 
     /// Append RecordBatches to a freshly created table, injecting MVCC columns.

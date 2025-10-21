@@ -19,6 +19,7 @@ use crate::table::Table;
 use crate::types::{FieldId, TableColumn, TableId};
 use crate::view::{ForeignKeyView, TableView};
 use crate::{ColMeta, MultiColumnUniqueEntryMeta, TableMeta, TableMultiColumnUniqueMeta};
+use crate::sys_catalog::SingleColumnIndexEntryMeta;
 use arrow::datatypes::DataType;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::IndexKind;
@@ -30,6 +31,15 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{Arc, RwLock};
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SingleColumnIndexEntry {
+    pub index_name: String,
+    pub canonical_name: String,
+    pub column_id: FieldId,
+    pub column_name: String,
+    pub unique: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 struct TableSnapshot {
     table_meta: Option<TableMeta>,
@@ -37,6 +47,7 @@ struct TableSnapshot {
     constraints: FxHashMap<ConstraintId, ConstraintRecord>,
     multi_uniques: Vec<MultiColumnUniqueEntryMeta>,
     constraint_names: FxHashMap<ConstraintId, String>,
+    single_indexes: FxHashMap<String, SingleColumnIndexEntry>,
     sort_indexes: FxHashSet<FieldId>,
 }
 
@@ -47,6 +58,8 @@ impl TableSnapshot {
         constraints: FxHashMap<ConstraintId, ConstraintRecord>,
         multi_uniques: Vec<MultiColumnUniqueEntryMeta>,
         constraint_names: FxHashMap<ConstraintId, String>,
+        single_indexes: FxHashMap<String, SingleColumnIndexEntry>,
+        sort_indexes: FxHashSet<FieldId>,
     ) -> Self {
         Self {
             table_meta,
@@ -54,7 +67,8 @@ impl TableSnapshot {
             constraints,
             multi_uniques,
             constraint_names,
-            sort_indexes: FxHashSet::default(),
+            single_indexes,
+            sort_indexes,
         }
     }
 }
@@ -174,8 +188,24 @@ where
             catalog.get_constraint_names(table_id, &constraint_ids)?
         };
         let multi_uniques = catalog.get_multi_column_uniques(table_id)?;
+        let single_index_metas = catalog.get_single_column_indexes(table_id)?;
         let mut constraints = FxHashMap::default();
         let mut constraint_names = FxHashMap::default();
+        let mut single_indexes = FxHashMap::default();
+        let mut sort_indexes = FxHashSet::default();
+        for meta in single_index_metas {
+            sort_indexes.insert(meta.column_id);
+            single_indexes.insert(
+                meta.canonical_name.clone(),
+                SingleColumnIndexEntry {
+                    index_name: meta.index_name,
+                    canonical_name: meta.canonical_name,
+                    column_id: meta.column_id,
+                    column_name: meta.column_name,
+                    unique: meta.unique,
+                },
+            );
+        }
         for (record, name) in constraint_records
             .into_iter()
             .zip(constraint_name_entries.into_iter())
@@ -191,6 +221,8 @@ where
             constraints,
             multi_uniques,
             constraint_names,
+            single_indexes,
+            sort_indexes,
         );
         Ok(TableState::from_snapshot(snapshot))
     }
@@ -360,6 +392,74 @@ where
         Ok(())
     }
 
+    /// Return the named single-column indexes registered for a table.
+    pub fn single_column_indexes(
+        &self,
+        table_id: TableId,
+    ) -> LlkvResult<Vec<SingleColumnIndexEntry>> {
+        self.ensure_table_state(table_id)?;
+        let tables = self.tables.read().unwrap();
+        let state = tables.get(&table_id).unwrap();
+        Ok(state.current.single_indexes.values().cloned().collect())
+    }
+
+    /// Lookup a single-column index by canonical name.
+    pub fn single_column_index(
+        &self,
+        table_id: TableId,
+        canonical_index_name: &str,
+    ) -> LlkvResult<Option<SingleColumnIndexEntry>> {
+        self.ensure_table_state(table_id)?;
+        let tables = self.tables.read().unwrap();
+        let state = tables.get(&table_id).unwrap();
+        Ok(state
+            .current
+            .single_indexes
+            .get(canonical_index_name)
+            .cloned())
+    }
+
+    /// Register or replace a single-column index metadata entry in the cached snapshot.
+    pub fn put_single_column_index(
+        &self,
+        table_id: TableId,
+        entry: SingleColumnIndexEntry,
+    ) -> LlkvResult<()> {
+        self.ensure_table_state(table_id)?;
+        let mut tables = self.tables.write().unwrap();
+        let state = tables.get_mut(&table_id).unwrap();
+        let column_id = entry.column_id;
+        state
+            .current
+            .single_indexes
+            .insert(entry.canonical_name.clone(), entry);
+        state.current.sort_indexes.insert(column_id);
+        Ok(())
+    }
+
+    /// Remove a single-column index metadata entry from the cached snapshot.
+    pub fn remove_single_column_index(
+        &self,
+        table_id: TableId,
+        canonical_index_name: &str,
+    ) -> LlkvResult<Option<SingleColumnIndexEntry>> {
+        self.ensure_table_state(table_id)?;
+        let mut tables = self.tables.write().unwrap();
+        let state = tables.get_mut(&table_id).unwrap();
+        let removed = state.current.single_indexes.remove(canonical_index_name);
+        if let Some(ref entry) = removed {
+            let still_indexed = state
+                .current
+                .single_indexes
+                .values()
+                .any(|existing| existing.column_id == entry.column_id);
+            if !still_indexed {
+                state.current.sort_indexes.remove(&entry.column_id);
+            }
+        }
+        Ok(removed)
+    }
+
     /// Register a sort index for a column at the metadata level, staging the change for the next flush.
     pub fn register_sort_index(&self, table_id: TableId, field_id: FieldId) -> LlkvResult<()> {
         self.ensure_table_state(table_id)?;
@@ -439,6 +539,7 @@ where
             state.current.constraints.clear();
             state.current.multi_uniques.clear();
             state.current.constraint_names.clear();
+            state.current.single_indexes.clear();
             state.current.sort_indexes.clear();
         }
         drop(tables);
@@ -661,6 +762,30 @@ where
             } else {
                 catalog.put_multi_column_uniques(table_id, &state.current.multi_uniques)?;
                 state.persisted.multi_uniques = state.current.multi_uniques.clone();
+            }
+        }
+
+        if state.current.single_indexes != state.persisted.single_indexes {
+            if state.current.single_indexes.is_empty() {
+                catalog.delete_single_column_indexes(table_id)?;
+                state.persisted.single_indexes.clear();
+            } else {
+                let mut entries: Vec<SingleColumnIndexEntryMeta> = state
+                    .current
+                    .single_indexes
+                    .values()
+                    .cloned()
+                    .map(|entry| SingleColumnIndexEntryMeta {
+                        index_name: entry.index_name,
+                        canonical_name: entry.canonical_name,
+                        column_id: entry.column_id,
+                        column_name: entry.column_name,
+                        unique: entry.unique,
+                    })
+                    .collect();
+                entries.sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+                catalog.put_single_column_indexes(table_id, &entries)?;
+                state.persisted.single_indexes = state.current.single_indexes.clone();
             }
         }
 

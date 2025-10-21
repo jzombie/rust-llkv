@@ -56,12 +56,30 @@ use llkv_table::catalog::{FieldConstraints, FieldDefinition, MvccColumnBuilder, 
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId};
 use llkv_table::{
-    CatalogManager, ConstraintColumnInfo, ConstraintService, CreateTableResult, 
-    ForeignKeyColumn, ForeignKeyTableInfo, ForeignKeyView, InsertColumnConstraint, 
-    InsertMultiColumnUnique, InsertUniqueColumn, MetadataManager, MultiColumnUniqueEntryMeta, 
-    MultiColumnUniqueRegistration, SysCatalog, TableConstraintSummaryView, TableView, UniqueKey, 
-    build_composite_unique_key, canonical_table_name, constraints::ConstraintKind, 
-    ensure_multi_column_unique, ensure_single_column_unique,
+    build_composite_unique_key,
+    canonical_table_name,
+    constraints::ConstraintKind,
+    CatalogManager,
+    ConstraintColumnInfo,
+    ConstraintService,
+    CreateTableResult,
+    ensure_multi_column_unique,
+    ensure_single_column_unique,
+    ForeignKeyColumn,
+    ForeignKeyTableInfo,
+    ForeignKeyView,
+    InsertColumnConstraint,
+    InsertMultiColumnUnique,
+    InsertUniqueColumn,
+    MetadataManager,
+    MultiColumnUniqueEntryMeta,
+    MultiColumnUniqueRegistration,
+    SingleColumnIndexDescriptor,
+    SingleColumnIndexRegistration,
+    SysCatalog,
+    TableConstraintSummaryView,
+    TableView,
+    UniqueKey,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -77,7 +95,7 @@ pub type Result<T> = llkv_result::Result<T>;
 pub use llkv_plan::{
     AggregateExpr, AggregateFunction, AlterTablePlan, AssignmentValue, ColumnAssignment, 
     ColumnNullability, ColumnSpec, CreateIndexPlan, CreateTablePlan, CreateTableSource, 
-    DeletePlan, DropTablePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan, 
+    DeletePlan, DropIndexPlan, DropTablePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan, 
     InsertSource, IntoColumnSpec, MultiColumnUniqueSpec, NotNull, Nullable, OrderByPlan, 
     OrderSortType, OrderTarget, PlanOperation, PlanStatement, PlanValue, SelectPlan, 
     SelectProjection, UpdatePlan,
@@ -306,7 +324,8 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
         PlanStatement::CreateTable(plan) => Some(&plan.name),
         PlanStatement::DropTable(plan) => Some(&plan.name),
         PlanStatement::AlterTable(plan) => Some(&plan.table_name),
-        PlanStatement::CreateIndex(plan) => Some(&plan.table),
+    PlanStatement::CreateIndex(plan) => Some(&plan.table),
+    PlanStatement::DropIndex(_plan) => None,
         PlanStatement::Insert(plan) => Some(&plan.table),
         PlanStatement::Update(plan) => Some(&plan.table),
         PlanStatement::Delete(plan) => Some(&plan.table),
@@ -322,6 +341,10 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
         | PlanStatement::CommitTransaction
         | PlanStatement::RollbackTransaction => None,
     }
+}
+
+fn is_index_not_found_error(err: &Error) -> bool {
+    matches!(err, Error::CatalogError(message) if message.contains("does not exist"))
 }
 
 // ============================================================================
@@ -1195,14 +1218,64 @@ where
         }
     }
 
-    // TODO: Implement
-    /// Drop an index. The runtime currently treats index drops as metadata no-ops
-    /// because index registration is limited to sort/unique markers without name tracking.
-    ///
-    /// Once index catalog entries carry stable identifiers we should plumb explicit
-    /// drop support through the storage namespaces.
-    pub fn drop_index(&self, _index_name: &str, _if_exists: bool) -> Result<()> {
+    /// Drop an index by name through plan execution.
+    pub fn drop_index(&self, index_name: &str, if_exists: bool) -> Result<()> {
+    let plan = DropIndexPlan::new(index_name).if_exists(if_exists);
+        self.drop_index_plan(plan)?;
         Ok(())
+    }
+
+    pub fn drop_index_plan(&self, plan: DropIndexPlan) -> Result<RuntimeStatementResult<P>> {
+        if self.has_active_transaction() {
+            return Err(Error::InvalidArgumentError(
+                "DROP INDEX is not supported inside an active transaction".into(),
+            ));
+        }
+
+    let canonical_index = plan.canonical_name.clone();
+        let mut dropped = false;
+
+        match self
+            .persistent_namespace()
+            .drop_index(&canonical_index, plan.if_exists)
+        {
+            Ok(Some(_)) => {
+                dropped = true;
+            }
+            Ok(None) => {
+                // Index not found in persistent namespace (allowed when IF EXISTS)
+            }
+            Err(err) => {
+                if !is_index_not_found_error(&err) {
+                    return Err(err);
+                }
+            }
+        }
+
+        if !dropped {
+            if let Some(temp_namespace) = self.temporary_namespace() {
+                match temp_namespace.drop_index(&canonical_index, plan.if_exists) {
+                    Ok(Some(_)) => {
+                        dropped = true;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        if !is_index_not_found_error(&err) {
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+        }
+
+        if dropped || plan.if_exists {
+            Ok(RuntimeStatementResult::NoOp)
+        } else {
+            Err(Error::CatalogError(format!(
+                "Index '{}' does not exist",
+                plan.name
+            )))
+        }
     }
 
     fn normalize_insert_plan(&self, plan: InsertPlan) -> Result<(InsertPlan, usize)> {
@@ -1584,8 +1657,9 @@ where
             PlanStatement::BeginTransaction => self.session.begin_transaction(),
             PlanStatement::CommitTransaction => self.session.commit_transaction(),
             PlanStatement::RollbackTransaction => self.session.rollback_transaction(),
-            PlanStatement::CreateTable(plan) => self.session.create_table_plan(plan),
-            PlanStatement::DropTable(plan) => self.session.drop_table_plan(plan),
+        PlanStatement::CreateTable(plan) => self.session.create_table_plan(plan),
+        PlanStatement::DropTable(plan) => self.session.drop_table_plan(plan),
+        PlanStatement::DropIndex(plan) => self.session.drop_index_plan(plan),
             PlanStatement::AlterTable(plan) => self.session.alter_table_plan(plan),
             PlanStatement::CreateIndex(plan) => self.session.create_index(plan),
             PlanStatement::Insert(plan) => self.session.insert(plan),
@@ -2273,7 +2347,7 @@ where
             }
         }
 
-        let index_name = plan.name.clone();
+    let mut index_name = plan.name.clone();
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
 
@@ -2319,23 +2393,29 @@ where
                 ensure_single_column_unique(&existing_values, &[], &column_name)?;
             }
 
-            let created = self.catalog_service.register_single_column_index(
+            let registration = self.catalog_service.register_single_column_index(
                 &display_name,
                 &canonical_name,
                 &table.table,
                 field_id,
                 &column_name,
+                plan.name.clone(),
                 plan.unique,
                 plan.if_not_exists,
             )?;
 
-            if !created {
-                // Index already existed and if_not_exists was true
-                return Ok(RuntimeStatementResult::CreateIndex {
-                    table_name: display_name,
-                    index_name,
-                });
-            }
+            let created_name = match registration {
+                SingleColumnIndexRegistration::Created { index_name } => index_name,
+                SingleColumnIndexRegistration::AlreadyExists { index_name } => {
+                    drop(table);
+                    return Ok(RuntimeStatementResult::CreateIndex {
+                        table_name: display_name,
+                        index_name: Some(index_name),
+                    });
+                }
+            };
+
+            index_name = Some(created_name.clone());
 
             if let Some(updated_table) =
                 Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)
@@ -2404,6 +2484,23 @@ where
             table_name: display_name,
             index_name,
         })
+    }
+
+    /// Drop a single-column index and clear any cached executor state.
+    pub fn drop_index(
+        &self,
+        canonical_index_name: &str,
+        if_exists: bool,
+    ) -> Result<Option<SingleColumnIndexDescriptor>> {
+        let descriptor = self
+            .catalog_service
+            .drop_single_column_index(canonical_index_name, if_exists)?;
+
+        if let Some(descriptor) = &descriptor {
+            self.remove_table_entry(&descriptor.canonical_table_name);
+        }
+
+        Ok(descriptor)
     }
 
     /// Returns all table names currently registered in the catalog.
@@ -3287,6 +3384,7 @@ where
             multi_column_uniques: RwLock::new(uniques),
         }))
     }
+
 
     fn record_table_with_new_rows(&self, txn_id: TxnId, canonical_name: String) {
         if txn_id == TXN_ID_AUTO_COMMIT {
@@ -5202,30 +5300,62 @@ where
         
         tracing::debug!("drop_table_immediate: attempting to drop table '{}'", canonical_name);
         
-        let (table_id, column_field_ids) = {
+        let cached_entry = {
             let tables = self.tables.read().unwrap();
-            tracing::debug!("drop_table_immediate: cache contains {} tables", tables.len());
-            
-            let Some(entry) = tables.get(&canonical_name) else {
-                tracing::debug!("drop_table_immediate: table '{}' not found in cache", canonical_name);
-                if if_exists {
-                    return Ok(());
-                } else {
+            tracing::debug!(
+                "drop_table_immediate: cache contains {} tables",
+                tables.len()
+            );
+            tables.get(&canonical_name).cloned()
+        };
+
+        let table_entry = match cached_entry {
+            Some(entry) => entry,
+            None => {
+                tracing::debug!(
+                    "drop_table_immediate: table '{}' not cached; attempting reload",
+                    canonical_name
+                );
+
+                if self.catalog.table_id(&canonical_name).is_none() {
+                    tracing::debug!(
+                        "drop_table_immediate: no catalog entry for '{}'; if_exists={}",
+                        canonical_name,
+                        if_exists
+                    );
+                    if if_exists {
+                        return Ok(());
+                    }
                     return Err(Error::CatalogError(format!(
                         "Catalog Error: Table '{}' does not exist",
                         display_name
                     )));
                 }
-            };
 
-            let field_ids = entry
-                .schema
-                .columns
-                .iter()
-                .map(|col| col.field_id)
-                .collect::<Vec<_>>();
-            (entry.table.table_id(), field_ids)
+                match self.lookup_table(&canonical_name) {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        tracing::warn!(
+                            "drop_table_immediate: failed to reload table '{}': {:?}",
+                            canonical_name,
+                            err
+                        );
+                        if if_exists {
+                            return Ok(());
+                        }
+                        return Err(err);
+                    }
+                }
+            }
         };
+
+        let column_field_ids = table_entry
+            .schema
+            .columns
+            .iter()
+            .map(|col| col.field_id)
+            .collect::<Vec<_>>();
+        let table_id = table_entry.table.table_id();
 
         let referencing = self.constraint_service.referencing_foreign_keys(table_id)?;
 
