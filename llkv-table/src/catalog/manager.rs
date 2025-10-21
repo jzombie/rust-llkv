@@ -249,8 +249,7 @@ where
         current_name: &str,
         new_name: &str,
     ) -> LlkvResult<()> {
-        if !current_name.eq_ignore_ascii_case(new_name)
-            && self.catalog.table_id(new_name).is_some()
+        if !current_name.eq_ignore_ascii_case(new_name) && self.catalog.table_id(new_name).is_some()
         {
             return Err(Error::CatalogError(format!(
                 "Table '{}' already exists",
@@ -266,27 +265,20 @@ where
             self.metadata.set_table_meta(table_id, meta)?;
         }
 
-        if let Err(err) = self
-            .catalog
-            .rename_registered_table(current_name, new_name)
-        {
+        if let Err(err) = self.catalog.rename_registered_table(current_name, new_name) {
             if let Some(prior) = prior_snapshot {
                 let _ = self.metadata.set_table_meta(table_id, prior);
             }
             return Err(err);
         }
 
-        if prior_snapshot.is_some() {
-            if let Err(err) = self.metadata.flush_table(table_id) {
-                if let Some(prior) = prior_snapshot {
-                    let _ = self.metadata.set_table_meta(table_id, prior);
-                    let _ = self
-                        .catalog
-                        .rename_registered_table(new_name, current_name);
-                    let _ = self.metadata.flush_table(table_id);
-                }
-                return Err(err);
-            }
+        if let Some(prior) = prior_snapshot.clone()
+            && let Err(err) = self.metadata.flush_table(table_id)
+        {
+            let _ = self.metadata.set_table_meta(table_id, prior);
+            let _ = self.catalog.rename_registered_table(new_name, current_name);
+            let _ = self.metadata.flush_table(table_id);
+            return Err(err);
         }
 
         Ok(())

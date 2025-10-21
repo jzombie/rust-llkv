@@ -231,16 +231,11 @@ impl TableCatalog {
             .get(&old_key)
             .copied()
             .ok_or_else(|| {
-                Error::CatalogError(format!(
-                    "Table '{}' does not exist in catalog",
-                    old_display
-                ))
+                Error::CatalogError(format!("Table '{}' does not exist in catalog", old_display))
             })?;
 
         if old_key != new_key
-            && inner
-                .table_name_to_id
-                .contains_key(&new_key)
+            && inner.table_name_to_id.contains_key(&new_key)
             && !old_display.eq_ignore_ascii_case(&new_display)
         {
             return Err(Error::CatalogError(format!(

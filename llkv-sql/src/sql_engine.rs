@@ -33,8 +33,8 @@ use sqlparser::ast::{
     GroupByExpr, Ident, LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType,
     OrderBy, OrderByKind, Query, ReferentialAction, SchemaName, Select, SelectItem,
     SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableConstraint,
-    TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier,
-    UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
+    TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
+    UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -2144,13 +2144,15 @@ where
             ));
         }
 
-        let (raw_new_schema_opt, raw_new_table) = if let Some((schema_part, table_part)) =
-            new_table_name_clean.split_once('.')
-        {
-            (Some(schema_part.trim().to_string()), table_part.trim().to_string())
-        } else {
-            (None, new_table_name_clean.to_string())
-        };
+        let (raw_new_schema_opt, raw_new_table) =
+            if let Some((schema_part, table_part)) = new_table_name_clean.split_once('.') {
+                (
+                    Some(schema_part.trim().to_string()),
+                    table_part.trim().to_string(),
+                )
+            } else {
+                (None, new_table_name_clean.to_string())
+            };
 
         if schema_opt.is_none() && raw_new_schema_opt.is_some() {
             return Err(Error::InvalidArgumentError(

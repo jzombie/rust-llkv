@@ -753,16 +753,16 @@ where
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 temp_namespace.rename_table(current_name, new_name)
             }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => {
-                self.persistent_namespace().rename_table(current_name, new_name)
-            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => self
+                .persistent_namespace()
+                .rename_table(current_name, new_name),
             other => Err(Error::InvalidArgumentError(format!(
                 "Unknown storage namespace '{}'",
                 other
             ))),
         }
     }
-    
+
     /// Create an index (auto-commit only for now).
     pub fn create_index(&self, plan: CreateIndexPlan) -> Result<RuntimeStatementResult<P>> {
         let (_, canonical_table) = canonical_table_name(&plan.table)?;
@@ -4420,10 +4420,8 @@ where
         let (current_display, current_canonical) = canonical_table_name(current_name)?;
         let (new_display, new_canonical) = canonical_table_name(new_name)?;
 
-        if current_canonical == new_canonical {
-            if current_display == new_display {
-                return Ok(());
-            }
+        if current_canonical == new_canonical && current_display == new_display {
+            return Ok(());
         }
 
         if self.is_table_marked_dropped(&current_canonical) {
