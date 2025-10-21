@@ -325,6 +325,7 @@ where
     }
 
     /// Append RecordBatches to a freshly created table, injecting MVCC columns.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_batches_with_mvcc(
         &self,
         table: &Table<P>,
