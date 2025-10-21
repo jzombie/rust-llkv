@@ -100,6 +100,31 @@ impl CreateTablePlan {
 }
 
 // ============================================================================
+// DROP TABLE Plan
+// ============================================================================
+
+/// Plan for dropping a table.
+#[derive(Clone, Debug)]
+pub struct DropTablePlan {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+impl DropTablePlan {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            if_exists: false,
+        }
+    }
+
+    pub fn if_exists(mut self, if_exists: bool) -> Self {
+        self.if_exists = if_exists;
+        self
+    }
+}
+
+// ============================================================================
 // FOREIGN KEY Plan Structures
 // ============================================================================
 
@@ -665,6 +690,7 @@ pub enum OrderTarget {
 #[derive(Clone, Debug)]
 pub enum PlanOperation {
     CreateTable(CreateTablePlan),
+    DropTable(DropTablePlan),
     Insert(InsertPlan),
     Update(UpdatePlan),
     Delete(DeletePlan),
@@ -678,6 +704,7 @@ pub enum PlanStatement {
     CommitTransaction,
     RollbackTransaction,
     CreateTable(CreateTablePlan),
+    DropTable(DropTablePlan),
     CreateIndex(CreateIndexPlan),
     Insert(InsertPlan),
     Update(UpdatePlan),

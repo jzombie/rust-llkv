@@ -76,10 +76,10 @@ pub type Result<T> = llkv_result::Result<T>;
 // Re-export plan structures from llkv-plan
 pub use llkv_plan::{
     AggregateExpr, AggregateFunction, AssignmentValue, ColumnAssignment, ColumnNullability,
-    ColumnSpec, CreateIndexPlan, CreateTablePlan, CreateTableSource, DeletePlan, ForeignKeyAction,
-    ForeignKeySpec, IndexColumnPlan, InsertPlan, InsertSource, IntoColumnSpec, NotNull, Nullable,
-    OrderByPlan, OrderSortType, OrderTarget, PlanOperation, PlanStatement, PlanValue, SelectPlan,
-    SelectProjection, UpdatePlan,
+    ColumnSpec, CreateIndexPlan, CreateTablePlan, CreateTableSource, DeletePlan, DropTablePlan,
+    ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan, InsertSource, IntoColumnSpec,
+    NotNull, Nullable, OrderByPlan, OrderSortType, OrderTarget, PlanOperation, PlanStatement,
+    PlanValue, SelectPlan, SelectProjection, UpdatePlan,
 };
 
 // Execution structures from llkv-executor
@@ -303,6 +303,7 @@ where
 pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
     match statement {
         PlanStatement::CreateTable(plan) => Some(&plan.name),
+        PlanStatement::DropTable(plan) => Some(&plan.name),
         PlanStatement::CreateIndex(plan) => Some(&plan.table),
         PlanStatement::Insert(plan) => Some(&plan.table),
         PlanStatement::Update(plan) => Some(&plan.table),
@@ -581,6 +582,20 @@ where
         self.inner.is_aborted()
     }
 
+    /// Check if a table was created in the current active transaction.
+    pub fn is_table_created_in_transaction(&self, table_name: &str) -> bool {
+        self.inner.is_table_created_in_transaction(table_name)
+    }
+
+    /// Get column specifications for a table created in the current transaction.
+    /// Returns `None` if there's no active transaction or the table wasn't created in it.
+    pub fn table_column_specs_from_transaction(
+        &self,
+        table_name: &str,
+    ) -> Option<Vec<ColumnSpec>> {
+        self.inner.table_column_specs_from_transaction(table_name)
+    }
+
     /// Commit the current transaction and apply changes to the base context.
     /// If the transaction was aborted, this acts as a ROLLBACK instead.
     pub fn commit_transaction(&self) -> Result<RuntimeStatementResult<P>> {
@@ -637,6 +652,9 @@ where
             match operation {
                 PlanOperation::CreateTable(plan) => {
                     TransactionContext::create_table_plan(&**self.inner.context(), plan)?;
+                }
+                PlanOperation::DropTable(plan) => {
+                    TransactionContext::drop_table(&**self.inner.context(), &plan.name, plan.if_exists)?;
                 }
                 PlanOperation::Insert(plan) => {
                     TransactionContext::insert(&**self.inner.context(), plan)?;
@@ -733,7 +751,55 @@ where
                         }
                     }
                 } else {
+                    // Even without an active transaction, check if another session has this table locked
+                    if self.inner.has_table_locked_by_other_session(&plan.name) {
+                        return Err(Error::TransactionContextError(format!(
+                            "table '{}' is locked by another active transaction",
+                            plan.name
+                        )));
+                    }
                     self.persistent_namespace().create_table(plan)
+                }
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
+        }
+    }
+
+    pub fn drop_table_plan(&self, plan: DropTablePlan) -> Result<RuntimeStatementResult<P>> {
+        let (_, canonical_table) = canonical_table_name(&plan.name)?;
+        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
+
+        match namespace_id.as_str() {
+            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                temp_namespace.drop_table(&plan.name, plan.if_exists)?;
+                Ok(RuntimeStatementResult::NoOp)
+            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+                if self.has_active_transaction() {
+                    match self.inner.execute_operation(PlanOperation::DropTable(plan)) {
+                        Ok(_) => Ok(RuntimeStatementResult::NoOp),
+                        Err(e) => {
+                            // If an error occurs during a transaction, abort it
+                            self.abort_transaction();
+                            Err(e)
+                        }
+                    }
+                } else {
+                    // Even without an active transaction, check if another session has this table locked
+                    if self.inner.has_table_locked_by_other_session(&plan.name) {
+                        return Err(Error::TransactionContextError(format!(
+                            "table '{}' is locked by another active transaction",
+                            plan.name
+                        )));
+                    }
+                    self.persistent_namespace().drop_table(&plan.name, plan.if_exists)?;
+                    Ok(RuntimeStatementResult::NoOp)
                 }
             }
             other => Err(Error::InvalidArgumentError(format!(
@@ -1210,6 +1276,7 @@ where
             PlanStatement::CommitTransaction => self.session.commit_transaction(),
             PlanStatement::RollbackTransaction => self.session.rollback_transaction(),
             PlanStatement::CreateTable(plan) => self.session.create_table_plan(plan),
+            PlanStatement::DropTable(plan) => self.session.drop_table_plan(plan),
             PlanStatement::CreateIndex(plan) => self.session.create_index(plan),
             PlanStatement::Insert(plan) => self.session.insert(plan),
             PlanStatement::Update(plan) => self.session.update(plan),
@@ -4591,6 +4658,11 @@ where
     ) -> llkv_result::Result<TransactionResult<P>> {
         let result = RuntimeContext::create_table_plan(self.context(), plan)?;
         Ok(convert_statement_result(result))
+    }
+
+    fn drop_table(&self, name: &str, if_exists: bool) -> llkv_result::Result<()> {
+        // For transaction contexts, use drop_table_immediate which bypasses transaction handling
+        self.ctx.drop_table_immediate(name, if_exists)
     }
 
     fn insert(&self, plan: InsertPlan) -> llkv_result::Result<TransactionResult<P>> {

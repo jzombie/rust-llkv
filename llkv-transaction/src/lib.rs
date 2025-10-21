@@ -121,6 +121,7 @@ where
     Transaction {
         kind: TransactionKind,
     },
+    NoOp,
 }
 
 /// Catalog snapshot interface used by the transaction layer.
@@ -189,6 +190,7 @@ where
                 index_name,
             }),
             TransactionResult::Transaction { kind } => Ok(TransactionResult::Transaction { kind }),
+            TransactionResult::NoOp => Ok(TransactionResult::NoOp),
             TransactionResult::Select { .. } => Err(Error::Internal(
                 "cannot convert SELECT TransactionResult between pager types".into(),
             )),
@@ -236,6 +238,9 @@ pub trait TransactionContext: Send + Sync {
         &self,
         plan: CreateTablePlan,
     ) -> LlkvResult<TransactionResult<Self::Pager>>;
+
+    /// Drop a table
+    fn drop_table(&self, name: &str, if_exists: bool) -> LlkvResult<()>;
 
     /// Insert rows
     fn insert(&self, plan: InsertPlan) -> LlkvResult<TransactionResult<Self::Pager>>;
@@ -292,6 +297,9 @@ where
     new_tables: HashSet<String>,
     /// Tables known to be missing.
     missing_tables: HashSet<String>,
+    /// All table names locked by this transaction for DDL operations (for conflict detection).
+    /// This includes tables that were created, dropped, or both within the transaction.
+    locked_table_names: HashSet<String>,
     /// Immutable catalog snapshot at transaction start (for isolation).
     /// Contains table name→ID mappings. Replaces separate HashSet and HashMap.
     catalog_snapshot: BaseCtx::Snapshot,
@@ -334,6 +342,7 @@ where
             staged_tables: HashSet::new(),
             new_tables: HashSet::new(),
             missing_tables: HashSet::new(),
+            locked_table_names: HashSet::new(),
             catalog_snapshot,
             base_context,
             is_aborted: false,
@@ -481,13 +490,38 @@ where
         // Execute operation and catch errors to mark transaction as aborted
         let result = match operation {
             PlanOperation::CreateTable(ref plan) => {
-                match self.staging.create_table_plan(plan.clone()) {
+                // Before creating in staging, validate that all foreign key referenced tables
+                // exist in the base context. This is necessary because the staging context
+                // can't see tables from the base context.
+                for fk in &plan.foreign_keys {
+                    let canonical_ref_table = fk.referenced_table.to_ascii_lowercase();
+                    // Check if the referenced table exists in base context or was created in this transaction
+                    if !self.new_tables.contains(&canonical_ref_table)
+                        && !self.catalog_snapshot.table_exists(&canonical_ref_table)
+                    {
+                        self.is_aborted = true;
+                        return Err(Error::InvalidArgumentError(format!(
+                            "referenced table '{}' does not exist",
+                            fk.referenced_table
+                        )));
+                    }
+                }
+
+                // Create a modified plan without foreign keys for staging context.
+                // The staging context can't validate foreign keys against base tables,
+                // so we skip FK registration in staging and will re-apply at commit time.
+                let mut staging_plan = plan.clone();
+                staging_plan.foreign_keys.clear();
+
+                match self.staging.create_table_plan(staging_plan) {
                     Ok(result) => {
                         // Track new table so it's visible to subsequent operations in this transaction
                         self.new_tables.insert(plan.name.clone());
                         self.missing_tables.remove(&plan.name);
                         self.staged_tables.insert(plan.name.clone());
-                        // Track for commit replay
+                        // Lock this table name for the duration of the transaction
+                        self.locked_table_names.insert(plan.name.to_ascii_lowercase());
+                        // Track for commit replay WITH original foreign keys
                         self.operations
                             .push(PlanOperation::CreateTable(plan.clone()));
                         result.convert_pager_type()?
@@ -497,6 +531,48 @@ where
                         return Err(e);
                     }
                 }
+            }
+            PlanOperation::DropTable(ref plan) => {
+                let canonical_name = plan.name.to_ascii_lowercase();
+                
+                // Lock this table name for conflict detection (even if CREATE/DROP cancel out)
+                self.locked_table_names.insert(canonical_name.clone());
+                
+                // Check if the table was created in this transaction
+                let result = if self.new_tables.contains(&canonical_name) {
+                    // Table was created in this transaction, so drop it from staging
+                    // and remove from tracking
+                    self.staging.drop_table(&plan.name, plan.if_exists)?;
+                    self.new_tables.remove(&canonical_name);
+                    self.staged_tables.remove(&canonical_name);
+                    // Remove the CREATE TABLE operation from the operation list
+                    self.operations.retain(|op| {
+                        !matches!(op, PlanOperation::CreateTable(p) if p.name.to_ascii_lowercase() == canonical_name)
+                    });
+                    // Don't add DROP to operations since we're canceling out the CREATE
+                    // But keep the table name locked for conflict detection
+                    TransactionResult::NoOp
+                } else {
+                    // Table exists in base context, track the drop for replay at commit
+                    // Verify the table exists
+                    if !self.catalog_snapshot.table_exists(&canonical_name) && !plan.if_exists {
+                        self.is_aborted = true;
+                        return Err(Error::InvalidArgumentError(format!(
+                            "table '{}' does not exist",
+                            plan.name
+                        )));
+                    }
+                    
+                    if self.catalog_snapshot.table_exists(&canonical_name) {
+                        // Mark as dropped so it's not visible in this transaction
+                        self.missing_tables.insert(canonical_name.clone());
+                        self.staged_tables.remove(&canonical_name);
+                        // Track for commit replay
+                        self.operations.push(PlanOperation::DropTable(plan.clone()));
+                    }
+                    TransactionResult::NoOp
+                };
+                result
             }
             PlanOperation::Insert(ref plan) => {
                 tracing::trace!(
@@ -786,6 +862,57 @@ where
             .unwrap_or(false)
     }
 
+    /// Check if a table was created in the current active transaction.
+    /// Returns `true` if there's an active transaction and the table exists in its `new_tables` set.
+    pub fn is_table_created_in_transaction(&self, table_name: &str) -> bool {
+        self.transactions
+            .lock()
+            .expect("transactions lock poisoned")
+            .get(&self.session_id)
+            .map(|tx| tx.new_tables.contains(table_name))
+            .unwrap_or(false)
+    }
+
+    /// Get column specifications for a table created in the current transaction.
+    /// Returns `None` if there's no active transaction or the table wasn't created in it.
+    pub fn table_column_specs_from_transaction(
+        &self,
+        table_name: &str,
+    ) -> Option<Vec<ColumnSpec>> {
+        let guard = self
+            .transactions
+            .lock()
+            .expect("transactions lock poisoned");
+        
+        let tx = guard.get(&self.session_id)?;
+        if !tx.new_tables.contains(table_name) {
+            return None;
+        }
+        
+        // Get column specs from the staging context
+        tx.staging.table_column_specs(table_name).ok()
+    }
+    /// Check if a table is locked by another active session's transaction.
+    /// Returns true if ANY other session has this table in their locked_table_names.
+    pub fn has_table_locked_by_other_session(&self, table_name: &str) -> bool {
+        let canonical = table_name.to_ascii_lowercase();
+        let guard = self.transactions.lock().expect("transactions lock poisoned");
+        
+        for (session_id, tx) in guard.iter() {
+            // Skip our own session
+            if *session_id == self.session_id {
+                continue;
+            }
+            
+            // Check if this other session has the table locked
+            if tx.locked_table_names.contains(&canonical) {
+                return true;
+            }
+        }
+        
+        false
+    }
+
     /// Mark the current transaction as aborted due to an error.
     /// This should be called when any error occurs during a transaction.
     pub fn abort_transaction(&self) {
@@ -1016,6 +1143,52 @@ where
             return Err(Error::InvalidArgumentError(
                 "execute_operation called without active transaction".into(),
             ));
+        }
+
+        // Check for cross-transaction conflicts before executing
+        if let PlanOperation::CreateTable(ref plan) = operation {
+            let guard = self
+                .transactions
+                .lock()
+                .expect("transactions lock poisoned");
+            
+            let canonical_name = plan.name.to_ascii_lowercase();
+            
+            // Check if another session has this table locked in their transaction
+            for (other_session_id, other_tx) in guard.iter() {
+                if *other_session_id != self.session_id {
+                    if other_tx.locked_table_names.contains(&canonical_name) {
+                        return Err(Error::TransactionContextError(format!(
+                            "table '{}' is locked by another active transaction",
+                            plan.name
+                        )));
+                    }
+                }
+            }
+            drop(guard); // Release lock before continuing
+        }
+        
+        // Also check DROP TABLE for conflicts
+        if let PlanOperation::DropTable(ref plan) = operation {
+            let guard = self
+                .transactions
+                .lock()
+                .expect("transactions lock poisoned");
+            
+            let canonical_name = plan.name.to_ascii_lowercase();
+            
+            // Check if another session has this table locked in their transaction
+            for (other_session_id, other_tx) in guard.iter() {
+                if *other_session_id != self.session_id {
+                    if other_tx.locked_table_names.contains(&canonical_name) {
+                        return Err(Error::TransactionContextError(format!(
+                            "table '{}' is locked by another active transaction",
+                            plan.name
+                        )));
+                    }
+                }
+            }
+            drop(guard); // Release lock before continuing
         }
 
         // In transaction - add to transaction and execute on staging context

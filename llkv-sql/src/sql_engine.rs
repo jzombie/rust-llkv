@@ -536,6 +536,19 @@ where
             return Err(Self::table_not_found_error(display_name));
         }
 
+        // First, check if the table was created in the current transaction
+        if let Some(specs) = self
+            .engine
+            .session()
+            .table_column_specs_from_transaction(canonical_name)
+        {
+            return Ok(specs
+                .into_iter()
+                .map(|spec| spec.name.to_ascii_lowercase())
+                .collect());
+        }
+
+        // Otherwise, look it up in the committed catalog
         match context.table_column_specs(display_name) {
             Ok(specs) => Ok(specs
                 .into_iter()
@@ -2016,11 +2029,25 @@ where
                 }
 
                 let session = self.engine.session();
-                for name in names {
-                    let table_name = Self::object_name_to_string(&name)?;
-                    session
-                        .drop_table(&table_name, if_exists)
-                        .map_err(|err| Self::map_table_error(&table_name, err))?;
+                
+                // If we're in a transaction, use PlanOperation for transactional handling
+                if session.has_active_transaction() {
+                    for name in names {
+                        let table_name = Self::object_name_to_string(&name)?;
+                        let mut plan = llkv_plan::DropTablePlan::new(table_name.clone());
+                        plan.if_exists = if_exists;
+                        
+                        let plan_statement = llkv_plan::PlanStatement::DropTable(plan);
+                        self.execute_plan_statement(plan_statement)?;
+                    }
+                } else {
+                    // Auto-commit mode: drop directly
+                    for name in names {
+                        let table_name = Self::object_name_to_string(&name)?;
+                        session
+                            .drop_table(&table_name, if_exists)
+                            .map_err(|err| Self::map_table_error(&table_name, err))?;
+                    }
                 }
 
                 Ok(RuntimeStatementResult::NoOp)
