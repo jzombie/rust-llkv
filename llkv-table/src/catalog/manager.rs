@@ -20,7 +20,6 @@ use llkv_storage::pager::Pager;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
-
 use super::table_catalog::{FieldDefinition, TableCatalog};
 use crate::constraints::ConstraintKind;
 use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration};
@@ -354,13 +353,8 @@ where
 
             let row_count = batch.num_rows();
 
-            let (row_id_array, created_by_array, deleted_by_array) =
-                mvcc_builder.build_insert_columns(
-                    row_count,
-                    next_row_id,
-                    creator_txn_id,
-                    deleted_marker,
-                );
+            let (row_id_array, created_by_array, deleted_by_array) = mvcc_builder
+                .build_insert_columns(row_count, next_row_id, creator_txn_id, deleted_marker);
 
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(table_columns.len() + 3);
             arrays.push(row_id_array);

@@ -93,8 +93,8 @@ use crate::storage_namespace::{
 // Import transaction structures from llkv-transaction for internal use.
 pub use llkv_transaction::TransactionKind;
 use llkv_transaction::{
-    RowVersion, TableId, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TransactionContext,
-    TransactionManager, TransactionResult, TxnId, TxnIdManager, mvcc::TransactionSnapshot,
+    RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TableId, TransactionContext, TransactionManager,
+    TransactionResult, TxnId, TxnIdManager, mvcc::TransactionSnapshot,
 };
 
 // Internal low-level transaction session type (from llkv-transaction)

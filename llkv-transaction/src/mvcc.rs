@@ -413,7 +413,10 @@ pub fn build_field_with_metadata(
 }
 
 /// Build DELETE batch with row_id and deleted_by columns.
-pub fn build_delete_batch(row_ids: Vec<RowId>, deleted_by_txn_id: TxnId) -> llkv_result::Result<RecordBatch> {
+pub fn build_delete_batch(
+    row_ids: Vec<RowId>,
+    deleted_by_txn_id: TxnId,
+) -> llkv_result::Result<RecordBatch> {
     let row_count = row_ids.len();
 
     let fields = vec![
