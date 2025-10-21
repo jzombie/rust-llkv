@@ -16,6 +16,7 @@ This guide keeps feature work aligned with our architecture so we avoid wasteful
 - **Performance first:** moving logic downward must not introduce cross-crate chatter that slows hot paths.
 - **No duplicates:** extend existing modules instead of cloning functionality elsewhere. If you catch yourself wiring up the same method signature twice in different files or crates, stop and reassess (the architecture is likely wrong and needs refactoring rather than another copy).
 - **No loops:** ensure dependency arrows still point downward; adding a reference that forces a circular dependency is a blocker.
+- **Flag debt:** mark future work with `TODO` or `FIXME` so follow-ups stay searchable and accountable.
 - **Comment hygiene:** follow [comment-style-guide.md](comment-style-guide.md) and tidy nearby comments while you are in the module so style drifts do not accumulate.
 
 ## Before You Open a PR

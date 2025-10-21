@@ -125,6 +125,54 @@ impl DropTablePlan {
 }
 
 // ============================================================================
+// ALTER TABLE Plan Structures
+// ============================================================================
+
+/// Plan for ALTER TABLE operations.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlterTablePlan {
+    pub table_name: String,
+    pub if_exists: bool,
+    pub operation: AlterTableOperation,
+}
+
+/// Specific ALTER TABLE operation to perform.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterTableOperation {
+    /// RENAME COLUMN old_name TO new_name
+    RenameColumn {
+        old_column_name: String,
+        new_column_name: String,
+    },
+    /// ALTER COLUMN column_name SET DATA TYPE new_type
+    SetColumnDataType {
+        column_name: String,
+        new_data_type: String, // SQL type string like "INTEGER", "VARCHAR", etc.
+    },
+    /// DROP COLUMN column_name
+    DropColumn {
+        column_name: String,
+        if_exists: bool,
+        cascade: bool,
+    },
+}
+
+impl AlterTablePlan {
+    pub fn new(table_name: impl Into<String>, operation: AlterTableOperation) -> Self {
+        Self {
+            table_name: table_name.into(),
+            if_exists: false,
+            operation,
+        }
+    }
+
+    pub fn if_exists(mut self, if_exists: bool) -> Self {
+        self.if_exists = if_exists;
+        self
+    }
+}
+
+// ============================================================================
 // FOREIGN KEY Plan Structures
 // ============================================================================
 
@@ -705,6 +753,7 @@ pub enum PlanStatement {
     RollbackTransaction,
     CreateTable(CreateTablePlan),
     DropTable(DropTablePlan),
+    AlterTable(AlterTablePlan),
     CreateIndex(CreateIndexPlan),
     Insert(InsertPlan),
     Update(UpdatePlan),

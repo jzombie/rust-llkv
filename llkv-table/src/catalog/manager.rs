@@ -23,6 +23,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 use super::table_catalog::{FieldDefinition, TableCatalog};
 use crate::constraints::ConstraintKind;
 use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration};
+use crate::sys_catalog::{ColMeta, SysCatalog};
 use crate::table::Table;
 use crate::types::{FieldId, RowId, TableColumn, TableId};
 use crate::{
@@ -308,6 +309,141 @@ where
             return Err(err);
         }
 
+        Ok(())
+    }
+
+    /// Rename a column in a table by updating its metadata.
+    pub fn rename_column(
+        &self,
+        table_id: TableId,
+        old_column_name: &str,
+        new_column_name: &str,
+    ) -> LlkvResult<()> {
+        // Get all column metas for this table
+        let (_, field_ids) = self.sorted_user_fields(table_id);
+        let column_metas = self.metadata.column_metas(table_id, &field_ids)?;
+        
+        // Find the column by old name
+        let mut found_col: Option<(u32, ColMeta)> = None;
+        for (idx, meta_opt) in column_metas.iter().enumerate() {
+            if let Some(meta) = meta_opt {
+                if let Some(name) = &meta.name {
+                    if name.eq_ignore_ascii_case(old_column_name) {
+                        found_col = Some((field_ids[idx], meta.clone()));
+                        break;
+                    }
+                }
+            }
+        }
+        
+        let (_field_id, mut col_meta) = found_col.ok_or_else(|| {
+            Error::InvalidArgumentError(format!(
+                "column '{}' not found in table",
+                old_column_name
+            ))
+        })?;
+        
+        // Update the column name
+        col_meta.name = Some(new_column_name.to_string());
+        
+        // Save to catalog
+        let catalog = SysCatalog::new(&self.store);
+        catalog.put_col_meta(table_id, &col_meta);
+        
+        // Update metadata manager cache
+        self.metadata.set_column_meta(table_id, col_meta)?;
+        
+        Ok(())
+    }
+
+    /// Alter the data type of a column.
+    /// 
+    /// This updates both the column metadata and the storage layer's data type fingerprint.
+    /// Note that actual data conversion is NOT performed - the caller must ensure that
+    /// existing data is compatible with the new type (or that no data exists).
+    /// 
+    /// # Arguments
+    /// * `table_id` - The table containing the column
+    /// * `column_name` - Name of the column to alter
+    /// * `new_data_type` - Arrow DataType to set for this column
+    pub fn alter_column_type(
+        &self,
+        table_id: TableId,
+        column_name: &str,
+        new_data_type: &DataType,
+    ) -> LlkvResult<()> {
+        // Get all column metas for this table
+        let (logical_fields, field_ids) = self.sorted_user_fields(table_id);
+        let column_metas = self.metadata.column_metas(table_id, &field_ids)?;
+        
+        // Find the column by name
+        let mut found_col: Option<(usize, u32, ColMeta)> = None;
+        for (idx, meta_opt) in column_metas.iter().enumerate() {
+            if let Some(meta) = meta_opt {
+                if let Some(name) = &meta.name {
+                    if name.eq_ignore_ascii_case(column_name) {
+                        found_col = Some((idx, field_ids[idx], meta.clone()));
+                        break;
+                    }
+                }
+            }
+        }
+        
+        let (col_idx, _field_id, col_meta) = found_col.ok_or_else(|| {
+            Error::InvalidArgumentError(format!(
+                "column '{}' not found in table",
+                column_name
+            ))
+        })?;
+        
+        // Update the data type in the storage layer
+        let lfid = logical_fields[col_idx];
+        self.store.update_data_type(lfid, new_data_type)?;
+        
+        // Save metadata to catalog
+        let catalog = SysCatalog::new(&self.store);
+        catalog.put_col_meta(table_id, &col_meta);
+        
+        // Update metadata manager cache
+        self.metadata.set_column_meta(table_id, col_meta)?;
+        
+        Ok(())
+    }
+
+    /// Drop a column from a table by removing its metadata.
+    pub fn drop_column(
+        &self,
+        table_id: TableId,
+        column_name: &str,
+    ) -> LlkvResult<()> {
+        // Get all column metas for this table
+        let (_, field_ids) = self.sorted_user_fields(table_id);
+        let column_metas = self.metadata.column_metas(table_id, &field_ids)?;
+        
+        // Find the column by name
+        let mut found_col_id: Option<u32> = None;
+        for (idx, meta_opt) in column_metas.iter().enumerate() {
+            if let Some(meta) = meta_opt {
+                if let Some(name) = &meta.name {
+                    if name.eq_ignore_ascii_case(column_name) {
+                        found_col_id = Some(field_ids[idx]);
+                        break;
+                    }
+                }
+            }
+        }
+        
+        let col_id = found_col_id.ok_or_else(|| {
+            Error::InvalidArgumentError(format!(
+                "column '{}' not found in table",
+                column_name
+            ))
+        })?;
+        
+        // Delete from catalog
+        let catalog = SysCatalog::new(&self.store);
+        catalog.delete_col_meta(table_id, &[col_id])?;
+        
         Ok(())
     }
 

@@ -27,12 +27,13 @@ use llkv_table::catalog::{IdentifierContext, IdentifierResolver};
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
-    AlterTableOperation, Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator,
-    ColumnOption, ColumnOptionDef, ConstraintCharacteristics, DataType as SqlDataType, Delete,
-    ExceptionWhen, Expr as SqlExpr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, Ident, LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType,
-    OrderBy, OrderByKind, Query, ReferentialAction, SchemaName, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableConstraint,
+    AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, BeginTransactionKind, 
+    BinaryOperator, ColumnOption, ColumnOptionDef, ConstraintCharacteristics, 
+    DataType as SqlDataType, Delete, DropBehavior, ExceptionWhen, Expr as SqlExpr, FromTable, 
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, 
+    NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType, OrderBy, OrderByKind, Query, 
+    ReferentialAction, SchemaName, Select, SelectItem, SelectItemQualifiedWildcardKind, Set, 
+    SetExpr, SqlOption, Statement, TableConstraint,
     TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
     UpdateTableFromKind, Value, ValueWithSpan,
 };
@@ -1317,8 +1318,8 @@ where
                 known_columns_lower,
                 |unknown| {
                     format!(
-                        "unknown referenced column '{}' in FOREIGN KEY constraint",
-                        unknown
+                        "Binder Error: table '{}' does not have a column named '{}'",
+                        referenced_display, unknown
                     )
                 },
             )?;
@@ -1331,8 +1332,8 @@ where
                     &known_columns,
                     |unknown| {
                         format!(
-                            "unknown referenced column '{}' in FOREIGN KEY constraint",
-                            unknown
+                            "Binder Error: table '{}' does not have a column named '{}'",
+                            referenced_display, unknown
                         )
                     },
                 )?;
@@ -2562,6 +2563,74 @@ where
             AlterTableOperation::RenameTable { table_name } => {
                 let new_name = table_name.to_string();
                 self.handle_alter_table_rename(name, new_name, if_exists)
+            }
+            AlterTableOperation::RenameColumn {
+                old_column_name,
+                new_column_name,
+            } => {
+                let plan = llkv_plan::AlterTablePlan {
+                    table_name: name.to_string(),
+                    if_exists,
+                    operation: llkv_plan::AlterTableOperation::RenameColumn {
+                        old_column_name: old_column_name.to_string(),
+                        new_column_name: new_column_name.to_string(),
+                    },
+                };
+                self.execute_plan_statement(PlanStatement::AlterTable(plan))
+            }
+            AlterTableOperation::AlterColumn {
+                column_name,
+                op,
+            } => {
+                // Only support SET DATA TYPE for now
+                if let AlterColumnOperation::SetDataType { data_type, using, had_set: _ } = op {
+                    if using.is_some() {
+                        return Err(Error::InvalidArgumentError(
+                            "ALTER COLUMN SET DATA TYPE USING clause is not yet supported".into(),
+                        ));
+                    }
+                    
+                    let plan = llkv_plan::AlterTablePlan {
+                        table_name: name.to_string(),
+                        if_exists,
+                        operation: llkv_plan::AlterTableOperation::SetColumnDataType {
+                            column_name: column_name.to_string(),
+                            new_data_type: data_type.to_string(),
+                        },
+                    };
+                    self.execute_plan_statement(PlanStatement::AlterTable(plan))
+                } else {
+                    Err(Error::InvalidArgumentError(format!(
+                        "unsupported ALTER COLUMN operation: {:?}",
+                        op
+                    )))
+                }
+            }
+            AlterTableOperation::DropColumn {
+                has_column_keyword: _,
+                column_names,
+                if_exists: column_if_exists,
+                drop_behavior,
+            } => {
+                if column_names.len() != 1 {
+                    return Err(Error::InvalidArgumentError(
+                        "DROP COLUMN currently supports dropping one column at a time".into(),
+                    ));
+                }
+                
+                let column_name = column_names.into_iter().next().unwrap().to_string();
+                let cascade = matches!(drop_behavior, Some(sqlparser::ast::DropBehavior::Cascade));
+                
+                let plan = llkv_plan::AlterTablePlan {
+                    table_name: name.to_string(),
+                    if_exists,
+                    operation: llkv_plan::AlterTableOperation::DropColumn {
+                        column_name,
+                        if_exists: column_if_exists,
+                        cascade,
+                    },
+                };
+                self.execute_plan_statement(PlanStatement::AlterTable(plan))
             }
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported ALTER TABLE operation: {:?}",
