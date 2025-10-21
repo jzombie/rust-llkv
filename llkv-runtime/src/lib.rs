@@ -736,6 +736,17 @@ where
         }
     }
 
+    /// Rename a table through the owning storage namespace.
+    ///
+    /// The session looks up the namespace that currently owns `current_name`, then
+    /// delegates the rename request to that namespace. Renames are limited to
+    /// auto-commit mode so catalog consistency and namespace routing stay simple.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgumentError`] when the session has an active
+    /// transaction or when the target namespace rejects the rename (for example
+    /// because the destination already exists).
     pub fn rename_table(&self, current_name: &str, new_name: &str) -> Result<()> {
         if self.has_active_transaction() {
             return Err(Error::InvalidArgumentError(
@@ -4416,6 +4427,17 @@ where
         Ok(())
     }
 
+    /// Apply a table rename directly against the persistent catalog.
+    ///
+    /// This helper performs catalog lookups, foreign-key dependency checks, and cache
+    /// maintenance in a single step. Callers must already ensure that any higher-level
+    /// transactional state has been resolved, because this method updates metadata and
+    /// catalog records immediately.
+    ///
+    /// # Errors
+    /// Returns a catalog error when the source table does not exist, when the new
+    /// name conflicts with an existing table, or when foreign-key constraints prevent
+    /// the rename.
     pub fn rename_table_immediate(&self, current_name: &str, new_name: &str) -> Result<()> {
         let (current_display, current_canonical) = canonical_table_name(current_name)?;
         let (new_display, new_canonical) = canonical_table_name(new_name)?;
