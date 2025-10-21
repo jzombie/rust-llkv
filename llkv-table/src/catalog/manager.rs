@@ -21,7 +21,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use super::table_catalog::{FieldDefinition, TableCatalog};
-use crate::constraints::ConstraintKind;
+use crate::constraints::{ConstraintId, ConstraintKind};
 use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration};
 use crate::sys_catalog::{ColMeta, SysCatalog};
 use crate::table::Table;
@@ -597,11 +597,17 @@ where
             })
             .collect();
 
+        let multi_column_uniques = {
+            let catalog = SysCatalog::new(&self.store);
+            catalog.get_multi_column_uniques(table_id)?
+        };
+
         let referencing_table = ForeignKeyTableInfo {
             display_name: display_name.to_string(),
             canonical_name: canonical_name.to_string(),
             table_id,
             columns: referencing_columns,
+            multi_column_uniques,
         };
 
         self.metadata.validate_and_register_foreign_keys(
@@ -654,11 +660,17 @@ where
                 });
             }
 
+            let multi_column_uniques = {
+                let catalog = SysCatalog::new(&self.store);
+                catalog.get_multi_column_uniques(table_id)?
+            };
+
             results.push(ForeignKeyTableInfo {
                 display_name: view.referenced_table_display.clone(),
                 canonical_name: view.referenced_table_canonical.clone(),
                 table_id,
                 columns,
+                multi_column_uniques,
             });
         }
 
@@ -849,6 +861,18 @@ where
     /// Note: This is primarily for internal use by services like ConstraintService.
     pub fn catalog(&self) -> &Arc<TableCatalog> {
         &self.catalog
+    }
+
+    /// Returns all foreign keys that reference the specified table.
+    /// Returns a vector of (referencing_table_id, constraint_id) pairs.
+    pub fn foreign_keys_referencing(&self, referenced_table_id: TableId) -> LlkvResult<Vec<(TableId, ConstraintId)>> {
+        self.metadata.foreign_keys_referencing(referenced_table_id)
+    }
+
+    /// Returns detailed foreign key views for a specific table.
+    /// This includes foreign keys where the specified table is the referencing table.
+    pub fn foreign_key_views_for_table(&self, table_id: TableId) -> LlkvResult<Vec<ForeignKeyView>> {
+        self.metadata.foreign_key_views(&self.catalog, table_id)
     }
 }
 

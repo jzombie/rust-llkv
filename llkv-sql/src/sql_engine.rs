@@ -18,8 +18,8 @@ use llkv_runtime::storage_namespace::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan, CreateTablePlan,
     CreateTableSource, DeletePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan,
-    InsertSource, OrderByPlan, OrderSortType, OrderTarget, PlanStatement, PlanValue,
-    RuntimeContext, RuntimeEngine, RuntimeSession, RuntimeStatementResult, SelectPlan,
+    InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanStatement, 
+    PlanValue, RuntimeContext, RuntimeEngine, RuntimeSession, RuntimeStatementResult, SelectPlan,
     SelectProjection, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
@@ -29,7 +29,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, BeginTransactionKind, 
     BinaryOperator, ColumnOption, ColumnOptionDef, ConstraintCharacteristics, 
-    DataType as SqlDataType, Delete, DropBehavior, ExceptionWhen, Expr as SqlExpr, FromTable, 
+    DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable, 
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, 
     NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType, OrderBy, OrderByKind, Query, 
     ReferentialAction, SchemaName, Select, SelectItem, SelectItemQualifiedWildcardKind, Set, 
@@ -765,6 +765,7 @@ where
         let mut columns: Vec<ColumnSpec> = Vec::with_capacity(column_defs_ast.len());
         let mut primary_key_columns: HashSet<String> = HashSet::new();
         let mut foreign_keys: Vec<ForeignKeySpec> = Vec::new();
+        let mut multi_column_uniques: Vec<MultiColumnUniqueSpec> = Vec::new();
 
         // Second pass: process columns including CHECK validation and column-level FKs
         for column_def in column_defs_ast {
@@ -946,6 +947,7 @@ where
                         index_options,
                         characteristics,
                         nulls_distinct,
+                        name,
                         ..
                     } => {
                         if !matches!(nulls_distinct, NullsDistinctOption::None) {
@@ -990,12 +992,6 @@ where
                             unique_column_names.push(column_ident);
                         }
 
-                        if unique_column_names.len() > 1 {
-                            return Err(Error::InvalidArgumentError(
-                                "multi-column UNIQUE constraints are not supported yet".into(),
-                            ));
-                        }
-
                         ensure_unique_case_insensitive(
                             unique_column_names.iter().map(|name| name.as_str()),
                             |dup| format!("duplicate column '{}' in UNIQUE constraint", dup),
@@ -1007,22 +1003,31 @@ where
                             |unknown| format!("unknown column '{}' in UNIQUE constraint", unknown),
                         )?;
 
-                        let column_ident = unique_column_names
-                            .into_iter()
-                            .next()
-                            .expect("unique constraint checked for emptiness");
-                        let normalized = column_ident.to_ascii_lowercase();
-                        let idx = column_lookup.get(&normalized).copied().ok_or_else(|| {
-                            Error::InvalidArgumentError(format!(
-                                "unknown column '{}' in UNIQUE constraint",
-                                column_ident
-                            ))
-                        })?;
+                        if unique_column_names.len() > 1 {
+                            // Multi-column UNIQUE constraint
+                            multi_column_uniques.push(MultiColumnUniqueSpec {
+                                name: name.map(|n| n.value),
+                                columns: unique_column_names,
+                            });
+                        } else {
+                            // Single-column UNIQUE constraint
+                            let column_ident = unique_column_names
+                                .into_iter()
+                                .next()
+                                .expect("unique constraint checked for emptiness");
+                            let normalized = column_ident.to_ascii_lowercase();
+                            let idx = column_lookup.get(&normalized).copied().ok_or_else(|| {
+                                Error::InvalidArgumentError(format!(
+                                    "unknown column '{}' in UNIQUE constraint",
+                                    column_ident
+                                ))
+                            })?;
 
-                        let column = columns
-                            .get_mut(idx)
-                            .expect("column index from lookup must be valid");
-                        column.unique = true;
+                            let column = columns
+                                .get_mut(idx)
+                                .expect("column index from lookup must be valid");
+                            column.unique = true;
+                        }
                     }
                     TableConstraint::ForeignKey {
                         name,
@@ -1076,6 +1081,7 @@ where
             source: None,
             namespace,
             foreign_keys,
+            multi_column_uniques,
         };
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
     }
@@ -1721,6 +1727,7 @@ where
             source: None,
             namespace,
             foreign_keys: Vec::new(),
+            multi_column_uniques: Vec::new(),
         };
         let create_result = self.execute_plan_statement(PlanStatement::CreateTable(plan))?;
 
@@ -2000,6 +2007,7 @@ where
             }),
             namespace,
             foreign_keys: Vec::new(),
+            multi_column_uniques: Vec::new(),
         };
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
     }
@@ -2135,6 +2143,7 @@ where
             }),
             namespace,
             foreign_keys: Vec::new(),
+            multi_column_uniques: Vec::new(),
         };
         
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
@@ -2464,6 +2473,22 @@ where
                             .drop_table(&table_name, if_exists)
                             .map_err(|err| Self::map_table_error(&table_name, err))?;
                     }
+                }
+
+                Ok(RuntimeStatementResult::NoOp)
+            }
+            ObjectType::Index => {
+                if cascade || restrict {
+                    return Err(Error::InvalidArgumentError(
+                        "DROP INDEX CASCADE/RESTRICT is not supported".into(),
+                    ));
+                }
+
+                for name in names {
+                    let index_name = Self::object_name_to_string(&name)?;
+                    self.engine
+                        .session()
+                        .drop_index(&index_name, if_exists)?;
                 }
 
                 Ok(RuntimeStatementResult::NoOp)

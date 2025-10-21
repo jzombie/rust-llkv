@@ -7,6 +7,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use super::types::ForeignKeyAction;
+use crate::sys_catalog::MultiColumnUniqueEntryMeta;
 use crate::types::{FieldId, TableId};
 
 /// Lightweight column descriptor used for constraint validation.
@@ -510,6 +511,7 @@ pub struct ForeignKeyTableInfo {
     pub canonical_name: String,
     pub table_id: TableId,
     pub columns: Vec<ForeignKeyColumn>,
+    pub multi_column_uniques: Vec<MultiColumnUniqueEntryMeta>,
 }
 
 /// Result of validating a foreign key specification.
@@ -638,16 +640,51 @@ where
                 ))
             })?;
 
-            if !column.primary_key && !column.unique {
-                return Err(Error::InvalidArgumentError(format!(
-                    "FOREIGN KEY references column '{}' in table '{}' that is not UNIQUE or PRIMARY KEY",
-                    column_name, referenced_table_info.display_name
-                )));
-            }
-
             referenced_field_ids.push(column.field_id);
             referenced_column_defs.push((*column).clone());
             referenced_column_names.push(column.name.clone());
+        }
+
+        // Validate that the referenced columns form a UNIQUE or PRIMARY KEY constraint
+        if referenced_columns.len() == 1 {
+            // Single column: check if it has UNIQUE or PRIMARY KEY constraint
+            let column = &referenced_column_defs[0];
+            if !column.primary_key && !column.unique {
+                return Err(Error::InvalidArgumentError(format!(
+                    "FOREIGN KEY references column '{}' in table '{}' that is not UNIQUE or PRIMARY KEY",
+                    column.name, referenced_table_info.display_name
+                )));
+            }
+        } else {
+            // Multiple columns: check if they form a multi-column PRIMARY KEY or UNIQUE constraint
+            
+            // First check if all columns have primary_key = true (multi-column PRIMARY KEY)
+            let all_primary_key = referenced_column_defs
+                .iter()
+                .all(|col| col.primary_key);
+            
+            // Also check if they form a multi-column UNIQUE constraint
+            let has_multi_column_unique = referenced_table_info
+                .multi_column_uniques
+                .iter()
+                .any(|unique_entry| {
+                    // Check if this unique constraint matches our referenced columns
+                    if unique_entry.column_ids.len() != referenced_field_ids.len() {
+                        return false;
+                    }
+                    // Check if all field IDs match (order-independent)
+                    let unique_set: FxHashSet<_> = unique_entry.column_ids.iter().copied().collect();
+                    let referenced_set: FxHashSet<_> = referenced_field_ids.iter().copied().collect();
+                    unique_set == referenced_set
+                });
+
+            if !all_primary_key && !has_multi_column_unique {
+                return Err(Error::InvalidArgumentError(format!(
+                    "FOREIGN KEY references columns ({}) in table '{}' that do not form a UNIQUE or PRIMARY KEY constraint",
+                    referenced_column_names.join(", "),
+                    referenced_table_info.display_name
+                )));
+            }
         }
 
         for (child_col, parent_col) in referencing_column_defs

@@ -78,8 +78,9 @@ pub use llkv_plan::{
     AggregateExpr, AggregateFunction, AlterTablePlan, AssignmentValue, ColumnAssignment, 
     ColumnNullability, ColumnSpec, CreateIndexPlan, CreateTablePlan, CreateTableSource, 
     DeletePlan, DropTablePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan, 
-    InsertSource, IntoColumnSpec, NotNull, Nullable, OrderByPlan, OrderSortType, OrderTarget, 
-    PlanOperation, PlanStatement, PlanValue, SelectPlan, SelectProjection, UpdatePlan,
+    InsertSource, IntoColumnSpec, MultiColumnUniqueSpec, NotNull, Nullable, OrderByPlan, 
+    OrderSortType, OrderTarget, PlanOperation, PlanStatement, PlanValue, SelectPlan, 
+    SelectProjection, UpdatePlan,
 };
 
 // Execution structures from llkv-executor
@@ -868,14 +869,96 @@ where
     pub fn alter_table_plan(&self, plan: AlterTablePlan) -> Result<RuntimeStatementResult<P>> {
         let (_, canonical_table) = canonical_table_name(&plan.table_name)?;
         
-        // Get table metadata for validation
-        let view = self.persistent_namespace().context().catalog_service.table_view(&canonical_table)?;
+        // Determine which namespace contains this table
+        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
         
-        // Perform validation based on operation type
-        match &plan.operation {
+        match namespace_id.as_str() {
+            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                
+                let catalog_service = &temp_namespace.context().catalog_service;
+                let view = catalog_service.table_view(&canonical_table)?;
+                let table_id = view.table_meta.as_ref()
+                    .ok_or_else(|| Error::Internal("table metadata missing".into()))?
+                    .table_id;
+                
+                // Perform validation
+                Self::validate_alter_table_operation(&plan.operation, &view, table_id, catalog_service)?;
+                
+                // Execute the ALTER TABLE operation
+                match &plan.operation {
+                    llkv_plan::AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                        temp_namespace.context().rename_column(&plan.table_name, old_column_name, new_column_name)?;
+                        Ok(RuntimeStatementResult::NoOp)
+                    },
+                    llkv_plan::AlterTableOperation::SetColumnDataType { column_name, new_data_type } => {
+                        temp_namespace.context().alter_column_type(&plan.table_name, column_name, new_data_type)?;
+                        Ok(RuntimeStatementResult::NoOp)
+                    },
+                    llkv_plan::AlterTableOperation::DropColumn { column_name, if_exists: _, cascade: _ } => {
+                        temp_namespace.context().drop_column(&plan.table_name, column_name)?;
+                        Ok(RuntimeStatementResult::NoOp)
+                    },
+                }
+            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+                let catalog_service = &self.persistent_namespace().context().catalog_service;
+                let view = catalog_service.table_view(&canonical_table)?;
+                let table_id = view.table_meta.as_ref()
+                    .ok_or_else(|| Error::Internal("table metadata missing".into()))?
+                    .table_id;
+                
+                // Perform validation
+                Self::validate_alter_table_operation(&plan.operation, &view, table_id, catalog_service)?;
+                
+                // Execute the ALTER TABLE operation
+                match &plan.operation {
+                    llkv_plan::AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                        self.persistent_namespace()
+                            .context()
+                            .rename_column(&plan.table_name, old_column_name, new_column_name)?;
+                        Ok(RuntimeStatementResult::NoOp)
+                    },
+                    llkv_plan::AlterTableOperation::SetColumnDataType { column_name, new_data_type } => {
+                        self.persistent_namespace()
+                            .context()
+                            .alter_column_type(&plan.table_name, column_name, new_data_type)?;
+                        Ok(RuntimeStatementResult::NoOp)
+                    },
+                    llkv_plan::AlterTableOperation::DropColumn { column_name, if_exists: _, cascade: _ } => {
+                        self.persistent_namespace()
+                            .context()
+                            .drop_column(&plan.table_name, column_name)?;
+                        Ok(RuntimeStatementResult::NoOp)
+                    },
+                }
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
+        }
+    }
+    
+    /// Helper method to validate ALTER TABLE operations against foreign key constraints.
+    /// This is generic over the pager type to work with both temporary and persistent namespaces.
+    fn validate_alter_table_operation<PagerType>(
+        operation: &llkv_plan::AlterTableOperation,
+        view: &TableView,
+        table_id: TableId,
+        catalog_service: &llkv_table::CatalogManager<PagerType>,
+    ) -> Result<()>
+    where
+        PagerType: Pager<Blob = EntryHandle> + Send + Sync,
+    {
+        match operation {
             llkv_plan::AlterTableOperation::RenameColumn { old_column_name, new_column_name: _ } => {
                 // Check if column is involved in any foreign key constraint
                 let old_col_lower = old_column_name.to_ascii_lowercase();
+                
+                // Check foreign keys defined on this table (where this table is the referencing table)
                 for fk in &view.foreign_keys {
                     // Check if column is a referencing column (in this table)
                     for ref_col in &fk.referencing_column_names {
@@ -887,49 +970,110 @@ where
                             )));
                         }
                     }
-                    // Check if column is a referenced column (referenced by other tables)
-                    if fk.referenced_table_canonical == canonical_table {
-                        for ref_col in &fk.referenced_column_names {
-                            if ref_col.to_ascii_lowercase() == old_col_lower {
-                                return Err(Error::CatalogError(format!(
-                                    "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
-                                    old_column_name,
-                                    fk.constraint_name.as_ref().map(|s| s.as_str()).unwrap_or("unnamed")
-                                )));
-                            }
-                        }
-                    }
                 }
-            },
-            llkv_plan::AlterTableOperation::SetColumnDataType { column_name, new_data_type: _ } => {
-                // Check if column has PRIMARY KEY or UNIQUE constraint
-                let col_lower = column_name.to_ascii_lowercase();
                 
-                // Find the column by name
-                for col_meta in &view.column_metas {
-                    if let Some(meta) = col_meta {
-                        if let Some(name) = &meta.name {
-                            if name.to_ascii_lowercase() == col_lower {
-                                // TODO: Check constraint records properly
-                                // For now, reject if column name matches common PK pattern
-                                if col_lower == "id" || name.ends_with("_id") {
-                                    // This is a heuristic - we need better constraint metadata access
-                                    return Err(Error::InvalidArgumentError(format!(
-                                        "Binder Error: Cannot change the type of a column that has a UNIQUE or PRIMARY KEY constraint specified (column '{}')",
-                                        column_name
+                // Check foreign keys that reference this table (where this table is the referenced table)
+                let referencing_fks = catalog_service.foreign_keys_referencing(table_id)?;
+                for (referencing_table_id, _constraint_id) in referencing_fks {
+                    // Get the foreign key details for this referencing table
+                    let referencing_table_fks = catalog_service.foreign_key_views_for_table(referencing_table_id)?;
+                    
+                    for fk in referencing_table_fks {
+                        if fk.referenced_table_id == table_id {
+                            // Check if the column being renamed is referenced by this FK
+                            for ref_col in &fk.referenced_column_names {
+                                if ref_col.to_ascii_lowercase() == old_col_lower {
+                                    return Err(Error::CatalogError(format!(
+                                        "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
+                                        old_column_name,
+                                        fk.constraint_name.as_ref().map(|s| s.as_str()).unwrap_or("unnamed")
                                     )));
                                 }
-                                break;
                             }
                         }
                     }
                 }
+                Ok(())
+            },
+            llkv_plan::AlterTableOperation::SetColumnDataType { column_name, new_data_type: _ } => {
+                let col_lower = column_name.to_ascii_lowercase();
+
+                // Resolve the column's field id so constraint metadata can be inspected precisely.
+                let mut column_field_id: Option<FieldId> = None;
+                for meta_opt in &view.column_metas {
+                    if let Some(meta) = meta_opt {
+                        if meta
+                            .name
+                            .as_ref()
+                            .map(|name| name.eq_ignore_ascii_case(column_name))
+                            .unwrap_or(false)
+                        {
+                            column_field_id = Some(meta.col_id);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(field_id) = column_field_id {
+                    let violates_key_constraint = view
+                        .constraint_records
+                        .iter()
+                        .filter(|record| record.is_active())
+                        .any(|record| match &record.kind {
+                            ConstraintKind::PrimaryKey(payload) => payload.field_ids.contains(&field_id),
+                            ConstraintKind::Unique(payload) => payload.field_ids.contains(&field_id),
+                            _ => false,
+                        });
+
+                    if violates_key_constraint {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Binder Error: Cannot change the type of a column that has a UNIQUE or PRIMARY KEY constraint specified (column '{}')",
+                            column_name
+                        )));
+                    }
+                }
+
+                // Check if column is involved in any foreign key constraint
+                // Check foreign keys defined on this table (where this table is the referencing table)
+                for fk in &view.foreign_keys {
+                    for ref_col in &fk.referencing_column_names {
+                        if ref_col.to_ascii_lowercase() == col_lower {
+                            return Err(Error::CatalogError(format!(
+                                "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
+                                column_name,
+                                fk.constraint_name.as_ref().map(|s| s.as_str()).unwrap_or("unnamed")
+                            )));
+                        }
+                    }
+                }
+
+                // Check foreign keys that reference this table (where this table is the referenced table)
+                let referencing_fks = catalog_service.foreign_keys_referencing(table_id)?;
+                for (referencing_table_id, _constraint_id) in referencing_fks {
+                    let referencing_table_fks = catalog_service.foreign_key_views_for_table(referencing_table_id)?;
+
+                    for fk in referencing_table_fks {
+                        if fk.referenced_table_id == table_id {
+                            for ref_col in &fk.referenced_column_names {
+                                if ref_col.to_ascii_lowercase() == col_lower {
+                                    return Err(Error::CatalogError(format!(
+                                        "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
+                                        column_name,
+                                        fk.constraint_name.as_ref().map(|s| s.as_str()).unwrap_or("unnamed")
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
             },
             llkv_plan::AlterTableOperation::DropColumn { column_name, if_exists: _, cascade: _ } => {
                 // Check if column is involved in any constraint
                 let col_lower = column_name.to_ascii_lowercase();
                 
-                // Check FK constraints
+                // Check FK constraints defined on this table (where this table is the referencing table)
                 for fk in &view.foreign_keys {
                     for ref_col in &fk.referencing_column_names {
                         if ref_col.to_ascii_lowercase() == col_lower {
@@ -939,39 +1083,27 @@ where
                             )));
                         }
                     }
-                    if fk.referenced_table_canonical == canonical_table {
-                        for ref_col in &fk.referenced_column_names {
-                            if ref_col.to_ascii_lowercase() == col_lower {
-                                return Err(Error::CatalogError(format!(
-                                    "Catalog Error: there is a UNIQUE constraint that depends on it (column '{}')",
-                                    column_name
-                                )));
+                }
+                
+                // Check foreign keys that reference this table (where this table is the referenced table)
+                let referencing_fks = catalog_service.foreign_keys_referencing(table_id)?;
+                for (referencing_table_id, _constraint_id) in referencing_fks {
+                    let referencing_table_fks = catalog_service.foreign_key_views_for_table(referencing_table_id)?;
+                    
+                    for fk in referencing_table_fks {
+                        if fk.referenced_table_id == table_id {
+                            for ref_col in &fk.referenced_column_names {
+                                if ref_col.to_ascii_lowercase() == col_lower {
+                                    return Err(Error::CatalogError(format!(
+                                        "Catalog Error: there is a UNIQUE constraint that depends on it (column '{}')",
+                                        column_name
+                                    )));
+                                }
                             }
                         }
                     }
                 }
-            },
-        }
-        
-        // Execute the ALTER TABLE operation
-        match &plan.operation {
-            llkv_plan::AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
-                self.persistent_namespace()
-                    .context()
-                    .rename_column(&plan.table_name, old_column_name, new_column_name)?;
-                Ok(RuntimeStatementResult::NoOp)
-            },
-            llkv_plan::AlterTableOperation::SetColumnDataType { column_name, new_data_type } => {
-                self.persistent_namespace()
-                    .context()
-                    .alter_column_type(&plan.table_name, column_name, new_data_type)?;
-                Ok(RuntimeStatementResult::NoOp)
-            },
-            llkv_plan::AlterTableOperation::DropColumn { column_name, if_exists: _, cascade: _ } => {
-                self.persistent_namespace()
-                    .context()
-                    .drop_column(&plan.table_name, column_name)?;
-                Ok(RuntimeStatementResult::NoOp)
+                Ok(())
             },
         }
     }
@@ -1061,6 +1193,16 @@ where
                 other
             ))),
         }
+    }
+
+    // TODO: Implement
+    /// Drop an index. The runtime currently treats index drops as metadata no-ops
+    /// because index registration is limited to sort/unique markers without name tracking.
+    ///
+    /// Once index catalog entries carry stable identifiers we should plumb explicit
+    /// drop support through the storage namespaces.
+    pub fn drop_index(&self, _index_name: &str, _if_exists: bool) -> Result<()> {
+        Ok(())
     }
 
     fn normalize_insert_plan(&self, plan: InsertPlan) -> Result<(InsertPlan, usize)> {
@@ -2030,6 +2172,7 @@ where
             source,
             namespace: _,
             foreign_keys,
+            multi_column_uniques,
         } = plan;
 
         tracing::trace!(
@@ -2109,6 +2252,7 @@ where
                 canonical_name,
                 columns,
                 foreign_keys,
+                multi_column_uniques,
                 if_not_exists,
             ),
         }
@@ -2771,6 +2915,7 @@ where
         canonical_name: String,
         columns: Vec<ColumnSpec>,
         foreign_keys: Vec<ForeignKeySpec>,
+        multi_column_uniques: Vec<MultiColumnUniqueSpec>,
         if_not_exists: bool,
     ) -> Result<RuntimeStatementResult<P>> {
         tracing::trace!(
@@ -2915,11 +3060,18 @@ where
                         })
                         .collect();
 
+                    // Get multi-column unique constraints for this table
+                    let multi_column_uniques = self
+                        .catalog_service
+                        .table_view(&canonical)?
+                        .multi_column_uniques;
+
                     Ok(ForeignKeyTableInfo {
                         display_name: display,
                         canonical_name: canonical,
                         table_id: referenced_table.table.table_id(),
                         columns,
+                        multi_column_uniques,
                     })
                 },
                 current_time_micros(),
@@ -2933,6 +3085,50 @@ where
                     .drop_table(&canonical_name, table_id, &field_ids);
                 self.remove_table_entry(&canonical_name);
                 return Err(err);
+            }
+        }
+
+        // Register multi-column unique constraints
+        if !multi_column_uniques.is_empty() {
+            // Build column name to field_id lookup
+            let column_lookup: FxHashMap<String, FieldId> = table_columns
+                .iter()
+                .map(|col| (col.name.to_ascii_lowercase(), col.field_id))
+                .collect();
+
+            for unique_spec in &multi_column_uniques {
+                // Map column names to field IDs
+                let field_ids: Result<Vec<FieldId>> = unique_spec
+                    .columns
+                    .iter()
+                    .map(|col_name| {
+                        let normalized = col_name.to_ascii_lowercase();
+                        column_lookup.get(&normalized).copied().ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "unknown column '{}' in UNIQUE constraint",
+                                col_name
+                            ))
+                        })
+                    })
+                    .collect();
+
+                let field_ids = field_ids?;
+
+                let registration_result = self.catalog_service.register_multi_column_unique_index(
+                    table_id,
+                    &field_ids,
+                    unique_spec.name.clone(),
+                );
+
+                if let Err(err) = registration_result {
+                    let field_ids: Vec<FieldId> =
+                        table_columns.iter().map(|column| column.field_id).collect();
+                    let _ = self
+                        .catalog_service
+                        .drop_table(&canonical_name, table_id, &field_ids);
+                    self.remove_table_entry(&canonical_name);
+                    return Err(err);
+                }
             }
         }
 

@@ -72,6 +72,15 @@ impl From<i32> for PlanValue {
 // CREATE TABLE Plan
 // ============================================================================
 
+/// Multi-column unique constraint specification.
+#[derive(Clone, Debug)]
+pub struct MultiColumnUniqueSpec {
+    /// Optional name for the unique constraint
+    pub name: Option<String>,
+    /// Column names participating in this UNIQUE constraint
+    pub columns: Vec<String>,
+}
+
 /// Plan for creating a table.
 #[derive(Clone, Debug)]
 pub struct CreateTablePlan {
@@ -83,6 +92,7 @@ pub struct CreateTablePlan {
     /// Optional storage namespace for the table.
     pub namespace: Option<String>,
     pub foreign_keys: Vec<ForeignKeySpec>,
+    pub multi_column_uniques: Vec<MultiColumnUniqueSpec>,
 }
 
 impl CreateTablePlan {
@@ -95,6 +105,7 @@ impl CreateTablePlan {
             source: None,
             namespace: None,
             foreign_keys: Vec::new(),
+            multi_column_uniques: Vec::new(),
         }
     }
 }
