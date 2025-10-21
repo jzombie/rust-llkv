@@ -234,7 +234,7 @@ pub trait TransactionContext: Send + Sync {
     fn execute_select(&self, plan: SelectPlan) -> LlkvResult<SelectExecution<Self::Pager>>;
 
     /// Create a table from plan
-    fn create_table_plan(
+    fn apply_create_table_plan(
         &self,
         plan: CreateTablePlan,
     ) -> LlkvResult<TransactionResult<Self::Pager>>;
@@ -518,15 +518,16 @@ where
                 let mut staging_plan = plan.clone();
                 staging_plan.foreign_keys.clear();
 
-                match self.staging.create_table_plan(staging_plan) {
+                match self.staging.apply_create_table_plan(staging_plan) {
                     Ok(result) => {
                         // Track new table so it's visible to subsequent operations in this transaction
                         self.new_tables.insert(plan.name.clone());
                         self.missing_tables.remove(&plan.name);
                         self.staged_tables.insert(plan.name.clone());
                         // Lock this table name for the duration of the transaction
-                        self.locked_table_names.insert(plan.name.to_ascii_lowercase());
-                        
+                        self.locked_table_names
+                            .insert(plan.name.to_ascii_lowercase());
+
                         // Track foreign key dependencies for DROP TABLE validation
                         for fk in &plan.foreign_keys {
                             let referenced_table = fk.referenced_table.to_ascii_lowercase();
@@ -535,7 +536,7 @@ where
                                 .or_insert_with(Vec::new)
                                 .push(plan.name.to_ascii_lowercase());
                         }
-                        
+
                         // Track for commit replay WITH original foreign keys
                         self.operations
                             .push(PlanOperation::CreateTable(plan.clone()));
@@ -549,10 +550,10 @@ where
             }
             PlanOperation::DropTable(ref plan) => {
                 let canonical_name = plan.name.to_ascii_lowercase();
-                
+
                 // Lock this table name for conflict detection (even if CREATE/DROP cancel out)
                 self.locked_table_names.insert(canonical_name.clone());
-                
+
                 // Check if the table was created in this transaction
                 let result = if self.new_tables.contains(&canonical_name) {
                     // Table was created in this transaction, so drop it from staging
@@ -560,14 +561,17 @@ where
                     self.staging.drop_table(&plan.name, plan.if_exists)?;
                     self.new_tables.remove(&canonical_name);
                     self.staged_tables.remove(&canonical_name);
-                    
+
                     // Remove FK constraints where this table was the referencing table
-                    self.transactional_foreign_keys.iter_mut().for_each(|(_, referencing_tables)| {
-                        referencing_tables.retain(|t| t != &canonical_name);
-                    });
+                    self.transactional_foreign_keys.iter_mut().for_each(
+                        |(_, referencing_tables)| {
+                            referencing_tables.retain(|t| t != &canonical_name);
+                        },
+                    );
                     // Clean up empty entries
-                    self.transactional_foreign_keys.retain(|_, referencing_tables| !referencing_tables.is_empty());
-                    
+                    self.transactional_foreign_keys
+                        .retain(|_, referencing_tables| !referencing_tables.is_empty());
+
                     // Remove the CREATE TABLE operation from the operation list
                     self.operations.retain(|op| {
                         !matches!(op, PlanOperation::CreateTable(p) if p.name.to_ascii_lowercase() == canonical_name)
@@ -585,7 +589,7 @@ where
                             plan.name
                         )));
                     }
-                    
+
                     if self.catalog_snapshot.table_exists(&canonical_name) {
                         // Mark as dropped so it's not visible in this transaction
                         self.missing_tables.insert(canonical_name.clone());
@@ -898,20 +902,17 @@ where
 
     /// Get column specifications for a table created in the current transaction.
     /// Returns `None` if there's no active transaction or the table wasn't created in it.
-    pub fn table_column_specs_from_transaction(
-        &self,
-        table_name: &str,
-    ) -> Option<Vec<ColumnSpec>> {
+    pub fn table_column_specs_from_transaction(&self, table_name: &str) -> Option<Vec<ColumnSpec>> {
         let guard = self
             .transactions
             .lock()
             .expect("transactions lock poisoned");
-        
+
         let tx = guard.get(&self.session_id)?;
         if !tx.new_tables.contains(table_name) {
             return None;
         }
-        
+
         // Get column specs from the staging context
         tx.staging.table_column_specs(table_name).ok()
     }
@@ -924,36 +925,39 @@ where
             .transactions
             .lock()
             .expect("transactions lock poisoned");
-        
+
         let tx = match guard.get(&self.session_id) {
             Some(tx) => tx,
             None => return Vec::new(),
         };
-        
+
         tx.transactional_foreign_keys
             .get(&canonical)
             .cloned()
             .unwrap_or_else(Vec::new)
     }
-    
+
     /// Check if a table is locked by another active session's transaction.
     /// Returns true if ANY other session has this table in their locked_table_names.
     pub fn has_table_locked_by_other_session(&self, table_name: &str) -> bool {
         let canonical = table_name.to_ascii_lowercase();
-        let guard = self.transactions.lock().expect("transactions lock poisoned");
-        
+        let guard = self
+            .transactions
+            .lock()
+            .expect("transactions lock poisoned");
+
         for (session_id, tx) in guard.iter() {
             // Skip our own session
             if *session_id == self.session_id {
                 continue;
             }
-            
+
             // Check if this other session has the table locked
             if tx.locked_table_names.contains(&canonical) {
                 return true;
             }
         }
-        
+
         false
     }
 
@@ -1195,9 +1199,9 @@ where
                 .transactions
                 .lock()
                 .expect("transactions lock poisoned");
-            
+
             let canonical_name = plan.name.to_ascii_lowercase();
-            
+
             // Check if another session has this table locked in their transaction
             for (other_session_id, other_tx) in guard.iter() {
                 if *other_session_id != self.session_id {
@@ -1211,16 +1215,16 @@ where
             }
             drop(guard); // Release lock before continuing
         }
-        
+
         // Also check DROP TABLE for conflicts
         if let PlanOperation::DropTable(ref plan) = operation {
             let guard = self
                 .transactions
                 .lock()
                 .expect("transactions lock poisoned");
-            
+
             let canonical_name = plan.name.to_ascii_lowercase();
-            
+
             // Check if another session has this table locked in their transaction
             for (other_session_id, other_tx) in guard.iter() {
                 if *other_session_id != self.session_id {

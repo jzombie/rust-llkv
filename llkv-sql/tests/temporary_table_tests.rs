@@ -156,7 +156,7 @@ fn temporary_tables_allow_inserts_after_unique_index() {
 
     let result = engine
         .session()
-        .insert(insert_plan)
+        .execute_insert_plan(insert_plan)
         .expect("insert now succeeds after catalog synchronization fix");
 
     assert!(

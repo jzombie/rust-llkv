@@ -21,9 +21,6 @@ pub(crate) use table_catalog::TableMetadataView;
 
 // Re-export CatalogManager (formerly CatalogService)
 pub use manager::{
-    CatalogManager,
-    CreateTableResult,
-    MvccColumnBuilder,
-    SingleColumnIndexDescriptor,
+    CatalogManager, CreateTableResult, MvccColumnBuilder, SingleColumnIndexDescriptor,
     SingleColumnIndexRegistration,
 };

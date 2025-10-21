@@ -341,7 +341,7 @@ where
         // Get all column metas for this table
         let (_, field_ids) = self.sorted_user_fields(table_id);
         let column_metas = self.metadata.column_metas(table_id, &field_ids)?;
-        
+
         // Find the column by old name
         let mut found_col: Option<(u32, ColMeta)> = None;
         for (idx, meta_opt) in column_metas.iter().enumerate() {
@@ -354,33 +354,30 @@ where
                 }
             }
         }
-        
+
         let (_field_id, mut col_meta) = found_col.ok_or_else(|| {
-            Error::InvalidArgumentError(format!(
-                "column '{}' not found in table",
-                old_column_name
-            ))
+            Error::InvalidArgumentError(format!("column '{}' not found in table", old_column_name))
         })?;
-        
+
         // Update the column name
         col_meta.name = Some(new_column_name.to_string());
-        
+
         // Save to catalog
         let catalog = SysCatalog::new(&self.store);
         catalog.put_col_meta(table_id, &col_meta);
-        
+
         // Update metadata manager cache
         self.metadata.set_column_meta(table_id, col_meta)?;
-        
+
         Ok(())
     }
 
     /// Alter the data type of a column.
-    /// 
+    ///
     /// This updates both the column metadata and the storage layer's data type fingerprint.
     /// Note that actual data conversion is NOT performed - the caller must ensure that
     /// existing data is compatible with the new type (or that no data exists).
-    /// 
+    ///
     /// # Arguments
     /// * `table_id` - The table containing the column
     /// * `column_name` - Name of the column to alter
@@ -394,7 +391,7 @@ where
         // Get all column metas for this table
         let (logical_fields, field_ids) = self.sorted_user_fields(table_id);
         let column_metas = self.metadata.column_metas(table_id, &field_ids)?;
-        
+
         // Find the column by name
         let mut found_col: Option<(usize, u32, ColMeta)> = None;
         for (idx, meta_opt) in column_metas.iter().enumerate() {
@@ -407,38 +404,31 @@ where
                 }
             }
         }
-        
+
         let (col_idx, _field_id, col_meta) = found_col.ok_or_else(|| {
-            Error::InvalidArgumentError(format!(
-                "column '{}' not found in table",
-                column_name
-            ))
+            Error::InvalidArgumentError(format!("column '{}' not found in table", column_name))
         })?;
-        
+
         // Update the data type in the storage layer
         let lfid = logical_fields[col_idx];
         self.store.update_data_type(lfid, new_data_type)?;
-        
+
         // Save metadata to catalog
         let catalog = SysCatalog::new(&self.store);
         catalog.put_col_meta(table_id, &col_meta);
-        
+
         // Update metadata manager cache
         self.metadata.set_column_meta(table_id, col_meta)?;
-        
+
         Ok(())
     }
 
     /// Drop a column from a table by removing its metadata.
-    pub fn drop_column(
-        &self,
-        table_id: TableId,
-        column_name: &str,
-    ) -> LlkvResult<()> {
+    pub fn drop_column(&self, table_id: TableId, column_name: &str) -> LlkvResult<()> {
         // Get all column metas for this table
         let (_, field_ids) = self.sorted_user_fields(table_id);
         let column_metas = self.metadata.column_metas(table_id, &field_ids)?;
-        
+
         // Find the column by name
         let mut found_col_id: Option<u32> = None;
         for (idx, meta_opt) in column_metas.iter().enumerate() {
@@ -451,18 +441,15 @@ where
                 }
             }
         }
-        
+
         let col_id = found_col_id.ok_or_else(|| {
-            Error::InvalidArgumentError(format!(
-                "column '{}' not found in table",
-                column_name
-            ))
+            Error::InvalidArgumentError(format!("column '{}' not found in table", column_name))
         })?;
-        
+
         // Delete from catalog
         let catalog = SysCatalog::new(&self.store);
         catalog.delete_col_meta(table_id, &[col_id])?;
-        
+
         Ok(())
     }
 
@@ -503,9 +490,11 @@ where
             )));
         }
 
-    let index_display_name = match index_name {
+        let index_display_name = match index_name {
             Some(name) => name,
-            None => self.generate_single_column_index_name(table_id, canonical_name, column_name)?,
+            None => {
+                self.generate_single_column_index_name(table_id, canonical_name, column_name)?
+            }
         };
         if index_display_name.is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -655,13 +644,9 @@ where
             }
 
             candidate = format!("{}_{}_idx{}", table_token, column_token, suffix);
-            suffix = suffix
-                .checked_add(1)
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "exhausted unique index name generation space".into(),
-                    )
-                })?;
+            suffix = suffix.checked_add(1).ok_or_else(|| {
+                Error::InvalidArgumentError("exhausted unique index name generation space".into())
+            })?;
         }
     }
 
@@ -1027,13 +1012,19 @@ where
 
     /// Returns all foreign keys that reference the specified table.
     /// Returns a vector of (referencing_table_id, constraint_id) pairs.
-    pub fn foreign_keys_referencing(&self, referenced_table_id: TableId) -> LlkvResult<Vec<(TableId, ConstraintId)>> {
+    pub fn foreign_keys_referencing(
+        &self,
+        referenced_table_id: TableId,
+    ) -> LlkvResult<Vec<(TableId, ConstraintId)>> {
         self.metadata.foreign_keys_referencing(referenced_table_id)
     }
 
     /// Returns detailed foreign key views for a specific table.
     /// This includes foreign keys where the specified table is the referencing table.
-    pub fn foreign_key_views_for_table(&self, table_id: TableId) -> LlkvResult<Vec<ForeignKeyView>> {
+    pub fn foreign_key_views_for_table(
+        &self,
+        table_id: TableId,
+    ) -> LlkvResult<Vec<ForeignKeyView>> {
         self.metadata.foreign_key_views(&self.catalog, table_id)
     }
 }

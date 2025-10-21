@@ -14,12 +14,12 @@ use crate::constraints::{
 use crate::constraints::{ForeignKeyTableInfo, ValidatedForeignKey, validate_foreign_keys};
 use crate::reserved;
 use crate::resolvers::resolve_table_name;
+use crate::sys_catalog::SingleColumnIndexEntryMeta;
 use crate::sys_catalog::{ConstraintNameRecord, SysCatalog};
 use crate::table::Table;
 use crate::types::{FieldId, TableColumn, TableId};
 use crate::view::{ForeignKeyView, TableView};
 use crate::{ColMeta, MultiColumnUniqueEntryMeta, TableMeta, TableMultiColumnUniqueMeta};
-use crate::sys_catalog::SingleColumnIndexEntryMeta;
 use arrow::datatypes::DataType;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::IndexKind;

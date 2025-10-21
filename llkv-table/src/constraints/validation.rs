@@ -657,26 +657,27 @@ where
             }
         } else {
             // Multiple columns: check if they form a multi-column PRIMARY KEY or UNIQUE constraint
-            
+
             // First check if all columns have primary_key = true (multi-column PRIMARY KEY)
-            let all_primary_key = referenced_column_defs
-                .iter()
-                .all(|col| col.primary_key);
-            
+            let all_primary_key = referenced_column_defs.iter().all(|col| col.primary_key);
+
             // Also check if they form a multi-column UNIQUE constraint
-            let has_multi_column_unique = referenced_table_info
-                .multi_column_uniques
-                .iter()
-                .any(|unique_entry| {
-                    // Check if this unique constraint matches our referenced columns
-                    if unique_entry.column_ids.len() != referenced_field_ids.len() {
-                        return false;
-                    }
-                    // Check if all field IDs match (order-independent)
-                    let unique_set: FxHashSet<_> = unique_entry.column_ids.iter().copied().collect();
-                    let referenced_set: FxHashSet<_> = referenced_field_ids.iter().copied().collect();
-                    unique_set == referenced_set
-                });
+            let has_multi_column_unique =
+                referenced_table_info
+                    .multi_column_uniques
+                    .iter()
+                    .any(|unique_entry| {
+                        // Check if this unique constraint matches our referenced columns
+                        if unique_entry.column_ids.len() != referenced_field_ids.len() {
+                            return false;
+                        }
+                        // Check if all field IDs match (order-independent)
+                        let unique_set: FxHashSet<_> =
+                            unique_entry.column_ids.iter().copied().collect();
+                        let referenced_set: FxHashSet<_> =
+                            referenced_field_ids.iter().copied().collect();
+                        unique_set == referenced_set
+                    });
 
             if !all_primary_key && !has_multi_column_unique {
                 return Err(Error::InvalidArgumentError(format!(

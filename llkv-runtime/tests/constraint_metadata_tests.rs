@@ -83,7 +83,7 @@ fn foreign_key_views_reload_from_metadata() {
         });
 
         match context
-            .create_table_plan(plan)
+            .apply_create_table_plan(plan)
             .expect("create children table with foreign key")
         {
             RuntimeStatementResult::CreateTable { .. } => {}

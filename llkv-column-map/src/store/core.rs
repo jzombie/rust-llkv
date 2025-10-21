@@ -161,13 +161,15 @@ where
     /// # Errors
     ///
     /// Returns an error if the column doesn't exist or if the descriptor update fails.
-    pub fn update_data_type(&self, field_id: LogicalFieldId, new_data_type: &DataType) -> Result<()> {
+    pub fn update_data_type(
+        &self,
+        field_id: LogicalFieldId,
+        new_data_type: &DataType,
+    ) -> Result<()> {
         // Get the descriptor physical key from catalog
         let descriptor_pk = {
             let catalog = self.catalog.read().unwrap();
-            *catalog.map.get(&field_id).ok_or_else(|| {
-                Error::NotFound
-            })?
+            *catalog.map.get(&field_id).ok_or_else(|| Error::NotFound)?
         };
 
         // Load the existing descriptor

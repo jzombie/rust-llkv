@@ -75,7 +75,7 @@ constraint-specific logic.
 - `table_column_specs`, `table_view`, and `foreign_key_views` forward to catalog service.
 - Lazy table loading (`lookup_table`) uses `table_constraint_summary` to rebuild executor
   schemas, ensuring constraint flags are derived from persisted records.
-- `RuntimeCreateTableBuilder` / `create_table_plan` route CREATE TABLE + FK registration
+- `RuntimeCreateTableBuilder` / `apply_create_table_plan` route CREATE TABLE + FK registration
   through catalog service, keeping metadata writes inside `llkv-table`.
 
 This split lets the runtime focus on execution and transaction orchestration.

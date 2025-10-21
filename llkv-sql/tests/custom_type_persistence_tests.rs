@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::SimdRDrivePager;
+use std::sync::Arc;
 
 #[test]
 fn test_custom_type_persistence_across_restarts() {
@@ -31,9 +31,7 @@ fn test_custom_type_persistence_across_restarts() {
         assert_eq!(results.len(), 1);
 
         // Verify data
-        let results = engine
-            .execute("SELECT * FROM users;")
-            .expect("select data");
+        let results = engine.execute("SELECT * FROM users;").expect("select data");
         assert_eq!(results.len(), 1);
     }
     // Drop engine to close the database
@@ -57,9 +55,7 @@ fn test_custom_type_persistence_across_restarts() {
 
         // Drop the table and type
         engine.execute("DROP TABLE users;").expect("drop table");
-        engine
-            .execute("DROP TYPE user_id;")
-            .expect("drop type");
+        engine.execute("DROP TYPE user_id;").expect("drop type");
     }
     // Drop engine to close the database
 

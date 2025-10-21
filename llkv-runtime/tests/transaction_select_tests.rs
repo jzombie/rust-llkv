@@ -24,8 +24,9 @@ fn test_transaction_select() {
         source: None,
         namespace: None,
         foreign_keys: Vec::new(),
+        multi_column_uniques: Vec::new(),
     };
-    session.create_table_plan(create_plan).unwrap();
+    session.execute_create_table_plan(create_plan).unwrap();
 
     // Insert data
     let insert_plan = InsertPlan {
@@ -36,7 +37,7 @@ fn test_transaction_select() {
             vec![PlanValue::Integer(2), PlanValue::String("Bob".into())],
         ]),
     };
-    session.insert(insert_plan).unwrap();
+    session.execute_insert_plan(insert_plan).unwrap();
 
     // Begin transaction
     session.begin_transaction().unwrap();
@@ -50,11 +51,11 @@ fn test_transaction_select() {
             PlanValue::String("Charlie".into()),
         ]]),
     };
-    session.insert(insert_plan2).unwrap();
+    session.execute_insert_plan(insert_plan2).unwrap();
 
     // Select all rows (should see 3)
     let select_plan = SelectPlan::new("users");
-    let result1 = session.select(select_plan).unwrap();
+    let result1 = session.execute_select_plan(select_plan).unwrap();
 
     if let RuntimeStatementResult::Select { execution, .. } = result1 {
         let batches = execution.collect().unwrap();
@@ -69,7 +70,7 @@ fn test_transaction_select() {
 
     // Select again (should see only 2 - Charlie should be gone)
     let select_plan2 = SelectPlan::new("users");
-    let result2 = session.select(select_plan2).unwrap();
+    let result2 = session.execute_select_plan(select_plan2).unwrap();
 
     if let RuntimeStatementResult::Select { execution, .. } = result2 {
         let batches = execution.collect().unwrap();
@@ -98,8 +99,9 @@ fn test_transaction_select_with_aggregates() {
         source: None,
         namespace: None,
         foreign_keys: Vec::new(),
+        multi_column_uniques: Vec::new(),
     };
-    session.create_table_plan(create_plan).unwrap();
+    session.execute_create_table_plan(create_plan).unwrap();
 
     // Insert data
     let insert_plan = InsertPlan {
@@ -110,7 +112,7 @@ fn test_transaction_select_with_aggregates() {
             vec![PlanValue::Integer(2), PlanValue::Integer(200)],
         ]),
     };
-    session.insert(insert_plan).unwrap();
+    session.execute_insert_plan(insert_plan).unwrap();
 
     // Begin transaction
     session.begin_transaction().unwrap();
@@ -121,12 +123,12 @@ fn test_transaction_select_with_aggregates() {
         columns: vec![],
         source: InsertSource::Rows(vec![vec![PlanValue::Integer(3), PlanValue::Integer(300)]]),
     };
-    session.insert(insert_plan2).unwrap();
+    session.execute_insert_plan(insert_plan2).unwrap();
 
     // SELECT with aggregate within transaction should see all 3 rows
     let select_plan = SelectPlan::new("products")
         .with_aggregates(vec![AggregateExpr::sum_int64("price", "total_price")]);
-    let result = session.select(select_plan).unwrap();
+    let result = session.execute_select_plan(select_plan).unwrap();
 
     if let RuntimeStatementResult::Select { execution, .. } = result {
         let batches = execution.collect().unwrap();
@@ -149,7 +151,7 @@ fn test_transaction_select_with_aggregates() {
     // SELECT after rollback should only see first 2 rows
     let select_plan2 = SelectPlan::new("products")
         .with_aggregates(vec![AggregateExpr::sum_int64("price", "total_price")]);
-    let result2 = session.select(select_plan2).unwrap();
+    let result2 = session.execute_select_plan(select_plan2).unwrap();
 
     if let RuntimeStatementResult::Select { execution, .. } = result2 {
         let batches = execution.collect().unwrap();

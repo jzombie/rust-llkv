@@ -18,7 +18,7 @@ use llkv_runtime::storage_namespace::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan, CreateTablePlan,
     CreateTableSource, DeletePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan,
-    InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanStatement, 
+    InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanStatement,
     PlanValue, RuntimeContext, RuntimeEngine, RuntimeSession, RuntimeStatementResult, SelectPlan,
     SelectProjection, UpdatePlan, extract_rows_from_range,
 };
@@ -27,15 +27,14 @@ use llkv_table::catalog::{IdentifierContext, IdentifierResolver};
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
-    AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, BeginTransactionKind, 
-    BinaryOperator, ColumnOption, ColumnOptionDef, ConstraintCharacteristics, 
-    DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable, 
-    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, 
-    NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType, OrderBy, OrderByKind, Query, 
-    ReferentialAction, SchemaName, Select, SelectItem, SelectItemQualifiedWildcardKind, Set, 
-    SetExpr, SqlOption, Statement, TableConstraint,
-    TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
-    UpdateTableFromKind, Value, ValueWithSpan,
+    AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, BeginTransactionKind,
+    BinaryOperator, ColumnOption, ColumnOptionDef, ConstraintCharacteristics,
+    DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, NullsDistinctOption,
+    ObjectName, ObjectNamePart, ObjectType, OrderBy, OrderByKind, Query, ReferentialAction,
+    SchemaName, Select, SelectItem, SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption,
+    Statement, TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionMode,
+    TransactionModifier, UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -182,19 +181,16 @@ where
 
         // Match: CREATE TYPE name AS datatype
         let create_re = CREATE_TYPE_REGEX.get_or_init(|| {
-            Regex::new(r"(?i)\bCREATE\s+TYPE\s+")
-                .expect("valid CREATE TYPE regex")
+            Regex::new(r"(?i)\bCREATE\s+TYPE\s+").expect("valid CREATE TYPE regex")
         });
 
         // Match: DROP TYPE [IF EXISTS] name
-        let drop_re = DROP_TYPE_REGEX.get_or_init(|| {
-            Regex::new(r"(?i)\bDROP\s+TYPE\s+")
-                .expect("valid DROP TYPE regex")
-        });
+        let drop_re = DROP_TYPE_REGEX
+            .get_or_init(|| Regex::new(r"(?i)\bDROP\s+TYPE\s+").expect("valid DROP TYPE regex"));
 
         // First replace CREATE TYPE with CREATE DOMAIN
         let sql = create_re.replace_all(sql, "CREATE DOMAIN ").to_string();
-        
+
         // Then replace DROP TYPE with DROP DOMAIN
         drop_re.replace_all(&sql, "DROP DOMAIN ").to_string()
     }
@@ -225,10 +221,8 @@ where
 
         // Pattern to match trailing comma before closing paren in VALUES
         // Matches: , followed by optional whitespace and )
-        let re = TRAILING_COMMA_REGEX.get_or_init(|| {
-            Regex::new(r",(\s*)\)")
-                .expect("valid trailing comma regex")
-        });
+        let re = TRAILING_COMMA_REGEX
+            .get_or_init(|| Regex::new(r",(\s*)\)").expect("valid trailing comma regex"));
 
         re.replace_all(sql, "$1)").to_string()
     }
@@ -1465,7 +1459,7 @@ where
 
         // Parse view name (same as table parsing)
         let (schema_name, view_name) = parse_schema_qualified_name(&name)?;
-        
+
         // Validate schema exists if specified
         if let Some(ref schema) = schema_name {
             let catalog = self.engine.context().table_catalog();
@@ -1483,7 +1477,7 @@ where
             None => view_name.clone(),
         };
         let canonical_name = display_name.to_ascii_lowercase();
-        
+
         // Check if view already exists
         let catalog = self.engine.context().table_catalog();
         if catalog.table_exists(&canonical_name) {
@@ -1516,10 +1510,10 @@ where
 
         // Extract the type alias name
         let type_name = create_domain.name.to_string();
-        
+
         // Convert the data type to SQL string for persistence
         let base_type_sql = create_domain.data_type.to_string();
-        
+
         // Register the type alias in the runtime context (in-memory)
         self.engine
             .context()
@@ -1528,18 +1522,18 @@ where
         // Persist to catalog
         let context = self.engine.context();
         let catalog = llkv_table::SysCatalog::new(context.store());
-        
+
         let created_at_micros = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-        
+
         let meta = CustomTypeMeta {
             name: type_name.clone(),
             base_type_sql,
             created_at_micros,
         };
-        
+
         catalog.put_custom_type_meta(&meta)?;
 
         tracing::debug!("Created and persisted type alias: {}", type_name);
@@ -1552,10 +1546,10 @@ where
     ) -> SqlResult<RuntimeStatementResult<P>> {
         let if_exists = drop_domain.if_exists;
         let type_name = drop_domain.name.to_string();
-        
+
         // Drop the type from the registry (in-memory)
         let result = self.engine.context().drop_type(&type_name);
-        
+
         if let Err(err) = result {
             if !if_exists {
                 return Err(err);
@@ -1566,7 +1560,7 @@ where
             let context = self.engine.context();
             let catalog = llkv_table::SysCatalog::new(context.store());
             catalog.delete_custom_type_meta(&type_name)?;
-            
+
             tracing::debug!("Dropped and removed from catalog type alias: {}", type_name);
         }
 
@@ -2021,7 +2015,7 @@ where
         or_replace: bool,
         namespace: Option<String>,
     ) -> SqlResult<RuntimeStatementResult<P>> {
-        use arrow::array::{ArrayRef, StringBuilder, Int64Builder, Float64Builder};
+        use arrow::array::{ArrayRef, Float64Builder, Int64Builder, StringBuilder};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use std::sync::Arc;
@@ -2033,7 +2027,7 @@ where
         }
 
         let num_cols = column_names.len();
-        
+
         // Infer schema from first row
         let first_row = &rows[0];
         if first_row.len() != num_cols {
@@ -2058,7 +2052,7 @@ where
                     )));
                 }
             };
-            
+
             column_types.push(data_type.clone());
             fields.push(Field::new(&column_names[idx], data_type, nullable));
         }
@@ -2067,10 +2061,10 @@ where
 
         // Build Arrow arrays for each column
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(num_cols);
-        
+
         for col_idx in 0..num_cols {
             let col_type = &column_types[col_idx];
-            
+
             match col_type {
                 DataType::Int64 => {
                     let mut builder = Int64Builder::with_capacity(rows.len());
@@ -2129,8 +2123,9 @@ where
             }
         }
 
-        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
-            .map_err(|e| Error::Internal(format!("failed to create RecordBatch from VALUES: {}", e)))?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).map_err(|e| {
+            Error::Internal(format!("failed to create RecordBatch from VALUES: {}", e))
+        })?;
 
         let plan = CreateTablePlan {
             name: display_name.clone(),
@@ -2145,7 +2140,7 @@ where
             foreign_keys: Vec::new(),
             multi_column_uniques: Vec::new(),
         };
-        
+
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
     }
 
@@ -2453,26 +2448,13 @@ where
                     ));
                 }
 
-                let session = self.engine.session();
-                
-                // If we're in a transaction, use PlanOperation for transactional handling
-                if session.has_active_transaction() {
-                    for name in names {
-                        let table_name = Self::object_name_to_string(&name)?;
-                        let mut plan = llkv_plan::DropTablePlan::new(table_name.clone());
-                        plan.if_exists = if_exists;
-                        
-                        let plan_statement = llkv_plan::PlanStatement::DropTable(plan);
-                        self.execute_plan_statement(plan_statement)?;
-                    }
-                } else {
-                    // Auto-commit mode: drop directly
-                    for name in names {
-                        let table_name = Self::object_name_to_string(&name)?;
-                        session
-                            .drop_table(&table_name, if_exists)
-                            .map_err(|err| Self::map_table_error(&table_name, err))?;
-                    }
+                for name in names {
+                    let table_name = Self::object_name_to_string(&name)?;
+                    let mut plan = llkv_plan::DropTablePlan::new(table_name.clone());
+                    plan.if_exists = if_exists;
+
+                    self.execute_plan_statement(llkv_plan::PlanStatement::DropTable(plan))
+                        .map_err(|err| Self::map_table_error(&table_name, err))?;
                 }
 
                 Ok(RuntimeStatementResult::NoOp)
@@ -2486,9 +2468,8 @@ where
 
                 for name in names {
                     let index_name = Self::object_name_to_string(&name)?;
-                    self.engine
-                        .session()
-                        .drop_index(&index_name, if_exists)?;
+                    let plan = llkv_plan::DropIndexPlan::new(index_name).if_exists(if_exists);
+                    self.execute_plan_statement(llkv_plan::PlanStatement::DropIndex(plan))?;
                 }
 
                 Ok(RuntimeStatementResult::NoOp)
@@ -2520,10 +2501,13 @@ where
                         let all_tables = catalog.table_names();
                         let schema_prefix = format!("{}.", canonical_name);
 
-                        let ctx = self.engine.context();
                         for table in all_tables {
                             if table.to_ascii_lowercase().starts_with(&schema_prefix) {
-                                ctx.drop_table_immediate(&table, false)?;
+                                let mut plan = llkv_plan::DropTablePlan::new(table.clone());
+                                plan.if_exists = false;
+                                self.execute_plan_statement(llkv_plan::PlanStatement::DropTable(
+                                    plan,
+                                ))?;
                             }
                         }
                     } else {
@@ -2603,18 +2587,20 @@ where
                 };
                 self.execute_plan_statement(PlanStatement::AlterTable(plan))
             }
-            AlterTableOperation::AlterColumn {
-                column_name,
-                op,
-            } => {
+            AlterTableOperation::AlterColumn { column_name, op } => {
                 // Only support SET DATA TYPE for now
-                if let AlterColumnOperation::SetDataType { data_type, using, had_set: _ } = op {
+                if let AlterColumnOperation::SetDataType {
+                    data_type,
+                    using,
+                    had_set: _,
+                } = op
+                {
                     if using.is_some() {
                         return Err(Error::InvalidArgumentError(
                             "ALTER COLUMN SET DATA TYPE USING clause is not yet supported".into(),
                         ));
                     }
-                    
+
                     let plan = llkv_plan::AlterTablePlan {
                         table_name: name.to_string(),
                         if_exists,
@@ -2642,10 +2628,10 @@ where
                         "DROP COLUMN currently supports dropping one column at a time".into(),
                     ));
                 }
-                
+
                 let column_name = column_names.into_iter().next().unwrap().to_string();
                 let cascade = matches!(drop_behavior, Some(sqlparser::ast::DropBehavior::Cascade));
-                
+
                 let plan = llkv_plan::AlterTablePlan {
                     table_name: name.to_string(),
                     if_exists,

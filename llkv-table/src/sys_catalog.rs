@@ -603,12 +603,10 @@ where
             lfid(CATALOG_TABLE_ID, CATALOG_FIELD_SINGLE_COLUMN_INDEX_META_ID).into();
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
-            Field::new("meta", DataType::Binary, false).with_metadata(HashMap::from([
-                (
-                    crate::constants::FIELD_ID_META_KEY.to_string(),
-                    lfid_val.to_string(),
-                ),
-            ])),
+            Field::new("meta", DataType::Binary, false).with_metadata(HashMap::from([(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            )])),
         ]));
 
         let row_id = Arc::new(UInt64Array::from(vec![rid_table(table_id)]));

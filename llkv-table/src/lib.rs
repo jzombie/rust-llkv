@@ -53,6 +53,7 @@ pub mod types;
 pub mod stream;
 
 pub use catalog::{CatalogManager, CreateTableResult, FieldResolver, TableCatalogSnapshot};
+pub use catalog::{SingleColumnIndexDescriptor, SingleColumnIndexRegistration};
 pub use constraints::{
     CheckConstraint, ConstraintColumnInfo, ConstraintExpressionRef, ConstraintId, ConstraintKind,
     ConstraintRecord, ConstraintService, ConstraintState, ForeignKeyAction,
@@ -65,7 +66,6 @@ pub use constraints::{
     validate_foreign_keys,
 };
 pub use metadata::MultiColumnUniqueRegistration;
-pub use catalog::{SingleColumnIndexDescriptor, SingleColumnIndexRegistration};
 pub use metadata::{ForeignKeyDescriptor, MetadataManager};
 pub use reserved::CATALOG_TABLE_ID;
 pub use resolvers::{canonical_table_name, resolve_table_name};

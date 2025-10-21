@@ -15,8 +15,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{RuntimeContext, RuntimeStatementResult};
-use llkv_table::canonical_table_name;
 use llkv_table::SingleColumnIndexDescriptor;
+use llkv_table::canonical_table_name;
 
 pub type NamespaceId = String;
 
@@ -157,7 +157,7 @@ where
         &self,
         plan: CreateTablePlan,
     ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
-        self.context.create_table_plan(plan)
+        self.context.apply_create_table_plan(plan)
     }
 
     fn drop_table(&self, name: &str, if_exists: bool) -> crate::Result<()> {
@@ -180,8 +180,7 @@ where
         canonical_index_name: &str,
         if_exists: bool,
     ) -> crate::Result<Option<SingleColumnIndexDescriptor>> {
-        self.context
-            .drop_index(canonical_index_name, if_exists)
+        self.context.drop_index(canonical_index_name, if_exists)
     }
 
     fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<Self::Pager>>> {
@@ -300,7 +299,7 @@ where
     ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
         let (_, canonical) = canonical_table_name(&plan.name)?;
         let context = self.context();
-        let result = context.create_table_plan(plan)?;
+        let result = context.apply_create_table_plan(plan)?;
         if !self.has_table(&canonical) {
             self.register_table(canonical);
         }
@@ -337,8 +336,7 @@ where
         canonical_index_name: &str,
         if_exists: bool,
     ) -> crate::Result<Option<SingleColumnIndexDescriptor>> {
-        self.context()
-            .drop_index(canonical_index_name, if_exists)
+        self.context().drop_index(canonical_index_name, if_exists)
     }
 
     fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<Self::Pager>>> {

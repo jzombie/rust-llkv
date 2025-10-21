@@ -56,30 +56,13 @@ use llkv_table::catalog::{FieldConstraints, FieldDefinition, MvccColumnBuilder, 
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId};
 use llkv_table::{
-    build_composite_unique_key,
-    canonical_table_name,
-    constraints::ConstraintKind,
-    CatalogManager,
-    ConstraintColumnInfo,
-    ConstraintService,
-    CreateTableResult,
-    ensure_multi_column_unique,
+    CatalogManager, ConstraintColumnInfo, ConstraintService, CreateTableResult, ForeignKeyColumn,
+    ForeignKeyTableInfo, ForeignKeyView, InsertColumnConstraint, InsertMultiColumnUnique,
+    InsertUniqueColumn, MetadataManager, MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration,
+    SingleColumnIndexDescriptor, SingleColumnIndexRegistration, SysCatalog,
+    TableConstraintSummaryView, TableView, UniqueKey, build_composite_unique_key,
+    canonical_table_name, constraints::ConstraintKind, ensure_multi_column_unique,
     ensure_single_column_unique,
-    ForeignKeyColumn,
-    ForeignKeyTableInfo,
-    ForeignKeyView,
-    InsertColumnConstraint,
-    InsertMultiColumnUnique,
-    InsertUniqueColumn,
-    MetadataManager,
-    MultiColumnUniqueEntryMeta,
-    MultiColumnUniqueRegistration,
-    SingleColumnIndexDescriptor,
-    SingleColumnIndexRegistration,
-    SysCatalog,
-    TableConstraintSummaryView,
-    TableView,
-    UniqueKey,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -93,11 +76,11 @@ pub type Result<T> = llkv_result::Result<T>;
 
 // Re-export plan structures from llkv-plan
 pub use llkv_plan::{
-    AggregateExpr, AggregateFunction, AlterTablePlan, AssignmentValue, ColumnAssignment, 
-    ColumnNullability, ColumnSpec, CreateIndexPlan, CreateTablePlan, CreateTableSource, 
-    DeletePlan, DropIndexPlan, DropTablePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan, 
-    InsertSource, IntoColumnSpec, MultiColumnUniqueSpec, NotNull, Nullable, OrderByPlan, 
-    OrderSortType, OrderTarget, PlanOperation, PlanStatement, PlanValue, SelectPlan, 
+    AggregateExpr, AggregateFunction, AlterTablePlan, AssignmentValue, ColumnAssignment,
+    ColumnNullability, ColumnSpec, CreateIndexPlan, CreateTablePlan, CreateTableSource, DeletePlan,
+    DropIndexPlan, DropTablePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan,
+    InsertSource, IntoColumnSpec, MultiColumnUniqueSpec, NotNull, Nullable, OrderByPlan,
+    OrderSortType, OrderTarget, PlanOperation, PlanStatement, PlanValue, SelectPlan,
     SelectProjection, UpdatePlan,
 };
 
@@ -131,6 +114,7 @@ struct TableConstraintContext {
     primary_key: Option<InsertMultiColumnUnique>,
 }
 
+// TODO: This should be moved to `llkv-transaction`
 struct TransactionMvccBuilder;
 
 impl MvccColumnBuilder for TransactionMvccBuilder {
@@ -324,8 +308,8 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
         PlanStatement::CreateTable(plan) => Some(&plan.name),
         PlanStatement::DropTable(plan) => Some(&plan.name),
         PlanStatement::AlterTable(plan) => Some(&plan.table_name),
-    PlanStatement::CreateIndex(plan) => Some(&plan.table),
-    PlanStatement::DropIndex(_plan) => None,
+        PlanStatement::CreateIndex(plan) => Some(&plan.table),
+        PlanStatement::DropIndex(_plan) => None,
         PlanStatement::Insert(plan) => Some(&plan.table),
         PlanStatement::Update(plan) => Some(&plan.table),
         PlanStatement::Delete(plan) => Some(&plan.table),
@@ -614,17 +598,15 @@ where
 
     /// Get column specifications for a table created in the current transaction.
     /// Returns `None` if there's no active transaction or the table wasn't created in it.
-    pub fn table_column_specs_from_transaction(
-        &self,
-        table_name: &str,
-    ) -> Option<Vec<ColumnSpec>> {
+    pub fn table_column_specs_from_transaction(&self, table_name: &str) -> Option<Vec<ColumnSpec>> {
         self.inner.table_column_specs_from_transaction(table_name)
     }
 
     /// Get tables that reference the given table via foreign keys created in the current transaction.
     /// Returns an empty vector if there's no active transaction or no transactional FKs reference this table.
     pub fn tables_referencing_in_transaction(&self, referenced_table: &str) -> Vec<String> {
-        self.inner.tables_referencing_in_transaction(referenced_table)
+        self.inner
+            .tables_referencing_in_transaction(referenced_table)
     }
 
     /// Commit the current transaction and apply changes to the base context.
@@ -682,10 +664,14 @@ where
         for operation in operations {
             match operation {
                 PlanOperation::CreateTable(plan) => {
-                    TransactionContext::create_table_plan(&**self.inner.context(), plan)?;
+                    TransactionContext::apply_create_table_plan(&**self.inner.context(), plan)?;
                 }
                 PlanOperation::DropTable(plan) => {
-                    TransactionContext::drop_table(&**self.inner.context(), &plan.name, plan.if_exists)?;
+                    TransactionContext::drop_table(
+                        &**self.inner.context(),
+                        &plan.name,
+                        plan.if_exists,
+                    )?;
                 }
                 PlanOperation::Insert(plan) => {
                     TransactionContext::insert(&**self.inner.context(), plan)?;
@@ -748,7 +734,7 @@ where
         // If source is already Batches, leave it alone
         if matches!(plan.source, Some(CreateTableSource::Select { .. })) {
             if let Some(CreateTableSource::Select { plan: select_plan }) = plan.source.take() {
-                let select_result = self.select(*select_plan)?;
+                let select_result = self.execute_select_plan(*select_plan)?;
                 let (schema, batches) = match select_result {
                     RuntimeStatementResult::Select {
                         schema, execution, ..
@@ -780,16 +766,19 @@ where
     /// # Call Chain
     /// ```text
     /// RuntimeEngine::execute_statement()
-    ///   └─> RuntimeSession::create_table_plan()  ← YOU ARE HERE
+    ///   └─> RuntimeSession::execute_create_table_plan()  ← YOU ARE HERE
     ///         ├─> materialize_create_table_plan() (if source is SELECT)
-    ///         └─> RuntimeContext::create_table_plan() (for actual table creation)
+    ///         └─> RuntimeContext::apply_create_table_plan() (for actual table creation)
     /// ```
     ///
     /// # See Also
-    /// - [`RuntimeContext::create_table_plan`] - Lower-level implementation that does the
+    /// - [`RuntimeContext::apply_create_table_plan`] - Lower-level implementation that does the
     ///   actual table creation work.
     /// - [`materialize_ctas_plan`] - Helper that executes SELECT queries in CTAS.
-    pub fn create_table_plan(&self, plan: CreateTablePlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_create_table_plan(
+        &self,
+        plan: CreateTablePlan,
+    ) -> Result<RuntimeStatementResult<P>> {
         let mut plan = self.materialize_ctas_plan(plan)?;
         let namespace_id = plan
             .namespace
@@ -851,7 +840,10 @@ where
     /// Returns [`Error::TransactionContextError`] when another session holds the
     /// table lock. Returns [`Error::InvalidArgumentError`] if the table lives in an
     /// unknown namespace.
-    pub fn drop_table_plan(&self, plan: DropTablePlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_drop_table_plan(
+        &self,
+        plan: DropTablePlan,
+    ) -> Result<RuntimeStatementResult<P>> {
         let (_, canonical_table) = canonical_table_name(&plan.name)?;
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
@@ -876,7 +868,7 @@ where
                             referencing_table
                         )));
                     }
-                    
+
                     match self.inner.execute_operation(PlanOperation::DropTable(plan)) {
                         Ok(_) => Ok(RuntimeStatementResult::NoOp),
                         Err(e) => {
@@ -893,7 +885,8 @@ where
                             plan.name
                         )));
                     }
-                    self.persistent_namespace().drop_table(&plan.name, plan.if_exists)?;
+                    self.persistent_namespace()
+                        .drop_table(&plan.name, plan.if_exists)?;
                     Ok(RuntimeStatementResult::NoOp)
                 }
             }
@@ -904,73 +897,124 @@ where
         }
     }
 
-    pub fn alter_table_plan(&self, plan: AlterTablePlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_alter_table_plan(
+        &self,
+        plan: AlterTablePlan,
+    ) -> Result<RuntimeStatementResult<P>> {
         let (_, canonical_table) = canonical_table_name(&plan.table_name)?;
-        
+
         // Determine which namespace contains this table
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
-        
+
         match namespace_id.as_str() {
             storage_namespace::TEMPORARY_NAMESPACE_ID => {
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                
+
                 let catalog_service = &temp_namespace.context().catalog_service;
                 let view = catalog_service.table_view(&canonical_table)?;
-                let table_id = view.table_meta.as_ref()
+                let table_id = view
+                    .table_meta
+                    .as_ref()
                     .ok_or_else(|| Error::Internal("table metadata missing".into()))?
                     .table_id;
-                
+
                 // Perform validation
-                Self::validate_alter_table_operation(&plan.operation, &view, table_id, catalog_service)?;
-                
+                Self::validate_alter_table_operation(
+                    &plan.operation,
+                    &view,
+                    table_id,
+                    catalog_service,
+                )?;
+
                 // Execute the ALTER TABLE operation
                 match &plan.operation {
-                    llkv_plan::AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
-                        temp_namespace.context().rename_column(&plan.table_name, old_column_name, new_column_name)?;
+                    llkv_plan::AlterTableOperation::RenameColumn {
+                        old_column_name,
+                        new_column_name,
+                    } => {
+                        temp_namespace.context().rename_column(
+                            &plan.table_name,
+                            old_column_name,
+                            new_column_name,
+                        )?;
                         Ok(RuntimeStatementResult::NoOp)
-                    },
-                    llkv_plan::AlterTableOperation::SetColumnDataType { column_name, new_data_type } => {
-                        temp_namespace.context().alter_column_type(&plan.table_name, column_name, new_data_type)?;
+                    }
+                    llkv_plan::AlterTableOperation::SetColumnDataType {
+                        column_name,
+                        new_data_type,
+                    } => {
+                        temp_namespace.context().alter_column_type(
+                            &plan.table_name,
+                            column_name,
+                            new_data_type,
+                        )?;
                         Ok(RuntimeStatementResult::NoOp)
-                    },
-                    llkv_plan::AlterTableOperation::DropColumn { column_name, if_exists: _, cascade: _ } => {
-                        temp_namespace.context().drop_column(&plan.table_name, column_name)?;
+                    }
+                    llkv_plan::AlterTableOperation::DropColumn {
+                        column_name,
+                        if_exists: _,
+                        cascade: _,
+                    } => {
+                        temp_namespace
+                            .context()
+                            .drop_column(&plan.table_name, column_name)?;
                         Ok(RuntimeStatementResult::NoOp)
-                    },
+                    }
                 }
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {
                 let catalog_service = &self.persistent_namespace().context().catalog_service;
                 let view = catalog_service.table_view(&canonical_table)?;
-                let table_id = view.table_meta.as_ref()
+                let table_id = view
+                    .table_meta
+                    .as_ref()
                     .ok_or_else(|| Error::Internal("table metadata missing".into()))?
                     .table_id;
-                
+
                 // Perform validation
-                Self::validate_alter_table_operation(&plan.operation, &view, table_id, catalog_service)?;
-                
+                Self::validate_alter_table_operation(
+                    &plan.operation,
+                    &view,
+                    table_id,
+                    catalog_service,
+                )?;
+
                 // Execute the ALTER TABLE operation
                 match &plan.operation {
-                    llkv_plan::AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
-                        self.persistent_namespace()
-                            .context()
-                            .rename_column(&plan.table_name, old_column_name, new_column_name)?;
+                    llkv_plan::AlterTableOperation::RenameColumn {
+                        old_column_name,
+                        new_column_name,
+                    } => {
+                        self.persistent_namespace().context().rename_column(
+                            &plan.table_name,
+                            old_column_name,
+                            new_column_name,
+                        )?;
                         Ok(RuntimeStatementResult::NoOp)
-                    },
-                    llkv_plan::AlterTableOperation::SetColumnDataType { column_name, new_data_type } => {
-                        self.persistent_namespace()
-                            .context()
-                            .alter_column_type(&plan.table_name, column_name, new_data_type)?;
+                    }
+                    llkv_plan::AlterTableOperation::SetColumnDataType {
+                        column_name,
+                        new_data_type,
+                    } => {
+                        self.persistent_namespace().context().alter_column_type(
+                            &plan.table_name,
+                            column_name,
+                            new_data_type,
+                        )?;
                         Ok(RuntimeStatementResult::NoOp)
-                    },
-                    llkv_plan::AlterTableOperation::DropColumn { column_name, if_exists: _, cascade: _ } => {
+                    }
+                    llkv_plan::AlterTableOperation::DropColumn {
+                        column_name,
+                        if_exists: _,
+                        cascade: _,
+                    } => {
                         self.persistent_namespace()
                             .context()
                             .drop_column(&plan.table_name, column_name)?;
                         Ok(RuntimeStatementResult::NoOp)
-                    },
+                    }
                 }
             }
             other => Err(Error::InvalidArgumentError(format!(
@@ -979,7 +1023,7 @@ where
             ))),
         }
     }
-    
+
     /// Helper method to validate ALTER TABLE operations against foreign key constraints.
     /// This is generic over the pager type to work with both temporary and persistent namespaces.
     fn validate_alter_table_operation<PagerType>(
@@ -992,10 +1036,13 @@ where
         PagerType: Pager<Blob = EntryHandle> + Send + Sync,
     {
         match operation {
-            llkv_plan::AlterTableOperation::RenameColumn { old_column_name, new_column_name: _ } => {
+            llkv_plan::AlterTableOperation::RenameColumn {
+                old_column_name,
+                new_column_name: _,
+            } => {
                 // Check if column is involved in any foreign key constraint
                 let old_col_lower = old_column_name.to_ascii_lowercase();
-                
+
                 // Check foreign keys defined on this table (where this table is the referencing table)
                 for fk in &view.foreign_keys {
                     // Check if column is a referencing column (in this table)
@@ -1004,18 +1051,22 @@ where
                             return Err(Error::CatalogError(format!(
                                 "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
                                 old_column_name,
-                                fk.constraint_name.as_ref().map(|s| s.as_str()).unwrap_or("unnamed")
+                                fk.constraint_name
+                                    .as_ref()
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("unnamed")
                             )));
                         }
                     }
                 }
-                
+
                 // Check foreign keys that reference this table (where this table is the referenced table)
                 let referencing_fks = catalog_service.foreign_keys_referencing(table_id)?;
                 for (referencing_table_id, _constraint_id) in referencing_fks {
                     // Get the foreign key details for this referencing table
-                    let referencing_table_fks = catalog_service.foreign_key_views_for_table(referencing_table_id)?;
-                    
+                    let referencing_table_fks =
+                        catalog_service.foreign_key_views_for_table(referencing_table_id)?;
+
                     for fk in referencing_table_fks {
                         if fk.referenced_table_id == table_id {
                             // Check if the column being renamed is referenced by this FK
@@ -1024,7 +1075,10 @@ where
                                     return Err(Error::CatalogError(format!(
                                         "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
                                         old_column_name,
-                                        fk.constraint_name.as_ref().map(|s| s.as_str()).unwrap_or("unnamed")
+                                        fk.constraint_name
+                                            .as_ref()
+                                            .map(|s| s.as_str())
+                                            .unwrap_or("unnamed")
                                     )));
                                 }
                             }
@@ -1032,8 +1086,11 @@ where
                     }
                 }
                 Ok(())
-            },
-            llkv_plan::AlterTableOperation::SetColumnDataType { column_name, new_data_type: _ } => {
+            }
+            llkv_plan::AlterTableOperation::SetColumnDataType {
+                column_name,
+                new_data_type: _,
+            } => {
                 let col_lower = column_name.to_ascii_lowercase();
 
                 // Resolve the column's field id so constraint metadata can be inspected precisely.
@@ -1058,8 +1115,12 @@ where
                         .iter()
                         .filter(|record| record.is_active())
                         .any(|record| match &record.kind {
-                            ConstraintKind::PrimaryKey(payload) => payload.field_ids.contains(&field_id),
-                            ConstraintKind::Unique(payload) => payload.field_ids.contains(&field_id),
+                            ConstraintKind::PrimaryKey(payload) => {
+                                payload.field_ids.contains(&field_id)
+                            }
+                            ConstraintKind::Unique(payload) => {
+                                payload.field_ids.contains(&field_id)
+                            }
                             _ => false,
                         });
 
@@ -1079,7 +1140,10 @@ where
                             return Err(Error::CatalogError(format!(
                                 "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
                                 column_name,
-                                fk.constraint_name.as_ref().map(|s| s.as_str()).unwrap_or("unnamed")
+                                fk.constraint_name
+                                    .as_ref()
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("unnamed")
                             )));
                         }
                     }
@@ -1088,7 +1152,8 @@ where
                 // Check foreign keys that reference this table (where this table is the referenced table)
                 let referencing_fks = catalog_service.foreign_keys_referencing(table_id)?;
                 for (referencing_table_id, _constraint_id) in referencing_fks {
-                    let referencing_table_fks = catalog_service.foreign_key_views_for_table(referencing_table_id)?;
+                    let referencing_table_fks =
+                        catalog_service.foreign_key_views_for_table(referencing_table_id)?;
 
                     for fk in referencing_table_fks {
                         if fk.referenced_table_id == table_id {
@@ -1097,7 +1162,10 @@ where
                                     return Err(Error::CatalogError(format!(
                                         "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
                                         column_name,
-                                        fk.constraint_name.as_ref().map(|s| s.as_str()).unwrap_or("unnamed")
+                                        fk.constraint_name
+                                            .as_ref()
+                                            .map(|s| s.as_str())
+                                            .unwrap_or("unnamed")
                                     )));
                                 }
                             }
@@ -1106,11 +1174,15 @@ where
                 }
 
                 Ok(())
-            },
-            llkv_plan::AlterTableOperation::DropColumn { column_name, if_exists: _, cascade: _ } => {
+            }
+            llkv_plan::AlterTableOperation::DropColumn {
+                column_name,
+                if_exists: _,
+                cascade: _,
+            } => {
                 // Check if column is involved in any constraint
                 let col_lower = column_name.to_ascii_lowercase();
-                
+
                 // Check FK constraints defined on this table (where this table is the referencing table)
                 for fk in &view.foreign_keys {
                     for ref_col in &fk.referencing_column_names {
@@ -1122,12 +1194,13 @@ where
                         }
                     }
                 }
-                
+
                 // Check foreign keys that reference this table (where this table is the referenced table)
                 let referencing_fks = catalog_service.foreign_keys_referencing(table_id)?;
                 for (referencing_table_id, _constraint_id) in referencing_fks {
-                    let referencing_table_fks = catalog_service.foreign_key_views_for_table(referencing_table_id)?;
-                    
+                    let referencing_table_fks =
+                        catalog_service.foreign_key_views_for_table(referencing_table_id)?;
+
                     for fk in referencing_table_fks {
                         if fk.referenced_table_id == table_id {
                             for ref_col in &fk.referenced_column_names {
@@ -1142,43 +1215,7 @@ where
                     }
                 }
                 Ok(())
-            },
-        }
-    }
-
-    /// Drops a table by delegating to the namespace that owns it.
-    ///
-    /// This helper bypasses planning and transaction bookkeeping; it is intended for
-    /// auto-commit flows, direct namespace manipulation, and test utilities. The
-    /// underlying namespace forwards the request to
-    /// [`RuntimeContext::drop_table_immediate`], which performs catalog updates and
-    /// cache eviction.
-    ///
-    /// # Arguments
-    /// * `name` – Table name provided by the caller, which may include schema prefixes.
-    /// * `if_exists` – Skips the drop when the table is missing if set to `true`.
-    ///
-    /// # Errors
-    /// Mirrors the errors raised by [`RuntimeContext::drop_table_immediate`],
-    /// including catalog, foreign-key, and namespace resolution failures.
-    pub fn drop_table(&self, name: &str, if_exists: bool) -> Result<()> {
-        let (_, canonical_table) = canonical_table_name(name)?;
-        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
-
-        match namespace_id.as_str() {
-            storage_namespace::TEMPORARY_NAMESPACE_ID => {
-                let temp_namespace = self
-                    .temporary_namespace()
-                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                temp_namespace.drop_table(name, if_exists)
             }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => {
-                self.persistent_namespace().drop_table(name, if_exists)
-            }
-            other => Err(Error::InvalidArgumentError(format!(
-                "Unknown storage namespace '{}'",
-                other
-            ))),
         }
     }
 
@@ -1221,7 +1258,10 @@ where
     }
 
     /// Create an index (auto-commit only for now).
-    pub fn create_index(&self, plan: CreateIndexPlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_create_index_plan(
+        &self,
+        plan: CreateIndexPlan,
+    ) -> Result<RuntimeStatementResult<P>> {
         let (_, canonical_table) = canonical_table_name(&plan.table)?;
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
@@ -1250,19 +1290,22 @@ where
 
     /// Drop an index by name through plan execution.
     pub fn drop_index(&self, index_name: &str, if_exists: bool) -> Result<()> {
-    let plan = DropIndexPlan::new(index_name).if_exists(if_exists);
-        self.drop_index_plan(plan)?;
+        let plan = DropIndexPlan::new(index_name).if_exists(if_exists);
+        self.execute_drop_index_plan(plan)?;
         Ok(())
     }
 
-    pub fn drop_index_plan(&self, plan: DropIndexPlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_drop_index_plan(
+        &self,
+        plan: DropIndexPlan,
+    ) -> Result<RuntimeStatementResult<P>> {
         if self.has_active_transaction() {
             return Err(Error::InvalidArgumentError(
                 "DROP INDEX is not supported inside an active transaction".into(),
             ));
         }
 
-    let canonical_index = plan.canonical_name.clone();
+        let canonical_index = plan.canonical_name.clone();
         let mut dropped = false;
 
         match self
@@ -1339,7 +1382,7 @@ where
                 ))
             }
             InsertSource::Select { plan: select_plan } => {
-                let select_result = self.select(*select_plan)?;
+                let select_result = self.execute_select_plan(*select_plan)?;
                 let rows = match select_result {
                     RuntimeStatementResult::Select { execution, .. } => execution.into_rows()?,
                     _ => {
@@ -1362,7 +1405,7 @@ where
     }
 
     /// Insert rows (outside or inside transaction).
-    pub fn insert(&self, plan: InsertPlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_insert_plan(&self, plan: InsertPlan) -> Result<RuntimeStatementResult<P>> {
         tracing::trace!("Session::insert called for table={}", plan.table);
         let (plan, rows_inserted) = self.normalize_insert_plan(plan)?;
         let table_name = plan.table.clone();
@@ -1425,7 +1468,7 @@ where
     }
 
     /// Select rows (outside or inside transaction).
-    pub fn select(&self, plan: SelectPlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_select_plan(&self, plan: SelectPlan) -> Result<RuntimeStatementResult<P>> {
         if let Some(namespace_id) = self.namespace_for_select_plan(&plan)
             && namespace_id == storage_namespace::TEMPORARY_NAMESPACE_ID
         {
@@ -1503,7 +1546,7 @@ where
     pub fn table_rows(&self, table: &str) -> Result<Vec<Vec<PlanValue>>> {
         let plan =
             SelectPlan::new(table.to_string()).with_projections(vec![SelectProjection::AllColumns]);
-        match self.select(plan)? {
+        match self.execute_select_plan(plan)? {
             RuntimeStatementResult::Select { execution, .. } => Ok(execution.collect_rows()?.rows),
             other => Err(Error::Internal(format!(
                 "expected Select result when reading table '{table}', got {:?}",
@@ -1513,7 +1556,7 @@ where
     }
 
     /// Update rows (outside or inside transaction).
-    pub fn update(&self, plan: UpdatePlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_update_plan(&self, plan: UpdatePlan) -> Result<RuntimeStatementResult<P>> {
         let (_, canonical_table) = canonical_table_name(&plan.table)?;
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
@@ -1575,7 +1618,7 @@ where
     }
 
     /// Delete rows (outside or inside transaction).
-    pub fn delete(&self, plan: DeletePlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_delete_plan(&self, plan: DeletePlan) -> Result<RuntimeStatementResult<P>> {
         let (_, canonical_table) = canonical_table_name(&plan.table)?;
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
@@ -1687,15 +1730,15 @@ where
             PlanStatement::BeginTransaction => self.session.begin_transaction(),
             PlanStatement::CommitTransaction => self.session.commit_transaction(),
             PlanStatement::RollbackTransaction => self.session.rollback_transaction(),
-        PlanStatement::CreateTable(plan) => self.session.create_table_plan(plan),
-        PlanStatement::DropTable(plan) => self.session.drop_table_plan(plan),
-        PlanStatement::DropIndex(plan) => self.session.drop_index_plan(plan),
-            PlanStatement::AlterTable(plan) => self.session.alter_table_plan(plan),
-            PlanStatement::CreateIndex(plan) => self.session.create_index(plan),
-            PlanStatement::Insert(plan) => self.session.insert(plan),
-            PlanStatement::Update(plan) => self.session.update(plan),
-            PlanStatement::Delete(plan) => self.session.delete(plan),
-            PlanStatement::Select(plan) => self.session.select(plan),
+            PlanStatement::CreateTable(plan) => self.session.execute_create_table_plan(plan),
+            PlanStatement::DropTable(plan) => self.session.execute_drop_table_plan(plan),
+            PlanStatement::DropIndex(plan) => self.session.execute_drop_index_plan(plan),
+            PlanStatement::AlterTable(plan) => self.session.execute_alter_table_plan(plan),
+            PlanStatement::CreateIndex(plan) => self.session.execute_create_index_plan(plan),
+            PlanStatement::Insert(plan) => self.session.execute_insert_plan(plan),
+            PlanStatement::Update(plan) => self.session.execute_update_plan(plan),
+            PlanStatement::Delete(plan) => self.session.execute_delete_plan(plan),
+            PlanStatement::Select(plan) => self.session.execute_select_plan(plan),
         }
     }
 
@@ -1894,13 +1937,18 @@ where
         // Load custom types from catalog
         let sys_catalog = SysCatalog::new(&store_arc);
         let mut type_registry_map = FxHashMap::default();
-        
+
         match sys_catalog.all_custom_type_metas() {
             Ok(type_metas) => {
-                tracing::debug!("[CONTEXT] Loaded {} custom type(s) from catalog", type_metas.len());
+                tracing::debug!(
+                    "[CONTEXT] Loaded {} custom type(s) from catalog",
+                    type_metas.len()
+                );
                 for type_meta in type_metas {
                     // Parse the base_type_sql back to a DataType
-                    if let Ok(parsed_type) = Self::parse_data_type_from_sql(&type_meta.base_type_sql) {
+                    if let Ok(parsed_type) =
+                        Self::parse_data_type_from_sql(&type_meta.base_type_sql)
+                    {
                         type_registry_map.insert(type_meta.name.to_lowercase(), parsed_type);
                     } else {
                         tracing::warn!(
@@ -1975,7 +2023,7 @@ where
 
         // Reserve a new table ID for the view
         let table_id = self.metadata.reserve_table_id()?;
-        
+
         let created_at_micros = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -2014,7 +2062,7 @@ where
     /// Resolve a type name to its base DataType, recursively following aliases.
     pub fn resolve_type(&self, data_type: &sqlparser::ast::DataType) -> sqlparser::ast::DataType {
         use sqlparser::ast::DataType;
-        
+
         match data_type {
             DataType::Custom(obj_name, _) => {
                 let name = obj_name.to_string().to_lowercase();
@@ -2040,7 +2088,7 @@ where
         // Try to parse as a simple CREATE DOMAIN statement
         let create_sql = format!("CREATE DOMAIN dummy AS {}", sql);
         let dialect = GenericDialect {};
-        
+
         match Parser::parse_sql(&dialect, &create_sql) {
             Ok(stmts) if !stmts.is_empty() => {
                 if let sqlparser::ast::Statement::CreateDomain(create_domain) = &stmts[0] {
@@ -2157,7 +2205,7 @@ where
     /// column definitions. Use this when you're writing Rust code that needs to create tables
     /// directly, rather than executing SQL.
     ///
-    /// # When to use `create_table` vs `create_table_plan`
+    /// # When to use `create_table` vs `apply_create_table_plan`
     ///
     /// **Use `create_table`:**
     /// - You're writing Rust code (not parsing SQL)
@@ -2166,7 +2214,7 @@ where
     /// - You want a `RuntimeTableHandle` to work with immediately
     /// - **Does NOT support**: CREATE TABLE AS SELECT, foreign keys, namespaces
     ///
-    /// **Use `create_table_plan`:**
+    /// **Use `apply_create_table_plan`:**
     /// - You're implementing SQL execution (already have a parsed `CreateTablePlan`)
     /// - You need CREATE TABLE AS SELECT support
     /// - You need foreign key constraints
@@ -2181,7 +2229,7 @@ where
     /// - Returns `RuntimeTableHandle` for immediate use
     /// - Simple, ergonomic, no plan construction needed
     ///
-    /// **SQL execution API** ([`create_table_plan`]):
+    /// **SQL execution API** ([`apply_create_table_plan`]):
     /// - Construct a `CreateTablePlan` with all SQL features
     /// - Support for CTAS, foreign keys, namespaces, transactions
     /// - Returns `RuntimeStatementResult` for consistency with other SQL operations
@@ -2216,10 +2264,10 @@ where
     /// Create a table from a plan - RuntimeContext layer (low-level implementation).
     ///
     /// This is the **context-level** implementation that performs the actual table creation.
-    /// It is called by [`RuntimeSession::create_table_plan`] after that layer has handled
+    /// It is called by [`RuntimeSession::execute_create_table_plan`] after that layer has handled
     /// transaction and namespace concerns.
     ///
-    /// # When to use `create_table` vs `create_table_plan`
+    /// # When to use `create_table` vs `apply_create_table_plan`
     ///
     /// **Use [`create_table`]** (the simple programmatic API):
     /// - Writing Rust code that needs to create tables
@@ -2227,7 +2275,7 @@ where
     /// - Want immediate `RuntimeTableHandle` access
     /// - Don't need advanced SQL features
     ///
-    /// **Use `create_table_plan`** (this method):
+    /// **Use `apply_create_table_plan`** (this method):
     /// - Implementing SQL execution (you have a `CreateTablePlan` from parsing)
     /// - Need CREATE TABLE AS SELECT support
     /// - Need foreign key constraints
@@ -2246,21 +2294,24 @@ where
     /// # Call Chain
     /// ```text
     /// RuntimeEngine::execute_statement()
-    ///   └─> RuntimeSession::create_table_plan()
+    ///   └─> RuntimeSession::execute_create_table_plan()
     ///         ├─> materialize_create_table_plan() (if source is SELECT)
-    ///         └─> RuntimeContext::create_table_plan() ← YOU ARE HERE
+    ///         └─> RuntimeContext::apply_create_table_plan() ← YOU ARE HERE
     ///               └─> create_table_from_batches() / create_table_with_explicit_columns()
     /// ```
     ///
     /// # See Also
-    /// - [`RuntimeSession::create_table_plan`] - Higher-level session wrapper that handles
+    /// - [`RuntimeSession::execute_create_table_plan`] - Higher-level session wrapper that handles
     ///   CTAS materialization and transaction routing.
     ///
     /// # Panics
     /// This method expects that `CreateTableSource::Select` has already been materialized
     /// into `CreateTableSource::Batches` by the session layer. If a `Select` source is
     /// received here, it returns an error.
-    pub fn create_table_plan(&self, plan: CreateTablePlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn apply_create_table_plan(
+        &self,
+        plan: CreateTablePlan,
+    ) -> Result<RuntimeStatementResult<P>> {
         if plan.columns.is_empty() && plan.source.is_none() {
             return Err(Error::InvalidArgumentError(
                 "CREATE TABLE requires explicit columns or a source".into(),
@@ -2280,7 +2331,7 @@ where
         } = plan;
 
         tracing::trace!(
-            "DEBUG create_table_plan: table='{}' if_not_exists={} columns={}",
+            "DEBUG apply_create_table_plan: table='{}' if_not_exists={} columns={}",
             display_name,
             if_not_exists,
             columns.len()
@@ -2305,7 +2356,7 @@ where
             (in_cache && !is_dropped, is_dropped)
         };
         tracing::trace!(
-            "DEBUG create_table_plan: exists={}, is_dropped={}",
+            "DEBUG apply_create_table_plan: exists={}, is_dropped={}",
             exists,
             is_dropped
         );
@@ -2348,7 +2399,7 @@ where
                 if_not_exists,
             ),
             Some(CreateTableSource::Select { .. }) => Err(Error::Internal(
-                "CreateTableSource::Select should be materialized before reaching RuntimeContext::create_table_plan"
+                "CreateTableSource::Select should be materialized before reaching RuntimeContext::apply_create_table_plan"
                     .into(),
             )),
             None => self.create_table_from_columns(
@@ -2377,7 +2428,7 @@ where
             }
         }
 
-    let mut index_name = plan.name.clone();
+        let mut index_name = plan.name.clone();
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
 
@@ -2575,16 +2626,19 @@ where
         new_column_name: &str,
     ) -> Result<()> {
         let (_, canonical_table) = canonical_table_name(table_name)?;
-        
+
         // Get table ID
-        let table_id = self.catalog.table_id(&canonical_table)
+        let table_id = self
+            .catalog
+            .table_id(&canonical_table)
             .ok_or_else(|| Error::CatalogError(format!("table '{}' not found", table_name)))?;
-        
+
         // Delegate to catalog layer
-        self.catalog_service.rename_column(table_id, old_column_name, new_column_name)?;
-        
+        self.catalog_service
+            .rename_column(table_id, old_column_name, new_column_name)?;
+
         // Table will be lazily reloaded on next access with updated metadata
-        
+
         Ok(())
     }
 
@@ -2596,41 +2650,43 @@ where
         new_data_type_sql: &str,
     ) -> Result<()> {
         let (_, canonical_table) = canonical_table_name(table_name)?;
-        
+
         // Get table ID
-        let table_id = self.catalog.table_id(&canonical_table)
+        let table_id = self
+            .catalog
+            .table_id(&canonical_table)
             .ok_or_else(|| Error::CatalogError(format!("table '{}' not found", table_name)))?;
-        
+
         // Parse SQL type string to Arrow DataType
         let arrow_type = sql_type_to_arrow(new_data_type_sql)?;
-        
+
         // Delegate to catalog layer
-        self.catalog_service.alter_column_type(table_id, column_name, &arrow_type)?;
-        
+        self.catalog_service
+            .alter_column_type(table_id, column_name, &arrow_type)?;
+
         // Table will be lazily reloaded on next access with updated metadata
-        
+
         Ok(())
     }
 
     /// Drops a column from a table by delegating to the catalog layer.
-    pub fn drop_column(
-        &self,
-        table_name: &str,
-        column_name: &str,
-    ) -> Result<()> {
+    pub fn drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
         let (_, canonical_table) = canonical_table_name(table_name)?;
-        
+
         // Get table ID
-        let table_id = self.catalog.table_id(&canonical_table)
+        let table_id = self
+            .catalog
+            .table_id(&canonical_table)
             .ok_or_else(|| Error::CatalogError(format!("table '{}' not found", table_name)))?;
-        
+
         // Delegate to catalog layer
         self.catalog_service.drop_column(table_id, column_name)?;
-        
+
         // Table will be lazily reloaded on next access with updated metadata
-        
+
         Ok(())
-    }    /// Returns foreign key relationships for a table, both referencing and referenced constraints.
+    }
+    /// Returns foreign key relationships for a table, both referencing and referenced constraints.
     pub fn foreign_key_views(self: &Arc<Self>, name: &str) -> Result<Vec<ForeignKeyView>> {
         let (_, canonical_name) = canonical_table_name(name)?;
         self.catalog_service.foreign_key_views(&canonical_name)
@@ -2643,7 +2699,7 @@ where
     }
 
     fn execute_create_table(&self, plan: CreateTablePlan) -> Result<RuntimeStatementResult<P>> {
-        self.create_table_plan(plan)
+        self.apply_create_table_plan(plan)
     }
 
     fn create_table_with_options<C, I>(
@@ -2662,7 +2718,7 @@ where
             .into_iter()
             .map(|column| column.into_column_spec())
             .collect();
-        let result = self.create_table_plan(plan)?;
+        let result = self.apply_create_table_plan(plan)?;
         match result {
             RuntimeStatementResult::CreateTable { .. } => {
                 RuntimeTableHandle::new(Arc::clone(self), name)
@@ -3414,7 +3470,6 @@ where
             multi_column_uniques: RwLock::new(uniques),
         }))
     }
-
 
     fn record_table_with_new_rows(&self, txn_id: TxnId, canonical_name: String) {
         if txn_id == TXN_ID_AUTO_COMMIT {
@@ -4373,10 +4428,8 @@ where
         );
 
         // Extract field IDs being updated for FK validation later
-        let updated_field_ids: Vec<FieldId> = prepared
-            .iter()
-            .map(|(column, _)| column.field_id)
-            .collect();
+        let updated_field_ids: Vec<FieldId> =
+            prepared.iter().map(|(column, _)| column.field_id).collect();
 
         for (column, value) in prepared {
             let column_index =
@@ -4625,10 +4678,8 @@ where
         );
 
         // Extract field IDs being updated for FK validation later (update_all_rows)
-        let updated_field_ids: Vec<FieldId> = prepared
-            .iter()
-            .map(|(column, _)| column.field_id)
-            .collect();
+        let updated_field_ids: Vec<FieldId> =
+            prepared.iter().map(|(column, _)| column.field_id).collect();
 
         for (column, value) in prepared {
             let column_index =
@@ -5342,9 +5393,12 @@ where
     /// storage errors bubbled up from metadata reload and catalog service interactions.
     pub fn drop_table_immediate(&self, name: &str, if_exists: bool) -> Result<()> {
         let (display_name, canonical_name) = canonical_table_name(name)?;
-        
-        tracing::debug!("drop_table_immediate: attempting to drop table '{}'", canonical_name);
-        
+
+        tracing::debug!(
+            "drop_table_immediate: attempting to drop table '{}'",
+            canonical_name
+        );
+
         let cached_entry = {
             let tables = self.tables.read().unwrap();
             tracing::debug!(
@@ -5562,11 +5616,11 @@ where
         RuntimeContext::execute_select_with_snapshot(self.context(), plan, self.snapshot())
     }
 
-    fn create_table_plan(
+    fn apply_create_table_plan(
         &self,
         plan: CreateTablePlan,
     ) -> llkv_result::Result<TransactionResult<P>> {
-        let result = RuntimeContext::create_table_plan(self.context(), plan)?;
+        let result = RuntimeContext::apply_create_table_plan(self.context(), plan)?;
         Ok(convert_statement_result(result))
     }
 
@@ -7107,14 +7161,14 @@ where
 /// Supports common SQL types like TEXT, VARCHAR, INTEGER, etc.
 fn sql_type_to_arrow(type_str: &str) -> Result<DataType> {
     let normalized = type_str.trim().to_uppercase();
-    
+
     // Remove precision/scale for simplicity (VARCHAR(100) -> VARCHAR)
     let base_type = if let Some(paren_pos) = normalized.find('(') {
         &normalized[..paren_pos]
     } else {
         &normalized
     };
-    
+
     match base_type {
         "TEXT" | "VARCHAR" | "CHAR" | "STRING" => Ok(DataType::Utf8),
         "INTEGER" | "INT" | "BIGINT" | "SMALLINT" | "TINYINT" => Ok(DataType::Int64),
