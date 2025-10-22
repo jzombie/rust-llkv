@@ -110,7 +110,7 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
 }
 
 mod runtime_context;
-pub use runtime_context::{RuntimeContext, filter_row_ids_for_snapshot, resolve_insert_columns, build_array_for_column};
+pub use runtime_context::RuntimeContext;
 
 fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
     match expr {

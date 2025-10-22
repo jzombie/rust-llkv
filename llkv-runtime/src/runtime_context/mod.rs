@@ -1,18 +1,19 @@
-// RuntimeContext - extracted from lib.rs
-// Complete implementation of the RuntimeContext struct and all its methods
+//! Runtime context submodules
+//!
+//! This module contains the RuntimeContext implementation split into logical submodules:
+//! - `mvcc_helpers`: MVCC transaction visibility filtering
+//! - `data_conversion`: Data type conversion and insert value normalization  
+//! - `query_translation`: String-based expression to field-ID-based expression translation
+//! - `types`: Helper types (PreparedAssignmentValue, TableConstraintContext)
+//! - `provider`: ContextProvider for TableProvider trait
 
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}, RwLock};
 use std::mem;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::marker::PhantomData;
-use std::ops::Bound;
 use rustc_hash::{FxHashMap, FxHashSet};
 use arrow::array::{
-    Array, ArrayRef, BooleanBuilder, Date32Builder, Float64Builder,
-    Int64Builder, RecordBatch, StringBuilder, UInt64Array, UInt64Builder,
+    Array, ArrayRef, RecordBatch, UInt64Array, UInt64Builder,
 };
-use arrow::datatypes::{DataType, Field, FieldRef, Schema};
-use time::{Date, Month};
+use arrow::datatypes::{DataType, Field, Schema};
 use llkv_storage::pager::Pager;
 use llkv_result::{Error, Result};
 use llkv_column_map::store::ColumnStore;
@@ -21,7 +22,7 @@ use llkv_column_map::store::GatherNullPolicy;
 use llkv_table::{
     Table, MetadataManager, SysCatalog, TableId,
     CatalogManager, ConstraintService, ConstraintKind,
-    CreateTableResult, FieldId, RowId, ROW_ID_FIELD_ID,
+    CreateTableResult, FieldId, RowId,
     ConstraintColumnInfo, InsertColumnConstraint, InsertUniqueColumn, InsertMultiColumnUnique,
     ForeignKeyTableInfo, ForeignKeyColumn, ForeignKeyView, TableView,
     SingleColumnIndexDescriptor, SingleColumnIndexRegistration, MultiColumnUniqueRegistration,
@@ -29,17 +30,17 @@ use llkv_table::{
     ensure_single_column_unique, ensure_multi_column_unique, build_composite_unique_key, UniqueKey,
     CatalogDdl,
 };
-use llkv_table::catalog::{TableCatalog, MvccColumnBuilder};
+use llkv_table::catalog::TableCatalog;
 use llkv_table::resolvers::{FieldDefinition, FieldConstraints};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions};
 use llkv_transaction::{TransactionManager, TxnIdManager, TransactionSnapshot, TxnId};
-use llkv_transaction::mvcc::{self, RowVersion};
+use llkv_transaction::mvcc;
 use llkv_executor::{
     ExecutorTable, ExecutorColumn, ExecutorSchema, ExecutorMultiColumnUnique,
     QueryExecutor, TableProvider, RowBatch,
 };
 use llkv_column_map::store::{ROW_ID_COLUMN_NAME};
-use llkv_expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
+use llkv_expr::{Expr as LlkvExpr, ScalarExpr};
 use llkv_plan::{
     CreateTablePlan, CreateTableSource, InsertPlan, InsertSource, UpdatePlan, DeletePlan,
     SelectPlan, DropTablePlan, RenameTablePlan, AlterTablePlan, CreateIndexPlan, DropIndexPlan,
@@ -57,41 +58,41 @@ use crate::{
 };
 use llkv_storage::pager::MemPager;
 
-// Import helper modules
 mod mvcc_helpers;
 mod data_conversion;
 mod query_translation;
 mod types;
 mod provider;
 
-// Re-export for use within RuntimeContext implementation
-use mvcc_helpers::{
+// Re-export for use within this module and RuntimeContext
+pub(crate) use mvcc_helpers::{
     TransactionMvccBuilder, 
     filter_row_ids_for_snapshot, 
     MvccRowIdFilter, 
     current_time_micros
 };
 
-use data_conversion::{
+pub(crate) use data_conversion::{
     resolve_insert_columns,
     normalize_insert_value_for_column,
     build_array_for_column,
-    parse_date32_literal,
 };
 
-use query_translation::{
+// Also import parse_date32_literal for internal use (not re-exported)
+use data_conversion::parse_date32_literal;
+
+pub(crate) use query_translation::{
     full_table_scan_filter,
-    resolve_field_id_from_schema,
     translate_predicate,
     translate_scalar,
 };
 
-use types::{
+pub(crate) use types::{
     PreparedAssignmentValue,
     TableConstraintContext,
 };
 
-use provider::ContextProvider;
+pub(crate) use provider::ContextProvider;
 
 /// In-memory execution context shared by plan-based queries.
 ///
