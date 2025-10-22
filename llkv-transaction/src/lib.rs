@@ -6,8 +6,8 @@
 //!
 //! # Module Organization
 //!
-//! - [`core`]: Core MVCC primitives (TxnIdManager, TransactionSnapshot, RowVersion) - *currently `mvcc` module*
-//! - [`table`]: Table-level MVCC integration (row filtering, builders) - *currently `helpers` module*
+//! - `core`: Core MVCC primitives (TxnIdManager, TransactionSnapshot, RowVersion) - *currently `mvcc` module*
+//! - `table`: Table-level MVCC integration (row filtering, builders) - *currently `helpers` module*
 //! - [`types`]: Type definitions (TransactionResult, TransactionCatalogSnapshot)
 //!
 //! The main transaction context types (`SessionTransaction`, `TransactionSession`, `TransactionManager`)
@@ -39,14 +39,14 @@
 //! - **[`TransactionSnapshot`]**: Immutable view of transaction state for visibility checks
 //! - **[`TransactionContext`]**: Main interface for executing operations within a transaction
 //! - **[`RowVersion`]**: Metadata tracking which transaction created/deleted a row
-//! - **[`TransactionCatalogSnapshot`]**: Catalog snapshot interface for table lookups
+//! - **[`types::TransactionCatalogSnapshot`]**: Catalog snapshot interface for table lookups
 
 // ============================================================================
 // Module Declarations
 // ============================================================================
 
-pub mod helpers;  // TODO: Rename to `table`
-pub mod mvcc;     // TODO: Rename to `core`
+pub mod helpers;
+pub mod mvcc;
 pub mod types;
 
 use std::collections::{HashMap, HashSet};
