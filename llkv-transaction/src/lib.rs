@@ -81,10 +81,6 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 use llkv_executor::{SelectExecution, ExecutorRowBatch};
 
-// ============================================================================
-// Type Definitions
-// ============================================================================
-
 /// Extracts table name from SelectPlan for single-table queries.
 fn select_plan_table_name(plan: &SelectPlan) -> Option<String> {
     if plan.tables.len() == 1 {
