@@ -1,7 +1,7 @@
 //! ContextProvider implementation for TableProvider trait
 
 use crate::runtime_context::RuntimeContext;
-use llkv_executor::{ExecutorTable, TableProvider};
+use llkv_executor::{ExecutorTable, ExecutorTableProvider};
 use llkv_result::Result;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -15,7 +15,7 @@ where
     pub(crate) context: Arc<RuntimeContext<P>>,
 }
 
-impl<P> TableProvider<P> for ContextProvider<P>
+impl<P> ExecutorTableProvider<P> for ContextProvider<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {

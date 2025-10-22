@@ -54,25 +54,19 @@ pub use llkv_column_map::types::TableId;
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
     CreateIndexPlan, CreateTablePlan, DeletePlan, DropTablePlan, InsertPlan, PlanColumnSpec,
-    PlanOperation, PlanValue, SelectPlan, UpdatePlan,
+    PlanOperation, SelectPlan, UpdatePlan,
 };
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use llkv_table::CatalogDdl;
 use simd_r_drive_entry_handle::EntryHandle;
 
-use llkv_executor::SelectExecution;
+use llkv_executor::{SelectExecution, ExecutorRowBatch};
 
 // ============================================================================
 // Type Definitions
 // ============================================================================
 
-// TODO: Dedupe!!! (call it `TransactionRowBatch`?)
-/// Simplified row batch for export/import
-pub struct RowBatch {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<PlanValue>>,
-}
 
 /// Transaction kind enum.
 #[derive(Clone, Debug)]
@@ -225,7 +219,7 @@ pub trait TransactionContext: CatalogDdl + Send + Sync {
     fn table_column_specs(&self, table_name: &str) -> LlkvResult<Vec<PlanColumnSpec>>;
 
     /// Export table rows for snapshotting
-    fn export_table_rows(&self, table_name: &str) -> LlkvResult<RowBatch>;
+    fn export_table_rows(&self, table_name: &str) -> LlkvResult<ExecutorRowBatch>;
 
     /// Get batches with row IDs for seeding updates
     fn get_batches_with_row_ids(

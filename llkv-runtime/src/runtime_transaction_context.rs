@@ -7,6 +7,7 @@ use llkv_storage::pager::Pager;
 use llkv_table::{CatalogDdl, SingleColumnIndexDescriptor, TableId};
 use llkv_transaction::{TransactionContext, TransactionResult, TransactionSnapshot, TxnId};
 use simd_r_drive_entry_handle::EntryHandle;
+use llkv_executor::{ExecutorRowBatch};
 
 use crate::{
     AlterTablePlan, CreateIndexPlan, CreateTablePlan, DeletePlan, DropIndexPlan, DropTablePlan,
@@ -121,13 +122,8 @@ where
         RuntimeContext::table_column_specs(self.context(), table_name)
     }
 
-    fn export_table_rows(&self, table_name: &str) -> LlkvResult<llkv_transaction::RowBatch> {
-        let batch = RuntimeContext::export_table_rows(self.context(), table_name)?;
-        // Convert from llkv_executor::RowBatch to llkv_transaction::RowBatch
-        Ok(llkv_transaction::RowBatch {
-            columns: batch.columns,
-            rows: batch.rows,
-        })
+    fn export_table_rows(&self, table_name: &str) -> LlkvResult<ExecutorRowBatch> {
+        RuntimeContext::export_table_rows(self.context(), table_name)
     }
 
     fn get_batches_with_row_ids(

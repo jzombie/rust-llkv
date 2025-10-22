@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashSet;
 
 use arrow::record_batch::RecordBatch;
-use llkv_executor::RowBatch;
+use llkv_executor::ExecutorRowBatch;
 use llkv_plan::{CreateTablePlan, InsertPlan, InsertSource, PlanColumnSpec, PlanValue};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
@@ -345,13 +345,13 @@ where
         }
 
         let columns = column_names.unwrap_or_else(|| schema_column_names.clone());
-        self.insert_row_batch(RowBatch {
+        self.insert_row_batch(ExecutorRowBatch {
             columns,
             rows: normalized_rows,
         })
     }
 
-    pub fn insert_row_batch(&self, batch: RowBatch) -> Result<RuntimeStatementResult<P>> {
+    pub fn insert_row_batch(&self, batch: ExecutorRowBatch) -> Result<RuntimeStatementResult<P>> {
         if batch.rows.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "insert requires at least one row".into(),
@@ -390,8 +390,8 @@ where
     }
 
     pub fn insert_lazy(&self, frame: RuntimeLazyFrame<P>) -> Result<RuntimeStatementResult<P>> {
-        let RowBatch { columns, rows } = frame.collect_rows()?;
-        self.insert_row_batch(RowBatch { columns, rows })
+        let ExecutorRowBatch { columns, rows } = frame.collect_rows()?;
+        self.insert_row_batch(  ExecutorRowBatch { columns, rows })
     }
 
     pub fn name(&self) -> &str {

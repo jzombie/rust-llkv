@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use llkv_executor::{RowBatch, SelectExecution};
+use llkv_executor::{ExecutorRowBatch, SelectExecution};
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::{AggregateExpr, PlanValue, SelectPlan, SelectProjection};
 use llkv_result::Result;
@@ -70,7 +70,7 @@ where
         self.context.execute_select(self.plan, snapshot)
     }
 
-    pub fn collect_rows(self) -> Result<RowBatch> {
+    pub fn collect_rows(self) -> Result<ExecutorRowBatch> {
         let snapshot = self.context.default_snapshot();
         let execution = self.context.execute_select(self.plan, snapshot)?;
         execution.collect_rows()

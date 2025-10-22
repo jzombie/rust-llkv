@@ -1,93 +1,24 @@
-//! Query execution engine for LLKV.
-//!
-//! This crate provides the query execution layer that sits between the query planner
-//! (`llkv-plan`) and the storage layer (`llkv-table`, `llkv-column-map`).
-//!
-//! # Module Organization
-//!
-//! - [`translation`]: Expression and projection translation utilities
-//! - [`types`]: Core type definitions (tables, schemas, columns)  
-//! - [`insert`]: INSERT operation support (value coercion)
-//! - [`utils`]: Utility functions (time)
-//!
-//! The [`QueryExecutor`] and [`SelectExecution`] implementations are defined inline
-//! in this module for now, but should be extracted to a dedicated `query` module
-//! in a future refactoring.
-
-use arrow::array::{Array, ArrayRef, Int64Builder, RecordBatch, StringArray, UInt32Array};
-use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
-use arrow::datatypes::{DataType, Schema};
-use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
-use llkv_column_map::store::Projection as StoreProjection;
-use llkv_column_map::types::LogicalFieldId;
-use llkv_expr::expr::{Expr as LlkvExpr, ScalarExpr};
-use llkv_plan::{
-    AggregateExpr, AggregateFunction, OrderByPlan, OrderSortType, OrderTarget, PlanValue,
-    SelectPlan, SelectProjection,
-};
-use llkv_result::Error;
-use llkv_storage::pager::Pager;
-use llkv_table::table::{
-    RowIdFilter, ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection,
-    ScanStreamOptions,
-};
-use llkv_table::types::FieldId;
-use rustc_hash::FxHashMap;
-use simd_r_drive_entry_handle::EntryHandle;
-use std::fmt;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-
-// ============================================================================
-// Module Declarations
-// ============================================================================
-
-pub mod insert;
-pub mod translation;
-pub mod types;
-pub mod utils;
-
-// ============================================================================
-// Type Aliases and Re-exports
-// ============================================================================
-
-/// Result type for executor operations.
-pub type ExecutorResult<T> = Result<T, Error>;
-
-// Re-export commonly used items for convenience
-pub use insert::{
-    build_array_for_column, normalize_insert_value_for_column,
-    resolve_insert_columns,
-};
-pub use translation::{
-    build_projected_columns, build_wildcard_projections, full_table_scan_filter,
-    resolve_field_id_from_schema, schema_for_projections, translate_predicate,
-    translate_predicate_with, translate_scalar, translate_scalar_with,
-};
-pub use types::{
-    ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema, ExecutorTable,
-    ExecutorTableProvider, ExecutorRowBatch
-};
-pub use utils::current_time_micros;
-
-// ============================================================================
-// Query Executor - Implementation
-// ============================================================================
-// TODO: Extract this implementation into a dedicated query/ module
+/// Trait for providing table access to the executor.
+pub trait TableProvider<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn get_table(&self, canonical_name: &str) -> ExecutorResult<Arc<ExecutorTable<P>>>;
+}
 
 /// Query executor that executes SELECT plans.
 pub struct QueryExecutor<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    provider: Arc<dyn ExecutorTableProvider<P>>,
+    provider: Arc<dyn TableProvider<P>>,
 }
 
 impl<P> QueryExecutor<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    pub fn new(provider: Arc<dyn ExecutorTableProvider<P>>) -> Self {
+    pub fn new(provider: Arc<dyn TableProvider<P>>) -> Self {
         Self { provider }
     }
 
@@ -465,7 +396,7 @@ where
 
         let (filter_expr, full_table_scan) = match plan.filter {
             Some(expr) => (
-                crate::translation::expression::translate_predicate(
+                crate::expression::translate_predicate(
                     expr,
                     table_ref.schema.as_ref(),
                     |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
@@ -478,7 +409,7 @@ where
                         "table has no columns; cannot perform wildcard scan".into(),
                     )
                 })?;
-                (crate::translation::expression::full_table_scan_filter(field_id), true)
+                (crate::expression::full_table_scan_filter(field_id), true)
             }
         };
 
@@ -617,7 +548,7 @@ where
 
         let had_filter = plan.filter.is_some();
         let filter_expr = match plan.filter {
-            Some(expr) => crate::translation::expression::translate_predicate(
+            Some(expr) => crate::expression::translate_predicate(
                 expr,
                 table.schema.as_ref(),
                 |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
@@ -628,7 +559,7 @@ where
                         "table has no columns; cannot perform aggregate scan".into(),
                     )
                 })?;
-                crate::translation::expression::full_table_scan_filter(field_id)
+                crate::expression::full_table_scan_filter(field_id)
             }
         };
 
@@ -941,7 +872,7 @@ where
 
         // Prepare filter and projections
         let filter_expr = match filter {
-            Some(expr) => crate::translation::expression::translate_predicate(
+            Some(expr) => crate::expression::translate_predicate(
                 expr.clone(),
                 table_ref.schema.as_ref(),
                 |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
@@ -952,7 +883,7 @@ where
                         "table has no columns; cannot perform aggregate scan".into(),
                     )
                 })?;
-                crate::translation::expression::full_table_scan_filter(field_id)
+                crate::expression::full_table_scan_filter(field_id)
             }
         };
 
@@ -1331,7 +1262,7 @@ where
         Ok(batches)
     }
 
-    pub fn collect_rows(self) -> ExecutorResult<ExecutorRowBatch> {
+    pub fn collect_rows(self) -> ExecutorResult<RowBatch> {
         let schema = self.schema();
         let mut rows: Vec<Vec<PlanValue>> = Vec::new();
         self.stream(|batch| {
@@ -1350,7 +1281,7 @@ where
             .iter()
             .map(|field| field.name().to_string())
             .collect();
-        Ok(ExecutorRowBatch { columns, rows })
+        Ok(RowBatch { columns, rows })
     }
 
     pub fn into_rows(self) -> ExecutorResult<Vec<Vec<PlanValue>>> {
@@ -1368,270 +1299,4 @@ where
             .field("schema", &self.schema)
             .finish()
     }
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-fn expand_order_targets(
-    order_items: &[OrderByPlan],
-    projections: &[ScanProjection],
-) -> ExecutorResult<Vec<OrderByPlan>> {
-    let mut expanded = Vec::new();
-
-    for item in order_items {
-        match &item.target {
-            OrderTarget::All => {
-                if projections.is_empty() {
-                    return Err(Error::InvalidArgumentError(
-                        "ORDER BY ALL requires at least one projection".into(),
-                    ));
-                }
-
-                for (idx, projection) in projections.iter().enumerate() {
-                    if matches!(projection, ScanProjection::Computed { .. }) {
-                        return Err(Error::InvalidArgumentError(
-                            "ORDER BY ALL cannot reference computed projections".into(),
-                        ));
-                    }
-
-                    let mut clone = item.clone();
-                    clone.target = OrderTarget::Index(idx);
-                    expanded.push(clone);
-                }
-            }
-            _ => expanded.push(item.clone()),
-        }
-    }
-
-    Ok(expanded)
-}
-
-fn resolve_scan_order<P>(
-    table: &ExecutorTable<P>,
-    projections: &[ScanProjection],
-    order_plan: &OrderByPlan,
-) -> ExecutorResult<ScanOrderSpec>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    let (column, field_id) = match &order_plan.target {
-        OrderTarget::Column(name) => {
-            let column = table.schema.resolve(name).ok_or_else(|| {
-                Error::InvalidArgumentError(format!("unknown column '{}' in ORDER BY", name))
-            })?;
-            (column, column.field_id)
-        }
-        OrderTarget::Index(position) => {
-            let projection = projections.get(*position).ok_or_else(|| {
-                Error::InvalidArgumentError(format!(
-                    "ORDER BY position {} is out of range",
-                    position + 1
-                ))
-            })?;
-            match projection {
-                ScanProjection::Column(store_projection) => {
-                    let field_id = store_projection.logical_field_id.field_id();
-                    let column = table.schema.column_by_field_id(field_id).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "unknown column with field id {field_id} in ORDER BY"
-                        ))
-                    })?;
-                    (column, field_id)
-                }
-                ScanProjection::Computed { .. } => {
-                    return Err(Error::InvalidArgumentError(
-                        "ORDER BY position referring to computed projection is not supported"
-                            .into(),
-                    ));
-                }
-            }
-        }
-        OrderTarget::All => {
-            return Err(Error::InvalidArgumentError(
-                "ORDER BY ALL should be expanded before execution".into(),
-            ));
-        }
-    };
-
-    let transform = match order_plan.sort_type {
-        OrderSortType::Native => match column.data_type {
-            DataType::Int64 => ScanOrderTransform::IdentityInteger,
-            DataType::Utf8 => ScanOrderTransform::IdentityUtf8,
-            ref other => {
-                return Err(Error::InvalidArgumentError(format!(
-                    "ORDER BY on column type {:?} is not supported",
-                    other
-                )));
-            }
-        },
-        OrderSortType::CastTextToInteger => {
-            if column.data_type != DataType::Utf8 {
-                return Err(Error::InvalidArgumentError(
-                    "ORDER BY CAST expects a text column".into(),
-                ));
-            }
-            ScanOrderTransform::CastUtf8ToInteger
-        }
-    };
-
-    let direction = if order_plan.ascending {
-        ScanOrderDirection::Ascending
-    } else {
-        ScanOrderDirection::Descending
-    };
-
-    Ok(ScanOrderSpec {
-        field_id,
-        direction,
-        nulls_first: order_plan.nulls_first,
-        transform,
-    })
-}
-
-fn synthesize_null_scan(schema: Arc<Schema>, total_rows: u64) -> ExecutorResult<Vec<RecordBatch>> {
-    let row_count = usize::try_from(total_rows).map_err(|_| {
-        Error::InvalidArgumentError("table row count exceeds supported in-memory batch size".into())
-    })?;
-
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        match field.data_type() {
-            DataType::Int64 => {
-                let mut builder = Int64Builder::with_capacity(row_count);
-                for _ in 0..row_count {
-                    builder.append_null();
-                }
-                arrays.push(Arc::new(builder.finish()));
-            }
-            DataType::Float64 => {
-                let mut builder = arrow::array::Float64Builder::with_capacity(row_count);
-                for _ in 0..row_count {
-                    builder.append_null();
-                }
-                arrays.push(Arc::new(builder.finish()));
-            }
-            DataType::Utf8 => {
-                let mut builder = arrow::array::StringBuilder::with_capacity(row_count, 0);
-                for _ in 0..row_count {
-                    builder.append_null();
-                }
-                arrays.push(Arc::new(builder.finish()));
-            }
-            DataType::Date32 => {
-                let mut builder = arrow::array::Date32Builder::with_capacity(row_count);
-                for _ in 0..row_count {
-                    builder.append_null();
-                }
-                arrays.push(Arc::new(builder.finish()));
-            }
-            other => {
-                return Err(Error::InvalidArgumentError(format!(
-                    "unsupported data type in null synthesis: {other:?}"
-                )));
-            }
-        }
-    }
-
-    let batch = RecordBatch::try_new(schema, arrays)?;
-    Ok(vec![batch])
-}
-
-fn sort_record_batch_with_order(
-    schema: &Arc<Schema>,
-    batch: &RecordBatch,
-    order_by: &[OrderByPlan],
-) -> ExecutorResult<RecordBatch> {
-    if order_by.is_empty() {
-        return Ok(batch.clone());
-    }
-
-    let mut sort_columns: Vec<SortColumn> = Vec::with_capacity(order_by.len());
-
-    for order in order_by {
-        let column_index = match &order.target {
-            OrderTarget::Column(name) => schema.index_of(name).map_err(|_| {
-                Error::InvalidArgumentError(format!(
-                    "ORDER BY references unknown column '{}'",
-                    name
-                ))
-            })?,
-            OrderTarget::Index(idx) => {
-                if *idx >= batch.num_columns() {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "ORDER BY position {} is out of bounds for {} columns",
-                        idx + 1,
-                        batch.num_columns()
-                    )));
-                }
-                *idx
-            }
-            OrderTarget::All => {
-                return Err(Error::InvalidArgumentError(
-                    "ORDER BY ALL should be expanded before sorting".into(),
-                ));
-            }
-        };
-
-        let source_array = batch.column(column_index);
-
-        let values: ArrayRef = match order.sort_type {
-            OrderSortType::Native => Arc::clone(source_array),
-            OrderSortType::CastTextToInteger => {
-                let strings = source_array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "ORDER BY CAST expects the underlying column to be TEXT".into(),
-                        )
-                    })?;
-                let mut builder = Int64Builder::with_capacity(strings.len());
-                for i in 0..strings.len() {
-                    if strings.is_null(i) {
-                        builder.append_null();
-                    } else {
-                        match strings.value(i).parse::<i64>() {
-                            Ok(value) => builder.append_value(value),
-                            Err(_) => builder.append_null(),
-                        }
-                    }
-                }
-                Arc::new(builder.finish()) as ArrayRef
-            }
-        };
-
-        let sort_options = SortOptions {
-            descending: !order.ascending,
-            nulls_first: order.nulls_first,
-        };
-
-        sort_columns.push(SortColumn {
-            values,
-            options: Some(sort_options),
-        });
-    }
-
-    let indices = lexsort_to_indices(&sort_columns, None).map_err(|err| {
-        Error::InvalidArgumentError(format!("failed to compute ORDER BY indices: {err}"))
-    })?;
-
-    let perm = indices
-        .as_any()
-        .downcast_ref::<UInt32Array>()
-        .ok_or_else(|| Error::Internal("ORDER BY sorting produced unexpected index type".into()))?;
-
-    let mut reordered_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-    for col_idx in 0..batch.num_columns() {
-        let reordered = take(batch.column(col_idx), perm, None).map_err(|err| {
-            Error::InvalidArgumentError(format!(
-                "failed to apply ORDER BY permutation to column {col_idx}: {err}"
-            ))
-        })?;
-        reordered_columns.push(reordered);
-    }
-
-    RecordBatch::try_new(Arc::clone(schema), reordered_columns)
-        .map_err(|err| Error::Internal(format!("failed to build reordered ORDER BY batch: {err}")))
 }

@@ -1,9 +1,11 @@
-use super::{ExecutorResult, ExecutorTable, ScanProjection};
+use crate::types::ExecutorTable;
+use crate::ExecutorResult;
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_expr::expr::ScalarExpr;
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
+use llkv_table::table::ScanProjection;
 use llkv_table::types::FieldId;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::collections::HashMap;
