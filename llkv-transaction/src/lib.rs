@@ -54,12 +54,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::Schema;
 
 pub use helpers::{MvccRowIdFilter, TransactionMvccBuilder, filter_row_ids_for_snapshot};
 pub use mvcc::{
     RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TransactionSnapshot, TxnId, TxnIdManager,
 };
+pub use types::{TransactionCatalogSnapshot, TransactionKind, TransactionResult};
 
 // TODO: Rename to `TransactionSessionId`?
 /// Session identifier type.
@@ -85,15 +85,6 @@ use llkv_executor::{SelectExecution, ExecutorRowBatch};
 // Type Definitions
 // ============================================================================
 
-
-/// Transaction kind enum.
-#[derive(Clone, Debug)]
-pub enum TransactionKind {
-    Begin,
-    Commit,
-    Rollback,
-}
-
 /// Extracts table name from SelectPlan for single-table queries.
 fn select_plan_table_name(plan: &SelectPlan) -> Option<String> {
     if plan.tables.len() == 1 {
@@ -101,43 +92,6 @@ fn select_plan_table_name(plan: &SelectPlan) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Transaction result enum (simplified version for transaction module).
-#[allow(clippy::large_enum_variant)]
-// TODO: Consider refactoring large variants
-// NOTE: The SELECT arm holds stateful execution handles; splitting it requires planner/runtime API changes.
-#[derive(Clone, Debug)]
-pub enum TransactionResult<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    CreateTable {
-        table_name: String,
-    },
-    Insert {
-        rows_inserted: usize,
-    },
-    Update {
-        rows_matched: usize,
-        rows_updated: usize,
-    },
-    Delete {
-        rows_deleted: usize,
-    },
-    CreateIndex {
-        table_name: String,
-        index_name: Option<String>,
-    },
-    Select {
-        table_name: String,
-        schema: Arc<Schema>,
-        execution: SelectExecution<P>,
-    },
-    Transaction {
-        kind: TransactionKind,
-    },
-    NoOp,
 }
 
 /// Catalog snapshot interface used by the transaction layer.
@@ -169,48 +123,6 @@ impl CatalogSnapshot for llkv_table::catalog::TableCatalogSnapshot {
 
     fn table_names(&self) -> Vec<String> {
         llkv_table::catalog::TableCatalogSnapshot::table_names(self)
-    }
-}
-
-impl<P> TransactionResult<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    /// Convert pager type for compatibility
-    pub fn convert_pager_type<P2>(self) -> LlkvResult<TransactionResult<P2>>
-    where
-        P2: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-    {
-        match self {
-            TransactionResult::CreateTable { table_name } => {
-                Ok(TransactionResult::CreateTable { table_name })
-            }
-            TransactionResult::Insert { rows_inserted } => {
-                Ok(TransactionResult::Insert { rows_inserted })
-            }
-            TransactionResult::Update {
-                rows_matched,
-                rows_updated,
-            } => Ok(TransactionResult::Update {
-                rows_matched,
-                rows_updated,
-            }),
-            TransactionResult::Delete { rows_deleted } => {
-                Ok(TransactionResult::Delete { rows_deleted })
-            }
-            TransactionResult::CreateIndex {
-                table_name,
-                index_name,
-            } => Ok(TransactionResult::CreateIndex {
-                table_name,
-                index_name,
-            }),
-            TransactionResult::Transaction { kind } => Ok(TransactionResult::Transaction { kind }),
-            TransactionResult::NoOp => Ok(TransactionResult::NoOp),
-            TransactionResult::Select { .. } => Err(Error::Internal(
-                "cannot convert SELECT TransactionResult between pager types".into(),
-            )),
-        }
     }
 }
 
