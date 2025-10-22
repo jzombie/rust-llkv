@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::{BoxedPager, MemPager, Pager};
-use llkv_table::canonical_table_name;
+use llkv_table::{SingleColumnIndexDescriptor, canonical_table_name};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::storage_namespace::{
@@ -163,8 +163,8 @@ where
         };
 
         let temp_context = temp_namespace.context();
-        let snapshot = temp_context.default_snapshot();
-        let execution = temp_context.execute_select(plan.clone(), snapshot)?;
+        let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+        let execution = TransactionContext::execute_select(&temp_tx_context, plan)?;
         let schema = execution.schema();
         let batches = execution.collect()?;
 
@@ -220,6 +220,84 @@ where
 
     fn run_autocommit_delete(&self, plan: DeletePlan) -> Result<TransactionResult<P>> {
         self.with_autocommit_transaction_context(|ctx| TransactionContext::delete(ctx, plan))
+    }
+
+    fn run_autocommit_create_table(
+        &self,
+        plan: CreateTablePlan,
+    ) -> Result<RuntimeStatementResult<P>> {
+        let result =
+            self.with_autocommit_transaction_context(|ctx| CatalogDdl::create_table(ctx, plan))?;
+        match result {
+            TransactionResult::CreateTable { table_name } => {
+                Ok(RuntimeStatementResult::CreateTable { table_name })
+            }
+            TransactionResult::NoOp => Ok(RuntimeStatementResult::NoOp),
+            _ => Err(Error::Internal(
+                "unexpected transaction result for CREATE TABLE".into(),
+            )),
+        }
+    }
+
+    fn run_autocommit_drop_table(&self, plan: DropTablePlan) -> Result<RuntimeStatementResult<P>> {
+        self.with_autocommit_transaction_context(|ctx| CatalogDdl::drop_table(ctx, plan))?;
+        Ok(RuntimeStatementResult::NoOp)
+    }
+
+    fn run_autocommit_rename_table(&self, plan: RenameTablePlan) -> Result<()> {
+        self.with_autocommit_transaction_context(|ctx| CatalogDdl::rename_table(ctx, plan))
+    }
+
+    fn run_autocommit_alter_table(
+        &self,
+        plan: AlterTablePlan,
+    ) -> Result<RuntimeStatementResult<P>> {
+        let result =
+            self.with_autocommit_transaction_context(|ctx| CatalogDdl::alter_table(ctx, plan))?;
+        match result {
+            TransactionResult::NoOp => Ok(RuntimeStatementResult::NoOp),
+            TransactionResult::CreateTable { table_name } => {
+                Ok(RuntimeStatementResult::CreateTable { table_name })
+            }
+            TransactionResult::CreateIndex {
+                table_name,
+                index_name,
+            } => Ok(RuntimeStatementResult::CreateIndex {
+                table_name,
+                index_name,
+            }),
+            _ => Err(Error::Internal(
+                "unexpected transaction result for ALTER TABLE".into(),
+            )),
+        }
+    }
+
+    fn run_autocommit_create_index(
+        &self,
+        plan: CreateIndexPlan,
+    ) -> Result<RuntimeStatementResult<P>> {
+        let result =
+            self.with_autocommit_transaction_context(|ctx| CatalogDdl::create_index(ctx, plan))?;
+        match result {
+            TransactionResult::CreateIndex {
+                table_name,
+                index_name,
+            } => Ok(RuntimeStatementResult::CreateIndex {
+                table_name,
+                index_name,
+            }),
+            TransactionResult::NoOp => Ok(RuntimeStatementResult::NoOp),
+            _ => Err(Error::Internal(
+                "unexpected transaction result for CREATE INDEX".into(),
+            )),
+        }
+    }
+
+    fn run_autocommit_drop_index(
+        &self,
+        plan: DropIndexPlan,
+    ) -> Result<Option<SingleColumnIndexDescriptor>> {
+        self.with_autocommit_transaction_context(|ctx| CatalogDdl::drop_index(ctx, plan))
     }
 
     /// Begin a transaction in this session.
@@ -809,7 +887,7 @@ where
                             plan.name
                         )));
                     }
-                    self.persistent_namespace().create_table(plan)
+                    self.run_autocommit_create_table(plan)
                 }
             }
             other => Err(Error::InvalidArgumentError(format!(
@@ -864,8 +942,7 @@ where
                             plan.name
                         )));
                     }
-                    self.persistent_namespace().drop_table(plan)?;
-                    Ok(RuntimeStatementResult::NoOp)
+                    self.run_autocommit_drop_table(plan)
                 }
             }
             other => Err(Error::InvalidArgumentError(format!(
@@ -897,7 +974,7 @@ where
                 }
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {
-                match self.persistent_namespace().rename_table(plan.clone()) {
+                match self.run_autocommit_rename_table(plan.clone()) {
                     Ok(()) => Ok(()),
                     Err(err) if plan.if_exists && super::is_table_missing_error(&err) => Ok(()),
                     Err(err) => Err(err),
@@ -968,7 +1045,7 @@ where
                     catalog_service,
                 )?;
 
-                persistent.alter_table(plan)
+                self.run_autocommit_alter_table(plan)
             }
             other => Err(Error::InvalidArgumentError(format!(
                 "Unknown storage namespace '{}'",
@@ -1009,7 +1086,7 @@ where
                     ));
                 }
 
-                self.persistent_namespace().create_index(plan)
+                self.run_autocommit_create_index(plan)
             }
             other => Err(Error::InvalidArgumentError(format!(
                 "Unknown storage namespace '{}'",
@@ -1027,7 +1104,7 @@ where
 
         let mut dropped = false;
 
-        match self.persistent_namespace().drop_index(plan.clone()) {
+        match self.run_autocommit_drop_index(plan.clone()) {
             Ok(Some(_)) => {
                 dropped = true;
             }

@@ -242,6 +242,7 @@ where
         },
         RuntimeStatementResult::Delete { rows_deleted, .. } => TxResult::Delete { rows_deleted },
         RuntimeStatementResult::Transaction { kind } => TxResult::Transaction { kind },
+        RuntimeStatementResult::NoOp => TxResult::NoOp,
         _ => panic!("unsupported StatementResult conversion"),
     }
 }
