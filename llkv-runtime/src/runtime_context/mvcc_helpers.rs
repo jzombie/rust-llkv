@@ -1,5 +1,7 @@
 //! MVCC-related helper types and functions for RuntimeContext
 
+// TODO: Move a majority (or all) of this to `llkv-transaction` crate.
+
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
