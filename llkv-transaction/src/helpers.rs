@@ -1,6 +1,7 @@
-//! MVCC-related helper types and functions for RuntimeContext
-
-// TODO: Move a majority (or all) of this to `llkv-transaction` crate.
+//! MVCC row filtering and builder utilities.
+//!
+//! This module provides higher-level MVCC utilities that work with tables,
+//! including row visibility filtering and MVCC column building for table operations.
 
 use arrow::array::{Array, ArrayRef, UInt64Array};
 use arrow::datatypes::{DataType, Field};
@@ -11,14 +12,18 @@ use llkv_storage::pager::Pager;
 use llkv_table::catalog::MvccColumnBuilder;
 use llkv_table::table::RowIdFilter;
 use llkv_table::{FieldId, RowId, Table};
-use llkv_transaction::mvcc::{self, RowVersion};
-use llkv_transaction::{TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TransactionSnapshot, TxnIdManager};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) struct TransactionMvccBuilder;
+use crate::mvcc::{self, RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE};
+use crate::{TransactionSnapshot, TxnIdManager};
+
+/// Builder for MVCC columns that delegates to the `mvcc` module functions.
+///
+/// This implements the `MvccColumnBuilder` trait from `llkv-table` and provides
+/// MVCC column construction for INSERT operations and table creation.
+pub struct TransactionMvccBuilder;
 
 impl MvccColumnBuilder for TransactionMvccBuilder {
     fn build_insert_columns(
@@ -46,6 +51,28 @@ impl MvccColumnBuilder for TransactionMvccBuilder {
     }
 }
 
+/// Filters a list of row IDs to return only those visible to the given snapshot.
+///
+/// This function:
+/// 1. Retrieves MVCC metadata (created_by, deleted_by) for each row
+/// 2. Applies snapshot visibility rules using the transaction manager
+/// 3. Returns only row IDs that are visible to the snapshot
+///
+/// # Arguments
+///
+/// * `table` - The table to filter rows from
+/// * `row_ids` - Row IDs to check for visibility
+/// * `txn_manager` - Transaction ID manager for visibility checks
+/// * `snapshot` - Transaction snapshot defining the visibility point
+///
+/// # Returns
+///
+/// A filtered vector of row IDs that are visible to the snapshot.
+///
+/// # Errors
+///
+/// Returns an error if MVCC column gathering fails (excluding NotFound, which
+/// is treated as all rows being visible).
 pub fn filter_row_ids_for_snapshot<P>(
     table: &Table<P>,
     row_ids: Vec<RowId>,
@@ -174,7 +201,11 @@ where
     Ok(visible)
 }
 
-pub(crate) struct MvccRowIdFilter<P>
+/// A `RowIdFilter` implementation that applies MVCC visibility filtering.
+///
+/// This filter can be passed to table scan operations to automatically filter
+/// out rows that are not visible to a particular transaction snapshot.
+pub struct MvccRowIdFilter<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -187,7 +218,8 @@ impl<P> MvccRowIdFilter<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    pub(crate) fn new(txn_manager: Arc<TxnIdManager>, snapshot: TransactionSnapshot) -> Self {
+    /// Creates a new MVCC row filter with the given transaction manager and snapshot.
+    pub fn new(txn_manager: Arc<TxnIdManager>, snapshot: TransactionSnapshot) -> Self {
         Self {
             txn_manager,
             snapshot,
@@ -216,12 +248,4 @@ where
         }
         result
     }
-}
-
-// TODO: Move to `llkv-executor` crate?
-pub(crate) fn current_time_micros() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64
 }

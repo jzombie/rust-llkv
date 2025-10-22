@@ -29,6 +29,7 @@
 //! - **[`TransactionSnapshot`]**: Immutable view of transaction state for visibility checks
 //! - **[`TransactionContext`]**: Main interface for executing operations within a transaction
 //! - **[`RowVersion`]**: Metadata tracking which transaction created/deleted a row
+pub mod helpers;
 pub mod mvcc;
 
 use std::collections::{HashMap, HashSet};
@@ -38,6 +39,7 @@ use std::sync::{Arc, Mutex};
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 
+pub use helpers::{MvccRowIdFilter, TransactionMvccBuilder, filter_row_ids_for_snapshot};
 pub use mvcc::{
     RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TransactionSnapshot, TxnId, TxnIdManager,
 };

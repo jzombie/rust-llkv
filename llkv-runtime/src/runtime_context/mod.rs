@@ -21,7 +21,7 @@ use llkv_column_map::types::LogicalFieldId;
 use llkv_executor::{
     build_array_for_column, normalize_insert_value_for_column, parse_date32_literal,
     resolve_insert_columns, ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema,
-    ExecutorTable, QueryExecutor, RowBatch, TableProvider, expression,
+    ExecutorTable, QueryExecutor, RowBatch, TableProvider, expression, time_utils,
 };
 use llkv_expr::{Expr as LlkvExpr, ScalarExpr};
 use llkv_plan::{
@@ -46,7 +46,10 @@ use llkv_table::{
     ensure_single_column_unique,
 };
 use llkv_transaction::mvcc;
-use llkv_transaction::{TransactionManager, TransactionSnapshot, TxnId, TxnIdManager};
+use llkv_transaction::{
+    MvccRowIdFilter, TransactionManager, TransactionMvccBuilder, TransactionSnapshot, TxnId,
+    TxnIdManager, filter_row_ids_for_snapshot,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::mem;
@@ -55,14 +58,10 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-mod mvcc_helpers;
 mod provider;
 mod types;
 
 // Re-export for use within this module and RuntimeContext
-pub(crate) use mvcc_helpers::{
-    MvccRowIdFilter, TransactionMvccBuilder, current_time_micros, filter_row_ids_for_snapshot,
-};
 
 pub(crate) use types::{PreparedAssignmentValue, TableConstraintContext};
 
@@ -1209,7 +1208,7 @@ where
                         multi_column_uniques,
                     })
                 },
-                current_time_micros(),
+                time_utils::current_time_micros(),
             );
 
             if let Err(err) = fk_result {

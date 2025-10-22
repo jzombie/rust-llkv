@@ -25,6 +25,7 @@ use std::sync::{Arc, RwLock};
 pub type ExecutorResult<T> = Result<T, Error>;
 
 pub mod expression;
+pub mod time_utils;
 mod value_coercion;
 mod projections;
 mod schema;
