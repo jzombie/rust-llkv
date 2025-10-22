@@ -58,29 +58,7 @@ pub use runtime_table::{
     RuntimeTableHandle,
 };
 
-use std::marker::PhantomData;
-use std::mem;
-use std::ops::Bound;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use rustc_hash::{FxHashMap, FxHashSet};
-
-use arrow::array::{
-    Array, ArrayRef, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, StringBuilder,
-    UInt64Array, UInt64Builder,
-};
-use arrow::datatypes::{DataType, Field, FieldRef, Schema};
-use arrow::record_batch::RecordBatch;
-use llkv_column_map::ColumnStore;
-use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::LogicalFieldId;
-use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
-use llkv_executor::{
-    ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema, ExecutorTable, QueryExecutor,
-    RowBatch, TableProvider,
-};
+use arrow::datatypes::DataType;
 pub use llkv_executor::SelectExecution;
 pub use llkv_plan::{
     AggregateExpr, AlterTablePlan, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan,
@@ -90,32 +68,17 @@ pub use llkv_plan::{
     PlanValue, RenameTablePlan, SelectPlan, SelectProjection, UpdatePlan,
 };
 use llkv_result::{Error, Result};
-use llkv_storage::pager::{MemPager, Pager};
-use llkv_table::{
-    build_composite_unique_key, canonical_table_name, CatalogDdl, CatalogManager,
-    ConstraintColumnInfo, ConstraintKind, ConstraintService, CreateTableResult, FieldId,
-    ForeignKeyColumn, ForeignKeyTableInfo, ForeignKeyView, InsertColumnConstraint,
-    InsertMultiColumnUnique, InsertUniqueColumn, MetadataManager, MultiColumnUniqueEntryMeta,
-    MultiColumnUniqueRegistration, RowId, SingleColumnIndexDescriptor, SingleColumnIndexRegistration,
-    SysCatalog, Table, TableConstraintSummaryView, TableId, TableView, UniqueKey, ROW_ID_FIELD_ID,
-};
-use llkv_table::catalog::{MvccColumnBuilder, TableCatalog};
-use llkv_table::resolvers::{FieldConstraints, FieldDefinition};
-use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions};
-use llkv_table::{ensure_multi_column_unique, ensure_single_column_unique};
+use llkv_table::{canonical_table_name, CatalogDdl};
 pub use llkv_transaction::{
     TransactionContext, TransactionKind, TransactionManager, TransactionResult,
     TransactionSession, TransactionSnapshot, TxnId, TxnIdManager, TXN_ID_AUTO_COMMIT,
     TXN_ID_NONE,
 };
-use llkv_transaction::mvcc::{self, RowVersion};
 use sqlparser::ast::{
     Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName, ObjectNamePart,
     Select, SelectItem, SelectItemQualifiedWildcardKind, TableAlias, TableFactor, UnaryOperator,
     Value, ValueWithSpan,
 };
-use time::{Date, Month};
-use simd_r_drive_entry_handle::EntryHandle;
 
 
 fn is_index_not_found_error(err: &Error) -> bool {
@@ -144,49 +107,6 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
         | PlanStatement::CommitTransaction
         | PlanStatement::RollbackTransaction => None,
     }
-}
-
-/// Represents how a column assignment should be materialized during UPDATE/INSERT.
-enum PreparedAssignmentValue {
-    Literal(PlanValue),
-    Expression { expr_index: usize },
-}
-
-struct TransactionMvccBuilder;
-
-impl MvccColumnBuilder for TransactionMvccBuilder {
-    fn build_insert_columns(
-        &self,
-        row_count: usize,
-        start_row_id: RowId,
-        creator_txn_id: u64,
-        deleted_marker: u64,
-    ) -> (ArrayRef, ArrayRef, ArrayRef) {
-        mvcc::build_insert_mvcc_columns(row_count, start_row_id, creator_txn_id, deleted_marker)
-    }
-
-    fn mvcc_fields(&self) -> Vec<Field> {
-        mvcc::build_mvcc_fields()
-    }
-
-    fn field_with_metadata(
-        &self,
-        name: &str,
-        data_type: DataType,
-        nullable: bool,
-        field_id: FieldId,
-    ) -> Field {
-        mvcc::build_field_with_metadata(name, data_type, nullable, field_id)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct TableConstraintContext {
-    schema_field_ids: Vec<FieldId>,
-    column_constraints: Vec<InsertColumnConstraint>,
-    unique_columns: Vec<InsertUniqueColumn>,
-    multi_column_uniques: Vec<InsertMultiColumnUnique>,
-    primary_key: Option<InsertMultiColumnUnique>,
 }
 
 mod runtime_context;

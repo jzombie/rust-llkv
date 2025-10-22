@@ -8,15 +8,10 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use rustc_hash::{FxHashMap, FxHashSet};
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Builder, Float64Array, Float64Builder,
-    Int64Array, Int64Builder, RecordBatch, StringBuilder, UInt64Array, UInt64Builder,
+    Array, ArrayRef, BooleanBuilder, Date32Builder, Float64Builder,
+    Int64Builder, RecordBatch, StringBuilder, UInt64Array, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, FieldRef, Schema};
-use sqlparser::ast::{
-    Expr as SqlExpr, GroupByExpr, ObjectName, ObjectNamePart, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, TableAlias, TableFactor, UnaryOperator, Value,
-    ValueWithSpan, FunctionArg, FunctionArgExpr,
-};
 use time::{Date, Month};
 use llkv_storage::pager::Pager;
 use llkv_result::{Error, Result};
@@ -43,6 +38,7 @@ use llkv_executor::{
     ExecutorTable, ExecutorColumn, ExecutorSchema, ExecutorMultiColumnUnique,
     QueryExecutor, TableProvider, RowBatch,
 };
+use llkv_column_map::store::{ROW_ID_COLUMN_NAME};
 use llkv_expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_plan::{
     CreateTablePlan, CreateTableSource, InsertPlan, InsertSource, UpdatePlan, DeletePlan,
@@ -50,14 +46,14 @@ use llkv_plan::{
     ColumnAssignment, AssignmentValue, PlanValue, ColumnSpec, ForeignKeySpec,
     MultiColumnUniqueSpec, IntoColumnSpec,
 };
+use simd_r_drive_entry_handle::EntryHandle;
 use crate::{
     RuntimeStatementResult, RuntimeTableHandle, RuntimeSession, SelectExecution,
     RuntimeCreateTableBuilder, canonical_table_name,
-    ROW_ID_COLUMN_NAME,
     TXN_ID_AUTO_COMMIT, TXN_ID_NONE,
     RuntimeTransactionContext,
     validate_alter_table_operation, is_table_missing_error,
-    sql_type_to_arrow, EntryHandle,
+    sql_type_to_arrow,
 };
 use llkv_storage::pager::MemPager;
 
