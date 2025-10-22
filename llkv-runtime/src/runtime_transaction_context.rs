@@ -5,9 +5,7 @@ use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use llkv_table::{CatalogDdl, SingleColumnIndexDescriptor, TableId};
-use llkv_transaction::{
-    TransactionContext, TransactionResult, TransactionSnapshot, TxnId,
-};
+use llkv_transaction::{TransactionContext, TransactionResult, TransactionSnapshot, TxnId};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{
@@ -137,21 +135,15 @@ where
         table_name: &str,
         filter: Option<LlkvExpr<'static, String>>,
     ) -> LlkvResult<Vec<RecordBatch>> {
-        self.context().get_batches_with_row_ids(
-            table_name,
-            filter,
-            self.snapshot(),
-        )
+        self.context()
+            .get_batches_with_row_ids(table_name, filter, self.snapshot())
     }
 
     fn execute_select(&self, plan: SelectPlan) -> LlkvResult<SelectExecution<Self::Pager>> {
         self.context().execute_select(plan, self.snapshot())
     }
 
-    fn apply_create_table_plan(
-        &self,
-        plan: CreateTablePlan,
-    ) -> LlkvResult<TransactionResult<P>> {
+    fn apply_create_table_plan(&self, plan: CreateTablePlan) -> LlkvResult<TransactionResult<P>> {
         let ctx = self.context();
         let result = CatalogDdl::create_table(ctx.as_ref(), plan)?;
         Ok(convert_statement_result(result))

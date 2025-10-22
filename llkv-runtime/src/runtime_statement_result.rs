@@ -35,7 +35,7 @@ where
     },
     Select {
         table_name: String,
-    schema: Arc<Schema>,
+        schema: Arc<Schema>,
         execution: SelectExecution<P>,
     },
     Transaction {

@@ -9,7 +9,7 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::{canonical_table_name, RuntimeContext, RuntimeLazyFrame, RuntimeStatementResult};
+use crate::{RuntimeContext, RuntimeLazyFrame, RuntimeStatementResult, canonical_table_name};
 
 pub struct RuntimeCreateTableBuilder<'ctx, P>
 where
@@ -40,7 +40,11 @@ where
         self
     }
 
-    pub fn with_column(mut self, name: impl Into<String>, data_type: arrow::datatypes::DataType) -> Self {
+    pub fn with_column(
+        mut self,
+        name: impl Into<String>,
+        data_type: arrow::datatypes::DataType,
+    ) -> Self {
         self.plan
             .columns
             .push(ColumnSpec::new(name.into(), data_type, true));

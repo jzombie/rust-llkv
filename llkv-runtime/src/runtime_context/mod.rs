@@ -7,90 +7,75 @@
 //! - `types`: Helper types (PreparedAssignmentValue, TableConstraintContext)
 //! - `provider`: ContextProvider for TableProvider trait
 
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}, RwLock};
-use std::mem;
-use rustc_hash::{FxHashMap, FxHashSet};
-use arrow::array::{
-    Array, ArrayRef, RecordBatch, UInt64Array, UInt64Builder,
+use crate::{
+    RuntimeCreateTableBuilder, RuntimeSession, RuntimeStatementResult, RuntimeTableHandle,
+    RuntimeTransactionContext, SelectExecution, TXN_ID_AUTO_COMMIT, TXN_ID_NONE,
+    canonical_table_name, is_table_missing_error, sql_type_to_arrow,
+    validate_alter_table_operation,
 };
+use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema};
-use llkv_storage::pager::Pager;
-use llkv_result::{Error, Result};
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::LogicalFieldId;
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_table::{
-    Table, MetadataManager, SysCatalog, TableId,
-    CatalogManager, ConstraintService, ConstraintKind,
-    CreateTableResult, FieldId, RowId,
-    ConstraintColumnInfo, InsertColumnConstraint, InsertUniqueColumn, InsertMultiColumnUnique,
-    ForeignKeyTableInfo, ForeignKeyColumn, ForeignKeyView, TableView,
-    SingleColumnIndexDescriptor, SingleColumnIndexRegistration, MultiColumnUniqueRegistration,
-    TableConstraintSummaryView, MultiColumnUniqueEntryMeta,
-    ensure_single_column_unique, ensure_multi_column_unique, build_composite_unique_key, UniqueKey,
-    CatalogDdl,
-};
-use llkv_table::catalog::TableCatalog;
-use llkv_table::resolvers::{FieldDefinition, FieldConstraints};
-use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions};
-use llkv_transaction::{TransactionManager, TxnIdManager, TransactionSnapshot, TxnId};
-use llkv_transaction::mvcc;
+use llkv_column_map::store::ROW_ID_COLUMN_NAME;
+use llkv_column_map::types::LogicalFieldId;
 use llkv_executor::{
-    ExecutorTable, ExecutorColumn, ExecutorSchema, ExecutorMultiColumnUnique,
-    QueryExecutor, TableProvider, RowBatch,
+    ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema, ExecutorTable, QueryExecutor,
+    RowBatch, TableProvider,
 };
-use llkv_column_map::store::{ROW_ID_COLUMN_NAME};
 use llkv_expr::{Expr as LlkvExpr, ScalarExpr};
 use llkv_plan::{
-    CreateTablePlan, CreateTableSource, InsertPlan, InsertSource, UpdatePlan, DeletePlan,
-    SelectPlan, DropTablePlan, RenameTablePlan, AlterTablePlan, CreateIndexPlan, DropIndexPlan,
-    ColumnAssignment, AssignmentValue, PlanValue, ColumnSpec, ForeignKeySpec,
-    MultiColumnUniqueSpec, IntoColumnSpec,
+    AlterTablePlan, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan,
+    CreateTablePlan, CreateTableSource, DeletePlan, DropIndexPlan, DropTablePlan, ForeignKeySpec,
+    InsertPlan, InsertSource, IntoColumnSpec, MultiColumnUniqueSpec, PlanValue, RenameTablePlan,
+    SelectPlan, UpdatePlan,
 };
-use simd_r_drive_entry_handle::EntryHandle;
-use crate::{
-    RuntimeStatementResult, RuntimeTableHandle, RuntimeSession, SelectExecution,
-    RuntimeCreateTableBuilder, canonical_table_name,
-    TXN_ID_AUTO_COMMIT, TXN_ID_NONE,
-    RuntimeTransactionContext,
-    validate_alter_table_operation, is_table_missing_error,
-    sql_type_to_arrow,
-};
+use llkv_result::{Error, Result};
 use llkv_storage::pager::MemPager;
+use llkv_storage::pager::Pager;
+use llkv_table::catalog::TableCatalog;
+use llkv_table::resolvers::{FieldConstraints, FieldDefinition};
+use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions};
+use llkv_table::{
+    CatalogDdl, CatalogManager, ConstraintColumnInfo, ConstraintKind, ConstraintService,
+    CreateTableResult, FieldId, ForeignKeyColumn, ForeignKeyTableInfo, ForeignKeyView,
+    InsertColumnConstraint, InsertMultiColumnUnique, InsertUniqueColumn, MetadataManager,
+    MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, RowId, SingleColumnIndexDescriptor,
+    SingleColumnIndexRegistration, SysCatalog, Table, TableConstraintSummaryView, TableId,
+    TableView, UniqueKey, build_composite_unique_key, ensure_multi_column_unique,
+    ensure_single_column_unique,
+};
+use llkv_transaction::mvcc;
+use llkv_transaction::{TransactionManager, TransactionSnapshot, TxnId, TxnIdManager};
+use rustc_hash::{FxHashMap, FxHashSet};
+use simd_r_drive_entry_handle::EntryHandle;
+use std::mem;
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 
-mod mvcc_helpers;
 mod data_conversion;
+mod mvcc_helpers;
+mod provider;
 mod query_translation;
 mod types;
-mod provider;
 
 // Re-export for use within this module and RuntimeContext
 pub(crate) use mvcc_helpers::{
-    TransactionMvccBuilder, 
-    filter_row_ids_for_snapshot, 
-    MvccRowIdFilter, 
-    current_time_micros
+    MvccRowIdFilter, TransactionMvccBuilder, current_time_micros, filter_row_ids_for_snapshot,
 };
 
 pub(crate) use data_conversion::{
-    resolve_insert_columns,
-    normalize_insert_value_for_column,
-    build_array_for_column,
+    build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns,
 };
 
 // Also import parse_date32_literal for internal use (not re-exported)
 use data_conversion::parse_date32_literal;
 
-pub(crate) use query_translation::{
-    full_table_scan_filter,
-    translate_predicate,
-    translate_scalar,
-};
+pub(crate) use query_translation::{full_table_scan_filter, translate_predicate, translate_scalar};
 
-pub(crate) use types::{
-    PreparedAssignmentValue,
-    TableConstraintContext,
-};
+pub(crate) use types::{PreparedAssignmentValue, TableConstraintContext};
 
 pub(crate) use provider::ContextProvider;
 
@@ -519,8 +504,10 @@ where
     /// Each session can have its own independent transaction.
     pub fn create_session(self: &Arc<Self>) -> RuntimeSession<P> {
         tracing::debug!("[SESSION] RuntimeContext::create_session called");
-        let namespaces = Arc::new(crate::runtime_session::SessionNamespaces::new(Arc::clone(self)));
-    let wrapper = RuntimeTransactionContext::new(Arc::clone(self));
+        let namespaces = Arc::new(crate::runtime_session::SessionNamespaces::new(Arc::clone(
+            self,
+        )));
+        let wrapper = RuntimeTransactionContext::new(Arc::clone(self));
         let inner = self.transaction_manager.create_session(Arc::new(wrapper));
         tracing::debug!(
             "[SESSION] Created TransactionSession with session_id (will be logged by transaction manager)"
@@ -711,7 +698,10 @@ where
         handle.lazy()?.collect_rows()
     }
 
-    pub(crate) fn execute_create_table(&self, plan: CreateTablePlan) -> Result<RuntimeStatementResult<P>> {
+    pub(crate) fn execute_create_table(
+        &self,
+        plan: CreateTablePlan,
+    ) -> Result<RuntimeStatementResult<P>> {
         CatalogDdl::create_table(self, plan)
     }
 
@@ -2443,7 +2433,7 @@ where
             .map(|column| column.name.clone())
             .collect();
         let column_order = resolve_insert_columns(&column_names, table.schema.as_ref())?;
-        
+
         // Validate row-level constraints (NOT NULL, CHECK)
         self.constraint_service.validate_row_level_constraints(
             &constraint_ctx.schema_field_ids,
@@ -2457,14 +2447,15 @@ where
         // This prevents false duplicate detection when primary key values don't change.
         let row_ids_set: FxHashSet<RowId> = row_ids.iter().copied().collect();
         let all_visible_row_ids = {
-            let first_field = table.schema.first_field_id().ok_or_else(|| {
-                Error::Internal("table has no columns for validation".into())
-            })?;
+            let first_field = table
+                .schema
+                .first_field_id()
+                .ok_or_else(|| Error::Internal("table has no columns for validation".into()))?;
             let filter_expr = full_table_scan_filter(first_field);
             let all_ids = table.table.filter_row_ids(&filter_expr)?;
             filter_row_ids_for_snapshot(table.table.as_ref(), all_ids, &self.txn_manager, snapshot)?
         };
-        
+
         self.constraint_service.validate_insert_constraints(
             &constraint_ctx.schema_field_ids,
             &constraint_ctx.column_constraints,
@@ -2475,7 +2466,8 @@ where
             &new_rows,
             |field_id| {
                 // Get all values and filter out rows being updated
-                let all_vals = self.collect_row_values_for_ids(table, &all_visible_row_ids, &[field_id])?;
+                let all_vals =
+                    self.collect_row_values_for_ids(table, &all_visible_row_ids, &[field_id])?;
                 let filtered: Vec<PlanValue> = all_vals
                     .into_iter()
                     .zip(&all_visible_row_ids)
@@ -2491,7 +2483,8 @@ where
             },
             |field_ids| {
                 // Get all multi-column values and filter out rows being updated
-                let all_rows = self.collect_row_values_for_ids(table, &all_visible_row_ids, field_ids)?;
+                let all_rows =
+                    self.collect_row_values_for_ids(table, &all_visible_row_ids, field_ids)?;
                 let filtered: Vec<Vec<PlanValue>> = all_rows
                     .into_iter()
                     .zip(&all_visible_row_ids)
@@ -2530,7 +2523,13 @@ where
 
         // Also validate foreign keys for the new rows BEFORE deleting old rows
         // This prevents data loss if the new values violate FK constraints
-        self.check_foreign_keys_on_insert(table, &display_name, &new_rows, &column_order, snapshot)?;
+        self.check_foreign_keys_on_insert(
+            table,
+            &display_name,
+            &new_rows,
+            &column_order,
+            snapshot,
+        )?;
 
         let _ = self.apply_delete(
             table,
@@ -2754,7 +2753,7 @@ where
             .map(|column| column.name.clone())
             .collect();
         let column_order = resolve_insert_columns(&column_names, table.schema.as_ref())?;
-        
+
         // Validate row-level constraints (NOT NULL, CHECK)
         self.constraint_service.validate_row_level_constraints(
             &constraint_ctx.schema_field_ids,
@@ -2766,14 +2765,15 @@ where
         // For UPDATE, validate UNIQUE constraints excluding rows being updated
         let row_ids_set: FxHashSet<RowId> = row_ids.iter().copied().collect();
         let all_visible_row_ids = {
-            let first_field = table.schema.first_field_id().ok_or_else(|| {
-                Error::Internal("table has no columns for validation".into())
-            })?;
+            let first_field = table
+                .schema
+                .first_field_id()
+                .ok_or_else(|| Error::Internal("table has no columns for validation".into()))?;
             let filter_expr = full_table_scan_filter(first_field);
             let all_ids = table.table.filter_row_ids(&filter_expr)?;
             filter_row_ids_for_snapshot(table.table.as_ref(), all_ids, &self.txn_manager, snapshot)?
         };
-        
+
         self.constraint_service.validate_insert_constraints(
             &constraint_ctx.schema_field_ids,
             &constraint_ctx.column_constraints,
@@ -2783,7 +2783,8 @@ where
             &column_order,
             &new_rows,
             |field_id| {
-                let all_vals = self.collect_row_values_for_ids(table, &all_visible_row_ids, &[field_id])?;
+                let all_vals =
+                    self.collect_row_values_for_ids(table, &all_visible_row_ids, &[field_id])?;
                 let filtered: Vec<PlanValue> = all_vals
                     .into_iter()
                     .zip(&all_visible_row_ids)
@@ -2798,7 +2799,8 @@ where
                 Ok(filtered)
             },
             |field_ids| {
-                let all_rows = self.collect_row_values_for_ids(table, &all_visible_row_ids, field_ids)?;
+                let all_rows =
+                    self.collect_row_values_for_ids(table, &all_visible_row_ids, field_ids)?;
                 let filtered: Vec<Vec<PlanValue>> = all_rows
                     .into_iter()
                     .zip(&all_visible_row_ids)
@@ -2836,7 +2838,13 @@ where
         )?;
 
         // Also validate foreign keys for the new rows BEFORE deleting old rows
-        self.check_foreign_keys_on_insert(table, &display_name, &new_rows, &column_order, snapshot)?;
+        self.check_foreign_keys_on_insert(
+            table,
+            &display_name,
+            &new_rows,
+            &column_order,
+            snapshot,
+        )?;
 
         let _ = self.apply_delete(
             table,
@@ -3751,7 +3759,7 @@ where
         let view = match self.catalog_service.table_view(&canonical_table) {
             Ok(view) => view,
             Err(err) if plan.if_exists && is_table_missing_error(&err) => {
-                return Ok(RuntimeStatementResult::NoOp)
+                return Ok(RuntimeStatementResult::NoOp);
             }
             Err(err) => return Err(err),
         };
@@ -3768,12 +3776,7 @@ where
 
         let table_id = table_meta.table_id;
 
-        validate_alter_table_operation(
-            &plan.operation,
-            &view,
-            table_id,
-            &self.catalog_service,
-        )?;
+        validate_alter_table_operation(&plan.operation, &view, table_id, &self.catalog_service)?;
 
         match &plan.operation {
             llkv_plan::AlterTableOperation::RenameColumn {

@@ -50,12 +50,8 @@ pub use runtime_lazy_frame::RuntimeLazyFrame;
 
 mod runtime_table;
 pub use runtime_table::{
+    IntoInsertRow, RuntimeCreateTableBuilder, RuntimeInsertRowKind, RuntimeRow, RuntimeTableHandle,
     row,
-    IntoInsertRow,
-    RuntimeCreateTableBuilder,
-    RuntimeInsertRowKind,
-    RuntimeRow,
-    RuntimeTableHandle,
 };
 
 use arrow::datatypes::DataType;
@@ -68,18 +64,16 @@ pub use llkv_plan::{
     PlanValue, RenameTablePlan, SelectPlan, SelectProjection, UpdatePlan,
 };
 use llkv_result::{Error, Result};
-use llkv_table::{canonical_table_name, CatalogDdl};
+use llkv_table::{CatalogDdl, canonical_table_name};
 pub use llkv_transaction::{
-    TransactionContext, TransactionKind, TransactionManager, TransactionResult,
-    TransactionSession, TransactionSnapshot, TxnId, TxnIdManager, TXN_ID_AUTO_COMMIT,
-    TXN_ID_NONE,
+    TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TransactionContext, TransactionKind, TransactionManager,
+    TransactionResult, TransactionSession, TransactionSnapshot, TxnId, TxnIdManager,
 };
 use sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName, ObjectNamePart,
-    Select, SelectItem, SelectItemQualifiedWildcardKind, TableAlias, TableFactor, UnaryOperator,
-    Value, ValueWithSpan,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName, ObjectNamePart, Select,
+    SelectItem, SelectItemQualifiedWildcardKind, TableAlias, TableFactor, UnaryOperator, Value,
+    ValueWithSpan,
 };
-
 
 fn is_index_not_found_error(err: &Error) -> bool {
     matches!(err, Error::CatalogError(message) if message.contains("does not exist"))
@@ -508,8 +502,8 @@ pub(crate) fn sql_type_to_arrow(type_str: &str) -> Result<DataType> {
 mod tests {
     use super::*;
     use arrow::array::{Array, Int64Array, StringArray};
-    use llkv_storage::pager::MemPager;
     use llkv_plan::{NotNull, Nullable};
+    use llkv_storage::pager::MemPager;
     use std::sync::Arc;
 
     #[test]

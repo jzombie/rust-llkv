@@ -7,7 +7,7 @@ use llkv_result::Result;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::{canonical_table_name, RuntimeContext};
+use crate::{RuntimeContext, canonical_table_name};
 
 /// Lazily built logical plan (thin wrapper over SelectPlan).
 pub struct RuntimeLazyFrame<P>

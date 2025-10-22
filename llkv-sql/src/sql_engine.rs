@@ -19,8 +19,8 @@ use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan, CreateTablePlan,
     CreateTableSource, DeletePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan,
     InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanStatement,
-    PlanValue, RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession, RuntimeStatementResult,
-    SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
+    PlanValue, RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession,
+    RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
 use llkv_table::CatalogDdl;

@@ -109,7 +109,10 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     pub(crate) fn from_parts(
-    inner: TransactionSession<RuntimeTransactionContext<P>, RuntimeTransactionContext<MemPager>>,
+        inner: TransactionSession<
+            RuntimeTransactionContext<P>,
+            RuntimeTransactionContext<MemPager>,
+        >,
         namespaces: Arc<SessionNamespaces<P>>,
     ) -> Self {
         Self { inner, namespaces }
@@ -193,6 +196,32 @@ where
         self.namespaces.temporary()
     }
 
+    fn base_transaction_context(&self) -> Arc<RuntimeTransactionContext<P>> {
+        Arc::clone(self.inner.context())
+    }
+
+    fn with_autocommit_transaction_context<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&RuntimeTransactionContext<P>) -> Result<T>,
+    {
+        let context = self.base_transaction_context();
+        let default_snapshot = context.ctx().default_snapshot();
+        TransactionContext::set_snapshot(&*context, default_snapshot);
+        f(context.as_ref())
+    }
+
+    fn run_autocommit_insert(&self, plan: InsertPlan) -> Result<TransactionResult<P>> {
+        self.with_autocommit_transaction_context(|ctx| TransactionContext::insert(ctx, plan))
+    }
+
+    fn run_autocommit_update(&self, plan: UpdatePlan) -> Result<TransactionResult<P>> {
+        self.with_autocommit_transaction_context(|ctx| TransactionContext::update(ctx, plan))
+    }
+
+    fn run_autocommit_delete(&self, plan: DeletePlan) -> Result<TransactionResult<P>> {
+        self.with_autocommit_transaction_context(|ctx| TransactionContext::delete(ctx, plan))
+    }
+
     /// Begin a transaction in this session.
     /// Creates an empty staging context for new tables created within the transaction.
     /// Existing tables are accessed via MVCC visibility filtering - NO data copying occurs.
@@ -208,7 +237,7 @@ where
         // Existing tables are read from base context with MVCC visibility filtering.
         // No data copying occurs at BEGIN - this is pure MVCC.
 
-    let staging_wrapper = Arc::new(RuntimeTransactionContext::new(staging_ctx));
+        let staging_wrapper = Arc::new(RuntimeTransactionContext::new(staging_ctx));
 
         self.inner.begin_transaction(staging_wrapper)?;
         Ok(RuntimeStatementResult::Transaction {
@@ -447,10 +476,15 @@ where
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 let temp_context = temp_namespace.context();
-                let snapshot = temp_context.default_snapshot();
-                temp_context
-                    .insert(plan, snapshot)?
-                    .convert_pager_type::<P>()?;
+                let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+                match TransactionContext::insert(&temp_tx_context, plan)? {
+                    TransactionResult::Insert { .. } => {}
+                    _ => {
+                        return Err(Error::Internal(
+                            "unexpected transaction result for temporary INSERT".into(),
+                        ));
+                    }
+                }
                 Ok(RuntimeStatementResult::Insert {
                     rows_inserted,
                     table_name,
@@ -480,10 +514,12 @@ where
                         }
                     }
                 } else {
-                    let context = self.inner.context();
-                    let default_snapshot = context.ctx().default_snapshot();
-                    TransactionContext::set_snapshot(&**context, default_snapshot);
-                    TransactionContext::insert(&**context, plan)?;
+                    let result = self.run_autocommit_insert(plan)?;
+                    if !matches!(result, TransactionResult::Insert { .. }) {
+                        return Err(Error::Internal(
+                            "unexpected transaction result for INSERT operation".into(),
+                        ));
+                    }
                     Ok(RuntimeStatementResult::Insert {
                         rows_inserted,
                         table_name,
@@ -554,15 +590,14 @@ where
             }
         } else {
             // Call via TransactionContext trait
-            let context = self.inner.context();
-            let default_snapshot = context.ctx().default_snapshot();
-            TransactionContext::set_snapshot(&**context, default_snapshot);
             let table_name = if plan.tables.len() == 1 {
                 plan.tables[0].qualified_name()
             } else {
                 String::new()
             };
-            let execution = TransactionContext::execute_select(&**context, plan)?;
+            let execution = self.with_autocommit_transaction_context(|ctx| {
+                TransactionContext::execute_select(ctx, plan)
+            })?;
             let schema = execution.schema();
             Ok(RuntimeStatementResult::Select {
                 execution,
@@ -580,8 +615,7 @@ where
             RuntimeStatementResult::Select { execution, .. } => Ok(execution.collect_rows()?.rows),
             other => Err(Error::Internal(format!(
                 "expected Select result when reading table '{}', got {:?}",
-                table,
-                other
+                table, other
             ))),
         }
     }
@@ -596,10 +630,19 @@ where
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 let temp_context = temp_namespace.context();
-                let snapshot = temp_context.default_snapshot();
-                temp_context
-                    .update(plan, snapshot)?
-                    .convert_pager_type::<P>()
+                let table_name = plan.table.clone();
+                let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+                match TransactionContext::update(&temp_tx_context, plan)? {
+                    TransactionResult::Update { rows_updated, .. } => {
+                        Ok(RuntimeStatementResult::Update {
+                            rows_updated,
+                            table_name,
+                        })
+                    }
+                    _ => Err(Error::Internal(
+                        "unexpected transaction result for temporary UPDATE".into(),
+                    )),
+                }
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
@@ -623,12 +666,8 @@ where
                         _ => Err(Error::Internal("expected Update result".into())),
                     }
                 } else {
-                    // Call via TransactionContext trait
-                    let context = self.inner.context();
-                    let default_snapshot = context.ctx().default_snapshot();
-                    TransactionContext::set_snapshot(&**context, default_snapshot);
                     let table_name = plan.table.clone();
-                    let result = TransactionContext::update(&**context, plan)?;
+                    let result = self.run_autocommit_update(plan)?;
                     match result {
                         TransactionResult::Update {
                             rows_matched: _,
@@ -658,10 +697,19 @@ where
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 let temp_context = temp_namespace.context();
-                let snapshot = temp_context.default_snapshot();
-                temp_context
-                    .delete(plan, snapshot)?
-                    .convert_pager_type::<P>()
+                let table_name = plan.table.clone();
+                let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+                match TransactionContext::delete(&temp_tx_context, plan)? {
+                    TransactionResult::Delete { rows_deleted } => {
+                        Ok(RuntimeStatementResult::Delete {
+                            rows_deleted,
+                            table_name,
+                        })
+                    }
+                    _ => Err(Error::Internal(
+                        "unexpected transaction result for temporary DELETE".into(),
+                    )),
+                }
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
@@ -684,12 +732,8 @@ where
                         _ => Err(Error::Internal("expected Delete result".into())),
                     }
                 } else {
-                    // Call via TransactionContext trait
-                    let context = self.inner.context();
-                    let default_snapshot = context.ctx().default_snapshot();
-                    TransactionContext::set_snapshot(&**context, default_snapshot);
                     let table_name = plan.table.clone();
-                    let result = TransactionContext::delete(&**context, plan)?;
+                    let result = self.run_autocommit_delete(plan)?;
                     match result {
                         TransactionResult::Delete { rows_deleted } => {
                             Ok(RuntimeStatementResult::Delete {
@@ -742,14 +786,16 @@ where
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
-                    match self.inner.execute_operation(PlanOperation::CreateTable(plan)) {
+                    match self
+                        .inner
+                        .execute_operation(PlanOperation::CreateTable(plan))
+                    {
                         Ok(TransactionResult::CreateTable { table_name }) => {
                             Ok(RuntimeStatementResult::CreateTable { table_name })
                         }
                         Ok(TransactionResult::NoOp) => Ok(RuntimeStatementResult::NoOp),
                         Ok(_) => Err(Error::Internal(
-                            "expected CreateTable result during transactional CREATE TABLE"
-                                .into(),
+                            "expected CreateTable result during transactional CREATE TABLE".into(),
                         )),
                         Err(err) => {
                             self.abort_transaction();
@@ -757,10 +803,7 @@ where
                         }
                     }
                 } else {
-                    if self
-                        .inner
-                        .has_table_locked_by_other_session(&plan.name)
-                    {
+                    if self.inner.has_table_locked_by_other_session(&plan.name) {
                         return Err(Error::TransactionContextError(format!(
                             "table '{}' is locked by another active transaction",
                             plan.name
@@ -790,8 +833,7 @@ where
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
-                    let referencing_tables =
-                        self.tables_referencing_in_transaction(&plan.name);
+                    let referencing_tables = self.tables_referencing_in_transaction(&plan.name);
                     if !referencing_tables.is_empty() {
                         let referencing_table = &referencing_tables[0];
                         self.abort_transaction();
@@ -816,10 +858,7 @@ where
                         }
                     }
                 } else {
-                    if self
-                        .inner
-                        .has_table_locked_by_other_session(&plan.name)
-                    {
+                    if self.inner.has_table_locked_by_other_session(&plan.name) {
                         return Err(Error::TransactionContextError(format!(
                             "table '{}' is locked by another active transaction",
                             plan.name
@@ -886,7 +925,7 @@ where
                 let view = match catalog_service.table_view(&canonical_table) {
                     Ok(view) => view,
                     Err(err) if plan.if_exists && super::is_table_missing_error(&err) => {
-                        return Ok(RuntimeStatementResult::NoOp)
+                        return Ok(RuntimeStatementResult::NoOp);
                     }
                     Err(err) => return Err(err),
                 };
@@ -903,9 +942,7 @@ where
                     catalog_service,
                 )?;
 
-                temp_namespace
-                    .alter_table(plan)?
-                    .convert_pager_type::<P>()
+                temp_namespace.alter_table(plan)?.convert_pager_type::<P>()
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {
                 let persistent = self.persistent_namespace();
@@ -914,7 +951,7 @@ where
                 let view = match catalog_service.table_view(&canonical_table) {
                     Ok(view) => view,
                     Err(err) if plan.if_exists && super::is_table_missing_error(&err) => {
-                        return Ok(RuntimeStatementResult::NoOp)
+                        return Ok(RuntimeStatementResult::NoOp);
                     }
                     Err(err) => return Err(err),
                 };

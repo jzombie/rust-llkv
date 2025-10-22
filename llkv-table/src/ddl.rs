@@ -6,8 +6,7 @@
 //! index) while letting each layer choose its own return types via associated outputs.
 
 use llkv_plan::{
-    AlterTablePlan, CreateIndexPlan, CreateTablePlan, DropIndexPlan, DropTablePlan,
-    RenameTablePlan,
+    AlterTablePlan, CreateIndexPlan, CreateTablePlan, DropIndexPlan, DropTablePlan, RenameTablePlan,
 };
 use llkv_result::Result;
 

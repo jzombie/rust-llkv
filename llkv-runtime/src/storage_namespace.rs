@@ -8,8 +8,8 @@ use std::sync::{Arc, RwLock};
 
 use llkv_executor::ExecutorTable;
 use llkv_plan::{
-    AlterTablePlan, CreateIndexPlan, CreateTablePlan, DropIndexPlan, DropTablePlan,
-    PlanOperation, RenameTablePlan,
+    AlterTablePlan, CreateIndexPlan, CreateTablePlan, DropIndexPlan, DropTablePlan, PlanOperation,
+    RenameTablePlan,
 };
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
@@ -59,7 +59,10 @@ pub trait StorageNamespace: Send + Sync + 'static {
     fn rename_table(&self, plan: RenameTablePlan) -> crate::Result<()>;
 
     /// Alter a table within this namespace.
-    fn alter_table(&self, plan: AlterTablePlan) -> crate::Result<RuntimeStatementResult<Self::Pager>>;
+    fn alter_table(
+        &self,
+        plan: AlterTablePlan,
+    ) -> crate::Result<RuntimeStatementResult<Self::Pager>>;
 
     /// Create an index within this namespace.
     fn create_index(
@@ -173,7 +176,10 @@ where
         CatalogDdl::rename_table(self.context.as_ref(), plan)
     }
 
-    fn alter_table(&self, plan: AlterTablePlan) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
+    fn alter_table(
+        &self,
+        plan: AlterTablePlan,
+    ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
         CatalogDdl::alter_table(self.context.as_ref(), plan)
     }
 
@@ -332,7 +338,10 @@ where
         Ok(())
     }
 
-    fn alter_table(&self, plan: AlterTablePlan) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
+    fn alter_table(
+        &self,
+        plan: AlterTablePlan,
+    ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
         let context = self.context();
         CatalogDdl::alter_table(context.as_ref(), plan)
     }

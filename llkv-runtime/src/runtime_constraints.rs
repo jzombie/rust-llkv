@@ -20,8 +20,7 @@ pub(crate) fn column_in_primary_or_unique(view: &TableView, field_id: FieldId) -
 }
 
 pub(crate) fn column_in_multi_column_unique(view: &TableView, field_id: FieldId) -> bool {
-    view
-        .multi_column_uniques
+    view.multi_column_uniques
         .iter()
         .any(|entry| entry.column_ids.contains(&field_id))
 }
@@ -55,9 +54,7 @@ where
         }
 
         for fk in catalog_service.foreign_key_views_for_table(referencing_table_id)? {
-            if fk.referenced_table_id == table_id
-                && fk.referenced_field_ids.contains(&field_id)
-            {
+            if fk.referenced_table_id == table_id && fk.referenced_field_ids.contains(&field_id) {
                 return Ok(Some(
                     fk.constraint_name
                         .as_deref()
@@ -154,7 +151,7 @@ where
                     return Err(Error::CatalogError(format!(
                         "Catalog Error: column '{}' does not exist",
                         column_name
-                    )))
+                    )));
                 }
             };
 

@@ -4,9 +4,7 @@ use llkv_result::Result;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::{
-    CatalogDdl, PlanStatement, RuntimeContext, RuntimeSession, RuntimeStatementResult,
-};
+use crate::{CatalogDdl, PlanStatement, RuntimeContext, RuntimeSession, RuntimeStatementResult};
 
 pub struct RuntimeEngine<P>
 where

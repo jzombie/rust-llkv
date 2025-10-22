@@ -1,7 +1,7 @@
 //! Helper types used internally by RuntimeContext
 
 use llkv_plan::PlanValue;
-use llkv_table::{FieldId, InsertColumnConstraint, InsertUniqueColumn, InsertMultiColumnUnique};
+use llkv_table::{FieldId, InsertColumnConstraint, InsertMultiColumnUnique, InsertUniqueColumn};
 
 /// Represents how a column assignment should be materialized during UPDATE/INSERT.
 pub(crate) enum PreparedAssignmentValue {

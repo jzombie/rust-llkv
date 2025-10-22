@@ -1,11 +1,11 @@
 //! Query translation helpers - converts string-based expressions to field-ID based expressions
 
-use std::ops::Bound;
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
+use llkv_executor::ExecutorSchema;
 use llkv_expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result};
 use llkv_table::{FieldId, ROW_ID_FIELD_ID};
-use llkv_executor::ExecutorSchema;
+use std::ops::Bound;
 
 pub(crate) fn full_table_scan_filter(field_id: FieldId) -> LlkvExpr<'static, FieldId> {
     LlkvExpr::Pred(Filter {

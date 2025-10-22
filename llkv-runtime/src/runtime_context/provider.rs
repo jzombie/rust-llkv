@@ -1,11 +1,11 @@
 //! ContextProvider implementation for TableProvider trait
 
-use std::sync::Arc;
-use llkv_storage::pager::Pager;
-use simd_r_drive_entry_handle::EntryHandle;
+use crate::runtime_context::RuntimeContext;
 use llkv_executor::{ExecutorTable, TableProvider};
 use llkv_result::Result;
-use crate::runtime_context::RuntimeContext;
+use llkv_storage::pager::Pager;
+use simd_r_drive_entry_handle::EntryHandle;
+use std::sync::Arc;
 
 /// Internal provider struct that wraps RuntimeContext for use with llkv_executor.
 pub(crate) struct ContextProvider<P>

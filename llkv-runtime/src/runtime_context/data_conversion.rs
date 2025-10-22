@@ -1,14 +1,14 @@
 //! Data conversion helpers for insert operations and type coercion
 
-use std::sync::Arc;
 use arrow::array::{
     ArrayRef, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, StringBuilder,
 };
 use arrow::datatypes::{DataType, FieldRef};
-use time::{Date, Month};
-use llkv_result::{Error, Result};
+use llkv_executor::{ExecutorColumn, ExecutorSchema};
 use llkv_plan::PlanValue;
-use llkv_executor::{ExecutorSchema, ExecutorColumn};
+use llkv_result::{Error, Result};
+use std::sync::Arc;
+use time::{Date, Month};
 
 pub fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> Result<Vec<usize>> {
     if columns.is_empty() {
