@@ -21,7 +21,7 @@ use llkv_column_map::types::LogicalFieldId;
 use llkv_executor::{
     build_array_for_column, normalize_insert_value_for_column, parse_date32_literal,
     resolve_insert_columns, ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema,
-    ExecutorTable, QueryExecutor, RowBatch, TableProvider,
+    ExecutorTable, QueryExecutor, RowBatch, TableProvider, expression,
 };
 use llkv_expr::{Expr as LlkvExpr, ScalarExpr};
 use llkv_plan::{
@@ -57,15 +57,12 @@ use std::sync::{
 
 mod mvcc_helpers;
 mod provider;
-mod query_translation;
 mod types;
 
 // Re-export for use within this module and RuntimeContext
 pub(crate) use mvcc_helpers::{
     MvccRowIdFilter, TransactionMvccBuilder, current_time_micros, filter_row_ids_for_snapshot,
 };
-
-pub(crate) use query_translation::{full_table_scan_filter, translate_predicate, translate_scalar};
 
 pub(crate) use types::{PreparedAssignmentValue, TableConstraintContext};
 
@@ -811,14 +808,19 @@ where
         let table = self.lookup_table(&canonical_name)?;
 
         let filter_expr = match filter {
-            Some(expr) => translate_predicate(expr, table.schema.as_ref())?,
+            Some(expr) => expression::translate_predicate(expr, table.schema.as_ref(), |name| {
+                Error::InvalidArgumentError(format!(
+                    "Binder Error: does not have a column named '{}'",
+                    name
+                ))
+            })?,
             None => {
                 let field_id = table.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "table has no columns; cannot perform wildcard scan".into(),
                     )
                 })?;
-                full_table_scan_filter(field_id)
+                expression::full_table_scan_filter(field_id)
             }
         };
 
@@ -1446,7 +1448,7 @@ where
         let Some(first_field_id) = table.schema.first_field_id() else {
             return Ok(Vec::new());
         };
-        let filter_expr = full_table_scan_filter(first_field_id);
+        let filter_expr = expression::full_table_scan_filter(first_field_id);
 
         let row_ids = table.table.filter_row_ids(&filter_expr)?;
         if row_ids.is_empty() {
@@ -1879,7 +1881,7 @@ where
         }
 
         let anchor_field = field_ids[0];
-        let filter_expr = full_table_scan_filter(anchor_field);
+        let filter_expr = expression::full_table_scan_filter(anchor_field);
         let raw_row_ids = match table.table.filter_row_ids(&filter_expr) {
             Ok(ids) => ids,
             Err(Error::NotFound) => return Ok(Vec::new()),
@@ -2254,7 +2256,12 @@ where
         }
 
         let schema = table.schema.as_ref();
-        let filter_expr = translate_predicate(filter, schema)?;
+        let filter_expr = expression::translate_predicate(filter, schema, |name| {
+            Error::InvalidArgumentError(format!(
+                "Binder Error: does not have a column named '{}'",
+                name
+            ))
+        })?;
 
         let mut seen_columns: FxHashSet<String> =
             FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
@@ -2282,7 +2289,19 @@ where
                     prepared.push((column.clone(), PreparedAssignmentValue::Literal(value)));
                 }
                 AssignmentValue::Expression(expr) => {
-                    let translated = translate_scalar(&expr, schema)?;
+                    let translated = expression::translate_scalar_with(
+                        &expr,
+                        schema,
+                        |name| {
+                            Error::InvalidArgumentError(format!(
+                                "Binder Error: does not have a column named '{}'",
+                                name
+                            ))
+                        },
+                        |name| {
+                            Error::InvalidArgumentError(format!("unknown column '{}' in aggregate", name))
+                        },
+                    )?;
                     let expr_index = scalar_exprs.len();
                     scalar_exprs.push(translated);
                     prepared.push((
@@ -2443,7 +2462,7 @@ where
                 .schema
                 .first_field_id()
                 .ok_or_else(|| Error::Internal("table has no columns for validation".into()))?;
-            let filter_expr = full_table_scan_filter(first_field);
+            let filter_expr = expression::full_table_scan_filter(first_field);
             let all_ids = table.table.filter_row_ids(&filter_expr)?;
             filter_row_ids_for_snapshot(table.table.as_ref(), all_ids, &self.txn_manager, snapshot)?
         };
@@ -2604,7 +2623,19 @@ where
                     prepared.push((column.clone(), PreparedAssignmentValue::Literal(value)));
                 }
                 AssignmentValue::Expression(expr) => {
-                    let translated = translate_scalar(&expr, schema)?;
+                    let translated = expression::translate_scalar_with(
+                        &expr,
+                        schema,
+                        |name| {
+                            Error::InvalidArgumentError(format!(
+                                "Binder Error: does not have a column named '{}'",
+                                name
+                            ))
+                        },
+                        |name| {
+                            Error::InvalidArgumentError(format!("unknown column '{}' in aggregate", name))
+                        },
+                    )?;
                     let expr_index = scalar_exprs.len();
                     scalar_exprs.push(translated);
                     prepared.push((
@@ -2619,7 +2650,7 @@ where
             Error::InvalidArgumentError("UPDATE requires at least one target column".into())
         })?;
 
-        let filter_expr = full_table_scan_filter(anchor_field);
+        let filter_expr = expression::full_table_scan_filter(anchor_field);
         let (row_ids, mut expr_values) =
             self.collect_update_rows(table, &filter_expr, &scalar_exprs, snapshot)?;
 
@@ -2761,7 +2792,7 @@ where
                 .schema
                 .first_field_id()
                 .ok_or_else(|| Error::Internal("table has no columns for validation".into()))?;
-            let filter_expr = full_table_scan_filter(first_field);
+            let filter_expr = expression::full_table_scan_filter(first_field);
             let all_ids = table.table.filter_row_ids(&filter_expr)?;
             filter_row_ids_for_snapshot(table.table.as_ref(), all_ids, &self.txn_manager, snapshot)?
         };
@@ -2871,7 +2902,12 @@ where
         snapshot: TransactionSnapshot,
     ) -> Result<RuntimeStatementResult<P>> {
         let schema = table.schema.as_ref();
-        let filter_expr = translate_predicate(filter, schema)?;
+        let filter_expr = expression::translate_predicate(filter, schema, |name| {
+            Error::InvalidArgumentError(format!(
+                "Binder Error: does not have a column named '{}'",
+                name
+            ))
+        })?;
         let row_ids = table.table.filter_row_ids(&filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         tracing::trace!(
@@ -2900,7 +2936,7 @@ where
         let anchor_field = table.schema.first_field_id().ok_or_else(|| {
             Error::InvalidArgumentError("DELETE requires a table with at least one column".into())
         })?;
-        let filter_expr = full_table_scan_filter(anchor_field);
+        let filter_expr = expression::full_table_scan_filter(anchor_field);
         let row_ids = table.table.filter_row_ids(&filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         self.apply_delete(table, display_name, canonical_name, row_ids, snapshot, true)

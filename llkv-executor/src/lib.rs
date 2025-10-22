@@ -4,7 +4,7 @@ use arrow::datatypes::{DataType, Schema};
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
+use llkv_expr::expr::{Expr as LlkvExpr, ScalarExpr};
 use llkv_plan::{
     AggregateExpr, AggregateFunction, OrderByPlan, OrderSortType, OrderTarget, PlanValue,
     SelectPlan, SelectProjection,
@@ -19,13 +19,12 @@ use llkv_table::types::FieldId;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::fmt;
-use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 pub type ExecutorResult<T> = Result<T, Error>;
 
-mod expression;
+pub mod expression;
 mod value_coercion;
 mod projections;
 mod schema;
@@ -434,14 +433,21 @@ where
         let schema = schema_for_projections(table_ref, &projections)?;
 
         let (filter_expr, full_table_scan) = match plan.filter {
-            Some(expr) => (translate_predicate(expr, table_ref.schema.as_ref())?, false),
+            Some(expr) => (
+                crate::expression::translate_predicate(
+                    expr,
+                    table_ref.schema.as_ref(),
+                    |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
+                )?,
+                false,
+            ),
             None => {
                 let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "table has no columns; cannot perform wildcard scan".into(),
                     )
                 })?;
-                (full_table_scan_filter(field_id), true)
+                (crate::expression::full_table_scan_filter(field_id), true)
             }
         };
 
@@ -513,6 +519,7 @@ where
                             column
                         ))
                     })?;
+
                     let kind = match function {
                         AggregateFunction::Count => {
                             if distinct {
@@ -579,14 +586,18 @@ where
 
         let had_filter = plan.filter.is_some();
         let filter_expr = match plan.filter {
-            Some(expr) => translate_predicate(expr, table.schema.as_ref())?,
+            Some(expr) => crate::expression::translate_predicate(
+                expr,
+                table.schema.as_ref(),
+                |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
+            )?,
             None => {
                 let field_id = table.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "table has no columns; cannot perform aggregate scan".into(),
                     )
                 })?;
-                full_table_scan_filter(field_id)
+                crate::expression::full_table_scan_filter(field_id)
             }
         };
 
@@ -899,14 +910,18 @@ where
 
         // Prepare filter and projections
         let filter_expr = match filter {
-            Some(expr) => translate_predicate(expr.clone(), table_ref.schema.as_ref())?,
+            Some(expr) => crate::expression::translate_predicate(
+                expr.clone(),
+                table_ref.schema.as_ref(),
+                |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
+            )?,
             None => {
                 let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "table has no columns; cannot perform aggregate scan".into(),
                     )
                 })?;
-                full_table_scan_filter(field_id)
+                crate::expression::full_table_scan_filter(field_id)
             }
         };
 
@@ -1528,16 +1543,6 @@ where
     })
 }
 
-fn full_table_scan_filter(field_id: FieldId) -> LlkvExpr<'static, FieldId> {
-    LlkvExpr::Pred(Filter {
-        field_id,
-        op: Operator::Range {
-            lower: Bound::Unbounded,
-            upper: Bound::Unbounded,
-        },
-    })
-}
-
 fn synthesize_null_scan(schema: Arc<Schema>, total_rows: u64) -> ExecutorResult<Vec<RecordBatch>> {
     let row_count = usize::try_from(total_rows).map_err(|_| {
         Error::InvalidArgumentError("table row count exceeds supported in-memory batch size".into())
@@ -1682,50 +1687,4 @@ fn sort_record_batch_with_order(
 
     RecordBatch::try_new(Arc::clone(schema), reordered_columns)
         .map_err(|err| Error::Internal(format!("failed to build reordered ORDER BY batch: {err}")))
-}
-
-// TODO: Dedupe!!!
-// Translate predicate from column names to field IDs
-fn translate_predicate(
-    expr: llkv_expr::expr::Expr<'static, String>,
-    schema: &ExecutorSchema,
-) -> ExecutorResult<llkv_expr::expr::Expr<'static, FieldId>> {
-    let unknown_column = |name: &str| {
-        Error::InvalidArgumentError(format!("unknown column '{}'", name))
-    };
-    use llkv_expr::expr::Expr;
-    match expr {
-        Expr::And(exprs) => {
-            let translated: Result<Vec<_>, _> = exprs
-                .into_iter()
-                .map(|e| translate_predicate(e, schema))
-                .collect();
-            Ok(Expr::And(translated?))
-        }
-        Expr::Or(exprs) => {
-            let translated: Result<Vec<_>, _> = exprs
-                .into_iter()
-                .map(|e| translate_predicate(e, schema))
-                .collect();
-            Ok(Expr::Or(translated?))
-        }
-        Expr::Not(inner) => {
-            let translated = translate_predicate(*inner, schema)?;
-            Ok(Expr::Not(Box::new(translated)))
-        }
-        Expr::Pred(filter) => {
-            let column = schema.resolve(&filter.field_id).ok_or_else(|| {
-                Error::InvalidArgumentError(format!("unknown column '{}'", filter.field_id))
-            })?;
-            Ok(Expr::Pred(Filter {
-                field_id: column.field_id,
-                op: filter.op,
-            }))
-        }
-        Expr::Compare { left, op, right } => Ok(Expr::Compare {
-            left: crate::expression::translate_scalar(&left, schema, unknown_column)?,
-            op,
-            right: crate::expression::translate_scalar(&right, schema, unknown_column)?,
-        }),
-    }
 }
