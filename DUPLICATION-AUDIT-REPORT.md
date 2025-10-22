@@ -430,12 +430,12 @@ Horizontal Dependencies:
 
 ## RISK ASSESSMENT
 
-| Risk | Probability | Impact | Mitigation |
-|------|------------|--------|------------|
-| Breaking public API | HIGH | HIGH | Use `#[deprecated]` shims during migration |
-| Test failures | MEDIUM | MEDIUM | Phase work, validate per phase |
-| Performance regression | LOW | LOW | No algorithmic changes, just reorganization |
-| Merge conflicts | HIGH | HIGH | Do work in dedicated branch, frequent rebases |
+| Risk                   | Probability | Impact | Mitigation                                    |
+| ---------------------- | ----------- | ------ | --------------------------------------------- |
+| Breaking public API    | HIGH        | HIGH   | Use `#[deprecated]` shims during migration    |
+| Test failures          | MEDIUM      | MEDIUM | Phase work, validate per phase                |
+| Performance regression | LOW         | LOW    | No algorithmic changes, just reorganization   |
+| Merge conflicts        | HIGH        | HIGH   | Do work in dedicated branch, frequent rebases |
 
 ---
 

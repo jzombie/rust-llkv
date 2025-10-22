@@ -26,7 +26,8 @@ fn primary_key_and_unique_constraints_reload_from_metadata() {
             .expect("create table");
         assert!(matches!(result, RuntimeStatementResult::CreateTable { .. }));
 
-        let specs = context.table_column_specs("accounts").expect("table specs");
+        let (_, canonical_name) = llkv_table::canonical_table_name("accounts").unwrap();
+        let specs = context.catalog().table_column_specs(&canonical_name).expect("table specs");
         assert_eq!(specs.len(), 2);
         let id_spec = specs.iter().find(|spec| spec.name == "id").unwrap();
         assert!(id_spec.primary_key);
@@ -45,7 +46,8 @@ fn primary_key_and_unique_constraints_reload_from_metadata() {
         "expected accounts table, got {:?}",
         names
     );
-    let specs_result = context.table_column_specs("accounts");
+    let (_, canonical_name) = llkv_table::canonical_table_name("accounts").unwrap();
+    let specs_result = context.catalog().table_column_specs(&canonical_name);
     assert_accounts_constraints(&pager);
     let specs = specs_result.unwrap_or_else(|err| panic!("table specs after restart: {:?}", err));
     assert_eq!(specs.len(), 2);
@@ -93,8 +95,10 @@ fn foreign_key_views_reload_from_metadata() {
     }
 
     let context = Arc::new(RuntimeContext::new(Arc::clone(&pager)));
+    let (_, canonical_name) = llkv_table::canonical_table_name("children").unwrap();
     let views = context
-        .foreign_key_views("children")
+        .catalog()
+        .foreign_key_views(&canonical_name)
         .expect("load foreign key views");
 
     assert_eq!(views.len(), 1);

@@ -119,7 +119,8 @@ where
     }
 
     fn table_column_specs(&self, table_name: &str) -> LlkvResult<Vec<PlanColumnSpec>> {
-        RuntimeContext::table_column_specs(self.context(), table_name)
+        let (_, canonical_name) = llkv_table::canonical_table_name(table_name)?;
+        self.context().catalog().table_column_specs(&canonical_name)
     }
 
     fn export_table_rows(&self, table_name: &str) -> LlkvResult<ExecutorRowBatch> {

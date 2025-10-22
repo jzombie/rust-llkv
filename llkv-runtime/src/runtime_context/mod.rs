@@ -38,11 +38,11 @@ use llkv_table::resolvers::{FieldConstraints, FieldDefinition};
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions};
 use llkv_table::{
     CatalogDdl, CatalogManager, ConstraintColumnInfo, ConstraintKind, ConstraintService,
-    CreateTableResult, FieldId, ForeignKeyColumn, ForeignKeyTableInfo, ForeignKeyView,
+    CreateTableResult, FieldId, ForeignKeyColumn, ForeignKeyTableInfo,
     InsertColumnConstraint, InsertMultiColumnUnique, InsertUniqueColumn, MetadataManager,
     MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, RowId, SingleColumnIndexDescriptor,
     SingleColumnIndexRegistration, SysCatalog, Table, TableConstraintSummaryView, TableId,
-    TableView, UniqueKey, build_composite_unique_key, ensure_multi_column_unique,
+    UniqueKey, build_composite_unique_key, ensure_multi_column_unique,
     ensure_single_column_unique, validate_alter_table_operation,
 };
 use llkv_transaction::mvcc;
@@ -98,8 +98,6 @@ where
         TransactionManager<RuntimeTransactionContext<P>, RuntimeTransactionContext<MemPager>>,
     txn_manager: Arc<TxnIdManager>,
     txn_tables_with_new_rows: RwLock<FxHashMap<TxnId, FxHashSet<String>>>,
-    // Type registry for custom type aliases (CREATE TYPE/DOMAIN)
-    type_registry: RwLock<FxHashMap<String, sqlparser::ast::DataType>>,
 }
 
 impl<P> RuntimeContext<P>
@@ -245,42 +243,10 @@ where
             Arc::clone(&store_arc),
         );
 
-        // Load custom types from catalog
-        let sys_catalog = SysCatalog::new(&store_arc);
-        let mut type_registry_map = FxHashMap::default();
-
-        match sys_catalog.all_custom_type_metas() {
-            Ok(type_metas) => {
-                tracing::debug!(
-                    "[CONTEXT] Loaded {} custom type(s) from catalog",
-                    type_metas.len()
-                );
-                for type_meta in type_metas {
-                    // Parse the base_type_sql back to a DataType
-                    if let Ok(parsed_type) =
-                        Self::parse_data_type_from_sql(&type_meta.base_type_sql)
-                    {
-                        type_registry_map.insert(type_meta.name.to_lowercase(), parsed_type);
-                    } else {
-                        tracing::warn!(
-                            "[CONTEXT] Failed to parse base type SQL for type '{}': {}",
-                            type_meta.name,
-                            type_meta.base_type_sql
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "[CONTEXT] Failed to load custom types: {}, starting with empty type registry",
-                    e
-                );
-            }
+        // Load custom types from SysCatalog into catalog_service
+        if let Err(e) = catalog_service.load_types_from_catalog() {
+            tracing::warn!("[CONTEXT] Failed to load custom types: {}", e);
         }
-        tracing::debug!(
-            "[CONTEXT] Type registry initialized with {} type(s)",
-            type_registry_map.len()
-        );
 
         Self {
             pager,
@@ -294,7 +260,6 @@ where
             transaction_manager,
             txn_manager,
             txn_tables_with_new_rows: RwLock::new(FxHashMap::default()),
-            type_registry: RwLock::new(type_registry_map),
         }
     }
 
@@ -310,112 +275,30 @@ where
 
     /// Register a custom type alias (CREATE TYPE/DOMAIN).
     pub fn register_type(&self, name: String, data_type: sqlparser::ast::DataType) {
-        let mut registry = self.type_registry.write().unwrap();
-        registry.insert(name.to_lowercase(), data_type);
+        self.catalog_service.register_type(name, data_type);
     }
 
     /// Drop a custom type alias (DROP TYPE/DOMAIN).
     pub fn drop_type(&self, name: &str) -> Result<()> {
-        let mut registry = self.type_registry.write().unwrap();
-        if registry.remove(&name.to_lowercase()).is_none() {
-            return Err(Error::InvalidArgumentError(format!(
-                "Type '{}' does not exist",
-                name
-            )));
-        }
+        self.catalog_service.drop_type(name)?;
         Ok(())
     }
 
     /// Create a view by storing its SQL definition in the catalog.
     /// The view will be registered as a table with a view_definition.
     pub fn create_view(&self, display_name: &str, view_definition: String) -> Result<TableId> {
-        use llkv_table::TableMeta;
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        // Reserve a new table ID for the view
-        let table_id = self.metadata.reserve_table_id()?;
-
-        let created_at_micros = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
-
-        // Create the table metadata with view_definition set
-        let table_meta = TableMeta {
-            table_id,
-            name: Some(display_name.to_string()),
-            created_at_micros,
-            flags: 0,
-            epoch: 0,
-            view_definition: Some(view_definition),
-        };
-
-        // Store the metadata and flush to disk
-        self.metadata.set_table_meta(table_id, table_meta)?;
-        self.metadata.flush_table(table_id)?;
-
-        // Register the view in the catalog so it can be looked up by name
-        self.catalog.register_table(display_name, table_id)?;
-
-        tracing::debug!("Created view '{}' with table_id={}", display_name, table_id);
-        Ok(table_id)
+        Ok(self.catalog_service.create_view(display_name, view_definition)?)
     }
 
     /// Check if a table is actually a view by looking at its metadata.
     /// Returns true if the table exists and has a view_definition.
     pub fn is_view(&self, table_id: TableId) -> Result<bool> {
-        match self.metadata.table_meta(table_id)? {
-            Some(meta) => Ok(meta.view_definition.is_some()),
-            None => Ok(false),
-        }
+        Ok(self.catalog_service.is_view(table_id)?)
     }
 
     /// Resolve a type name to its base DataType, recursively following aliases.
     pub fn resolve_type(&self, data_type: &sqlparser::ast::DataType) -> sqlparser::ast::DataType {
-        use sqlparser::ast::DataType;
-
-        match data_type {
-            DataType::Custom(obj_name, _) => {
-                let name = obj_name.to_string().to_lowercase();
-                let registry = self.type_registry.read().unwrap();
-                if let Some(base_type) = registry.get(&name) {
-                    // Recursively resolve in case the base type is also an alias
-                    self.resolve_type(base_type)
-                } else {
-                    // Not a custom type, return as-is
-                    data_type.clone()
-                }
-            }
-            // For non-custom types, return as-is
-            _ => data_type.clone(),
-        }
-    }
-
-    /// Parse a SQL type string (e.g., "INTEGER") back into a DataType.
-    fn parse_data_type_from_sql(sql: &str) -> Result<sqlparser::ast::DataType> {
-        use sqlparser::dialect::GenericDialect;
-        use sqlparser::parser::Parser;
-
-        // Try to parse as a simple CREATE DOMAIN statement
-        let create_sql = format!("CREATE DOMAIN dummy AS {}", sql);
-        let dialect = GenericDialect {};
-
-        match Parser::parse_sql(&dialect, &create_sql) {
-            Ok(stmts) if !stmts.is_empty() => {
-                if let sqlparser::ast::Statement::CreateDomain(create_domain) = &stmts[0] {
-                    Ok(create_domain.data_type.clone())
-                } else {
-                    Err(Error::InvalidArgumentError(format!(
-                        "Failed to parse type from SQL: {}",
-                        sql
-                    )))
-                }
-            }
-            _ => Err(Error::InvalidArgumentError(format!(
-                "Failed to parse type from SQL: {}",
-                sql
-            ))),
-        }
+        self.catalog_service.resolve_type(data_type)
     }
 
     /// Persist the next_txn_id to the catalog.
@@ -484,6 +367,11 @@ where
     /// Get the table catalog for schema and table name management.
     pub fn table_catalog(&self) -> Arc<TableCatalog> {
         Arc::clone(&self.catalog)
+    }
+
+    /// Access the catalog manager for type registry, view management, and metadata operations.
+    pub fn catalog(&self) -> &CatalogManager<P> {
+        &self.catalog_service
     }
 
     /// Create a new session for transaction management.
@@ -576,10 +464,6 @@ where
     }
 
     /// Returns metadata snapshot for a table including columns, types, and constraints.
-    pub fn table_view(&self, canonical_name: &str) -> Result<TableView> {
-        self.catalog_service.table_view(canonical_name)
-    }
-
     fn filter_visible_row_ids(
         &self,
         table: &ExecutorTable<P>,
@@ -592,12 +476,6 @@ where
     /// Creates a fluent builder for defining and creating a new table with columns and constraints.
     pub fn create_table_builder(&self, name: &str) -> RuntimeCreateTableBuilder<'_, P> {
         RuntimeCreateTableBuilder::new(self, name)
-    }
-
-    /// Returns column specifications for a table including names, types, and constraint flags.
-    pub fn table_column_specs(self: &Arc<Self>, name: &str) -> Result<Vec<PlanColumnSpec>> {
-        let (_, canonical_name) = canonical_table_name(name)?;
-        self.catalog_service.table_column_specs(&canonical_name)
     }
 
     /// Renames a column in a table by delegating to the catalog layer.
@@ -670,11 +548,6 @@ where
         self.remove_table_entry(&canonical_table);
 
         Ok(())
-    }
-    /// Returns foreign key relationships for a table, both referencing and referenced constraints.
-    pub fn foreign_key_views(self: &Arc<Self>, name: &str) -> Result<Vec<ForeignKeyView>> {
-        let (_, canonical_name) = canonical_table_name(name)?;
-        self.catalog_service.foreign_key_views(&canonical_name)
     }
 
     /// Exports all rows from a table as a `RowBatch` - internal storage API.

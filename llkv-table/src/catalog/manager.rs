@@ -102,6 +102,7 @@ where
     metadata: Arc<MetadataManager<P>>,
     catalog: Arc<TableCatalog>,
     store: Arc<ColumnStore<P>>,
+    type_registry: Arc<std::sync::RwLock<FxHashMap<String, sqlparser::ast::DataType>>>,
 }
 
 impl<P> CatalogManager<P>
@@ -118,8 +119,146 @@ where
             metadata,
             catalog,
             store,
+            type_registry: Arc::new(std::sync::RwLock::new(FxHashMap::default())),
         }
     }
+
+    // ============================================================================
+    // Type Registry Management
+    // ============================================================================
+
+    /// Load custom types from system catalog.
+    /// Should be called during initialization to restore persisted types.
+    pub fn load_types_from_catalog(&self) -> LlkvResult<()> {
+        use crate::sys_catalog::SysCatalog;
+        
+        let sys_catalog = SysCatalog::new(&self.store);
+        match sys_catalog.all_custom_type_metas() {
+            Ok(type_metas) => {
+                tracing::debug!(
+                    "[CATALOG] Loaded {} custom type(s) from catalog",
+                    type_metas.len()
+                );
+                
+                let mut registry = self.type_registry.write().unwrap();
+                for type_meta in type_metas {
+                    // Parse the base_type_sql back to a DataType
+                    if let Ok(parsed_type) = parse_data_type_from_sql(&type_meta.base_type_sql) {
+                        registry.insert(type_meta.name.to_lowercase(), parsed_type);
+                    } else {
+                        tracing::warn!(
+                            "[CATALOG] Failed to parse base type SQL for type '{}': {}",
+                            type_meta.name,
+                            type_meta.base_type_sql
+                        );
+                    }
+                }
+                
+                tracing::debug!(
+                    "[CATALOG] Type registry initialized with {} type(s)",
+                    registry.len()
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[CATALOG] Failed to load custom types: {}, starting with empty type registry",
+                    e
+                );
+                Ok(()) // Non-fatal, start with empty registry
+            }
+        }
+    }
+
+    /// Register a custom type alias (CREATE TYPE/DOMAIN).
+    pub fn register_type(&self, name: String, data_type: sqlparser::ast::DataType) {
+        let mut registry = self.type_registry.write().unwrap();
+        registry.insert(name.to_lowercase(), data_type);
+    }
+
+    /// Drop a custom type alias (DROP TYPE/DOMAIN).
+    pub fn drop_type(&self, name: &str) -> LlkvResult<()> {
+        let mut registry = self.type_registry.write().unwrap();
+        if registry.remove(&name.to_lowercase()).is_none() {
+            return Err(Error::InvalidArgumentError(format!(
+                "Type '{}' does not exist",
+                name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolve a type name to its base DataType, recursively following aliases.
+    pub fn resolve_type(&self, data_type: &sqlparser::ast::DataType) -> sqlparser::ast::DataType {
+        use sqlparser::ast::DataType;
+
+        match data_type {
+            DataType::Custom(obj_name, _) => {
+                let name = obj_name.to_string().to_lowercase();
+                let registry = self.type_registry.read().unwrap();
+                if let Some(base_type) = registry.get(&name) {
+                    // Recursively resolve in case the base type is also an alias
+                    self.resolve_type(base_type)
+                } else {
+                    // Not a custom type, return as-is
+                    data_type.clone()
+                }
+            }
+            // For non-custom types, return as-is
+            _ => data_type.clone(),
+        }
+    }
+
+    // ============================================================================
+    // View Management
+    // ============================================================================
+
+    /// Create a view by storing its SQL definition in the catalog.
+    /// The view will be registered as a table with a view_definition.
+    pub fn create_view(&self, display_name: &str, view_definition: String) -> LlkvResult<crate::types::TableId> {
+        use crate::sys_catalog::TableMeta;
+
+        // Reserve a new table ID for the view
+        let table_id = self.metadata.reserve_table_id()?;
+
+        let created_at_micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+
+        // Create the table metadata with view_definition set
+        let table_meta = TableMeta {
+            table_id,
+            name: Some(display_name.to_string()),
+            created_at_micros,
+            flags: 0,
+            epoch: 0,
+            view_definition: Some(view_definition),
+        };
+
+        // Store the metadata and flush to disk
+        self.metadata.set_table_meta(table_id, table_meta)?;
+        self.metadata.flush_table(table_id)?;
+
+        // Register the view in the catalog so it can be looked up by name
+        self.catalog.register_table(display_name, table_id)?;
+
+        tracing::debug!("Created view '{}' with table_id={}", display_name, table_id);
+        Ok(table_id)
+    }
+
+    /// Check if a table is actually a view by looking at its metadata.
+    /// Returns true if the table exists and has a view_definition.
+    pub fn is_view(&self, table_id: crate::types::TableId) -> LlkvResult<bool> {
+        match self.metadata.table_meta(table_id)? {
+            Some(meta) => Ok(meta.view_definition.is_some()),
+            None => Ok(false),
+        }
+    }
+
+    // ============================================================================
+    // Table Creation
+    // ============================================================================
 
     /// Create a new table using column specifications.
     ///
@@ -1044,10 +1183,38 @@ fn field_id_for_index(idx: usize) -> LlkvResult<FieldId> {
     })
 }
 
+// TODO: Dedupe (another instance exists in llkv-executor)
 #[allow(clippy::unnecessary_wraps)]
 fn current_time_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_micros() as u64)
         .unwrap_or(0)
+}
+
+/// Parse a SQL type string (e.g., "INTEGER") back into a DataType.
+fn parse_data_type_from_sql(sql: &str) -> LlkvResult<sqlparser::ast::DataType> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    // Try to parse as a simple CREATE DOMAIN statement
+    let create_sql = format!("CREATE DOMAIN dummy AS {}", sql);
+    let dialect = GenericDialect {};
+
+    match Parser::parse_sql(&dialect, &create_sql) {
+        Ok(stmts) if !stmts.is_empty() => {
+            if let sqlparser::ast::Statement::CreateDomain(create_domain) = &stmts[0] {
+                Ok(create_domain.data_type.clone())
+            } else {
+                Err(Error::InvalidArgumentError(format!(
+                    "Failed to parse type from SQL: {}",
+                    sql
+                )))
+            }
+        }
+        _ => Err(Error::InvalidArgumentError(format!(
+            "Failed to parse type from SQL: {}",
+            sql
+        ))),
+    }
 }

@@ -642,7 +642,9 @@ where
         }
 
         // Otherwise, look it up in the committed catalog
-        match context.table_column_specs(display_name) {
+        let (_, canonical_name) = llkv_table::canonical_table_name(display_name)
+            .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
+        match context.catalog().table_column_specs(&canonical_name) {
             Ok(specs) => Ok(specs
                 .into_iter()
                 .map(|spec| spec.name.to_ascii_lowercase())
@@ -1807,7 +1809,8 @@ where
 
         // Get table column specs from runtime context
         let context = self.engine.context();
-        let columns = context.table_column_specs(&table_name)?;
+        let (_, canonical_name) = llkv_table::canonical_table_name(&table_name)?;
+        let columns = context.catalog().table_column_specs(&canonical_name)?;
 
         // Build RecordBatch with table column information
         use arrow::array::{BooleanArray, Int32Array, StringArray};
