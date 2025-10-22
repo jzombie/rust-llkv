@@ -184,6 +184,29 @@ where
     }
 }
 
+/// Macro to implement `IntoInsertRow` for tuples of various sizes.
+///
+/// This enables ergonomic tuple-based row insertion syntax:
+/// ```
+/// # use llkv_runtime::*;
+/// # let table: RuntimeTableHandle<_> = todo!();
+/// table.insert_rows([(1_i64, "alice"), (2_i64, "bob")])?;
+/// # Ok::<(), llkv_result::Error>(())
+/// ```
+///
+/// Without this, users would need to use the more verbose `RuntimeRow` builder:
+/// ```
+/// # use llkv_runtime::*;
+/// # let table: RuntimeTableHandle<_> = todo!();
+/// table.insert_rows([
+///     row().with("id", 1_i64).with("name", "alice"),
+///     row().with("id", 2_i64).with("name", "bob"),
+/// ])?;
+/// # Ok::<(), llkv_result::Error>(())
+/// ```
+///
+/// The macro generates implementations for tuples of 1-8 elements, covering
+/// most common table schemas. Each tuple element must implement `Into<PlanValue>`.
 macro_rules! impl_into_insert_row_tuple {
     ($($type:ident => $value:ident),+) => {
         impl<$($type,)+> IntoInsertRow for ($($type,)+)
@@ -198,6 +221,8 @@ macro_rules! impl_into_insert_row_tuple {
     };
 }
 
+// Generate IntoInsertRow implementations for tuples of size 1 through 8.
+// This covers the vast majority of table schemas in practice.
 impl_into_insert_row_tuple!(T1 => v1);
 impl_into_insert_row_tuple!(T1 => v1, T2 => v2);
 impl_into_insert_row_tuple!(T1 => v1, T2 => v2, T3 => v3);
