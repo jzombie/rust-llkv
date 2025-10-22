@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-`llkv-plan` is the query planner crate for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
+`llkv-plan` is the query planner crate for the [LLKV](../) toolkit.
 
 ## Purpose
 

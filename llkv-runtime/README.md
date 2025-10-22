@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-`llkv-runtime` is an orchestrator for [llkv-table](../llkv-table/) and provides the execution runtime for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
+`llkv-runtime` is an orchestrator for [llkv-table](../llkv-table/) and provides the execution runtime for the [LLKV](../) toolkit.
 
 ## Purpose
 

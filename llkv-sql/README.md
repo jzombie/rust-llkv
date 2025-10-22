@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-`llkv-sql` is the SQL interface for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
+`llkv-sql` is the SQL interface for the [LLKV](../) toolkit.
 
 ## Purpose
 
