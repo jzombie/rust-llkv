@@ -4,7 +4,7 @@ use rustc_hash::FxHashSet;
 
 use arrow::record_batch::RecordBatch;
 use llkv_executor::RowBatch;
-use llkv_plan::{ColumnSpec, CreateTablePlan, InsertPlan, InsertSource, PlanValue};
+use llkv_plan::{CreateTablePlan, InsertPlan, InsertSource, PlanColumnSpec, PlanValue};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -47,7 +47,7 @@ where
     ) -> Self {
         self.plan
             .columns
-            .push(ColumnSpec::new(name.into(), data_type, true));
+            .push(PlanColumnSpec::new(name.into(), data_type, true));
         self
     }
 
@@ -58,11 +58,11 @@ where
     ) -> Self {
         self.plan
             .columns
-            .push(ColumnSpec::new(name.into(), data_type, false));
+            .push(PlanColumnSpec::new(name.into(), data_type, false));
         self
     }
 
-    pub fn with_column_spec(mut self, spec: ColumnSpec) -> Self {
+    pub fn with_column_spec(mut self, spec: PlanColumnSpec) -> Self {
         self.plan.columns.push(spec);
         self
     }

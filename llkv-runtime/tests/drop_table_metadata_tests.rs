@@ -4,7 +4,7 @@ use arrow::datatypes::DataType;
 use llkv_column_map::store::ColumnStore;
 use llkv_plan::DropTablePlan;
 use llkv_result::Error;
-use llkv_runtime::{ColumnSpec, RuntimeContext};
+use llkv_runtime::{PlanColumnSpec, RuntimeContext};
 use llkv_storage::pager::MemPager;
 use llkv_table::constraints::{
     ConstraintKind, ConstraintRecord, ConstraintState, ForeignKeyAction, ForeignKeyConstraint,
@@ -18,8 +18,8 @@ fn drop_table_removes_persisted_metadata() {
 
     context
         .create_table_builder("drop_test")
-        .with_column_spec(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
-        .with_column_spec(ColumnSpec::new("name", DataType::Utf8, true))
+    .with_column_spec(PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
+    .with_column_spec(PlanColumnSpec::new("name", DataType::Utf8, true))
         .finish()
         .expect("create table");
 
@@ -74,14 +74,14 @@ fn drop_table_respects_foreign_keys_after_restart() {
 
         context
             .create_table_builder("parents")
-            .with_column_spec(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
+            .with_column_spec(PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
             .finish()
             .expect("create parents");
 
         context
             .create_table_builder("children")
-            .with_column_spec(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
-            .with_column_spec(ColumnSpec::new("parent_id", DataType::Int64, true))
+            .with_column_spec(PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
+            .with_column_spec(PlanColumnSpec::new("parent_id", DataType::Int64, true))
             .finish()
             .expect("create children");
 

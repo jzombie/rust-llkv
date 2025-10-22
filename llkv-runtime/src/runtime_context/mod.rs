@@ -2,7 +2,6 @@
 //!
 //! This module contains the RuntimeContext implementation split into logical submodules:
 //! - `mvcc_helpers`: MVCC transaction visibility filtering
-//! - `data_conversion`: Data type conversion and insert value normalization  
 //! - `query_translation`: String-based expression to field-ID-based expression translation
 //! - `types`: Helper types (PreparedAssignmentValue, TableConstraintContext)
 //! - `provider`: ContextProvider for TableProvider trait
@@ -20,15 +19,16 @@ use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_executor::{
-    ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema, ExecutorTable, QueryExecutor,
-    RowBatch, TableProvider,
+    build_array_for_column, normalize_insert_value_for_column, parse_date32_literal,
+    resolve_insert_columns, ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema,
+    ExecutorTable, QueryExecutor, RowBatch, TableProvider,
 };
 use llkv_expr::{Expr as LlkvExpr, ScalarExpr};
 use llkv_plan::{
-    AlterTablePlan, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan,
-    CreateTablePlan, CreateTableSource, DeletePlan, DropIndexPlan, DropTablePlan, ForeignKeySpec,
-    InsertPlan, InsertSource, IntoColumnSpec, MultiColumnUniqueSpec, PlanValue, RenameTablePlan,
-    SelectPlan, UpdatePlan,
+    AlterTablePlan, AssignmentValue, ColumnAssignment, CreateIndexPlan, CreateTablePlan,
+    CreateTableSource, DeletePlan, DropIndexPlan, DropTablePlan, ForeignKeySpec, InsertPlan,
+    InsertSource, IntoPlanColumnSpec, MultiColumnUniqueSpec, PlanColumnSpec, PlanValue,
+    RenameTablePlan, SelectPlan, UpdatePlan,
 };
 use llkv_result::{Error, Result};
 use llkv_storage::pager::MemPager;
@@ -55,7 +55,6 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-mod data_conversion;
 mod mvcc_helpers;
 mod provider;
 mod query_translation;
@@ -65,13 +64,6 @@ mod types;
 pub(crate) use mvcc_helpers::{
     MvccRowIdFilter, TransactionMvccBuilder, current_time_micros, filter_row_ids_for_snapshot,
 };
-
-pub(crate) use data_conversion::{
-    build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns,
-};
-
-// Also import parse_date32_literal for internal use (not re-exported)
-use data_conversion::parse_date32_literal;
 
 pub(crate) use query_translation::{full_table_scan_filter, translate_predicate, translate_scalar};
 
@@ -565,7 +557,7 @@ where
         columns: I,
     ) -> Result<RuntimeTableHandle<P>>
     where
-        C: IntoColumnSpec,
+        C: IntoPlanColumnSpec,
         I: IntoIterator<Item = C>,
     {
         self.create_table_with_options(name, columns, false)
@@ -577,7 +569,7 @@ where
         columns: I,
     ) -> Result<RuntimeTableHandle<P>>
     where
-        C: IntoColumnSpec,
+        C: IntoPlanColumnSpec,
         I: IntoIterator<Item = C>,
     {
         self.create_table_with_options(name, columns, true)
@@ -609,7 +601,7 @@ where
     }
 
     /// Returns column specifications for a table including names, types, and constraint flags.
-    pub fn table_column_specs(self: &Arc<Self>, name: &str) -> Result<Vec<ColumnSpec>> {
+    pub fn table_column_specs(self: &Arc<Self>, name: &str) -> Result<Vec<PlanColumnSpec>> {
         let (_, canonical_name) = canonical_table_name(name)?;
         self.catalog_service.table_column_specs(&canonical_name)
     }
@@ -712,14 +704,14 @@ where
         if_not_exists: bool,
     ) -> Result<RuntimeTableHandle<P>>
     where
-        C: IntoColumnSpec,
+        C: IntoPlanColumnSpec,
         I: IntoIterator<Item = C>,
     {
         let mut plan = CreateTablePlan::new(name);
         plan.if_not_exists = if_not_exists;
         plan.columns = columns
             .into_iter()
-            .map(|column| column.into_column_spec())
+            .map(|column| column.into_plan_column_spec())
             .collect();
         let result = CatalogDdl::create_table(self.as_ref(), plan)?;
         match result {
@@ -1054,7 +1046,7 @@ where
         &self,
         display_name: String,
         canonical_name: String,
-        columns: Vec<ColumnSpec>,
+    columns: Vec<PlanColumnSpec>,
         foreign_keys: Vec<ForeignKeySpec>,
         multi_column_uniques: Vec<MultiColumnUniqueSpec>,
         if_not_exists: bool,

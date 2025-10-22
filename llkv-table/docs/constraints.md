@@ -48,7 +48,7 @@ catalog registration, and storage work:
   register LogicalFieldId descriptors, and hand back `CreateTableResult`.
 - `register_foreign_keys_for_new_table` – validates FK specs (via `ConstraintService`),
   persists them, and returns friendly view structs.
-- `table_column_specs` – rebuilds restart-stable `ColumnSpec` instances with PK/unique/check
+- `table_column_specs` – rebuilds restart-stable `PlanColumnSpec` instances with PK/unique/check
   flags resolved from metadata.
 - `table_view` – returns the full `TableView` snapshot.
 - `table_constraint_summary` – returns constraint-only metadata snapshots.

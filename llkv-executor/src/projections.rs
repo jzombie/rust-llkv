@@ -79,6 +79,7 @@ where
     Ok(result)
 }
 
+// TODO: Dedupe!!!
 fn translate_scalar(
     expr: &llkv_expr::expr::ScalarExpr<String>,
     schema: &ExecutorSchema,

@@ -57,9 +57,9 @@ pub use runtime_table::{
 use arrow::datatypes::DataType;
 pub use llkv_executor::SelectExecution;
 pub use llkv_plan::{
-    AggregateExpr, AlterTablePlan, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan,
+    AggregateExpr, AlterTablePlan, AssignmentValue, ColumnAssignment, CreateIndexPlan,
     CreateTablePlan, CreateTableSource, DeletePlan, DropIndexPlan, DropTablePlan, ForeignKeyAction,
-    ForeignKeySpec, IndexColumnPlan, InsertPlan, InsertSource, IntoColumnSpec,
+    ForeignKeySpec, IndexColumnPlan, InsertPlan, InsertSource, IntoPlanColumnSpec, PlanColumnSpec,
     MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanOperation, PlanStatement,
     PlanValue, RenameTablePlan, SelectPlan, SelectProjection, UpdatePlan,
 };

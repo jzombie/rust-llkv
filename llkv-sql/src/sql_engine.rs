@@ -16,10 +16,11 @@ use llkv_plan::validation::{
 use llkv_result::Error;
 use llkv_runtime::storage_namespace::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
-    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan, CreateTablePlan,
+    AggregateExpr, AssignmentValue, ColumnAssignment, CreateIndexPlan, CreateTablePlan,
     CreateTableSource, DeletePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan,
-    InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanStatement,
-    PlanValue, RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession,
+    InsertSource, IntoPlanColumnSpec, MultiColumnUniqueSpec, OrderByPlan, OrderSortType,
+    OrderTarget, PlanColumnSpec, PlanStatement, PlanValue, RenameTablePlan, RuntimeContext,
+    RuntimeEngine, RuntimeSession,
     RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
@@ -757,7 +758,7 @@ where
             .map(|name| name.to_ascii_lowercase())
             .collect();
 
-        let mut columns: Vec<ColumnSpec> = Vec::with_capacity(column_defs_ast.len());
+    let mut columns: Vec<PlanColumnSpec> = Vec::with_capacity(column_defs_ast.len());
         let mut primary_key_columns: HashSet<String> = HashSet::new();
         let mut foreign_keys: Vec<ForeignKeySpec> = Vec::new();
         let mut multi_column_uniques: Vec<MultiColumnUniqueSpec> = Vec::new();
@@ -838,13 +839,13 @@ where
             // Resolve custom type aliases to their base types
             let resolved_data_type = self.engine.context().resolve_type(&column_def.data_type);
 
-            let mut column = ColumnSpec::new(
+            let mut column = PlanColumnSpec::new(
                 column_def.name.value.clone(),
                 arrow_type_from_sql(&resolved_data_type)?,
                 is_nullable,
             );
             tracing::trace!(
-                "DEBUG ColumnSpec after new(): primary_key={} unique={}",
+                "DEBUG PlanColumnSpec after new(): primary_key={} unique={}",
                 column.primary_key,
                 column.unique
             );
@@ -859,7 +860,7 @@ where
                 primary_key_columns.insert(column.name.to_ascii_lowercase());
             }
             tracing::trace!(
-                "DEBUG ColumnSpec after with_primary_key({})/with_unique({}): primary_key={} unique={} check_expr={:?}",
+                "DEBUG PlanColumnSpec after with_primary_key({})/with_unique({}): primary_key={} unique={} check_expr={:?}",
                 is_primary_key,
                 has_unique_constraint,
                 column.primary_key,
@@ -1701,7 +1702,7 @@ where
                         }
                     };
                     let column_name = alias.value.clone();
-                    column_specs.push(ColumnSpec::new(column_name.clone(), data_type, true));
+                    column_specs.push(PlanColumnSpec::new(column_name.clone(), data_type, true));
                     column_names.push(column_name);
                     row_template.push(value);
                 }
@@ -4292,6 +4293,7 @@ fn translate_scalar_with_context(
     }
 }
 
+// TODO: Rename?  Already many `translate_scaler` functions... be more sepcific?
 fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     match expr {
         SqlExpr::Identifier(ident) => Ok(llkv_expr::expr::ScalarExpr::column(ident.value.clone())),

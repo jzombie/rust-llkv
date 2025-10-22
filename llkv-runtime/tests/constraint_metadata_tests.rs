@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use llkv_column_map::store::ColumnStore;
 use llkv_runtime::{
-    ColumnSpec, CreateTablePlan, ForeignKeyAction, ForeignKeySpec, RuntimeContext,
+    CreateTablePlan, ForeignKeyAction, ForeignKeySpec, PlanColumnSpec, RuntimeContext,
     RuntimeStatementResult,
 };
 use llkv_storage::pager::MemPager;
@@ -20,8 +20,8 @@ fn primary_key_and_unique_constraints_reload_from_metadata() {
 
         let result = context
             .create_table_builder("accounts")
-            .with_column_spec(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
-            .with_column_spec(ColumnSpec::new("email", DataType::Utf8, false).with_unique(true))
+            .with_column_spec(PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
+            .with_column_spec(PlanColumnSpec::new("email", DataType::Utf8, false).with_unique(true))
             .finish()
             .expect("create table");
         assert!(matches!(result, RuntimeStatementResult::CreateTable { .. }));
@@ -66,15 +66,15 @@ fn foreign_key_views_reload_from_metadata() {
 
         context
             .create_table_builder("parents")
-            .with_column_spec(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
+            .with_column_spec(PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
             .finish()
             .expect("create parents table");
 
         let mut plan = CreateTablePlan::new("children");
         plan.columns
-            .push(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true));
+            .push(PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true));
         plan.columns
-            .push(ColumnSpec::new("parent_id", DataType::Int64, true));
+            .push(PlanColumnSpec::new("parent_id", DataType::Int64, true));
         plan.foreign_keys.push(ForeignKeySpec {
             name: Some("fk_children_parent".into()),
             columns: vec!["parent_id".into()],

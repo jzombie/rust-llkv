@@ -51,7 +51,7 @@ pub type SessionId = u64;
 pub use llkv_column_map::types::TableId;
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
-    ColumnSpec, CreateIndexPlan, CreateTablePlan, DeletePlan, DropTablePlan, InsertPlan,
+    CreateIndexPlan, CreateTablePlan, DeletePlan, DropTablePlan, InsertPlan, PlanColumnSpec,
     PlanOperation, PlanValue, SelectPlan, UpdatePlan,
 };
 use llkv_result::{Error, Result as LlkvResult};
@@ -219,7 +219,7 @@ pub trait TransactionContext: CatalogDdl + Send + Sync {
     fn snapshot(&self) -> mvcc::TransactionSnapshot;
 
     /// Get table column specifications
-    fn table_column_specs(&self, table_name: &str) -> LlkvResult<Vec<ColumnSpec>>;
+    fn table_column_specs(&self, table_name: &str) -> LlkvResult<Vec<PlanColumnSpec>>;
 
     /// Export table rows for snapshotting
     fn export_table_rows(&self, table_name: &str) -> LlkvResult<RowBatch>;
@@ -903,7 +903,10 @@ where
 
     /// Get column specifications for a table created in the current transaction.
     /// Returns `None` if there's no active transaction or the table wasn't created in it.
-    pub fn table_column_specs_from_transaction(&self, table_name: &str) -> Option<Vec<ColumnSpec>> {
+    pub fn table_column_specs_from_transaction(
+        &self,
+        table_name: &str,
+    ) -> Option<Vec<PlanColumnSpec>> {
         let guard = self
             .transactions
             .lock()

@@ -14,7 +14,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::IndexKind;
-use llkv_plan::{ColumnSpec, DropIndexPlan, ForeignKeySpec};
+use llkv_plan::{DropIndexPlan, ForeignKeySpec, PlanColumnSpec};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -129,7 +129,7 @@ where
         &self,
         display_name: &str,
         canonical_name: &str,
-        columns: &[ColumnSpec],
+    columns: &[PlanColumnSpec],
     ) -> LlkvResult<CreateTableResult<P>> {
         if columns.is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -841,7 +841,7 @@ where
     }
 
     /// Produce a read-only view of a table's catalog, including column metadata and constraints.
-    pub fn table_column_specs(&self, canonical_name: &str) -> LlkvResult<Vec<ColumnSpec>> {
+    pub fn table_column_specs(&self, canonical_name: &str) -> LlkvResult<Vec<PlanColumnSpec>> {
         let table_id = self.catalog.table_id(canonical_name).ok_or_else(|| {
             Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
         })?;
@@ -918,7 +918,7 @@ where
             let data_type = self.store.data_type(*lfid)?;
             let nullable = !primary_key;
 
-            let mut spec = ColumnSpec::new(column_name.clone(), data_type, nullable)
+            let mut spec = PlanColumnSpec::new(column_name.clone(), data_type, nullable)
                 .with_primary_key(primary_key)
                 .with_unique(unique);
 

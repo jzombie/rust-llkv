@@ -1,19 +1,23 @@
-//! Data conversion helpers for insert operations and type coercion
+//! Helper functions for insert planning and data preparation.
 
 use arrow::array::{
     ArrayRef, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, StringBuilder,
 };
 use arrow::datatypes::{DataType, FieldRef};
-use llkv_executor::{ExecutorColumn, ExecutorSchema};
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
 use std::sync::Arc;
 use time::{Date, Month};
 
+use crate::{ExecutorColumn, ExecutorSchema};
+
+/// Resolve the user-specified column list for an INSERT statement into indexes
+/// of the executor schema. If no columns were provided, return the identity order.
 pub fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> Result<Vec<usize>> {
     if columns.is_empty() {
         return Ok((0..schema.columns.len()).collect());
     }
+
     let mut resolved = Vec::with_capacity(columns.len());
     for column in columns {
         let normalized = column.to_ascii_lowercase();
@@ -28,7 +32,8 @@ pub fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> Re
     Ok(resolved)
 }
 
-pub(crate) fn normalize_insert_value_for_column(
+/// Coerce a `PlanValue` into the Arrow data type required by the executor column.
+pub fn normalize_insert_value_for_column(
     column: &ExecutorColumn,
     value: PlanValue,
 ) -> Result<PlanValue> {
@@ -106,6 +111,7 @@ pub(crate) fn normalize_insert_value_for_column(
     }
 }
 
+/// Build an Arrow array that matches the executor column's data type from the provided values.
 pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<ArrayRef> {
     match dtype {
         DataType::Int64 => {
@@ -250,7 +256,8 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
     }
 }
 
-pub(crate) fn parse_date32_literal(text: &str) -> Result<i32> {
+/// Parse a string literal formatted as `YYYY-MM-DD` into the Arrow `Date32` day count.
+pub fn parse_date32_literal(text: &str) -> Result<i32> {
     let mut parts = text.split('-');
     let year_str = parts
         .next()
@@ -267,23 +274,21 @@ pub(crate) fn parse_date32_literal(text: &str) -> Result<i32> {
         )));
     }
 
-    let year = year_str.parse::<i32>().map_err(|_| {
-        Error::InvalidArgumentError(format!("invalid year in DATE literal '{text}'"))
-    })?;
-    let month_num = month_str.parse::<u8>().map_err(|_| {
-        Error::InvalidArgumentError(format!("invalid month in DATE literal '{text}'"))
-    })?;
-    let day = day_str.parse::<u8>().map_err(|_| {
-        Error::InvalidArgumentError(format!("invalid day in DATE literal '{text}'"))
-    })?;
+    let year = year_str
+        .parse::<i32>()
+        .map_err(|_| Error::InvalidArgumentError(format!("invalid year in DATE literal '{text}'")))?;
+    let month_num = month_str
+        .parse::<u8>()
+        .map_err(|_| Error::InvalidArgumentError(format!("invalid month in DATE literal '{text}'")))?;
+    let day = day_str
+        .parse::<u8>()
+        .map_err(|_| Error::InvalidArgumentError(format!("invalid day in DATE literal '{text}'")))?;
 
-    let month = Month::try_from(month_num).map_err(|_| {
-        Error::InvalidArgumentError(format!("invalid month in DATE literal '{text}'"))
-    })?;
+    let month = Month::try_from(month_num)
+        .map_err(|_| Error::InvalidArgumentError(format!("invalid month in DATE literal '{text}'")))?;
 
-    let date = Date::from_calendar_date(year, month, day).map_err(|err| {
-        Error::InvalidArgumentError(format!("invalid DATE literal '{text}': {err}"))
-    })?;
+    let date = Date::from_calendar_date(year, month, day)
+        .map_err(|err| Error::InvalidArgumentError(format!("invalid DATE literal '{text}': {err}")))?;
     let days = date.to_julian_day() - epoch_julian_day();
     Ok(days)
 }

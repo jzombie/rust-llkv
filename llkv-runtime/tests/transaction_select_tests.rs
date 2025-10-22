@@ -1,6 +1,6 @@
 use llkv_plan::PlanValue;
 use llkv_runtime::{
-    AggregateExpr, ColumnSpec, CreateTablePlan, InsertPlan, InsertSource, RuntimeContext,
+    AggregateExpr, CreateTablePlan, InsertPlan, InsertSource, PlanColumnSpec, RuntimeContext,
     RuntimeStatementResult, SelectPlan,
 };
 use llkv_storage::pager::MemPager;
@@ -17,8 +17,8 @@ fn test_transaction_select() {
     let create_plan = CreateTablePlan {
         name: "users".into(),
         columns: vec![
-            ColumnSpec::new("id", arrow::datatypes::DataType::Int64, true),
-            ColumnSpec::new("name", arrow::datatypes::DataType::Utf8, true),
+            PlanColumnSpec::new("id", arrow::datatypes::DataType::Int64, true),
+            PlanColumnSpec::new("name", arrow::datatypes::DataType::Utf8, true),
         ],
         if_not_exists: false,
         or_replace: false,
@@ -92,8 +92,8 @@ fn test_transaction_select_with_aggregates() {
     let create_plan = CreateTablePlan {
         name: "products".into(),
         columns: vec![
-            ColumnSpec::new("id", arrow::datatypes::DataType::Int64, true),
-            ColumnSpec::new("price", arrow::datatypes::DataType::Int64, true),
+            PlanColumnSpec::new("id", arrow::datatypes::DataType::Int64, true),
+            PlanColumnSpec::new("price", arrow::datatypes::DataType::Int64, true),
         ],
         if_not_exists: false,
         or_replace: false,

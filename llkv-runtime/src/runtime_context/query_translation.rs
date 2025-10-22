@@ -69,6 +69,7 @@ pub(crate) fn translate_predicate(
     }
 }
 
+// TODO: Dedupe!!!
 pub(crate) fn translate_scalar(
     expr: &ScalarExpr<String>,
     schema: &ExecutorSchema,

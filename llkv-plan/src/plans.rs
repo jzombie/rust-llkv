@@ -87,7 +87,7 @@ pub struct CreateTablePlan {
     pub name: String,
     pub if_not_exists: bool,
     pub or_replace: bool,
-    pub columns: Vec<ColumnSpec>,
+    pub columns: Vec<PlanColumnSpec>,
     pub source: Option<CreateTableSource>,
     /// Optional storage namespace for the table.
     pub namespace: Option<String>,
@@ -335,9 +335,12 @@ impl CreateIndexPlan {
     }
 }
 
-/// Column specification for CREATE TABLE.
+/// Column specification produced by the logical planner.
+///
+/// This struct flows from the planner into the runtime/executor so callers can
+/// reason about column metadata without duplicating field definitions.
 #[derive(Clone, Debug)]
-pub struct ColumnSpec {
+pub struct PlanColumnSpec {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
@@ -348,7 +351,7 @@ pub struct ColumnSpec {
     pub check_expr: Option<String>,
 }
 
-impl ColumnSpec {
+impl PlanColumnSpec {
     pub fn new(name: impl Into<String>, data_type: DataType, nullable: bool) -> Self {
         Self {
             name: name.into(),
@@ -381,9 +384,9 @@ impl ColumnSpec {
     }
 }
 
-/// Trait for types that can be converted into a ColumnSpec.
-pub trait IntoColumnSpec {
-    fn into_column_spec(self) -> ColumnSpec;
+/// Trait for types that can be converted into a [`PlanColumnSpec`].
+pub trait IntoPlanColumnSpec {
+    fn into_plan_column_spec(self) -> PlanColumnSpec;
 }
 
 /// Column nullability specification.
@@ -407,36 +410,36 @@ pub const Nullable: ColumnNullability = ColumnNullability::Nullable;
 #[allow(non_upper_case_globals)]
 pub const NotNull: ColumnNullability = ColumnNullability::NotNull;
 
-impl IntoColumnSpec for ColumnSpec {
-    fn into_column_spec(self) -> ColumnSpec {
+impl IntoPlanColumnSpec for PlanColumnSpec {
+    fn into_plan_column_spec(self) -> PlanColumnSpec {
         self
     }
 }
 
-impl<T> IntoColumnSpec for &T
+impl<T> IntoPlanColumnSpec for &T
 where
-    T: Clone + IntoColumnSpec,
+    T: Clone + IntoPlanColumnSpec,
 {
-    fn into_column_spec(self) -> ColumnSpec {
-        self.clone().into_column_spec()
+    fn into_plan_column_spec(self) -> PlanColumnSpec {
+        self.clone().into_plan_column_spec()
     }
 }
 
-impl IntoColumnSpec for (&str, DataType) {
-    fn into_column_spec(self) -> ColumnSpec {
-        ColumnSpec::new(self.0, self.1, true)
+impl IntoPlanColumnSpec for (&str, DataType) {
+    fn into_plan_column_spec(self) -> PlanColumnSpec {
+        PlanColumnSpec::new(self.0, self.1, true)
     }
 }
 
-impl IntoColumnSpec for (&str, DataType, bool) {
-    fn into_column_spec(self) -> ColumnSpec {
-        ColumnSpec::new(self.0, self.1, self.2)
+impl IntoPlanColumnSpec for (&str, DataType, bool) {
+    fn into_plan_column_spec(self) -> PlanColumnSpec {
+        PlanColumnSpec::new(self.0, self.1, self.2)
     }
 }
 
-impl IntoColumnSpec for (&str, DataType, ColumnNullability) {
-    fn into_column_spec(self) -> ColumnSpec {
-        ColumnSpec::new(self.0, self.1, self.2.is_nullable())
+impl IntoPlanColumnSpec for (&str, DataType, ColumnNullability) {
+    fn into_plan_column_spec(self) -> PlanColumnSpec {
+        PlanColumnSpec::new(self.0, self.1, self.2.is_nullable())
     }
 }
 

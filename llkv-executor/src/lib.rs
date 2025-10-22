@@ -25,8 +25,13 @@ use std::sync::{Arc, RwLock};
 
 pub type ExecutorResult<T> = Result<T, Error>;
 
+mod ingest;
 mod projections;
 mod schema;
+pub use ingest::{
+    build_array_for_column, normalize_insert_value_for_column, parse_date32_literal,
+    resolve_insert_columns,
+};
 pub use projections::{build_projected_columns, build_wildcard_projections};
 pub use schema::schema_for_projections;
 
@@ -1718,6 +1723,7 @@ fn translate_predicate(
     }
 }
 
+// TODO: Dedupe!!!
 // Translate scalar expressions
 fn translate_scalar(
     expr: &ScalarExpr<String>,

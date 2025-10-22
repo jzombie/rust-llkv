@@ -12,11 +12,11 @@ use crate::storage_namespace::{
     self, PersistentNamespace, StorageNamespace, StorageNamespaceRegistry, TemporaryNamespace,
 };
 use crate::{
-    AlterTablePlan, CatalogDdl, ColumnSpec, CreateIndexPlan, CreateTablePlan, CreateTableSource,
-    DeletePlan, DropIndexPlan, DropTablePlan, InsertPlan, InsertSource, PlanOperation, PlanValue,
-    RenameTablePlan, RuntimeContext, RuntimeStatementResult, RuntimeTransactionContext,
-    SelectExecution, SelectPlan, SelectProjection, TransactionContext, TransactionKind,
-    TransactionResult, TransactionSession, UpdatePlan,
+    AlterTablePlan, CatalogDdl, CreateIndexPlan, CreateTablePlan, CreateTableSource, DeletePlan,
+    DropIndexPlan, DropTablePlan, InsertPlan, InsertSource, IntoPlanColumnSpec, PlanColumnSpec,
+    PlanOperation, PlanValue, RenameTablePlan, RuntimeContext, RuntimeStatementResult,
+    RuntimeTransactionContext, SelectExecution, SelectPlan, SelectProjection, TransactionContext,
+    TransactionKind, TransactionResult, TransactionSession, UpdatePlan,
 };
 
 pub(crate) struct SessionNamespaces<P>
@@ -348,7 +348,10 @@ where
 
     /// Get column specifications for a table created in the current transaction.
     /// Returns `None` if there's no active transaction or the table wasn't created in it.
-    pub fn table_column_specs_from_transaction(&self, table_name: &str) -> Option<Vec<ColumnSpec>> {
+    pub fn table_column_specs_from_transaction(
+        &self,
+        table_name: &str,
+    ) -> Option<Vec<PlanColumnSpec>> {
         self.inner.table_column_specs_from_transaction(table_name)
     }
 

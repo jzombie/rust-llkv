@@ -9,8 +9,8 @@ use llkv_transaction::{TransactionContext, TransactionResult, TransactionSnapsho
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{
-    AlterTablePlan, ColumnSpec, CreateIndexPlan, CreateTablePlan, DeletePlan, DropIndexPlan,
-    DropTablePlan, InsertPlan, RenameTablePlan, RuntimeContext, RuntimeStatementResult,
+    AlterTablePlan, CreateIndexPlan, CreateTablePlan, DeletePlan, DropIndexPlan, DropTablePlan,
+    InsertPlan, PlanColumnSpec, RenameTablePlan, RuntimeContext, RuntimeStatementResult,
     SelectExecution, SelectPlan, UpdatePlan,
 };
 
@@ -117,7 +117,7 @@ where
         self.current_snapshot()
     }
 
-    fn table_column_specs(&self, table_name: &str) -> LlkvResult<Vec<ColumnSpec>> {
+    fn table_column_specs(&self, table_name: &str) -> LlkvResult<Vec<PlanColumnSpec>> {
         RuntimeContext::table_column_specs(self.context(), table_name)
     }
 
