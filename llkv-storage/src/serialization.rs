@@ -161,7 +161,6 @@ enum PrimType {
     Date64 = 17,
 }
 
-// Re-export convenience helpers from codecs to keep call sites tidy.
 use crate::codecs::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 
 /// Map Arrow `DataType` to on-disk `PrimType`.

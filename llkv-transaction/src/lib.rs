@@ -50,7 +50,6 @@ pub mod helpers;
 pub mod mvcc;
 pub mod types;
 
-// Re-export commonly used types
 pub use context::{
     TransactionSessionId, SessionTransaction, TransactionContext, TransactionManager, TransactionSession,
 };

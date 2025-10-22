@@ -7,7 +7,6 @@ pub mod catalog;
 pub mod kind;
 pub mod result;
 
-// Re-export commonly used items
 pub use catalog::TransactionCatalogSnapshot;
 pub use kind::TransactionKind;
 pub use result::TransactionResult;

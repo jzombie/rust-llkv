@@ -61,8 +61,6 @@ use std::sync::{
 mod provider;
 mod types;
 
-// Re-export for use within this module and RuntimeContext
-
 pub(crate) use types::{PreparedAssignmentValue, TableConstraintContext};
 
 pub(crate) use provider::ContextProvider;

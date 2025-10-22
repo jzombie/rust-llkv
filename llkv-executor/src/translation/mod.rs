@@ -8,7 +8,6 @@ pub mod expression;
 pub mod projection;
 pub mod schema;
 
-// Re-export commonly used items
 pub use expression::{
     full_table_scan_filter, resolve_field_id_from_schema, translate_predicate,
     translate_predicate_with, translate_scalar, translate_scalar_with,

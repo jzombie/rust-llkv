@@ -5,7 +5,6 @@
 
 pub mod value_coercion;
 
-// Re-export commonly used items
 pub use value_coercion::{
     build_array_for_column, normalize_insert_value_for_column, 
     resolve_insert_columns,

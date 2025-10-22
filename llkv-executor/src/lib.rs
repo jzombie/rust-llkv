@@ -54,7 +54,6 @@ pub mod utils;
 /// Result type for executor operations.
 pub type ExecutorResult<T> = Result<T, Error>;
 
-// Re-export commonly used items for convenience
 pub use insert::{
     build_array_for_column, normalize_insert_value_for_column,
     resolve_insert_columns,

@@ -9,7 +9,6 @@
 pub mod executor_types;
 pub mod provider;
 
-// Re-export all public types
 pub use executor_types::{ExecutorRowBatch, ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema, ExecutorTable};
 pub use provider::ExecutorTableProvider;
 
