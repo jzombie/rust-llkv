@@ -84,7 +84,15 @@ where
 {
     fn drop(&mut self) {
         if let Some(temp) = &self.temporary {
-            temp.clear_tables();
+            let namespace_id = temp.namespace_id().to_string();
+            let canonical_names = {
+                let mut registry = self
+                    .registry
+                    .write()
+                    .expect("namespace registry poisoned");
+                registry.drain_namespace_tables(&namespace_id)
+            };
+            temp.clear_tables(canonical_names);
         }
     }
 }
@@ -862,7 +870,16 @@ where
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                let (_, canonical) = canonical_table_name(&plan.name)?;
                 let result = temp_namespace.create_table(plan)?;
+                if matches!(result, RuntimeStatementResult::CreateTable { .. }) {
+                    let namespace_id = temp_namespace.namespace_id().to_string();
+                    let registry = self.namespace_registry();
+                    registry
+                        .write()
+                        .expect("namespace registry poisoned")
+                        .register_table(&namespace_id, canonical);
+                }
                 result.convert_pager_type::<P>()
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {
@@ -910,6 +927,11 @@ where
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 temp_namespace.drop_table(plan)?;
+                let registry = self.namespace_registry();
+                registry
+                    .write()
+                    .expect("namespace registry poisoned")
+                    .unregister_table(&canonical_table);
                 Ok(RuntimeStatementResult::NoOp)
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {
@@ -963,6 +985,7 @@ where
         }
 
         let (_, canonical_table) = canonical_table_name(&plan.current_name)?;
+        let (_, new_canonical) = canonical_table_name(&plan.new_name)?;
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
         match namespace_id.as_str() {
@@ -971,7 +994,15 @@ where
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 match temp_namespace.rename_table(plan.clone()) {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        let namespace_id = temp_namespace.namespace_id().to_string();
+                        let registry = self.namespace_registry();
+                        let mut registry =
+                            registry.write().expect("namespace registry poisoned");
+                        registry.unregister_table(&canonical_table);
+                        registry.register_table(&namespace_id, new_canonical);
+                        Ok(())
+                    }
                     Err(err) if plan.if_exists && super::is_table_missing_error(&err) => Ok(()),
                     Err(err) => Err(err),
                 }

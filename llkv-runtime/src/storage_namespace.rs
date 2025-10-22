@@ -18,7 +18,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{RuntimeContext, RuntimeStatementResult};
-use llkv_table::canonical_table_name;
 use llkv_table::{CatalogDdl, SingleColumnIndexDescriptor};
 
 // TODO: Rename to `RuntimeStorageNamespaceId`?
@@ -93,18 +92,12 @@ pub trait StorageNamespace: Send + Sync + 'static {
     /// List tables visible to this namespace.
     fn list_tables(&self) -> Vec<String>;
 
-    /// Returns true if the namespace owns (and should answer for) the canonical table name.
-    fn owns_table(&self, canonical: &str) -> bool {
-        let _ = canonical;
-        false
-    }
 }
 
 /// Helper trait for storing namespaces behind trait objects with basic inspection support.
 pub trait StorageNamespaceOps: Send + Sync {
     fn namespace_id(&self) -> &NamespaceId;
     fn list_tables(&self) -> Vec<String>;
-    fn owns_table(&self, canonical: &str) -> bool;
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -118,10 +111,6 @@ where
 
     fn list_tables(&self) -> Vec<String> {
         StorageNamespace::list_tables(self)
-    }
-
-    fn owns_table(&self, canonical: &str) -> bool {
-        StorageNamespace::owns_table(self, canonical)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -213,7 +202,6 @@ where
 {
     id: NamespaceId,
     context: Arc<RwLock<Arc<RuntimeContext<P>>>>,
-    tables: Arc<RwLock<FxHashSet<String>>>,
 }
 
 impl<P> TemporaryNamespace<P>
@@ -224,7 +212,6 @@ where
         Self {
             id,
             context: Arc::new(RwLock::new(context)),
-            tables: Arc::new(RwLock::new(FxHashSet::default())),
         }
     }
 
@@ -236,29 +223,11 @@ where
         *guard = context;
     }
 
-    pub fn register_table(&self, canonical: String) {
-        self.tables
-            .write()
-            .expect("temporary table registry poisoned")
-            .insert(canonical);
-    }
-
-    pub fn unregister_table(&self, canonical: &str) {
-        self.tables
-            .write()
-            .expect("temporary table registry poisoned")
-            .remove(canonical);
-    }
-
-    pub fn clear_tables(&self) {
-        let canonical_names: Vec<String> = {
-            let mut guard = self
-                .tables
-                .write()
-                .expect("temporary table registry poisoned");
-            guard.drain().collect()
-        };
-
+    pub fn clear_tables<I>(&self, canonical_names: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let canonical_names: Vec<String> = canonical_names.into_iter().collect();
         if canonical_names.is_empty() {
             return;
         }
@@ -274,13 +243,6 @@ where
                 );
             }
         }
-    }
-
-    pub fn has_table(&self, canonical: &str) -> bool {
-        self.tables
-            .read()
-            .expect("temporary table registry poisoned")
-            .contains(canonical)
     }
 
     pub fn context(&self) -> Arc<RuntimeContext<P>> {
@@ -311,30 +273,20 @@ where
         &self,
         plan: CreateTablePlan,
     ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
-        let (_, canonical) = canonical_table_name(&plan.name)?;
         let context = self.context();
         let result = CatalogDdl::create_table(context.as_ref(), plan)?;
-        if !self.has_table(&canonical) {
-            self.register_table(canonical);
-        }
         Ok(result)
     }
 
     fn drop_table(&self, plan: DropTablePlan) -> crate::Result<()> {
-        let (_, canonical) = canonical_table_name(&plan.name)?;
         let context = self.context();
         CatalogDdl::drop_table(context.as_ref(), plan)?;
-        self.unregister_table(&canonical);
         Ok(())
     }
 
     fn rename_table(&self, plan: RenameTablePlan) -> crate::Result<()> {
-        let (_, current_canonical) = canonical_table_name(&plan.current_name)?;
-        let (_, new_canonical) = canonical_table_name(&plan.new_name)?;
         let context = self.context();
         CatalogDdl::rename_table(context.as_ref(), plan)?;
-        self.unregister_table(&current_canonical);
-        self.register_table(new_canonical);
         Ok(())
     }
 
@@ -367,22 +319,7 @@ where
     }
 
     fn list_tables(&self) -> Vec<String> {
-        let mut names = self.context().table_names();
-        let tracked = self
-            .tables
-            .read()
-            .expect("temporary table registry poisoned")
-            .clone();
-        for canonical in tracked {
-            if !names.iter().any(|existing| existing == &canonical) {
-                names.push(canonical);
-            }
-        }
-        names
-    }
-
-    fn owns_table(&self, canonical: &str) -> bool {
-        self.has_table(canonical)
+        self.context().table_names()
     }
 }
 
@@ -415,6 +352,8 @@ pub struct StorageNamespaceRegistry {
     namespaces: FxHashMap<NamespaceId, NamespaceEntry>,
     schema_map: FxHashMap<String, NamespaceId>,
     priority: Vec<NamespaceId>,
+    table_map: FxHashMap<String, NamespaceId>,
+    namespace_tables: FxHashMap<NamespaceId, FxHashSet<String>>,
 }
 
 impl StorageNamespaceRegistry {
@@ -424,6 +363,8 @@ impl StorageNamespaceRegistry {
             namespaces: FxHashMap::default(),
             schema_map: FxHashMap::default(),
             priority: vec![persistent_id],
+            table_map: FxHashMap::default(),
+            namespace_tables: FxHashMap::default(),
         }
     }
 
@@ -452,6 +393,10 @@ impl StorageNamespaceRegistry {
         } else if !self.priority.iter().any(|existing| existing == &id) {
             self.priority.push(id.clone());
         }
+        self
+            .namespace_tables
+            .entry(id.clone())
+            .or_insert_with(FxHashSet::default);
         self.namespaces.insert(id, entry);
     }
 
@@ -461,6 +406,40 @@ impl StorageNamespaceRegistry {
 
     pub fn set_unqualified_priority(&mut self, order: Vec<NamespaceId>) {
         self.priority = order;
+    }
+
+    pub fn register_table(&mut self, namespace: &NamespaceId, canonical: String) {
+        let namespace_id = namespace.clone();
+        self.table_map
+            .insert(canonical.clone(), namespace_id.clone());
+        self
+            .namespace_tables
+            .entry(namespace_id)
+            .or_insert_with(FxHashSet::default)
+            .insert(canonical);
+    }
+
+    pub fn unregister_table(&mut self, canonical: &str) -> Option<NamespaceId> {
+        if let Some(namespace_id) = self.table_map.remove(canonical) {
+            if let Some(tables) = self.namespace_tables.get_mut(&namespace_id) {
+                tables.remove(canonical);
+            }
+            Some(namespace_id)
+        } else {
+            None
+        }
+    }
+
+    pub fn drain_namespace_tables(&mut self, namespace: &NamespaceId) -> Vec<String> {
+        let tables = self
+            .namespace_tables
+            .entry(namespace.clone())
+            .or_insert_with(FxHashSet::default);
+        let drained: Vec<String> = tables.drain().collect();
+        for canonical in &drained {
+            self.table_map.remove(canonical);
+        }
+        drained
     }
 
     pub fn namespace_for_schema(&self, schema: &str) -> Option<&NamespaceId> {
@@ -489,22 +468,16 @@ impl StorageNamespaceRegistry {
     }
 
     pub fn is_temporary_table(&self, canonical: &str) -> bool {
-        self.namespaces
-            .values()
-            .any(|entry| entry.ops.owns_table(canonical))
+        matches!(
+            self.table_map.get(canonical),
+            Some(namespace_id) if namespace_id == TEMPORARY_NAMESPACE_ID
+        )
     }
 
     pub fn namespace_for_table(&self, canonical: &str) -> NamespaceId {
-        if let Some(namespace_id) = self
-            .priority
-            .iter()
-            .filter_map(|namespace_id| self.namespaces.get(namespace_id))
-            .find(|entry| entry.ops.owns_table(canonical))
-            .map(|entry| entry.ops.namespace_id().clone())
-        {
-            return namespace_id;
-        }
-
-        self.persistent_id.clone()
+        self.table_map
+            .get(canonical)
+            .cloned()
+            .unwrap_or_else(|| self.persistent_id.clone())
     }
 }
