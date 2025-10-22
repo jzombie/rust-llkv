@@ -42,9 +42,6 @@ pub use runtime_session::RuntimeSession;
 mod runtime_engine;
 pub use runtime_engine::RuntimeEngine;
 
-mod runtime_constraints;
-pub(crate) use runtime_constraints::validate_alter_table_operation;
-
 mod runtime_lazy_frame;
 pub use runtime_lazy_frame::RuntimeLazyFrame;
 

@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::{BoxedPager, MemPager, Pager};
-use llkv_table::{SingleColumnIndexDescriptor, canonical_table_name};
+use llkv_table::{SingleColumnIndexDescriptor, canonical_table_name, validate_alter_table_operation};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::storage_namespace::{
@@ -1015,7 +1015,7 @@ where
                     .ok_or_else(|| Error::Internal("table metadata missing".into()))?
                     .table_id;
 
-                super::validate_alter_table_operation(
+                validate_alter_table_operation(
                     &plan.operation,
                     &view,
                     table_id,
@@ -1041,7 +1041,7 @@ where
                     .ok_or_else(|| Error::Internal("table metadata missing".into()))?
                     .table_id;
 
-                super::validate_alter_table_operation(
+                validate_alter_table_operation(
                     &plan.operation,
                     &view,
                     table_id,

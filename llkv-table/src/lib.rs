@@ -61,10 +61,11 @@ pub use constraints::{
     ForeignKeyChildRowsFetch, ForeignKeyColumn, ForeignKeyConstraint, ForeignKeyParentRowsFetch,
     ForeignKeyRowFetch, ForeignKeyTableInfo, InsertColumnConstraint, InsertMultiColumnUnique,
     InsertUniqueColumn, PrimaryKeyConstraint, UniqueConstraint, UniqueKey, ValidatedForeignKey,
-    build_composite_unique_key, decode_constraint_row_id, encode_constraint_row_id,
+    build_composite_unique_key, column_in_foreign_keys, column_in_multi_column_unique,
+    column_in_primary_or_unique, decode_constraint_row_id, encode_constraint_row_id,
     ensure_multi_column_unique, ensure_primary_key, ensure_single_column_unique,
-    unique_key_component, validate_check_constraints, validate_foreign_key_rows,
-    validate_foreign_keys,
+    unique_key_component, validate_alter_table_operation, validate_check_constraints,
+    validate_foreign_key_rows, validate_foreign_keys,
 };
 pub use ddl::CatalogDdl;
 pub use metadata::MultiColumnUniqueRegistration;

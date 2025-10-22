@@ -10,7 +10,6 @@ use crate::{
     RuntimeCreateTableBuilder, RuntimeSession, RuntimeStatementResult, RuntimeTableHandle,
     RuntimeTransactionContext, SelectExecution, TXN_ID_AUTO_COMMIT, TXN_ID_NONE,
     canonical_table_name, is_table_missing_error, sql_type_to_arrow,
-    validate_alter_table_operation,
 };
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -44,7 +43,7 @@ use llkv_table::{
     MultiColumnUniqueEntryMeta, MultiColumnUniqueRegistration, RowId, SingleColumnIndexDescriptor,
     SingleColumnIndexRegistration, SysCatalog, Table, TableConstraintSummaryView, TableId,
     TableView, UniqueKey, build_composite_unique_key, ensure_multi_column_unique,
-    ensure_single_column_unique,
+    ensure_single_column_unique, validate_alter_table_operation,
 };
 use llkv_transaction::mvcc;
 use llkv_transaction::{
