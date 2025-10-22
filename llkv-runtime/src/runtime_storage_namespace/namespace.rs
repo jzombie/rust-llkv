@@ -70,10 +70,8 @@ pub trait RuntimeStorageNamespace: Send + Sync + 'static {
     ) -> crate::Result<RuntimeStatementResult<Self::Pager>>;
 
     /// Drop an index from this namespace by forwarding the request.
-    fn drop_index(
-        &self,
-        plan: DropIndexPlan,
-    ) -> crate::Result<Option<SingleColumnIndexDescriptor>>;
+    fn drop_index(&self, plan: DropIndexPlan)
+    -> crate::Result<Option<SingleColumnIndexDescriptor>>;
 
     /// Execute a generic plan operation. Namespaces that do not yet support
     /// this entry point should override this method.

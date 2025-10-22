@@ -13,7 +13,7 @@ use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 
-use super::{provider::ContextProvider, RuntimeContext};
+use super::{RuntimeContext, provider::ContextProvider};
 
 impl<P> RuntimeContext<P>
 where

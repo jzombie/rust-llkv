@@ -1,5 +1,5 @@
-use crate::types::ExecutorTable;
 use crate::ExecutorResult;
+use crate::types::ExecutorTable;
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_expr::expr::ScalarExpr;
 use llkv_expr::literal::Literal;

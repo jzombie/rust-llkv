@@ -75,8 +75,10 @@ where
             }))
         }
         LlkvExpr::Compare { left, op, right } => {
-            let left_expr = translate_scalar_with(&left, schema, unknown_column, unknown_aggregate)?;
-            let right_expr = translate_scalar_with(&right, schema, unknown_column, unknown_aggregate)?;
+            let left_expr =
+                translate_scalar_with(&left, schema, unknown_column, unknown_aggregate)?;
+            let right_expr =
+                translate_scalar_with(&right, schema, unknown_column, unknown_aggregate)?;
             Ok(LlkvExpr::Compare {
                 left: left_expr,
                 op,
@@ -143,11 +145,9 @@ where
                 AggregateCall::Max(name) => {
                     AggregateCall::Max(resolve_field_id(schema, name, unknown_aggregate)?)
                 }
-                AggregateCall::CountNulls(name) => AggregateCall::CountNulls(resolve_field_id(
-                    schema,
-                    name,
-                    unknown_aggregate,
-                )?),
+                AggregateCall::CountNulls(name) => {
+                    AggregateCall::CountNulls(resolve_field_id(schema, name, unknown_aggregate)?)
+                }
             };
             Ok(ScalarExpr::Aggregate(translated))
         }

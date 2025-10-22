@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use llkv_plan::{InsertPlan, InsertSource, PlanValue};
-use llkv_runtime::{
-    RuntimeStatementResult, TemporaryRuntimeNamespace, TEMPORARY_NAMESPACE_ID,
-};
+use llkv_runtime::{RuntimeStatementResult, TEMPORARY_NAMESPACE_ID, TemporaryRuntimeNamespace};
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::BoxedPager;
 use llkv_storage::pager::MemPager;
@@ -123,7 +121,7 @@ fn temporary_tables_allow_inserts_after_unique_index() {
         .namespace_registry()
         .read()
         .expect("namespace registry lock")
-    .namespace::<TemporaryRuntimeNamespace<BoxedPager>>(TEMPORARY_NAMESPACE_ID)
+        .namespace::<TemporaryRuntimeNamespace<BoxedPager>>(TEMPORARY_NAMESPACE_ID)
         .expect("temporary namespace present");
 
     let temp_context = temp_namespace.context();

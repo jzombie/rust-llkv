@@ -5,20 +5,22 @@ use std::sync::{Arc, RwLock};
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::{BoxedPager, MemPager, Pager};
-use llkv_table::{SingleColumnIndexDescriptor, canonical_table_name, validate_alter_table_operation};
+use llkv_table::{
+    SingleColumnIndexDescriptor, canonical_table_name, validate_alter_table_operation,
+};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{
     AlterTablePlan, CatalogDdl, CreateIndexPlan, CreateTablePlan, CreateTableSource, DeletePlan,
-    DropIndexPlan, DropTablePlan, InsertPlan, InsertSource, PlanColumnSpec,
-    PlanOperation, PlanValue, RenameTablePlan, RuntimeContext, RuntimeStatementResult,
-    RuntimeTransactionContext, SelectExecution, SelectPlan, SelectProjection, TransactionContext,
-    TransactionKind, TransactionResult, TransactionSession, UpdatePlan,
+    DropIndexPlan, DropTablePlan, InsertPlan, InsertSource, PlanColumnSpec, PlanOperation,
+    PlanValue, RenameTablePlan, RuntimeContext, RuntimeStatementResult, RuntimeTransactionContext,
+    SelectExecution, SelectPlan, SelectProjection, TransactionContext, TransactionKind,
+    TransactionResult, TransactionSession, UpdatePlan,
 };
 use crate::{
-    PersistentRuntimeNamespace, RuntimeNamespaceId, RuntimeStorageNamespace,
-    RuntimeStorageNamespaceRegistry, TemporaryRuntimeNamespace, PERSISTENT_NAMESPACE_ID,
-    TEMPORARY_NAMESPACE_ID,
+    PERSISTENT_NAMESPACE_ID, PersistentRuntimeNamespace, RuntimeNamespaceId,
+    RuntimeStorageNamespace, RuntimeStorageNamespaceRegistry, TEMPORARY_NAMESPACE_ID,
+    TemporaryRuntimeNamespace,
 };
 
 pub(crate) struct SessionNamespaces<P>
@@ -88,10 +90,7 @@ where
         if let Some(temp) = &self.temporary {
             let namespace_id = temp.namespace_id().to_string();
             let canonical_names = {
-                let mut registry = self
-                    .registry
-                    .write()
-                    .expect("namespace registry poisoned");
+                let mut registry = self.registry.write().expect("namespace registry poisoned");
                 registry.drain_namespace_tables(&namespace_id)
             };
             temp.clear_tables(canonical_names);
@@ -148,10 +147,7 @@ where
             .namespace_for_table(canonical)
     }
 
-    fn namespace_for_select_plan(
-        &self,
-        plan: &SelectPlan,
-    ) -> Option<RuntimeNamespaceId> {
+    fn namespace_for_select_plan(&self, plan: &SelectPlan) -> Option<RuntimeNamespaceId> {
         if plan.tables.len() != 1 {
             return None;
         }
@@ -999,8 +995,7 @@ where
                     Ok(()) => {
                         let namespace_id = temp_namespace.namespace_id().to_string();
                         let registry = self.namespace_registry();
-                        let mut registry =
-                            registry.write().expect("namespace registry poisoned");
+                        let mut registry = registry.write().expect("namespace registry poisoned");
                         registry.unregister_table(&canonical_table);
                         registry.register_table(&namespace_id, new_canonical);
                         Ok(())
@@ -1009,13 +1004,11 @@ where
                     Err(err) => Err(err),
                 }
             }
-            PERSISTENT_NAMESPACE_ID => {
-                match self.run_autocommit_rename_table(plan.clone()) {
-                    Ok(()) => Ok(()),
-                    Err(err) if plan.if_exists && super::is_table_missing_error(&err) => Ok(()),
-                    Err(err) => Err(err),
-                }
-            }
+            PERSISTENT_NAMESPACE_ID => match self.run_autocommit_rename_table(plan.clone()) {
+                Ok(()) => Ok(()),
+                Err(err) if plan.if_exists && super::is_table_missing_error(&err) => Ok(()),
+                Err(err) => Err(err),
+            },
             other => Err(Error::InvalidArgumentError(format!(
                 "Unknown storage namespace '{}'",
                 other
@@ -1048,12 +1041,7 @@ where
                     .ok_or_else(|| Error::Internal("table metadata missing".into()))?
                     .table_id;
 
-                validate_alter_table_operation(
-                    &plan.operation,
-                    &view,
-                    table_id,
-                    catalog_service,
-                )?;
+                validate_alter_table_operation(&plan.operation, &view, table_id, catalog_service)?;
 
                 temp_namespace.alter_table(plan)?.convert_pager_type::<P>()
             }
@@ -1074,12 +1062,7 @@ where
                     .ok_or_else(|| Error::Internal("table metadata missing".into()))?
                     .table_id;
 
-                validate_alter_table_operation(
-                    &plan.operation,
-                    &view,
-                    table_id,
-                    catalog_service,
-                )?;
+                validate_alter_table_operation(&plan.operation, &view, table_id, catalog_service)?;
 
                 self.run_autocommit_alter_table(plan)
             }

@@ -230,7 +230,7 @@ where
     pub fn create_from_columns(
         display_name: &str,
         canonical_name: &str,
-    columns: &[llkv_plan::PlanColumnSpec],
+        columns: &[llkv_plan::PlanColumnSpec],
         metadata: Arc<crate::metadata::MetadataManager<P>>,
         catalog: Arc<crate::catalog::TableCatalog>,
         store: Arc<ColumnStore<P>>,

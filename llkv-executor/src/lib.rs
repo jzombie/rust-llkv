@@ -35,8 +35,8 @@ use llkv_table::types::FieldId;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::fmt;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 // ============================================================================
 // Module Declarations
@@ -55,8 +55,7 @@ pub mod utils;
 pub type ExecutorResult<T> = Result<T, Error>;
 
 pub use insert::{
-    build_array_for_column, normalize_insert_value_for_column,
-    resolve_insert_columns,
+    build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns,
 };
 pub use translation::{
     build_projected_columns, build_wildcard_projections, full_table_scan_filter,
@@ -64,8 +63,8 @@ pub use translation::{
     translate_predicate_with, translate_scalar, translate_scalar_with,
 };
 pub use types::{
-    ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema, ExecutorTable,
-    ExecutorTableProvider, ExecutorRowBatch
+    ExecutorColumn, ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorSchema, ExecutorTable,
+    ExecutorTableProvider,
 };
 pub use utils::current_time_micros;
 
@@ -477,7 +476,10 @@ where
                         "table has no columns; cannot perform wildcard scan".into(),
                     )
                 })?;
-                (crate::translation::expression::full_table_scan_filter(field_id), true)
+                (
+                    crate::translation::expression::full_table_scan_filter(field_id),
+                    true,
+                )
             }
         };
 

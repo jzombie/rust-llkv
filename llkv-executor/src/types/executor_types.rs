@@ -1,9 +1,9 @@
 //! Executor table, schema, and column types.
 
 use arrow::datatypes::DataType;
+use llkv_plan::PlanValue;
 use llkv_storage::pager::Pager;
 use llkv_table::types::FieldId;
-use llkv_plan::PlanValue;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::atomic::AtomicU64;
@@ -123,4 +123,3 @@ pub struct ExecutorMultiColumnUnique {
     /// Indices of columns in the schema that form the unique constraint
     pub column_indices: Vec<usize>,
 }
-

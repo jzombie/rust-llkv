@@ -131,7 +131,7 @@ where
     /// Should be called during initialization to restore persisted types.
     pub fn load_types_from_catalog(&self) -> LlkvResult<()> {
         use crate::sys_catalog::SysCatalog;
-        
+
         let sys_catalog = SysCatalog::new(&self.store);
         match sys_catalog.all_custom_type_metas() {
             Ok(type_metas) => {
@@ -139,7 +139,7 @@ where
                     "[CATALOG] Loaded {} custom type(s) from catalog",
                     type_metas.len()
                 );
-                
+
                 let mut registry = self.type_registry.write().unwrap();
                 for type_meta in type_metas {
                     // Parse the base_type_sql back to a DataType
@@ -153,7 +153,7 @@ where
                         );
                     }
                 }
-                
+
                 tracing::debug!(
                     "[CATALOG] Type registry initialized with {} type(s)",
                     registry.len()
@@ -215,7 +215,11 @@ where
 
     /// Create a view by storing its SQL definition in the catalog.
     /// The view will be registered as a table with a view_definition.
-    pub fn create_view(&self, display_name: &str, view_definition: String) -> LlkvResult<crate::types::TableId> {
+    pub fn create_view(
+        &self,
+        display_name: &str,
+        view_definition: String,
+    ) -> LlkvResult<crate::types::TableId> {
         use crate::sys_catalog::TableMeta;
 
         // Reserve a new table ID for the view
@@ -268,7 +272,7 @@ where
         &self,
         display_name: &str,
         canonical_name: &str,
-    columns: &[PlanColumnSpec],
+        columns: &[PlanColumnSpec],
     ) -> LlkvResult<CreateTableResult<P>> {
         if columns.is_empty() {
             return Err(Error::InvalidArgumentError(

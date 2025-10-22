@@ -20,14 +20,19 @@ fn primary_key_and_unique_constraints_reload_from_metadata() {
 
         let result = context
             .create_table_builder("accounts")
-            .with_column_spec(PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
+            .with_column_spec(
+                PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true),
+            )
             .with_column_spec(PlanColumnSpec::new("email", DataType::Utf8, false).with_unique(true))
             .finish()
             .expect("create table");
         assert!(matches!(result, RuntimeStatementResult::CreateTable { .. }));
 
         let (_, canonical_name) = llkv_table::canonical_table_name("accounts").unwrap();
-        let specs = context.catalog().table_column_specs(&canonical_name).expect("table specs");
+        let specs = context
+            .catalog()
+            .table_column_specs(&canonical_name)
+            .expect("table specs");
         assert_eq!(specs.len(), 2);
         let id_spec = specs.iter().find(|spec| spec.name == "id").unwrap();
         assert!(id_spec.primary_key);
@@ -68,7 +73,9 @@ fn foreign_key_views_reload_from_metadata() {
 
         context
             .create_table_builder("parents")
-            .with_column_spec(PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
+            .with_column_spec(
+                PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true),
+            )
             .finish()
             .expect("create parents table");
 

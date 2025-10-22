@@ -6,13 +6,13 @@
 //! - MVCC-based soft deletion
 
 use crate::{RuntimeStatementResult, canonical_table_name};
-use llkv_executor::{translation, ExecutorTable};
+use llkv_executor::{ExecutorTable, translation};
 use llkv_expr::Expr as LlkvExpr;
 use llkv_plan::DeletePlan;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::RowId;
-use llkv_transaction::{mvcc, TransactionSnapshot};
+use llkv_transaction::{TransactionSnapshot, mvcc};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{Arc, atomic::Ordering};
 
@@ -120,12 +120,7 @@ where
         }
 
         if enforce_foreign_keys {
-            self.check_foreign_keys_on_delete(
-                table,
-                &display_name,
-                &row_ids,
-                snapshot,
-            )?;
+            self.check_foreign_keys_on_delete(table, &display_name, &row_ids, snapshot)?;
         }
 
         self.detect_delete_conflicts(table, &display_name, &row_ids, snapshot)?;

@@ -23,7 +23,7 @@ use llkv_storage::pager::Pager;
 use llkv_table::CatalogDdl;
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::mvcc::{TransactionSnapshot, TxnId, TxnIdManager, TXN_ID_AUTO_COMMIT};
+use crate::mvcc::{TXN_ID_AUTO_COMMIT, TransactionSnapshot, TxnId, TxnIdManager};
 use crate::types::{TransactionCatalogSnapshot, TransactionKind, TransactionResult};
 
 /// Session identifier type.
@@ -48,7 +48,7 @@ fn select_plan_table_name(plan: &SelectPlan) -> Option<String> {
 pub trait TransactionContext: CatalogDdl + Send + Sync {
     /// The pager type used by this context
     type Pager: Pager<Blob = EntryHandle> + Send + Sync + 'static;
-    
+
     /// Snapshot representation returned by this context.
     type Snapshot: TransactionCatalogSnapshot;
 
@@ -675,7 +675,8 @@ where
 {
     context: Arc<BaseCtx>,
     session_id: TransactionSessionId,
-    transactions: Arc<Mutex<HashMap<TransactionSessionId, SessionTransaction<BaseCtx, StagingCtx>>>>,
+    transactions:
+        Arc<Mutex<HashMap<TransactionSessionId, SessionTransaction<BaseCtx, StagingCtx>>>>,
     txn_manager: Arc<TxnIdManager>,
 }
 
@@ -687,7 +688,9 @@ where
     pub fn new(
         context: Arc<BaseCtx>,
         session_id: TransactionSessionId,
-        transactions: Arc<Mutex<HashMap<TransactionSessionId, SessionTransaction<BaseCtx, StagingCtx>>>>,
+        transactions: Arc<
+            Mutex<HashMap<TransactionSessionId, SessionTransaction<BaseCtx, StagingCtx>>>,
+        >,
         txn_manager: Arc<TxnIdManager>,
     ) -> Self {
         Self {
@@ -1155,7 +1158,8 @@ where
     BaseCtx: TransactionContext + 'static,
     StagingCtx: TransactionContext + 'static,
 {
-    transactions: Arc<Mutex<HashMap<TransactionSessionId, SessionTransaction<BaseCtx, StagingCtx>>>>,
+    transactions:
+        Arc<Mutex<HashMap<TransactionSessionId, SessionTransaction<BaseCtx, StagingCtx>>>>,
     next_session_id: AtomicU64,
     txn_manager: Arc<TxnIdManager>,
 }

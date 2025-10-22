@@ -16,6 +16,8 @@ pub mod plan_graph;
 pub mod plans;
 pub mod validation;
 
-pub use conversion::{extract_rows_from_range, plan_value_from_sql_expr, plan_value_from_sql_value, RangeSelectRows};
+pub use conversion::{
+    RangeSelectRows, extract_rows_from_range, plan_value_from_sql_expr, plan_value_from_sql_value,
+};
 pub use plan_graph::*;
 pub use plans::*;

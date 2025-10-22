@@ -19,21 +19,23 @@ pub fn parse_date32_literal(text: &str) -> LlkvResult<i32> {
         )));
     }
 
-    let year = year_str
-        .parse::<i32>()
-        .map_err(|_| Error::InvalidArgumentError(format!("invalid year in DATE literal '{text}'")))?;
-    let month_num = month_str
-        .parse::<u8>()
-        .map_err(|_| Error::InvalidArgumentError(format!("invalid month in DATE literal '{text}'")))?;
-    let day = day_str
-        .parse::<u8>()
-        .map_err(|_| Error::InvalidArgumentError(format!("invalid day in DATE literal '{text}'")))?;
+    let year = year_str.parse::<i32>().map_err(|_| {
+        Error::InvalidArgumentError(format!("invalid year in DATE literal '{text}'"))
+    })?;
+    let month_num = month_str.parse::<u8>().map_err(|_| {
+        Error::InvalidArgumentError(format!("invalid month in DATE literal '{text}'"))
+    })?;
+    let day = day_str.parse::<u8>().map_err(|_| {
+        Error::InvalidArgumentError(format!("invalid day in DATE literal '{text}'"))
+    })?;
 
-    let month = Month::try_from(month_num)
-        .map_err(|_| Error::InvalidArgumentError(format!("invalid month in DATE literal '{text}'")))?;
+    let month = Month::try_from(month_num).map_err(|_| {
+        Error::InvalidArgumentError(format!("invalid month in DATE literal '{text}'"))
+    })?;
 
-    let date = Date::from_calendar_date(year, month, day)
-        .map_err(|err| Error::InvalidArgumentError(format!("invalid DATE literal '{text}': {err}")))?;
+    let date = Date::from_calendar_date(year, month, day).map_err(|err| {
+        Error::InvalidArgumentError(format!("invalid DATE literal '{text}': {err}"))
+    })?;
     let days = date.to_julian_day() - epoch_julian_day();
     Ok(days)
 }

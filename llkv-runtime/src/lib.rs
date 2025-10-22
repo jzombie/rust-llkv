@@ -31,9 +31,9 @@
 pub mod runtime_storage_namespace;
 
 pub use runtime_storage_namespace::{
-    PersistentRuntimeNamespace, RuntimeNamespaceId, RuntimeStorageNamespace,
-    RuntimeStorageNamespaceOps, RuntimeStorageNamespaceRegistry, TemporaryRuntimeNamespace,
-    PERSISTENT_NAMESPACE_ID, TEMPORARY_NAMESPACE_ID,
+    PERSISTENT_NAMESPACE_ID, PersistentRuntimeNamespace, RuntimeNamespaceId,
+    RuntimeStorageNamespace, RuntimeStorageNamespaceOps, RuntimeStorageNamespaceRegistry,
+    TEMPORARY_NAMESPACE_ID, TemporaryRuntimeNamespace,
 };
 
 mod runtime_statement_result;
@@ -61,9 +61,9 @@ pub use llkv_executor::SelectExecution;
 pub use llkv_plan::{
     AggregateExpr, AlterTablePlan, AssignmentValue, ColumnAssignment, CreateIndexPlan,
     CreateTablePlan, CreateTableSource, DeletePlan, DropIndexPlan, DropTablePlan, ForeignKeyAction,
-    ForeignKeySpec, IndexColumnPlan, InsertPlan, InsertSource, IntoPlanColumnSpec, PlanColumnSpec,
-    MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanOperation, PlanStatement,
-    PlanValue, RenameTablePlan, SelectPlan, SelectProjection, UpdatePlan,
+    ForeignKeySpec, IndexColumnPlan, InsertPlan, InsertSource, IntoPlanColumnSpec,
+    MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec, PlanOperation,
+    PlanStatement, PlanValue, RenameTablePlan, SelectPlan, SelectProjection, UpdatePlan,
 };
 use llkv_result::{Error, Result};
 use llkv_table::{CatalogDdl, canonical_table_name};

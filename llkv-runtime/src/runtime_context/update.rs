@@ -8,24 +8,24 @@
 
 use crate::{RuntimeStatementResult, canonical_table_name};
 use arrow::record_batch::RecordBatch;
+use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_executor::{resolve_insert_columns, translation, ExecutorColumn, ExecutorTable};
+use llkv_executor::{ExecutorColumn, ExecutorTable, resolve_insert_columns, translation};
 use llkv_expr::{Expr as LlkvExpr, ScalarExpr};
 use llkv_plan::{AssignmentValue, ColumnAssignment, PlanValue, UpdatePlan};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
-use llkv_table::{FieldId, RowId, build_composite_unique_key, UniqueKey};
 use llkv_table::table::ScanProjection;
-use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot};
-use llkv_column_map::store::GatherNullPolicy;
 use llkv_table::table::ScanStreamOptions;
+use llkv_table::{FieldId, RowId, UniqueKey, build_composite_unique_key};
+use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::mem;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use super::{RuntimeContext, PreparedAssignmentValue};
+use super::{PreparedAssignmentValue, RuntimeContext};
 
 impl<P> RuntimeContext<P>
 where
@@ -124,7 +124,10 @@ where
                             ))
                         },
                         |name| {
-                            Error::InvalidArgumentError(format!("unknown column '{}' in aggregate", name))
+                            Error::InvalidArgumentError(format!(
+                                "unknown column '{}' in aggregate",
+                                name
+                            ))
                         },
                     )?;
                     let expr_index = scalar_exprs.len();
@@ -459,7 +462,10 @@ where
                             ))
                         },
                         |name| {
-                            Error::InvalidArgumentError(format!("unknown column '{}' in aggregate", name))
+                            Error::InvalidArgumentError(format!(
+                                "unknown column '{}' in aggregate",
+                                name
+                            ))
                         },
                     )?;
                     let expr_index = scalar_exprs.len();
@@ -746,10 +752,9 @@ where
         let mut expr_values: Vec<Vec<PlanValue>> =
             vec![Vec::with_capacity(row_ids.len()); expressions.len()];
         let mut error: Option<Error> = None;
-        let row_filter: Arc<dyn llkv_table::table::RowIdFilter<P>> = Arc::new(MvccRowIdFilter::new(
-            Arc::clone(&self.txn_manager),
-            snapshot,
-        ));
+        let row_filter: Arc<dyn llkv_table::table::RowIdFilter<P>> = Arc::new(
+            MvccRowIdFilter::new(Arc::clone(&self.txn_manager), snapshot),
+        );
         let options = ScanStreamOptions {
             include_nulls: true,
             order: None,

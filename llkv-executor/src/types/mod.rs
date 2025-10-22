@@ -9,6 +9,7 @@
 pub mod executor_types;
 pub mod provider;
 
-pub use executor_types::{ExecutorRowBatch, ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema, ExecutorTable};
+pub use executor_types::{
+    ExecutorColumn, ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorSchema, ExecutorTable,
+};
 pub use provider::ExecutorTableProvider;
-

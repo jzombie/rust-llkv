@@ -110,7 +110,10 @@ fn basic_transaction_visibility() {
 
     let (_, canonical_name) = llkv_table::canonical_table_name("integers").unwrap();
     assert!(
-        context.catalog().table_column_specs(&canonical_name).is_err(),
+        context
+            .catalog()
+            .table_column_specs(&canonical_name)
+            .is_err(),
         "base context should not see transactional table"
     );
 
@@ -132,7 +135,10 @@ fn basic_transaction_visibility() {
 
     let (_, canonical_name) = llkv_table::canonical_table_name("integers").unwrap();
     assert!(
-        context.catalog().table_column_specs(&canonical_name).is_err(),
+        context
+            .catalog()
+            .table_column_specs(&canonical_name)
+            .is_err(),
         "base context should still not see table before commit"
     );
     conn1.execute("COMMIT").expect("conn1 commit");

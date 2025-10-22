@@ -9,14 +9,17 @@ use crate::{RuntimeStatementResult, TXN_ID_NONE, canonical_table_name};
 use arrow::array::ArrayRef;
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
-use llkv_executor::{build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns, ExecutorTable};
+use llkv_executor::{
+    ExecutorTable, build_array_for_column, normalize_insert_value_for_column,
+    resolve_insert_columns,
+};
 use llkv_plan::{InsertPlan, InsertSource, PlanValue};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
-use llkv_transaction::{mvcc, TransactionSnapshot};
+use llkv_transaction::{TransactionSnapshot, mvcc};
 use simd_r_drive_entry_handle::EntryHandle;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::RuntimeContext;
 

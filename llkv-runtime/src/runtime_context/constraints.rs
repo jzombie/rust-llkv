@@ -9,7 +9,7 @@
 use arrow::array::{Array, UInt64Array};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_executor::{translation, ExecutorTable};
+use llkv_executor::{ExecutorTable, translation};
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
@@ -17,7 +17,7 @@ use llkv_table::{
     ConstraintColumnInfo, FieldId, InsertColumnConstraint, InsertMultiColumnUnique,
     InsertUniqueColumn, RowId,
 };
-use llkv_transaction::{TransactionSnapshot, filter_row_ids_for_snapshot, TxnId};
+use llkv_transaction::{TransactionSnapshot, TxnId, filter_row_ids_for_snapshot};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 
@@ -30,7 +30,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     /// Detect delete conflicts by checking if any rows are locked by other transactions.
-    /// 
+    ///
     /// This function is `pub(super)` because it's called by apply_delete in delete.rs.
     pub(super) fn detect_delete_conflicts(
         &self,
@@ -221,7 +221,7 @@ where
     }
 
     /// Validate foreign key constraints for UPDATE operations.
-    /// 
+    ///
     /// This function is `pub(super)` because it's called by update operations in update.rs.
     pub(super) fn check_foreign_keys_on_update(
         &self,
@@ -259,7 +259,7 @@ where
     }
 
     /// Validate foreign key constraints for DELETE operations.
-    /// 
+    ///
     /// This function is `pub(super)` because it's called by apply_delete in delete.rs.
     pub(super) fn check_foreign_keys_on_delete(
         &self,

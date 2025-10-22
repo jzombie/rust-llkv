@@ -1,5 +1,6 @@
 //! Helper functions for value coercion and data preparation used during inserts.
 
+use crate::utils::date::parse_date32_literal;
 use arrow::array::{
     ArrayRef, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, StringBuilder,
 };
@@ -7,7 +8,6 @@ use arrow::datatypes::{DataType, FieldRef};
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
 use std::sync::Arc;
-use crate::utils::date::parse_date32_literal;
 
 use crate::{ExecutorColumn, ExecutorSchema};
 

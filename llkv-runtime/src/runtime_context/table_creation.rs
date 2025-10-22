@@ -5,14 +5,21 @@
 //! - CREATE TABLE from column specifications
 //! - CREATE TABLE AS SELECT (from batches)
 
-use crate::{RuntimeCreateTableBuilder, RuntimeStatementResult, RuntimeTableHandle, TXN_ID_NONE, canonical_table_name};
+use crate::{
+    RuntimeCreateTableBuilder, RuntimeStatementResult, RuntimeTableHandle, TXN_ID_NONE,
+    canonical_table_name,
+};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
-use llkv_executor::{current_time_micros, ExecutorColumn, ExecutorSchema, ExecutorTable};
-use llkv_plan::{CreateTablePlan, ForeignKeySpec, IntoPlanColumnSpec, MultiColumnUniqueSpec, PlanColumnSpec};
+use llkv_executor::{ExecutorColumn, ExecutorSchema, ExecutorTable, current_time_micros};
+use llkv_plan::{
+    CreateTablePlan, ForeignKeySpec, IntoPlanColumnSpec, MultiColumnUniqueSpec, PlanColumnSpec,
+};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
-use llkv_table::{CatalogDdl, CreateTableResult, FieldId, ForeignKeyColumn, ForeignKeyTableInfo, Table};
+use llkv_table::{
+    CatalogDdl, CreateTableResult, FieldId, ForeignKeyColumn, ForeignKeyTableInfo, Table,
+};
 use llkv_transaction::TransactionMvccBuilder;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;

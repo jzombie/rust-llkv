@@ -7,8 +7,8 @@
 //! - `provider`: ContextProvider for TableProvider trait
 
 use crate::{
-    RuntimeSession, RuntimeStatementResult, RuntimeTableHandle,
-    RuntimeTransactionContext, TXN_ID_AUTO_COMMIT, canonical_table_name, is_table_missing_error,
+    RuntimeSession, RuntimeStatementResult, RuntimeTableHandle, RuntimeTransactionContext,
+    TXN_ID_AUTO_COMMIT, canonical_table_name, is_table_missing_error,
 };
 use llkv_column_map::store::ColumnStore;
 use llkv_executor::{ExecutorMultiColumnUnique, ExecutorTable};
@@ -20,10 +20,9 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::{MemPager, Pager};
 use llkv_table::catalog::TableCatalog;
 use llkv_table::{
-    CatalogDdl, CatalogManager, ConstraintService, MetadataManager,
-    MultiColumnUniqueRegistration, SingleColumnIndexDescriptor, SingleColumnIndexRegistration,
-    SysCatalog, TableId, ensure_multi_column_unique, ensure_single_column_unique,
-    validate_alter_table_operation,
+    CatalogDdl, CatalogManager, ConstraintService, MetadataManager, MultiColumnUniqueRegistration,
+    SingleColumnIndexDescriptor, SingleColumnIndexRegistration, SysCatalog, TableId,
+    ensure_multi_column_unique, ensure_single_column_unique, validate_alter_table_operation,
 };
 use llkv_transaction::{TransactionManager, TransactionSnapshot, TxnId, TxnIdManager};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -34,9 +33,9 @@ mod alter;
 mod constraints;
 mod delete;
 mod insert;
-mod table_access;
 mod provider;
 mod query;
+mod table_access;
 mod table_creation;
 mod types;
 mod update;
@@ -266,7 +265,9 @@ where
     /// Create a view by storing its SQL definition in the catalog.
     /// The view will be registered as a table with a view_definition.
     pub fn create_view(&self, display_name: &str, view_definition: String) -> Result<TableId> {
-        Ok(self.catalog_service.create_view(display_name, view_definition)?)
+        Ok(self
+            .catalog_service
+            .create_view(display_name, view_definition)?)
     }
 
     /// Check if a table is actually a view by looking at its metadata.
@@ -371,13 +372,12 @@ where
     /// # Returns
     /// Returns a [`RuntimeTableHandle`] that provides immediate access to the table.
     /// Use this for further programmatic operations on the table.
-    
+
     /// Returns all table names currently registered in the catalog.
     pub fn table_names(self: &Arc<Self>) -> Vec<String> {
         // Use catalog for table names (single source of truth)
         self.catalog.table_names()
     }
-
 }
 
 impl<P> CatalogDdl for RuntimeContext<P>

@@ -51,7 +51,8 @@ pub mod mvcc;
 pub mod types;
 
 pub use context::{
-    TransactionSessionId, SessionTransaction, TransactionContext, TransactionManager, TransactionSession,
+    SessionTransaction, TransactionContext, TransactionManager, TransactionSession,
+    TransactionSessionId,
 };
 pub use helpers::{MvccRowIdFilter, TransactionMvccBuilder, filter_row_ids_for_snapshot};
 pub use mvcc::{

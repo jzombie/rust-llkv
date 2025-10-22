@@ -5,25 +5,22 @@
 //! focused on high-level orchestration while these helpers encapsulate caching,
 //! lazy loading, and direct batch interactions.
 
-use crate::{
-    RuntimeContext, RuntimeTableHandle,
-    canonical_table_name,
-};
+use crate::{RuntimeContext, RuntimeTableHandle, canonical_table_name};
 use arrow::array::{ArrayRef, RecordBatch, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_executor::{
-    translation, ExecutorColumn, ExecutorMultiColumnUnique,
-    ExecutorRowBatch, ExecutorSchema, ExecutorTable,
+    ExecutorColumn, ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorSchema, ExecutorTable,
+    translation,
 };
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
-use llkv_table::{
-    ConstraintKind, FieldId, Table, TableConstraintSummaryView, RowId, MultiColumnUniqueEntryMeta,
-};
 use llkv_table::resolvers::{FieldConstraints, FieldDefinition};
-use llkv_transaction::{mvcc, TransactionSnapshot};
+use llkv_table::{
+    ConstraintKind, FieldId, MultiColumnUniqueEntryMeta, RowId, Table, TableConstraintSummaryView,
+};
+use llkv_transaction::{TransactionSnapshot, mvcc};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{
@@ -55,16 +52,14 @@ where
         let table = self.lookup_table(&canonical_name)?;
 
         let filter_expr = match filter {
-            Some(expr) => translation::expression::translate_predicate(
-                expr,
-                table.schema.as_ref(),
-                |name| {
+            Some(expr) => {
+                translation::expression::translate_predicate(expr, table.schema.as_ref(), |name| {
                     Error::InvalidArgumentError(format!(
                         "Binder Error: does not have a column named '{}'",
                         name
                     ))
-                },
-            )?,
+                })?
+            }
             None => {
                 let field_id = table.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(

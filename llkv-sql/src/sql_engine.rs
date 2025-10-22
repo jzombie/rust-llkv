@@ -18,9 +18,8 @@ use llkv_runtime::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, CreateIndexPlan, CreateTablePlan,
     CreateTableSource, DeletePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan,
-    InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType,
-    OrderTarget, PlanColumnSpec, PlanStatement, PlanValue, RenameTablePlan, RuntimeContext,
-    RuntimeEngine, RuntimeSession,
+    InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec,
+    PlanStatement, PlanValue, RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession,
     RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
@@ -760,7 +759,7 @@ where
             .map(|name| name.to_ascii_lowercase())
             .collect();
 
-    let mut columns: Vec<PlanColumnSpec> = Vec::with_capacity(column_defs_ast.len());
+        let mut columns: Vec<PlanColumnSpec> = Vec::with_capacity(column_defs_ast.len());
         let mut primary_key_columns: HashSet<String> = HashSet::new();
         let mut foreign_keys: Vec<ForeignKeySpec> = Vec::new();
         let mut multi_column_uniques: Vec<MultiColumnUniqueSpec> = Vec::new();

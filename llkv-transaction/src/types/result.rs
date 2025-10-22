@@ -19,22 +19,16 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     /// CREATE TABLE result
-    CreateTable {
-        table_name: String,
-    },
+    CreateTable { table_name: String },
     /// INSERT result with row count
-    Insert {
-        rows_inserted: usize,
-    },
+    Insert { rows_inserted: usize },
     /// UPDATE result with match and update counts
     Update {
         rows_matched: usize,
         rows_updated: usize,
     },
     /// DELETE result with row count
-    Delete {
-        rows_deleted: usize,
-    },
+    Delete { rows_deleted: usize },
     /// CREATE INDEX result
     CreateIndex {
         table_name: String,
@@ -47,9 +41,7 @@ where
         execution: SelectExecution<P>,
     },
     /// Transaction control statement result
-    Transaction {
-        kind: TransactionKind,
-    },
+    Transaction { kind: TransactionKind },
     /// No-op result (e.g., for DDL statements that don't produce output)
     NoOp,
 }
@@ -90,9 +82,7 @@ where
             TransactionResult::Select { .. } => Err(LlkvError::InvalidArgumentError(
                 "cannot convert SELECT result with pager type change".into(),
             )),
-            TransactionResult::Transaction { kind } => {
-                Ok(TransactionResult::Transaction { kind })
-            }
+            TransactionResult::Transaction { kind } => Ok(TransactionResult::Transaction { kind }),
             TransactionResult::NoOp => Ok(TransactionResult::NoOp),
         }
     }

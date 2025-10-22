@@ -1,7 +1,7 @@
 //! TableProvider trait for executor table access.
 
-use crate::types::ExecutorTable;
 use crate::ExecutorResult;
+use crate::types::ExecutorTable;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;

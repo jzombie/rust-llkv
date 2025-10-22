@@ -1,5 +1,5 @@
-use crate::types::ExecutorTable;
 use crate::ExecutorResult;
+use crate::types::ExecutorTable;
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_plan::SelectProjection;
@@ -67,16 +67,13 @@ where
                 )));
             }
             SelectProjection::Computed { expr, alias } => {
-                let scalar = super::expression::translate_scalar(
-                    expr,
-                    table.schema.as_ref(),
-                    |name| {
+                let scalar =
+                    super::expression::translate_scalar(expr, table.schema.as_ref(), |name| {
                         Error::InvalidArgumentError(format!(
                             "Binder Error: does not have a column named '{}'",
                             name
                         ))
-                    },
-                )?;
+                    })?;
                 result.push(ScanProjection::computed(scalar, alias.clone()));
             }
         }

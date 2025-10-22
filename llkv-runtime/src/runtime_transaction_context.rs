@@ -1,13 +1,13 @@
 use std::sync::{Arc, RwLock};
 
 use arrow::record_batch::RecordBatch;
+use llkv_executor::ExecutorRowBatch;
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use llkv_table::{CatalogDdl, SingleColumnIndexDescriptor, TableId};
 use llkv_transaction::{TransactionContext, TransactionResult, TransactionSnapshot, TxnId};
 use simd_r_drive_entry_handle::EntryHandle;
-use llkv_executor::{ExecutorRowBatch};
 
 use crate::{
     AlterTablePlan, CreateIndexPlan, CreateTablePlan, DeletePlan, DropIndexPlan, DropTablePlan,
