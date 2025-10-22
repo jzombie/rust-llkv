@@ -56,6 +56,7 @@ use llkv_plan::plans::{
 };
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
+use llkv_table::CatalogDdl;
 use simd_r_drive_entry_handle::EntryHandle;
 
 use llkv_executor::SelectExecution;
@@ -202,11 +203,10 @@ where
 // Transaction Management Types
 // ============================================================================
 
-// TODO: This should extend `CatalogDDL`
 /// A trait for transaction context operations.
 /// This allows SessionTransaction to work with any context that implements these operations.
 /// The associated type P specifies the pager type this context uses.
-pub trait TransactionContext: Send + Sync {
+pub trait TransactionContext: CatalogDdl + Send + Sync {
     /// The pager type used by this context
     type Pager: Pager<Blob = EntryHandle> + Send + Sync + 'static;
     /// Snapshot representation returned by this context.
@@ -559,7 +559,7 @@ where
                 let result = if self.new_tables.contains(&canonical_name) {
                     // Table was created in this transaction, so drop it from staging
                     // and remove from tracking
-                    self.staging.drop_table(plan.clone())?;
+                    TransactionContext::drop_table(self.staging.as_ref(), plan.clone())?;
                     self.new_tables.remove(&canonical_name);
                     self.staged_tables.remove(&canonical_name);
 
