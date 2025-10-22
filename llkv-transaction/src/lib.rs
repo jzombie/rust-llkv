@@ -81,44 +81,16 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 use llkv_executor::{SelectExecution, ExecutorRowBatch};
 
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
 /// Extracts table name from SelectPlan for single-table queries.
 fn select_plan_table_name(plan: &SelectPlan) -> Option<String> {
     if plan.tables.len() == 1 {
         Some(plan.tables[0].qualified_name())
     } else {
         None
-    }
-}
-
-/// Catalog snapshot interface used by the transaction layer.
-///
-/// Implementers provide immutable access to table name→ID mappings captured at
-/// the start of a transaction. The trait is lightweight so callers can wrap or
-/// translate existing catalog views without copying large data structures.
-pub trait CatalogSnapshot: Clone + Send + Sync + 'static {
-    /// Look up a table ID by name (case-insensitive).
-    fn table_id(&self, name: &str) -> Option<TableId>;
-
-    /// Check whether a table exists in this snapshot.
-    fn table_exists(&self, name: &str) -> bool {
-        self.table_id(name).is_some()
-    }
-
-    /// Return all table names captured in this snapshot.
-    fn table_names(&self) -> Vec<String>;
-}
-
-impl CatalogSnapshot for llkv_table::catalog::TableCatalogSnapshot {
-    fn table_id(&self, name: &str) -> Option<TableId> {
-        llkv_table::catalog::TableCatalogSnapshot::table_id(self, name)
-    }
-
-    fn table_exists(&self, name: &str) -> bool {
-        llkv_table::catalog::TableCatalogSnapshot::table_exists(self, name)
-    }
-
-    fn table_names(&self) -> Vec<String> {
-        llkv_table::catalog::TableCatalogSnapshot::table_names(self)
     }
 }
 
@@ -133,7 +105,7 @@ pub trait TransactionContext: CatalogDdl + Send + Sync {
     /// The pager type used by this context
     type Pager: Pager<Blob = EntryHandle> + Send + Sync + 'static;
     /// Snapshot representation returned by this context.
-    type Snapshot: CatalogSnapshot;
+    type Snapshot: TransactionCatalogSnapshot;
 
     /// Update the snapshot used for MVCC visibility decisions.
     fn set_snapshot(&self, snapshot: mvcc::TransactionSnapshot);
