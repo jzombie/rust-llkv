@@ -1,17 +1,18 @@
 //! Table creation operations for RuntimeContext.
 //!
 //! This module contains logic for creating new tables:
+//! - Public API methods (create_table, create_table_if_not_exists, create_table_builder)
 //! - CREATE TABLE from column specifications
 //! - CREATE TABLE AS SELECT (from batches)
 
-use crate::{RuntimeStatementResult, TXN_ID_NONE, canonical_table_name};
+use crate::{RuntimeCreateTableBuilder, RuntimeStatementResult, RuntimeTableHandle, TXN_ID_NONE, canonical_table_name};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use llkv_executor::{current_time_micros, ExecutorColumn, ExecutorSchema, ExecutorTable};
-use llkv_plan::{ForeignKeySpec, MultiColumnUniqueSpec, PlanColumnSpec};
+use llkv_plan::{CreateTablePlan, ForeignKeySpec, IntoPlanColumnSpec, MultiColumnUniqueSpec, PlanColumnSpec};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
-use llkv_table::{CreateTableResult, FieldId, ForeignKeyColumn, ForeignKeyTableInfo, Table};
+use llkv_table::{CatalogDdl, CreateTableResult, FieldId, ForeignKeyColumn, ForeignKeyTableInfo, Table};
 use llkv_transaction::TransactionMvccBuilder;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -368,5 +369,80 @@ where
         Ok(RuntimeStatementResult::CreateTable {
             table_name: display_name,
         })
+    }
+
+    /// Create a new table with the given columns.
+    ///
+    /// Public API method for table creation.
+    pub fn create_table<C, I>(
+        self: &Arc<Self>,
+        name: &str,
+        columns: I,
+    ) -> Result<RuntimeTableHandle<P>>
+    where
+        C: IntoPlanColumnSpec,
+        I: IntoIterator<Item = C>,
+    {
+        self.create_table_with_options(name, columns, false)
+    }
+
+    /// Create a new table if it doesn't already exist.
+    ///
+    /// Public API method for conditional table creation.
+    pub fn create_table_if_not_exists<C, I>(
+        self: &Arc<Self>,
+        name: &str,
+        columns: I,
+    ) -> Result<RuntimeTableHandle<P>>
+    where
+        C: IntoPlanColumnSpec,
+        I: IntoIterator<Item = C>,
+    {
+        self.create_table_with_options(name, columns, true)
+    }
+
+    /// Creates a fluent builder for defining and creating a new table with columns and constraints.
+    ///
+    /// Public API method for advanced table creation with constraints.
+    pub fn create_table_builder(&self, name: &str) -> RuntimeCreateTableBuilder<'_, P> {
+        RuntimeCreateTableBuilder::new(self, name)
+    }
+
+    /// Internal helper for create_table and create_table_if_not_exists.
+    fn create_table_with_options<C, I>(
+        self: &Arc<Self>,
+        name: &str,
+        columns: I,
+        if_not_exists: bool,
+    ) -> Result<RuntimeTableHandle<P>>
+    where
+        C: IntoPlanColumnSpec,
+        I: IntoIterator<Item = C>,
+    {
+        let mut plan = CreateTablePlan::new(name);
+        plan.if_not_exists = if_not_exists;
+        plan.columns = columns
+            .into_iter()
+            .map(|column| column.into_plan_column_spec())
+            .collect();
+        let result = CatalogDdl::create_table(self.as_ref(), plan)?;
+        match result {
+            RuntimeStatementResult::CreateTable { .. } => {
+                RuntimeTableHandle::new(Arc::clone(self), name)
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "unexpected statement result {other:?} when creating table"
+            ))),
+        }
+    }
+
+    /// Execute a CREATE TABLE plan - internal storage API.
+    ///
+    /// Use RuntimeSession::execute_statement() instead for external use.
+    pub(crate) fn execute_create_table(
+        &self,
+        plan: CreateTablePlan,
+    ) -> Result<RuntimeStatementResult<P>> {
+        CatalogDdl::create_table(self, plan)
     }
 }

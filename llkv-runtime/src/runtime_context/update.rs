@@ -6,12 +6,12 @@
 //! - Constraint validation for updates
 //! - Foreign key validation for updates
 
-use crate::RuntimeStatementResult;
+use crate::{RuntimeStatementResult, canonical_table_name};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_executor::{resolve_insert_columns, translation, ExecutorColumn, ExecutorTable};
 use llkv_expr::{Expr as LlkvExpr, ScalarExpr};
-use llkv_plan::{AssignmentValue, ColumnAssignment, PlanValue};
+use llkv_plan::{AssignmentValue, ColumnAssignment, PlanValue, UpdatePlan};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::{FieldId, RowId, build_composite_unique_key, UniqueKey};
@@ -31,6 +31,39 @@ impl<P> RuntimeContext<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    /// Update operation - internal storage API. Use `RuntimeSession::execute_update_plan()` instead.
+    pub(crate) fn update(
+        &self,
+        plan: UpdatePlan,
+        snapshot: TransactionSnapshot,
+    ) -> Result<RuntimeStatementResult<P>> {
+        let UpdatePlan {
+            table,
+            assignments,
+            filter,
+        } = plan;
+        let (display_name, canonical_name) = canonical_table_name(&table)?;
+        let table = self.lookup_table(&canonical_name)?;
+        if let Some(filter) = filter {
+            self.update_filtered_rows(
+                table.as_ref(),
+                display_name,
+                canonical_name,
+                assignments,
+                filter,
+                snapshot,
+            )
+        } else {
+            self.update_all_rows(
+                table.as_ref(),
+                display_name,
+                canonical_name,
+                assignments,
+                snapshot,
+            )
+        }
+    }
+
     /// Update rows in a table that match a filter expression.
     pub(super) fn update_filtered_rows(
         &self,

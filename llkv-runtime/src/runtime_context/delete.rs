@@ -5,15 +5,16 @@
 //! - Foreign key validation for deletes
 //! - MVCC-based soft deletion
 
-use crate::RuntimeStatementResult;
+use crate::{RuntimeStatementResult, canonical_table_name};
 use llkv_executor::{translation, ExecutorTable};
 use llkv_expr::Expr as LlkvExpr;
+use llkv_plan::DeletePlan;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::RowId;
 use llkv_transaction::{mvcc, TransactionSnapshot};
 use simd_r_drive_entry_handle::EntryHandle;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 
 use super::RuntimeContext;
 
@@ -21,6 +22,32 @@ impl<P> RuntimeContext<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    /// Delete rows according to a parsed DeletePlan.
+    pub(crate) fn delete(
+        &self,
+        plan: DeletePlan,
+        snapshot: TransactionSnapshot,
+    ) -> Result<RuntimeStatementResult<P>> {
+        let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
+        let table = match self.tables.read().unwrap().get(&canonical_name) {
+            Some(table) => Arc::clone(table),
+            None => {
+                return Err(Error::NotFound);
+            }
+        };
+
+        match plan.filter {
+            Some(filter) => self.delete_filtered_rows(
+                table.as_ref(),
+                display_name,
+                canonical_name.clone(),
+                filter,
+                snapshot,
+            ),
+            None => self.delete_all_rows(table.as_ref(), display_name, canonical_name, snapshot),
+        }
+    }
+
     /// Delete rows from a table that match a filter expression.
     pub(super) fn delete_filtered_rows(
         &self,

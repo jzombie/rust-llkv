@@ -5,12 +5,12 @@
 //! - Batch insertion
 //! - Foreign key validation for inserts
 
-use crate::{RuntimeStatementResult, TXN_ID_NONE};
+use crate::{RuntimeStatementResult, TXN_ID_NONE, canonical_table_name};
 use arrow::array::ArrayRef;
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_executor::{build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns, ExecutorTable};
-use llkv_plan::PlanValue;
+use llkv_plan::{InsertPlan, InsertSource, PlanValue};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_transaction::{mvcc, TransactionSnapshot};
@@ -24,6 +24,80 @@ impl<P> RuntimeContext<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    /// Insert operation - internal storage API. Use `RuntimeSession::execute_insert_plan()` instead.
+    pub(crate) fn insert(
+        &self,
+        plan: InsertPlan,
+        snapshot: TransactionSnapshot,
+    ) -> Result<RuntimeStatementResult<P>> {
+        let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
+        let table = self.lookup_table(&canonical_name)?;
+
+        // Targeted debug for 'keys' table only
+        if display_name == "keys" {
+            tracing::trace!(
+                "\n[KEYS] INSERT starting - table_id={}, context_pager={:p}",
+                table.table.table_id(),
+                &*self.pager
+            );
+            tracing::trace!(
+                "[KEYS] Table has {} columns, primary_key columns: {:?}",
+                table.schema.columns.len(),
+                table
+                    .schema
+                    .columns
+                    .iter()
+                    .filter(|c| c.primary_key)
+                    .map(|c| &c.name)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let result = match plan.source {
+            InsertSource::Rows(rows) => self.insert_rows(
+                table.as_ref(),
+                display_name.clone(),
+                canonical_name.clone(),
+                rows,
+                plan.columns,
+                snapshot,
+            ),
+            InsertSource::Batches(batches) => self.insert_batches(
+                table.as_ref(),
+                display_name.clone(),
+                canonical_name.clone(),
+                batches,
+                plan.columns,
+                snapshot,
+            ),
+            InsertSource::Select { .. } => Err(Error::Internal(
+                "InsertSource::Select should be materialized before reaching RuntimeContext::insert"
+                    .into(),
+            )),
+        };
+
+        if display_name == "keys" {
+            tracing::trace!(
+                "[KEYS] INSERT completed: {:?}",
+                result
+                    .as_ref()
+                    .map(|_| "OK")
+                    .map_err(|e| format!("{:?}", e))
+            );
+        }
+
+        if matches!(result, Err(Error::NotFound)) {
+            panic!(
+                "BUG: insert yielded Error::NotFound for table '{}'. \
+                 This should never happen: insert should never return NotFound after successful table lookup. \
+                 This indicates a logic error in the runtime.",
+                display_name
+            );
+        }
+
+        result
+    }
+
     /// Insert rows into a table with full constraint and foreign key validation.
     pub(super) fn insert_rows(
         &self,
