@@ -9,6 +9,7 @@ pub(crate) enum PreparedAssignmentValue {
     Expression { expr_index: usize },
 }
 
+// TODO: Move to llkv-table?
 #[derive(Debug, Clone)]
 pub(crate) struct TableConstraintContext {
     pub(crate) schema_field_ids: Vec<FieldId>,
