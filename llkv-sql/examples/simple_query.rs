@@ -11,7 +11,13 @@ fn main() {
         CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
         INSERT INTO users (id, name) VALUES (1, 'Ada');
         INSERT INTO users (id, name) VALUES (2, 'Sam');
-        INSERT INTO users (id, name) VALUES (3, 'Bob');
+        
+        -- Comments begin with `--` and are ignored by the SQL engine.
+        -- BEGIN TRANSACTION;
+        -- INSERT INTO users (id, name) VALUES (3, 'Bob');
+        -- ROLLBACK;
+        -- INSERT INTO users (id, name) VALUES (3, 'Bob');
+        -- COMMIT;
     "#;
 
     // Execute setup statements
