@@ -51,6 +51,7 @@ where
     }
 }
 
+// TODO: Move to `resolvers.rs`
 fn resolve_field_id<F>(
     schema: &ExecutorSchema,
     name: &str,
@@ -65,6 +66,7 @@ where
         .ok_or_else(|| unknown_column(name))
 }
 
+// TODO: Move to `resolvers.rs`
 pub fn resolve_field_id_from_schema(schema: &ExecutorSchema, name: &str) -> LlkvResult<FieldId> {
     if name.eq_ignore_ascii_case(ROW_ID_COLUMN_NAME) {
         return Ok(ROW_ID_FIELD_ID);
