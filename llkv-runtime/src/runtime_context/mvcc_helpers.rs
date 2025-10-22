@@ -218,6 +218,7 @@ where
     }
 }
 
+// TODO: Move to `llkv-executor` crate?
 pub(crate) fn current_time_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
