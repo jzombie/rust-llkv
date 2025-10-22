@@ -63,7 +63,8 @@ pub use llkv_plan::{
     CreateTablePlan, CreateTableSource, DeletePlan, DropIndexPlan, DropTablePlan, ForeignKeyAction,
     ForeignKeySpec, IndexColumnPlan, InsertPlan, InsertSource, IntoPlanColumnSpec,
     MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec, PlanOperation,
-    PlanStatement, PlanValue, RenameTablePlan, SelectPlan, SelectProjection, TruncatePlan, UpdatePlan,
+    PlanStatement, PlanValue, RenameTablePlan, SelectPlan, SelectProjection, TruncatePlan,
+    UpdatePlan,
 };
 use llkv_result::{Error, Result};
 use llkv_table::{CatalogDdl, canonical_table_name};

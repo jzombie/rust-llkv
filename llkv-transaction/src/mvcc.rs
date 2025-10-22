@@ -329,7 +329,11 @@ impl RowVersion {
     ///
     /// This implements the SQL standard behavior where FK constraints are checked
     /// against the committed state plus uncommitted inserts, but ignoring uncommitted deletes.
-    pub fn is_visible_for_fk_check(&self, manager: &TxnIdManager, snapshot: TransactionSnapshot) -> bool {
+    pub fn is_visible_for_fk_check(
+        &self,
+        manager: &TxnIdManager,
+        snapshot: TransactionSnapshot,
+    ) -> bool {
         tracing::trace!(
             "[MVCC-FK] is_visible_for_fk_check: created_by={}, deleted_by={}, snapshot.txn_id={}, snapshot.snapshot_id={}",
             self.created_by,

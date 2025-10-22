@@ -20,7 +20,8 @@ use llkv_runtime::{
     CreateTableSource, DeletePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan,
     InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec,
     PlanStatement, PlanValue, RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession,
-    RuntimeStatementResult, SelectPlan, SelectProjection, TruncatePlan, UpdatePlan, extract_rows_from_range,
+    RuntimeStatementResult, SelectPlan, SelectProjection, TruncatePlan, UpdatePlan,
+    extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
 use llkv_table::CatalogDdl;
@@ -505,7 +506,14 @@ where
                 ref on_cluster,
             } => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: Truncate");
-                self.handle_truncate(table_names, partitions, table, identity, cascade, on_cluster)
+                self.handle_truncate(
+                    table_names,
+                    partitions,
+                    table,
+                    identity,
+                    cascade,
+                    on_cluster,
+                )
             }
             Statement::Drop {
                 object_type,
@@ -2443,7 +2451,7 @@ where
         &self,
         table_names: &[sqlparser::ast::TruncateTableTarget],
         partitions: &Option<Vec<SqlExpr>>,
-        _table: bool,  // boolean field in sqlparser, not the table name
+        _table: bool, // boolean field in sqlparser, not the table name
         identity: &Option<sqlparser::ast::TruncateIdentityOption>,
         cascade: Option<sqlparser::ast::CascadeOption>,
         on_cluster: &Option<Ident>,
@@ -2482,7 +2490,7 @@ where
             let table_obj = &target.name;
             let display_name = table_obj.to_string();
             let canonical_name = display_name.to_ascii_lowercase();
-            
+
             // Check if table is dropped in transaction
             if !self.engine.session().has_active_transaction()
                 && self
@@ -2494,7 +2502,7 @@ where
                     DROPPED_TABLE_TRANSACTION_ERR.into(),
                 ));
             }
-            
+
             display_name
         } else {
             return Err(Error::InvalidArgumentError(

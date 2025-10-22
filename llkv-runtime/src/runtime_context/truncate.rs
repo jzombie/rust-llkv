@@ -48,10 +48,10 @@ where
         // TRUNCATE is not allowed on tables with incoming FK references unless CASCADE is specified
         let table_id = table.table.table_id();
         let referencing_fks = self.constraint_service.referencing_foreign_keys(table_id)?;
-        
+
         if !referencing_fks.is_empty() {
             return Err(Error::ConstraintError(
-                "Violates foreign key constraint".to_string()
+                "Violates foreign key constraint".to_string(),
             ));
         }
 
@@ -70,7 +70,7 @@ where
         let filter_expr = translation::expression::full_table_scan_filter(anchor_field);
         let row_ids = table.table.filter_row_ids(&filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
-        
+
         // TRUNCATE always enforces foreign key checks (cannot truncate if other tables reference this one)
         self.apply_delete(table, display_name, canonical_name, row_ids, snapshot, true)
     }

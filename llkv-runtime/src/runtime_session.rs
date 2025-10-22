@@ -17,12 +17,12 @@ use crate::{
     SelectExecution, SelectPlan, SelectProjection, TransactionContext, TransactionKind,
     TransactionResult, TransactionSession, UpdatePlan,
 };
-use llkv_plan::TruncatePlan;
 use crate::{
     PERSISTENT_NAMESPACE_ID, PersistentRuntimeNamespace, RuntimeNamespaceId,
     RuntimeStorageNamespace, RuntimeStorageNamespaceRegistry, TEMPORARY_NAMESPACE_ID,
     TemporaryRuntimeNamespace,
 };
+use llkv_plan::TruncatePlan;
 
 pub(crate) struct SessionNamespaces<P>
 where
