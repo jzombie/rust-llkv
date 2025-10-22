@@ -487,6 +487,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_float_value() {
         let value = value_with_span(Value::Number("3.14".to_string(), false));
         assert_eq!(

@@ -380,7 +380,7 @@ where
                             let referenced_table = fk.referenced_table.to_ascii_lowercase();
                             self.transactional_foreign_keys
                                 .entry(referenced_table)
-                                .or_insert_with(Vec::new)
+                                .or_default()
                                 .push(plan.name.to_ascii_lowercase());
                         }
 
@@ -402,7 +402,7 @@ where
                 self.locked_table_names.insert(canonical_name.clone());
 
                 // Check if the table was created in this transaction
-                let result = if self.new_tables.contains(&canonical_name) {
+                if self.new_tables.contains(&canonical_name) {
                     // Table was created in this transaction, so drop it from staging
                     // and remove from tracking
                     TransactionContext::drop_table(self.staging.as_ref(), plan.clone())?;
@@ -445,8 +445,7 @@ where
                         self.operations.push(PlanOperation::DropTable(plan.clone()));
                     }
                     TransactionResult::NoOp
-                };
-                result
+                }
             }
             PlanOperation::Insert(ref plan) => {
                 tracing::trace!(
@@ -1058,13 +1057,13 @@ where
 
             // Check if another session has this table locked in their transaction
             for (other_session_id, other_tx) in guard.iter() {
-                if *other_session_id != self.session_id {
-                    if other_tx.locked_table_names.contains(&canonical_name) {
-                        return Err(Error::TransactionContextError(format!(
-                            "table '{}' is locked by another active transaction",
-                            plan.name
-                        )));
-                    }
+                if *other_session_id != self.session_id
+                    && other_tx.locked_table_names.contains(&canonical_name)
+                {
+                    return Err(Error::TransactionContextError(format!(
+                        "table '{}' is locked by another active transaction",
+                        plan.name
+                    )));
                 }
             }
             drop(guard); // Release lock before continuing
@@ -1081,13 +1080,13 @@ where
 
             // Check if another session has this table locked in their transaction
             for (other_session_id, other_tx) in guard.iter() {
-                if *other_session_id != self.session_id {
-                    if other_tx.locked_table_names.contains(&canonical_name) {
-                        return Err(Error::TransactionContextError(format!(
-                            "table '{}' is locked by another active transaction",
-                            plan.name
-                        )));
-                    }
+                if *other_session_id != self.session_id
+                    && other_tx.locked_table_names.contains(&canonical_name)
+                {
+                    return Err(Error::TransactionContextError(format!(
+                        "table '{}' is locked by another active transaction",
+                        plan.name
+                    )));
                 }
             }
             drop(guard); // Release lock before continuing

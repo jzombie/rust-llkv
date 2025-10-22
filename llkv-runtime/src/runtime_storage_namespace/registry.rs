@@ -87,9 +87,7 @@ impl RuntimeStorageNamespaceRegistry {
         } else if !self.priority.iter().any(|existing| existing == &id) {
             self.priority.push(id.clone());
         }
-        self.namespace_tables
-            .entry(id.clone())
-            .or_insert_with(FxHashSet::default);
+        self.namespace_tables.entry(id.clone()).or_default();
         self.namespaces.insert(id, entry);
     }
 
@@ -107,7 +105,7 @@ impl RuntimeStorageNamespaceRegistry {
             .insert(canonical.clone(), namespace_id.clone());
         self.namespace_tables
             .entry(namespace_id)
-            .or_insert_with(FxHashSet::default)
+            .or_default()
             .insert(canonical);
     }
 
@@ -123,10 +121,7 @@ impl RuntimeStorageNamespaceRegistry {
     }
 
     pub fn drain_namespace_tables(&mut self, namespace: &RuntimeNamespaceId) -> Vec<String> {
-        let tables = self
-            .namespace_tables
-            .entry(namespace.clone())
-            .or_insert_with(FxHashSet::default);
+        let tables = self.namespace_tables.entry(namespace.clone()).or_default();
         let drained: Vec<String> = tables.drain().collect();
         for canonical in &drained {
             self.table_map.remove(canonical);

@@ -488,13 +488,12 @@ where
         // Find the column by old name
         let mut found_col: Option<(u32, ColMeta)> = None;
         for (idx, meta_opt) in column_metas.iter().enumerate() {
-            if let Some(meta) = meta_opt {
-                if let Some(name) = &meta.name {
-                    if name.eq_ignore_ascii_case(old_column_name) {
-                        found_col = Some((field_ids[idx], meta.clone()));
-                        break;
-                    }
-                }
+            if let Some(meta) = meta_opt
+                && let Some(name) = &meta.name
+                && name.eq_ignore_ascii_case(old_column_name)
+            {
+                found_col = Some((field_ids[idx], meta.clone()));
+                break;
             }
         }
 
@@ -545,13 +544,12 @@ where
         // Find the column by name
         let mut found_col: Option<(usize, u32, ColMeta)> = None;
         for (idx, meta_opt) in column_metas.iter().enumerate() {
-            if let Some(meta) = meta_opt {
-                if let Some(name) = &meta.name {
-                    if name.eq_ignore_ascii_case(column_name) {
-                        found_col = Some((idx, field_ids[idx], meta.clone()));
-                        break;
-                    }
-                }
+            if let Some(meta) = meta_opt
+                && let Some(name) = &meta.name
+                && name.eq_ignore_ascii_case(column_name)
+            {
+                found_col = Some((idx, field_ids[idx], meta.clone()));
+                break;
             }
         }
 
@@ -582,13 +580,12 @@ where
         // Find the column by name
         let mut found_col_id: Option<u32> = None;
         for (idx, meta_opt) in column_metas.iter().enumerate() {
-            if let Some(meta) = meta_opt {
-                if let Some(name) = &meta.name {
-                    if name.eq_ignore_ascii_case(column_name) {
-                        found_col_id = Some(field_ids[idx]);
-                        break;
-                    }
-                }
+            if let Some(meta) = meta_opt
+                && let Some(name) = &meta.name
+                && name.eq_ignore_ascii_case(column_name)
+            {
+                found_col_id = Some(field_ids[idx]);
+                break;
             }
         }
 
@@ -713,10 +710,10 @@ where
                 self.metadata
                     .remove_single_column_index(table_id, &canonical_index)?;
 
-                if entry.unique {
-                    if let Some(resolver) = self.catalog.field_resolver(table_id) {
-                        resolver.set_field_unique(&entry.column_name, false)?;
-                    }
+                if entry.unique
+                    && let Some(resolver) = self.catalog.field_resolver(table_id)
+                {
+                    resolver.set_field_unique(&entry.column_name, false)?;
                 }
 
                 self.metadata.flush_table(table_id)?;

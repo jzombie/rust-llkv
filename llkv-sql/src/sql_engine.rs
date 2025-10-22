@@ -1419,6 +1419,7 @@ where
         Ok(RuntimeStatementResult::NoOp)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_create_view(
         &self,
         name: ObjectName,
@@ -1957,7 +1958,7 @@ where
         Ok(Some(RuntimeStatementResult::Select {
             table_name,
             schema: projected_schema,
-            execution,
+            execution: Box::new(execution),
         }))
     }
 
@@ -1972,18 +1973,18 @@ where
     ) -> SqlResult<RuntimeStatementResult<P>> {
         // Check if this is a SELECT from VALUES in a derived table
         // Pattern: SELECT * FROM (VALUES ...) alias(col1, col2, ...)
-        if let SetExpr::Select(select) = query.body.as_ref() {
-            if let Some((rows, column_names)) = extract_values_from_derived_table(&select.from)? {
-                // Convert VALUES rows to Arrow RecordBatches
-                return self.handle_create_table_from_values(
-                    display_name,
-                    rows,
-                    column_names,
-                    if_not_exists,
-                    or_replace,
-                    namespace,
-                );
-            }
+        if let SetExpr::Select(select) = query.body.as_ref()
+            && let Some((rows, column_names)) = extract_values_from_derived_table(&select.from)?
+        {
+            // Convert VALUES rows to Arrow RecordBatches
+            return self.handle_create_table_from_values(
+                display_name,
+                rows,
+                column_names,
+                if_not_exists,
+                or_replace,
+                namespace,
+            );
         }
 
         // Regular CTAS with SELECT from existing tables
@@ -4676,9 +4677,10 @@ fn parse_sql_data_type(type_str: &str, dialect: &GenericDialect) -> SqlResult<Sq
 
 /// Extract VALUES data from a derived table in FROM clause.
 /// Returns (rows, column_names) if the pattern matches: SELECT ... FROM (VALUES ...) alias(col1, col2, ...)
-fn extract_values_from_derived_table(
-    from: &[TableWithJoins],
-) -> SqlResult<Option<(Vec<Vec<PlanValue>>, Vec<String>)>> {
+type ExtractValuesResult = Option<(Vec<Vec<PlanValue>>, Vec<String>)>;
+
+#[allow(clippy::type_complexity)]
+fn extract_values_from_derived_table(from: &[TableWithJoins]) -> SqlResult<ExtractValuesResult> {
     if from.len() != 1 {
         return Ok(None);
     }

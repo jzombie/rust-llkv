@@ -265,15 +265,14 @@ where
     /// Create a view by storing its SQL definition in the catalog.
     /// The view will be registered as a table with a view_definition.
     pub fn create_view(&self, display_name: &str, view_definition: String) -> Result<TableId> {
-        Ok(self
-            .catalog_service
-            .create_view(display_name, view_definition)?)
+        self.catalog_service
+            .create_view(display_name, view_definition)
     }
 
     /// Check if a table is actually a view by looking at its metadata.
     /// Returns true if the table exists and has a view_definition.
     pub fn is_view(&self, table_id: TableId) -> Result<bool> {
-        Ok(self.catalog_service.is_view(table_id)?)
+        self.catalog_service.is_view(table_id)
     }
 
     /// Resolve a type name to its base DataType, recursively following aliases.
@@ -372,7 +371,6 @@ where
     /// # Returns
     /// Returns a [`RuntimeTableHandle`] that provides immediate access to the table.
     /// Use this for further programmatic operations on the table.
-
     /// Returns all table names currently registered in the catalog.
     pub fn table_names(self: &Arc<Self>) -> Vec<String> {
         // Use catalog for table names (single source of truth)

@@ -36,7 +36,7 @@ where
     Select {
         table_name: String,
         schema: Arc<Schema>,
-        execution: SelectExecution<P>,
+        execution: Box<SelectExecution<P>>,
     },
     Transaction {
         kind: TransactionKind,

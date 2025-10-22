@@ -187,7 +187,7 @@ where
             SelectExecution::from_batch(table_name.clone(), Arc::clone(&schema), combined);
 
         Ok(RuntimeStatementResult::Select {
-            execution,
+            execution: Box::new(execution),
             table_name,
             schema,
         })
@@ -474,24 +474,24 @@ where
     fn materialize_ctas_plan(&self, mut plan: CreateTablePlan) -> Result<CreateTablePlan> {
         // Only materialize if source is a SELECT query
         // If source is already Batches, leave it alone
-        if matches!(plan.source, Some(CreateTableSource::Select { .. })) {
-            if let Some(CreateTableSource::Select { plan: select_plan }) = plan.source.take() {
-                let select_result = self.execute_select_plan(*select_plan)?;
-                let (schema, batches) = match select_result {
-                    RuntimeStatementResult::Select {
-                        schema, execution, ..
-                    } => {
-                        let batches = execution.collect()?;
-                        (schema, batches)
-                    }
-                    _ => {
-                        return Err(Error::Internal(
-                            "expected SELECT result while executing CREATE TABLE AS SELECT".into(),
-                        ));
-                    }
-                };
-                plan.source = Some(CreateTableSource::Batches { schema, batches });
-            }
+        if matches!(plan.source, Some(CreateTableSource::Select { .. }))
+            && let Some(CreateTableSource::Select { plan: select_plan }) = plan.source.take()
+        {
+            let select_result = self.execute_select_plan(*select_plan)?;
+            let (schema, batches) = match select_result {
+                RuntimeStatementResult::Select {
+                    schema, execution, ..
+                } => {
+                    let batches = execution.collect()?;
+                    (schema, batches)
+                }
+                _ => {
+                    return Err(Error::Internal(
+                        "expected SELECT result while executing CREATE TABLE AS SELECT".into(),
+                    ));
+                }
+            };
+            plan.source = Some(CreateTableSource::Batches { schema, batches });
         }
         Ok(plan)
     }
@@ -668,7 +668,7 @@ where
                     );
 
                     Ok(RuntimeStatementResult::Select {
-                        execution,
+                        execution: Box::new(execution),
                         table_name,
                         schema,
                     })
@@ -687,7 +687,7 @@ where
             })?;
             let schema = execution.schema();
             Ok(RuntimeStatementResult::Select {
-                execution,
+                execution: Box::new(execution),
                 table_name,
                 schema,
             })
@@ -1135,17 +1135,15 @@ where
             }
         }
 
-        if !dropped {
-            if let Some(temp_namespace) = self.temporary_namespace() {
-                match temp_namespace.drop_index(plan.clone()) {
-                    Ok(Some(_)) => {
-                        dropped = true;
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        if !super::is_index_not_found_error(&err) {
-                            return Err(err);
-                        }
+        if !dropped && let Some(temp_namespace) = self.temporary_namespace() {
+            match temp_namespace.drop_index(plan.clone()) {
+                Ok(Some(_)) => {
+                    dropped = true;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    if !super::is_index_not_found_error(&err) {
+                        return Err(err);
                     }
                 }
             }
