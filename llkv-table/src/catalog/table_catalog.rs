@@ -193,6 +193,70 @@ impl TableCatalog {
         Ok(())
     }
 
+    /// Update the catalog entry for a table to use a new display/canonical name.
+    ///
+    /// This helper is scoped to crate consumers (CatalogManager) so higher layers have a single
+    /// rename entry point. Schema changes are not allowed; the table must remain in the same
+    /// schema.
+    pub(crate) fn rename_registered_table(
+        &self,
+        old_name: impl Into<QualifiedTableName>,
+        new_name: impl Into<QualifiedTableName>,
+    ) -> Result<()> {
+        let old_name: QualifiedTableName = old_name.into();
+        let new_name: QualifiedTableName = new_name.into();
+
+        let old_display = old_name.to_display_string();
+        let new_display = new_name.to_display_string();
+
+        // Prevent moving tables across schemas for now.
+        let old_schema = old_name.schema().map(str::to_ascii_lowercase);
+        let new_schema = new_name.schema().map(str::to_ascii_lowercase);
+        if old_schema != new_schema {
+            return Err(Error::InvalidArgumentError(
+                "ALTER TABLE RENAME cannot change table schema".into(),
+            ));
+        }
+
+        let old_key = old_name.canonical_key();
+        let new_key = new_name.canonical_key();
+
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| Error::Internal("Failed to acquire catalog write lock".into()))?;
+
+        let table_id = inner
+            .table_name_to_id
+            .get(&old_key)
+            .copied()
+            .ok_or_else(|| {
+                Error::CatalogError(format!("Table '{}' does not exist in catalog", old_display))
+            })?;
+
+        if old_key != new_key
+            && inner.table_name_to_id.contains_key(&new_key)
+            && !old_display.eq_ignore_ascii_case(&new_display)
+        {
+            return Err(Error::CatalogError(format!(
+                "Table '{}' already exists in catalog",
+                new_display
+            )));
+        }
+
+        if let Some(meta) = inner.table_id_to_meta.get_mut(&table_id) {
+            meta.display_name = new_name.clone();
+            meta.canonical_name = new_key.clone();
+        }
+
+        if old_key != new_key {
+            inner.table_name_to_id.remove(&old_key);
+            inner.table_name_to_id.insert(new_key, table_id);
+        }
+
+        Ok(())
+    }
+
     /// Unregister a table from the catalog.
     ///
     /// Removes the table and its associated field resolver from the catalog.

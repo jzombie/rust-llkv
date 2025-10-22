@@ -7,6 +7,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use super::types::ForeignKeyAction;
+use crate::sys_catalog::MultiColumnUniqueEntryMeta;
 use crate::types::{FieldId, TableId};
 
 /// Lightweight column descriptor used for constraint validation.
@@ -510,6 +511,7 @@ pub struct ForeignKeyTableInfo {
     pub canonical_name: String,
     pub table_id: TableId,
     pub columns: Vec<ForeignKeyColumn>,
+    pub multi_column_uniques: Vec<MultiColumnUniqueEntryMeta>,
 }
 
 /// Result of validating a foreign key specification.
@@ -638,16 +640,52 @@ where
                 ))
             })?;
 
-            if !column.primary_key && !column.unique {
-                return Err(Error::InvalidArgumentError(format!(
-                    "FOREIGN KEY references column '{}' in table '{}' that is not UNIQUE or PRIMARY KEY",
-                    column_name, referenced_table_info.display_name
-                )));
-            }
-
             referenced_field_ids.push(column.field_id);
             referenced_column_defs.push((*column).clone());
             referenced_column_names.push(column.name.clone());
+        }
+
+        // Validate that the referenced columns form a UNIQUE or PRIMARY KEY constraint
+        if referenced_columns.len() == 1 {
+            // Single column: check if it has UNIQUE or PRIMARY KEY constraint
+            let column = &referenced_column_defs[0];
+            if !column.primary_key && !column.unique {
+                return Err(Error::InvalidArgumentError(format!(
+                    "FOREIGN KEY references column '{}' in table '{}' that is not UNIQUE or PRIMARY KEY",
+                    column.name, referenced_table_info.display_name
+                )));
+            }
+        } else {
+            // Multiple columns: check if they form a multi-column PRIMARY KEY or UNIQUE constraint
+
+            // First check if all columns have primary_key = true (multi-column PRIMARY KEY)
+            let all_primary_key = referenced_column_defs.iter().all(|col| col.primary_key);
+
+            // Also check if they form a multi-column UNIQUE constraint
+            let has_multi_column_unique =
+                referenced_table_info
+                    .multi_column_uniques
+                    .iter()
+                    .any(|unique_entry| {
+                        // Check if this unique constraint matches our referenced columns
+                        if unique_entry.column_ids.len() != referenced_field_ids.len() {
+                            return false;
+                        }
+                        // Check if all field IDs match (order-independent)
+                        let unique_set: FxHashSet<_> =
+                            unique_entry.column_ids.iter().copied().collect();
+                        let referenced_set: FxHashSet<_> =
+                            referenced_field_ids.iter().copied().collect();
+                        unique_set == referenced_set
+                    });
+
+            if !all_primary_key && !has_multi_column_unique {
+                return Err(Error::InvalidArgumentError(format!(
+                    "FOREIGN KEY references columns ({}) in table '{}' that do not form a UNIQUE or PRIMARY KEY constraint",
+                    referenced_column_names.join(", "),
+                    referenced_table_info.display_name
+                )));
+            }
         }
 
         for (child_col, parent_col) in referencing_column_defs
@@ -837,4 +875,197 @@ pub fn validate_foreign_key_rows(
     }
 
     Ok(())
+}
+
+// ========================================
+// ALTER TABLE validation helpers
+// ========================================
+
+use crate::{CatalogManager, TableView};
+use llkv_plan::AlterTableOperation;
+use llkv_storage::pager::Pager;
+use simd_r_drive_entry_handle::EntryHandle;
+
+/// Check if a column is part of a PRIMARY KEY or UNIQUE constraint.
+pub fn column_in_primary_or_unique(view: &TableView, field_id: FieldId) -> bool {
+    view.constraint_records
+        .iter()
+        .filter(|record| record.is_active())
+        .any(|record| match &record.kind {
+            super::ConstraintKind::PrimaryKey(payload) => payload.field_ids.contains(&field_id),
+            super::ConstraintKind::Unique(payload) => payload.field_ids.contains(&field_id),
+            _ => false,
+        })
+}
+
+/// Check if a column is part of a multi-column unique constraint.
+pub fn column_in_multi_column_unique(view: &TableView, field_id: FieldId) -> bool {
+    view.multi_column_uniques
+        .iter()
+        .any(|entry| entry.column_ids.contains(&field_id))
+}
+
+/// Check if a column is involved in any foreign key constraints.
+///
+/// Returns the name of the constraint if found, or None if the column is not referenced.
+pub fn column_in_foreign_keys<PagerType>(
+    view: &TableView,
+    field_id: FieldId,
+    table_id: TableId,
+    catalog_service: &CatalogManager<PagerType>,
+) -> LlkvResult<Option<String>>
+where
+    PagerType: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    // Check if column is a referencing column in this table's foreign keys
+    if let Some(fk) = view
+        .foreign_keys
+        .iter()
+        .find(|fk| fk.referencing_field_ids.contains(&field_id))
+    {
+        return Ok(Some(
+            fk.constraint_name
+                .as_deref()
+                .unwrap_or("unnamed")
+                .to_string(),
+        ));
+    }
+
+    // Check if column is referenced by other tables' foreign keys
+    let mut visited: FxHashSet<TableId> = FxHashSet::default();
+    for (referencing_table_id, _) in catalog_service.foreign_keys_referencing(table_id)? {
+        if !visited.insert(referencing_table_id) {
+            continue;
+        }
+
+        for fk in catalog_service.foreign_key_views_for_table(referencing_table_id)? {
+            if fk.referenced_table_id == table_id && fk.referenced_field_ids.contains(&field_id) {
+                return Ok(Some(
+                    fk.constraint_name
+                        .as_deref()
+                        .unwrap_or("unnamed")
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Validate an ALTER TABLE operation against existing constraints.
+///
+/// This function checks whether the requested ALTER TABLE operation would violate
+/// any existing constraints on the table, including:
+/// - PRIMARY KEY constraints
+/// - UNIQUE constraints
+/// - FOREIGN KEY constraints
+///
+/// Returns an error if the operation would violate a constraint.
+pub fn validate_alter_table_operation<PagerType>(
+    operation: &AlterTableOperation,
+    view: &TableView,
+    table_id: TableId,
+    catalog_service: &CatalogManager<PagerType>,
+) -> LlkvResult<()>
+where
+    PagerType: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    let resolver = catalog_service
+        .field_resolver(table_id)
+        .ok_or_else(|| Error::Internal("missing field resolver for table".into()))?;
+
+    match operation {
+        AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => {
+            let field_id = resolver.field_id(old_column_name).ok_or_else(|| {
+                Error::CatalogError(format!(
+                    "Catalog Error: column '{}' does not exist",
+                    old_column_name
+                ))
+            })?;
+
+            if resolver.field_id(new_column_name).is_some() {
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: column '{}' already exists",
+                    new_column_name
+                )));
+            }
+
+            if let Some(constraint) =
+                column_in_foreign_keys(view, field_id, table_id, catalog_service)?
+            {
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
+                    old_column_name, constraint
+                )));
+            }
+
+            Ok(())
+        }
+        AlterTableOperation::SetColumnDataType { column_name, .. } => {
+            let field_id = resolver.field_id(column_name).ok_or_else(|| {
+                Error::CatalogError(format!(
+                    "Catalog Error: column '{}' does not exist",
+                    column_name
+                ))
+            })?;
+
+            if column_in_primary_or_unique(view, field_id)
+                || column_in_multi_column_unique(view, field_id)
+            {
+                return Err(Error::InvalidArgumentError(format!(
+                    "Binder Error: Cannot change the type of a column that has a UNIQUE or PRIMARY KEY constraint specified (column '{}')",
+                    column_name
+                )));
+            }
+
+            if let Some(constraint) =
+                column_in_foreign_keys(view, field_id, table_id, catalog_service)?
+            {
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
+                    column_name, constraint
+                )));
+            }
+
+            Ok(())
+        }
+        AlterTableOperation::DropColumn {
+            column_name,
+            if_exists,
+            ..
+        } => {
+            let field_id = match resolver.field_id(column_name) {
+                Some(id) => id,
+                None if *if_exists => return Ok(()),
+                None => {
+                    return Err(Error::CatalogError(format!(
+                        "Catalog Error: column '{}' does not exist",
+                        column_name
+                    )));
+                }
+            };
+
+            if column_in_primary_or_unique(view, field_id)
+                || column_in_multi_column_unique(view, field_id)
+            {
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: there is a UNIQUE constraint that depends on it (column '{}')",
+                    column_name
+                )));
+            }
+
+            if column_in_foreign_keys(view, field_id, table_id, catalog_service)?.is_some() {
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: there is a FOREIGN KEY constraint that depends on it (column '{}')",
+                    column_name
+                )));
+            }
+
+            Ok(())
+        }
+    }
 }

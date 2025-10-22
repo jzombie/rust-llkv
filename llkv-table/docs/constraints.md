@@ -48,7 +48,7 @@ catalog registration, and storage work:
   register LogicalFieldId descriptors, and hand back `CreateTableResult`.
 - `register_foreign_keys_for_new_table` – validates FK specs (via `ConstraintService`),
   persists them, and returns friendly view structs.
-- `table_column_specs` – rebuilds restart-stable `ColumnSpec` instances with PK/unique/check
+- `table_column_specs` – rebuilds restart-stable `PlanColumnSpec` instances with PK/unique/check
   flags resolved from metadata.
 - `table_view` – returns the full `TableView` snapshot.
 - `table_constraint_summary` – returns constraint-only metadata snapshots.
@@ -75,7 +75,7 @@ constraint-specific logic.
 - `table_column_specs`, `table_view`, and `foreign_key_views` forward to catalog service.
 - Lazy table loading (`lookup_table`) uses `table_constraint_summary` to rebuild executor
   schemas, ensuring constraint flags are derived from persisted records.
-- `RuntimeCreateTableBuilder` / `create_table_plan` route CREATE TABLE + FK registration
+- `RuntimeCreateTableBuilder` / `apply_create_table_plan` route CREATE TABLE + FK registration
   through catalog service, keeping metadata writes inside `llkv-table`.
 
 This split lets the runtime focus on execution and transaction orchestration.

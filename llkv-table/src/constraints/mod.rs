@@ -11,23 +11,21 @@ mod service;
 mod types;
 mod validation;
 
-// Re-export constraint types
 pub use types::{
     CheckConstraint, ConstraintExpressionRef, ConstraintId, ConstraintKind, ConstraintRecord,
     ConstraintState, ForeignKeyAction, ForeignKeyConstraint, PrimaryKeyConstraint,
     UniqueConstraint, decode_constraint_row_id, encode_constraint_row_id,
 };
 
-// Re-export ConstraintService and related types
 pub use service::{
     ConstraintService, ForeignKeyChildRowsFetch, ForeignKeyParentRowsFetch, ForeignKeyRowFetch,
     InsertColumnConstraint, InsertMultiColumnUnique, InsertUniqueColumn,
 };
 
-// Re-export validation functions and types
 pub use validation::{
     ConstraintColumnInfo, ForeignKeyColumn, ForeignKeyTableInfo, UniqueKey, ValidatedForeignKey,
-    build_composite_unique_key, ensure_multi_column_unique, ensure_primary_key,
-    ensure_single_column_unique, unique_key_component, validate_check_constraints,
-    validate_foreign_key_rows, validate_foreign_keys,
+    build_composite_unique_key, column_in_foreign_keys, column_in_multi_column_unique,
+    column_in_primary_or_unique, ensure_multi_column_unique, ensure_primary_key,
+    ensure_single_column_unique, unique_key_component, validate_alter_table_operation,
+    validate_check_constraints, validate_foreign_key_rows, validate_foreign_keys,
 };

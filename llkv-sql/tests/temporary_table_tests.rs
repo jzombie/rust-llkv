@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use llkv_plan::{InsertPlan, InsertSource, PlanValue};
-use llkv_runtime::{
-    RuntimeStatementResult, storage_namespace, storage_namespace::TemporaryNamespace,
-};
+use llkv_runtime::{RuntimeStatementResult, TEMPORARY_NAMESPACE_ID, TemporaryRuntimeNamespace};
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::BoxedPager;
 use llkv_storage::pager::MemPager;
@@ -40,10 +38,7 @@ fn temporary_tables_support_core_dml() {
         .read()
         .expect("namespace registry lock")
         .namespace_for_table("integers");
-    assert_eq!(
-        namespace_id,
-        llkv_runtime::storage_namespace::TEMPORARY_NAMESPACE_ID
-    );
+    assert_eq!(namespace_id, TEMPORARY_NAMESPACE_ID);
 
     let mut results = engine
         .execute("CREATE UNIQUE INDEX \"uidx\" ON \"integers\" (\"value\");")
@@ -126,7 +121,7 @@ fn temporary_tables_allow_inserts_after_unique_index() {
         .namespace_registry()
         .read()
         .expect("namespace registry lock")
-        .namespace::<TemporaryNamespace<BoxedPager>>(storage_namespace::TEMPORARY_NAMESPACE_ID)
+        .namespace::<TemporaryRuntimeNamespace<BoxedPager>>(TEMPORARY_NAMESPACE_ID)
         .expect("temporary namespace present");
 
     let temp_context = temp_namespace.context();
@@ -156,7 +151,7 @@ fn temporary_tables_allow_inserts_after_unique_index() {
 
     let result = engine
         .session()
-        .insert(insert_plan)
+        .execute_insert_plan(insert_plan)
         .expect("insert now succeeds after catalog synchronization fix");
 
     assert!(

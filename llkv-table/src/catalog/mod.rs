@@ -9,15 +9,15 @@
 mod manager;
 mod table_catalog;
 
-// Re-export TableCatalog and related types
 pub use table_catalog::{
     ColumnResolution, FieldConstraints, FieldDefinition, FieldInfo, FieldResolver,
     FieldResolverState, FieldState, IdentifierContext, IdentifierResolver, QualifiedTableName,
     QualifiedTableNameRef, TableCatalog, TableCatalogSnapshot, TableCatalogState, TableState,
 };
 
-// Re-export internal types needed by other modules
 pub(crate) use table_catalog::TableMetadataView;
 
-// Re-export CatalogManager (formerly CatalogService)
-pub use manager::{CatalogManager, CreateTableResult};
+pub use manager::{
+    CatalogManager, CreateTableResult, MvccColumnBuilder, SingleColumnIndexDescriptor,
+    SingleColumnIndexRegistration,
+};

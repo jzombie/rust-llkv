@@ -153,6 +153,53 @@ where
         self.dtype_cache.dtype_for_field(field_id)
     }
 
+    /// Updates the data type of an existing column.
+    ///
+    /// This updates the descriptor's data type fingerprint and cache. Note that this
+    /// does NOT migrate existing data - the caller must ensure data compatibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if the descriptor update fails.
+    pub fn update_data_type(
+        &self,
+        field_id: LogicalFieldId,
+        new_data_type: &DataType,
+    ) -> Result<()> {
+        // Get the descriptor physical key from catalog
+        let descriptor_pk = {
+            let catalog = self.catalog.read().unwrap();
+            *catalog.map.get(&field_id).ok_or_else(|| Error::NotFound)?
+        };
+
+        // Load the existing descriptor
+        let mut descriptor = match self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+        {
+            Some(GetResult::Raw { bytes, .. }) => ColumnDescriptor::from_le_bytes(bytes.as_ref()),
+            _ => return Err(Error::NotFound),
+        };
+
+        // Update the data type fingerprint
+        let new_fingerprint = DTypeCache::<P>::dtype_fingerprint(new_data_type);
+        if new_fingerprint != 0 {
+            DTypeCache::<P>::set_desc_dtype_fingerprint(&mut descriptor, new_fingerprint);
+        }
+
+        // Persist the updated descriptor
+        self.pager.batch_put(&[BatchPut::Raw {
+            key: descriptor_pk,
+            bytes: descriptor.to_le_bytes(),
+        }])?;
+
+        // Update the cache
+        self.dtype_cache.insert(field_id, new_data_type.clone());
+
+        Ok(())
+    }
+
     /// Ensures that catalog entries and descriptors exist for a logical column.
     ///
     /// Primarily used when creating empty tables so that subsequent

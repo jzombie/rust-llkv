@@ -3,11 +3,13 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use llkv_column_map::store::ColumnStore;
 use llkv_runtime::{
-    ColumnSpec, CreateTablePlan, ForeignKeyAction, ForeignKeySpec, RuntimeContext,
+    CreateTablePlan, ForeignKeyAction, ForeignKeySpec, PlanColumnSpec, RuntimeContext,
     RuntimeStatementResult,
 };
 use llkv_storage::pager::MemPager;
-use llkv_table::{ConstraintKind, MetadataManager, PrimaryKeyConstraint, Table, UniqueConstraint};
+use llkv_table::{
+    CatalogDdl, ConstraintKind, MetadataManager, PrimaryKeyConstraint, Table, UniqueConstraint,
+};
 
 #[test]
 fn primary_key_and_unique_constraints_reload_from_metadata() {
@@ -18,13 +20,19 @@ fn primary_key_and_unique_constraints_reload_from_metadata() {
 
         let result = context
             .create_table_builder("accounts")
-            .with_column_spec(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
-            .with_column_spec(ColumnSpec::new("email", DataType::Utf8, false).with_unique(true))
+            .with_column_spec(
+                PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true),
+            )
+            .with_column_spec(PlanColumnSpec::new("email", DataType::Utf8, false).with_unique(true))
             .finish()
             .expect("create table");
         assert!(matches!(result, RuntimeStatementResult::CreateTable { .. }));
 
-        let specs = context.table_column_specs("accounts").expect("table specs");
+        let (_, canonical_name) = llkv_table::canonical_table_name("accounts").unwrap();
+        let specs = context
+            .catalog()
+            .table_column_specs(&canonical_name)
+            .expect("table specs");
         assert_eq!(specs.len(), 2);
         let id_spec = specs.iter().find(|spec| spec.name == "id").unwrap();
         assert!(id_spec.primary_key);
@@ -43,7 +51,8 @@ fn primary_key_and_unique_constraints_reload_from_metadata() {
         "expected accounts table, got {:?}",
         names
     );
-    let specs_result = context.table_column_specs("accounts");
+    let (_, canonical_name) = llkv_table::canonical_table_name("accounts").unwrap();
+    let specs_result = context.catalog().table_column_specs(&canonical_name);
     assert_accounts_constraints(&pager);
     let specs = specs_result.unwrap_or_else(|err| panic!("table specs after restart: {:?}", err));
     assert_eq!(specs.len(), 2);
@@ -64,15 +73,17 @@ fn foreign_key_views_reload_from_metadata() {
 
         context
             .create_table_builder("parents")
-            .with_column_spec(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
+            .with_column_spec(
+                PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true),
+            )
             .finish()
             .expect("create parents table");
 
         let mut plan = CreateTablePlan::new("children");
         plan.columns
-            .push(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true));
+            .push(PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true));
         plan.columns
-            .push(ColumnSpec::new("parent_id", DataType::Int64, true));
+            .push(PlanColumnSpec::new("parent_id", DataType::Int64, true));
         plan.foreign_keys.push(ForeignKeySpec {
             name: Some("fk_children_parent".into()),
             columns: vec!["parent_id".into()],
@@ -82,8 +93,7 @@ fn foreign_key_views_reload_from_metadata() {
             on_update: ForeignKeyAction::Restrict,
         });
 
-        match context
-            .create_table_plan(plan)
+        match CatalogDdl::create_table(context.as_ref(), plan)
             .expect("create children table with foreign key")
         {
             RuntimeStatementResult::CreateTable { .. } => {}
@@ -92,8 +102,10 @@ fn foreign_key_views_reload_from_metadata() {
     }
 
     let context = Arc::new(RuntimeContext::new(Arc::clone(&pager)));
+    let (_, canonical_name) = llkv_table::canonical_table_name("children").unwrap();
     let views = context
-        .foreign_key_views("children")
+        .catalog()
+        .foreign_key_views(&canonical_name)
         .expect("load foreign key views");
 
     assert_eq!(views.len(), 1);

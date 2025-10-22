@@ -10,21 +10,20 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::ArrayRef;
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::IndexKind;
-use llkv_plan::{ColumnSpec, ForeignKeySpec};
+use llkv_plan::{DropIndexPlan, ForeignKeySpec, PlanColumnSpec};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::mvcc;
-
 use super::table_catalog::{FieldDefinition, TableCatalog};
-use crate::constraints::ConstraintKind;
-use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration};
+use crate::constraints::{ConstraintId, ConstraintKind};
+use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration, SingleColumnIndexEntry};
+use crate::sys_catalog::{ColMeta, SysCatalog};
 use crate::table::Table;
 use crate::types::{FieldId, RowId, TableColumn, TableId};
 use crate::{
@@ -44,6 +43,53 @@ where
     pub column_lookup: FxHashMap<String, usize>,
 }
 
+/// Result of attempting to register a single-column index definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SingleColumnIndexRegistration {
+    Created { index_name: String },
+    AlreadyExists { index_name: String },
+}
+
+/// Descriptor for a single-column index resolved from catalog metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingleColumnIndexDescriptor {
+    pub index_name: String,
+    pub table_id: TableId,
+    pub canonical_table_name: String,
+    pub display_table_name: String,
+    pub field_id: FieldId,
+    pub column_name: String,
+    pub was_unique: bool,
+}
+
+/// Trait for constructing MVCC columns and Arrow metadata during batch ingestion.
+///
+/// Implementations can delegate to `llkv_transaction::mvcc` or provide custom logic
+/// for synthetic data sources. This indirection avoids coupling the table crate to the
+/// transaction crate while still centralizing MVCC helpers.
+pub trait MvccColumnBuilder: Send + Sync {
+    /// Build MVCC columns (row_id, created_by, deleted_by) for INSERT/CTAS operations.
+    fn build_insert_columns(
+        &self,
+        row_count: usize,
+        start_row_id: RowId,
+        creator_txn_id: u64,
+        deleted_marker: u64,
+    ) -> (ArrayRef, ArrayRef, ArrayRef);
+
+    /// Return the Arrow field definitions for MVCC columns.
+    fn mvcc_fields(&self) -> Vec<Field>;
+
+    /// Construct a user column field with the required metadata assigned.
+    fn field_with_metadata(
+        &self,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        field_id: FieldId,
+    ) -> Field;
+}
+
 /// Service for creating tables.
 ///
 /// Coordinates metadata persistence (`MetadataManager`), catalog registration
@@ -56,6 +102,7 @@ where
     metadata: Arc<MetadataManager<P>>,
     catalog: Arc<TableCatalog>,
     store: Arc<ColumnStore<P>>,
+    type_registry: Arc<std::sync::RwLock<FxHashMap<String, sqlparser::ast::DataType>>>,
 }
 
 impl<P> CatalogManager<P>
@@ -72,8 +119,150 @@ where
             metadata,
             catalog,
             store,
+            type_registry: Arc::new(std::sync::RwLock::new(FxHashMap::default())),
         }
     }
+
+    // ============================================================================
+    // Type Registry Management
+    // ============================================================================
+
+    /// Load custom types from system catalog.
+    /// Should be called during initialization to restore persisted types.
+    pub fn load_types_from_catalog(&self) -> LlkvResult<()> {
+        use crate::sys_catalog::SysCatalog;
+
+        let sys_catalog = SysCatalog::new(&self.store);
+        match sys_catalog.all_custom_type_metas() {
+            Ok(type_metas) => {
+                tracing::debug!(
+                    "[CATALOG] Loaded {} custom type(s) from catalog",
+                    type_metas.len()
+                );
+
+                let mut registry = self.type_registry.write().unwrap();
+                for type_meta in type_metas {
+                    // Parse the base_type_sql back to a DataType
+                    if let Ok(parsed_type) = parse_data_type_from_sql(&type_meta.base_type_sql) {
+                        registry.insert(type_meta.name.to_lowercase(), parsed_type);
+                    } else {
+                        tracing::warn!(
+                            "[CATALOG] Failed to parse base type SQL for type '{}': {}",
+                            type_meta.name,
+                            type_meta.base_type_sql
+                        );
+                    }
+                }
+
+                tracing::debug!(
+                    "[CATALOG] Type registry initialized with {} type(s)",
+                    registry.len()
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[CATALOG] Failed to load custom types: {}, starting with empty type registry",
+                    e
+                );
+                Ok(()) // Non-fatal, start with empty registry
+            }
+        }
+    }
+
+    /// Register a custom type alias (CREATE TYPE/DOMAIN).
+    pub fn register_type(&self, name: String, data_type: sqlparser::ast::DataType) {
+        let mut registry = self.type_registry.write().unwrap();
+        registry.insert(name.to_lowercase(), data_type);
+    }
+
+    /// Drop a custom type alias (DROP TYPE/DOMAIN).
+    pub fn drop_type(&self, name: &str) -> LlkvResult<()> {
+        let mut registry = self.type_registry.write().unwrap();
+        if registry.remove(&name.to_lowercase()).is_none() {
+            return Err(Error::InvalidArgumentError(format!(
+                "Type '{}' does not exist",
+                name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolve a type name to its base DataType, recursively following aliases.
+    pub fn resolve_type(&self, data_type: &sqlparser::ast::DataType) -> sqlparser::ast::DataType {
+        use sqlparser::ast::DataType;
+
+        match data_type {
+            DataType::Custom(obj_name, _) => {
+                let name = obj_name.to_string().to_lowercase();
+                let registry = self.type_registry.read().unwrap();
+                if let Some(base_type) = registry.get(&name) {
+                    // Recursively resolve in case the base type is also an alias
+                    self.resolve_type(base_type)
+                } else {
+                    // Not a custom type, return as-is
+                    data_type.clone()
+                }
+            }
+            // For non-custom types, return as-is
+            _ => data_type.clone(),
+        }
+    }
+
+    // ============================================================================
+    // View Management
+    // ============================================================================
+
+    /// Create a view by storing its SQL definition in the catalog.
+    /// The view will be registered as a table with a view_definition.
+    pub fn create_view(
+        &self,
+        display_name: &str,
+        view_definition: String,
+    ) -> LlkvResult<crate::types::TableId> {
+        use crate::sys_catalog::TableMeta;
+
+        // Reserve a new table ID for the view
+        let table_id = self.metadata.reserve_table_id()?;
+
+        let created_at_micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+
+        // Create the table metadata with view_definition set
+        let table_meta = TableMeta {
+            table_id,
+            name: Some(display_name.to_string()),
+            created_at_micros,
+            flags: 0,
+            epoch: 0,
+            view_definition: Some(view_definition),
+        };
+
+        // Store the metadata and flush to disk
+        self.metadata.set_table_meta(table_id, table_meta)?;
+        self.metadata.flush_table(table_id)?;
+
+        // Register the view in the catalog so it can be looked up by name
+        self.catalog.register_table(display_name, table_id)?;
+
+        tracing::debug!("Created view '{}' with table_id={}", display_name, table_id);
+        Ok(table_id)
+    }
+
+    /// Check if a table is actually a view by looking at its metadata.
+    /// Returns true if the table exists and has a view_definition.
+    pub fn is_view(&self, table_id: crate::types::TableId) -> LlkvResult<bool> {
+        match self.metadata.table_meta(table_id)? {
+            Some(meta) => Ok(meta.view_definition.is_some()),
+            None => Ok(false),
+        }
+    }
+
+    // ============================================================================
+    // Table Creation
+    // ============================================================================
 
     /// Create a new table using column specifications.
     ///
@@ -83,7 +272,7 @@ where
         &self,
         display_name: &str,
         canonical_name: &str,
-        columns: &[ColumnSpec],
+        columns: &[PlanColumnSpec],
     ) -> LlkvResult<CreateTableResult<P>> {
         if columns.is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -186,6 +375,7 @@ where
             created_at_micros: timestamp,
             flags: 0,
             epoch: 0,
+            view_definition: None, // Regular table, not a view
         };
 
         self.metadata.set_table_meta(table_id, table_meta)?;
@@ -242,6 +432,174 @@ where
         Ok(())
     }
 
+    /// Rename a table across metadata and catalog layers.
+    pub fn rename_table(
+        &self,
+        table_id: TableId,
+        current_name: &str,
+        new_name: &str,
+    ) -> LlkvResult<()> {
+        if !current_name.eq_ignore_ascii_case(new_name) && self.catalog.table_id(new_name).is_some()
+        {
+            return Err(Error::CatalogError(format!(
+                "Table '{}' already exists",
+                new_name
+            )));
+        }
+
+        let previous_meta = self.metadata.table_meta(table_id)?;
+        let mut prior_snapshot = None;
+        if let Some(mut meta) = previous_meta.clone() {
+            prior_snapshot = Some(meta.clone());
+            meta.name = Some(new_name.to_string());
+            self.metadata.set_table_meta(table_id, meta)?;
+        }
+
+        if let Err(err) = self.catalog.rename_registered_table(current_name, new_name) {
+            if let Some(prior) = prior_snapshot {
+                let _ = self.metadata.set_table_meta(table_id, prior);
+            }
+            return Err(err);
+        }
+
+        if let Some(prior) = prior_snapshot.clone()
+            && let Err(err) = self.metadata.flush_table(table_id)
+        {
+            let _ = self.metadata.set_table_meta(table_id, prior);
+            let _ = self.catalog.rename_registered_table(new_name, current_name);
+            let _ = self.metadata.flush_table(table_id);
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    /// Rename a column in a table by updating its metadata.
+    pub fn rename_column(
+        &self,
+        table_id: TableId,
+        old_column_name: &str,
+        new_column_name: &str,
+    ) -> LlkvResult<()> {
+        // Get all column metas for this table
+        let (_, field_ids) = self.sorted_user_fields(table_id);
+        let column_metas = self.metadata.column_metas(table_id, &field_ids)?;
+
+        // Find the column by old name
+        let mut found_col: Option<(u32, ColMeta)> = None;
+        for (idx, meta_opt) in column_metas.iter().enumerate() {
+            if let Some(meta) = meta_opt
+                && let Some(name) = &meta.name
+                && name.eq_ignore_ascii_case(old_column_name)
+            {
+                found_col = Some((field_ids[idx], meta.clone()));
+                break;
+            }
+        }
+
+        let (_field_id, mut col_meta) = found_col.ok_or_else(|| {
+            Error::InvalidArgumentError(format!("column '{}' not found in table", old_column_name))
+        })?;
+
+        // Update the column name
+        col_meta.name = Some(new_column_name.to_string());
+
+        // Save to catalog
+        let catalog = SysCatalog::new(&self.store);
+        catalog.put_col_meta(table_id, &col_meta);
+
+        // Update metadata manager cache
+        self.metadata.set_column_meta(table_id, col_meta)?;
+
+        // Update field resolver mapping for this column name change.
+        if let Some(resolver) = self.catalog.field_resolver(table_id) {
+            resolver.rename_field(old_column_name, new_column_name)?;
+        }
+
+        self.metadata.flush_table(table_id)?;
+
+        Ok(())
+    }
+
+    /// Alter the data type of a column.
+    ///
+    /// This updates both the column metadata and the storage layer's data type fingerprint.
+    /// Note that actual data conversion is NOT performed - the caller must ensure that
+    /// existing data is compatible with the new type (or that no data exists).
+    ///
+    /// # Arguments
+    /// * `table_id` - The table containing the column
+    /// * `column_name` - Name of the column to alter
+    /// * `new_data_type` - Arrow DataType to set for this column
+    pub fn alter_column_type(
+        &self,
+        table_id: TableId,
+        column_name: &str,
+        new_data_type: &DataType,
+    ) -> LlkvResult<()> {
+        // Get all column metas for this table
+        let (logical_fields, field_ids) = self.sorted_user_fields(table_id);
+        let column_metas = self.metadata.column_metas(table_id, &field_ids)?;
+
+        // Find the column by name
+        let mut found_col: Option<(usize, u32, ColMeta)> = None;
+        for (idx, meta_opt) in column_metas.iter().enumerate() {
+            if let Some(meta) = meta_opt
+                && let Some(name) = &meta.name
+                && name.eq_ignore_ascii_case(column_name)
+            {
+                found_col = Some((idx, field_ids[idx], meta.clone()));
+                break;
+            }
+        }
+
+        let (col_idx, _field_id, col_meta) = found_col.ok_or_else(|| {
+            Error::InvalidArgumentError(format!("column '{}' not found in table", column_name))
+        })?;
+
+        // Update the data type in the storage layer
+        let lfid = logical_fields[col_idx];
+        self.store.update_data_type(lfid, new_data_type)?;
+
+        // Save metadata to catalog
+        let catalog = SysCatalog::new(&self.store);
+        catalog.put_col_meta(table_id, &col_meta);
+
+        // Update metadata manager cache
+        self.metadata.set_column_meta(table_id, col_meta)?;
+
+        Ok(())
+    }
+
+    /// Drop a column from a table by removing its metadata.
+    pub fn drop_column(&self, table_id: TableId, column_name: &str) -> LlkvResult<()> {
+        // Get all column metas for this table
+        let (_, field_ids) = self.sorted_user_fields(table_id);
+        let column_metas = self.metadata.column_metas(table_id, &field_ids)?;
+
+        // Find the column by name
+        let mut found_col_id: Option<u32> = None;
+        for (idx, meta_opt) in column_metas.iter().enumerate() {
+            if let Some(meta) = meta_opt
+                && let Some(name) = &meta.name
+                && name.eq_ignore_ascii_case(column_name)
+            {
+                found_col_id = Some(field_ids[idx]);
+                break;
+            }
+        }
+
+        let col_id = found_col_id.ok_or_else(|| {
+            Error::InvalidArgumentError(format!("column '{}' not found in table", column_name))
+        })?;
+
+        // Delete from catalog
+        let catalog = SysCatalog::new(&self.store);
+        catalog.delete_col_meta(table_id, &[col_id])?;
+
+        Ok(())
+    }
+
     /// Register a single-column sort (B-tree) index. Optionally marks the field unique.
     /// Returns `true` if the index was newly created, `false` if it already existed and `if_not_exists` was true.
     #[allow(clippy::too_many_arguments)]
@@ -252,21 +610,71 @@ where
         table: &Table<P>,
         field_id: FieldId,
         column_name: &str,
+        index_name: Option<String>,
         mark_unique: bool,
         if_not_exists: bool,
-    ) -> LlkvResult<bool> {
+    ) -> LlkvResult<SingleColumnIndexRegistration> {
+        let table_id = table.table_id();
         let existing_indexes = table.list_registered_indexes(field_id)?;
         if existing_indexes.contains(&IndexKind::Sort) {
+            let existing_name = self
+                .metadata
+                .single_column_indexes(table_id)?
+                .into_iter()
+                .find(|entry| entry.column_id == field_id)
+                .map(|entry| entry.index_name)
+                .unwrap_or_else(|| column_name.to_string());
+
             if if_not_exists {
-                return Ok(false);
+                return Ok(SingleColumnIndexRegistration::AlreadyExists {
+                    index_name: existing_name,
+                });
             }
+
             return Err(Error::CatalogError(format!(
                 "Index already exists on column '{}' in table '{}'",
                 column_name, display_name
             )));
         }
 
-        let table_id = table.table_id();
+        let index_display_name = match index_name {
+            Some(name) => name,
+            None => {
+                self.generate_single_column_index_name(table_id, canonical_name, column_name)?
+            }
+        };
+        if index_display_name.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "Index name must not be empty".into(),
+            ));
+        }
+        let canonical_index_name = index_display_name.to_ascii_lowercase();
+
+        if let Some(existing) = self
+            .metadata
+            .single_column_index(table_id, &canonical_index_name)?
+        {
+            if if_not_exists {
+                return Ok(SingleColumnIndexRegistration::AlreadyExists {
+                    index_name: existing.index_name,
+                });
+            }
+
+            return Err(Error::CatalogError(format!(
+                "Index '{}' already exists on table '{}'",
+                existing.index_name, display_name
+            )));
+        }
+
+        let entry = SingleColumnIndexEntry {
+            index_name: index_display_name.clone(),
+            canonical_name: canonical_index_name,
+            column_id: field_id,
+            column_name: column_name.to_string(),
+            unique: mark_unique,
+        };
+
+        self.metadata.put_single_column_index(table_id, entry)?;
         self.metadata.register_sort_index(table_id, field_id)?;
 
         if mark_unique {
@@ -277,7 +685,65 @@ where
         }
 
         self.metadata.flush_table(table_id)?;
-        Ok(true)
+
+        Ok(SingleColumnIndexRegistration::Created {
+            index_name: index_display_name,
+        })
+    }
+
+    pub fn drop_single_column_index(
+        &self,
+        plan: DropIndexPlan,
+    ) -> LlkvResult<Option<SingleColumnIndexDescriptor>> {
+        let canonical_index = plan.canonical_name.to_ascii_lowercase();
+        let snapshot = self.catalog.snapshot();
+
+        for canonical_table_name in snapshot.table_names() {
+            let Some(table_id) = snapshot.table_id(&canonical_table_name) else {
+                continue;
+            };
+
+            if let Some(entry) = self
+                .metadata
+                .single_column_index(table_id, &canonical_index)?
+            {
+                self.metadata
+                    .remove_single_column_index(table_id, &canonical_index)?;
+
+                if entry.unique
+                    && let Some(resolver) = self.catalog.field_resolver(table_id)
+                {
+                    resolver.set_field_unique(&entry.column_name, false)?;
+                }
+
+                self.metadata.flush_table(table_id)?;
+
+                let display_table_name = self
+                    .metadata
+                    .table_meta(table_id)?
+                    .and_then(|meta| meta.name)
+                    .unwrap_or_else(|| canonical_table_name.clone());
+
+                return Ok(Some(SingleColumnIndexDescriptor {
+                    index_name: entry.index_name,
+                    table_id,
+                    canonical_table_name,
+                    display_table_name,
+                    field_id: entry.column_id,
+                    column_name: entry.column_name,
+                    was_unique: entry.unique,
+                }));
+            }
+        }
+
+        if plan.if_exists {
+            Ok(None)
+        } else {
+            Err(Error::CatalogError(format!(
+                "Index '{}' does not exist",
+                plan.name
+            )))
+        }
     }
 
     /// Register a multi-column UNIQUE index.
@@ -298,7 +764,40 @@ where
         Ok(registration)
     }
 
+    fn generate_single_column_index_name(
+        &self,
+        table_id: TableId,
+        canonical_table_name: &str,
+        column_name: &str,
+    ) -> LlkvResult<String> {
+        let table_token = if canonical_table_name.is_empty() {
+            "table".to_string()
+        } else {
+            canonical_table_name.replace('.', "_")
+        };
+        let column_token = column_name.to_ascii_lowercase();
+
+        let mut candidate = format!("{}_{}_idx", table_token, column_token);
+        let mut suffix: u32 = 1;
+        loop {
+            let canonical = candidate.to_ascii_lowercase();
+            if self
+                .metadata
+                .single_column_index(table_id, &canonical)?
+                .is_none()
+            {
+                return Ok(candidate);
+            }
+
+            candidate = format!("{}_{}_idx{}", table_token, column_token, suffix);
+            suffix = suffix.checked_add(1).ok_or_else(|| {
+                Error::InvalidArgumentError("exhausted unique index name generation space".into())
+            })?;
+        }
+    }
+
     /// Append RecordBatches to a freshly created table, injecting MVCC columns.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_batches_with_mvcc(
         &self,
         table: &Table<P>,
@@ -307,6 +806,7 @@ where
         creator_txn_id: u64,
         deleted_marker: u64,
         starting_row_id: RowId,
+        mvcc_builder: &dyn MvccColumnBuilder,
     ) -> LlkvResult<(RowId, u64)> {
         let mut next_row_id = starting_row_id;
         let mut total_rows: u64 = 0;
@@ -326,24 +826,19 @@ where
 
             let row_count = batch.num_rows();
 
-            let (row_id_array, created_by_array, deleted_by_array) =
-                mvcc::build_insert_mvcc_columns(
-                    row_count,
-                    next_row_id,
-                    creator_txn_id,
-                    deleted_marker,
-                );
+            let (row_id_array, created_by_array, deleted_by_array) = mvcc_builder
+                .build_insert_columns(row_count, next_row_id, creator_txn_id, deleted_marker);
 
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(table_columns.len() + 3);
             arrays.push(row_id_array);
             arrays.push(created_by_array);
             arrays.push(deleted_by_array);
 
-            let mut fields = mvcc::build_mvcc_fields();
+            let mut fields = mvcc_builder.mvcc_fields();
 
             for (idx, column) in table_columns.iter().enumerate() {
                 let array = batch.column(idx).clone();
-                let field = mvcc::build_field_with_metadata(
+                let field = mvcc_builder.field_with_metadata(
                     &column.name,
                     column.data_type.clone(),
                     column.nullable,
@@ -395,11 +890,17 @@ where
             })
             .collect();
 
+        let multi_column_uniques = {
+            let catalog = SysCatalog::new(&self.store);
+            catalog.get_multi_column_uniques(table_id)?
+        };
+
         let referencing_table = ForeignKeyTableInfo {
             display_name: display_name.to_string(),
             canonical_name: canonical_name.to_string(),
             table_id,
             columns: referencing_columns,
+            multi_column_uniques,
         };
 
         self.metadata.validate_and_register_foreign_keys(
@@ -418,8 +919,8 @@ where
         let mut results = Vec::with_capacity(views.len());
         for view in views {
             let Some(table_id) = self.catalog.table_id(&view.referenced_table_canonical) else {
-                return Err(Error::InvalidArgumentError(format!(
-                    "referenced table '{}' does not exist",
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: referenced table '{}' does not exist",
                     view.referenced_table_display
                 )));
             };
@@ -452,11 +953,17 @@ where
                 });
             }
 
+            let multi_column_uniques = {
+                let catalog = SysCatalog::new(&self.store);
+                catalog.get_multi_column_uniques(table_id)?
+            };
+
             results.push(ForeignKeyTableInfo {
                 display_name: view.referenced_table_display.clone(),
                 canonical_name: view.referenced_table_canonical.clone(),
                 table_id,
                 columns,
+                multi_column_uniques,
             });
         }
 
@@ -474,7 +981,7 @@ where
     }
 
     /// Produce a read-only view of a table's catalog, including column metadata and constraints.
-    pub fn table_column_specs(&self, canonical_name: &str) -> LlkvResult<Vec<ColumnSpec>> {
+    pub fn table_column_specs(&self, canonical_name: &str) -> LlkvResult<Vec<PlanColumnSpec>> {
         let table_id = self.catalog.table_id(canonical_name).ok_or_else(|| {
             Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
         })?;
@@ -551,7 +1058,7 @@ where
             let data_type = self.store.data_type(*lfid)?;
             let nullable = !primary_key;
 
-            let mut spec = ColumnSpec::new(column_name.clone(), data_type, nullable)
+            let mut spec = PlanColumnSpec::new(column_name.clone(), data_type, nullable)
                 .with_primary_key(primary_key)
                 .with_unique(unique);
 
@@ -648,6 +1155,24 @@ where
     pub fn catalog(&self) -> &Arc<TableCatalog> {
         &self.catalog
     }
+
+    /// Returns all foreign keys that reference the specified table.
+    /// Returns a vector of (referencing_table_id, constraint_id) pairs.
+    pub fn foreign_keys_referencing(
+        &self,
+        referenced_table_id: TableId,
+    ) -> LlkvResult<Vec<(TableId, ConstraintId)>> {
+        self.metadata.foreign_keys_referencing(referenced_table_id)
+    }
+
+    /// Returns detailed foreign key views for a specific table.
+    /// This includes foreign keys where the specified table is the referencing table.
+    pub fn foreign_key_views_for_table(
+        &self,
+        table_id: TableId,
+    ) -> LlkvResult<Vec<ForeignKeyView>> {
+        self.metadata.foreign_key_views(&self.catalog, table_id)
+    }
 }
 
 fn field_id_for_index(idx: usize) -> LlkvResult<FieldId> {
@@ -659,10 +1184,38 @@ fn field_id_for_index(idx: usize) -> LlkvResult<FieldId> {
     })
 }
 
+// TODO: Dedupe (another instance exists in llkv-executor)
 #[allow(clippy::unnecessary_wraps)]
 fn current_time_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_micros() as u64)
         .unwrap_or(0)
+}
+
+/// Parse a SQL type string (e.g., "INTEGER") back into a DataType.
+fn parse_data_type_from_sql(sql: &str) -> LlkvResult<sqlparser::ast::DataType> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    // Try to parse as a simple CREATE DOMAIN statement
+    let create_sql = format!("CREATE DOMAIN dummy AS {}", sql);
+    let dialect = GenericDialect {};
+
+    match Parser::parse_sql(&dialect, &create_sql) {
+        Ok(stmts) if !stmts.is_empty() => {
+            if let sqlparser::ast::Statement::CreateDomain(create_domain) = &stmts[0] {
+                Ok(create_domain.data_type.clone())
+            } else {
+                Err(Error::InvalidArgumentError(format!(
+                    "Failed to parse type from SQL: {}",
+                    sql
+                )))
+            }
+        }
+        _ => Err(Error::InvalidArgumentError(format!(
+            "Failed to parse type from SQL: {}",
+            sql
+        ))),
+    }
 }

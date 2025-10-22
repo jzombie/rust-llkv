@@ -72,17 +72,27 @@ impl From<i32> for PlanValue {
 // CREATE TABLE Plan
 // ============================================================================
 
+/// Multi-column unique constraint specification.
+#[derive(Clone, Debug)]
+pub struct MultiColumnUniqueSpec {
+    /// Optional name for the unique constraint
+    pub name: Option<String>,
+    /// Column names participating in this UNIQUE constraint
+    pub columns: Vec<String>,
+}
+
 /// Plan for creating a table.
 #[derive(Clone, Debug)]
 pub struct CreateTablePlan {
     pub name: String,
     pub if_not_exists: bool,
     pub or_replace: bool,
-    pub columns: Vec<ColumnSpec>,
+    pub columns: Vec<PlanColumnSpec>,
     pub source: Option<CreateTableSource>,
     /// Optional storage namespace for the table.
     pub namespace: Option<String>,
     pub foreign_keys: Vec<ForeignKeySpec>,
+    pub multi_column_uniques: Vec<MultiColumnUniqueSpec>,
 }
 
 impl CreateTablePlan {
@@ -95,7 +105,137 @@ impl CreateTablePlan {
             source: None,
             namespace: None,
             foreign_keys: Vec::new(),
+            multi_column_uniques: Vec::new(),
         }
+    }
+}
+
+// ============================================================================
+// DROP TABLE Plan
+// ============================================================================
+
+/// Plan for dropping a table.
+#[derive(Clone, Debug)]
+pub struct DropTablePlan {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+impl DropTablePlan {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            if_exists: false,
+        }
+    }
+
+    pub fn if_exists(mut self, if_exists: bool) -> Self {
+        self.if_exists = if_exists;
+        self
+    }
+}
+
+// ============================================================================
+// RENAME TABLE Plan
+// ============================================================================
+
+/// Plan for renaming a table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenameTablePlan {
+    pub current_name: String,
+    pub new_name: String,
+    pub if_exists: bool,
+}
+
+impl RenameTablePlan {
+    pub fn new(current_name: impl Into<String>, new_name: impl Into<String>) -> Self {
+        Self {
+            current_name: current_name.into(),
+            new_name: new_name.into(),
+            if_exists: false,
+        }
+    }
+
+    pub fn if_exists(mut self, if_exists: bool) -> Self {
+        self.if_exists = if_exists;
+        self
+    }
+}
+
+/// Plan for dropping an index.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropIndexPlan {
+    pub name: String,
+    pub canonical_name: String,
+    pub if_exists: bool,
+}
+
+impl DropIndexPlan {
+    pub fn new(name: impl Into<String>) -> Self {
+        let display = name.into();
+        Self {
+            canonical_name: display.to_ascii_lowercase(),
+            name: display,
+            if_exists: false,
+        }
+    }
+
+    pub fn with_canonical(mut self, canonical: impl Into<String>) -> Self {
+        self.canonical_name = canonical.into();
+        self
+    }
+
+    pub fn if_exists(mut self, if_exists: bool) -> Self {
+        self.if_exists = if_exists;
+        self
+    }
+}
+
+// ============================================================================
+// ALTER TABLE Plan Structures
+// ============================================================================
+
+/// Plan for ALTER TABLE operations.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlterTablePlan {
+    pub table_name: String,
+    pub if_exists: bool,
+    pub operation: AlterTableOperation,
+}
+
+/// Specific ALTER TABLE operation to perform.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterTableOperation {
+    /// RENAME COLUMN old_name TO new_name
+    RenameColumn {
+        old_column_name: String,
+        new_column_name: String,
+    },
+    /// ALTER COLUMN column_name SET DATA TYPE new_type
+    SetColumnDataType {
+        column_name: String,
+        new_data_type: String, // SQL type string like "INTEGER", "VARCHAR", etc.
+    },
+    /// DROP COLUMN column_name
+    DropColumn {
+        column_name: String,
+        if_exists: bool,
+        cascade: bool,
+    },
+}
+
+impl AlterTablePlan {
+    pub fn new(table_name: impl Into<String>, operation: AlterTableOperation) -> Self {
+        Self {
+            table_name: table_name.into(),
+            if_exists: false,
+            operation,
+        }
+    }
+
+    pub fn if_exists(mut self, if_exists: bool) -> Self {
+        self.if_exists = if_exists;
+        self
     }
 }
 
@@ -195,9 +335,12 @@ impl CreateIndexPlan {
     }
 }
 
-/// Column specification for CREATE TABLE.
+/// Column specification produced by the logical planner.
+///
+/// This struct flows from the planner into the runtime/executor so callers can
+/// reason about column metadata without duplicating field definitions.
 #[derive(Clone, Debug)]
-pub struct ColumnSpec {
+pub struct PlanColumnSpec {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
@@ -208,7 +351,7 @@ pub struct ColumnSpec {
     pub check_expr: Option<String>,
 }
 
-impl ColumnSpec {
+impl PlanColumnSpec {
     pub fn new(name: impl Into<String>, data_type: DataType, nullable: bool) -> Self {
         Self {
             name: name.into(),
@@ -241,9 +384,9 @@ impl ColumnSpec {
     }
 }
 
-/// Trait for types that can be converted into a ColumnSpec.
-pub trait IntoColumnSpec {
-    fn into_column_spec(self) -> ColumnSpec;
+/// Trait for types that can be converted into a [`PlanColumnSpec`].
+pub trait IntoPlanColumnSpec {
+    fn into_plan_column_spec(self) -> PlanColumnSpec;
 }
 
 /// Column nullability specification.
@@ -267,36 +410,36 @@ pub const Nullable: ColumnNullability = ColumnNullability::Nullable;
 #[allow(non_upper_case_globals)]
 pub const NotNull: ColumnNullability = ColumnNullability::NotNull;
 
-impl IntoColumnSpec for ColumnSpec {
-    fn into_column_spec(self) -> ColumnSpec {
+impl IntoPlanColumnSpec for PlanColumnSpec {
+    fn into_plan_column_spec(self) -> PlanColumnSpec {
         self
     }
 }
 
-impl<T> IntoColumnSpec for &T
+impl<T> IntoPlanColumnSpec for &T
 where
-    T: Clone + IntoColumnSpec,
+    T: Clone + IntoPlanColumnSpec,
 {
-    fn into_column_spec(self) -> ColumnSpec {
-        self.clone().into_column_spec()
+    fn into_plan_column_spec(self) -> PlanColumnSpec {
+        self.clone().into_plan_column_spec()
     }
 }
 
-impl IntoColumnSpec for (&str, DataType) {
-    fn into_column_spec(self) -> ColumnSpec {
-        ColumnSpec::new(self.0, self.1, true)
+impl IntoPlanColumnSpec for (&str, DataType) {
+    fn into_plan_column_spec(self) -> PlanColumnSpec {
+        PlanColumnSpec::new(self.0, self.1, true)
     }
 }
 
-impl IntoColumnSpec for (&str, DataType, bool) {
-    fn into_column_spec(self) -> ColumnSpec {
-        ColumnSpec::new(self.0, self.1, self.2)
+impl IntoPlanColumnSpec for (&str, DataType, bool) {
+    fn into_plan_column_spec(self) -> PlanColumnSpec {
+        PlanColumnSpec::new(self.0, self.1, self.2)
     }
 }
 
-impl IntoColumnSpec for (&str, DataType, ColumnNullability) {
-    fn into_column_spec(self) -> ColumnSpec {
-        ColumnSpec::new(self.0, self.1, self.2.is_nullable())
+impl IntoPlanColumnSpec for (&str, DataType, ColumnNullability) {
+    fn into_plan_column_spec(self) -> PlanColumnSpec {
+        PlanColumnSpec::new(self.0, self.1, self.2.is_nullable())
     }
 }
 
@@ -665,6 +808,7 @@ pub enum OrderTarget {
 #[derive(Clone, Debug)]
 pub enum PlanOperation {
     CreateTable(CreateTablePlan),
+    DropTable(DropTablePlan),
     Insert(InsertPlan),
     Update(UpdatePlan),
     Delete(DeletePlan),
@@ -678,6 +822,9 @@ pub enum PlanStatement {
     CommitTransaction,
     RollbackTransaction,
     CreateTable(CreateTablePlan),
+    DropTable(DropTablePlan),
+    DropIndex(DropIndexPlan),
+    AlterTable(AlterTablePlan),
     CreateIndex(CreateIndexPlan),
     Insert(InsertPlan),
     Update(UpdatePlan),

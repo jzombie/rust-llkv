@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-`llkv-join` implements relational join algorithms for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
+`llkv-join` implements relational join algorithms for the [LLKV](../) toolkit.
 
 ## Purpose
 

@@ -6,6 +6,7 @@ use llkv_runtime::{
     CreateIndexPlan, IndexColumnPlan, PlanValue, RuntimeContext, RuntimeStatementResult, row,
 };
 use llkv_storage::pager::MemPager;
+use llkv_table::CatalogDdl;
 
 #[test]
 fn multi_column_unique_survives_restart() {

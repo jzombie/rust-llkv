@@ -14,27 +14,28 @@ use llkv_plan::validation::{
     ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
 };
 use llkv_result::Error;
-use llkv_runtime::storage_namespace::TEMPORARY_NAMESPACE_ID;
+use llkv_runtime::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
-    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan, CreateTablePlan,
+    AggregateExpr, AssignmentValue, ColumnAssignment, CreateIndexPlan, CreateTablePlan,
     CreateTableSource, DeletePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan,
-    InsertSource, OrderByPlan, OrderSortType, OrderTarget, PlanStatement, PlanValue,
-    RuntimeContext, RuntimeEngine, RuntimeSession, RuntimeStatementResult, SelectPlan,
-    SelectProjection, UpdatePlan, extract_rows_from_range,
+    InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec,
+    PlanStatement, PlanValue, RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession,
+    RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
+use llkv_table::CatalogDdl;
 use llkv_table::catalog::{IdentifierContext, IdentifierResolver};
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator, ColumnOption,
-    ColumnOptionDef, ConstraintCharacteristics, DataType as SqlDataType, Delete, ExceptionWhen,
-    Expr as SqlExpr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    Ident, LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType, OrderBy,
-    OrderByKind, Query, ReferentialAction, SchemaName, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableConstraint,
-    TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
-    UpdateTableFromKind, Value, ValueWithSpan,
+    AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, BeginTransactionKind,
+    BinaryOperator, ColumnOption, ColumnOptionDef, ConstraintCharacteristics,
+    DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, NullsDistinctOption,
+    ObjectName, ObjectNamePart, ObjectType, OrderBy, OrderByKind, Query, ReferentialAction,
+    SchemaName, Select, SelectItem, SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption,
+    Statement, TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionMode,
+    TransactionModifier, UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -170,6 +171,31 @@ where
 
     /// Preprocess SQL to handle qualified names in EXCLUDE clauses
     /// Converts EXCLUDE (schema.table.col) to EXCLUDE ("schema.table.col")
+    /// Preprocess CREATE TYPE to CREATE DOMAIN for sqlparser compatibility.
+    ///
+    /// DuckDB uses `CREATE TYPE name AS basetype` for type aliases, but sqlparser
+    /// only supports the SQL standard `CREATE DOMAIN name AS basetype` syntax.
+    /// This method converts the DuckDB syntax to the standard syntax.
+    fn preprocess_create_type_syntax(sql: &str) -> String {
+        static CREATE_TYPE_REGEX: OnceLock<Regex> = OnceLock::new();
+        static DROP_TYPE_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        // Match: CREATE TYPE name AS datatype
+        let create_re = CREATE_TYPE_REGEX.get_or_init(|| {
+            Regex::new(r"(?i)\bCREATE\s+TYPE\s+").expect("valid CREATE TYPE regex")
+        });
+
+        // Match: DROP TYPE [IF EXISTS] name
+        let drop_re = DROP_TYPE_REGEX
+            .get_or_init(|| Regex::new(r"(?i)\bDROP\s+TYPE\s+").expect("valid DROP TYPE regex"));
+
+        // First replace CREATE TYPE with CREATE DOMAIN
+        let sql = create_re.replace_all(sql, "CREATE DOMAIN ").to_string();
+
+        // Then replace DROP TYPE with DROP DOMAIN
+        drop_re.replace_all(&sql, "DROP DOMAIN ").to_string()
+    }
+
     fn preprocess_exclude_syntax(sql: &str) -> String {
         static EXCLUDE_REGEX: OnceLock<Regex> = OnceLock::new();
 
@@ -187,6 +213,19 @@ where
             format!("EXCLUDE (\"{}\")", qualified_name)
         })
         .to_string()
+    }
+
+    /// Preprocess SQL to remove trailing commas in VALUES clauses.
+    /// DuckDB allows trailing commas like VALUES ('v2',) but sqlparser does not.
+    fn preprocess_trailing_commas_in_values(sql: &str) -> String {
+        static TRAILING_COMMA_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        // Pattern to match trailing comma before closing paren in VALUES
+        // Matches: , followed by optional whitespace and )
+        let re = TRAILING_COMMA_REGEX
+            .get_or_init(|| Regex::new(r",(\s*)\)").expect("valid trailing comma regex"));
+
+        re.replace_all(sql, "$1)").to_string()
     }
 
     pub(crate) fn context_arc(&self) -> Arc<RuntimeContext<P>> {
@@ -229,9 +268,16 @@ where
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<RuntimeStatementResult<P>>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
 
+        // Preprocess SQL to handle CREATE TYPE / DROP TYPE (DuckDB syntax)
+        let processed_sql = Self::preprocess_create_type_syntax(sql);
+
         // Preprocess SQL to handle qualified names in EXCLUDE
         // Replace EXCLUDE (schema.table.col) with EXCLUDE ("schema.table.col")
-        let processed_sql = Self::preprocess_exclude_syntax(sql);
+        let processed_sql = Self::preprocess_exclude_syntax(&processed_sql);
+
+        // Preprocess SQL to remove trailing commas in VALUES clauses
+        // DuckDB allows VALUES ('v2',) but sqlparser does not
+        let processed_sql = Self::preprocess_trailing_commas_in_values(&processed_sql);
 
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, &processed_sql)
@@ -376,6 +422,52 @@ where
                     clone,
                 )
             }
+            Statement::CreateView {
+                name,
+                columns,
+                query,
+                materialized,
+                or_replace,
+                or_alter,
+                options,
+                cluster_by,
+                comment,
+                with_no_schema_binding,
+                if_not_exists,
+                temporary,
+                to,
+                params,
+                secure,
+                name_before_not_exists,
+            } => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateView");
+                self.handle_create_view(
+                    name,
+                    columns,
+                    query,
+                    materialized,
+                    or_replace,
+                    or_alter,
+                    options,
+                    cluster_by,
+                    comment,
+                    with_no_schema_binding,
+                    if_not_exists,
+                    temporary,
+                    to,
+                    params,
+                    secure,
+                    name_before_not_exists,
+                )
+            }
+            Statement::CreateDomain(create_domain) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateDomain");
+                self.handle_create_domain(create_domain)
+            }
+            Statement::DropDomain(drop_domain) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: DropDomain");
+                self.handle_drop_domain(drop_domain)
+            }
             Statement::Insert(stmt) => {
                 let table_name =
                     Self::table_name_from_insert(&stmt).unwrap_or_else(|_| "unknown".to_string());
@@ -424,6 +516,16 @@ where
                     purge,
                     temporary,
                 )
+            }
+            Statement::AlterTable {
+                name,
+                if_exists,
+                only,
+                operations,
+                ..
+            } => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: AlterTable");
+                self.handle_alter_table(name, if_exists, only, operations)
             }
             Statement::Set(set_stmt) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: Set");
@@ -526,7 +628,22 @@ where
             return Err(Self::table_not_found_error(display_name));
         }
 
-        match context.table_column_specs(display_name) {
+        // First, check if the table was created in the current transaction
+        if let Some(specs) = self
+            .engine
+            .session()
+            .table_column_specs_from_transaction(canonical_name)
+        {
+            return Ok(specs
+                .into_iter()
+                .map(|spec| spec.name.to_ascii_lowercase())
+                .collect());
+        }
+
+        // Otherwise, look it up in the committed catalog
+        let (_, canonical_name) = llkv_table::canonical_table_name(display_name)
+            .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
+        match context.catalog().table_column_specs(&canonical_name) {
             Ok(specs) => Ok(specs
                 .into_iter()
                 .map(|spec| spec.name.to_ascii_lowercase())
@@ -642,9 +759,10 @@ where
             .map(|name| name.to_ascii_lowercase())
             .collect();
 
-        let mut columns: Vec<ColumnSpec> = Vec::with_capacity(column_defs_ast.len());
+        let mut columns: Vec<PlanColumnSpec> = Vec::with_capacity(column_defs_ast.len());
         let mut primary_key_columns: HashSet<String> = HashSet::new();
         let mut foreign_keys: Vec<ForeignKeySpec> = Vec::new();
+        let mut multi_column_uniques: Vec<MultiColumnUniqueSpec> = Vec::new();
 
         // Second pass: process columns including CHECK validation and column-level FKs
         for column_def in column_defs_ast {
@@ -719,13 +837,16 @@ where
                 check_expr_str
             );
 
-            let mut column = ColumnSpec::new(
+            // Resolve custom type aliases to their base types
+            let resolved_data_type = self.engine.context().resolve_type(&column_def.data_type);
+
+            let mut column = PlanColumnSpec::new(
                 column_def.name.value.clone(),
-                arrow_type_from_sql(&column_def.data_type)?,
+                arrow_type_from_sql(&resolved_data_type)?,
                 is_nullable,
             );
             tracing::trace!(
-                "DEBUG ColumnSpec after new(): primary_key={} unique={}",
+                "DEBUG PlanColumnSpec after new(): primary_key={} unique={}",
                 column.primary_key,
                 column.unique
             );
@@ -740,7 +861,7 @@ where
                 primary_key_columns.insert(column.name.to_ascii_lowercase());
             }
             tracing::trace!(
-                "DEBUG ColumnSpec after with_primary_key({})/with_unique({}): primary_key={} unique={} check_expr={:?}",
+                "DEBUG PlanColumnSpec after with_primary_key({})/with_unique({}): primary_key={} unique={} check_expr={:?}",
                 is_primary_key,
                 has_unique_constraint,
                 column.primary_key,
@@ -823,6 +944,7 @@ where
                         index_options,
                         characteristics,
                         nulls_distinct,
+                        name,
                         ..
                     } => {
                         if !matches!(nulls_distinct, NullsDistinctOption::None) {
@@ -867,12 +989,6 @@ where
                             unique_column_names.push(column_ident);
                         }
 
-                        if unique_column_names.len() > 1 {
-                            return Err(Error::InvalidArgumentError(
-                                "multi-column UNIQUE constraints are not supported yet".into(),
-                            ));
-                        }
-
                         ensure_unique_case_insensitive(
                             unique_column_names.iter().map(|name| name.as_str()),
                             |dup| format!("duplicate column '{}' in UNIQUE constraint", dup),
@@ -884,22 +1000,31 @@ where
                             |unknown| format!("unknown column '{}' in UNIQUE constraint", unknown),
                         )?;
 
-                        let column_ident = unique_column_names
-                            .into_iter()
-                            .next()
-                            .expect("unique constraint checked for emptiness");
-                        let normalized = column_ident.to_ascii_lowercase();
-                        let idx = column_lookup.get(&normalized).copied().ok_or_else(|| {
-                            Error::InvalidArgumentError(format!(
-                                "unknown column '{}' in UNIQUE constraint",
-                                column_ident
-                            ))
-                        })?;
+                        if unique_column_names.len() > 1 {
+                            // Multi-column UNIQUE constraint
+                            multi_column_uniques.push(MultiColumnUniqueSpec {
+                                name: name.map(|n| n.value),
+                                columns: unique_column_names,
+                            });
+                        } else {
+                            // Single-column UNIQUE constraint
+                            let column_ident = unique_column_names
+                                .into_iter()
+                                .next()
+                                .expect("unique constraint checked for emptiness");
+                            let normalized = column_ident.to_ascii_lowercase();
+                            let idx = column_lookup.get(&normalized).copied().ok_or_else(|| {
+                                Error::InvalidArgumentError(format!(
+                                    "unknown column '{}' in UNIQUE constraint",
+                                    column_ident
+                                ))
+                            })?;
 
-                        let column = columns
-                            .get_mut(idx)
-                            .expect("column index from lookup must be valid");
-                        column.unique = true;
+                            let column = columns
+                                .get_mut(idx)
+                                .expect("column index from lookup must be valid");
+                            column.unique = true;
+                        }
                     }
                     TableConstraint::ForeignKey {
                         name,
@@ -953,6 +1078,7 @@ where
             source: None,
             namespace,
             foreign_keys,
+            multi_column_uniques,
         };
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
     }
@@ -1177,14 +1303,26 @@ where
 
         let (referenced_display, referenced_canonical) = canonical_object_name(foreign_table)?;
 
+        // Check if the referenced table is a VIEW - VIEWs cannot be referenced by foreign keys
+        let catalog = self.engine.context().table_catalog();
+        if let Some(table_id) = catalog.table_id(&referenced_canonical) {
+            let context = self.engine.context();
+            if context.is_view(table_id)? {
+                return Err(Error::CatalogError(format!(
+                    "Binder Error: cannot reference a VIEW with a FOREIGN KEY: {}",
+                    referenced_display
+                )));
+            }
+        }
+
         if referenced_canonical == referencing_canonical {
             ensure_known_columns_case_insensitive(
                 referenced_columns_vec.iter().map(|name| name.as_str()),
                 known_columns_lower,
                 |unknown| {
                     format!(
-                        "unknown referenced column '{}' in FOREIGN KEY constraint",
-                        unknown
+                        "Binder Error: table '{}' does not have a column named '{}'",
+                        referenced_display, unknown
                     )
                 },
             )?;
@@ -1197,8 +1335,8 @@ where
                     &known_columns,
                     |unknown| {
                         format!(
-                            "unknown referenced column '{}' in FOREIGN KEY constraint",
-                            unknown
+                            "Binder Error: table '{}' does not have a column named '{}'",
+                            referenced_display, unknown
                         )
                     },
                 )?;
@@ -1277,6 +1415,158 @@ where
                 display_name, err
             ))
         })?;
+
+        Ok(RuntimeStatementResult::NoOp)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_create_view(
+        &self,
+        name: ObjectName,
+        _columns: Vec<sqlparser::ast::ViewColumnDef>,
+        query: Box<sqlparser::ast::Query>,
+        materialized: bool,
+        or_replace: bool,
+        or_alter: bool,
+        _options: sqlparser::ast::CreateTableOptions,
+        _cluster_by: Vec<sqlparser::ast::Ident>,
+        _comment: Option<String>,
+        _with_no_schema_binding: bool,
+        if_not_exists: bool,
+        temporary: bool,
+        _to: Option<ObjectName>,
+        _params: Option<sqlparser::ast::CreateViewParams>,
+        _secure: bool,
+        _name_before_not_exists: bool,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        // Validate unsupported features
+        if materialized {
+            return Err(Error::InvalidArgumentError(
+                "MATERIALIZED VIEWS are not supported".into(),
+            ));
+        }
+        if or_replace {
+            return Err(Error::InvalidArgumentError(
+                "CREATE OR REPLACE VIEW is not supported".into(),
+            ));
+        }
+        if or_alter {
+            return Err(Error::InvalidArgumentError(
+                "CREATE OR ALTER VIEW is not supported".into(),
+            ));
+        }
+        if temporary {
+            return Err(Error::InvalidArgumentError(
+                "TEMPORARY VIEWS are not supported".into(),
+            ));
+        }
+
+        // Parse view name (same as table parsing)
+        let (schema_name, view_name) = parse_schema_qualified_name(&name)?;
+
+        // Validate schema exists if specified
+        if let Some(ref schema) = schema_name {
+            let catalog = self.engine.context().table_catalog();
+            if !catalog.schema_exists(schema) {
+                return Err(Error::CatalogError(format!(
+                    "Schema '{}' does not exist",
+                    schema
+                )));
+            }
+        }
+
+        // Use full qualified name (schema.view or just view)
+        let display_name = match &schema_name {
+            Some(schema) => format!("{}.{}", schema, view_name),
+            None => view_name.clone(),
+        };
+        let canonical_name = display_name.to_ascii_lowercase();
+
+        // Check if view already exists
+        let catalog = self.engine.context().table_catalog();
+        if catalog.table_exists(&canonical_name) {
+            if if_not_exists {
+                return Ok(RuntimeStatementResult::NoOp);
+            }
+            return Err(Error::CatalogError(format!(
+                "Table or view '{}' already exists",
+                display_name
+            )));
+        }
+
+        // Convert query to SQL string for storage
+        let view_definition = query.to_string();
+
+        // Create the view using the runtime context helper
+        let context = self.engine.context();
+        context.create_view(&display_name, view_definition)?;
+
+        tracing::debug!("Created view: {}", display_name);
+        Ok(RuntimeStatementResult::NoOp)
+    }
+
+    fn handle_create_domain(
+        &self,
+        create_domain: sqlparser::ast::CreateDomain,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        use llkv_table::CustomTypeMeta;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Extract the type alias name
+        let type_name = create_domain.name.to_string();
+
+        // Convert the data type to SQL string for persistence
+        let base_type_sql = create_domain.data_type.to_string();
+
+        // Register the type alias in the runtime context (in-memory)
+        self.engine
+            .context()
+            .register_type(type_name.clone(), create_domain.data_type.clone());
+
+        // Persist to catalog
+        let context = self.engine.context();
+        let catalog = llkv_table::SysCatalog::new(context.store());
+
+        let created_at_micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+
+        let meta = CustomTypeMeta {
+            name: type_name.clone(),
+            base_type_sql,
+            created_at_micros,
+        };
+
+        catalog.put_custom_type_meta(&meta)?;
+
+        tracing::debug!("Created and persisted type alias: {}", type_name);
+        Ok(RuntimeStatementResult::NoOp)
+    }
+
+    fn handle_drop_domain(
+        &self,
+        drop_domain: sqlparser::ast::DropDomain,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let if_exists = drop_domain.if_exists;
+        let type_name = drop_domain.name.to_string();
+
+        // Drop the type from the registry (in-memory)
+        let result = self.engine.context().drop_type(&type_name);
+
+        if let Err(err) = result {
+            if !if_exists {
+                return Err(err);
+            }
+            // if_exists = true, so ignore the error
+        } else {
+            // Persist deletion to catalog
+            let context = self.engine.context();
+            let catalog = llkv_table::SysCatalog::new(context.store());
+            catalog.delete_custom_type_meta(&type_name)?;
+
+            tracing::debug!("Dropped and removed from catalog type alias: {}", type_name);
+        }
 
         Ok(RuntimeStatementResult::NoOp)
     }
@@ -1414,7 +1704,7 @@ where
                         }
                     };
                     let column_name = alias.value.clone();
-                    column_specs.push(ColumnSpec::new(column_name.clone(), data_type, true));
+                    column_specs.push(PlanColumnSpec::new(column_name.clone(), data_type, true));
                     column_names.push(column_name);
                     row_template.push(value);
                 }
@@ -1435,6 +1725,7 @@ where
             source: None,
             namespace,
             foreign_keys: Vec::new(),
+            multi_column_uniques: Vec::new(),
         };
         let create_result = self.execute_plan_statement(PlanStatement::CreateTable(plan))?;
 
@@ -1518,7 +1809,8 @@ where
 
         // Get table column specs from runtime context
         let context = self.engine.context();
-        let columns = context.table_column_specs(&table_name)?;
+        let (_, canonical_name) = llkv_table::canonical_table_name(&table_name)?;
+        let columns = context.catalog().table_column_specs(&canonical_name)?;
 
         // Build RecordBatch with table column information
         use arrow::array::{BooleanArray, Int32Array, StringArray};
@@ -1666,7 +1958,7 @@ where
         Ok(Some(RuntimeStatementResult::Select {
             table_name,
             schema: projected_schema,
-            execution,
+            execution: Box::new(execution),
         }))
     }
 
@@ -1679,6 +1971,23 @@ where
         or_replace: bool,
         namespace: Option<String>,
     ) -> SqlResult<RuntimeStatementResult<P>> {
+        // Check if this is a SELECT from VALUES in a derived table
+        // Pattern: SELECT * FROM (VALUES ...) alias(col1, col2, ...)
+        if let SetExpr::Select(select) = query.body.as_ref()
+            && let Some((rows, column_names)) = extract_values_from_derived_table(&select.from)?
+        {
+            // Convert VALUES rows to Arrow RecordBatches
+            return self.handle_create_table_from_values(
+                display_name,
+                rows,
+                column_names,
+                if_not_exists,
+                or_replace,
+                namespace,
+            );
+        }
+
+        // Regular CTAS with SELECT from existing tables
         let select_plan = self.build_select_plan(query)?;
 
         if select_plan.projections.is_empty() && select_plan.aggregates.is_empty() {
@@ -1697,7 +2006,146 @@ where
             }),
             namespace,
             foreign_keys: Vec::new(),
+            multi_column_uniques: Vec::new(),
         };
+        self.execute_plan_statement(PlanStatement::CreateTable(plan))
+    }
+
+    fn handle_create_table_from_values(
+        &self,
+        display_name: String,
+        rows: Vec<Vec<PlanValue>>,
+        column_names: Vec<String>,
+        if_not_exists: bool,
+        or_replace: bool,
+        namespace: Option<String>,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        use arrow::array::{ArrayRef, Float64Builder, Int64Builder, StringBuilder};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        if rows.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "VALUES must have at least one row".into(),
+            ));
+        }
+
+        let num_cols = column_names.len();
+
+        // Infer schema from first row
+        let first_row = &rows[0];
+        if first_row.len() != num_cols {
+            return Err(Error::InvalidArgumentError(
+                "VALUES row column count mismatch".into(),
+            ));
+        }
+
+        let mut fields = Vec::with_capacity(num_cols);
+        let mut column_types = Vec::with_capacity(num_cols);
+
+        for (idx, value) in first_row.iter().enumerate() {
+            let (data_type, nullable) = match value {
+                PlanValue::Integer(_) => (DataType::Int64, false),
+                PlanValue::Float(_) => (DataType::Float64, false),
+                PlanValue::String(_) => (DataType::Utf8, false),
+                PlanValue::Null => (DataType::Utf8, true), // Default NULL to string type
+                _ => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported value type in VALUES for column '{}'",
+                        column_names.get(idx).unwrap_or(&format!("column{}", idx))
+                    )));
+                }
+            };
+
+            column_types.push(data_type.clone());
+            fields.push(Field::new(&column_names[idx], data_type, nullable));
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+
+        // Build Arrow arrays for each column
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(num_cols);
+
+        for col_idx in 0..num_cols {
+            let col_type = &column_types[col_idx];
+
+            match col_type {
+                DataType::Int64 => {
+                    let mut builder = Int64Builder::with_capacity(rows.len());
+                    for row in &rows {
+                        match &row[col_idx] {
+                            PlanValue::Integer(v) => builder.append_value(*v),
+                            PlanValue::Null => builder.append_null(),
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "type mismatch in VALUES: expected Integer, got {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()) as ArrayRef);
+                }
+                DataType::Float64 => {
+                    let mut builder = Float64Builder::with_capacity(rows.len());
+                    for row in &rows {
+                        match &row[col_idx] {
+                            PlanValue::Float(v) => builder.append_value(*v),
+                            PlanValue::Null => builder.append_null(),
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "type mismatch in VALUES: expected Float, got {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()) as ArrayRef);
+                }
+                DataType::Utf8 => {
+                    let mut builder = StringBuilder::with_capacity(rows.len(), 1024);
+                    for row in &rows {
+                        match &row[col_idx] {
+                            PlanValue::String(v) => builder.append_value(v),
+                            PlanValue::Null => builder.append_null(),
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "type mismatch in VALUES: expected String, got {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()) as ArrayRef);
+                }
+                other => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported column type in VALUES: {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).map_err(|e| {
+            Error::Internal(format!("failed to create RecordBatch from VALUES: {}", e))
+        })?;
+
+        let plan = CreateTablePlan {
+            name: display_name.clone(),
+            if_not_exists,
+            or_replace,
+            columns: Vec::new(),
+            source: Some(CreateTableSource::Batches {
+                schema: Arc::clone(&schema),
+                batches: vec![batch],
+            }),
+            namespace,
+            foreign_keys: Vec::new(),
+            multi_column_uniques: Vec::new(),
+        };
+
         self.execute_plan_statement(PlanStatement::CreateTable(plan))
     }
 
@@ -2005,12 +2453,28 @@ where
                     ));
                 }
 
-                let session = self.engine.session();
                 for name in names {
                     let table_name = Self::object_name_to_string(&name)?;
-                    session
-                        .drop_table(&table_name, if_exists)
+                    let mut plan = llkv_plan::DropTablePlan::new(table_name.clone());
+                    plan.if_exists = if_exists;
+
+                    self.execute_plan_statement(llkv_plan::PlanStatement::DropTable(plan))
                         .map_err(|err| Self::map_table_error(&table_name, err))?;
+                }
+
+                Ok(RuntimeStatementResult::NoOp)
+            }
+            ObjectType::Index => {
+                if cascade || restrict {
+                    return Err(Error::InvalidArgumentError(
+                        "DROP INDEX CASCADE/RESTRICT is not supported".into(),
+                    ));
+                }
+
+                for name in names {
+                    let index_name = Self::object_name_to_string(&name)?;
+                    let plan = llkv_plan::DropIndexPlan::new(index_name).if_exists(if_exists);
+                    self.execute_plan_statement(llkv_plan::PlanStatement::DropIndex(plan))?;
                 }
 
                 Ok(RuntimeStatementResult::NoOp)
@@ -2042,10 +2506,13 @@ where
                         let all_tables = catalog.table_names();
                         let schema_prefix = format!("{}.", canonical_name);
 
-                        let ctx = self.engine.context();
                         for table in all_tables {
                             if table.to_ascii_lowercase().starts_with(&schema_prefix) {
-                                ctx.drop_table_immediate(&table, false)?;
+                                let mut plan = llkv_plan::DropTablePlan::new(table.clone());
+                                plan.if_exists = false;
+                                self.execute_plan_statement(llkv_plan::PlanStatement::DropTable(
+                                    plan,
+                                ))?;
                             }
                         }
                     } else {
@@ -2079,6 +2546,194 @@ where
                 "DROP {} is not supported",
                 object_type
             ))),
+        }
+    }
+
+    fn handle_alter_table(
+        &self,
+        name: ObjectName,
+        if_exists: bool,
+        only: bool,
+        operations: Vec<AlterTableOperation>,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        if only {
+            return Err(Error::InvalidArgumentError(
+                "ALTER TABLE ONLY is not supported yet".into(),
+            ));
+        }
+
+        if operations.is_empty() {
+            return Ok(RuntimeStatementResult::NoOp);
+        }
+
+        if operations.len() != 1 {
+            return Err(Error::InvalidArgumentError(
+                "ALTER TABLE currently supports exactly one operation".into(),
+            ));
+        }
+
+        let operation = operations.into_iter().next().expect("checked length");
+        match operation {
+            AlterTableOperation::RenameTable { table_name } => {
+                let new_name = table_name.to_string();
+                self.handle_alter_table_rename(name, new_name, if_exists)
+            }
+            AlterTableOperation::RenameColumn {
+                old_column_name,
+                new_column_name,
+            } => {
+                let plan = llkv_plan::AlterTablePlan {
+                    table_name: name.to_string(),
+                    if_exists,
+                    operation: llkv_plan::AlterTableOperation::RenameColumn {
+                        old_column_name: old_column_name.to_string(),
+                        new_column_name: new_column_name.to_string(),
+                    },
+                };
+                self.execute_plan_statement(PlanStatement::AlterTable(plan))
+            }
+            AlterTableOperation::AlterColumn { column_name, op } => {
+                // Only support SET DATA TYPE for now
+                if let AlterColumnOperation::SetDataType {
+                    data_type,
+                    using,
+                    had_set: _,
+                } = op
+                {
+                    if using.is_some() {
+                        return Err(Error::InvalidArgumentError(
+                            "ALTER COLUMN SET DATA TYPE USING clause is not yet supported".into(),
+                        ));
+                    }
+
+                    let plan = llkv_plan::AlterTablePlan {
+                        table_name: name.to_string(),
+                        if_exists,
+                        operation: llkv_plan::AlterTableOperation::SetColumnDataType {
+                            column_name: column_name.to_string(),
+                            new_data_type: data_type.to_string(),
+                        },
+                    };
+                    self.execute_plan_statement(PlanStatement::AlterTable(plan))
+                } else {
+                    Err(Error::InvalidArgumentError(format!(
+                        "unsupported ALTER COLUMN operation: {:?}",
+                        op
+                    )))
+                }
+            }
+            AlterTableOperation::DropColumn {
+                has_column_keyword: _,
+                column_names,
+                if_exists: column_if_exists,
+                drop_behavior,
+            } => {
+                if column_names.len() != 1 {
+                    return Err(Error::InvalidArgumentError(
+                        "DROP COLUMN currently supports dropping one column at a time".into(),
+                    ));
+                }
+
+                let column_name = column_names.into_iter().next().unwrap().to_string();
+                let cascade = matches!(drop_behavior, Some(sqlparser::ast::DropBehavior::Cascade));
+
+                let plan = llkv_plan::AlterTablePlan {
+                    table_name: name.to_string(),
+                    if_exists,
+                    operation: llkv_plan::AlterTableOperation::DropColumn {
+                        column_name,
+                        if_exists: column_if_exists,
+                        cascade,
+                    },
+                };
+                self.execute_plan_statement(PlanStatement::AlterTable(plan))
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "unsupported ALTER TABLE operation: {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn handle_alter_table_rename(
+        &self,
+        original_name: ObjectName,
+        new_table_name: String,
+        if_exists: bool,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let (schema_opt, table_name) = parse_schema_qualified_name(&original_name)?;
+
+        let new_table_name_clean = new_table_name.trim();
+
+        if new_table_name_clean.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "ALTER TABLE RENAME requires a non-empty table name".into(),
+            ));
+        }
+
+        let (raw_new_schema_opt, raw_new_table) =
+            if let Some((schema_part, table_part)) = new_table_name_clean.split_once('.') {
+                (
+                    Some(schema_part.trim().to_string()),
+                    table_part.trim().to_string(),
+                )
+            } else {
+                (None, new_table_name_clean.to_string())
+            };
+
+        if schema_opt.is_none() && raw_new_schema_opt.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "ALTER TABLE RENAME cannot add a schema qualifier".into(),
+            ));
+        }
+
+        let new_table_trimmed = raw_new_table.trim_matches('"');
+        if new_table_trimmed.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "ALTER TABLE RENAME requires a non-empty table name".into(),
+            ));
+        }
+
+        if let (Some(existing_schema), Some(new_schema_raw)) =
+            (schema_opt.as_ref(), raw_new_schema_opt.as_ref())
+        {
+            let new_schema_trimmed = new_schema_raw.trim_matches('"');
+            if !existing_schema.eq_ignore_ascii_case(new_schema_trimmed) {
+                return Err(Error::InvalidArgumentError(
+                    "ALTER TABLE RENAME cannot change table schema".into(),
+                ));
+            }
+        }
+
+        let new_table_display = raw_new_table;
+        let new_schema_opt = raw_new_schema_opt;
+
+        fn join_schema_table(schema: &str, table: &str) -> String {
+            let mut qualified = String::with_capacity(schema.len() + table.len() + 1);
+            qualified.push_str(schema);
+            qualified.push('.');
+            qualified.push_str(table);
+            qualified
+        }
+
+        let current_display = schema_opt
+            .as_ref()
+            .map(|schema| join_schema_table(schema, &table_name))
+            .unwrap_or_else(|| table_name.clone());
+
+        let new_display = if let Some(new_schema_raw) = new_schema_opt.clone() {
+            join_schema_table(&new_schema_raw, &new_table_display)
+        } else if let Some(schema) = schema_opt.as_ref() {
+            join_schema_table(schema, &new_table_display)
+        } else {
+            new_table_display.clone()
+        };
+
+        let plan = RenameTablePlan::new(&current_display, &new_display).if_exists(if_exists);
+
+        match CatalogDdl::rename_table(self.engine.session(), plan) {
+            Ok(()) => Ok(RuntimeStatementResult::NoOp),
+            Err(err) => Err(Self::map_table_error(&current_display, err)),
         }
     }
 
@@ -3641,6 +4296,7 @@ fn translate_scalar_with_context(
     }
 }
 
+// TODO: Rename?  Already many `translate_scaler` functions... be more sepcific?
 fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     match expr {
         SqlExpr::Identifier(ident) => Ok(llkv_expr::expr::ScalarExpr::column(ident.value.clone())),
@@ -4019,6 +4675,82 @@ fn parse_sql_data_type(type_str: &str, dialect: &GenericDialect) -> SqlResult<Sq
     }
 }
 
+/// Extract VALUES data from a derived table in FROM clause.
+/// Returns (rows, column_names) if the pattern matches: SELECT ... FROM (VALUES ...) alias(col1, col2, ...)
+type ExtractValuesResult = Option<(Vec<Vec<PlanValue>>, Vec<String>)>;
+
+#[allow(clippy::type_complexity)]
+fn extract_values_from_derived_table(from: &[TableWithJoins]) -> SqlResult<ExtractValuesResult> {
+    if from.len() != 1 {
+        return Ok(None);
+    }
+
+    let table_with_joins = &from[0];
+    if !table_with_joins.joins.is_empty() {
+        return Ok(None);
+    }
+
+    match &table_with_joins.relation {
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            // Check if the subquery is a VALUES expression
+            let values = match subquery.body.as_ref() {
+                SetExpr::Values(v) => v,
+                _ => return Ok(None),
+            };
+
+            // Extract column names from alias
+            let column_names = if let Some(alias) = alias {
+                alias
+                    .columns
+                    .iter()
+                    .map(|col_def| col_def.name.value.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                // Generate default column names if no alias provided
+                if values.rows.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "VALUES expression must have at least one row".into(),
+                    ));
+                }
+                let first_row = &values.rows[0];
+                (0..first_row.len())
+                    .map(|i| format!("column{}", i))
+                    .collect()
+            };
+
+            // Extract rows
+            if values.rows.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "VALUES expression must have at least one row".into(),
+                ));
+            }
+
+            let mut rows = Vec::with_capacity(values.rows.len());
+            for row in &values.rows {
+                if row.len() != column_names.len() {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "VALUES row has {} columns but table alias specifies {} columns",
+                        row.len(),
+                        column_names.len()
+                    )));
+                }
+
+                let mut converted_row = Vec::with_capacity(row.len());
+                for expr in row {
+                    let value = SqlValue::try_from_expr(expr)?;
+                    converted_row.push(PlanValue::from(value));
+                }
+                rows.push(converted_row);
+            }
+
+            Ok(Some((rows, column_names)))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn extract_constant_select_rows(select: &Select) -> SqlResult<Option<Vec<Vec<PlanValue>>>> {
     if !select.from.is_empty() {
         return Ok(None);
@@ -4080,8 +4812,18 @@ fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> 
     }
     match &item.relation {
         TableFactor::Table { name, .. } => canonical_object_name(name),
+        TableFactor::Derived { alias, .. } => {
+            // Derived table (subquery) - use the alias as the table name if provided
+            // For CTAS, this allows: CREATE TABLE t AS SELECT * FROM (VALUES ...) v(id)
+            let table_name = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| "derived".to_string());
+            let canonical = table_name.to_ascii_lowercase();
+            Ok((table_name, canonical))
+        }
         _ => Err(Error::InvalidArgumentError(
-            "queries require a plain table name".into(),
+            "queries require a plain table name or derived table".into(),
         )),
     }
 }

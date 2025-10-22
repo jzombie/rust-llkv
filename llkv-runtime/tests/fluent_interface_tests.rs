@@ -76,7 +76,7 @@ fn fluent_transaction_flow() {
         columns: vec![],
         source: InsertSource::Rows(vec![vec![PlanValue::Integer(41)]]),
     };
-    let insert_result = session.insert(insert_plan).expect("insert");
+    let insert_result = session.execute_insert_plan(insert_plan).expect("insert");
     assert!(matches!(
         insert_result,
         RuntimeStatementResult::Insert {

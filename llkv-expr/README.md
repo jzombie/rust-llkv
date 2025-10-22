@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-A buffer-level, allocator-friendly predicate AST over borrowed byte slices (`&[u8]`), built for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
+A buffer-level, allocator-friendly predicate AST over borrowed byte slices (`&[u8]`), built for the [LLKV](../) toolkit.
 
 This crate intentionally ships without an evaluator or planner.
 

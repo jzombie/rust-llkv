@@ -1,10 +1,26 @@
+//! Query execution engine for LLKV.
+//!
+//! This crate provides the query execution layer that sits between the query planner
+//! (`llkv-plan`) and the storage layer (`llkv-table`, `llkv-column-map`).
+//!
+//! # Module Organization
+//!
+//! - [`translation`]: Expression and projection translation utilities
+//! - [`types`]: Core type definitions (tables, schemas, columns)  
+//! - [`insert`]: INSERT operation support (value coercion)
+//! - [`utils`]: Utility functions (time)
+//!
+//! The [`QueryExecutor`] and [`SelectExecution`] implementations are defined inline
+//! in this module for now, but should be extracted to a dedicated `query` module
+//! in a future refactoring.
+
 use arrow::array::{Array, ArrayRef, Int64Builder, RecordBatch, StringArray, UInt32Array};
 use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Schema};
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
+use llkv_expr::expr::{Expr as LlkvExpr, ScalarExpr};
 use llkv_plan::{
     AggregateExpr, AggregateFunction, OrderByPlan, OrderSortType, OrderTarget, PlanValue,
     SelectPlan, SelectProjection,
@@ -19,38 +35,57 @@ use llkv_table::types::FieldId;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::fmt;
-use std::ops::Bound;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
+// ============================================================================
+// Module Declarations
+// ============================================================================
+
+pub mod insert;
+pub mod translation;
+pub mod types;
+pub mod utils;
+
+// ============================================================================
+// Type Aliases and Re-exports
+// ============================================================================
+
+/// Result type for executor operations.
 pub type ExecutorResult<T> = Result<T, Error>;
 
-mod projections;
-mod schema;
-pub use projections::{build_projected_columns, build_wildcard_projections};
-pub use schema::schema_for_projections;
+pub use insert::{
+    build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns,
+};
+pub use translation::{
+    build_projected_columns, build_wildcard_projections, full_table_scan_filter,
+    resolve_field_id_from_schema, schema_for_projections, translate_predicate,
+    translate_predicate_with, translate_scalar, translate_scalar_with,
+};
+pub use types::{
+    ExecutorColumn, ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorSchema, ExecutorTable,
+    ExecutorTableProvider,
+};
+pub use utils::current_time_micros;
 
-/// Trait for providing table access to the executor.
-pub trait TableProvider<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    fn get_table(&self, canonical_name: &str) -> ExecutorResult<Arc<ExecutorTable<P>>>;
-}
+// ============================================================================
+// Query Executor - Implementation
+// ============================================================================
+// TODO: Extract this implementation into a dedicated query/ module
 
 /// Query executor that executes SELECT plans.
 pub struct QueryExecutor<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    provider: Arc<dyn TableProvider<P>>,
+    provider: Arc<dyn ExecutorTableProvider<P>>,
 }
 
 impl<P> QueryExecutor<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    pub fn new(provider: Arc<dyn TableProvider<P>>) -> Self {
+    pub fn new(provider: Arc<dyn ExecutorTableProvider<P>>) -> Self {
         Self { provider }
     }
 
@@ -427,14 +462,24 @@ where
         let schema = schema_for_projections(table_ref, &projections)?;
 
         let (filter_expr, full_table_scan) = match plan.filter {
-            Some(expr) => (translate_predicate(expr, table_ref.schema.as_ref())?, false),
+            Some(expr) => (
+                crate::translation::expression::translate_predicate(
+                    expr,
+                    table_ref.schema.as_ref(),
+                    |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
+                )?,
+                false,
+            ),
             None => {
                 let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "table has no columns; cannot perform wildcard scan".into(),
                     )
                 })?;
-                (full_table_scan_filter(field_id), true)
+                (
+                    crate::translation::expression::full_table_scan_filter(field_id),
+                    true,
+                )
             }
         };
 
@@ -506,6 +551,7 @@ where
                             column
                         ))
                     })?;
+
                     let kind = match function {
                         AggregateFunction::Count => {
                             if distinct {
@@ -572,14 +618,18 @@ where
 
         let had_filter = plan.filter.is_some();
         let filter_expr = match plan.filter {
-            Some(expr) => translate_predicate(expr, table.schema.as_ref())?,
+            Some(expr) => crate::translation::expression::translate_predicate(
+                expr,
+                table.schema.as_ref(),
+                |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
+            )?,
             None => {
                 let field_id = table.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "table has no columns; cannot perform aggregate scan".into(),
                     )
                 })?;
-                full_table_scan_filter(field_id)
+                crate::translation::expression::full_table_scan_filter(field_id)
             }
         };
 
@@ -892,14 +942,18 @@ where
 
         // Prepare filter and projections
         let filter_expr = match filter {
-            Some(expr) => translate_predicate(expr.clone(), table_ref.schema.as_ref())?,
+            Some(expr) => crate::translation::expression::translate_predicate(
+                expr.clone(),
+                table_ref.schema.as_ref(),
+                |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
+            )?,
             None => {
                 let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "table has no columns; cannot perform aggregate scan".into(),
                     )
                 })?;
-                full_table_scan_filter(field_id)
+                crate::translation::expression::full_table_scan_filter(field_id)
             }
         };
 
@@ -1278,7 +1332,7 @@ where
         Ok(batches)
     }
 
-    pub fn collect_rows(self) -> ExecutorResult<RowBatch> {
+    pub fn collect_rows(self) -> ExecutorResult<ExecutorRowBatch> {
         let schema = self.schema();
         let mut rows: Vec<Vec<PlanValue>> = Vec::new();
         self.stream(|batch| {
@@ -1297,7 +1351,7 @@ where
             .iter()
             .map(|field| field.name().to_string())
             .collect();
-        Ok(RowBatch { columns, rows })
+        Ok(ExecutorRowBatch { columns, rows })
     }
 
     pub fn into_rows(self) -> ExecutorResult<Vec<Vec<PlanValue>>> {
@@ -1317,92 +1371,9 @@ where
     }
 }
 
-pub struct ExecutorTable<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    // underlying physical table from llkv_table
-    pub table: Arc<llkv_table::table::Table<P>>,
-    pub schema: Arc<ExecutorSchema>,
-    pub next_row_id: AtomicU64,
-    pub total_rows: AtomicU64,
-    pub multi_column_uniques: RwLock<Vec<ExecutorMultiColumnUnique>>,
-}
-
-pub struct ExecutorSchema {
-    pub columns: Vec<ExecutorColumn>,
-    pub lookup: FxHashMap<String, usize>,
-}
-
-impl ExecutorSchema {
-    pub fn resolve(&self, name: &str) -> Option<&ExecutorColumn> {
-        let normalized = name.to_ascii_lowercase();
-        self.lookup
-            .get(&normalized)
-            .and_then(|idx| self.columns.get(*idx))
-    }
-
-    pub fn first_field_id(&self) -> Option<FieldId> {
-        self.columns.first().map(|col| col.field_id)
-    }
-
-    pub fn column_by_field_id(&self, field_id: FieldId) -> Option<&ExecutorColumn> {
-        self.columns.iter().find(|col| col.field_id == field_id)
-    }
-}
-
-#[derive(Clone)]
-pub struct ExecutorColumn {
-    pub name: String,
-    pub data_type: DataType,
-    pub nullable: bool,
-    pub primary_key: bool,
-    pub unique: bool,
-    pub field_id: FieldId,
-    pub check_expr: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecutorMultiColumnUnique {
-    pub index_name: Option<String>,
-    pub column_indices: Vec<usize>,
-}
-
-impl<P> ExecutorTable<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    pub fn multi_column_uniques(&self) -> Vec<ExecutorMultiColumnUnique> {
-        self.multi_column_uniques.read().unwrap().clone()
-    }
-
-    pub fn set_multi_column_uniques(&self, uniques: Vec<ExecutorMultiColumnUnique>) {
-        *self.multi_column_uniques.write().unwrap() = uniques;
-    }
-
-    pub fn add_multi_column_unique(&self, unique: ExecutorMultiColumnUnique) {
-        let mut guard = self.multi_column_uniques.write().unwrap();
-        if !guard
-            .iter()
-            .any(|existing| existing.column_indices == unique.column_indices)
-        {
-            guard.push(unique);
-        }
-    }
-}
-
-// Re-export from llkv-plan
-// PlanValue is the plan-level value type; do not re-export higher-level prefixed symbols.
-
-// Export executor-local types with explicit Exec-prefixed names to avoid
-// colliding with Arrow / storage types imported above.
-// Executor types are public `ExecutorColumn`, `ExecutorSchema`, `ExecutorTable`.
-// No short `Exec*` aliases to avoid confusion.
-
-pub struct RowBatch {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<PlanValue>>,
-}
+// ============================================================================
+// Helper Functions
+// ============================================================================
 
 fn expand_order_targets(
     order_items: &[OrderByPlan],
@@ -1517,16 +1488,6 @@ where
         direction,
         nulls_first: order_plan.nulls_first,
         transform,
-    })
-}
-
-fn full_table_scan_filter(field_id: FieldId) -> LlkvExpr<'static, FieldId> {
-    LlkvExpr::Pred(Filter {
-        field_id,
-        op: Operator::Range {
-            lower: Bound::Unbounded,
-            upper: Bound::Unbounded,
-        },
     })
 }
 
@@ -1674,109 +1635,4 @@ fn sort_record_batch_with_order(
 
     RecordBatch::try_new(Arc::clone(schema), reordered_columns)
         .map_err(|err| Error::Internal(format!("failed to build reordered ORDER BY batch: {err}")))
-}
-
-// Translate predicate from column names to field IDs
-fn translate_predicate(
-    expr: llkv_expr::expr::Expr<'static, String>,
-    schema: &ExecutorSchema,
-) -> ExecutorResult<llkv_expr::expr::Expr<'static, FieldId>> {
-    use llkv_expr::expr::Expr;
-    match expr {
-        Expr::And(exprs) => {
-            let translated: Result<Vec<_>, _> = exprs
-                .into_iter()
-                .map(|e| translate_predicate(e, schema))
-                .collect();
-            Ok(Expr::And(translated?))
-        }
-        Expr::Or(exprs) => {
-            let translated: Result<Vec<_>, _> = exprs
-                .into_iter()
-                .map(|e| translate_predicate(e, schema))
-                .collect();
-            Ok(Expr::Or(translated?))
-        }
-        Expr::Not(inner) => {
-            let translated = translate_predicate(*inner, schema)?;
-            Ok(Expr::Not(Box::new(translated)))
-        }
-        Expr::Pred(filter) => {
-            let column = schema.resolve(&filter.field_id).ok_or_else(|| {
-                Error::InvalidArgumentError(format!("unknown column '{}'", filter.field_id))
-            })?;
-            Ok(Expr::Pred(Filter {
-                field_id: column.field_id,
-                op: filter.op,
-            }))
-        }
-        Expr::Compare { left, op, right } => Ok(Expr::Compare {
-            left: translate_scalar(&left, schema)?,
-            op,
-            right: translate_scalar(&right, schema)?,
-        }),
-    }
-}
-
-// Translate scalar expressions
-fn translate_scalar(
-    expr: &ScalarExpr<String>,
-    schema: &ExecutorSchema,
-) -> ExecutorResult<ScalarExpr<FieldId>> {
-    match expr {
-        ScalarExpr::Literal(lit) => Ok(ScalarExpr::Literal(lit.clone())),
-        ScalarExpr::Column(name) => {
-            let column = schema
-                .resolve(name)
-                .ok_or_else(|| Error::InvalidArgumentError(format!("unknown column '{}'", name)))?;
-            Ok(ScalarExpr::Column(column.field_id))
-        }
-        ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
-            left: Box::new(translate_scalar(left, schema)?),
-            op: *op,
-            right: Box::new(translate_scalar(right, schema)?),
-        }),
-        ScalarExpr::Aggregate(agg) => {
-            // Translate column names in aggregate calls to field IDs
-            use llkv_expr::expr::AggregateCall;
-            let translated_agg = match agg {
-                AggregateCall::CountStar => AggregateCall::CountStar,
-                AggregateCall::Count(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
-                    })?;
-                    AggregateCall::Count(column.field_id)
-                }
-                AggregateCall::Sum(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
-                    })?;
-                    AggregateCall::Sum(column.field_id)
-                }
-                AggregateCall::Min(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
-                    })?;
-                    AggregateCall::Min(column.field_id)
-                }
-                AggregateCall::Max(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
-                    })?;
-                    AggregateCall::Max(column.field_id)
-                }
-                AggregateCall::CountNulls(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
-                    })?;
-                    AggregateCall::CountNulls(column.field_id)
-                }
-            };
-            Ok(ScalarExpr::Aggregate(translated_agg))
-        }
-        ScalarExpr::GetField { base, field_name } => Ok(ScalarExpr::GetField {
-            base: Box::new(translate_scalar(base, schema)?),
-            field_name: field_name.clone(),
-        }),
-    }
 }

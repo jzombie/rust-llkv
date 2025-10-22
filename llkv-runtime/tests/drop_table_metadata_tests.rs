@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use llkv_column_map::store::ColumnStore;
+use llkv_plan::DropTablePlan;
 use llkv_result::Error;
-use llkv_runtime::{ColumnSpec, RuntimeContext};
+use llkv_runtime::{PlanColumnSpec, RuntimeContext};
 use llkv_storage::pager::MemPager;
-use llkv_table::MetadataManager;
 use llkv_table::constraints::{
     ConstraintKind, ConstraintRecord, ConstraintState, ForeignKeyAction, ForeignKeyConstraint,
 };
+use llkv_table::{CatalogDdl, MetadataManager};
 
 #[test]
 fn drop_table_removes_persisted_metadata() {
@@ -17,8 +18,8 @@ fn drop_table_removes_persisted_metadata() {
 
     context
         .create_table_builder("drop_test")
-        .with_column_spec(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
-        .with_column_spec(ColumnSpec::new("name", DataType::Utf8, true))
+        .with_column_spec(PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
+        .with_column_spec(PlanColumnSpec::new("name", DataType::Utf8, true))
         .finish()
         .expect("create table");
 
@@ -42,8 +43,7 @@ fn drop_table_removes_persisted_metadata() {
             .is_empty()
     );
 
-    context
-        .drop_table_immediate("drop_test", false)
+    CatalogDdl::drop_table(context.as_ref(), DropTablePlan::new("drop_test"))
         .expect("drop table succeeds");
 
     let metadata_after = MetadataManager::new(Arc::clone(&store));
@@ -74,14 +74,18 @@ fn drop_table_respects_foreign_keys_after_restart() {
 
         context
             .create_table_builder("parents")
-            .with_column_spec(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
+            .with_column_spec(
+                PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true),
+            )
             .finish()
             .expect("create parents");
 
         context
             .create_table_builder("children")
-            .with_column_spec(ColumnSpec::new("id", DataType::Int64, false).with_primary_key(true))
-            .with_column_spec(ColumnSpec::new("parent_id", DataType::Int64, true))
+            .with_column_spec(
+                PlanColumnSpec::new("id", DataType::Int64, false).with_primary_key(true),
+            )
+            .with_column_spec(PlanColumnSpec::new("parent_id", DataType::Int64, true))
             .finish()
             .expect("create children");
 
@@ -120,18 +124,17 @@ fn drop_table_respects_foreign_keys_after_restart() {
     context
         .lookup_table("parents")
         .expect("load parent table before drop");
-    let err = context
-        .drop_table_immediate("parents", false)
+    let err = CatalogDdl::drop_table(&context, DropTablePlan::new("parents"))
         .expect_err("dropping referenced parent should fail");
 
     match err {
-        Error::ConstraintError(message) => {
+        Error::ConstraintError(message) | Error::CatalogError(message) => {
             assert!(
                 message.to_ascii_lowercase().contains("children"),
                 "error message should mention child table, got '{}'",
                 message
             );
         }
-        other => panic!("expected constraint error, got {:?}", other),
+        other => panic!("expected catalog or constraint error, got {:?}", other),
     }
 }
