@@ -285,6 +285,98 @@ where
         Ok(rows)
     }
 
+    /// Scan multi-column values with FK-aware visibility semantics.
+    ///
+    /// This is similar to [`Self::scan_multi_column_values`], but uses FK-specific
+    /// MVCC visibility rules where rows deleted by the current transaction are treated
+    /// as still visible (matching SQL standard FK constraint checking behavior).
+    pub(super) fn scan_multi_column_values_for_fk_check(
+        &self,
+        table: &ExecutorTable<P>,
+        field_ids: &[FieldId],
+        snapshot: TransactionSnapshot,
+    ) -> Result<Vec<Vec<PlanValue>>> {
+        if field_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table_id = table.table.table_id();
+        use llkv_expr::{Expr, Filter, Operator};
+        use std::ops::Bound;
+
+        let match_all_filter = Filter {
+            field_id: field_ids[0],
+            op: Operator::Range {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+        };
+        let filter_expr = Expr::Pred(match_all_filter);
+
+        let row_ids = match table.table.filter_row_ids(&filter_expr) {
+            Ok(ids) => ids,
+            Err(Error::NotFound) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        // Use FK-specific filtering that treats deleted rows as still visible
+        let row_ids = llkv_transaction::filter_row_ids_for_fk_check(
+            table.table.as_ref(),
+            row_ids,
+            &self.txn_manager,
+            snapshot,
+        )?;
+
+        if row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let logical_field_ids: Vec<_> = field_ids
+            .iter()
+            .map(|&fid| LogicalFieldId::for_user(table_id, fid))
+            .collect();
+
+        let total_rows = row_ids.len();
+        let mut stream = match table.table.stream_columns(
+            logical_field_ids,
+            row_ids,
+            GatherNullPolicy::IncludeNulls,
+        ) {
+            Ok(stream) => stream,
+            Err(Error::NotFound) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let mut rows = vec![Vec::with_capacity(field_ids.len()); total_rows];
+        while let Some(chunk) = stream.next_batch()? {
+            let batch = chunk.batch();
+            if batch.num_columns() == 0 {
+                continue;
+            }
+
+            let base = chunk.row_offset();
+            let local_len = batch.num_rows();
+            for col_idx in 0..batch.num_columns() {
+                let array = batch.column(col_idx);
+                for local_idx in 0..local_len {
+                    let target_index = base + local_idx;
+                    debug_assert!(
+                        target_index < rows.len(),
+                        "stream chunk produced out-of-bounds row index"
+                    );
+                    if let Some(row) = rows.get_mut(target_index) {
+                        match llkv_plan::plan_value_from_array(array, local_idx) {
+                            Ok(value) => row.push(value),
+                            Err(_) => row.push(PlanValue::Null),
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+
     /// Collect row values for specific row IDs and field IDs.
     ///
     /// Used during foreign key validation to gather referenced/referencing values.

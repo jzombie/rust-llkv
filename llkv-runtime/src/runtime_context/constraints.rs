@@ -185,6 +185,14 @@ where
     ///
     /// This function is `pub(super)` because it's called by insert operations
     /// in insert.rs and update operations in update.rs (when inserting new row values).
+    ///
+    /// For foreign key validation, we use a modified snapshot that includes:
+    /// - Rows inserted by the current transaction (so FK checks see new parent rows)
+    /// - Rows deleted by the current transaction are treated as STILL VISIBLE for FK checks
+    ///   (this matches SQL standard where uncommitted deletes don't affect FK validation)
+    ///
+    /// We achieve this by using a snapshot with a special txn_id marker that tells the
+    /// MVCC layer to ignore deletes from the current transaction.
     pub(super) fn check_foreign_keys_on_insert(
         &self,
         table: &ExecutorTable<P>,
@@ -211,7 +219,7 @@ where
             rows,
             |request| {
                 let parent_table = self.lookup_table(request.referenced_table_canonical)?;
-                self.scan_multi_column_values(
+                self.scan_multi_column_values_for_fk_check(
                     parent_table.as_ref(),
                     request.referenced_field_ids,
                     snapshot,

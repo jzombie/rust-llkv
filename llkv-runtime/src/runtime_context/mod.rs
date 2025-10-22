@@ -1,7 +1,6 @@
 //! Runtime context submodules
 //!
 //! This module contains the RuntimeContext implementation split into logical submodules:
-//! - `mvcc_helpers`: MVCC transaction visibility filtering
 //! - `query_translation`: String-based expression to field-ID-based expression translation
 //! - `types`: Helper types (PreparedAssignmentValue, TableConstraintContext)
 //! - `provider`: ContextProvider for TableProvider trait
